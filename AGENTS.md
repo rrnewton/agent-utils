@@ -240,5 +240,8 @@ open-source systems. Keep private organizational sources and deployment details
 out of that comparison.
 
 Introduce tools by explaining the user's problem, the useful outcome, and the
-dependencies. CLI help must describe every argument, including relevant defaults,
-units, and command applicability, and include useful examples.
+dependencies. The primary operator documentation belongs in CLI `quickstart` and
+`userguide` commands, plus top-level and per-subcommand help. CLI help must describe
+every argument, including relevant defaults, units, and command applicability,
+and include useful examples. Generated implementation/API documentation is a
+separate reference.

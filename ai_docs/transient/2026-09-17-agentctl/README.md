@@ -52,3 +52,18 @@ Read the [component design](DESIGN.md) for the exact current message path,
 ownership boundaries, proposed interfaces, and limitations. Read
 [related work](RELATED_WORK.md) for public open-source alternatives, including
 systems that already offer remote session control and agent-to-agent operation.
+
+The follow-up sanity check examines implementation guarantees rather than CLI
+feature lists:
+
+- [Our worker lifecycle](CURRENT_LIFECYCLE_REVIEW.md): reproduced failure cases,
+  source-level risks, and existing safeguards.
+- [Public lifecycle implementations](PUBLIC_LIFECYCLE_REVIEW.md): Happy and
+  Claude Squad source comparisons, with pinned references and bounded claims.
+- [Dependencies and Chat lifecycle](DEPENDENCIES_AND_CHAT_REVIEW.md): why the
+  agent package need not depend on the shell executor, plus local Chat
+  reproductions.
+
+The proposed operator documentation surface is CLI `quickstart`, `userguide`,
+and top-level/per-command help. These working files are design input, not a
+parallel user manual.

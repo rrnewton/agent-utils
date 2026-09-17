@@ -187,6 +187,19 @@ queued work. A rename alone would leave the current duplication intact.
 
 ## Proposed CLI and documentation contract
 
+The CLI is the primary operator documentation surface. `agentctl --help` should
+explain the purpose and available operations; `agentctl COMMAND --help` should
+explain that operation; `agentctl quickstart` should provide a short working
+setup; and `agentctl userguide` should expose the complete operator guide.
+These are proposed command forms, not commands implemented by this draft.
+
+The guide text needs one maintained source and must be embedded in installed
+artifacts so it works offline, outside a source checkout. Whether that source
+should be Markdown, structured data, or another form remains open. A separate
+static user manual is not required merely because source files exist. Working
+designs remain under `ai_docs/transient/`; generated implementation/API reference
+such as rustdoc is a separate documentation product.
+
 - Top-level help starts with the problem solved and lists commands with a short
   purpose, followed by a small working example.
 - Command help describes every argument, required inputs, defaults, units,
