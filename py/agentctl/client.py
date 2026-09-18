@@ -555,6 +555,22 @@ class HerdrClient:
                 f"{purpose}: event reported pane={returned_pane!r} status={returned_status!r}"
             )
 
+    def event_socket(self) -> str:
+        """Resolve the running server's event socket through Herdr's own discovery."""
+        completed = self._invoke(["status", "server", "--json"])
+        if completed.returncode:
+            raise HerdrUnavailable("cannot discover the running Herdr server for output subscriptions")
+        try:
+            document = as_mapping(json.loads(completed.stdout), "Herdr server status")
+            path = get_str(document, "socket", "Herdr server status")
+            if document.get("running") is not True or document.get("compatible") is not True:
+                raise HerdrUnavailable("output subscriptions require a running, compatible Herdr server")
+            if not os.path.isabs(path) or "\0" in path:
+                raise ValueError("event socket must be an absolute path")
+            return path
+        except (TypeError, ValueError) as exc:
+            raise HerdrUnavailable(f"invalid Herdr server status: {exc}") from exc
+
     def process_info(self, pane_id: str) -> ProcessInfo:
         """The pane's live shell pid and foreground process group — the readiness signal."""
         result = self._call(

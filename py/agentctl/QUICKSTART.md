@@ -53,3 +53,9 @@ you choose; use separate worktrees when their edits need isolation.
 and the other subcommand help pages describe every option. Worker, Chat, and
 MCP extensions are installation-dependent; inspect `agentctl capabilities`
 before using their commands.
+
+To message one of these agents remotely, run `agentctl chat quickstart`.
+The Chat bridge accepts messages from configured senders, acknowledges intake
+with 🤖, and sends the agent's tagged final answer back to its Google Chat
+thread. The agent normally needs no reply-file write or reply command. Thread
+replies also include a command hint for reading the nearest ten prior messages.

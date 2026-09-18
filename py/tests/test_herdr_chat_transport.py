@@ -437,10 +437,11 @@ def test_run_loop_retries_malformed_transport_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls = 0
+    now = 0.0
 
     class RetryBridge:
         def __init__(self, state: Path) -> None:
-            pass
+            self.state = state
 
         def tick(self) -> dict[str, object]:
             nonlocal calls
@@ -449,11 +450,16 @@ def test_run_loop_retries_malformed_transport_output(
                 raise TypeError("malformed adapter message")
             raise KeyboardInterrupt
 
+        def output_requests(self, *, retry_failed: bool = False) -> dict[str, str]:
+            return {}
+
     def skip_sleep(seconds: float) -> None:
-        pass
+        nonlocal now
+        now += seconds
 
     monkeypatch.setattr(chat_module, "Bridge", RetryBridge)
     monkeypatch.setattr(time, "sleep", skip_sleep)
+    monkeypatch.setattr(time, "monotonic", lambda: now)
     assert chat_module.run_cli(["run", "--state", str(tmp_path)]) == 130
     assert calls == 2
     assert "malformed adapter message" in capsys.readouterr().err
@@ -463,11 +469,12 @@ def test_run_loop_backs_off_failures_and_recovers_configured_interval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = 0
+    now = 0.0
     delays: list[float] = []
 
     class RecoveringBridge:
         def __init__(self, state: Path) -> None:
-            pass
+            self.state = state
 
         def tick(self) -> dict[str, object]:
             nonlocal calls
@@ -478,7 +485,16 @@ def test_run_loop_backs_off_failures_and_recovers_configured_interval(
                 return {}
             raise KeyboardInterrupt
 
+        def output_requests(self, *, retry_failed: bool = False) -> dict[str, str]:
+            return {}
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        delays.append(seconds)
+        now += seconds
+
     monkeypatch.setattr(chat_module, "Bridge", RecoveringBridge)
-    monkeypatch.setattr(time, "sleep", delays.append)
+    monkeypatch.setattr(time, "sleep", sleep)
+    monkeypatch.setattr(time, "monotonic", lambda: now)
     assert chat_module.run_cli(["run", "--state", str(tmp_path), "--interval", "10"]) == 130
     assert delays == [20, 40, 60, 60, 10]

@@ -19,7 +19,10 @@ always-running manager process.
 
 Installations with the worker and Chat extensions also provide resumable
 headless turns in Herdr or tmux, a Google Chat coordinator bridge with reaction
-ACKs, and an MCP interface. Run `agentctl capabilities` to see the modes,
+ACKs and automatic capture of explicitly tagged final replies, and an MCP
+interface. The agent replies in its terminal without writing a reply file.
+Thread replies include a command hint for reading earlier context.
+Run `agentctl capabilities` to see the modes,
 backends, harnesses, and services included in your installation. A headless
 worker's terminal displays its transcript; it is not a native harness TUI.
 

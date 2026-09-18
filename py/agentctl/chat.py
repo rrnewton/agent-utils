@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import signal
 import subprocess
@@ -37,6 +38,8 @@ from agentctl.agent import (
     _validate_private_directory, drain, enqueue, resolve_target,
 )
 from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutputStream
+from agentctl.chat_replies import extract_replies
 from agentctl.errors import HerdrRunError, HerdrUnavailable
 from agentctl.jsonx import as_mapping, as_sequence, get_str
 
@@ -92,6 +95,28 @@ def _reaction_emoji(value: object) -> str | None:
     return value
 
 
+def _reply_instruction(nonce: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]{22}", nonce) is None:
+        raise ValueError("invalid saved chat reply nonce")
+    return (f"Put your final reply between <GCHAT_REPLY_{nonce}> and </GCHAT_REPLY_{nonce}>, "
+            "each on its own line, without a code fence.")
+
+
+def _closing_pattern(nonces: Sequence[str]) -> str:
+    for nonce in nonces:
+        _reply_instruction(nonce)
+    return r"^\s*(?:[•⏺]\s+)?</GCHAT_REPLY_(?:" + "|".join(map(re.escape, nonces)) + r")>\s*$"
+
+
+def _request_path(state: Path, key: str) -> Path:
+    if re.fullmatch(r"[0-9a-f]{12,64}", key) is None:
+        raise ValueError("request must be a hexadecimal key or unique prefix of at least 12 characters")
+    matches = list((state / "requests").glob(key + "*.json"))
+    if len(matches) != 1:
+        raise ValueError(f"request prefix must identify exactly one saved request; found {len(matches)}")
+    return matches[0]
+
+
 @dataclass(frozen=True)
 class Config:
     """The authority boundary is one space, named senders, and one pinned target."""
@@ -106,6 +131,7 @@ class Config:
     agent_name: str | None = None
     ack_reaction: str | None = "🤖"
     reaction_user: str | None = None
+    reply_mode: str = "tagged"
 
     @classmethod
     def parse(cls, document: dict[str, object]) -> Config:
@@ -147,10 +173,13 @@ class Config:
             or reaction_user in ("users/me", "users/app")
         ):
             raise ValueError("reaction_user must be the canonical users/ID of the OAuth user")
+        reply_mode = document.get("reply_mode", "tagged")
+        if reply_mode not in ("tagged", "file"):
+            raise ValueError("reply_mode must be tagged or file")
         return cls(space, _strings(document.get("allowed_senders"), "allowed_senders"), target,
                    label, () if command is None or command == [] else _strings(command, "transport_command"), token_env,
                    () if token_command is None or token_command == [] else _strings(token_command, "token_command"),
-                   agent_name, _reaction_emoji(document.get("ack_reaction", "🤖")), reaction_user)
+                   agent_name, _reaction_emoji(document.get("ack_reaction", "🤖")), reaction_user, str(reply_mode))
 
 
 class _NamedClient(HerdrClient):
@@ -183,6 +212,9 @@ class _NamedClient(HerdrClient):
     def read(self, pane_id: str, *, source: str = "recent-unwrapped", lines: int | None = None) -> str:
         self.pane_info(pane_id)
         return self._delegate.read(pane_id, source=source, lines=lines)
+
+    def event_socket(self) -> str:
+        return self._delegate.event_socket()
 
 
 class CommandTransport:
@@ -296,7 +328,10 @@ class GoogleChatTransport:
             return self._react(token, space, request)
         data: bytes | None = None
         params: dict[str, str] = {}
-        if action == "poll":
+        if action == "context":
+            from agentctl.chat_context import google_context_params
+            params.update(google_context_params(request))
+        elif action == "poll":
             after = get_str(request, "after", "poll request")
             _timestamp(after)
             params.update(pageSize="100", orderBy="createTime asc", filter=f'createTime > "{after}"')
@@ -328,10 +363,15 @@ class GoogleChatTransport:
             message = as_mapping(value, "Google Chat message")
             sender = as_mapping(message.get("sender", {}), "Google Chat sender")
             thread = as_mapping(message.get("thread", {}), "Google Chat thread")
-            messages.append({"id": message.get("name"), "text": message.get("text", ""),
-                             "sender": sender.get("name"), "thread": thread.get("name"),
-                             "created_at": message.get("createTime")})
-        return {"messages": messages, "cursor": document.get("nextPageToken")}
+            normalized: dict[str, object] = {"id": message.get("name"), "text": message.get("text", ""),
+                                            "sender": sender.get("name"), "thread": thread.get("name"),
+                                            "created_at": message.get("createTime")}
+            if "threadReply" in message:
+                if not isinstance(message["threadReply"], bool):
+                    raise ValueError("Google Chat threadReply must be a boolean")
+                normalized["thread_reply"] = message["threadReply"]
+            messages.append(normalized)
+        return {"messages": messages, "cursor": document.get("nextPageToken") or None}
 
 
 class Bridge:
@@ -380,7 +420,8 @@ class Bridge:
             if identifier in own_replies:
                 continue
             thread = get_str(message, "thread", "message")
-            if not identifier.startswith(self.config.space + "/messages/") or not thread.startswith(self.config.space + "/threads/"):
+            if (re.fullmatch(re.escape(self.config.space) + r"/messages/[A-Za-z0-9_.-]+", identifier) is None
+                    or re.fullmatch(re.escape(self.config.space) + r"/threads/[A-Za-z0-9_.-]+", thread) is None):
                 raise ValueError("transport returned a message outside the configured space")
             created = _timestamp(get_str(message, "created_at", "message"))
             high = max(high, created)
@@ -389,15 +430,22 @@ class Bridge:
             if message.get("sender") not in self.config.allowed_senders or not message.get("text"):
                 continue
             text = get_str(message, "text", "message")
+            if "thread_reply" in message and not isinstance(message["thread_reply"], bool):
+                raise ValueError("thread_reply must be a boolean")
             if len(text.encode()) > 32000:
                 raise ValueError("chat message exceeds 32000 bytes")
             key = hashlib.sha256(identifier.encode()).hexdigest()
             path = self.state / "requests" / f"{key}.json"
             if not path.exists():
-                _write(path, {"key": key, "message": message, "phase": "received",
-                              "queue_id": f"{int(created.timestamp() * 1_000_000):020d}-{key}",
-                              "request_id": str(uuid.uuid5(uuid.NAMESPACE_URL, identifier)),
-                              "received_at": _utc(), "ack": self._ack_record(identifier)})
+                record: dict[str, object] = {"key": key, "message": message, "phase": "received",
+                                            "queue_id": f"{int(created.timestamp() * 1_000_000):020d}-{key}",
+                                            "request_id": str(uuid.uuid5(uuid.NAMESPACE_URL, identifier)),
+                                            "received_at": _utc(), "ack": self._ack_record(identifier)}
+                if self.config.reply_mode == "tagged":
+                    # Persist an unpredictable marker before the prompt can reach the TUI.
+                    # Source text cannot know it; retained output from another request cannot match it.
+                    record["reply_nonce"] = secrets.token_urlsafe(16)
+                _write(path, record)
         cursor = result.get("cursor")
         if cursor is not None and not isinstance(cursor, str):
             raise ValueError("transport cursor must be a string or null")
@@ -459,10 +507,25 @@ class Bridge:
     def _prompt(self, record: dict[str, object]) -> str:
         message = as_mapping(record["message"], "message")
         key = get_str(record, "key", "request")
+        context = ""
+        if message.get("thread_reply") is True:
+            launcher = Path(__file__).resolve().parent.parent / "bin" / "agentctl"
+            invocation = ([str(launcher), "chat"] if launcher.is_file() and os.access(launcher, os.X_OK)
+                          else [sys.executable, str(Path(__file__).resolve())])
+            command = shlex.join([*invocation, "context", "--state", str(self.state),
+                                  "--request", key[:12], "--limit", "10"])
+            context = ("Run this for the prior 10 messages in this thread; read further back if needed:\n"
+                       f"{command}\n")
+        nonce = record.get("reply_nonce")
+        if isinstance(nonce, str):
+            return ("The user's request arrived through the Google Chat bridge.\n"
+                    f"Source: {message['id']}\n"
+                    f"{_reply_instruction(nonce)}\n"
+                    f"{context}\n{message['text']}")
         reply = shlex.join([sys.executable, str(Path(__file__).resolve()), "reply", "--state", str(self.state),
                             "--request", key, "--file", "PATH_TO_YOUR_REPLY"])
         return ("A message from an authorized user arrived through your configured chat bridge.\n"
-                f"Source: {message['id']}\nSender: {message['sender']}\n\n"
+                f"Source: {message['id']}\nSender: {message['sender']}\n{context}\n"
                 f"{message['text']}\n\n"
                 "Complete this user's request using your normal instructions and tools. Only you are the "
                 "chat coordinator; manage other long-lived agents through agentctl as needed. "
@@ -532,12 +595,186 @@ class Bridge:
         finally:
             os.close(descriptor)
 
+    def output_requests(self, *, retry_failed: bool = False) -> dict[str, str]:
+        """Return unfinished tagged requests; a completed artifact needs no more TUI reads."""
+        result: dict[str, str] = {}
+        for path in sorted((self.state / "requests").glob("*.json")):
+            record = _read(path)
+            nonce = record.get("reply_nonce")
+            if not isinstance(nonce, str) or record.get("phase") not in (
+                "queued", "awaiting_reply", "delivery_uncertain"
+            ):
+                continue
+            _reply_instruction(nonce)
+            key = get_str(record, "key", "chat request")
+            if (self.state / "replies" / f"{key}.json").exists():
+                continue
+            if record.get("capture_error") and not retry_failed:
+                continue
+            if nonce in result:
+                raise ValueError("saved chat requests contain a duplicate reply nonce")
+            result[nonce] = key
+        return result
+
+    def open_output(self, nonces: Sequence[str]) -> PaneOutputStream:
+        """Subscribe to unique closing markers after checking the pinned coordinator."""
+        info = resolve_target(self.client, self.config.target)
+        return PaneOutputStream(self.client.event_socket(), info.pane_id,
+                               _closing_pattern(nonces) if nonces else "", watch_settled=True)
+
+    def capture_event(self, event: PaneOutputSnapshot | PaneAgentStatus) -> dict[str, object]:
+        """Treat settled-state events as a hint to recheck previously incomplete replies."""
+        if isinstance(event, PaneOutputSnapshot):
+            return self.capture_output(event)
+        info = resolve_target(self.client, self.config.target)
+        if info.pane_id != event.pane_id:
+            raise HerdrUnavailable("chat status event belongs to a different coordinator pane")
+        if info.status not in ("idle", "done"):
+            return {"captured": [], "errors": []}
+        # One read per settled event recovers an early close inside a quoted
+        # example, or a missed output edge. Idle alone never proves an answer.
+        text = self.client.read(info.pane_id, source="recent-unwrapped", lines=4000)
+        if len(text.encode("utf-8")) > 2 * 1024 * 1024:
+            raise ValueError("retained chat output exceeds the 2 MiB capture limit")
+        return self.capture_output(PaneOutputSnapshot(info.pane_id, text, None))
+
+    def capture_output(self, snapshot: PaneOutputSnapshot) -> dict[str, object]:
+        """Durably capture complete matching blocks and immediately reconcile the outbox."""
+        descriptor = _open_private_lock(str(self.state / ".bridge.lock"), "chat bridge lock")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            info = resolve_target(self.client, self.config.target)
+            if snapshot.pane_id != info.pane_id:
+                raise HerdrUnavailable("chat reply output belongs to a different coordinator pane")
+            captured: list[str] = []
+            errors: list[dict[str, str]] = []
+            for nonce, key in self.output_requests(retry_failed=True).items():
+                if re.search(_closing_pattern([nonce]), snapshot.text, flags=re.MULTILINE) is None:
+                    continue
+                path = self.state / "requests" / f"{key}.json"
+                record = _read(path)
+                # Remove unrelated older scrollback when the echoed instruction is
+                # still retained. Its inline markers cannot constitute a reply.
+                text = snapshot.text
+                instruction = _reply_instruction(nonce)
+                start = text.find(instruction)
+                if start >= 0:
+                    text = text[start + len(instruction):]
+                try:
+                    answers = extract_replies(text, (nonce,))
+                    if nonce not in answers:
+                        raise ValueError("closing marker is visible but no complete reply block is retained; inspect the pane and retry chat tick or submit a reply file")
+                    submit_reply(self.state, key, answers[nonce])
+                except ValueError as exc:
+                    error = str(exc)[:2000]
+                    record.update(capture_error=error, capture_failed_at=_utc())
+                    errors.append({"request": key, "error": error})
+                else:
+                    record.pop("capture_error", None)
+                    record.pop("capture_failed_at", None)
+                    record["reply_capture"] = {"source": "herdr_output", "pane_id": snapshot.pane_id,
+                                               "captured_at": _utc(), "snapshot_truncated": snapshot.truncated}
+                    captured.append(key)
+                _write(path, record)
+            # Existing send request IDs retain their idempotency semantics. A
+            # provider failure here leaves the captured artifact ready for retry.
+            self._deliver()
+            return {"captured": captured, "errors": errors}
+        finally:
+            os.close(descriptor)
+
+    def capture_once(self) -> dict[str, object]:
+        """Inspect retained matching output once, including explicitly retried failures."""
+        nonces = tuple(self.output_requests(retry_failed=True))
+        if not nonces:
+            return {"captured": [], "errors": []}
+        stream = self.open_output(nonces)
+        try:
+            for snapshot in stream.wait(0.25):
+                return self.capture_event(snapshot)
+            return {"captured": [], "errors": []}
+        finally:
+            stream.close()
+
     def status(self) -> dict[str, object]:
         """Return durable request phases without accessing Chat or the harness."""
         records = [_read(path) for path in sorted((self.state / "requests").glob("*.json"))]
         return {"space": self.config.space, "target": asdict(self.config.target),
                 "agent_name": self.config.agent_name, "ack_reaction": self.config.ack_reaction,
+                "reply_mode": self.config.reply_mode,
+                "output_observer": _read(self.state / "output.json") if (self.state / "output.json").exists() else None,
                 "requests": records}
+
+
+def _run_bridge(bridge: Bridge, interval: float, prog: str) -> None:
+    """Poll Chat on its schedule while blocking for terminal reply events between polls."""
+    stream: PaneOutputStream | None = None
+    subscribed: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+    next_poll = 0.0
+    poll_delay = interval
+    reconnect_at = 0.0
+    reconnect_delay = 1.0
+    errors = (OSError, ValueError, TypeError, HerdrRunError, subprocess.SubprocessError)
+    try:
+        while True:
+            if time.monotonic() >= next_poll:
+                try:
+                    bridge.tick()
+                except errors as exc:
+                    print(f"{prog}: {exc}", file=sys.stderr, flush=True)
+                    poll_delay = min(60.0, poll_delay * 2)
+                else:
+                    poll_delay = interval
+                next_poll = time.monotonic() + poll_delay
+            unfinished = tuple(bridge.output_requests(retry_failed=True))
+            nonces = tuple(bridge.output_requests())
+            signature = (unfinished, nonces)
+            if signature != subscribed:
+                if stream is not None:
+                    stream.close()
+                stream = None
+                subscribed = signature
+                reconnect_at = 0.0
+                reconnect_delay = 1.0
+                if not unfinished:
+                    _write(bridge.state / "output.json", {"state": "idle", "error": None,
+                                                         "updated_at": _utc()})
+            if unfinished and stream is None and time.monotonic() >= reconnect_at:
+                try:
+                    stream = bridge.open_output(nonces)
+                except errors as exc:
+                    print(f"{prog}: output subscription: {exc}", file=sys.stderr, flush=True)
+                    _write(bridge.state / "output.json", {"state": "retrying", "error": str(exc)[:2000],
+                                                         "updated_at": _utc()})
+                    reconnect_at = time.monotonic() + reconnect_delay
+                    reconnect_delay = min(60.0, reconnect_delay * 2)
+                else:
+                    _write(bridge.state / "output.json", {"state": "connected", "error": None,
+                                                         "updated_at": _utc()})
+                    reconnect_delay = 1.0
+            deadline = next_poll
+            if unfinished and stream is None:
+                deadline = min(deadline, reconnect_at)
+            timeout = max(0.0, deadline - time.monotonic())
+            if stream is None:
+                time.sleep(timeout)
+                continue
+            try:
+                for snapshot in stream.wait(timeout):
+                    outcome = bridge.capture_event(snapshot)
+                    for error in as_sequence(outcome["errors"], "capture errors"):
+                        print(f"{prog}: output capture: {error}", file=sys.stderr, flush=True)
+            except errors as exc:
+                print(f"{prog}: output subscription: {exc}", file=sys.stderr, flush=True)
+                _write(bridge.state / "output.json", {"state": "retrying", "error": str(exc)[:2000],
+                                                     "updated_at": _utc()})
+                stream.close()
+                stream = None
+                reconnect_at = time.monotonic() + reconnect_delay
+                reconnect_delay = min(60.0, reconnect_delay * 2)
+    finally:
+        if stream is not None:
+            stream.close()
 
 
 def submit_reply(state: Path, key: str, text: str) -> None:
@@ -571,12 +808,13 @@ def run_cli(argv: Sequence[str] | None = None, *, prog: str = "agentctl chat",
         description=(
             "Message a Codex or Claude coordinator in Herdr from one Google Chat space.\n"
             "Authorized messages enter a durable queue and receive a configurable reaction ACK\n"
-            "(default: 🤖). The coordinator explicitly submits each final threaded reply."
+            "(default: 🤖). Bracketed final replies are harvested from terminal output and sent durably."
         ),
         epilog=f"""Examples:
   {prog} init --config chat.json
   {prog} run --interval 10
   {prog} status
+  {prog} context --request "$REQUEST_KEY" --limit 10
   {prog} reply --request "$REQUEST_KEY" --file answer.txt
 
 Use '{prog} quickstart' for setup, '{prog} userguide' for the full guide,
@@ -593,16 +831,18 @@ and '{prog} COMMAND --help' for command-specific options.
     commands = parser.add_subparsers(dest="command", title="commands", metavar="COMMAND")
     descriptions = {
         "init": "Create private bridge state from configuration and check the pinned target.",
-        "tick": "Poll one page, ACK accepted messages, deliver ready prompts, and post final replies.",
-        "run": "Keep polling, retrying pending ACKs, delivering prompts, and posting replies until interrupted.",
+        "tick": "Poll one page, ACK accepted messages, deliver ready prompts, and inspect retained tagged replies once.",
+        "run": "Poll Chat, retry pending ACKs, and wait on Herdr output subscriptions to forward bracketed replies.",
         "status": "Print saved target, request phases, ACK attempts, and retry errors as JSON; no network or harness access.",
+        "context": "Read a page of messages before a saved request in its thread; no live harness or state changes required.",
         "reply": "Durably queue one final answer from a UTF-8 file for the bridge to post in its originating thread.",
         "quickstart": "Print the shortest setup path and an example configuration.",
         "userguide": "Print the complete setup, authentication, adapter, and recovery guide.",
     }
     subparsers: dict[str, argparse.ArgumentParser] = {}
     examples = {"init": "--config chat.json", "tick": "", "run": "--interval 10", "status": "",
-                "reply": '--request "$REQUEST_KEY" --file answer.txt', "quickstart": "", "userguide": ""}
+                "reply": '--request "$REQUEST_KEY" --file answer.txt', "quickstart": "", "userguide": "",
+                "context": '--request "$REQUEST_KEY" --limit 10'}
     for name, description in descriptions.items():
         command = commands.add_parser(name, help=description, description=description,
             epilog=f"Example: {prog} {name} {examples[name]}".rstrip(), allow_abbrev=False)
@@ -615,7 +855,13 @@ and '{prog} COMMAND --help' for command-specific options.
     subparsers["init"].add_argument("--after", metavar="RFC3339_TIME",
         help="earliest message time, including timezone (default: current time; no history replay)")
     subparsers["run"].add_argument("--interval", type=float, default=3, metavar="SECONDS",
-        help="polling interval in seconds, 0.1–60 (default: 3); failures back off to 60 seconds")
+        help="Google Chat polling interval in seconds, 0.1–60 (default: 3); output events wake independently; failures back off to 60 seconds")
+    subparsers["context"].add_argument("--request", required=True, metavar="KEY_OR_PREFIX",
+        help="saved request's hexadecimal key or unique prefix of at least 12 characters; fixes thread and cutoff")
+    subparsers["context"].add_argument("--limit", type=int, default=10, metavar="COUNT",
+        help="maximum prior messages per page, 1–200 (default: 10); nearest prior messages, displayed chronologically")
+    subparsers["context"].add_argument("--cursor", metavar="TOKEN",
+        help="opaque cursor from the preceding context result to read older messages; keep request and limit unchanged")
     subparsers["reply"].add_argument("--request", required=True, metavar="KEY",
         help="64-character hexadecimal request key supplied in the coordinator's reply instructions")
     subparsers["reply"].add_argument("--file", type=Path, required=True, metavar="UTF8_FILE",
@@ -644,12 +890,19 @@ and '{prog} COMMAND --help' for command-specific options.
 4. Run: {prog} init --config chat.json
    Then: {prog} run --interval 3
 5. Send a message in the configured space. The reaction acknowledges durable
-   intake; the agent's final answer arrives later in the same thread.
+   intake; the agent brackets its final answer with the unique tags in its prompt.
+   The daemon captures that block and posts it in the same thread. No reply tool
+   call or file write is required from the coordinator.
 
 Set ack_reaction to a different Unicode emoji, or null/"" to disable ACKs.
 Optional reaction_user: "users/OAUTH_USER_ID" lets the public REST adapter
 reconcile an existing reaction after a lost create response. This is the
 credential's user, which can differ from an allowed sender.
+
+The default reply_mode is "tagged". Set it to "file" for explicit reply files.
+Herdr output subscriptions wake the bridge independently of Chat's poll interval;
+Herdr 0.8 checks its match predicates internally every 100 milliseconds.
+Thread replies include a command to read the prior ten messages when needed.
 
 Keep the bridge process running independently of the coordinator's pane.
 Inspect delivery and reaction retry errors with '{prog} status'.
@@ -669,25 +922,31 @@ See '{prog} userguide' for exact scopes and the command-adapter protocol.""")
         elif args.command == "reply":
             submit_reply(args.state, args.request, args.file.read_text(encoding="utf-8"))
             print(json.dumps({"outcome": "reply_queued", "request": args.request}))
+        elif args.command == "context":
+            from agentctl.chat_context import read_context
+            config = Config.parse(as_mapping(_read(args.state / "bridge.json")["config"], "saved config"))
+            path = _request_path(args.state, args.request)
+            record = _read(path)
+            if record.get("key") != path.stem:
+                raise ValueError("saved request key does not match its file")
+            source = as_mapping(record.get("message"), "saved source message")
+            if not get_str(source, "id", "saved source message").startswith(config.space + "/messages/"):
+                raise ValueError("saved request belongs to a different configured space")
+            transport: Transport = (CommandTransport(config.transport_command) if config.transport_command
+                                    else GoogleChatTransport(config.token_env, config.token_command, config.reaction_user))
+            print(json.dumps(read_context(transport, source, limit=args.limit, cursor=args.cursor), indent=2))
         else:
             bridge = Bridge(args.state)
             if args.command == "status":
                 print(json.dumps(bridge.status(), indent=2))
             elif args.command == "tick":
-                print(json.dumps(bridge.tick(), indent=2))
+                bridge.tick()
+                bridge.capture_once()
+                print(json.dumps(bridge.status(), indent=2))
             else:
                 if not 0.1 <= args.interval <= 60:
                     raise ValueError("interval must be between 0.1 and 60 seconds")
-                delay = args.interval
-                while True:
-                    try:
-                        bridge.tick()
-                    except (OSError, ValueError, TypeError, HerdrRunError, subprocess.SubprocessError) as exc:
-                        print(f"{prog}: {exc}", file=sys.stderr, flush=True)
-                        delay = min(60.0, delay * 2)
-                    else:
-                        delay = args.interval
-                    time.sleep(delay)
+                _run_bridge(bridge, args.interval, prog)
         return 0
     except (OSError, ValueError, TypeError, HerdrRunError, subprocess.SubprocessError) as exc:
         print(f"{prog}: {exc}", file=sys.stderr)

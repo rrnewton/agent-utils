@@ -19,21 +19,24 @@ paste and Enter sequence.** Input does not arrive through a native harness
 channel or protocol connection. Herdr must report the subsequent working state
 to confirm submission.
 
-For the response, the agent writes an explicit answer file and runs a supplied
-reply command. The bridge posts that answer in the original thread. It does not
-scrape the screen for a final answer or mirror every terminal event.
+For the response, the agent brackets its final answer with the unique reply tags
+supplied in the prompt. The bridge watches for the closing tag, captures the
+complete block, and posts the answer in the original thread. The agent needs no
+file write or reply-command invocation for this normal path.
 
 `agentctl chat run` is a separate, long-running process. The Herdr server owns the
 agent's terminal and harness process. The bridge does not launch or restart the
-agent: stopping either process leaves the other running. The bridge and agent
-must share the local reply-state filesystem and have access to the reply command.
+agent: stopping either process leaves the other running. The bridge owns its
+local reply state. History and manual recovery commands need access to that
+state and, for history, the configured Chat transport.
 
 ## Setup
 
 This guide applies when `agentctl capabilities` lists the Chat extension.
 The Python distribution includes it; no separate extra or plugin is required.
-Herdr must be installed separately with its `agent prompt`, `agent wait`, and
-pane/session inspection APIs. The supported command interface is Herdr 0.8.
+Herdr must be installed separately with its `agent prompt`, `agent wait`,
+pane/session inspection, and `events.subscribe` APIs. The supported command
+interface is Herdr 0.8.
 
 Authenticate your harness and start a dedicated coordinator:
 
@@ -60,6 +63,7 @@ still proves execution and permits the threaded response without reinjection.
   "allowed_senders": ["users/YOUR_GOOGLE_USER_ID"],
   "agent_label": "your-coordinator-model",
   "ack_reaction": "🤖",
+  "reply_mode": "tagged",
   "agent_name": "coordinator",
   "target": {
     "pane_id": "RETURNED_PANE_ID",
@@ -101,10 +105,11 @@ agentctl chat run --state /work/project/.agentctl/.chat
 
 Initialization starts at the current time. It does not replay the space's history.
 Use an explicit RFC3339 `--after` on `init` to replay a chosen interval. `run` polls
-every three seconds; `--interval` accepts 0.1–60 seconds. A service manager can
-restart the process using the same state directory. `tick` performs one polling
-and delivery cycle, and `status` displays each request, delivery phase, and ACK
-retry state.
+Google Chat every three seconds; `--interval` accepts 0.1–60 seconds. Reply
+capture waits on Herdr subscriptions independently of this network polling
+interval. A service manager can restart the process using the same state
+directory. `tick` performs one polling, capture, and delivery cycle, and
+`status` displays each request, delivery phase, ACK retry state, and capture error.
 Choose a longer interval when your authenticated client has a shared read quota.
 Failures double the retry delay up to 60 seconds; successful cycles restore the
 configured interval.
@@ -116,11 +121,58 @@ send acknowledgements are recovered before polling resumes. A command
 transport must preserve Google sender IDs rather than replace them with display
 names. The bridge does not authorize messages from everyone in a space.
 
-The coordinator receives a reply command with each request. It writes its final
-answer to a UTF-8 file and runs the supplied `agentctl chat reply` command. The bridge
-then posts that answer in the originating thread, prefixed with `agent_label`.
-This explicit reply artifact works with both harnesses and avoids treating terminal
-redraws or tool output as an answer. Final replies may contain up to 30,000 UTF-8 bytes.
+## Reply capture
+
+`reply_mode` defaults to `"tagged"` for newly ingested requests. Each prompt
+supplies a unique pair of tags. The agent places each tag on its own line, with
+only its final user-facing answer between them:
+
+```text
+<GCHAT_REPLY_NONCE>
+The checks passed. The change is ready.
+</GCHAT_REPLY_NONCE>
+```
+
+`NONCE` stands for the unique value in that request's actual tags; do not reuse
+this example literally. The daemon subscribes to that closing tag using Herdr's
+`events.subscribe` API and blocks locally until it is observed. The supported
+Herdr implementation checks text subscriptions internally every 100 milliseconds;
+this is separate from the Google Chat polling interval.
+
+The bridge captures only a complete tagged block, saves a durable reply artifact,
+and sends it with the request's stable reply ID. It prefixes the posted answer
+with `agent_label`. Final replies may contain up to 30,000 UTF-8 bytes. Unbracketed
+terminal output is not a final Chat answer.
+
+Set `reply_mode` to `"file"` to retain explicit file submission. Requests saved
+before tagged capture was enabled retain their original file-reply instructions.
+`agentctl chat reply` remains available for deliberate recovery in either mode:
+
+```sh
+agentctl chat reply --state /work/project/.agentctl/.chat \
+  --request REQUEST_KEY --file answer.txt
+```
+
+## Thread context
+
+An actual thread reply includes a prompt hint for reading the nearest ten prior
+messages. A top-level message does not. The hint uses:
+
+```sh
+agentctl chat context --state /work/project/.agentctl/.chat \
+  --request REQUEST_KEY_OR_UNIQUE_HEX_PREFIX --limit 10
+```
+
+This read-only command needs no live Herdr pane. It uses the saved request's
+exact thread and creation time, excludes that request and later messages, and
+displays one page in chronological order. It returns source/thread metadata and
+an opaque `cursor` when older context is available. Read further back by
+repeating the command with the same limit and `--cursor TOKEN`. The default
+limit is 10; permitted limits are 1–200.
+
+Context includes all participants in that thread as reference material. It
+does not authorize their messages as new tasks. History is fetched only when
+the command is run; receiving a message does not automatically load its thread.
 
 ## Reaction acknowledgements
 
@@ -168,6 +220,19 @@ queue artifact before deciding whether a new request is needed. Provider failure
 and unanswered prompts remain visible in `status`; delivery is not proof of task
 completion. A blocked harness may need interaction in its pane.
 
+After a restart or subscription reconnect, the bridge can recover a complete
+tagged block only while it remains in Herdr's retained terminal history. This
+history is bounded and is not a lossless output log. A visible closing tag with a
+clipped or malformed block leaves a `capture_error` instead of posting a guessed
+answer. If all tags have been evicted, the request remains awaiting a reply. Inspect
+the pane and `agentctl chat status`. An idle/done event triggers one fresh read
+to recover an early closing tag inside a quoted example; readiness itself is
+never treated as an answer. These subscriptions stay active after capture errors,
+without repeatedly polling the pane. An explicit `agentctl chat tick` also retries
+capture once after inspection. Captures request up to 4,000 retained logical lines
+and are bounded to 2 MiB. If the answer cannot be recovered from retained
+history, submit the verified answer with `agentctl chat reply`.
+
 An identical `reply` retry succeeds even after its final answer was posted;
 a different answer for the same request is refused. Replies use a stable UUID
 request ID. If the upstream acknowledgement is lost,
@@ -201,12 +266,36 @@ Poll request and response:
 ```
 
 ```json
-{"messages":[{"id":"spaces/SPACE/messages/MESSAGE","text":"Please inspect the build","sender":"users/OWNER","thread":"spaces/SPACE/threads/THREAD","created_at":"2026-01-01T00:01:00Z"}],"cursor":null}
+{"messages":[{"id":"spaces/SPACE/messages/MESSAGE","text":"Please inspect the build","sender":"users/OWNER","thread":"spaces/SPACE/threads/THREAD","created_at":"2026-01-01T00:01:00Z","thread_reply":true}],"cursor":null}
 ```
 
 Return messages in ascending creation order. A nonempty cursor continues the same
 query; `null` means the page is complete. Sender and thread identity must come from
 the authenticated upstream response. Empty/non-text messages may be omitted.
+Optional `thread_reply` must be a boolean from the provider's reply metadata,
+such as Google Chat's `threadReply`. Only `true` enables the thread-context
+prompt hint. A thread resource alone does not establish that a message is a
+reply; do not derive this flag or the thread ID from a message ID.
+
+Context request and response:
+
+```json
+{"action":"context","space":"spaces/SPACE","thread":"spaces/SPACE/threads/THREAD","before":"2026-01-01T00:01:00.123456789Z","limit":10,"cursor":null}
+```
+
+```json
+{"messages":[{"id":"spaces/SPACE/messages/EARLIER","text":"The relevant background","sender":"users/PARTICIPANT","thread":"spaces/SPACE/threads/THREAD","created_at":"2026-01-01T00:00:00Z","thread_reply":false}],"cursor":null}
+```
+
+Return at most `limit` messages from that exact thread strictly before the
+cutoff, in descending creation order. Preserve fractional timestamp precision.
+The CLI reverses each page for chronological display. A cursor continues the
+same thread, cutoff, limit, and descending order; `null` means no older page.
+For the public API, use `createTime < "TIMESTAMP" AND thread.name = THREAD`
+with `orderBy=createTime DESC`. Report unsupported history or provider failures
+as errors, rather than an empty successful page. Existing poll/send/react-only
+adapters continue to deliver messages and replies, but need this action for
+`chat context`.
 
 Reaction request and response:
 

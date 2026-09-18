@@ -213,11 +213,21 @@ Configure another emoji with `ack_reaction`, or disable reactions with null or
 an empty string. Reaction failures remain visible and retryable without aborting
 prompt delivery or replies.
 
-The Chat bridge is a separate polling process. It can target one coordinator
+The Chat bridge is a separate, long-running process. It can target one coordinator
 without any worker team. It requires an interactive coordinator in Herdr and
 uses terminal input; a command transport changes Google Chat access, not the
-harness connection. Chat and the coordinator must share the local reply-state
-filesystem. The bridge does not supervise the coordinator's process.
+harness connection. By default, the coordinator brackets its final answer with
+unique tags from the prompt. The bridge waits on a Herdr subscription, captures
+that block, and posts it durably; no reply file or CLI call is needed from the
+agent. Explicit file replies remain available with `reply_mode: "file"` and for
+recovery. Retained terminal history is bounded, so capture failures remain
+visible for inspection. The bridge does not supervise the coordinator's process.
+
+Thread replies include a command hint for the nearest ten prior messages:
+`agentctl chat context --state DIR --request KEY_OR_UNIQUE_HEX_PREFIX --limit 10`.
+It reads one page from the request's exact thread and time cutoff, prints it
+chronologically, and supplies a cursor for older context. This command needs
+Chat access and saved bridge state, but no live Herdr pane.
 
 `agentctl mcp --registry /absolute/path` serves session operations over stdio
 when the MCP extension is available. The coordinator can use either CLI or MCP;
