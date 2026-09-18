@@ -224,20 +224,26 @@ class _Runtime:
                     return True
         return False
 
-    def _accept_message(self, message: dict[str, object]) -> None:
+    def _accept_message(self, message: dict[str, object]) -> Path | None:
         identifier = get_str(message, "id", "stream message")
         if re.fullmatch(re.escape(self.bridge.config.space) + r"/messages/[A-Za-z0-9_.-]+", identifier) is None:
             raise ValueError("stream message belongs to another space")
+        key = hashlib.sha256(identifier.encode()).hexdigest()
+        accepted: Path | None = None
         if self._possible_echo(message):
             # Deferral also commits input before its stream cursor advances.
             # Require the same normalized schema as ordinary accepted messages.
             self.bridge._validate_message_source(message)
             self.bridge._validate_message_content(message)
-            key = hashlib.sha256(identifier.encode()).hexdigest()
             _write(self.deferred / f"{key}.json", message)
         else:
+            path = self.bridge.state / "requests" / f"{key}.json"
+            existed = path.exists()
             self.bridge._ingest_result({"messages": [message]})
+            if not existed and path.exists():
+                accepted = path
         self.next_drain = 0.0
+        return accepted
 
     def _input_event(self, event: dict[str, object]) -> None:
         kind = event.get("type")
@@ -245,7 +251,14 @@ class _Runtime:
         if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 8192):
             raise ValueError("stream cursor must be a nonempty string of at most 8192 characters")
         if kind == "message":
-            self._accept_message(as_mapping(event.get("message"), "stream message"))
+            path = self._accept_message(as_mapping(event.get("message"), "stream message"))
+            if path is not None:
+                # The request is durable. Start its independent workers before
+                # cursor persistence can stall; replay retains this request and
+                # the delivery queue's existing identities after a crash.
+                now = time.monotonic()
+                pending, prompt = self._stage_request(path, _read(path), now)
+                self._start_delivery(pending, [] if prompt is None else [prompt], now)
         elif kind == "gap":
             self.reconcile_requested = True
         elif kind not in ("heartbeat", "checkpoint"):
@@ -260,62 +273,76 @@ class _Runtime:
             fields["last_gap_at"] = _utc()
         self._input_status(**fields)
 
-    def _stage(self) -> None:
-        now = time.monotonic()
+    def _stage_request(self, path: Path, record: dict[str, object],
+                       now: float) -> tuple[bool, tuple[str, str] | None]:
         queue_root = self.bridge.state / "queue"
         pending = False
-        to_enqueue: list[tuple[str, str]] = []
-        for path, record in self._records():
-            key = get_str(record, "key", "request")
-            queue_id = get_str(record, "queue_id", "request")
-            changed = False
-            if record["phase"] == "received":
-                if any((queue_root / phase / f"{queue_id}.json").exists()
-                       for phase in ("inbox", "inflight", "processed", "failed")):
-                    record.update(phase="queued", queued_at=_utc())
-                    changed = True
-                else:
-                    to_enqueue.append((queue_id, self.bridge._prompt(record)))
-                    pending = True
-            if record["phase"] == "queued":
-                if (queue_root / "processed" / f"{queue_id}.json").exists():
-                    record.update(phase="awaiting_reply", delivery_confirmed_at=_utc())
-                    changed = True
-                elif (queue_root / "failed" / f"{queue_id}.json").exists():
-                    record["phase"] = "delivery_uncertain"
-                    changed = True
-                else:
-                    pending = True
-            if "ack" not in record:
-                source = as_mapping(record["message"], "source")
-                record["ack"] = self.bridge._ack_record(get_str(source, "id", "source"),
-                                                        completed_legacy=record["phase"] == "replied")
+        prompt: tuple[str, str] | None = None
+        key = get_str(record, "key", "request")
+        queue_id = get_str(record, "queue_id", "request")
+        changed = False
+        if record["phase"] == "received":
+            if any((queue_root / phase / f"{queue_id}.json").exists()
+                   for phase in ("inbox", "inflight", "processed", "failed")):
+                record.update(phase="queued", queued_at=_utc())
                 changed = True
-            if changed:
-                _write(path, record)
-            ack = as_mapping(record["ack"], "ack")
-            retry = ack.get("next_retry_at")
-            due = not isinstance(retry, str) or _timestamp(retry) <= datetime.now(timezone.utc)
-            if (ack["state"] == "pending" and due and ("ack", key) not in self.jobs
-                    and sum(lane == "ack" for lane, _ in self.jobs) < 4):
-                self._ack_start(path, record)
-            if (record["phase"] in ("awaiting_reply", "delivery_uncertain", "reply_pending")
-                    and (self.bridge.state / "replies" / f"{key}.json").exists()
-                    and ("send", key) not in self.jobs
-                    and now >= self.retry.get(("send", key), (0, 1))[0]
-                    and sum(lane == "send" for lane, _ in self.jobs) < 2):
-                # Reload after the ACK attempt's record update.
-                self._send_start(path, _read(path))
+            else:
+                prompt = (queue_id, self.bridge._prompt(record))
+                pending = True
+        if record["phase"] == "queued":
+            if (queue_root / "processed" / f"{queue_id}.json").exists():
+                record.update(phase="awaiting_reply", delivery_confirmed_at=_utc())
+                changed = True
+            elif (queue_root / "failed" / f"{queue_id}.json").exists():
+                record["phase"] = "delivery_uncertain"
+                changed = True
+            else:
+                pending = True
+        if "ack" not in record:
+            source = as_mapping(record["message"], "source")
+            record["ack"] = self.bridge._ack_record(get_str(source, "id", "source"),
+                                                    completed_legacy=record["phase"] == "replied")
+            changed = True
+        if changed:
+            _write(path, record)
+        ack = as_mapping(record["ack"], "ack")
+        retry = ack.get("next_retry_at")
+        due = not isinstance(retry, str) or _timestamp(retry) <= datetime.now(timezone.utc)
+        if (ack["state"] == "pending" and due and ("ack", key) not in self.jobs
+                and sum(lane == "ack" for lane, _ in self.jobs) < 4):
+            self._ack_start(path, record)
+        if (record["phase"] in ("awaiting_reply", "delivery_uncertain", "reply_pending")
+                and (self.bridge.state / "replies" / f"{key}.json").exists()
+                and ("send", key) not in self.jobs
+                and now >= self.retry.get(("send", key), (0, 1))[0]
+                and sum(lane == "send" for lane, _ in self.jobs) < 2):
+            # Reload after the ACK attempt's record update.
+            self._send_start(path, _read(path))
+        return pending, prompt
+
+    def _start_delivery(self, pending: bool, to_enqueue: list[tuple[str, str]], now: float) -> None:
         if pending and ("drain", "queue") not in self.jobs and now >= self.next_drain:
             self.next_drain = now + 30
             # enqueue shares the delivery lock with drain. Both belong in the
             # harness lane: a slow prompt must never hold up durable intake/ACK.
             def deliver() -> object:
+                queue_root = self.bridge.state / "queue"
                 for identifier, prompt in to_enqueue:
                     enqueue(str(queue_root), prompt, message_id=identifier)
                 return drain(self.bridge.client, self.bridge.config.target,
                              str(queue_root), ready_timeout=0)
             self._start("drain", "queue", deliver)
+
+    def _stage(self) -> None:
+        now = time.monotonic()
+        pending = False
+        to_enqueue: list[tuple[str, str]] = []
+        for path, record in self._records():
+            waiting, prompt = self._stage_request(path, record, now)
+            pending = pending or waiting
+            if prompt is not None:
+                to_enqueue.append(prompt)
+        self._start_delivery(pending, to_enqueue, now)
         if ((self.reconcile_requested or now >= self.next_poll) and ("poll", "page") not in self.jobs
                 and now >= self.retry.get(("poll", "page"), (0, 1))[0]):
             self.poll_checkpoint = _read(self.bridge.state / "bridge.json")

@@ -7,10 +7,12 @@ import queue
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+import agentctl.chat as chat_module
 import agentctl.chat_runtime as runtime_module
 from agentctl.agent import Target
 from agentctl.chat import Bridge, Config, _read, _write, submit_reply
@@ -204,6 +206,87 @@ def test_hung_ack_does_not_delay_prompt_or_overwrite_later_reply_phase(rig: Rig)
     assert len(rig.harness.prompts) == 1
 
 
+def test_blocked_cursor_commit_does_not_delay_ack_or_native_delivery(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig.runtime._input_event({"type": "checkpoint", "cursor": "previous"})
+    checkpoint = Gate()
+    ack = rig.transport.gate("react")
+    failures: list[BaseException] = []
+    finished = threading.Event()
+
+    def blocked_cursor(path: Path, document: dict[str, object]) -> None:
+        if path == rig.state / "input.json":
+            checkpoint.wait()
+        _write(path, document)
+
+    def accept() -> None:
+        try:
+            rig.accept()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(runtime_module, "_write", blocked_cursor)
+    # This intake must not run unrelated polling or housekeeping while making
+    # the newly durable request eligible for the two independent workers.
+    rig.runtime.reconcile_requested = True
+    owner = threading.Thread(target=accept)
+    owner.start()
+    try:
+        assert checkpoint.entered.wait(5)
+        assert ack.entered.wait(5)
+        assert rig.harness.prompted.wait(5)
+        assert not finished.is_set()
+        assert not checkpoint.release.is_set()
+        assert _read(rig.state / "input.json")["cursor"] == "previous"
+        saved = rig.record()
+        attempted = as_mapping(saved["ack"], "ack")
+        assert saved["phase"] == "received"
+        assert attempted["attempts"] == 1
+        assert attempted["last_attempt_at"] is not None
+        assert attempted["next_retry_at"] is not None
+        assert rig.transport.calls("react")[0]["request_id"] == attempted["request_id"]
+        assert len(rig.harness.prompts) == 1
+        assert rig.transport.calls("poll") == []
+        assert not (rig.state / "output.json").exists()
+    finally:
+        checkpoint.release.set()
+        owner.join(timeout=5)
+        ack.release.set()
+    assert not owner.is_alive()
+    assert not checkpoint.expired.is_set()
+    assert failures == []
+    assert _read(rig.state / "input.json")["cursor"] == "cursor-one"
+    rig.runtime.reconcile_requested = False
+    rig.until(lambda: rig.phase() == "awaiting_reply" and rig.ack() == "acked")
+
+
+@pytest.mark.parametrize("failed_commit", ["request", "ack-attempt"])
+def test_failed_request_or_attempt_commit_cannot_start_external_effects(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, failed_commit: str,
+) -> None:
+    def failed_write(path: Path, document: dict[str, object]) -> None:
+        if path.parent == rig.state / "requests":
+            raise OSError("fixture persistence failure")
+        _write(path, document)
+
+    module = chat_module if failed_commit == "request" else runtime_module
+    monkeypatch.setattr(module, "_write", failed_write)
+    with pytest.raises(OSError, match="persistence failure"):
+        rig.accept()
+    assert rig.transport.requests == []
+    assert rig.harness.prompts == []
+    assert not (rig.state / "input.json").exists()
+    for phase in ("inbox", "inflight", "processed", "failed"):
+        assert list((rig.state / "queue" / phase).glob("*.json")) == []
+    if failed_commit == "request":
+        assert list((rig.state / "requests").glob("*.json")) == []
+    else:
+        assert as_mapping(rig.record()["ack"], "ack")["attempts"] == 0
+
+
 def test_fast_completion_with_full_mailbox_cannot_block_owner_start(
     rig: Rig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -309,12 +392,16 @@ def test_cursor_commit_follows_durable_intake_and_restart_replays_only_once(
 ) -> None:
     original = _write
     observed: list[object] = []
+    ack = rig.transport.gate("react")
 
     def crash_cursor(path: Path, document: dict[str, object]) -> None:
         if path == rig.state / "input.json":
             saved = rig.record()
             assert saved["phase"] == "received"
             assert as_mapping(saved["message"], "source")["id"] == _SPACE + "/messages/one"
+            assert as_mapping(saved["ack"], "ack")["attempts"] == 1
+            assert ack.entered.wait(5)
+            assert rig.harness.prompted.wait(5)
             observed.append(saved["reply_nonce"])
             raise OSError("simulated crash before cursor commit")
         original(path, document)
@@ -324,6 +411,23 @@ def test_cursor_commit_follows_durable_intake_and_restart_replays_only_once(
         rig.accept()
     assert len(observed) == 1
     assert not (rig.state / "input.json").exists()
+    # Lose the old owner's completions after the effects reached their workers.
+    # The restarted owner must use the durable queue and ACK retry identities.
+    rig.runtime.stop.set()
+    ack.release.set()
+    for pool in rig.runtime.pools.values():
+        pool.shutdown(wait=True, cancel_futures=True)
+    retry_at = as_mapping(rig.record()["ack"], "ack")["next_retry_at"]
+    assert isinstance(retry_at, str)
+    retry_due = datetime.fromisoformat(retry_at.replace("Z", "+00:00")) + timedelta(seconds=1)
+
+    class RetryClock:
+        @staticmethod
+        def now(zone: timezone) -> datetime:
+            assert zone is timezone.utc
+            return retry_due
+
+    monkeypatch.setattr(runtime_module, "datetime", RetryClock)
     monkeypatch.setattr(runtime_module, "_write", original)
     rig.restart()
     rig.accept()
@@ -335,6 +439,10 @@ def test_cursor_commit_follows_durable_intake_and_restart_replays_only_once(
     assert len(list((rig.state / "requests").glob("*.json"))) == 1
     assert len(list((rig.state / "queue" / "processed").glob("*.json"))) == 1
     assert len(rig.harness.prompts) == 1
+    reactions = rig.transport.calls("react")
+    assert len(reactions) == 2
+    assert reactions[0]["request_id"] == reactions[1]["request_id"]
+    assert [reaction["attempt"] for reaction in reactions] == [1, 2]
 
 
 def test_echo_before_lost_send_confirmation_is_durable_then_deduplicated(rig: Rig) -> None:
@@ -484,6 +592,9 @@ def test_input_source_reconnects_with_last_durable_cursor(
     assert _read(rig.state / "input.json")["cursor"] == "durable-cursor"
     fail_source.set()
     error = rig.runtime.events.get(timeout=5)
+    while error.kind == "complete":
+        rig.runtime._handle(error)
+        error = rig.runtime.events.get(timeout=5)
     assert error.kind == "input_error"
     rig.runtime._handle(error)
     assert _read(rig.state / "input.json")["cursor"] == "durable-cursor"
