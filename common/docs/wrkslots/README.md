@@ -108,6 +108,14 @@ requires its exact SHA-256 after the coordinator reads it; that content is reche
 with the worktree. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
 tree outside the managed slot root; it is not an exemption for arbitrary directories.
 
+Agent handoffs can live outside their checkouts. `write-handoff` copies bounded UTF-8 from an exact
+live owner into a generation-bound control sidecar; it never exempts checkout dirt from `finish`.
+`read-handoff` prints the exact contents and durably enqueues that slot generation without removing
+anything. `retirement-queue` inspects pending items, and `retire-pending --limit N` attempts each
+through the unchanged ordinary remove state machine, retaining every refusal for a later retry.
+Existing direct-child `HANDOFF.md` files are copied only when read, must agree with any sidecar, and
+remain in place until the slot is successfully archived and removed.
+
 If a command reports an interrupted operation, preserve the paths and run:
 
 ```sh

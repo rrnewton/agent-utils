@@ -10130,10 +10130,41 @@ def test_recovery_rolls_back_when_handoff_changes_after_path_fence(
         "--coordinator-pid",
         str(os.getpid()),
     )
-    assert reread.returncode == 0, reread.stderr
+    assert reread.returncode == 3
+    assert "sidecar disagrees with the legacy file" in reread.stderr
+    assert checkout(project).is_dir()
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    assert sidecar.is_file()
+    assert handoff.is_file()
+
+    adopted = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--adopt-legacy-change",
+        "--expected-generation",
+        "1",
+    )
+    assert adopted.returncode == 0, adopted.stderr
+    assert handoff.is_file()
+    assert checkout(project).is_dir()
+    artifact = wrkslots._load_handoff_sidecar(config, wrkslots._load_active(config).slots[0])
+    assert artifact is not None
+    assert artifact.contents == b"changed while reclaim was interrupted\n"
+    pending = wrkslots._retirement_candidates(
+        config, wrkslots._load_active(config), wrkslots._load_events(config)
+    )
+    assert len(pending) == 1
+    assert pending[0].sha256 == hashlib.sha256(artifact.contents).hexdigest()
+
     removed = remove(project)
     assert removed.returncode == 0, removed.stderr
     assert not checkout(project).exists()
+    assert not sidecar.exists()
 
 
 def test_crash_after_archive_before_active_delete_recovers_exact_overlap(
@@ -14074,6 +14105,454 @@ def test_unread_handoff_blocks_reclaim_until_its_exact_contents_are_read(
     assert payload["sha256"] == hashlib.sha256(
         b"Continue from the exact recorded commit.\n"
     ).hexdigest()
+
+
+def test_write_handoff_is_external_and_immutable_after_finish(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(
+        tmp_path, worktrees_directory="worktrees/slots", layout="flat"
+    )
+    assert create(project).returncode == 0
+    oversized = tmp_path / "oversized-handoff.md"
+    oversized.write_bytes(b"x" * (wrkslots.HANDOFF_BYTES_LIMIT + 1))
+    too_large = raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(oversized),
+    )
+    assert too_large.returncode == 3
+    assert "1 MiB safety bound" in too_large.stderr
+    source = tmp_path / "handoff-input.md"
+    source.write_text("continue from the published commit\n", encoding="utf-8")
+
+    written = raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    )
+
+    assert written.returncode == 0, written.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    assert sidecar.is_file()
+    assert not (checkout(project) / "HANDOFF.md").exists()
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+
+    refused = raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    )
+    assert refused.returncode == 3
+    assert "handoff is immutable" in refused.stderr
+
+
+@pytest.mark.parametrize(
+    ("layout", "worktrees_directory"),
+    ((None, "worktrees"), ("flat", "worktrees/slots")),
+)
+def test_read_handoff_migrates_legacy_without_removing_and_enqueues_once(
+    tmp_path: Path, layout: str | None, worktrees_directory: str
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path, layout=layout, worktrees_directory=worktrees_directory
+    )
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    legacy = tree / "HANDOFF.md" if layout == "flat" else tree.parent / "HANDOFF.md"
+    legacy.write_text("read exactly once\n", encoding="utf-8")
+
+    for _attempt in range(2):
+        read = raw_command(
+            project,
+            "read-handoff",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+        assert read.returncode == 0, read.stderr
+        assert "read exactly once" in read.stdout
+
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    assert legacy.read_text(encoding="utf-8") == "read exactly once\n"
+    assert sidecar.is_file()
+    queued = raw_command(project, "retirement-queue", "--format", "json")
+    assert queued.returncode == 0, queued.stderr
+    pending = json.loads(queued.stdout)["pending"]
+    assert len(pending) == 1
+    assert pending[0]["slot"] == "slot01"
+    assert pending[0]["blocked_reason"] is None
+
+
+def test_handoff_sidecar_disagreement_refuses_without_read_event(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "handoff-input.md"
+    source.write_text("sidecar\n", encoding="utf-8")
+    written = raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    )
+    assert written.returncode == 0, written.stderr
+    (checkout(project).parent / "HANDOFF.md").write_text("legacy\n", encoding="utf-8")
+
+    refused = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert refused.returncode == 3
+    assert "disagrees with the legacy file" in refused.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not any(
+        event["kind"] == "handoff-read" for event in wrkslots._load_events(config)
+    )
+
+
+def test_adopt_legacy_change_refuses_missing_equal_and_stale_inputs(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "handoff-input.md"
+    source.write_text("sidecar\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    ).returncode == 0
+    base = (
+        "read-handoff",
+        "slot01",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--adopt-legacy-change",
+        "--expected-generation",
+    )
+
+    missing = raw_command(project, *base, "1")
+    assert missing.returncode == 3
+    assert "requires both" in missing.stderr
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text("sidecar\n", encoding="utf-8")
+    equal = raw_command(project, *base, "1")
+    assert equal.returncode == 3
+    assert "requires an actual" in equal.stderr
+    legacy.write_text("changed\n", encoding="utf-8")
+    stale = raw_command(project, *base, "2")
+    assert stale.returncode == 3
+    assert "stale generation" in stale.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not any(
+        event["kind"] == "handoff-read" for event in wrkslots._load_events(config)
+    )
+
+
+def test_handoff_sidecar_write_and_migration_are_retry_idempotent(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "handoff-input.md"
+    source.write_text("durable owner handoff\n", encoding="utf-8")
+    write_args = (
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    )
+    interrupted_write = raw_command(
+        project,
+        *write_args,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-handoff-sidecar-write"},
+    )
+    assert interrupted_write.returncode == 86
+    retried_write = raw_command(project, *write_args)
+    assert retried_write.returncode == 0, retried_write.stderr
+
+    assert create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/second",
+    ).returncode == 0
+    legacy = checkout(project, slot="slot02").parent / "HANDOFF.md"
+    legacy.write_text("durable migrated handoff\n", encoding="utf-8")
+    read_args = (
+        "read-handoff",
+        "slot02",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    interrupted_read = raw_command(
+        project,
+        *read_args,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-handoff-sidecar-write"},
+    )
+    assert interrupted_read.returncode == 86
+    retried_read = raw_command(project, *read_args)
+    assert retried_read.returncode == 0, retried_read.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    slot02_reads = [
+        event
+        for event in wrkslots._load_events(config)
+        if event["kind"] == "handoff-read"
+        and wrkslots._as_mapping(event["payload"], "test payload").get("slot")
+        == "slot02"
+    ]
+    assert len(slot02_reads) == 1
+
+
+def test_historical_or_newer_unflagged_read_is_not_pending_but_allows_manual_remove(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    legacy = checkout(project).parent / "HANDOFF.md"
+    contents = b"historical read\n"
+    legacy.write_bytes(contents)
+    config = wrkslots._load_config(str(project), "testhost")
+    digest = hashlib.sha256(contents).hexdigest()
+    wrkslots._write_event_file(
+        config,
+        "testhost",
+        "handoff-read",
+        {"slot": "slot01", "generation": 1, "sha256": digest},
+    )
+    assert json.loads(
+        raw_command(project, "retirement-queue", "--format", "json").stdout
+    )["pending"] == []
+    read = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert read.returncode == 0, read.stderr
+    wrkslots._write_event_file(
+        config,
+        "testhost",
+        "handoff-read",
+        {
+            "slot": "slot01",
+            "generation": 1,
+            "sha256": digest,
+            "retirement_enqueued": False,
+        },
+    )
+    assert json.loads(
+        raw_command(project, "retirement-queue", "--format", "json").stdout
+    )["pending"] == []
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "slot01",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert not checkout(project).exists()
+
+
+def test_retire_pending_uses_remove_and_cleans_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    source = tmp_path / "handoff-input.md"
+    source.write_text("retire safely\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    ).returncode == 0
+    assert finish(project).returncode == 0
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+
+    code = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "retire-pending",
+            "--limit",
+            "1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["removed"] == [
+        {
+            "generation": 1,
+            "machine": "testhost",
+            "outcome": "removed",
+            "reason": "ordinary remove completed",
+            "sha256": hashlib.sha256(b"retire safely\n").hexdigest(),
+            "slot": "slot01",
+        }
+    ]
+    assert payload["retained"] == []
+    assert not checkout(project).exists()
+    assert not sidecar.exists()
+
+
+def test_retire_pending_retains_live_slot_and_queue_entry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text("not yet dead\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ).returncode == 0
+    assert create(
+        project,
+        slot="slot02",
+        agent="codex-2",
+        branch="codex/second",
+    ).returncode == 0
+    second = checkout(project, slot="slot02").parent / "HANDOFF.md"
+    second.write_text("also not yet dead\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot02",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ).returncode == 0
+
+    code = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "retire-pending",
+            "--limit",
+            "1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["removed"] == []
+    assert payload["retained"][0]["slot"] == "slot01"
+    assert "registered liveness authority reports owner alive" in payload["retained"][0]["reason"]
+    assert payload["deferred"][0]["slot"] == "slot02"
+    assert payload["deferred"][0]["outcome"] == "deferred"
+    assert payload["deferred"][0]["reason"] == "batch limit"
+    queued = raw_command(project, "retirement-queue", "--format", "json")
+    assert len(json.loads(queued.stdout)["pending"]) == 2
+
+
+def test_finish_still_refuses_a_legacy_flat_handoff(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(
+        tmp_path, worktrees_directory="worktrees/slots", layout="flat"
+    )
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    legacy = checkout(project) / "HANDOFF.md"
+    legacy.write_text("legacy untracked work\n", encoding="utf-8")
+
+    refused = finish(project)
+
+    assert refused.returncode == 3
+    assert "dirty or has untracked/ignored files" in refused.stderr
+    assert legacy.read_text(encoding="utf-8") == "legacy untracked work\n"
 
 
 def test_read_handoff_ignores_unrelated_absent_ownerless_row(
