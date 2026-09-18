@@ -14,12 +14,18 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import time
 from pathlib import Path
 
 from dagrun import DagConfig, Runner, Step
 from dagrun.attribution import LOG_DIR_ENV
 from dagrun.cgroup import NoopCgroups
-from dagrun.model import DEFAULT_SMALL_CPU_TIMEOUT
+from dagrun.model import (
+    ABORTED_BY_PEER_FAILURE_REASON,
+    ABORTED_BY_RUN_BUDGET_REASON,
+    DEFAULT_SMALL_CPU_TIMEOUT,
+)
 from dagrun.scheduler import _cpu_journal_fields
 
 
@@ -239,3 +245,102 @@ def test_an_outer_budget_cut_names_the_budget_and_never_a_peer(tmp_path: Path) -
     # the two cancellations this record claimed a peer had failed, and a reader who only has the
     # record -- the reader it exists for -- would have gone looking for one.
     assert "eager-exit" not in record["reason"], record
+
+
+class _CleanupAfterDeadline(NoopCgroups):
+    """Delay only result collection; children, fail-fast, clock and signals stay real.
+
+    This is not a containment test. The no-op manager still returns false from kill,
+    so the scheduler reaps actual process groups. Its cleanup callback makes the
+    otherwise timing-dependent completion/deadline overlap reproducible.
+    """
+
+    enabled = True
+
+    def __init__(self, journal: Path) -> None:
+        self.journal = journal
+        self.observed_deadline = False
+
+    def cleanup(self, tag: str) -> None:
+        if tag != "a.peer":
+            return
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            for line in self.journal.read_text().splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # A concurrent journal append may not have finished.
+                if record.get("event") == "run_timeout":
+                    self.observed_deadline = True
+                    return
+            time.sleep(0.01)
+        raise AssertionError("the real run deadline never fired during peer cleanup")
+
+
+def test_peer_cancellation_survives_a_later_deadline_in_the_same_run(tmp_path: Path) -> None:
+    logs = tmp_path / "mixed"
+    ready = shlex.quote(str(tmp_path / "ready"))
+    cfg = DagConfig(
+        steps=(
+            Step("a", "first", "spends the budget", "sleep 2", timeout=3, cpu_timeout=30),
+            Step(
+                "a", "peer", "cancelled by its failing peer", f"touch {ready}; sleep 30",
+                deps=["a.first"], timeout=3, cpu_timeout=30, fail_fast_family="failed",
+            ),
+            Step(
+                "a", "boom", "fails after its peer starts",
+                f"while [ ! -f {ready} ]; do sleep 0.01; done; exit 7",
+                deps=["a.first"], timeout=3, cpu_timeout=30, fail_fast_family="failed",
+            ),
+            Step(
+                "a", "independent", "cancelled only by the later run deadline", "sleep 30",
+                deps=["a.first"], timeout=3, cpu_timeout=30, fail_fast_family="independent",
+            ),
+        )
+    )
+    manager = _CleanupAfterDeadline(logs / "journal.jsonl")
+    previous = os.environ.get(LOG_DIR_ENV)
+    os.environ[LOG_DIR_ENV] = str(logs)
+    try:
+        runner = Runner(
+            cfg, max_steps=3, max_cpus=3, cgroups=manager, run_timeout_s=4,
+        )
+        runner.run()
+        result = runner.result()
+    finally:
+        if previous is None:
+            os.environ.pop(LOG_DIR_ENV, None)
+        else:
+            os.environ[LOG_DIR_ENV] = previous
+    assert not result.ok and result.run_timed_out
+    assert manager.observed_deadline
+    outcomes = {outcome.tag: outcome for outcome in result.outcomes}
+    assert set(outcomes) == {"a.first", "a.peer", "a.boom", "a.independent"}
+    assert outcomes["a.first"].ok
+    assert outcomes["a.boom"].returncode == 7 and not outcomes["a.boom"].aborted
+    records = [json.loads(line) for line in manager.journal.read_text().splitlines()]
+    ends = [record for record in records if record.get("event") == "step_end"]
+    for tag, reason in [
+        ("a.peer", ABORTED_BY_PEER_FAILURE_REASON),
+        ("a.independent", ABORTED_BY_RUN_BUDGET_REASON),
+    ]:
+        assert outcomes[tag].aborted and outcomes[tag].reason == reason
+        code = outcomes[tag].returncode
+        assert code is not None and code < 0, "the real child must have been signalled"
+        assert not outcomes[tag].timed_out and not outcomes[tag].cpu_timed_out
+        assert _by_step(ends, tag)["reason"] == reason
+    timeout_index = next(
+        i for i, record in enumerate(records) if record.get("event") == "run_timeout"
+    )
+    peer_failure_index = next(
+        i for i, record in enumerate(records)
+        if record.get("event") == "step_end" and record.get("step") == "a.boom"
+    )
+    peer_end_index = next(
+        i for i, record in enumerate(records)
+        if record.get("event") == "step_end" and record.get("step") == "a.peer"
+    )
+    assert peer_failure_index < timeout_index < peer_end_index, (
+        "peer failure, real deadline, delayed peer completion must occur in that order"
+    )

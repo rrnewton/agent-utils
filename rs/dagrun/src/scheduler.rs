@@ -51,7 +51,8 @@ use crate::model::{
     preferred_inner_jobs, resolved_wall_timeout, scale_cpu_timeout, step_classification,
     step_width_is_resizable, undeclared_resource_demands, validate_cmdtype_config,
     validate_jobs_env_config, write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
-    DAGRUN_EXTRA_ARGS_ENV, JOBS_ENV_ENV,
+    ABORTED_BY_PEER_FAILURE_REASON, ABORTED_BY_RUN_BUDGET_REASON, DAGRUN_EXTRA_ARGS_ENV,
+    JOBS_ENV_ENV,
 };
 use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
@@ -423,6 +424,26 @@ const POST_REAP_WAIT: Duration = Duration::from_secs(30);
 /// them. See [`join_bounded`].
 const JOIN_WAIT: Duration = Duration::from_secs(15);
 
+/// The first cancellation decision for a step, recorded under the scheduler lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbortCause {
+    PeerFailure,
+    RunBudget,
+    RunCpuAccountingLost,
+}
+
+impl AbortCause {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::PeerFailure => ABORTED_BY_PEER_FAILURE_REASON,
+            Self::RunBudget => ABORTED_BY_RUN_BUDGET_REASON,
+            Self::RunCpuAccountingLost => {
+                "ABORTED (required whole-run CPU accounting was lost; CPU budget exhaustion was not established)"
+            }
+        }
+    }
+}
+
 // Mutable scheduler state, guarded by one lock (mirrors the Python `Runner`'s single lock).
 struct Shared {
     done: HashMap<String, StepOutcome>,
@@ -430,8 +451,8 @@ struct Shared {
     /// tag -> the in-flight child's pid (== its process-group id), so a sibling that FAILS can
     /// eager-reap it without sharing the `Child` handle across threads.
     running_pids: HashMap<String, u32>,
-    /// Tags killed by eager-exit (labelled ABORTED, not FAIL).
-    aborted: HashSet<String>,
+    /// First cause wins: later run deadlines must not relabel a peer cancellation.
+    aborted: HashMap<String, AbortCause>,
     /// Remaining capacity per named scarce resource.
     resource_avail: HashMap<String, i64>,
     /// A genuine (non-aborted) step failed.
@@ -453,7 +474,7 @@ struct Shared {
     fail_fast_family_index: HashMap<String, String>,
     /// Families whose own failure has stopped their remaining work.
     failed_families: HashSet<String>,
-    /// The WHOLE RUN exceeded its outer wall budget and cut its in-flight steps short.
+    /// The whole run hit a wall/CPU budget or lost required CPU accounting.
     run_timed_out: bool,
     /// The whole-run CPU budget, rather than the wall backstop, caused the cut.
     run_cpu_timed_out: bool,
@@ -1128,7 +1149,9 @@ fn trip_fail_fast(sh: &mut Shared, cgroups: &BoxedCgroups, keep_going: bool, fai
         .collect();
     for other in &candidates {
         if !spared.contains(other) {
-            sh.aborted.insert(other.clone());
+            sh.aborted
+                .entry(other.clone())
+                .or_insert(AbortCause::PeerFailure);
         }
     }
     let others: Vec<(String, u32, Option<String>)> = sh
@@ -1540,7 +1563,7 @@ impl Runner {
                 done: HashMap::new(),
                 running: HashSet::new(),
                 running_pids: HashMap::new(),
-                aborted: HashSet::new(),
+                aborted: HashMap::new(),
                 resource_avail,
                 failed: false,
                 stop: false,
@@ -1783,8 +1806,13 @@ impl Runner {
                         }
                     }
                     let admitted: Vec<String> = sh.running.iter().cloned().collect();
+                    let cause = if cpu_accounting_lost {
+                        AbortCause::RunCpuAccountingLost
+                    } else {
+                        AbortCause::RunBudget
+                    };
                     for tag in admitted {
-                        sh.aborted.insert(tag);
+                        sh.aborted.entry(tag).or_insert(cause);
                     }
                     reap_many(&self.cgroups, &cut);
                 }
@@ -3302,7 +3330,7 @@ fn run_step(ctx: StepCtx) {
         sh.active_processes += 1;
         sh.counted_processes.insert(tag.clone());
         sh.max_concurrent_steps = sh.max_concurrent_steps.max(sh.active_processes);
-        sh.aborted.contains(&tag)
+        sh.aborted.contains_key(&tag)
     };
     if abort_after_spawn {
         // A peer can fail after this tag was admitted but before its Popen registered. The
@@ -3897,7 +3925,7 @@ fn run_step(ctx: StepCtx) {
         }
     }
 
-    let (was_aborted, cut_by_run_budget, reason) = {
+    let (abort_cause, reason) = {
         let mut sh = lock_shared(&shared);
         retire(&mut sh, &step);
         sh.step_profile_rows.push(row);
@@ -3911,21 +3939,22 @@ fn run_step(ctx: StepCtx) {
                     .cloned(),
             );
         }
-        let was_aborted = sh.aborted.contains(&tag);
-        // Distinguish the two ways a step gets cancelled. "Another step failed" and "the whole run
-        // ran out of budget" call for completely different follow-up, and reporting both with the
-        // eager-exit wording sends a reader hunting for a failing peer that does not exist.
-        let cut_by_run_budget = was_aborted && sh.run_timed_out;
-        let mut outcome = if was_aborted {
-            StepOutcome::aborted_outcome(
+        let abort_cause = sh.aborted.get(&tag).copied();
+        let was_aborted = abort_cause.is_some();
+        let mut outcome = if let Some(cause) = abort_cause {
+            let mut outcome = StepOutcome::aborted_outcome(
                 tag.clone(),
                 elapsed,
                 summary.clone(),
                 returncode,
                 test_counts.executed,
                 test_counts.filtered,
-                cut_by_run_budget,
-            )
+                cause == AbortCause::RunBudget,
+            );
+            // Keep the public boolean constructor compatible while recording the additional
+            // accounting-loss cause, which is not evidence that any budget was exhausted.
+            outcome.reason = cause.reason().to_string();
+            outcome
         } else if ok {
             StepOutcome::passed(
                 tag.clone(),
@@ -3984,11 +4013,18 @@ fn run_step(ctx: StepCtx) {
             // continue, while dependency-failure closure skips only true dependents.
             trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
         }
-        (was_aborted, cut_by_run_budget, reason)
+        (abort_cause, reason)
     };
+    let was_aborted = abort_cause.is_some();
 
     // Emit the terminal status OUTSIDE the lock.
-    if cut_by_run_budget {
+    if abort_cause == Some(AbortCause::RunCpuAccountingLost) {
+        emit(&format!(
+            "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} required whole-run CPU accounting was \
+             lost; CPU budget exhaustion was not established)",
+            step.desc
+        ));
+    } else if abort_cause == Some(AbortCause::RunBudget) {
         emit(&format!(
             "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} cut short by the OUTER run budget, not \
              by a failure of its own or of a peer)",

@@ -19,6 +19,13 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use dagrun::cgroup::CgroupManager;
+use dagrun::model::{ABORTED_BY_PEER_FAILURE_REASON, ABORTED_BY_RUN_BUDGET_REASON};
+use dagrun::scheduler::{run_dag_boxed_deadline_with_cpu, start_run_cpu_budget, BoxedCgroups};
 
 struct Fixture {
     dir: PathBuf,
@@ -203,4 +210,267 @@ fn a_passing_step_carries_no_reason_key_at_all() {
         !record.contains(r#""reason""#),
         "a passing step must not carry an empty reason: {record}"
     );
+}
+
+/// Isolate journal environment from the other integration tests in this process.
+fn cancellation_child(name: &str) -> Option<PathBuf> {
+    const CHILD: &str = "DAGRUN_ABORT_CAUSE_TEST_CHILD";
+    if let Some(root) = std::env::var_os(CHILD) {
+        return Some(PathBuf::from(root));
+    }
+    let fx = Fixture::new(name);
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, &fx.dir)
+        .env("DAGRUN_LOG_DIR", fx.logs())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    None
+}
+
+fn journal_records(root: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(root.join("logs/journal.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
+#[derive(Clone, Copy)]
+enum AccountingFault {
+    None,
+    Unreadable,
+    Backwards,
+}
+
+/// Only result collection and the explicitly faulted CPU reading are controlled.
+/// Commands, fail-fast decisions, wall deadlines and process-group signals are real.
+/// This manager does not establish cgroup containment: kill returns false.
+struct CancellationControl {
+    root: PathBuf,
+    delay_peer_cleanup: bool,
+    observed_deadline: AtomicBool,
+    accounting_fault: AccountingFault,
+}
+
+impl CgroupManager for CancellationControl {
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn prepare_command(
+        &self,
+        _tag: &str,
+        cmd: &str,
+        _mem: Option<i64>,
+        _cpus: Option<i64>,
+    ) -> String {
+        cmd.to_string()
+    }
+    fn kill(&self, _tag: &str) -> bool {
+        false
+    }
+    fn cleanup(&self, tag: &str) {
+        if !self.delay_peer_cleanup || tag != "a.peer" {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let text = std::fs::read_to_string(self.root.join("logs/journal.jsonl")).unwrap();
+            if text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|record| record["event"] == "run_timeout")
+            {
+                self.observed_deadline.store(true, Ordering::SeqCst);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the real run deadline never fired during peer cleanup");
+    }
+    fn oom_kills(&self, _tag: &str) -> i64 {
+        0
+    }
+    fn peak_bytes(&self, _tag: &str) -> Option<i64> {
+        None
+    }
+    fn cpu_stats(&self, _tag: &str) -> Option<std::collections::BTreeMap<String, i64>> {
+        None
+    }
+    fn run_cpu_usage_usec(&self) -> Option<i64> {
+        if !self.root.join("cpu-ready").exists() {
+            return Some(1_000_000);
+        }
+        match self.accounting_fault {
+            AccountingFault::None => Some(1_000_000),
+            AccountingFault::Unreadable => None,
+            AccountingFault::Backwards => Some(0),
+        }
+    }
+    fn cpu_pressure(&self, _tag: &str) -> Option<std::collections::BTreeMap<String, f64>> {
+        None
+    }
+    fn thread_count(&self, _tag: &str) -> Option<i64> {
+        None
+    }
+    fn kill_all_remaining(&self) -> i64 {
+        0
+    }
+}
+
+#[test]
+fn peer_cancellation_survives_a_later_deadline_in_the_same_run() {
+    let Some(root) =
+        cancellation_child("peer_cancellation_survives_a_later_deadline_in_the_same_run")
+    else {
+        return;
+    };
+    let ready = shell_path(&root.join("ready"));
+    let cfg = dagrun::dag_from_value(&serde_json::json!({"steps":[
+        {"group":"a","job":"first","cmd":"sleep 2","timeout":3,"cpu_timeout":30},
+        {"group":"a","job":"peer","cmd":format!("touch {ready}; sleep 30"),
+         "deps":["a.first"],"timeout":3,"cpu_timeout":30,"fail_fast_family":"failed"},
+        {"group":"a","job":"boom","cmd":format!("while [ ! -f {ready} ]; do sleep 0.01; done; exit 7"),
+         "deps":["a.first"],"timeout":3,"cpu_timeout":30,"fail_fast_family":"failed"},
+        {"group":"a","job":"independent","cmd":"sleep 30",
+         "deps":["a.first"],"timeout":3,"cpu_timeout":30,"fail_fast_family":"independent"}
+    ]})).unwrap();
+    let manager = Arc::new(CancellationControl {
+        root: root.clone(),
+        delay_peer_cleanup: true,
+        observed_deadline: AtomicBool::new(false),
+        accounting_fault: AccountingFault::None,
+    });
+    let result = run_dag_boxed_deadline_with_cpu(
+        &cfg,
+        3,
+        false,
+        0,
+        Some(manager.clone()),
+        None,
+        Some(3),
+        Some(4),
+        None,
+    );
+    assert!(!result.ok && result.run_timed_out);
+    assert!(!result.run_cpu_timed_out && !result.run_cpu_accounting_failed);
+    assert!(manager.observed_deadline.load(Ordering::SeqCst));
+    assert_eq!(result.outcomes.len(), 4);
+    let outcome = |tag: &str| {
+        result
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.tag == tag)
+            .unwrap()
+    };
+    assert!(outcome("a.first").ok);
+    assert_eq!(outcome("a.boom").returncode, Some(7));
+    assert!(!outcome("a.boom").aborted);
+    let records = journal_records(&root);
+    for (tag, reason) in [
+        ("a.peer", ABORTED_BY_PEER_FAILURE_REASON),
+        ("a.independent", ABORTED_BY_RUN_BUDGET_REASON),
+    ] {
+        assert!(outcome(tag).aborted);
+        assert!(
+            outcome(tag).returncode.is_some_and(|code| code < 0),
+            "the real child must have been signalled"
+        );
+        assert!(!outcome(tag).timed_out && !outcome(tag).cpu_timed_out);
+        assert_eq!(outcome(tag).reason, reason);
+        let ends = records
+            .iter()
+            .filter(|record| record["event"] == "step_end" && record["step"] == tag)
+            .collect::<Vec<_>>();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0]["reason"], reason);
+    }
+    let timeout = records
+        .iter()
+        .position(|record| record["event"] == "run_timeout")
+        .unwrap();
+    let peer_failure = records
+        .iter()
+        .position(|record| record["event"] == "step_end" && record["step"] == "a.boom")
+        .unwrap();
+    let peer_end = records
+        .iter()
+        .position(|record| record["event"] == "step_end" && record["step"] == "a.peer")
+        .unwrap();
+    assert!(
+        peer_failure < timeout && timeout < peer_end,
+        "peer failure, real deadline, delayed peer completion must occur in that order"
+    );
+}
+
+fn accounting_loss_cancels_a_live_step(root: PathBuf, fault: AccountingFault) {
+    let cfg = dagrun::dag_from_value(&serde_json::json!({"steps":[{
+        "group":"a","job":"live",
+        "cmd":format!("touch {}; sleep 30", shell_path(&root.join("cpu-ready"))),
+        "timeout":3,"cpu_timeout":30
+    }]}))
+    .unwrap();
+    let cgroups: BoxedCgroups = Some(Arc::new(CancellationControl {
+        root: root.clone(),
+        delay_peer_cleanup: false,
+        observed_deadline: AtomicBool::new(false),
+        accounting_fault: fault,
+    }));
+    let budget = start_run_cpu_budget(&cgroups, Some(1)).unwrap();
+    let result =
+        run_dag_boxed_deadline_with_cpu(&cfg, 1, false, 0, cgroups, None, Some(1), Some(4), budget);
+    assert!(
+        root.join("cpu-ready").exists(),
+        "the real child must have started"
+    );
+    assert!(!result.ok && result.run_timed_out && result.run_cpu_accounting_failed);
+    assert!(!result.run_cpu_timed_out);
+    assert_eq!(result.outcomes.len(), 1);
+    let outcome = &result.outcomes[0];
+    assert!(outcome.aborted && !outcome.timed_out && !outcome.cpu_timed_out);
+    assert!(
+        outcome.returncode.is_some_and(|code| code < 0),
+        "the real child must have been signalled"
+    );
+    let expected = "ABORTED (required whole-run CPU accounting was lost; CPU budget exhaustion was not established)";
+    assert_eq!(outcome.reason, expected);
+    let records = journal_records(&root);
+    assert!(records
+        .iter()
+        .any(|record| record["event"] == "run_cpu_accounting_lost"));
+    assert!(!records
+        .iter()
+        .any(|record| record["event"] == "run_timeout" || record["event"] == "run_cpu_timeout"));
+    let ends = records
+        .iter()
+        .filter(|record| record["event"] == "step_end")
+        .collect::<Vec<_>>();
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0]["reason"], expected);
+}
+
+#[test]
+fn unreadable_run_cpu_accounting_is_not_budget_exhaustion() {
+    if let Some(root) = cancellation_child("unreadable_run_cpu_accounting_is_not_budget_exhaustion")
+    {
+        accounting_loss_cancels_a_live_step(root, AccountingFault::Unreadable);
+    }
+}
+
+#[test]
+fn backwards_run_cpu_accounting_is_not_budget_exhaustion() {
+    if let Some(root) = cancellation_child("backwards_run_cpu_accounting_is_not_budget_exhaustion")
+    {
+        accounting_loss_cancels_a_live_step(root, AccountingFault::Backwards);
+    }
 }

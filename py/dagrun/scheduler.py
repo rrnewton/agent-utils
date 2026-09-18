@@ -531,6 +531,13 @@ class _NoopMetricsSink:
         return None
 
 
+class _AbortCause(Enum):
+    """The first cancellation decision for a step, recorded under the runner lock."""
+
+    PEER_FAILURE = ABORTED_BY_PEER_FAILURE_REASON
+    RUN_BUDGET = ABORTED_BY_RUN_BUDGET_REASON
+
+
 class _NoopCgroupManager:
     """The default :class:`CgroupManager` used when the caller passes ``cgroups=None``.
 
@@ -732,7 +739,8 @@ class Runner:
         # Tags whose admission-time accounting (named resources, cores_used, running/procs/nonces)
         # has already been handed back. See :meth:`_retire`.
         self.retired: set[str] = set()
-        self.aborted: set[str] = set()  # tags killed by eager-exit (labelled ABORTED, not FAIL)
+        # First cause wins: later run deadlines must not relabel a peer cancellation.
+        self.aborted: dict[str, _AbortCause] = {}
         self.step_profile_rows: list[Mapping[str, object]] = []
         self.step_timeseries_rows: list[Mapping[str, object]] = []
         self.profile_timeseries_interval_s = profile_timeseries_interval_s
@@ -872,7 +880,7 @@ class Runner:
         for other in candidates:
             if other in spared:
                 continue
-            self.aborted.add(other)  # its thread will label itself ABORTED
+            self.aborted.setdefault(other, _AbortCause.PEER_FAILURE)
         reap_many(
             tuple(
                 (other_proc, other, self.running_nonces.get(other))
@@ -1129,7 +1137,7 @@ class Runner:
                             ],
                         )
                     for other in self.running:
-                        self.aborted.add(other)
+                        self.aborted.setdefault(other, _AbortCause.RUN_BUDGET)
                     reap_many(
                         tuple(
                             (other_proc, other, self.running_nonces.get(other))
@@ -1918,13 +1926,9 @@ class Runner:
         with self.lock:
             self._retire(step)
             self.step_profile_rows.append(row)
-            was_aborted = step.tag in self.aborted
-            if was_aborted:
-                # Which of the two cancellations this was. They call for completely different
-                # follow-up, and the terminal output below has always distinguished them while
-                # this ``reason`` did not: it said eager-exit unconditionally, so a run-budget
-                # cut recorded a failing peer that does not exist, and a reader who only has the
-                # record was sent hunting for it.
+            abort_cause = self.aborted.get(step.tag)
+            was_aborted = abort_cause is not None
+            if abort_cause is not None:
                 outcome = StepOutcome(
                     tag=step.tag,
                     ok=False,
@@ -1935,11 +1939,7 @@ class Runner:
                     oom_kills=0,
                     timed_out=False,
                     cpu_timed_out=False,
-                    reason=(
-                        ABORTED_BY_RUN_BUDGET_REASON
-                        if self.run_timed_out
-                        else ABORTED_BY_PEER_FAILURE_REASON
-                    ),
+                    reason=abort_cause.value,
                     aborted=True,
                     pids_events=pids_events,
                 )
@@ -2003,7 +2003,7 @@ class Runner:
                 self._trip_fail_fast(step.tag)
 
         # Emit terminal status OUTSIDE the lock (_emit re-acquires it).
-        if outcome.aborted and self.run_timed_out:
+        if abort_cause is _AbortCause.RUN_BUDGET:
             # Distinguish the two ways a step gets cancelled. "Another step failed" and "the whole
             # run ran out of budget" call for different follow-up, and the eager-exit wording sends
             # a reader hunting for a failing peer that does not exist.
