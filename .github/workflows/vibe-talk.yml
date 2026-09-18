@@ -143,8 +143,22 @@ jobs:
             vibe-talk:ci
           wait_for_health 18081 vibe-talk-skip
           # A skip that says nothing is the same silent start the probe was added to remove.
-          podman logs vibe-talk-skip 2>&1 | grep -qi "SKIPPING the startup channel probe" \
-            || { echo "the skip was not announced" >&2; podman logs vibe-talk-skip; exit 1; }
+          # Container log forwarding can trail the health response by a few milliseconds. Wait
+          # for the assertion's evidence instead of sampling it once and then printing it in the
+          # failure diagnostic immediately afterwards.
+          announced=0
+          for _ in $(seq 1 20); do
+            if podman logs vibe-talk-skip 2>&1 | grep -qi "SKIPPING the startup channel probe"; then
+              announced=1
+              break
+            fi
+            sleep 0.1
+          done
+          if [[ "$announced" != 1 ]]; then
+            echo "the skip was not announced" >&2
+            podman logs vibe-talk-skip >&2
+            exit 1
+          fi
           podman stop vibe-talk-skip
 
       - name: the running server requires a token
