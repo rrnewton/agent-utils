@@ -102,7 +102,7 @@ def call_tool(name: str, arguments: dict[str, object], registry: str, herdr_bin:
     return {"content": [{"type": "text", "text": rendered}], "isError": code != 0}
 
 
-def main(registry: str = ".agentctl", herdr_bin: str = "herdr") -> int:
+def _serve(registry: str = ".agentctl", herdr_bin: str = "herdr") -> int:
     """Serve bounded JSON-RPC messages on stdio; diagnostics never enter stdout."""
     for line in sys.stdin:
         identifier: object = None

@@ -29,7 +29,7 @@ Issues = "https://github.com/rrnewton/agent-utils/issues"
 agentctl = "agentctl.cli:main"
 herdr-agent = "agentctl.legacy_cli:main"
 herdr-subagents = "agentctl.foreign_cli:main"
-herdr-chat = "agentctl.chat:legacy_main"
+herdr-chat = "agentctl.chat:main"
 
 [tool.setuptools]
 packages = ["agentctl", "agentctl.foreign", "agentctl.foreign.mcp"]

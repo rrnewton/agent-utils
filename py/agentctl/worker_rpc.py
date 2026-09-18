@@ -74,7 +74,7 @@ def dispatch(request: dict[str, object]) -> dict[str, object]:
     return {"result": value, "record": asdict(record) if record is not None else None}
 
 
-def main() -> int:
+def _main() -> int:
     """Exchange exactly one JSON request and response over stdin/stdout."""
     try:
         result = dispatch(as_mapping(json.load(sys.stdin), "runtime request"))
@@ -88,4 +88,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_main())

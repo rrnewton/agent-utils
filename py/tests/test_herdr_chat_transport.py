@@ -454,7 +454,7 @@ def test_run_loop_retries_malformed_transport_output(
 
     monkeypatch.setattr(chat_module, "Bridge", RetryBridge)
     monkeypatch.setattr(time, "sleep", skip_sleep)
-    assert chat_module.main(["run", "--state", str(tmp_path)]) == 130
+    assert chat_module.run_cli(["run", "--state", str(tmp_path)]) == 130
     assert calls == 2
     assert "malformed adapter message" in capsys.readouterr().err
 
@@ -480,5 +480,5 @@ def test_run_loop_backs_off_failures_and_recovers_configured_interval(
 
     monkeypatch.setattr(chat_module, "Bridge", RecoveringBridge)
     monkeypatch.setattr(time, "sleep", delays.append)
-    assert chat_module.main(["run", "--state", str(tmp_path), "--interval", "10"]) == 130
+    assert chat_module.run_cli(["run", "--state", str(tmp_path), "--interval", "10"]) == 130
     assert delays == [20, 40, 60, 60, 10]

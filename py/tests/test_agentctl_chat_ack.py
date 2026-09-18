@@ -412,7 +412,7 @@ def test_command_adapter_react_contract() -> None:
 @pytest.mark.parametrize("command", ["init", "tick", "run", "status", "reply", "quickstart", "userguide"])
 def test_each_chat_subcommand_has_specific_help(command: str, capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as result:
-        chat_module.main([command, "--help"])
+        chat_module.run_cli([command, "--help"])
     assert result.value.code == 0
     text = capsys.readouterr().out
     assert f"agentctl chat {command}" in text
@@ -426,12 +426,12 @@ def test_each_chat_subcommand_has_specific_help(command: str, capsys: pytest.Cap
 def test_init_and_reply_required_options_are_parser_errors() -> None:
     for arguments in (["init"], ["reply", "--file", "answer.txt"]):
         with pytest.raises(SystemExit) as result:
-            chat_module.main(arguments)
+            chat_module.run_cli(arguments)
         assert result.value.code == 2
 
 
 def test_quickstart_explains_ack_configuration(capsys: pytest.CaptureFixture[str]) -> None:
-    assert chat_module.main(["quickstart"]) == 0
+    assert chat_module.run_cli(["quickstart"]) == 0
     text = capsys.readouterr().out
     assert "ack_reaction" in text and "🤖" in text
     assert "reaction_user" in text
@@ -451,8 +451,8 @@ def test_state_flag_works_before_or_after_command_and_legacy_default_is_preserve
             return {}
 
     monkeypatch.setattr(chat_module, "Bridge", StatusBridge)
-    assert chat_module.main(["--state", str(tmp_path), "status"]) == 0
-    assert chat_module.main(["status", "--state", str(tmp_path)]) == 0
+    assert chat_module.run_cli(["--state", str(tmp_path), "status"]) == 0
+    assert chat_module.run_cli(["status", "--state", str(tmp_path)]) == 0
+    assert chat_module.run_cli(["status"]) == 0
     assert chat_module.main(["status"]) == 0
-    assert chat_module.legacy_main(["status"]) == 0
     assert states == [tmp_path, tmp_path, Path(".agentctl/.chat"), Path(".herdr-chat")]

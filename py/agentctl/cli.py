@@ -176,7 +176,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prefix = settings.parse_args(arguments[:command_index])
         if prefix.herdr_bin != "herdr":
             settings.error("--herdr-bin applies to session commands; Chat uses its configured target adapter")
-        from agentctl.chat import main as chat_main
+        from agentctl.chat import run_cli as chat_main
         return chat_main(arguments[command_index + 1:], default_state=Path(prefix.registry) / ".chat")
     root = parser()
     args = root.parse_args(arguments)
@@ -193,8 +193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "services": ["chat", "mcp"], "registry": args.registry}, indent=2, sort_keys=True))
         return 0
     if args.command == "mcp":
-        from agentctl.mcp import main as mcp_main
-        return mcp_main(args.registry, args.herdr_bin)
+        from agentctl.mcp import _serve
+        return _serve(args.registry, args.herdr_bin)
     try:
         for key in ("ready_timeout", "working_timeout", "startup_timeout", "timeout"):
             value = getattr(args, key, None)

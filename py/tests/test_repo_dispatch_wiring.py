@@ -18,6 +18,7 @@ RUST_TOOLS = (
     "tick-hub",
     "pr-landing-planner",
     "herdr-run",
+    "agentctl",
     "herdr-agent",
 )
 PYTHON_ONLY_TOOLS = (

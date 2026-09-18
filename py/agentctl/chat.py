@@ -563,7 +563,7 @@ def submit_reply(state: Path, key: str, text: str) -> None:
             raise ValueError("a different reply already exists for this request") from None
 
 
-def main(argv: Sequence[str] | None = None, *, prog: str = "agentctl chat",
+def run_cli(argv: Sequence[str] | None = None, *, prog: str = "agentctl chat",
          default_state: Path = Path(".agentctl/.chat")) -> int:
     """Initialize, inspect, run, or reply through a coordinator bridge."""
     parser = argparse.ArgumentParser(
@@ -696,10 +696,10 @@ See '{prog} userguide' for exact scopes and the command-adapter protocol.""")
         return 130
 
 
-def legacy_main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Compatibility entry point retaining herdr-chat's state directory."""
-    return main(argv, prog="herdr-chat", default_state=Path(".herdr-chat"))
+    return run_cli(argv, prog="herdr-chat", default_state=Path(".herdr-chat"))
 
 
 if __name__ == "__main__":
-    raise SystemExit(legacy_main() if Path(sys.argv[0]).name == "herdr-chat" else main())
+    raise SystemExit(main() if Path(sys.argv[0]).name == "herdr-chat" else run_cli())
