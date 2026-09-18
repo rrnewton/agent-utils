@@ -139,6 +139,9 @@ pre-sidecar `HANDOFF.md` inside a flat-layout checkout.
 enqueues that slot generation for later retirement. Reading never removes the sidecar, an existing
 checkout file, or the slot. If no sidecar exists, the command copies a direct-child `HANDOFF.md` into
 the sidecar without moving or unlinking the old file. If both exist, their bytes must agree.
+The command does not hold the state lock while it writes up to 1 MiB to the caller: it snapshots the
+exact generation and file identity, writes and flushes the bytes, then reacquires the lock and
+revalidates both before recording the read. A failed flush or concurrent change records no new read.
 When the checkout file genuinely changed after an earlier read, ordinary read still refuses and keeps
 both copies. After inspecting both versions, a coordinator may use the explicit adoption option
 shown by `wrkslots read-handoff --help`, with coordinator authorization and the expected generation.
@@ -150,7 +153,10 @@ bounded group with `wrkslots retire-pending --limit N --coordinator-pid PID --fo
 item runs the ordinary removal state machine independently; a live owner, fresh heartbeat, hold,
 process use, changed handoff, dirty or unpublished work that cannot be salvaged, remote mismatch,
 or path-fence race retains the slot in the queue. Successful archived removal clears its sidecar.
-The exact handoff bytes remain in append-only history.
+Attempt events rotate blocked entries behind never-attempted and less-recently-attempted entries, so
+one retained slot cannot starve the rest of a bounded queue. Lock contention is deferred; corrupt,
+partial, or indeterminate state stops the batch and requires recovery instead of being mislabeled as
+retained. The exact handoff bytes remain in append-only history.
 
 ## Git remotes and salvage
 

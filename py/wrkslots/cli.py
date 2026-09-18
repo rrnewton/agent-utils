@@ -361,6 +361,14 @@ class StateError(Refusal):
     """A corrupt, partial, or incompatible state refusal."""
 
 
+class _LockBusy(Refusal):
+    """A bounded lock wait elapsed without acquiring the requested lock."""
+
+
+class _RetirementDeferred(Refusal):
+    """A queue candidate changed before its exact guarded attempt began."""
+
+
 class _ProcessEvidenceChanged(Refusal):
     """A relevant PID generation changed while one liveness census ran."""
 
@@ -719,6 +727,7 @@ class _HandoffArtifact:
     recorded_at: str
     source: str
     source_identity: _RegularFileIdentity | None
+    storage_identity: _RegularFileIdentity
 
 
 @dataclasses.dataclass(frozen=True)
@@ -731,6 +740,7 @@ class _RetirementCandidate:
     sha256: str
     event_sequence: int
     enqueued_at: str
+    last_attempt_sequence: int | None
     artifact_path: str | None
     artifact_source: str | None
     blocked_reason: str | None
@@ -3008,7 +3018,7 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[
                 break
             except BlockingIOError as exc:
                 if time.monotonic() >= deadline:
-                    raise Refusal(
+                    raise _LockBusy(
                         f"state lock is busy for {subject}; retry after the current command exits"
                     ) from exc
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
@@ -3046,7 +3056,7 @@ def _locked_config(path: Path, wait_seconds: float) -> Iterator[int]:
                 break
             except BlockingIOError as exc:
                 if time.monotonic() >= deadline:
-                    raise Refusal(
+                    raise _LockBusy(
                         f"configuration lock is busy for {lock_path}; retry after the "
                         "other wrkslots mutation exits"
                     ) from exc
@@ -3059,9 +3069,21 @@ def _locked_config(path: Path, wait_seconds: float) -> Iterator[int]:
             os.close(fd)
 
 
+def _remaining_lock_wait(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
 @contextlib.contextmanager
-def _mutation_locks(config: Config, wait_seconds: float) -> Iterator[None]:
-    with _locked_config(config.config_path, wait_seconds):
+def _mutation_locks(
+    config: Config,
+    wait_seconds: float,
+    *,
+    deadline: float | None = None,
+) -> Iterator[None]:
+    effective_deadline = (
+        time.monotonic() + wait_seconds if deadline is None else deadline
+    )
+    with _locked_config(config.config_path, _remaining_lock_wait(effective_deadline)):
         current = _load_config(str(config.root), config.machine)
         if current != config:
             raise Refusal(
@@ -3069,8 +3091,16 @@ def _mutation_locks(config: Config, wait_seconds: float) -> Iterator[None]:
                 "uses one coherent policy"
             )
         global_subject = config.control / "ACTIVE"
-        with _locked(global_subject, exclusive=True, wait_seconds=wait_seconds):
-            with _locked(_active_path(config), exclusive=True, wait_seconds=wait_seconds):
+        with _locked(
+            global_subject,
+            exclusive=True,
+            wait_seconds=_remaining_lock_wait(effective_deadline),
+        ):
+            with _locked(
+                _active_path(config),
+                exclusive=True,
+                wait_seconds=_remaining_lock_wait(effective_deadline),
+            ):
                 yield
 
 
@@ -3271,6 +3301,7 @@ def _handoff_artifact_from_obj(
     record: ActiveRecord,
     value: object,
     path: Path,
+    storage_identity: _RegularFileIdentity,
 ) -> _HandoffArtifact:
     label = f"handoff sidecar {path}"
     raw = _as_mapping(value, label)
@@ -3337,6 +3368,7 @@ def _handoff_artifact_from_obj(
         recorded_at=recorded_at,
         source=source,
         source_identity=source_identity,
+        storage_identity=storage_identity,
     )
 
 
@@ -3348,11 +3380,15 @@ def _load_handoff_sidecar(
     )
     if not path.exists() and not path.is_symlink():
         return None
-    contents = _read_bounded_regular_file(
+    contents, storage_identity = _read_regular_file_identity(
         path, "handoff sidecar", HANDOFF_SIDECAR_BYTES_LIMIT
     )
     return _handoff_artifact_from_obj(
-        config, record, _strict_json_object(contents, "handoff sidecar"), path
+        config,
+        record,
+        _strict_json_object(contents, "handoff sidecar"),
+        path,
+        storage_identity,
     )
 
 
@@ -3381,6 +3417,7 @@ def _legacy_handoff_artifact(
         recorded_at=_utc_now(),
         source="legacy-slot-file",
         source_identity=identity,
+        storage_identity=identity,
     )
 
 
@@ -3388,8 +3425,6 @@ def _resolve_handoff_artifact(
     config: Config,
     record: ActiveRecord,
     slot_path: Path,
-    *,
-    materialize_legacy: bool = False,
 ) -> _HandoffArtifact | None:
     sidecar = _load_handoff_sidecar(config, record)
     legacy = _legacy_handoff_artifact(config, record, slot_path)
@@ -3403,16 +3438,6 @@ def _resolve_handoff_artifact(
         return sidecar
     if sidecar is not None:
         return sidecar
-    if legacy is None:
-        return None
-    if materialize_legacy:
-        sidecar_path = _handoff_sidecar_path(
-            config, record.slot, record.generation, record.machine
-        )
-        projected = dataclasses.replace(legacy, path=sidecar_path)
-        _atomic_write_json(sidecar_path, _handoff_artifact_to_obj(projected))
-        _interrupt_for_test("after-handoff-sidecar-write")
-        return projected
     return legacy
 
 
@@ -4856,6 +4881,22 @@ def _retirement_candidates(
     state: ActiveState,
     events: Sequence[Mapping[str, object]],
 ) -> tuple[_RetirementCandidate, ...]:
+    last_attempts: dict[tuple[str, int, str], int] = {}
+    for event in events:
+        if event.get("kind") != "retirement-attempted":
+            continue
+        payload = _as_mapping(event["payload"], "retirement-attempted event payload")
+        slot = _as_str(payload.get("slot"), "retirement-attempted event slot")
+        generation = _as_int(
+            payload.get("generation"), "retirement-attempted event generation", minimum=1
+        )
+        digest = _as_str(payload.get("sha256"), "retirement-attempted event sha256")
+        if not DIGEST_RE.fullmatch(digest):
+            raise StateError("retirement-attempted event sha256 is not a SHA-256 digest")
+        key = (slot, generation, digest)
+        last_attempts[key] = _as_int(
+            event["sequence"], "retirement-attempted event sequence", minimum=1
+        )
     candidates: list[_RetirementCandidate] = []
     for record in state.slots:
         if record.slot_type != "agent":
@@ -4882,6 +4923,8 @@ def _retirement_candidates(
             else:
                 artifact_path = str(artifact.path)
                 artifact_source = artifact.source
+        except StateError:
+            raise
         except Refusal as exc:
             blocked_reason = str(exc)
         candidates.append(
@@ -4892,12 +4935,25 @@ def _retirement_candidates(
                 sha256=digest,
                 event_sequence=sequence,
                 enqueued_at=recorded_at,
+                last_attempt_sequence=last_attempts.get(
+                    (record.slot, record.generation, digest)
+                ),
                 artifact_path=artifact_path,
                 artifact_source=artifact_source,
                 blocked_reason=blocked_reason,
             )
         )
-    return tuple(sorted(candidates, key=lambda item: (item.event_sequence, item.slot)))
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda item: (
+                item.last_attempt_sequence is not None,
+                item.last_attempt_sequence or item.event_sequence,
+                item.event_sequence,
+                item.slot,
+            ),
+        )
+    )
 
 
 def _remove_handoff_sidecar_after_archive(
@@ -11757,19 +11813,60 @@ def _cmd_unhold(args: argparse.Namespace) -> int:
     return 0
 
 
+def _same_handoff_snapshot(
+    left: _HandoffArtifact, right: _HandoffArtifact
+) -> bool:
+    return (
+        left.path,
+        left.machine,
+        left.slot,
+        left.generation,
+        left.contents,
+        left.sha256,
+        left.source,
+        left.source_identity,
+        left.storage_identity,
+    ) == (
+        right.path,
+        right.machine,
+        right.slot,
+        right.generation,
+        right.contents,
+        right.sha256,
+        right.source,
+        right.source_identity,
+        right.storage_identity,
+    )
+
+
+def _write_and_flush_handoff(path: Path, rendered: str) -> None:
+    try:
+        sys.stdout.write(f"--- {path} ---\n")
+        sys.stdout.write(rendered)
+        if not rendered.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.write(f"--- end {path} ---\n")
+        sys.stdout.flush()
+    except (OSError, ValueError) as exc:
+        raise Refusal(
+            "handoff output could not be flushed; no read or retirement queue event "
+            f"was recorded: {exc}"
+        ) from exc
+
+
 def _cmd_read_handoff(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     reader = _capture_caller_process(args.coordinator_pid, "coordinator")
     _assert_caller_process(reader, "coordinator")
+    adopt_legacy_change = bool(args.adopt_legacy_change)
+    sidecar_snapshot: _HandoffArtifact | None = None
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, _archives = _validate_global_state(config, require_repository=False)
-        record = _find_record(
-            _load_active(config, require_repository=False),
-            args.slot,
-        )
+        state = _load_active(config, require_repository=False)
+        record = _find_record(state, args.slot)
         if record.slot_type != "agent":
             raise Refusal(
                 f"slot {record.slot} has type validate and cannot carry an agent handoff. "
@@ -11778,36 +11875,31 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
             )
         _assert_target_record_storage_consistent(config, states, record)
         slot_path = _slot_directory(config, record.slot, record.slot_type)
-        adopt_legacy_change = bool(args.adopt_legacy_change)
         artifact: _HandoffArtifact | None
         if adopt_legacy_change:
             _require_coordinator_authorized(args, "legacy handoff adoption")
             if args.expected_generation is None:
-                raise Refusal(
-                    "--adopt-legacy-change requires --expected-generation"
-                )
+                raise Refusal("--adopt-legacy-change requires --expected-generation")
             _expected_generation(record, args.expected_generation)
-            sidecar = _load_handoff_sidecar(config, record)
+            sidecar_snapshot = _load_handoff_sidecar(config, record)
             legacy = _legacy_handoff_artifact(config, record, slot_path)
-            if sidecar is None or legacy is None:
+            if sidecar_snapshot is None or legacy is None:
                 raise Refusal(
                     "--adopt-legacy-change requires both the generation-bound sidecar "
                     "and a safe regular legacy HANDOFF.md"
                 )
-            if sidecar.contents == legacy.contents:
+            if sidecar_snapshot.contents == legacy.contents:
                 raise Refusal(
                     "--adopt-legacy-change requires an actual sidecar/legacy disagreement"
                 )
-            artifact = dataclasses.replace(legacy, path=sidecar.path)
+            artifact = legacy
         else:
             if args.expected_generation is not None:
                 raise Refusal(
                     "--expected-generation applies only with --adopt-legacy-change"
                 )
             try:
-                artifact = _resolve_handoff_artifact(
-                    config, record, slot_path, materialize_legacy=True
-                )
+                artifact = _resolve_handoff_artifact(config, record, slot_path)
             except Refusal as exc:
                 raise Refusal(
                     f"{exc}. state: REFUSED -- no read was recorded; preserve both the "
@@ -11816,9 +11908,8 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
         if artifact is None:
             raise Refusal(
                 f"slot {record.slot} has no handoff sidecar or legacy HANDOFF.md. "
-                "state: REFUSED -- no read was "
-                "recorded. remedy: continue the reclaim checks; absence of a handoff is not "
-                "evidence that the owner is dead"
+                "state: REFUSED -- no read was recorded. remedy: continue the reclaim "
+                "checks; absence of a handoff is not evidence that the owner is dead"
             )
         try:
             rendered = artifact.contents.decode("utf-8")
@@ -11828,44 +11919,108 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
                 "REFUSED -- no read was recorded. remedy: preserve and repair the handoff file"
             ) from exc
         legacy_path = slot_path / "HANDOFF.md"
-        display_path = (
-            legacy_path
-            if legacy_path.exists() or legacy_path.is_symlink()
-            else artifact.path
+        display_path = legacy_path if artifact.source == "legacy-slot-file" else artifact.path
+        record_snapshot = _record_to_obj(record)
+        latest_snapshot = _latest_handoff_read(record, _load_events(config, record.machine))
+
+    _write_and_flush_handoff(display_path, rendered)
+
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, _archives = _validate_global_state(config, require_repository=False)
+        current_record = _find_record(
+            _load_active(config, require_repository=False), args.slot
         )
-        print(f"--- {display_path} ---")
-        print(rendered, end="" if rendered.endswith("\n") else "\n")
-        print(f"--- end {display_path} ---")
-        digest = artifact.sha256
-        _assert_caller_process(reader, "coordinator")
-        _ensure_event_log(config, record.machine, require_repository=False)
-        _write_event_file(
-            config,
-            record.machine,
-            "handoff-read",
-            {
-                "slot": record.slot,
-                "generation": record.generation,
-                "sha256": digest,
-                "contents_utf8": rendered,
-                "reader": _identity_to_obj(reader),
-                "coordinator_authorized": bool(args.coordinator_authorized),
-                "retirement_enqueued": True,
-            },
+        if _record_to_obj(current_record) != record_snapshot:
+            raise Refusal(
+                f"slot {args.slot} changed while its handoff was displayed; no read or "
+                "retirement queue event was recorded"
+            )
+        _assert_target_record_storage_consistent(config, states, current_record)
+        current_slot_path = _slot_directory(
+            config, current_record.slot, current_record.slot_type
         )
+        current_latest = _latest_handoff_read(
+            current_record, _load_events(config, current_record.machine)
+        )
+        if current_latest != latest_snapshot:
+            raise Refusal(
+                f"slot {args.slot} handoff read history changed while its contents were "
+                "displayed; no superseding read was recorded"
+            )
+        current_sidecar: _HandoffArtifact | None = None
         if adopt_legacy_change:
-            _interrupt_for_test("after-handoff-adopt-read")
-            current_legacy = _legacy_handoff_artifact(config, record, slot_path)
+            current_sidecar = _load_handoff_sidecar(config, current_record)
+            current_artifact = _legacy_handoff_artifact(
+                config, current_record, current_slot_path
+            )
+            if current_sidecar is None or current_artifact is None:
+                raise Refusal(
+                    f"slot {args.slot} handoff changed while it was displayed; no read "
+                    "or retirement queue event was recorded"
+                )
+            assert sidecar_snapshot is not None
             if (
-                current_legacy is None
-                or current_legacy.source_identity != artifact.source_identity
-                or current_legacy.contents != artifact.contents
+                not _same_handoff_snapshot(current_sidecar, sidecar_snapshot)
+                or not _same_handoff_snapshot(current_artifact, artifact)
+                or current_sidecar.contents == current_artifact.contents
             ):
                 raise Refusal(
-                    f"slot {record.slot} legacy HANDOFF.md changed while its adoption was "
-                    "recorded; preserve both files and retry the explicit adoption"
+                    f"slot {args.slot} handoff changed while it was displayed; no read "
+                    "or retirement queue event was recorded"
                 )
-            _atomic_write_json(artifact.path, _handoff_artifact_to_obj(artifact))
+        else:
+            current_artifact = _resolve_handoff_artifact(
+                config, current_record, current_slot_path
+            )
+            if current_artifact is None or not _same_handoff_snapshot(
+                current_artifact, artifact
+            ):
+                raise Refusal(
+                    f"slot {args.slot} handoff changed while it was displayed; no read "
+                    "or retirement queue event was recorded"
+                )
+        _assert_caller_process(reader, "coordinator")
+        already_queued = bool(
+            current_latest is not None
+            and current_latest[0] == current_artifact.sha256
+            and current_latest[1] is True
+        )
+        if not already_queued:
+            _ensure_event_log(config, current_record.machine, require_repository=False)
+            _write_event_file(
+                config,
+                current_record.machine,
+                "handoff-read",
+                {
+                    "slot": current_record.slot,
+                    "generation": current_record.generation,
+                    "sha256": current_artifact.sha256,
+                    "contents_utf8": rendered,
+                    "reader": _identity_to_obj(reader),
+                    "coordinator_authorized": bool(args.coordinator_authorized),
+                    "retirement_enqueued": True,
+                },
+            )
+            _interrupt_for_test("after-handoff-read-event")
+        if current_artifact.source == "legacy-slot-file":
+            if adopt_legacy_change:
+                _interrupt_for_test("after-handoff-adopt-read")
+                assert current_sidecar is not None
+                sidecar_path = current_sidecar.path
+            else:
+                sidecar_path = _handoff_sidecar_path(
+                    config,
+                    current_record.slot,
+                    current_record.generation,
+                    current_record.machine,
+                )
+            projected = dataclasses.replace(current_artifact, path=sidecar_path)
+            _atomic_write_json(sidecar_path, _handoff_artifact_to_obj(projected))
+            _interrupt_for_test("after-handoff-sidecar-write")
+        digest = current_artifact.sha256
+        record = current_record
     print(f"recorded HANDOFF.md read slot={record.slot} sha256={digest}")
     return 0
 
@@ -11922,10 +12077,15 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
             recorded_at=_utc_now(),
             source="write-handoff",
             source_identity=None,
+            storage_identity=_source_identity,
         )
         if existing is None or existing.contents != artifact.contents:
             _atomic_write_json(sidecar_path, _handoff_artifact_to_obj(artifact))
             _interrupt_for_test("after-handoff-sidecar-write")
+            written = _load_handoff_sidecar(config, record)
+            if written is None:
+                raise StateError("handoff sidecar disappeared after its atomic write")
+            artifact = written
         else:
             artifact = existing
         _ensure_event_log(config, record.machine, require_repository=False)
@@ -11949,9 +12109,12 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
 
 
 def _current_retirement_candidates(
-    config: Config, wait_seconds: float
+    config: Config, wait_seconds: float, *, deadline: float | None = None
 ) -> tuple[_RetirementCandidate, ...]:
-    with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=wait_seconds):
+    effective_wait = (
+        wait_seconds if deadline is None else _remaining_lock_wait(deadline)
+    )
+    with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=effective_wait):
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         state = _load_active(config, require_repository=False)
         events = _load_events(config, state.machine)
@@ -11990,6 +12153,97 @@ def _cmd_retirement_queue(args: argparse.Namespace) -> int:
     return 0
 
 
+def _retirement_outcome_after_refusal(
+    config: Config,
+    candidate: _RetirementCandidate,
+    refusal: Refusal,
+    deadline: float,
+) -> tuple[str, str]:
+    if isinstance(refusal, _LockBusy):
+        return "deferred", str(refusal)
+    if isinstance(refusal, _RetirementDeferred):
+        return "deferred", str(refusal)
+    if isinstance(refusal, StateError):
+        raise StateError(
+            "retire-pending outcome=could-not-determine recovery_required=true: "
+            f"{refusal}"
+        ) from refusal
+    try:
+        with _mutation_locks(
+            config,
+            _remaining_lock_wait(deadline),
+            deadline=deadline,
+        ):
+            _refuse_partial_state(config)
+            journals = _outstanding_journals(config)
+            if journals:
+                raise StateError(
+                    f"retirement attempt for {candidate.slot} left mutation journal "
+                    f"{journals[0]}; run recover before classifying its outcome"
+                )
+            states, archives = _validate_global_state(
+                config, require_repository=False
+            )
+            state = next(
+                item for item in states if item.machine == candidate.machine
+            )
+            current = next(
+                (item for item in state.slots if item.slot == candidate.slot), None
+            )
+            if current is not None:
+                if current.generation != candidate.generation:
+                    return "deferred", "slot generation changed after queue selection"
+                _assert_target_record_storage_consistent(config, states, current)
+                latest = _latest_handoff_read(
+                    current, _load_events(config, current.machine)
+                )
+                if latest is None or (
+                    latest[0], latest[1], latest[2]
+                ) != (candidate.sha256, True, candidate.event_sequence):
+                    return "deferred", "retirement candidate was superseded"
+                return "retained", str(refusal)
+            matches = [
+                row
+                for archive in archives
+                if archive.machine == candidate.machine
+                for row in archive.records
+                if row.get("slot") == candidate.slot
+                and row.get("generation") == candidate.generation
+                and row.get("slot_type") == "agent"
+                and row.get("physical_storage") == "removed"
+            ]
+            if len(matches) != 1:
+                raise StateError(
+                    f"retirement attempt for {candidate.slot} has neither its exact "
+                    "active row nor one exact removed archive row"
+                )
+            slot_path = _slot_directory(config, candidate.slot, "agent")
+            sidecar = _handoff_sidecar_path(
+                config,
+                candidate.slot,
+                candidate.generation,
+                candidate.machine,
+            )
+            if (
+                slot_path.exists()
+                or slot_path.is_symlink()
+                or sidecar.exists()
+                or sidecar.is_symlink()
+            ):
+                raise StateError(
+                    f"retirement attempt for {candidate.slot} reached its archive but "
+                    "left physical storage or handoff sidecar state"
+                )
+            return "removed", "ordinary remove completed before reporting its refusal"
+    except _LockBusy as exc:
+        return "deferred", str(exc)
+    except StateError as exc:
+        raise StateError(
+            "retire-pending outcome=could-not-determine recovery_required=true: "
+            f"{exc}"
+        ) from exc
+
+
 def _cmd_retire_pending(args: argparse.Namespace) -> int:
     if args.limit <= 0 or args.limit > RETIRE_PENDING_LIMIT:
         raise Refusal(
@@ -11999,11 +12253,15 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
         args.wait_lock if args.wait_lock > 0 else RETIRE_PENDING_WAIT_LOCK_SECONDS,
         RETIRE_PENDING_MAX_WAIT_LOCK_SECONDS,
     )
+    deadline = time.monotonic() + wait_seconds
     config = _load_config(args.project_root, args.machine)
-    pending = _current_retirement_candidates(config, wait_seconds)
+    pending = _current_retirement_candidates(
+        config, wait_seconds, deadline=deadline
+    )
     selected = pending[: args.limit]
     removed: list[dict[str, object]] = []
     retained: list[dict[str, object]] = []
+    deferred: list[dict[str, object]] = []
     for candidate in selected:
         identity = {
             "machine": candidate.machine,
@@ -12011,30 +12269,38 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             "generation": candidate.generation,
             "sha256": candidate.sha256,
         }
-        if candidate.blocked_reason is not None:
-            retained.append(
-                {
-                    **identity,
-                    "outcome": "retained",
-                    "reason": candidate.blocked_reason,
-                }
-            )
-            continue
         remove_values = dict(vars(args))
         remove_values.update(
-            wait_lock=wait_seconds,
+            wait_lock=_remaining_lock_wait(deadline),
             slot=candidate.slot,
             expected_generation=candidate.generation,
             validate_complete=False,
             validation_proof_manifest=None,
             completed_record=None,
+            _wait_deadline=deadline,
+            _retirement_candidate=candidate,
         )
         remove_args = argparse.Namespace(**remove_values)
         try:
             _cmd_remove(remove_args, emit=False)
+        except StateError as exc:
+            raise StateError(
+                "retire-pending outcome=could-not-determine recovery_required=true: "
+                f"{exc}"
+            ) from exc
         except Refusal as exc:
-            retained.append(
-                {**identity, "outcome": "retained", "reason": str(exc)}
+            outcome, reason = _retirement_outcome_after_refusal(
+                config, candidate, exc, deadline
+            )
+            destination = (
+                retained
+                if outcome == "retained"
+                else removed
+                if outcome == "removed"
+                else deferred
+            )
+            destination.append(
+                {**identity, "outcome": outcome, "reason": reason}
             )
         else:
             removed.append(
@@ -12044,14 +12310,16 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                     "reason": "ordinary remove completed",
                 }
             )
-    deferred = [
-        {
-            **candidate.to_obj(),
-            "outcome": "deferred",
-            "reason": "batch limit",
-        }
-        for candidate in pending[args.limit :]
-    ]
+    deferred.extend(
+        [
+            {
+                **candidate.to_obj(),
+                "outcome": "deferred",
+                "reason": "batch limit",
+            }
+            for candidate in pending[args.limit :]
+        ]
+    )
     payload = {
         "schema": RETIREMENT_QUEUE_SCHEMA,
         "limit": args.limit,
@@ -12079,7 +12347,7 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
         for item in deferred:
             print(
                 f"DEFERRED: {item['machine']}/{item['slot']} "
-                f"generation={item['generation']} reason=batch limit"
+                f"generation={item['generation']} reason={item['reason']}"
             )
     return 0
 
@@ -15347,7 +15615,8 @@ def _cmd_remove(
         args.coordinator_pid
     )
     scoped_validation_finish = bool(args.validate_complete) and private_cleanup is None
-    with _mutation_locks(config, args.wait_lock):
+    wait_deadline = getattr(args, "_wait_deadline", None)
+    with _mutation_locks(config, args.wait_lock, deadline=wait_deadline):
         _refuse_partial_state(
             config,
             allow_validate_batch_seals=private_cleanup is not None,
@@ -15361,6 +15630,45 @@ def _cmd_remove(
         state = _load_active(config, require_repository=False)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
+        retirement_candidate = getattr(args, "_retirement_candidate", None)
+        if retirement_candidate is not None:
+            if not isinstance(retirement_candidate, _RetirementCandidate):
+                raise StateError("retirement queue candidate has an invalid type")
+            expected_identity = (
+                retirement_candidate.machine,
+                retirement_candidate.slot,
+                retirement_candidate.generation,
+            )
+            if expected_identity != (record.machine, record.slot, record.generation):
+                raise _RetirementDeferred(
+                    "retirement candidate generation changed before its guarded attempt"
+                )
+            latest = _latest_handoff_read(
+                record, _load_events(config, record.machine)
+            )
+            if latest is None or (
+                latest[0], latest[1], latest[2]
+            ) != (
+                retirement_candidate.sha256,
+                True,
+                retirement_candidate.event_sequence,
+            ):
+                raise _RetirementDeferred(
+                    "retirement candidate was superseded before its guarded attempt"
+                )
+            _write_event_file(
+                config,
+                record.machine,
+                "retirement-attempted",
+                {
+                    "slot": record.slot,
+                    "generation": record.generation,
+                    "sha256": retirement_candidate.sha256,
+                    "handoff_read_sequence": retirement_candidate.event_sequence,
+                    "reason": "selected by bounded retirement queue",
+                },
+            )
+            _interrupt_for_test("after-retirement-attempt")
         if private_cleanup is not None:
             _assert_validate_batch_seal_target(
                 config,
@@ -16030,6 +16338,13 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                     f"cannot promote temp file without a durable target: {leftover}"
                 )
             if handoff_sidecar:
+                contents, identity = _read_regular_file_identity(
+                    leftover, "handoff sidecar temp file", HANDOFF_SIDECAR_BYTES_LIMIT
+                )
+                raw = _as_mapping(
+                    _strict_json_object(contents, "handoff sidecar temp file"),
+                    "handoff sidecar temp file",
+                )
                 machine = _as_str(raw.get("machine"), "handoff temp machine")
                 slot = _as_str(raw.get("slot"), "handoff temp slot")
                 generation = _as_int(
@@ -16038,7 +16353,7 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 state = _load_active(config, machine, require_repository=False)
                 record = _find_record(state, slot)
                 _expected_generation(record, generation)
-                _handoff_artifact_from_obj(config, record, raw, target)
+                _handoff_artifact_from_obj(config, record, raw, target, identity)
                 os.replace(leftover, target)
                 _fsync_directory(target.parent)
                 print(
@@ -21798,6 +22113,11 @@ def _absent_agent_journal_inputs(
 def _assert_absent_agent_safe(config: Config, record: ActiveRecord) -> tuple[Path, ...]:
     _assert_absent_validate_rows_not_held(config, (record,))
     paths = _assert_absent_agent_storage(config, record)
+    _assert_handoff_read(
+        config,
+        record,
+        _slot_directory(config, record.slot, record.slot_type),
+    )
     _assert_absent_agent_liveness(config, record, paths)
     _absent_agent_checkout_receipts(config, record, _GitVcs())
     return paths
@@ -21825,6 +22145,7 @@ def _recover_absent_agent_row(
     if current is None:
         if archived is None or not _json_equal(archived, archive_entry):
             raise StateError("absent agent row disappeared without its exact archive")
+        _remove_handoff_sidecar_after_archive(config, recorded)
         _clear_journal(config, raw)
         print(f"recovered absent agent row={item.slot}")
         return
@@ -21898,6 +22219,7 @@ def _recover_absent_agent_row(
             evidence=_absent_agent_event_evidence(item, archive_entry),
         )
         _interrupt_for_test("after-absent-agent-active-delete")
+    _remove_handoff_sidecar_after_archive(config, recorded)
     _clear_journal(config, journal)
     print(f"recovered absent agent row={item.slot}")
 
@@ -26856,7 +27178,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="inspect handoff-read slots awaiting safe retirement",
     )
     retirement_queue.add_argument(
-        "--format", choices=("human", "json"), default="human"
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="queue output format (default: human); json is intended for workers",
     )
     retirement_queue.set_defaults(handler=_cmd_retirement_queue)
 
@@ -26866,8 +27191,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "Attempt one bounded group of handoff-read agent slots. Each target runs the "
             "ordinary remove state machine under its own lock scope; every liveness, hold, "
             "process-use, Git salvage, remote, digest, and path-fence refusal remains active."
-            " The default per-lock wait is 5 seconds and any global --wait-lock value is "
-            "capped at 30 seconds for this bounded command."
+            " The default end-to-end lock-wait budget is 5 seconds and any global "
+            "--wait-lock value is capped at 30 seconds for this bounded command."
         ),
         help="safely attempt a bounded group of queued agent slots",
         formatter_class=_HelpFormatter,
@@ -26892,7 +27217,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="record coordinator authorization with each ordinary removal attempt",
     )
     retire_pending.add_argument(
-        "--format", choices=("human", "json"), default="human"
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="batch result format (default: human); json includes typed per-target outcomes",
     )
     retire_pending.set_defaults(handler=_cmd_retire_pending)
 
