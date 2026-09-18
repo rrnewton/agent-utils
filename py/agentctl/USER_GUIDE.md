@@ -83,6 +83,11 @@ agentctl send reviewer --file /tmp/follow-up.txt --ready-timeout 0
 agentctl drain reviewer --ready-timeout 0
 ```
 
+Interactive timeout arguments accept finite seconds no greater than 31,536,000
+(one year). Readiness waits may be zero; working confirmation must be positive.
+The startup deadline must be positive and at most 300 seconds. The count options
+`--max-attempts` and `--lines` must be between 1 and 1,000,000.
+
 Known-unsubmitted work remains queued. Uncertain submission is quarantined and
 is not automatically injected again. `--message-id` gives an interactive
 request a caller-selected identity; duplicate IDs are rejected, not interpreted

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Pin every number a herdr-run document states as a default to the constant in the code.
+"""Pin documented shell-executor and agent-control numeric defaults to their code constants.
 
-The guides are shipped artifacts: `common/docs/herdr-run/AGENT_USER_GUIDE.md` is embedded into the
-crate and symlinked into the wheel, the rendered user guides go inside both distributions, and
+The guides are shipped artifacts: `py/agentctl/USER_GUIDE.md` is embedded into the agent-control
+crate and included in the wheel, the shell guides go inside both distributions, and
 `CONFIG_TEMPLATE.yaml` is what `herdr-run init` writes into a project. Agents read those documents
 as fact. Until this guard existed, "up to `--ready-timeout` (900 seconds by default)" was held true
-by nothing at all: the constant lives in four places across two implementations, and changing them
+by nothing at all: the constant lives in several places across two implementations, and changing them
 left the sentence quietly asserting the old number.
 
 **This is not a self-fulfilling test.** The repository has repeatedly written checks that read a
@@ -17,8 +17,8 @@ constant in memory and requiring this check to go red and name the document.
 
 What is pinned, and the rule for each:
 
-* A pin's CODE sites must all agree. `ready_timeout` is written out in four places (Rust default
-  struct, Rust CLI default, Python signature default, Python argparse default); an edition that
+* A pin's CODE sites must all agree. `ready_timeout` is written out in library defaults and both canonical and
+  compatibility CLI defaults; an edition that
   changes one of them is a bug before any document is consulted.
 * A pin's DOC sites must each match at least once, and EVERY occurrence must equal the code value.
   At-least-once matters as much as the equality: a sentence that is reworded until the pattern
@@ -153,34 +153,45 @@ class Pin:
 PINS: tuple[Pin, ...] = (
     Pin(
         "agent-ready-timeout",
-        "herdr-agent `--ready-timeout`, in seconds",
+        "agent-control `--ready-timeout`, in seconds",
         code=(
             Site(
-                "rs/herdr-run/src/agent.rs",
+                "rs/agentctl/src/agent.rs",
                 r"(?s)impl Default for DrainOptions \{.{0,200}?"
                 r"ready_timeout: Duration::from_secs\((?P<value>[\d_]+)\)",
                 "the Rust delivery default",
             ),
             Site(
-                "rs/herdr-run/src/agent_cli.rs",
+                "rs/agentctl/src/legacy_cli.rs",
                 r"(?m)^\s+ready_timeout: (?P<value>[\d_.]+),$",
                 "the Rust CLI default",
             ),
             Site(
-                "py/herdr_run/agent.py",
+                "py/agentctl/agent.py",
                 r"(?m)^\s+ready_timeout: float = (?P<value>[\d_.]+),$",
                 "the Python delivery default",
             ),
             Site(
-                "py/herdr_run/agent_cli.py",
+                "py/agentctl/legacy_cli.py",
                 r'"--ready-timeout", type=_ascii_float, default=(?P<value>[\d_.]+)\)',
                 "the Python CLI default",
+            ),
+            Site(
+                "py/agentctl/cli.py",
+                r'"--ready-timeout", type=_ascii_float, default=(?P<value>[\d_.]+),',
+                "the canonical Python CLI default",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r'(?s)#\[arg\(long, default_value = "(?P<value>[\d_]+)", value_parser = seconds\)\]'
+                r'\s+ready_timeout: f64',
+                "the canonical Rust CLI default",
             ),
         ),
         docs=(
             Site(
-                "common/docs/herdr-run/AGENT_USER_GUIDE.md",
-                r"`--ready-timeout` \((?P<value>[\d,]+) seconds by default\)",
+                "py/agentctl/USER_GUIDE.md",
+                r"default readiness wait is (?P<value>[\d,]+) seconds",
                 "the readiness wait the agent guide promises",
             ),
         ),
@@ -374,19 +385,29 @@ PINS: tuple[Pin, ...] = (
                 "the Python config bound",
             ),
             Site(
-                "rs/herdr-run/src/agent_cli.rs",
+                "rs/agentctl/src/legacy_cli.rs",
                 r"(?m)^const MAX_WAIT_SECONDS: f64 = (?P<value>[\d_.]+);$",
                 "the Rust herdr-agent bound",
             ),
             Site(
-                "py/herdr_run/agent_cli.py",
+                "py/agentctl/legacy_cli.py",
                 r"(?m)^_MAX_WAIT_SECONDS = (?P<value>[\d_.]+)$",
                 "the Python herdr-agent bound",
+            ),
+            Site(
+                "py/agentctl/cli.py",
+                r"value < 0 or value > (?P<value>[\d_]+)",
+                "the canonical Python CLI timeout bound",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"!\(0\.0\.\.=(?P<value>[\d_.]+)\)\.contains\(&value\)",
+                "the canonical Rust CLI timeout bound",
             ),
         ),
         docs=(
             Site(
-                "common/docs/herdr-run/AGENT_USER_GUIDE.md",
+                "py/agentctl/USER_GUIDE.md",
                 r"finite seconds no\s+greater than (?P<value>[\d_,]+)",
                 "the wait ceiling the agent guide states",
             ),
@@ -412,19 +433,24 @@ PINS: tuple[Pin, ...] = (
         "the largest accepted `--max-attempts` / `--lines`",
         code=(
             Site(
-                "rs/herdr-run/src/agent_cli.rs",
+                "rs/agentctl/src/legacy_cli.rs",
                 r"(?m)^const MAX_COUNT: u64 = (?P<value>[\d_]+);$",
                 "the Rust bound",
             ),
             Site(
-                "py/herdr_run/agent_cli.py",
+                "py/agentctl/legacy_cli.py",
                 r"(?m)^_MAX_COUNT = (?P<value>[\d_]+)$",
                 "the Python bound",
+            ),
+            Site(
+                "rs/agentctl/src/cli.rs",
+                r"value_parser = clap::value_parser!\((?:u64|u32)\)\.range\(1\.\.=(?P<value>[\d_]+)\)",
+                "the canonical Rust CLI count bounds",
             ),
         ),
         docs=(
             Site(
-                "common/docs/herdr-run/AGENT_USER_GUIDE.md",
+                "py/agentctl/USER_GUIDE.md",
                 r"must be between 1 and (?P<value>[\d_,]+)",
                 "the count ceiling the agent guide states",
             ),
