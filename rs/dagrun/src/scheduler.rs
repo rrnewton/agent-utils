@@ -58,6 +58,7 @@ use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_column
 use crate::resource_caps::{Acquire as SharedResourceAcquire, Coordinator as ResourceCoordinator};
 use crate::test_results::TestResult;
 use crate::test_results::TestResults;
+use crate::test_results::TestResultsErrorKind;
 
 /// The outer DAG step that launched this process. A second scheduler in that process tree must
 /// refuse by default instead of competing with its parent while reporting a whole inner graph as
@@ -1183,6 +1184,7 @@ fn publish_supervisor_failure(
                 filtered_tests: None,
                 test_results: None,
                 test_results_error: None,
+                test_results_error_kind: None,
                 returncode: None,
                 oomed: false,
                 oom_kills: 0,
@@ -2623,29 +2625,39 @@ fn structured_test_counts_path(
     )))
 }
 
+#[derive(Debug)]
+struct StructuredTestResultsError {
+    kind: TestResultsErrorKind,
+    message: String,
+}
+
 fn read_structured_test_counts(
     path: &std::path::Path,
     declared_schema: Option<u64>,
-) -> Result<Option<CapturedTestResults>, String> {
+) -> Result<Option<CapturedTestResults>, StructuredTestResultsError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(format!(
-                "cannot read structured test results {}: {error}",
-                path.display()
-            ));
+            return Err(StructuredTestResultsError {
+                kind: TestResultsErrorKind::ReadIo,
+                message: format!(
+                    "cannot read structured test results {}: {error}",
+                    path.display()
+                ),
+            });
         }
     };
     let report = match declared_schema {
         Some(schema) => TestResults::from_declared_schema_json_slice(&bytes, schema),
         None => TestResults::from_json_slice(&bytes),
     }
-    .map_err(|error| {
-        format!(
+    .map_err(|error| StructuredTestResultsError {
+        kind: TestResultsErrorKind::InvalidReport,
+        message: format!(
             "malformed structured test results {}: {error}",
             path.display()
-        )
+        ),
     })?;
     Ok(Some(CapturedTestResults {
         executed: Some(report.executed_tests),
@@ -2731,7 +2743,7 @@ fn resolved_test_counts(
     mode: TestResultsMode,
     path: Option<&std::path::Path>,
     captured: &[u8],
-) -> Result<CapturedTestResults, String> {
+) -> Result<CapturedTestResults, StructuredTestResultsError> {
     match mode {
         TestResultsMode::Structured(schema) => {
             if let Some(path) = path {
@@ -2742,7 +2754,10 @@ fn resolved_test_counts(
                 match read_structured_test_counts(path, Some(schema)) {
                     Ok(Some(counts)) => return Ok(counts),
                     Ok(None) => {}
-                    Err(error) => return Err(with_captured_tail(&error, captured)),
+                    Err(mut error) => {
+                        error.message = with_captured_tail(&error.message, captured);
+                        return Err(error);
+                    }
                 }
             }
             let location = path
@@ -2754,10 +2769,13 @@ fn resolved_test_counts(
             // passing, a stale prepared executable, a malformed report and an
             // unsupported event in the stream are byte-identical in the typed
             // record without it.
-            Err(with_captured_tail(
-                &format!("required structured test results were not written to {location}"),
-                captured,
-            ))
+            Err(StructuredTestResultsError {
+                kind: TestResultsErrorKind::Missing,
+                message: with_captured_tail(
+                    &format!("required structured test results were not written to {location}"),
+                    captured,
+                ),
+            })
         }
         TestResultsMode::ExplicitNone => Ok(CapturedTestResults {
             executed: None,
@@ -3773,16 +3791,17 @@ fn run_step(ctx: StepCtx) {
         (cap.tail(), cap.total, cap.dropped())
     };
     let summary = last_line(&combined);
-    let (test_counts, structured_test_results_error) =
+    let (test_counts, structured_test_results_error, structured_test_results_error_kind) =
         match resolved_test_counts(test_results_mode, test_counts_path.as_deref(), &combined) {
-            Ok(counts) => (counts, None),
+            Ok(counts) => (counts, None, None),
             Err(error) => (
                 CapturedTestResults {
                     executed: None,
                     filtered: None,
                     results: None,
                 },
-                Some(error),
+                Some(error.message),
+                Some(error.kind),
             ),
         };
     if let Some(path) = &test_counts_path {
@@ -3943,6 +3962,7 @@ fn run_step(ctx: StepCtx) {
                 outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
             }
             outcome.test_results_error = Some(error.clone());
+            outcome.test_results_error_kind = structured_test_results_error_kind;
             outcome.ok = false;
         } else if let Some(reason) = structured_test_failure_reason(
             &test_counts,
@@ -4084,6 +4104,9 @@ fn run_step(ctx: StepCtx) {
         }
         if let Some(error) = &structured_test_results_error {
             fields.push(("test_results_error", error.clone()));
+        }
+        if let Some(kind) = structured_test_results_error_kind {
+            fields.push(("test_results_error_kind", kind.value().into()));
         }
         e.record("step_end", &fields);
     }
@@ -4848,6 +4871,7 @@ mod tests {
                 printed
             )
             .unwrap_err()
+            .message
             .contains("required structured test results were not written"),
             "a printed banner must not create receipt evidence in structured mode"
         );
@@ -4867,7 +4891,8 @@ run-nextest-counted: cannot derive typed test results from /tmp/tmp.GnIJuuSDYR\n
             None,
             real,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         assert!(
             refusal.contains("expected 505 tests to execute, saw 507"),
             "the cause was discarded: {refusal}"
@@ -4902,7 +4927,8 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             Some(&malformed_path),
             noise,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         std::fs::remove_file(&malformed_path).unwrap();
         assert!(
             malformed.contains("malformed structured test results"),
@@ -4926,7 +4952,8 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             Some(&unreadable),
             noise,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         std::fs::remove_dir(&unreadable).unwrap();
         assert!(
             cannot_read.contains("cannot read structured test results"),
@@ -4943,7 +4970,8 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             None,
             b"   \n\t\n",
         )
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         assert!(
             silent.contains("wrote no output explaining why"),
             "{silent}"
@@ -4957,7 +4985,8 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             None,
             noisy.as_bytes(),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .message;
         assert!(bounded.contains("THE-ACTUAL-CAUSE"), "the tail was dropped");
         assert!(bounded.contains("of 4096 bytes"), "{bounded}");
         assert!(
@@ -4982,6 +5011,103 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         runner.evidence = None;
         let (_ok, wall) = runner.run();
         runner.result(wall)
+    }
+
+    #[test]
+    fn structured_import_kinds_reach_outcomes_and_journals_without_changing_verdicts() {
+        for (name, action, expected_kind) in [
+            ("missing", ":", Some(TestResultsErrorKind::Missing)),
+            (
+                "read_io",
+                "mkdir \"$DAGRUN_TEST_COUNTS_PATH\"",
+                Some(TestResultsErrorKind::ReadIo),
+            ),
+            (
+                "invalid",
+                "printf not-json > \"$DAGRUN_TEST_COUNTS_PATH\"",
+                Some(TestResultsErrorKind::InvalidReport),
+            ),
+            (
+                "failed_test",
+                r#"printf '%s' '{"schema":2,"executed_tests":1,"filtered_tests":7,"results":[{"id":"suite$case","result":"fail","attempts":1}]}' > "$DAGRUN_TEST_COUNTS_PATH""#,
+                None,
+            ),
+        ] {
+            for code in [0, 2, 75] {
+                let dir = std::env::temp_dir().join(format!(
+                    "dagrun-import-kind-{}-{}",
+                    std::process::id(),
+                    TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                let command = format!("{action}; printf 'producer detail\\n' >&2; exit {code}");
+                let cfg = structured_producer(&command, &dir.join("marker"));
+                let mut runner =
+                    Runner::new(&cfg, 1, 1, false, 0, None, None, None, None, None, None);
+                runner.evidence = Some(Arc::new(RunEvidence::open(Some(dir.clone())).unwrap()));
+                let (_, wall) = runner.run();
+                let result = runner.result(wall);
+                assert_eq!(result.outcomes.len(), 1, "{name}/{code}");
+                let outcome = &result.outcomes[0];
+                assert!(!result.ok && !outcome.ok, "{name}/{code}");
+                assert_eq!(outcome.returncode, Some(code));
+                assert_eq!(outcome.test_results_error_kind, expected_kind);
+                assert!(
+                    !outcome.aborted
+                        && !outcome.oomed
+                        && !outcome.timed_out
+                        && !outcome.cpu_timed_out
+                );
+                assert_eq!(outcome.oom_kills, 0);
+                if code != 0 {
+                    assert_eq!(outcome.reason, format!("exit {code}"));
+                }
+                if expected_kind.is_some() {
+                    assert!(outcome
+                        .test_results_error
+                        .as_ref()
+                        .unwrap()
+                        .contains("producer detail"));
+                    assert!(outcome.test_results.is_none());
+                    assert!(outcome.executed_tests.is_none() && outcome.filtered_tests.is_none());
+                } else {
+                    assert!(outcome.test_results_error.is_none());
+                    assert_eq!(outcome.executed_tests, Some(1));
+                    assert_eq!(outcome.filtered_tests, Some(7));
+                    assert_eq!(
+                        outcome.test_results.as_ref().unwrap()[0],
+                        TestResult::new("suite$case".into(), false, 1).unwrap()
+                    );
+                }
+                let records: Vec<serde_json::Value> =
+                    std::fs::read_to_string(dir.join("journal.jsonl"))
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect();
+                let ends: Vec<_> = records
+                    .iter()
+                    .filter(|record| record["event"] == "step_end")
+                    .collect();
+                assert_eq!(ends.len(), 1, "{records:?}");
+                let end = ends[0];
+                // Exit codes remain in StepOutcome; the existing journal stores the reason.
+                assert!(end.get("returncode").is_none());
+                assert_eq!(end["ok"], "false");
+                assert_eq!(end["reason"], outcome.reason);
+                assert_eq!(
+                    end.get("test_results_error_kind")
+                        .and_then(serde_json::Value::as_str),
+                    expected_kind.map(TestResultsErrorKind::value)
+                );
+                assert_eq!(
+                    end.get("test_results_error")
+                        .and_then(serde_json::Value::as_str),
+                    outcome.test_results_error.as_deref()
+                );
+                drop(runner);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
     }
 
     fn structured_producer(command: &str, marker: &std::path::Path) -> DagConfig {

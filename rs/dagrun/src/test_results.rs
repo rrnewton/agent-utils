@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
@@ -113,6 +114,88 @@ pub const CURRENT_SCHEMA: u64 = 2;
 pub const CLASSIFIED_RESULTS_SCHEMA: u64 = 3;
 /// Schema 2 remains readable while result producers migrate atomically.
 pub const RETAINED_RESULTS_SCHEMA: u64 = 2;
+
+/// Why the scheduler could not import a required structured result.
+///
+/// This describes the actual read or validation operation, not the producer's output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestResultsErrorKind {
+    /// No report was present at the scheduler-owned path.
+    Missing,
+    /// Reading the path failed for a reason other than absence.
+    ReadIo,
+    /// The bytes did not satisfy the declared result schema or its invariants.
+    InvalidReport,
+}
+
+impl TestResultsErrorKind {
+    /// Stable spelling in retained event records.
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::ReadIo => "read_io",
+            Self::InvalidReport => "invalid_report",
+        }
+    }
+
+    /// Decode a known kind. Unknown or absent retained values have no typed authority.
+    pub fn from_value(value: &str) -> Option<Self> {
+        match value {
+            "missing" => Some(Self::Missing),
+            "read_io" => Some(Self::ReadIo),
+            "invalid_report" => Some(Self::InvalidReport),
+            _ => None,
+        }
+    }
+}
+
+/// Failure to validate, write, or atomically publish a structured result.
+#[derive(Debug)]
+pub enum TestResultsWriteError {
+    /// The report, schema, or destination path was invalid before I/O.
+    Invalid(String),
+    /// Writing the temporary file failed.
+    Write {
+        /// The temporary path actually written.
+        path: PathBuf,
+        /// The original filesystem error.
+        source: io::Error,
+    },
+    /// Renaming the completed temporary file to its destination failed.
+    Publish {
+        /// The final destination path.
+        path: PathBuf,
+        /// The original filesystem error.
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for TestResultsWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::Write { path, source } => write!(
+                formatter,
+                "structured-test-results-write {}: {source}",
+                path.display()
+            ),
+            Self::Publish { path, source } => write!(
+                formatter,
+                "structured-test-results-publish {}: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TestResultsWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Invalid(_) => None,
+            Self::Write { source, .. } | Self::Publish { source, .. } => Some(source),
+        }
+    }
+}
 
 /// Classified terminal cause for one test-runner attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -542,33 +625,52 @@ impl TestResults {
 
     /// Atomically publish the current shape at the scheduler-owned path.
     pub fn write_current(&self, path: &Path) -> Result<(), String> {
-        let bytes = self.to_current_json()?;
-        self.write_bytes(path, bytes)
+        self.write_current_typed(path)
+            .map_err(|error| error.to_string())
     }
 
     /// Atomically publish explicitly classified schema-3 results.
     pub fn write_classified(&self, path: &Path) -> Result<(), String> {
-        self.write_bytes(path, self.to_classified_json()?)
+        self.write_classified_typed(path)
+            .map_err(|error| error.to_string())
     }
 
-    fn write_bytes(&self, path: &Path, bytes: Vec<u8>) -> Result<(), String> {
+    /// Atomically publish schema 2, retaining validation versus filesystem failure.
+    pub fn write_current_typed(&self, path: &Path) -> Result<(), TestResultsWriteError> {
+        let bytes = self
+            .to_current_json()
+            .map_err(TestResultsWriteError::Invalid)?;
+        self.write_bytes(path, bytes)
+    }
+
+    /// Atomically publish schema 3, retaining validation versus filesystem failure.
+    pub fn write_classified_typed(&self, path: &Path) -> Result<(), TestResultsWriteError> {
+        let bytes = self
+            .to_classified_json()
+            .map_err(TestResultsWriteError::Invalid)?;
+        self.write_bytes(path, bytes)
+    }
+
+    fn write_bytes(&self, path: &Path, bytes: Vec<u8>) -> Result<(), TestResultsWriteError> {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| "structured-test-results-path has no UTF-8 file name".to_string())?;
+            .ok_or_else(|| {
+                TestResultsWriteError::Invalid(
+                    "structured-test-results-path has no UTF-8 file name".to_string(),
+                )
+            })?;
         let temporary = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
-        fs::write(&temporary, bytes).map_err(|error| {
-            format!(
-                "structured-test-results-write {}: {error}",
-                temporary.display()
-            )
+        fs::write(&temporary, bytes).map_err(|source| TestResultsWriteError::Write {
+            path: temporary.clone(),
+            source,
         })?;
-        if let Err(error) = fs::rename(&temporary, path) {
+        if let Err(source) = fs::rename(&temporary, path) {
             let _ = fs::remove_file(&temporary);
-            return Err(format!(
-                "structured-test-results-publish {}: {error}",
-                path.display()
-            ));
+            return Err(TestResultsWriteError::Publish {
+                path: path.to_path_buf(),
+                source,
+            });
         }
         Ok(())
     }
@@ -723,6 +825,132 @@ mod tests {
         assert!(TestResults::from_json_slice(extra)
             .unwrap_err()
             .contains("2 terminal row(s), expected exactly 1 executed test(s)"));
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn typed_publication_keeps_validation_atomicity_and_original_io_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun-typed-publication-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let current = TestResults::current(
+            1,
+            2,
+            vec![TestResult::new("suite$case".into(), false, 1).unwrap()],
+        )
+        .unwrap();
+        let classified = TestResults::classified(
+            1,
+            2,
+            vec![TestResult::with_attempt_results(
+                "suite$case".into(),
+                false,
+                vec![
+                    TestAttemptResult::new(1, TestAttemptOutcome::Failed, Some("exit 17".into()))
+                        .unwrap(),
+                ],
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        for (name, report, schema) in [("current", current, 2), ("classified", classified, 3)] {
+            let typed_write = |report: &TestResults, path: &Path| match schema {
+                2 => report.write_current_typed(path),
+                _ => report.write_classified_typed(path),
+            };
+            let legacy_write = |report: &TestResults, path: &Path| match schema {
+                2 => report.write_current(path),
+                _ => report.write_classified(path),
+            };
+            let output = dir.join(name);
+            typed_write(&report, &output).unwrap();
+            let bytes = fs::read(&output).unwrap();
+            assert_eq!(
+                TestResults::from_declared_schema_json_slice(&bytes, schema).unwrap(),
+                report
+            );
+            legacy_write(&report, &output).unwrap();
+            assert_eq!(fs::read(&output).unwrap(), bytes);
+
+            // A genuine fs::write failure: its parent does not exist.
+            let missing = dir.join("missing").join(name);
+            let error = typed_write(&report, &missing).unwrap_err();
+            let TestResultsWriteError::Write { path, source } = &error else {
+                panic!("expected the original write I/O error: {error:?}");
+            };
+            assert_eq!(source.kind(), io::ErrorKind::NotFound);
+            assert_eq!(path.parent(), missing.parent());
+            assert!(std::error::Error::source(&error).is_some());
+            assert_eq!(
+                legacy_write(&report, &missing).unwrap_err(),
+                error.to_string()
+            );
+            assert!(!missing.exists());
+
+            // A real atomic publication failure, independent of uid permission bypasses.
+            let destination = dir.join(format!("{name}-directory"));
+            fs::create_dir(&destination).unwrap();
+            let error = typed_write(&report, &destination).unwrap_err();
+            let TestResultsWriteError::Publish { path, source } = &error else {
+                panic!("expected the original rename I/O error: {error:?}");
+            };
+            assert_eq!(path, &destination);
+            assert!(source.raw_os_error().is_some());
+            assert_eq!(
+                legacy_write(&report, &destination).unwrap_err(),
+                error.to_string()
+            );
+            assert!(destination.is_dir());
+            assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+            let temporary = dir.join(format!(".{name}-directory.tmp-{}", std::process::id()));
+            assert!(
+                !temporary.exists(),
+                "failed rename must retain existing cleanup"
+            );
+
+            // Invalid evidence must refuse BEFORE either inaccessible destination is touched.
+            let mut invalid = report.clone();
+            invalid.executed_tests = 2;
+            let error = typed_write(&invalid, &missing).unwrap_err();
+            assert!(matches!(&error, TestResultsWriteError::Invalid(_)));
+            assert!(error
+                .to_string()
+                .contains("expected exactly 2 executed test(s)"));
+            assert_eq!(
+                legacy_write(&invalid, &missing).unwrap_err(),
+                error.to_string()
+            );
+            assert!(std::error::Error::source(&error).is_none());
+            assert_eq!(
+                fs::read(&output).unwrap(),
+                bytes,
+                "prior evidence must survive"
+            );
+            let error = typed_write(&report, Path::new("")).unwrap_err();
+            assert!(matches!(error, TestResultsWriteError::Invalid(_)));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retained_import_kinds_do_not_invent_authority_for_unknown_values() {
+        for kind in [
+            TestResultsErrorKind::Missing,
+            TestResultsErrorKind::ReadIo,
+            TestResultsErrorKind::InvalidReport,
+        ] {
+            assert_eq!(TestResultsErrorKind::from_value(kind.value()), Some(kind));
+        }
+        for unknown in ["", "future", "Missing", "missing; last output: read_io"] {
+            assert_eq!(TestResultsErrorKind::from_value(unknown), None);
+        }
     }
 }
 

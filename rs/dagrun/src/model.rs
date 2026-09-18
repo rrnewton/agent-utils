@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 
-use crate::test_results::TestResult;
+use crate::test_results::{TestResult, TestResultsErrorKind};
 
 /// Wall-clock backstop (seconds) for a step that declares NO wall budget AND no CPU budget to
 /// derive one from. Wall time is LOAD-DEPENDENT, so it is only a defence-in-depth hang backstop;
@@ -1773,6 +1773,8 @@ pub struct StepOutcome {
     pub test_results: Option<Vec<TestResult>>,
     /// Required-result refusal, preserved separately from any outer failure cause.
     pub test_results_error: Option<String>,
+    /// Actual import operation that failed; absent for older or unclassified evidence.
+    pub test_results_error_kind: Option<TestResultsErrorKind>,
     /// Child process exit code; negative for a Unix signal; `None` if never collected.
     pub returncode: Option<i64>,
     /// Whether this step or one of its descendants hit the step's inner memory limit.
@@ -1811,6 +1813,7 @@ impl StepOutcome {
             filtered_tests,
             test_results: None,
             test_results_error: None,
+            test_results_error_kind: None,
             returncode,
             oomed: false,
             oom_kills: 0,
@@ -1867,6 +1870,7 @@ impl StepOutcome {
             filtered_tests,
             test_results: None,
             test_results_error: None,
+            test_results_error_kind: None,
             returncode,
             oomed,
             oom_kills,
@@ -1902,6 +1906,7 @@ impl StepOutcome {
             filtered_tests,
             test_results: None,
             test_results_error: None,
+            test_results_error_kind: None,
             returncode,
             oomed: false,
             oom_kills: 0,
