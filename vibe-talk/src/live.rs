@@ -8,8 +8,8 @@
 //!
 //! Discord's real-time mechanism is the Gateway, and this server does not use it. It keeps a
 //! per-channel snowflake cursor, seeds it with
-//! [`crate::discord::DiscordClient::fetch_recent`], and thereafter walks forward from it with
-//! [`crate::discord::DiscordClient::fetch_page`]'s `after` on an interval.
+//! [`crate::chat::ChatClient::fetch_recent`], and thereafter walks forward from it with
+//! [`crate::chat::ChatClient::fetch_page`]'s `after` on an interval.
 //!
 //! That is a deliberate choice against the more capable option, for three reasons:
 //!
@@ -103,7 +103,7 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
-use crate::discord::{DiscordClient, DiscordError};
+use crate::chat::{ChatClient, ChatError};
 use crate::model::{sort_oldest_first, ChannelId, Message, MessageId};
 use crate::state::AppState;
 
@@ -402,19 +402,19 @@ pub struct Tick {
 ///
 /// # Errors
 ///
-/// [`DiscordError`] from the fetch. **The cursor is not advanced past anything that was not
+/// [`ChatError`] from the fetch. **The cursor is not advanced past anything that was not
 /// published**, so the next successful tick publishes everything that arrived in the meantime
 /// rather than skipping it. It IS advanced past what this tick already published before the
 /// failure, because republishing that would relay the same message into a paid conversation twice.
 pub async fn poll_once(
-    discord: &dyn DiscordClient,
+    chat: &dyn ChatClient,
     hub: &LiveHub,
     channel: &ChannelId,
     limit: u16,
     cursor: &mut Option<u64>,
-) -> Result<Tick, DiscordError> {
+) -> Result<Tick, ChatError> {
     let Some(seen) = *cursor else {
-        let messages = discord.fetch_recent(channel, limit).await?;
+        let messages = chat.fetch_recent(channel, limit).await?;
         // Seed. `unwrap_or(0)` rather than leaving the cursor unset: an EMPTY channel is a
         // perfectly good starting point, and leaving it `None` would make the next tick seed
         // again and publish nothing for as long as the channel stayed quiet.
@@ -434,7 +434,7 @@ pub async fn poll_once(
     let mut backlog = false;
     for page in 0..MAX_PAGES_PER_TICK {
         let after = MessageId(at.to_string());
-        let mut messages = match discord.fetch_page(channel, limit, None, Some(&after)).await {
+        let mut messages = match chat.fetch_page(channel, limit, None, Some(&after)).await {
             Ok(messages) => messages,
             Err(error) => {
                 // Whatever went out in an earlier page of this tick really went out. Rewinding to
@@ -517,7 +517,7 @@ async fn poll_state_loop(
     ticks: Option<u32>,
 ) {
     poll_loop_with_channels(
-        state.discord.as_ref(),
+        state.chat.as_ref(),
         state.live.as_ref(),
         || {
             state
@@ -542,7 +542,7 @@ async fn poll_state_loop(
 /// as a comment.
 #[cfg(test)]
 async fn poll_loop(
-    discord: &dyn DiscordClient,
+    chat: &dyn ChatClient,
     hub: &LiveHub,
     channels: &[ChannelId],
     limit: u16,
@@ -552,7 +552,7 @@ async fn poll_loop(
 ) {
     let channels = channels.to_vec();
     poll_loop_with_channels(
-        discord,
+        chat,
         hub,
         || channels.clone(),
         limit,
@@ -564,7 +564,7 @@ async fn poll_loop(
 }
 
 async fn poll_loop_with_channels(
-    discord: &dyn DiscordClient,
+    chat: &dyn ChatClient,
     hub: &LiveHub,
     mut channels: impl FnMut() -> Vec<ChannelId>,
     limit: u16,
@@ -589,7 +589,7 @@ async fn poll_loop_with_channels(
         for channel in &channels {
             let cursor = cursors.entry(channel.clone()).or_default();
             let failed = failures.entry(channel.clone()).or_insert(0);
-            match poll_once(discord, hub, channel, limit, cursor).await {
+            match poll_once(chat, hub, channel, limit, cursor).await {
                 Ok(tick) => {
                     if *failed > 0 {
                         tracing::info!(

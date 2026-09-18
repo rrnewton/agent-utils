@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use vibe_talk::agent_backend::NoAgentBackend;
+use vibe_talk::chat::ChatClient;
 use vibe_talk::config::{Config, ENV_CONFIG_PATH};
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::discord::http::HttpDiscordClient;
-use vibe_talk::discord::DiscordClient;
 use vibe_talk::elevenlabs::http::HttpElevenLabsClient;
 use vibe_talk::elevenlabs::{SignedUrlProvider, SpeechProvider};
 use vibe_talk::probe::{self, ENV_SKIP_STARTUP_PROBE};
@@ -222,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
             .context("assembling configuration from the environment alone")?
     };
 
-    let discord: Arc<dyn DiscordClient> = if args.fake_discord {
+    let chat: Arc<dyn ChatClient> = if args.fake_discord {
         tracing::warn!(
             "--fake-discord: serving an IN-MEMORY Discord. Nothing is read from or posted to a \
              real channel."
@@ -286,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    run_startup_probe(discord.as_ref(), &config, args.skip_startup_probe).await?;
+    run_startup_probe(chat.as_ref(), &config, args.skip_startup_probe).await?;
 
     for channel in &config.channels {
         tracing::info!(
@@ -446,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
     let live_limit = config.discord.default_fetch_limit;
     let state = AppState {
         config: Arc::new(config),
-        discord: Arc::clone(&discord),
+        chat: Arc::clone(&chat),
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs,
@@ -503,12 +503,12 @@ async fn main() -> anyhow::Result<()> {
 /// configured, but never added to the channel — is invisible at startup today and surfaces later
 /// as an empty digest, which reads like a bug in this code.
 async fn run_startup_probe(
-    discord: &dyn DiscordClient,
+    chat: &dyn ChatClient,
     config: &Config,
     skip_flag: bool,
 ) -> anyhow::Result<()> {
     let skip_env = std::env::var(ENV_SKIP_STARTUP_PROBE).ok();
-    match probe::startup_check(discord, &config.channels, skip_flag, skip_env.as_deref()).await {
+    match probe::startup_check(chat, &config.channels, skip_flag, skip_env.as_deref()).await {
         // Loudly, and naming which switch did it: a skipped check that says nothing is the same
         // silent start this probe was added to remove.
         probe::StartupCheck::Skipped { source } => {

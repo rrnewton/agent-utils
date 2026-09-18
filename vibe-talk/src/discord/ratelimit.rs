@@ -65,13 +65,15 @@
 //! observation.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::DiscordError;
+use crate::chat::ChatError;
+#[cfg(test)]
+use crate::chat::ChatError as DiscordError;
+pub use crate::chat::RateLimitExhausted;
 
 /// How many times one logical request may be sent before the rate limit is declared unclearable.
 ///
@@ -153,52 +155,6 @@ pub struct RateLimit {
     /// Discord's `X-RateLimit-Scope`, verbatim, when present. Recorded for the log; nothing
     /// branches on it beyond `global`.
     pub scope: Option<String>,
-}
-
-/// Why a request gave up, in enough detail to act on.
-///
-/// Carried by [`super::DiscordError::RateLimited`]. Every field is here so the failure NAMES the
-/// rate limit rather than reading as a generic upstream error: whoever sees this knows it was
-/// quota, which route, and that the client really did wait first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RateLimitExhausted {
-    /// The method and path whose bucket was exhausted.
-    pub route: String,
-    /// How many times the request was actually sent. Zero when a known-empty bucket meant it was
-    /// never worth sending at all.
-    pub attempts: u32,
-    /// How long this call spent waiting before giving up.
-    pub waited: Duration,
-    /// The total-wait budget it was measured against.
-    pub budget: Duration,
-    /// What Discord last asked for, and which was not affordable.
-    pub retry_after: Duration,
-    /// Whether the limit was global rather than per-route.
-    pub global: bool,
-}
-
-impl fmt::Display for RateLimitExhausted {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let scope = if self.global {
-            "GLOBAL, the whole bot token"
-        } else {
-            "this route's bucket"
-        };
-        let gave_up = if self.attempts == 0 {
-            "gave up without sending it, because that bucket is known to be empty".to_owned()
-        } else {
-            format!("gave up after {} attempt(s)", self.attempts)
-        };
-        write!(
-            f,
-            "discord RATE LIMIT ({scope}) on {route}: {gave_up}; waited {waited:.1}s of a \
-             {budget:.0}s budget and discord still wants {retry_after:.1}s more",
-            route = self.route,
-            waited = self.waited.as_secs_f64(),
-            budget = self.budget.as_secs_f64(),
-            retry_after = self.retry_after.as_secs_f64(),
-        )
-    }
 }
 
 /// The bounds on waiting.
@@ -450,15 +406,10 @@ impl RateLimiter {
     /// Returns whatever `attempt` returns, and [`DiscordError::RateLimited`] when the attempt or
     /// total-wait budget runs out with the limit still in force. It never returns a success it did
     /// not get.
-    pub async fn run<T, F, Fut>(
-        &self,
-        method: &str,
-        url: &str,
-        attempt: F,
-    ) -> Result<T, DiscordError>
+    pub async fn run<T, F, Fut>(&self, method: &str, url: &str, attempt: F) -> Result<T, ChatError>
     where
         F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<Attempt<T>, DiscordError>>,
+        Fut: std::future::Future<Output = Result<Attempt<T>, ChatError>>,
     {
         let route = route_key(method, url);
         let budget = self.policy.max_total_wait;
@@ -521,8 +472,9 @@ impl RateLimiter {
         waited: Duration,
         retry_after: Duration,
         global: bool,
-    ) -> DiscordError {
+    ) -> ChatError {
         let detail = RateLimitExhausted {
+            provider: "discord",
             route: route.to_owned(),
             attempts,
             waited,
@@ -531,7 +483,7 @@ impl RateLimiter {
             global,
         };
         tracing::warn!(%detail, "giving up on a discord request: the rate limit did not clear");
-        DiscordError::RateLimited(detail)
+        ChatError::RateLimited(detail)
     }
 }
 

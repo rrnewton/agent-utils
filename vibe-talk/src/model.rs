@@ -1,6 +1,8 @@
-//! The message and channel types the whole server speaks in.
+//! The normalized message and channel types the whole server speaks in.
 //!
-//! These are deliberately independent of Discord's wire format: [`crate::discord`] converts.
+//! Provider implementations convert their wire formats into these types. The current cursor and
+//! ordering helpers still describe Discord snowflakes; making those provider-neutral is a separate
+//! migration because the browser and durable store rely on the same ordering contract.
 
 use serde::{Deserialize, Serialize};
 
@@ -108,14 +110,14 @@ impl std::fmt::Display for UserId {
     }
 }
 
-/// One message as the rest of the server sees it.
+/// One chat message as the rest of the server sees it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     /// Snowflake of this message.
     pub id: MessageId,
-    /// Channel the message was read from.
+    /// Channel the message was read from, in the provider-neutral application namespace.
     pub channel_id: ChannelId,
-    /// Display name of the author, as reported by Discord.
+    /// Display name of the author, as reported by the chat provider.
     pub author: String,
     /// Snowflake of the author.
     ///
@@ -134,9 +136,9 @@ pub struct Message {
     /// Bots have ids too and they are included: addressing another coding agent by mention is a
     /// legitimate thing to want.
     pub author_id: UserId,
-    /// Whether Discord flagged the author as a bot.
+    /// Whether the chat provider flagged the author as a bot.
     pub author_is_bot: bool,
-    /// The EXACT instant, ISO-8601, as reported by Discord. Compute with this one.
+    /// The exact instant, ISO-8601, as reported by the chat provider. Compute with this one.
     ///
     /// Unrounded on purpose: sub-second precision is ordering information, and anything that has
     /// to decide which of two messages came first needs it. This field is never spoken; see

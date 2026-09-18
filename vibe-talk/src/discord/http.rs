@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::ratelimit::{parse_rate_limit, Attempt, Headers, RateLimiter};
-use super::{BotIdentity, DiscordClient, DiscordError};
+#[cfg(test)]
+use crate::chat::ChatError as DiscordError;
+use crate::chat::{ChatClient, ChatError, ChatIdentity};
 use crate::config::{DiscordConfig, Secret};
 use crate::model::{ChannelId, Message, MessageId, UserId};
 
@@ -89,9 +91,9 @@ pub fn page_request(
     limit: u16,
     before: Option<&MessageId>,
     after: Option<&MessageId>,
-) -> Result<PreparedRequest, DiscordError> {
+) -> Result<PreparedRequest, ChatError> {
     if before.is_some() && after.is_some() {
-        return Err(DiscordError::Refused(
+        return Err(ChatError::Refused(
             "before and after cannot both be given: discord does not define what that means"
                 .to_owned(),
         ));
@@ -144,16 +146,16 @@ pub fn identity_request(api_base: &str) -> PreparedRequest {
 /// Returns [`DiscordError::Shape`] when the payload carries no string `id`. The username is
 /// allowed to be absent — it is a label, and refusing an otherwise perfectly good identity over a
 /// missing display name would turn a cosmetic difference into a failed credential check.
-pub fn parse_identity(value: &serde_json::Value) -> Result<BotIdentity, DiscordError> {
+pub fn parse_identity(value: &serde_json::Value) -> Result<ChatIdentity, ChatError> {
     let id = value
         .get("id")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .ok_or_else(|| {
-            DiscordError::Shape("the identity answer has no string \"id\" field".to_owned())
+            ChatError::Shape("the identity answer has no string \"id\" field".to_owned())
         })?;
-    Ok(BotIdentity {
+    Ok(ChatIdentity {
         id: id.to_owned(),
         username: value
             .get("username")
@@ -174,12 +176,12 @@ pub fn post_request(
     channel: &ChannelId,
     content: &str,
     reply_to: Option<&MessageId>,
-) -> Result<PreparedRequest, DiscordError> {
+) -> Result<PreparedRequest, ChatError> {
     if content.trim().is_empty() {
-        return Err(DiscordError::Refused("message content is empty".to_owned()));
+        return Err(ChatError::Refused("message content is empty".to_owned()));
     }
     if content.chars().count() > DISCORD_MAX_CONTENT_LEN {
-        return Err(DiscordError::Refused(format!(
+        return Err(ChatError::Refused(format!(
             "message content is {} characters; discord accepts at most {DISCORD_MAX_CONTENT_LEN}",
             content.chars().count()
         )));
@@ -220,26 +222,26 @@ pub fn post_request(
 /// # Errors
 ///
 /// Returns [`DiscordError::Shape`] when a required field is absent or the wrong type.
-pub fn parse_message(value: &serde_json::Value) -> Result<Message, DiscordError> {
-    let field = |name: &str| -> Result<String, DiscordError> {
+pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
+    let field = |name: &str| -> Result<String, ChatError> {
         value
             .get(name)
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| DiscordError::Shape(format!("message is missing a string {name:?}")))
+            .ok_or_else(|| ChatError::Shape(format!("message is missing a string {name:?}")))
     };
     let author = value
         .get("author")
-        .ok_or_else(|| DiscordError::Shape("message is missing an author".to_owned()))?;
+        .ok_or_else(|| ChatError::Shape("message is missing an author".to_owned()))?;
     let name = author
         .get("global_name")
         .and_then(serde_json::Value::as_str)
         .or_else(|| author.get("username").and_then(serde_json::Value::as_str))
-        .ok_or_else(|| DiscordError::Shape("author has no username".to_owned()))?;
+        .ok_or_else(|| ChatError::Shape("author has no username".to_owned()))?;
     let author_id = author
         .get("id")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| DiscordError::Shape("author has no id".to_owned()))?;
+        .ok_or_else(|| ChatError::Shape("author has no id".to_owned()))?;
     Ok(Message {
         id: MessageId(field("id")?),
         channel_id: ChannelId(field("channel_id")?),
@@ -280,10 +282,10 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, DiscordError>
 /// # Errors
 ///
 /// Returns [`DiscordError::Shape`] when the payload is not an array of understandable messages.
-pub fn parse_message_list(value: &serde_json::Value) -> Result<Vec<Message>, DiscordError> {
+pub fn parse_message_list(value: &serde_json::Value) -> Result<Vec<Message>, ChatError> {
     let items = value
         .as_array()
-        .ok_or_else(|| DiscordError::Shape("expected a JSON array of messages".to_owned()))?;
+        .ok_or_else(|| ChatError::Shape("expected a JSON array of messages".to_owned()))?;
     let mut messages = items
         .iter()
         .map(parse_message)
@@ -333,7 +335,7 @@ impl HttpDiscordClient {
     /// # Errors
     ///
     /// Returns [`DiscordError::Transport`] when the underlying HTTP client cannot be built.
-    pub fn new(config: &DiscordConfig) -> Result<Self, DiscordError> {
+    pub fn new(config: &DiscordConfig) -> Result<Self, ChatError> {
         let client = reqwest::Client::builder()
             .user_agent(concat!(
                 "vibe-talk (https://github.com/rrnewton/agent-utils, ",
@@ -342,7 +344,7 @@ impl HttpDiscordClient {
             ))
             .timeout(std::time::Duration::from_secs(20))
             .build()
-            .map_err(|e| DiscordError::Transport(e.to_string()))?;
+            .map_err(|e| ChatError::Transport(e.to_string()))?;
         Ok(Self {
             client,
             api_base: config.api_base.clone(),
@@ -362,11 +364,11 @@ impl HttpDiscordClient {
     /// The retry lives here rather than in the caller because the bucket state has to be shared:
     /// a per-caller retry would have every route rediscovering the same closed window one rejected
     /// request at a time.
-    async fn send(&self, request: PreparedRequest) -> Result<serde_json::Value, DiscordError> {
+    async fn send(&self, request: PreparedRequest) -> Result<serde_json::Value, ChatError> {
         let method = match request.method {
             "GET" => reqwest::Method::GET,
             "POST" => reqwest::Method::POST,
-            other => return Err(DiscordError::Refused(format!("unsupported method {other}"))),
+            other => return Err(ChatError::Refused(format!("unsupported method {other}"))),
         };
         let url = &request.url;
         let body = request.body.as_ref();
@@ -382,13 +384,13 @@ impl HttpDiscordClient {
                 let response = builder
                     .send()
                     .await
-                    .map_err(|e| DiscordError::Transport(e.to_string()))?;
+                    .map_err(|e| ChatError::Transport(e.to_string()))?;
                 let status = response.status();
                 let headers = rate_limit_headers(response.headers());
                 let text = response
                     .text()
                     .await
-                    .map_err(|e| DiscordError::Transport(e.to_string()))?;
+                    .map_err(|e| ChatError::Transport(e.to_string()))?;
                 // Before the generic failure path: a 429 is an instruction to wait, not an error
                 // to report. Surfacing it as one is what used to turn a transient burst into an
                 // HTTP 502 for whoever asked the question.
@@ -400,13 +402,13 @@ impl HttpDiscordClient {
                     // not, and this string ends up in a log.
                     let mut body = text;
                     body.truncate(500);
-                    return Err(DiscordError::Status {
+                    return Err(ChatError::Status {
                         status: status.as_u16(),
                         body,
                     });
                 }
                 let value: serde_json::Value =
-                    serde_json::from_str(&text).map_err(|e| DiscordError::Shape(e.to_string()))?;
+                    serde_json::from_str(&text).map_err(|e| ChatError::Shape(e.to_string()))?;
                 Ok(Attempt::Done(value, headers))
             })
             .await
@@ -414,8 +416,8 @@ impl HttpDiscordClient {
 }
 
 #[async_trait]
-impl DiscordClient for HttpDiscordClient {
-    async fn identity(&self) -> Result<BotIdentity, DiscordError> {
+impl ChatClient for HttpDiscordClient {
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
         let value = self.send(identity_request(&self.api_base)).await?;
         parse_identity(&value)
     }
@@ -426,7 +428,7 @@ impl DiscordClient for HttpDiscordClient {
         limit: u16,
         before: Option<&MessageId>,
         after: Option<&MessageId>,
-    ) -> Result<Vec<Message>, DiscordError> {
+    ) -> Result<Vec<Message>, ChatError> {
         let request = page_request(&self.api_base, channel, limit, before, after)?;
         let value = self.send(request).await?;
         parse_message_list(&value)
@@ -437,7 +439,7 @@ impl DiscordClient for HttpDiscordClient {
         channel: &ChannelId,
         content: &str,
         reply_to: Option<&MessageId>,
-    ) -> Result<Message, DiscordError> {
+    ) -> Result<Message, ChatError> {
         let request = post_request(&self.api_base, channel, content, reply_to)?;
         let value = self.send(request).await?;
         parse_message(&value)

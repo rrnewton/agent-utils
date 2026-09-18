@@ -15,10 +15,10 @@
 //! # What it does, precisely
 //!
 //! For each configured channel it performs the **smallest possible read** —
-//! [`DiscordClient::fetch_recent`] with a limit of one — and classifies the answer. It **never
+//! [`ChatClient::fetch_recent`] with a limit of one — and classifies the answer. It **never
 //! writes**, not even to a channel configured `rw`: a startup check that posted to the owner's
 //! channel on every restart would be its own bug. That property is structural, not a convention:
-//! nothing in this module can reach [`DiscordClient::post_message`].
+//! nothing in this module can reach [`ChatClient::post_message`].
 //!
 //! # Why the causes are kept apart
 //!
@@ -40,7 +40,7 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use crate::discord::{DiscordClient, DiscordError};
+use crate::chat::{ChatClient, ChatError};
 use crate::model::ChannelInfo;
 
 /// Environment variable that skips the startup probe entirely.
@@ -458,15 +458,15 @@ fn discord_error_code(body: &str) -> Option<u64> {
 /// classified by THIS function rather than by a second copy of the same match: a token check that
 /// disagreed with the channel checks about what a 401 means would be worse than no token check.
 #[must_use]
-pub fn classify(error: &DiscordError) -> Diagnosis {
+pub fn classify(error: &ChatError) -> Diagnosis {
     match error {
-        DiscordError::Transport(detail) => Diagnosis::Unreachable(detail.clone()),
-        DiscordError::Shape(detail) => Diagnosis::Unintelligible(detail.clone()),
-        DiscordError::Refused(detail) => Diagnosis::Refused(detail.clone()),
+        ChatError::Transport(detail) => Diagnosis::Unreachable(detail.clone()),
+        ChatError::Shape(detail) => Diagnosis::Unintelligible(detail.clone()),
+        ChatError::Refused(detail) => Diagnosis::Refused(detail.clone()),
         // The client already waited this out and could not clear it, so the probe learned nothing
         // about readability — exactly what a bare 429 used to mean here, and still does.
-        DiscordError::RateLimited(_) => Diagnosis::RateLimited,
-        DiscordError::Status { status, body } => match (*status, discord_error_code(body)) {
+        ChatError::RateLimited(_) => Diagnosis::RateLimited,
+        ChatError::Status { status, body } => match (*status, discord_error_code(body)) {
             (401, _) => Diagnosis::InvalidToken,
             (_, Some(DISCORD_MISSING_ACCESS)) => Diagnosis::NoAccess,
             (_, Some(DISCORD_MISSING_PERMISSIONS)) => Diagnosis::MissingReadHistory,
@@ -488,8 +488,8 @@ pub fn classify(error: &DiscordError) -> Diagnosis {
 ///
 /// Reads one message per channel and never writes. Returns a report rather than an error: the
 /// caller decides what a failure means, and the report is the thing worth logging either way.
-pub async fn probe_channels(discord: &dyn DiscordClient, channels: &[ChannelInfo]) -> ProbeReport {
-    probe_channels_within(discord, channels, None).await
+pub async fn probe_channels(chat: &dyn ChatClient, channels: &[ChannelInfo]) -> ProbeReport {
+    probe_channels_within(chat, channels, None).await
 }
 
 /// Probe every configured channel, giving each read at most `budget`.
@@ -503,14 +503,14 @@ pub async fn probe_channels(discord: &dyn DiscordClient, channels: &[ChannelInfo
 /// A budget that elapses yields [`Diagnosis::TimedOut`] for that channel and the loop CONTINUES:
 /// one unreachable channel must not hide the state of the others.
 pub async fn probe_channels_within(
-    discord: &dyn DiscordClient,
+    chat: &dyn ChatClient,
     channels: &[ChannelInfo],
     budget: Option<Duration>,
 ) -> ProbeReport {
     let mut outcomes = Vec::with_capacity(channels.len());
     let mut aborted = false;
     for channel in channels {
-        let read = discord.fetch_recent(&channel.id, PROBE_LIMIT);
+        let read = chat.fetch_recent(&channel.id, PROBE_LIMIT);
         let answered = match budget {
             Some(budget) => match tokio::time::timeout(budget, read).await {
                 Ok(answered) => answered,
@@ -579,7 +579,7 @@ pub fn env_requests_skip(value: Option<&str>) -> bool {
 /// The skip is resolved here rather than at the call site so that "was it skipped, and by what"
 /// is a value a test can assert on, instead of a branch that only exists inside `main`.
 pub async fn startup_check(
-    discord: &dyn DiscordClient,
+    chat: &dyn ChatClient,
     channels: &[ChannelInfo],
     skip_flag: bool,
     skip_env: Option<&str>,
@@ -592,7 +592,7 @@ pub async fn startup_check(
             source: ENV_SKIP_STARTUP_PROBE,
         };
     }
-    let report = probe_channels(discord, channels).await;
+    let report = probe_channels(chat, channels).await;
     if report.is_failure() {
         StartupCheck::Failed(report)
     } else {
@@ -619,8 +619,8 @@ mod tests {
         }
     }
 
-    fn status(status: u16, body: &str) -> DiscordError {
-        DiscordError::Status {
+    fn status(status: u16, body: &str) -> ChatError {
+        ChatError::Status {
             status,
             body: body.to_owned(),
         }
@@ -759,8 +759,8 @@ mod tests {
     async fn a_rejected_token_aborts_the_remaining_channels() {
         struct AlwaysUnauthorized;
         #[async_trait::async_trait]
-        impl DiscordClient for AlwaysUnauthorized {
-            async fn identity(&self) -> Result<crate::discord::BotIdentity, DiscordError> {
+        impl ChatClient for AlwaysUnauthorized {
+            async fn identity(&self) -> Result<crate::chat::ChatIdentity, ChatError> {
                 Err(status(401, r#"{"message":"401: Unauthorized","code":0}"#))
             }
             async fn fetch_page(
@@ -769,7 +769,7 @@ mod tests {
                 _limit: u16,
                 _before: Option<&crate::model::MessageId>,
                 _after: Option<&crate::model::MessageId>,
-            ) -> Result<Vec<crate::model::Message>, DiscordError> {
+            ) -> Result<Vec<crate::model::Message>, ChatError> {
                 Err(status(401, r#"{"message":"401: Unauthorized","code":0}"#))
             }
             async fn post_message(
@@ -777,7 +777,7 @@ mod tests {
                 _channel: &ChannelId,
                 _content: &str,
                 _reply_to: Option<&crate::model::MessageId>,
-            ) -> Result<crate::model::Message, DiscordError> {
+            ) -> Result<crate::model::Message, ChatError> {
                 panic!("the startup probe must never post");
             }
         }
@@ -797,9 +797,9 @@ mod tests {
         // The highest-cost misconfiguration available, because Discord reports it as success.
         struct BlankContent;
         #[async_trait::async_trait]
-        impl DiscordClient for BlankContent {
-            async fn identity(&self) -> Result<crate::discord::BotIdentity, DiscordError> {
-                Ok(crate::discord::BotIdentity {
+        impl ChatClient for BlankContent {
+            async fn identity(&self) -> Result<crate::chat::ChatIdentity, ChatError> {
+                Ok(crate::chat::ChatIdentity {
                     id: "3000000000000000002".to_owned(),
                     username: "blank-content-bot".to_owned(),
                 })
@@ -810,7 +810,7 @@ mod tests {
                 _limit: u16,
                 _before: Option<&crate::model::MessageId>,
                 _after: Option<&crate::model::MessageId>,
-            ) -> Result<Vec<crate::model::Message>, DiscordError> {
+            ) -> Result<Vec<crate::model::Message>, ChatError> {
                 Ok(vec![crate::model::Message {
                     id: crate::model::MessageId("1".to_owned()),
                     channel_id: channel.clone(),
@@ -828,7 +828,7 @@ mod tests {
                 _channel: &ChannelId,
                 _content: &str,
                 _reply_to: Option<&crate::model::MessageId>,
-            ) -> Result<crate::model::Message, DiscordError> {
+            ) -> Result<crate::model::Message, ChatError> {
                 panic!("the startup probe must never post");
             }
         }

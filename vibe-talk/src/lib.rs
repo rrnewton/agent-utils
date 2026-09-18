@@ -1,7 +1,7 @@
-//! `vibe-talk` — a Discord bridge for a voice agent.
+//! `vibe-talk` — a chat bridge for a voice agent and phone web app.
 //!
 //! The server owns the front door. A hosted voice agent (ElevenLabs, in the first intended
-//! deployment) reaches this process over HTTP, asks it what has been said in a Discord channel,
+//! deployment) reaches this process over HTTP, asks it what has been said in a chat channel,
 //! and — with explicit approval — asks it to post a reply.
 //!
 //! # One thing here pushes
@@ -37,6 +37,7 @@
 pub mod access;
 pub mod agent_backend;
 pub mod auth;
+pub mod chat;
 pub mod clock;
 pub mod config;
 pub mod diagnostics;

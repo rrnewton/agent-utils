@@ -17,7 +17,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::Value;
 use tower::ServiceExt as _;
-use vibe_talk::discord::{BotIdentity, DiscordClient, DiscordError};
+use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
 use vibe_talk::elevenlabs::fake::{KNOWN_AGENT_ID, KNOWN_VOICE_ID, VALID_API_KEY};
 use vibe_talk::http::router;
 use vibe_talk::model::{ChannelId, Message, MessageId};
@@ -371,9 +371,9 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
     #[derive(Debug)]
     struct BlankContent;
     #[async_trait::async_trait]
-    impl DiscordClient for BlankContent {
-        async fn identity(&self) -> Result<BotIdentity, DiscordError> {
-            Ok(BotIdentity {
+    impl ChatClient for BlankContent {
+        async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+            Ok(ChatIdentity {
                 id: "3000000000000000009".to_owned(),
                 username: "blank-content-bot".to_owned(),
             })
@@ -384,7 +384,7 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
             _limit: u16,
             _before: Option<&MessageId>,
             _after: Option<&MessageId>,
-        ) -> Result<Vec<Message>, DiscordError> {
+        ) -> Result<Vec<Message>, ChatError> {
             Ok(vec![Message {
                 id: MessageId("1".to_owned()),
                 channel_id: channel.clone(),
@@ -402,13 +402,13 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
             _channel: &ChannelId,
             _content: &str,
             _reply_to: Option<&MessageId>,
-        ) -> Result<Message, DiscordError> {
+        ) -> Result<Message, ChatError> {
             panic!("a diagnostics run must never post");
         }
     }
 
     let (mut state, _discord) = vibe_talk::testing::state();
-    state.discord = Arc::new(BlankContent);
+    state.chat = Arc::new(BlankContent);
     let body = report(state).await;
     assert_eq!(body["warned"], 2, "{body:#}");
     assert_eq!(
@@ -434,8 +434,8 @@ async fn a_vendor_that_never_answers_is_a_failed_check_and_not_a_hung_request() 
     #[derive(Debug)]
     struct NeverAnswers;
     #[async_trait::async_trait]
-    impl DiscordClient for NeverAnswers {
-        async fn identity(&self) -> Result<BotIdentity, DiscordError> {
+    impl ChatClient for NeverAnswers {
+        async fn identity(&self) -> Result<ChatIdentity, ChatError> {
             std::future::pending().await
         }
         async fn fetch_page(
@@ -444,7 +444,7 @@ async fn a_vendor_that_never_answers_is_a_failed_check_and_not_a_hung_request() 
             _limit: u16,
             _before: Option<&MessageId>,
             _after: Option<&MessageId>,
-        ) -> Result<Vec<Message>, DiscordError> {
+        ) -> Result<Vec<Message>, ChatError> {
             std::future::pending().await
         }
         async fn post_message(
@@ -452,7 +452,7 @@ async fn a_vendor_that_never_answers_is_a_failed_check_and_not_a_hung_request() 
             _channel: &ChannelId,
             _content: &str,
             _reply_to: Option<&MessageId>,
-        ) -> Result<Message, DiscordError> {
+        ) -> Result<Message, ChatError> {
             panic!("a diagnostics run must never post");
         }
     }
@@ -461,7 +461,7 @@ async fn a_vendor_that_never_answers_is_a_failed_check_and_not_a_hung_request() 
     // test would take three times `CHECK_BUDGET` in wall time or would not be written at all.
     tokio::time::pause();
     let (mut state, _discord) = vibe_talk::testing::state();
-    state.discord = Arc::new(NeverAnswers);
+    state.chat = Arc::new(NeverAnswers);
     let finished = tokio::time::timeout(Duration::from_secs(300), report(state))
         .await
         .expect("the route must answer even when the vendor does not");

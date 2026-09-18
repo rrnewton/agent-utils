@@ -38,7 +38,7 @@
 //! The trait is as much the point as the backend. A handler that reached for `rusqlite` directly
 //! would pin the deployment to one host with one filesystem forever; every call site goes through
 //! [`StateStore`] so a hosted backend can be substituted without touching one of them. This is
-//! the same shape [`crate::discord::DiscordClient`], [`crate::elevenlabs::SignedUrlProvider`] and
+//! the same shape [`crate::chat::ChatClient`], [`crate::elevenlabs::SignedUrlProvider`] and
 //! [`crate::retrieval::Ranker`] already have: a live implementation, plus a fake that can
 //! genuinely fail.
 //!
@@ -740,17 +740,18 @@ pub trait StateStore: Send + Sync {
     async fn purge_everything(&self) -> Result<(), StoreError>;
 }
 
-/// The standing statement that read state here is not Discord's.
+/// The standing statement that read state here is not the source service's.
 ///
 /// It rides along on every inbox answer for the same reason
 /// [`crate::untrusted::NOTICE`] rides along on every read: the alternative is that the owner
-/// discovers it from a divergence — an unread badge in the Discord app that will not clear, or a
-/// channel vibe-talk calls unread that he read on his laptop an hour ago — and has to guess which
-/// of the two is broken. Neither is. They are different records, and only one of them is ours.
-pub const INBOX_NOTICE: &str = "Read state is vibe-talk's own. Discord shares none with a bot, so \
-                                nothing here is read from Discord and nothing here is written \
-                                back to it: marking a channel read here does not clear its badge \
-                                in the Discord app, and clearing it there does not change this.";
+/// discovers it from a divergence — an unread badge in the source app that will not clear, or a
+/// channel vibe-talk calls unread that was read elsewhere an hour ago — and has to guess which of
+/// the two is broken. Neither is. They are different records, and only one of them is ours.
+pub const INBOX_NOTICE: &str =
+    "Read state is vibe-talk's own. The source chat service shares none \
+                                with this bridge, so nothing here is read from it or written back: \
+                                marking a channel read here does not clear its badge in the source \
+                                app, and clearing it there does not change this.";
 
 /// Condense one turn into a listing preview.
 ///

@@ -34,7 +34,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::ratelimit::{Attempt, Headers, RateLimit, RateLimiter, RetryPolicy};
-use super::{BotIdentity, DiscordClient, DiscordError};
+#[cfg(test)]
+use crate::chat::ChatError as DiscordError;
+use crate::chat::{ChatClient, ChatError, ChatIdentity};
 use crate::config::DEFAULT_DISCORD_API_BASE;
 use crate::model::{sort_oldest_first, ChannelId, Message, MessageId, UserId};
 
@@ -315,15 +317,15 @@ impl FakeDiscord {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn take_failure(&self) -> Option<DiscordError> {
-        self.lock().fail_with.take().map(DiscordError::Transport)
+    fn take_failure(&self) -> Option<ChatError> {
+        self.lock().fail_with.take().map(ChatError::Transport)
     }
 
     /// Discord's own answer for a token it will not accept, in the shape a live 401 arrives in,
     /// so [`crate::probe::classify`] reaches [`crate::probe::Diagnosis::InvalidToken`] through
     /// the production code path rather than through a test-only shortcut.
-    fn rejected_token(&self) -> Option<DiscordError> {
-        self.lock().token_revoked.then(|| DiscordError::Status {
+    fn rejected_token(&self) -> Option<ChatError> {
+        self.lock().token_revoked.then(|| ChatError::Status {
             status: 401,
             body: r#"{"message": "401: Unauthorized", "code": 0}"#.to_owned(),
         })
@@ -341,11 +343,11 @@ impl FakeDiscord {
 
     /// Discord's own answer for a channel this bot cannot see, byte for byte in shape, so that
     /// [`crate::probe`] classifies it through exactly the code path a live 404 takes.
-    fn unknown_channel(&self, channel: &ChannelId) -> Option<DiscordError> {
+    fn unknown_channel(&self, channel: &ChannelId) -> Option<ChatError> {
         if self.lock().known.contains(channel) {
             return None;
         }
-        Some(DiscordError::Status {
+        Some(ChatError::Status {
             status: 404,
             body: r#"{"message": "Unknown Channel", "code": 10003}"#.to_owned(),
         })
@@ -353,8 +355,8 @@ impl FakeDiscord {
 }
 
 #[async_trait]
-impl DiscordClient for FakeDiscord {
-    async fn identity(&self) -> Result<BotIdentity, DiscordError> {
+impl ChatClient for FakeDiscord {
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
         // Through the real URL builder, so this fake cannot drift from the endpoint the live
         // client calls, and through the same limiter, so a queued 429 is spent here too.
         let request = super::http::identity_request(DEFAULT_DISCORD_API_BASE);
@@ -370,7 +372,7 @@ impl DiscordClient for FakeDiscord {
                     return Err(rejected);
                 }
                 Ok(Attempt::Done(
-                    BotIdentity {
+                    ChatIdentity {
                         id: FAKE_BOT_USER_ID.to_owned(),
                         username: FAKE_BOT_USERNAME.to_owned(),
                     },
@@ -386,7 +388,7 @@ impl DiscordClient for FakeDiscord {
         limit: u16,
         before: Option<&MessageId>,
         after: Option<&MessageId>,
-    ) -> Result<Vec<Message>, DiscordError> {
+    ) -> Result<Vec<Message>, ChatError> {
         // Share the real client's refusal, so a caller cannot get away here with a request
         // Discord would not define. OUTSIDE the retry loop: a request this server refuses to
         // build was never going to be sent, so it neither spends an attempt nor counts as a fetch.
@@ -454,7 +456,7 @@ impl DiscordClient for FakeDiscord {
         channel: &ChannelId,
         content: &str,
         reply_to: Option<&MessageId>,
-    ) -> Result<Message, DiscordError> {
+    ) -> Result<Message, ChatError> {
         // Share the real client's validation so a test cannot pass on input Discord would reject.
         // Validation first, then existence, because Discord also rejects an empty body before it
         // ever looks the channel up.
@@ -491,7 +493,7 @@ impl DiscordClient for FakeDiscord {
                     .iter()
                     .find(|m| m.id == id)
                     .cloned()
-                    .ok_or_else(|| DiscordError::Shape("posted message vanished".to_owned()))?;
+                    .ok_or_else(|| ChatError::Shape("posted message vanished".to_owned()))?;
                 drop(state);
                 Ok(Attempt::Done(message, self.success_headers()))
             })

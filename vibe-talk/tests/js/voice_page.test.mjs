@@ -2407,7 +2407,7 @@ test("the view control is ONE switch carrying the word for the view you are in",
   await page.settle();
 
   assert.equal(page.tab(), "discord");
-  assert.equal(label.textContent, "Discord", "the word did not follow the switch");
+  assert.equal(label.textContent, "Channel", "the word did not follow the switch");
   assert.equal(page.el("view-switch").getAttribute("aria-checked"), "true");
 
   await page.el("view-switch").click();

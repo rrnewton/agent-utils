@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use crate::agent_backend::AgentBackend;
+use crate::chat::ChatClient;
 use crate::config::Config;
-use crate::discord::DiscordClient;
 use crate::elevenlabs::{SignedUrlProvider, SpeechProvider};
 use crate::live::LiveHub;
 use crate::model::{ChannelId, ChannelInfo};
@@ -17,8 +17,8 @@ use crate::summarize::Summarizer;
 pub struct AppState {
     /// Loaded configuration.
     pub config: Arc<Config>,
-    /// Discord access.
-    pub discord: Arc<dyn DiscordClient>,
+    /// Access to the configured chat provider.
+    pub chat: Arc<dyn ChatClient>,
     /// Strategy for semantic random access.
     pub ranker: Arc<dyn Ranker>,
     /// Mints short-lived signed conversation URLs for the configured ElevenLabs agent.

@@ -321,7 +321,7 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
 /// are the two most common ways this deployment is wrong, and a channel read reports both as a
 /// channel that cannot be read.
 async fn discord_token(state: &AppState, deadline: &Deadline) -> Check {
-    let diagnosis = match within(deadline, state.discord.identity()).await {
+    let diagnosis = match within(deadline, state.chat.identity()).await {
         Err(timed_out) => timed_out,
         Ok(Ok(identity)) => Diagnosis::Confirmed(format!(
             "Discord accepted the bot token; it belongs to {} ({})",
@@ -336,8 +336,7 @@ async fn discord_token(state: &AppState, deadline: &Deadline) -> Check {
 async fn discord_channels(state: &AppState, deadline: &Deadline) -> Vec<Check> {
     let channels = state.all_channels();
     let report =
-        probe::probe_channels_within(state.discord.as_ref(), &channels, Some(deadline.budget()))
-            .await;
+        probe::probe_channels_within(state.chat.as_ref(), &channels, Some(deadline.budget())).await;
     report
         .outcomes
         .into_iter()

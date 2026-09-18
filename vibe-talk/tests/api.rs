@@ -1448,7 +1448,7 @@ async fn an_unconfigured_store_refuses_loudly_instead_of_answering_from_nowhere(
 }
 
 #[tokio::test]
-async fn the_inbox_says_on_every_answer_that_this_read_state_is_not_discords() {
+async fn the_inbox_says_on_every_answer_that_this_read_state_is_local() {
     let (harness, _store) = store_harness();
     let (status, payload) = call(&harness, "GET", "/api/v1/inbox", Some(READ_TOKEN), None).await;
     assert_eq!(status, StatusCode::OK);
@@ -1464,7 +1464,7 @@ async fn the_inbox_says_on_every_answer_that_this_read_state_is_not_discords() {
     );
     let notice = payload["read_state_notice"].as_str().expect("a notice");
     assert!(
-        notice.contains("Discord shares none") && notice.contains("written"),
+        notice.contains("source chat service") && notice.contains("written back"),
         "the no-sync rule must be stated on the answer, not left in a document: {notice}"
     );
 
@@ -1481,8 +1481,8 @@ async fn the_inbox_says_on_every_answer_that_this_read_state_is_not_discords() {
     assert!(
         payload["read_state_notice"]
             .as_str()
-            .is_some_and(|n| n.contains("Discord")),
-        "the mutating route is exactly where someone expects the Discord badge to clear: {payload}"
+            .is_some_and(|n| n.contains("source chat service")),
+        "the mutating route is exactly where someone expects the source badge to clear: {payload}"
     );
     assert!(
         harness.discord.posted().is_empty(),
@@ -2192,8 +2192,7 @@ async fn every_to_do_answer_says_that_this_read_state_is_not_discords() {
         // Both directions, by name, because a notice stating only one of them would leave the
         // other to be discovered the hard way.
         assert!(
-            notice.contains("nothing here is read from Discord")
-                && notice.contains("nothing here is written"),
+            notice.contains("nothing here is read from it") && notice.contains("written back"),
             "the notice states only one direction: {notice}"
         );
     }

@@ -11,7 +11,7 @@
 //! Every function below assumes the caller has already been authorized for the scope it needs;
 //! the scope each one needs is stated in its documentation and enforced by its only callers.
 
-use crate::discord::DiscordError;
+use crate::chat::ChatError;
 use crate::model::{ChannelId, ChannelInfo, Message, MessageId};
 use crate::retrieval::{self, Resolution};
 use crate::state::AppState;
@@ -45,10 +45,9 @@ pub enum OpError {
          start time and an optional end time, but not both"
     )]
     InvalidRange,
-    /// Discord itself failed, or refused the request before it was sent.
-    /// Some parts of a split message reached Discord and the rest did not.
+    /// Some parts of a split message reached the chat provider and the rest did not.
     ///
-    /// A DISTINCT variant rather than a `Discord` error, because the two call for opposite things
+    /// A distinct variant rather than a plain [`ChatError`], because the two call for opposite things
     /// from the caller. A plain failure means "nothing happened, send it again". This means "half
     /// of it is in the channel and cannot be unsent" — sending the whole thing again would post
     /// the first half twice. `unsent` is the remainder, and once the caller has cleared their
@@ -56,17 +55,17 @@ pub enum OpError {
     /// than being reconstructable from it.
     #[error("posted {posted} part(s) and then failed: {cause}")]
     PartiallyPosted {
-        /// How many parts Discord accepted before the failure.
+        /// How many parts the provider accepted before the failure.
         posted: usize,
-        /// The text that did NOT reach Discord, ready to be sent on its own.
+        /// The text that did not reach the provider, ready to be sent on its own.
         unsent: String,
         /// Why the next part failed.
         cause: String,
     },
 
-    /// Discord itself failed, or refused the request before it was sent.
+    /// The configured chat provider failed, or refused the request before it was sent.
     #[error(transparent)]
-    Discord(#[from] DiscordError),
+    Chat(#[from] ChatError),
     /// The durable state store failed, or is not configured at all.
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
@@ -87,8 +86,9 @@ impl OpError {
             Self::InvalidCursor => "invalid_cursor",
             Self::InvalidRange => "invalid_range",
             Self::PartiallyPosted { .. } => "partially_posted",
-            Self::Discord(DiscordError::Refused(_)) => "refused",
-            Self::Discord(_) => "discord_error",
+            Self::Chat(ChatError::Refused(_)) => "refused",
+            // Retained for API compatibility while Discord is the only configured provider.
+            Self::Chat(_) => "discord_error",
             Self::Store(inner) => inner.code(),
             Self::Summarizer(inner) => inner.code(),
         }
@@ -240,7 +240,7 @@ impl Window {
 ///
 /// # Errors
 ///
-/// [`OpError::UnknownChannel`] for a channel outside the allowlist; [`OpError::Discord`] when the
+/// [`OpError::UnknownChannel`] for a channel outside the allowlist; [`OpError::Chat`] when the
 /// fetch fails.
 pub async fn messages(
     state: &AppState,
@@ -255,7 +255,7 @@ pub async fn messages(
     let limit = state
         .effective_limit(limit)
         .min(crate::discord::http::DISCORD_MAX_LIMIT);
-    let mut messages = state.discord.fetch_recent(&channel.id, limit).await?;
+    let mut messages = state.chat.fetch_recent(&channel.id, limit).await?;
     stamp(state, &mut messages);
     Ok(Window {
         channel,
@@ -269,7 +269,7 @@ pub async fn messages(
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`], [`OpError::UnknownMessage`] when the id is not in the fetched
-/// window, or [`OpError::Discord`].
+/// window, or [`OpError::Chat`].
 pub async fn message_by_id(
     state: &AppState,
     channel_id: &str,
@@ -401,7 +401,7 @@ fn instant(value: Option<&str>) -> Result<Option<i64>, OpError> {
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`], [`OpError::InvalidCursor`] for a cursor that is not a snowflake,
-/// [`OpError::InvalidRange`] for an unparseable or contradictory span, or [`OpError::Discord`].
+/// [`OpError::InvalidRange`] for an unparseable or contradictory span, or [`OpError::Chat`].
 pub async fn page(
     state: &AppState,
     channel_id: &str,
@@ -441,7 +441,7 @@ pub async fn page(
             // exactly on the boundary — the edge the issue asks be tested.
             let after = MessageId::at_time_ms(from - 1);
             let mut fetched = state
-                .discord
+                .chat
                 .fetch_page(&channel.id, probe, None, Some(&after))
                 .await?;
             // Both edges applied to the message's own creation instant, because the boundary
@@ -454,7 +454,7 @@ pub async fn page(
         }
         None => {
             let fetched = state
-                .discord
+                .chat
                 .fetch_page(&channel.id, probe, before.as_ref(), None)
                 .await?;
             (fetched, false)
@@ -534,7 +534,7 @@ pub struct MessageCount {
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`], [`OpError::InvalidRange`] for an unparseable `since`, or
-/// [`OpError::Discord`].
+/// [`OpError::Chat`].
 pub async fn count(
     state: &AppState,
     channel_id: &str,
@@ -554,7 +554,7 @@ pub async fn count(
 
     loop {
         let batch = state
-            .discord
+            .chat
             .fetch_page(&channel.id, stride, before.as_ref(), None)
             .await?;
         if batch.is_empty() {
@@ -623,7 +623,7 @@ pub async fn resolve(
     // This path does NOT go through `messages` above — it fetches directly — so it needs its own
     // stamping call. `run_find` renders a timestamp for the best match and every alternative, and
     // without this those lines would be the only ones still speaking raw UTC.
-    let mut messages = state.discord.fetch_recent(&info.id, limit).await?;
+    let mut messages = state.chat.fetch_recent(&info.id, limit).await?;
     stamp(state, &mut messages);
     let max_alternatives = usize::from(max_alternatives.unwrap_or(3)).min(10);
     let resolution = retrieval::resolve(state.ranker.as_ref(), &messages, query, max_alternatives);
@@ -639,7 +639,7 @@ pub async fn resolve(
 ///
 /// # Errors
 ///
-/// [`OpError::UnknownChannel`], [`OpError::ChannelNotWritable`], or [`OpError::Discord`] — which
+/// [`OpError::UnknownChannel`], [`OpError::ChannelNotWritable`], or [`OpError::Chat`] — which
 /// also covers the length and emptiness refusals the Discord layer makes before any request is
 /// sent.
 pub async fn reply(
@@ -659,7 +659,7 @@ pub async fn reply(
     // split their own long messages. See `crate::discord::split`.
     let parts = crate::discord::split::split_for_discord(text);
     if parts.is_empty() {
-        return Err(OpError::Discord(DiscordError::Refused(
+        return Err(OpError::Chat(ChatError::Refused(
             "message content is empty".to_owned(),
         )));
     }
@@ -670,7 +670,7 @@ pub async fn reply(
         // pointing every part at the same parent would render as several separate answers to the
         // same thing rather than as one answer that ran long.
         let parent = if index == 0 { reply_to.as_ref() } else { None };
-        match state.discord.post_message(&info.id, part, parent).await {
+        match state.chat.post_message(&info.id, part, parent).await {
             Ok(mut one) => {
                 stamp(state, std::slice::from_mut(&mut one));
                 // Remember that WE posted this, before anything can observe it. `#44 live-push`:
@@ -846,7 +846,7 @@ pub struct TodoView {
 ///
 /// # Errors
 ///
-/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Discord`] when the fetch fails;
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Chat`] when the fetch fails;
 /// [`OpError::Store`] when no store is configured or the read fails.
 pub async fn todo(
     state: &AppState,
@@ -922,7 +922,7 @@ pub struct InboxChange {
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::UnknownMessage`] when an id is
-/// not in the window; [`OpError::Discord`]; [`OpError::Store`].
+/// not in the window; [`OpError::Chat`]; [`OpError::Store`].
 pub async fn dismiss(
     state: &AppState,
     channel_id: &str,
@@ -1085,7 +1085,7 @@ pub struct Summarised {
 /// # Errors
 ///
 /// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::UnknownMessage`] when the
-/// message is not in the fetched window; [`OpError::Discord`] when the fetch fails;
+/// message is not in the fetched window; [`OpError::Chat`] when the fetch fails;
 /// [`OpError::Summarizer`] when the summariser refuses. A store that is unavailable is NOT an
 /// error here — see below.
 pub async fn summarize_message(
@@ -1817,11 +1817,11 @@ mod tests {
         assert_eq!(OpError::InvalidCursor.code(), "invalid_cursor");
         assert_eq!(OpError::InvalidRange.code(), "invalid_range");
         assert_eq!(
-            OpError::Discord(DiscordError::Refused("too long".to_owned())).code(),
+            OpError::Chat(ChatError::Refused("too long".to_owned())).code(),
             "refused"
         );
         assert_eq!(
-            OpError::Discord(DiscordError::Transport("down".to_owned())).code(),
+            OpError::Chat(ChatError::Transport("down".to_owned())).code(),
             "discord_error"
         );
     }

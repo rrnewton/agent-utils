@@ -225,7 +225,7 @@ fn state_pieces_with(
     let config_for_version = config.summaries.clone();
     let state = AppState {
         config: Arc::new(config),
-        discord: fake.clone(),
+        chat: fake.clone(),
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs: elevenlabs.clone(),

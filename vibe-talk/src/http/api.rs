@@ -12,7 +12,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, Scope};
-use crate::discord::DiscordError;
+use crate::chat::ChatError;
 use crate::elevenlabs::{SignedUrl, SignedUrlError, SpeechError};
 use crate::model::{ChannelInfo, Message, MessageId};
 use crate::ops::{self, OpError};
@@ -86,10 +86,10 @@ impl From<AuthError> for ApiError {
     }
 }
 
-impl From<DiscordError> for ApiError {
-    fn from(value: DiscordError) -> Self {
+impl From<ChatError> for ApiError {
+    fn from(value: ChatError) -> Self {
         match value {
-            DiscordError::Refused(detail) => Self::new(StatusCode::BAD_REQUEST, "refused", detail),
+            ChatError::Refused(detail) => Self::new(StatusCode::BAD_REQUEST, "refused", detail),
             other => Self::new(StatusCode::BAD_GATEWAY, "discord_error", other.to_string()),
         }
     }
@@ -148,7 +148,7 @@ impl From<OpError> for ApiError {
             // would mean some other caller grew a split path without deciding what to do with the
             // remainder, so it is a loud upstream failure rather than a quiet 500.
             OpError::PartiallyPosted { .. } => StatusCode::BAD_GATEWAY,
-            OpError::Discord(inner) => return Self::from(inner),
+            OpError::Chat(inner) => return Self::from(inner),
             OpError::Store(inner) => return Self::from(inner),
             OpError::Summarizer(inner) => {
                 let code = inner.code();
@@ -1995,8 +1995,7 @@ pub async fn add_channel(
     };
     // The same read the startup check makes, against the one channel being added.
     let report =
-        crate::probe::probe_channels(state.discord.as_ref(), std::slice::from_ref(&candidate))
-            .await;
+        crate::probe::probe_channels(state.chat.as_ref(), std::slice::from_ref(&candidate)).await;
     let outcome = report.outcomes.first().ok_or_else(|| {
         ApiError::new(
             StatusCode::BAD_GATEWAY,
