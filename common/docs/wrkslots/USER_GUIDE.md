@@ -164,7 +164,9 @@ one retained slot cannot starve the rest of a bounded queue. Lock contention is 
 partial, or indeterminate state stops the batch and requires recovery instead of being mislabeled as
 retained. Sidecar cleanup atomically renames the exact inode into content-addressed retired control
 storage and never unlinks that retired pathname, so a same-UID replacement cannot be mistaken for
-the acknowledged artifact. The exact handoff bytes remain in append-only history.
+the acknowledged artifact. A direct-child checkout handoff is likewise moved by no-replace into an
+identity-bound retired path before its fenced slot is removed; pathname recreation preserves both
+copies and refuses. The exact handoff bytes remain in append-only history.
 
 ## Git remotes and salvage
 
@@ -385,7 +387,9 @@ top-level content, live use, or an occupied destination, and journals the same-i
 Every mutation appends a numbered, hash-linked JSON event before refreshing the readable ACTIVE,
 ARCHIVED, hold, or journal view. Readers derive state from the event history whenever it exists, so
 a stale compatibility view cannot override later evidence. A complete event left at an atomic-write
-temporary path can be promoted by `recover --discard-partial`; malformed or ambiguous files refuse.
+temporary path can be promoted by `recover --discard-partial`; handoff publication temps use
+no-replace promotion, and a temp beside a conflicting durable sidecar is preserved and refused.
+Malformed or ambiguous files refuse.
 
 Create and removal journals contain the exact paths, Git identities, completed steps, salvage
 receipts, and remaining work. If the mutable journal view is missing, `recover` reconstructs the
