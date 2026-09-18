@@ -3173,6 +3173,53 @@ def _atomic_write_json(path: Path, payload: object) -> None:
         raise
 
 
+def _verify_noreplace_handoff_move(
+    source: Path,
+    destination: Path,
+    expected_contents: bytes,
+    expected_identity: _RegularFileIdentity,
+    label: str,
+) -> None:
+    """Verify a moved inode, restoring a raced destination without unlinking it."""
+
+    failure: Refusal | StateError | None = None
+    try:
+        contents, identity = _read_regular_file_identity(
+            destination, label, HANDOFF_SIDECAR_BYTES_LIMIT
+        )
+        if contents != expected_contents or identity != expected_identity:
+            failure = StateError(
+                f"{label} identity or content changed at its no-replace boundary"
+            )
+    except (Refusal, StateError) as exc:
+        failure = exc
+    if failure is not None:
+        if (
+            not source.exists()
+            and not source.is_symlink()
+            and (destination.exists() or destination.is_symlink())
+        ):
+            try:
+                _rename_noreplace(
+                    destination,
+                    source,
+                    f"restore raced {label}",
+                )
+                _fsync_directory(source.parent)
+            except Refusal as restore:
+                raise StateError(
+                    f"{failure}; raced path also could not be restored: {restore}"
+                ) from restore
+        raise StateError(
+            f"{failure}; preserved the raced artifact at {source} for recovery"
+        ) from failure
+    if source.exists() or source.is_symlink():
+        raise StateError(
+            f"{label} source pathname was recreated during publication; "
+            f"preserved both {source} and {destination}"
+        )
+
+
 def _atomic_write_handoff_noreplace(path: Path, payload: object) -> None:
     """Durably publish a new sidecar without replacing any pathname occupant."""
 
@@ -3197,9 +3244,19 @@ def _atomic_write_handoff_noreplace(path: Path, payload: object) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         _fsync_directory(path.parent)
+        temp_contents, temp_identity = _read_regular_file_identity(
+            temp, "handoff sidecar publication temp", HANDOFF_SIDECAR_BYTES_LIMIT
+        )
         _interrupt_for_test("before-handoff-sidecar-publish")
         _rename_noreplace(temp, path, "publish handoff sidecar")
         _fsync_directory(path.parent)
+        _verify_noreplace_handoff_move(
+            temp,
+            path,
+            temp_contents,
+            temp_identity,
+            "published handoff sidecar",
+        )
     except Refusal:
         # The complete temp file is recovery evidence. Never unlink its pathname
         # after caller-controlled code had an opportunity to replace it.
@@ -5342,6 +5399,39 @@ def _validate_retired_legacy_handoff(
     if observed != identity or hashlib.sha256(contents).hexdigest() != identity.sha256:
         raise StateError(
             f"retired legacy HANDOFF.md identity changed; preserve it for recovery: {path}"
+        )
+
+
+def _record_legacy_handoff_quarantine(
+    config: Config,
+    record: ActiveRecord,
+    retired: Path,
+    identity: _RegularFileIdentity,
+) -> None:
+    payload = {
+        "slot": record.slot,
+        "generation": record.generation,
+        "sha256": identity.sha256,
+        "retired_path": retired.name,
+        "source_identity": _regular_file_identity_to_obj(identity),
+    }
+    matches = []
+    for event in _load_events(config, record.machine):
+        if event.get("kind") != "handoff-removed":
+            continue
+        candidate = _as_mapping(event["payload"], "handoff-removed event payload")
+        if (
+            candidate.get("slot") == record.slot
+            and candidate.get("generation") == record.generation
+        ):
+            matches.append(candidate)
+    if not matches:
+        _write_event_file(config, record.machine, "handoff-removed", payload)
+        return
+    if len(matches) != 1 or not _json_equal(matches[0], payload):
+        raise StateError(
+            f"handoff removal history disagrees with retired legacy artifact for "
+            f"slot {record.slot}"
         )
 
 
@@ -12588,13 +12678,9 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
             )
             _interrupt_for_test("after-handoff-sidecar-write")
             published = _load_handoff_sidecar(config, current_record)
-            if published is None or (
-                published.contents != projected.contents
-                or published.sha256 != projected.sha256
-                or published.source != projected.source
-                or published.source_path != projected.source_path
-                or published.source_identity != projected.source_identity
-            ):
+            if published is None or _handoff_artifact_to_obj(
+                published
+            ) != _handoff_artifact_to_obj(projected):
                 raise StateError(
                     "handoff sidecar changed after its no-replace publication"
                 )
@@ -12686,11 +12772,23 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
             written = _load_handoff_sidecar(config, record)
             if written is None:
                 raise StateError("handoff sidecar disappeared after its atomic write")
+            if _handoff_artifact_to_obj(written) != _handoff_artifact_to_obj(artifact):
+                raise StateError(
+                    "handoff sidecar differs from the owner's exact published artifact; "
+                    "preserve it and the external source for recovery"
+                )
             artifact = written
-        elif existing.contents != artifact.contents:
+        elif (
+            existing.contents != artifact.contents
+            or existing.sha256 != artifact.sha256
+            or existing.source != artifact.source
+            or existing.source_path != artifact.source_path
+            or existing.source_identity != artifact.source_identity
+        ):
             raise Refusal(
                 f"slot {record.slot} already has an immutable handoff sidecar with "
-                "different contents; preserve both versions for manual review"
+                "different contents or source provenance; preserve both versions for "
+                "manual review"
             )
         else:
             artifact = existing
@@ -16067,22 +16165,16 @@ def _finish_remove_paths(
                     f"legacy HANDOFF.md pathname was recreated during quarantine for "
                     f"slot {record.slot}; preserved both {handoff} and {retired}"
                 )
-            _write_event_file(
-                config,
-                record.machine,
-                "handoff-removed",
-                {
-                    "slot": record.slot,
-                    "generation": record.generation,
-                    "sha256": digest,
-                    "retired_path": retired.name,
-                    "source_identity": _regular_file_identity_to_obj(identity),
-                },
+            _record_legacy_handoff_quarantine(
+                config, record, retired, identity
             )
         elif retired_present:
             assert retired is not None
             assert expected_identity is not None
             _validate_retired_legacy_handoff(retired, expected_identity)
+            _record_legacy_handoff_quarantine(
+                config, record, retired, expected_identity
+            )
         elif expected_identity is not None:
             raise Refusal(
                 f"legacy HANDOFF.md disappeared without its exact retired quarantine: "
@@ -17096,10 +17188,18 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 record = _find_record(state, slot)
                 _expected_generation(record, generation)
                 _handoff_artifact_from_obj(config, record, raw, target, identity)
+                _interrupt_for_test("before-handoff-temp-recovery-publish")
                 _rename_noreplace(
                     leftover, target, "recover handoff sidecar publication"
                 )
                 _fsync_directory(target.parent)
+                _verify_noreplace_handoff_move(
+                    leftover,
+                    target,
+                    contents,
+                    identity,
+                    "recovered handoff sidecar",
+                )
                 print(
                     f"recovered handoff sidecar {target.name} from {leftover.name}"
                 )

@@ -14637,6 +14637,145 @@ def test_legacy_projection_noreplace_does_not_enqueue_planted_destination(
 
 
 
+def test_write_handoff_same_bytes_different_source_provenance_refuses(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    first_source = tmp_path / "first-external-handoff.md"
+    second_source = tmp_path / "second-external-handoff.md"
+    first_source.write_text("identical bytes\n", encoding="utf-8")
+    second_source.write_text("identical bytes\n", encoding="utf-8")
+    base = (
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+    )
+    first = raw_command(project, *base, str(first_source))
+    assert first.returncode == 0, first.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    before = sidecar.read_bytes()
+
+    refused = raw_command(project, *base, str(second_source))
+
+    assert refused.returncode == 3
+    assert "different contents or source provenance" in refused.stderr
+    assert sidecar.read_bytes() == before
+    writes = [
+        event for event in wrkslots._load_events(config) if event["kind"] == "handoff-written"
+    ]
+    assert len(writes) == 1
+
+
+
+def test_write_handoff_rejects_and_restores_replaced_publication_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "external-handoff.md"
+    source.write_text("owner-authored continuation\n", encoding="utf-8")
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    replacement = b"replacement temp must survive\n"
+
+    def replace_temp(point: str) -> None:
+        if point != "before-handoff-sidecar-publish":
+            return
+        temps = list(config.control.glob(f"{sidecar.name}.tmp.*"))
+        assert len(temps) == 1
+        planted = config.control / "replacement-publication-temp"
+        planted.write_bytes(replacement)
+        os.replace(planted, temps[0])
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", replace_temp)
+    args = argparse.Namespace(
+        project_root=str(project),
+        machine="testhost",
+        slot="slot01",
+        agent="codex-1",
+        owner_pid=os.getpid(),
+        expected_generation=1,
+        from_file=str(source),
+        wait_lock=0.0,
+    )
+    with pytest.raises(wrkslots.StateError, match="preserved the raced artifact"):
+        wrkslots._cmd_write_handoff(args)
+
+    assert not sidecar.exists()
+    temps = list(config.control.glob(f"{sidecar.name}.tmp.*"))
+    assert len(temps) == 1
+    assert temps[0].read_bytes() == replacement
+    assert source.read_text(encoding="utf-8") == "owner-authored continuation\n"
+    assert not any(
+        event["kind"] == "handoff-written" for event in wrkslots._load_events(config)
+    )
+
+
+def test_recover_rejects_and_restores_replaced_handoff_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "external-handoff.md"
+    source.write_text("owner-authored continuation\n", encoding="utf-8")
+    write_args = (
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    )
+    interrupted = raw_command(
+        project,
+        *write_args,
+        env={"WRKSLOTS_TEST_INTERRUPT": "before-handoff-sidecar-publish"},
+    )
+    assert interrupted.returncode == 86
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    temps = list(config.control.glob(f"{sidecar.name}.tmp.*"))
+    assert len(temps) == 1
+    replacement = b"replacement recovery temp must survive\n"
+
+    def replace_temp(point: str) -> None:
+        if point != "before-handoff-temp-recovery-publish":
+            return
+        planted = config.control / "replacement-recovery-temp"
+        planted.write_bytes(replacement)
+        os.replace(planted, temps[0])
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", replace_temp)
+    code = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--discard-partial",
+        ]
+    )
+
+    assert code == 3
+    assert not sidecar.exists()
+    assert temps[0].read_bytes() == replacement
+    assert source.read_text(encoding="utf-8") == "owner-authored continuation\n"
+
+
+
 def test_recover_preserves_conflicting_planted_sidecar_and_owner_temp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -15427,6 +15566,55 @@ def test_retire_pending_uses_remove_and_cleans_sidecar(
     assert payload["retained"] == []
     assert not checkout(project).exists()
     assert not sidecar.exists()
+
+
+def test_recover_completes_legacy_handoff_quarantine_event(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text("retained across quarantine crash\n", encoding="utf-8")
+    assert raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    ).returncode == 0
+    assert finish(project).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    interrupted = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-legacy-handoff-quarantine"},
+    )
+
+    assert interrupted.returncode == 86
+    config = wrkslots._load_config(str(project), "testhost")
+    retired = list(config.control.glob("HANDOFF-LEGACY-RETIRED.*"))
+    assert len(retired) == 1
+    assert not any(
+        event["kind"] == "handoff-removed" for event in wrkslots._load_events(config)
+    )
+    recovered = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    removed = [
+        event for event in wrkslots._load_events(config) if event["kind"] == "handoff-removed"
+    ]
+    assert len(removed) == 1
+    payload = removed[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["retired_path"] == retired[0].name
+    assert retired[0].is_file()
+    assert not active_slots(project)
+
 
 
 def test_legacy_handoff_quarantine_preserves_path_replacement(
