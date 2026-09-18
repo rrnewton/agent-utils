@@ -130,8 +130,15 @@ wrkslots write-handoff SLOT --agent AGENT --owner-pid PID \
   --expected-generation N --from-file /path/to/HANDOFF.md
 ```
 
+The input must be a regular UTF-8 file outside every Git working tree. This prevents a tracked,
+shared repository document from being mistaken for slot-specific retirement intent. Direct-child
+`HANDOFF.md` discovery likewise refuses a Git-tracked file; an untracked direct-child
+file remains readable for migration.
+
 The bounded UTF-8 contents go to a generation-bound control-plane sidecar, so writing the handoff
-does not make a clean checkout dirty. The sidecar is immutable after `finish`; `finish` still
+does not make a clean checkout dirty. The sidecar records the source classification, absolute path,
+and exact file identity alongside its bytes. The same provenance is copied into write and read
+events. The sidecar is immutable after `finish`; `finish` still
 refuses every tracked, untracked, or ignored checkout change. In particular, it does not exempt a
 pre-sidecar `HANDOFF.md` inside a flat-layout checkout.
 

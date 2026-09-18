@@ -36,7 +36,8 @@ from wrkslots import __version__
 
 VERSION = __version__
 SCHEMA = 2
-HANDOFF_SIDECAR_SCHEMA = 1
+HANDOFF_SIDECAR_LEGACY_SCHEMA = 1
+HANDOFF_SIDECAR_SCHEMA = 2
 RETIREMENT_QUEUE_SCHEMA = 1
 HANDOFF_BYTES_LIMIT = 1024 * 1024
 HANDOFF_SIDECAR_BYTES_LIMIT = HANDOFF_BYTES_LIMIT * 6 + 64 * 1024
@@ -726,7 +727,8 @@ class _HandoffArtifact:
     sha256: str
     recorded_at: str
     source: str
-    source_identity: _RegularFileIdentity | None
+    source_path: Path
+    source_identity: _RegularFileIdentity
     storage_identity: _RegularFileIdentity
 
 
@@ -3328,11 +3330,8 @@ def _handoff_artifact_to_obj(artifact: _HandoffArtifact) -> dict[str, object]:
         "generation": artifact.generation,
         "recorded_at": artifact.recorded_at,
         "source": artifact.source,
-        "source_identity": (
-            None
-            if artifact.source_identity is None
-            else _regular_file_identity_to_obj(artifact.source_identity)
-        ),
+        "source_path": str(artifact.source_path),
+        "source_identity": _regular_file_identity_to_obj(artifact.source_identity),
         "contents_utf8": contents,
         "sha256": artifact.sha256,
     }
@@ -3347,24 +3346,23 @@ def _handoff_artifact_from_obj(
 ) -> _HandoffArtifact:
     label = f"handoff sidecar {path}"
     raw = _as_mapping(value, label)
-    _exact_keys(
-        raw,
-        {
-            "schema",
-            "machine",
-            "slot",
-            "generation",
-            "recorded_at",
-            "source",
-            "source_identity",
-            "contents_utf8",
-            "sha256",
-        },
-        set(),
-        label,
-    )
-    if _as_int(raw["schema"], f"{label}.schema") != HANDOFF_SIDECAR_SCHEMA:
+    schema = _as_int(raw.get("schema"), f"{label}.schema")
+    fields = {
+        "schema",
+        "machine",
+        "slot",
+        "generation",
+        "recorded_at",
+        "source",
+        "source_identity",
+        "contents_utf8",
+        "sha256",
+    }
+    if schema == HANDOFF_SIDECAR_SCHEMA:
+        fields.add("source_path")
+    elif schema != HANDOFF_SIDECAR_LEGACY_SCHEMA:
         raise StateError(f"unsupported handoff sidecar schema in {path}")
+    _exact_keys(raw, fields, set(), label)
     machine = _as_str(raw["machine"], f"{label}.machine")
     slot = _as_str(raw["slot"], f"{label}.slot")
     generation = _as_int(raw["generation"], f"{label}.generation", minimum=1)
@@ -3381,16 +3379,28 @@ def _handoff_artifact_from_obj(
     source = _as_str(raw["source"], f"{label}.source")
     if source not in {"write-handoff", "legacy-slot-file"}:
         raise StateError(f"{label}.source is invalid")
-    source_identity = (
-        None
-        if raw["source_identity"] is None
-        else _regular_file_identity_from_obj(
-            _as_mapping(raw["source_identity"], f"{label}.source_identity"),
-            f"{label}.source_identity",
-        )
+    expected_legacy_path = (
+        _slot_directory(config, record.slot, record.slot_type) / "HANDOFF.md"
+    ).resolve(strict=False)
+    if schema == HANDOFF_SIDECAR_LEGACY_SCHEMA:
+        if source != "legacy-slot-file" or raw["source_identity"] is None:
+            raise StateError(
+                f"{label} schema 1 lacks auditable write-handoff source provenance; "
+                "preserve it and rewrite it from an external source"
+            )
+        source_path = expected_legacy_path
+    else:
+        source_path = Path(_as_str(raw["source_path"], f"{label}.source_path"))
+        if not source_path.is_absolute() or ".." in source_path.parts:
+            raise StateError(f"{label}.source_path must be a normalized absolute path")
+    if raw["source_identity"] is None:
+        raise StateError(f"{label} lacks source file identity")
+    source_identity = _regular_file_identity_from_obj(
+        _as_mapping(raw["source_identity"], f"{label}.source_identity"),
+        f"{label}.source_identity",
     )
-    if (source == "legacy-slot-file") != (source_identity is not None):
-        raise StateError(f"{label} has inconsistent legacy source identity")
+    if source == "legacy-slot-file" and source_path != expected_legacy_path:
+        raise StateError(f"{label} legacy source path does not match its slot")
     contents_text = _as_str(raw["contents_utf8"], f"{label}.contents_utf8")
     contents = contents_text.encode("utf-8")
     if len(contents) > HANDOFF_BYTES_LIMIT:
@@ -3398,8 +3408,8 @@ def _handoff_artifact_from_obj(
     digest = _as_str(raw["sha256"], f"{label}.sha256")
     if not DIGEST_RE.fullmatch(digest) or hashlib.sha256(contents).hexdigest() != digest:
         raise StateError(f"{label} digest does not match its content")
-    if source_identity is not None and source_identity.sha256 != digest:
-        raise StateError(f"{label} legacy source digest does not match its content")
+    if source_identity.sha256 != digest:
+        raise StateError(f"{label} source digest does not match its content")
     return _HandoffArtifact(
         path=path,
         machine=machine,
@@ -3409,6 +3419,7 @@ def _handoff_artifact_from_obj(
         sha256=digest,
         recorded_at=recorded_at,
         source=source,
+        source_path=source_path,
         source_identity=source_identity,
         storage_identity=storage_identity,
     )
@@ -3434,6 +3445,115 @@ def _load_handoff_sidecar(
     )
 
 
+def _canonical_handoff_source(
+    path: Path,
+    contents: bytes,
+    identity: _RegularFileIdentity,
+    label: str,
+) -> Path:
+    try:
+        canonical = path.resolve(strict=True)
+    except OSError as exc:
+        raise Refusal(f"cannot resolve {label} {path}: {exc}") from exc
+    canonical_contents, canonical_identity = _read_regular_file_identity(
+        canonical, label, HANDOFF_BYTES_LIMIT
+    )
+    if canonical_contents != contents or canonical_identity != identity:
+        raise Refusal(f"{label} changed while its canonical path was resolved: {path}")
+    return canonical
+
+
+def _git_worktree_root_for_handoff_source(path: Path, label: str) -> Path | None:
+    """Return the containing Git worktree, refusing an indeterminate probe."""
+
+    result = _GitVcs._run(
+        path.parent,
+        (
+            "-c",
+            "core.fsmonitor=false",
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+        ),
+        check=False,
+        env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+    )
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode == 0:
+        if stderr or not stdout or "\n" in stdout or "\r" in stdout:
+            raise Refusal(
+                f"cannot determine Git provenance for {label} {path}: "
+                "Git returned an invalid worktree root"
+            )
+        root = Path(stdout)
+        try:
+            resolved = root.resolve(strict=True)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot determine Git provenance for {label} {path}: {exc}"
+            ) from exc
+        if not root.is_absolute() or root != resolved or not root.is_dir():
+            raise Refusal(
+                f"cannot determine Git provenance for {label} {path}: "
+                f"Git returned an unsafe worktree root {root}"
+            )
+        return root
+    if (
+        result.returncode == 128
+        and not stdout
+        and stderr.startswith("fatal: not a git repository")
+    ):
+        return None
+    detail = stderr or stdout or f"Git exited {result.returncode} without diagnostics"
+    raise Refusal(f"cannot determine Git provenance for {label} {path}: {detail}")
+
+
+def _assert_external_handoff_source(path: Path) -> None:
+    root = _git_worktree_root_for_handoff_source(path, "handoff input")
+    if root is not None:
+        raise Refusal(
+            f"handoff input is inside Git working tree {root}: {path}; copy intentionally "
+            "authored handoff bytes to an external regular file and retry"
+        )
+
+
+def _assert_legacy_handoff_is_not_tracked(path: Path) -> None:
+    root = _git_worktree_root_for_handoff_source(path, "legacy HANDOFF.md")
+    if root is None:
+        return
+    try:
+        relative = path.resolve(strict=True).relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise Refusal(
+            f"cannot determine Git provenance for legacy HANDOFF.md {path}: {exc}"
+        ) from exc
+    result = _GitVcs._run(
+        root,
+        (
+            "-c",
+            "core.fsmonitor=false",
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            relative.as_posix(),
+        ),
+        check=False,
+        env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+    )
+    if result.returncode == 0:
+        raise Refusal(
+            "slot HANDOFF.md is tracked by Git and cannot prove a slot-specific "
+            f"handoff: {path}"
+        )
+    if result.returncode != 1:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Refusal(
+            f"cannot determine whether legacy HANDOFF.md is tracked by Git: {path}"
+            + (f": {detail}" if detail else "")
+        )
+
+
 def _legacy_handoff_artifact(
     config: Config, record: ActiveRecord, slot_path: Path
 ) -> _HandoffArtifact | None:
@@ -3449,6 +3569,10 @@ def _legacy_handoff_artifact(
         raise Refusal(
             f"slot {record.slot} HANDOFF.md cannot be read as UTF-8: {exc}"
         ) from exc
+    source_path = _canonical_handoff_source(
+        path, contents, identity, f"slot {record.slot} HANDOFF.md"
+    )
+    _assert_legacy_handoff_is_not_tracked(source_path)
     return _HandoffArtifact(
         path=path,
         machine=record.machine,
@@ -3458,6 +3582,7 @@ def _legacy_handoff_artifact(
         sha256=identity.sha256,
         recorded_at=_utc_now(),
         source="legacy-slot-file",
+        source_path=source_path,
         source_identity=identity,
         storage_identity=identity,
     )
@@ -12062,6 +12187,7 @@ def _same_handoff_snapshot(
         left.contents,
         left.sha256,
         left.source,
+        left.source_path,
         left.source_identity,
         left.storage_identity,
     ) == (
@@ -12072,6 +12198,7 @@ def _same_handoff_snapshot(
         right.contents,
         right.sha256,
         right.source,
+        right.source_path,
         right.source_identity,
         right.storage_identity,
     )
@@ -12236,6 +12363,11 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
                     "generation": current_record.generation,
                     "sha256": current_artifact.sha256,
                     "contents_utf8": rendered,
+                    "source": current_artifact.source,
+                    "source_path": str(current_artifact.source_path),
+                    "source_identity": _regular_file_identity_to_obj(
+                        current_artifact.source_identity
+                    ),
                     "reader": _identity_to_obj(reader),
                     "coordinator_authorized": bool(args.coordinator_authorized),
                     "retirement_enqueued": True,
@@ -12268,14 +12400,18 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
     owner = _capture_caller_process(args.owner_pid, "owner")
-    source = Path(args.from_file).absolute()
+    requested_source = Path(args.from_file).absolute()
     contents, _source_identity = _read_regular_file_identity(
-        source, "handoff input", HANDOFF_BYTES_LIMIT
+        requested_source, "handoff input", HANDOFF_BYTES_LIMIT
     )
     try:
         contents.decode("utf-8")
     except UnicodeError as exc:
-        raise Refusal(f"handoff input is not UTF-8: {source}: {exc}") from exc
+        raise Refusal(f"handoff input is not UTF-8: {requested_source}: {exc}") from exc
+    source = _canonical_handoff_source(
+        requested_source, contents, _source_identity, "handoff input"
+    )
+    _assert_external_handoff_source(source)
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
@@ -12314,7 +12450,8 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
             sha256=hashlib.sha256(contents).hexdigest(),
             recorded_at=_utc_now(),
             source="write-handoff",
-            source_identity=None,
+            source_path=source,
+            source_identity=_source_identity,
             storage_identity=_source_identity,
         )
         if existing is None or existing.contents != artifact.contents:
@@ -12336,6 +12473,11 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
                 "generation": record.generation,
                 "sha256": artifact.sha256,
                 "path": sidecar_path.name,
+                "source": artifact.source,
+                "source_path": str(artifact.source_path),
+                "source_identity": _regular_file_identity_to_obj(
+                    artifact.source_identity
+                ),
                 "writer": _identity_to_obj(owner),
             },
         )
@@ -27416,7 +27558,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--from-file",
         required=True,
         metavar="PATH",
-        help="regular UTF-8 input file, at most 1 MiB; it is copied, never moved",
+        help="regular UTF-8 input outside every Git working tree, at most 1 MiB; "
+        "it is copied, never moved",
     )
     write_handoff.set_defaults(handler=_cmd_write_handoff)
 

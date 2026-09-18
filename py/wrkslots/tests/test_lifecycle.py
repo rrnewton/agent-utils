@@ -14251,9 +14251,39 @@ def test_write_handoff_is_external_and_immutable_after_finish(tmp_path: Path) ->
 
     assert written.returncode == 0, written.stderr
     config = wrkslots._load_config(str(project), "testhost")
+    _contents, source_identity = wrkslots._read_regular_file_identity(
+        source, "test handoff source", wrkslots.HANDOFF_BYTES_LIMIT
+    )
     sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
     assert sidecar.is_file()
+    sidecar_payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert sidecar_payload["schema"] == wrkslots.HANDOFF_SIDECAR_SCHEMA
+    assert sidecar_payload["source"] == "write-handoff"
+    assert sidecar_payload["source_path"] == str(source.absolute())
+    assert sidecar_payload["source_identity"] == wrkslots._regular_file_identity_to_obj(
+        source_identity
+    )
     assert not (checkout(project) / "HANDOFF.md").exists()
+    source.write_text("changed after the atomic projection\n", encoding="utf-8")
+    read = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert read.returncode == 0, read.stderr
+    assert "continue from the published commit" in read.stdout
+    assert "changed after the atomic projection" not in read.stdout
+    events = wrkslots._load_events(config)
+    for kind in ("handoff-written", "handoff-read"):
+        payload = next(event["payload"] for event in events if event["kind"] == kind)
+        assert isinstance(payload, dict)
+        assert payload["source"] == "write-handoff"
+        assert payload["source_path"] == str(source.absolute())
+        assert payload["source_identity"] == wrkslots._regular_file_identity_to_obj(
+            source_identity
+        )
     commit_task(repository, checkout(project), "codex/task")
     handed_off = finish(project)
     assert handed_off.returncode == 0, handed_off.stderr
@@ -14273,6 +14303,286 @@ def test_write_handoff_is_external_and_immutable_after_finish(tmp_path: Path) ->
     )
     assert refused.returncode == 3
     assert "handoff is immutable" in refused.stderr
+
+
+def test_write_handoff_refuses_tracked_checkout_source_without_queueing(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    broadcast = repository / "HANDOFF.md"
+    broadcast.write_text("shared repository instructions\n", encoding="utf-8")
+    git(repository, "add", "HANDOFF.md")
+    git(repository, "commit", "-m", "add shared instructions")
+    git(repository, "push", "origin", "main")
+    assert create(project).returncode == 0
+    source = checkout(project) / "HANDOFF.md"
+    assert git(
+        checkout(project), "ls-files", "--error-unmatch", "HANDOFF.md"
+    ).returncode == 0
+    assert git(checkout(project), "status", "--porcelain").stdout == ""
+
+    refused = raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    )
+
+    assert refused.returncode == 3
+    assert "inside Git working tree" in refused.stderr
+    unread = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert unread.returncode == 3
+    assert "has no handoff sidecar or legacy HANDOFF.md" in unread.stderr
+    queued = json.loads(
+        raw_command(project, "retirement-queue", "--format", "json").stdout
+    )
+    assert queued["pending"] == []
+
+
+def test_two_flat_tracked_handoffs_are_not_legacy_retirement_evidence(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path, worktrees_directory="worktrees/slots", layout="flat"
+    )
+    broadcast = repository / "HANDOFF.md"
+    broadcast.write_text("identical shared instructions\n", encoding="utf-8")
+    git(repository, "add", "HANDOFF.md")
+    git(repository, "commit", "-m", "add shared instructions")
+    git(repository, "push", "origin", "main")
+    assert create(project).returncode == 0
+    assert create(
+        project, slot="slot02", agent="codex-2", branch="codex/task-2"
+    ).returncode == 0
+    first = checkout(project)
+    second = checkout(project, slot="slot02")
+    assert (first / "HANDOFF.md").read_bytes() == (second / "HANDOFF.md").read_bytes()
+    for tree in (first, second):
+        assert git(
+            tree, "ls-files", "--error-unmatch", "HANDOFF.md"
+        ).returncode == 0
+        assert git(tree, "status", "--porcelain").stdout == ""
+
+    first_read = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    second_read = raw_command(
+        project,
+        "read-handoff",
+        "slot02",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    for refused_read in (first_read, second_read):
+        assert refused_read.returncode == 3
+        assert "tracked by Git" in refused_read.stderr
+    queued = json.loads(
+        raw_command(project, "retirement-queue", "--format", "json").stdout
+    )
+    assert queued["pending"] == []
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not any(
+        event["kind"] == "handoff-read" for event in wrkslots._load_events(config)
+    )
+
+
+def test_write_handoff_refuses_indeterminate_git_source_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "external-handoff.md"
+    source.write_text("slot-specific continuation\n", encoding="utf-8")
+
+    def indeterminate_git(
+        _repository: Path,
+        _args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        del check, input_text, env_overrides
+        return subprocess.CompletedProcess(
+            ["git"], 2, "", "fatal: simulated provenance failure\n"
+        )
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(indeterminate_git))
+    args = argparse.Namespace(
+        project_root=str(project),
+        machine="testhost",
+        slot="slot01",
+        agent="codex-1",
+        owner_pid=os.getpid(),
+        expected_generation=1,
+        from_file=str(source),
+        wait_lock=0.0,
+    )
+    with pytest.raises(wrkslots.Refusal, match="cannot determine Git provenance"):
+        wrkslots._cmd_write_handoff(args)
+
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._handoff_sidecar_path(config, "slot01", 1).exists()
+    assert not any(
+        event["kind"] in {"handoff-written", "handoff-read"}
+        for event in wrkslots._load_events(config)
+    )
+
+
+def test_legacy_handoff_refuses_indeterminate_git_tracking_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path, worktrees_directory="worktrees/slots", layout="flat"
+    )
+    assert create(project).returncode == 0
+    legacy = checkout(project) / "HANDOFF.md"
+    legacy.write_text("slot-specific continuation\n", encoding="utf-8")
+    original_run = wrkslots._GitVcs._run
+
+    def indeterminate_tracking(
+        repository: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if "ls-files" in args:
+            return subprocess.CompletedProcess(
+                ["git"], 2, "", "fatal: simulated tracking failure\n"
+            )
+        return original_run(
+            repository,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(
+        wrkslots._GitVcs, "_run", staticmethod(indeterminate_tracking)
+    )
+    args = argparse.Namespace(
+        project_root=str(project),
+        machine="testhost",
+        slot="slot01",
+        coordinator_pid=os.getpid(),
+        coordinator_authorized=False,
+        adopt_legacy_change=False,
+        expected_generation=None,
+        wait_lock=0.0,
+    )
+    with pytest.raises(
+        wrkslots.Refusal,
+        match="cannot determine whether legacy HANDOFF.md is tracked by Git",
+    ):
+        wrkslots._cmd_read_handoff(args)
+
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._handoff_sidecar_path(config, "slot01", 1).exists()
+    assert not any(
+        event["kind"] == "handoff-read" for event in wrkslots._load_events(config)
+    )
+
+
+def test_schema_one_write_handoff_sidecar_without_provenance_fails_closed(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "external-handoff.md"
+    source.write_text("slot-specific continuation\n", encoding="utf-8")
+    written = raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    )
+    assert written.returncode == 0, written.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    payload["schema"] = wrkslots.HANDOFF_SIDECAR_LEGACY_SCHEMA
+    del payload["source_path"]
+    payload["source_identity"] = None
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+    refused = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert refused.returncode == 3
+    assert "schema 1 lacks auditable write-handoff source provenance" in refused.stderr
+    queued = raw_command(project, "retirement-queue", "--format", "json")
+    assert queued.returncode == 0, queued.stderr
+    assert json.loads(queued.stdout)["pending"] == []
+
+
+def test_schema_one_legacy_sidecar_upgrades_with_derived_direct_child_path(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text("legacy continuation\n", encoding="utf-8")
+    first = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert first.returncode == 0, first.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    payload["schema"] = wrkslots.HANDOFF_SIDECAR_LEGACY_SCHEMA
+    del payload["source_path"]
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+
+    second = raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert second.returncode == 0, second.stderr
+    upgraded = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert upgraded["schema"] == wrkslots.HANDOFF_SIDECAR_SCHEMA
+    assert upgraded["source"] == "legacy-slot-file"
+    assert upgraded["source_path"] == str(legacy.resolve())
 
 
 @pytest.mark.parametrize(
@@ -14311,6 +14621,23 @@ def test_read_handoff_migrates_legacy_without_removing_and_enqueues_once(
     assert len(pending) == 1
     assert pending[0]["slot"] == "slot01"
     assert pending[0]["blocked_reason"] is None
+    _contents, source_identity = wrkslots._read_regular_file_identity(
+        legacy, "test legacy handoff", wrkslots.HANDOFF_BYTES_LIMIT
+    )
+    sidecar_payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert sidecar_payload["source"] == "legacy-slot-file"
+    assert sidecar_payload["source_path"] == str(legacy.absolute())
+    assert sidecar_payload["source_identity"] == wrkslots._regular_file_identity_to_obj(
+        source_identity
+    )
+    events = wrkslots._load_events(config)
+    payload = next(event["payload"] for event in events if event["kind"] == "handoff-read")
+    assert isinstance(payload, dict)
+    assert payload["source"] == "legacy-slot-file"
+    assert payload["source_path"] == str(legacy.absolute())
+    assert payload["source_identity"] == wrkslots._regular_file_identity_to_obj(
+        source_identity
+    )
 
 
 def test_handoff_sidecar_disagreement_refuses_without_read_event(tmp_path: Path) -> None:
