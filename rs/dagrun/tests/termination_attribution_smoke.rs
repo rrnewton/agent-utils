@@ -286,8 +286,17 @@ fn clean_suite_still_passes_and_accuses_nobody() {
         4,
         "a clean run must still report every test boundary:\n{journal}"
     );
-    assert!(
-        journal.contains("\"ok\":\"true\""),
+    let end = journal
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("journal must contain JSON")
+        .into_iter()
+        .find(|row| row["event"] == "step_end")
+        .expect("journal must contain step_end");
+    assert_eq!(
+        dagrun::require_step_end_ok(&end),
+        Ok(true),
         "the terminal record must say the step passed:\n{journal}"
     );
 }

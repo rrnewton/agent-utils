@@ -41,8 +41,8 @@ use std::time::{Duration, Instant};
 use crate::ambient::{capture_ambient_snapshot, PsiReading};
 use crate::attribution::{
     bind_process_tests, capture_max_bytes, capture_truncation_notice, default_log_dir,
-    mint_step_nonce, process_snapshot, recognize, Culprit, RunEvidence, StepStream, TestEvent,
-    STEP_NONCE_ENV, TEST_COUNTS_PATH_ENV,
+    mint_step_nonce, process_snapshot, recognize, Culprit, JournalValue, RunEvidence, StepStream,
+    TestEvent, STEP_NONCE_ENV, TEST_COUNTS_PATH_ENV,
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
@@ -2115,6 +2115,45 @@ impl Runner {
         for (h, _step) in handles {
             let _ = h.join();
         }
+        if let Some(evidence) = &self.evidence {
+            // Intentional skips were recorded before scheduling. Once all supervisors have
+            // joined, the dependency-skip closure and remaining not-launched set are stable, so
+            // the journal can account for every step in the plan.
+            let (mut dependency_skips, mut not_launched) = {
+                let sh = lock_shared(&self.shared);
+                let skipped = self.skipped(&sh);
+                let intentional_skip_tags: HashSet<&str> = self
+                    .intentional_skips
+                    .iter()
+                    .map(|(tag, _)| tag.as_str())
+                    .collect();
+                let not_launched = self
+                    .order
+                    .iter()
+                    .filter(|tag| {
+                        !sh.done.contains_key(*tag)
+                            && !skipped.contains(*tag)
+                            && !intentional_skip_tags.contains(tag.as_str())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (skipped.into_iter().collect::<Vec<_>>(), not_launched)
+            };
+            dependency_skips.sort();
+            not_launched.sort();
+            for tag in dependency_skips {
+                evidence.record(
+                    "step_skip",
+                    &[("step", tag), ("reason", "dependency_failed".to_string())],
+                );
+            }
+            for tag in not_launched {
+                evidence.record(
+                    "step_skip",
+                    &[("step", tag), ("reason", "not_launched".to_string())],
+                );
+            }
+        }
         if let Some(coordinator) = &self.resource_coordinator {
             coordinator.clear_pending();
         }
@@ -4170,46 +4209,67 @@ fn run_step(ctx: StepCtx) {
     if let Some(e) = &evidence {
         let counts = sink.counts();
         let mut fields = vec![
-            ("step", tag.clone()),
-            ("ok", ok.to_string()),
-            ("aborted", was_aborted.to_string()),
-            ("timed_out", timed_out.to_string()),
-            ("cpu_timed_out", cpu_timed_out.to_string()),
-            ("wall_elapsed_s", format!("{elapsed:.3}")),
-            ("tests_started", counts.started.to_string()),
-            ("tests_completed", counts.completed.to_string()),
+            ("step", JournalValue::Text(tag.clone())),
+            ("ok", JournalValue::Boolean(ok)),
+            ("aborted", JournalValue::Text(was_aborted.to_string())),
+            ("timed_out", JournalValue::Text(timed_out.to_string())),
+            (
+                "cpu_timed_out",
+                JournalValue::Text(cpu_timed_out.to_string()),
+            ),
+            (
+                "wall_elapsed_s",
+                JournalValue::Text(format!("{elapsed:.3}")),
+            ),
+            (
+                "tests_started",
+                JournalValue::Text(counts.started.to_string()),
+            ),
+            (
+                "tests_completed",
+                JournalValue::Text(counts.completed.to_string()),
+            ),
             (
                 "culprit_test",
-                culprit
-                    .as_ref()
-                    .and_then(|c| c.test.clone())
-                    .unwrap_or_default(),
+                JournalValue::Text(
+                    culprit
+                        .as_ref()
+                        .and_then(|c| c.test.clone())
+                        .unwrap_or_default(),
+                ),
             ),
         ];
         // The two ceilings this step ran under, each named for the quantity it bounds. Recorded
         // only when they are live, so a disabled budget stays absent instead of reading as 0.
         if cpu_budget > 0 {
-            fields.push(("cpu_limit_s", cpu_budget.to_string()));
+            fields.push(("cpu_limit_s", JournalValue::Text(cpu_budget.to_string())));
         }
         if wall_budget > 0 {
-            fields.push(("wall_limit_s", wall_budget.to_string()));
+            fields.push(("wall_limit_s", JournalValue::Text(wall_budget.to_string())));
         }
-        fields.extend(cpu_journal_fields(cpu_stats.as_ref()));
+        fields.extend(
+            cpu_journal_fields(cpu_stats.as_ref())
+                .into_iter()
+                .map(|(key, value)| (key, JournalValue::Text(value))),
+        );
         // WHY this step ended as it did. Without it the record says a step was not ok, or was
         // cancelled, and never what happened -- so a cancelled step could be COUNTED and never
         // NAMED, and an unknown nobody can name is an unknown nobody can drive down. Empty on a
         // pass, and absent rather than empty for the same reason the budgets above are: an empty
         // string in the record would read as a cause that was looked for and not found.
         if !reason.is_empty() {
-            fields.push(("reason", reason.clone()));
+            fields.push(("reason", JournalValue::Text(reason.clone())));
         }
         if let Some(error) = &structured_test_results_error {
-            fields.push(("test_results_error", error.clone()));
+            fields.push(("test_results_error", JournalValue::Text(error.clone())));
         }
         if let Some(kind) = structured_test_results_error_kind {
-            fields.push(("test_results_error_kind", kind.value().into()));
+            fields.push((
+                "test_results_error_kind",
+                JournalValue::Text(kind.value().into()),
+            ));
         }
-        e.record("step_end", &fields);
+        e.record_values("step_end", &fields);
     }
 }
 
@@ -5279,7 +5339,7 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
                 let end = ends[0];
                 // Exit codes remain in StepOutcome; the existing journal stores the reason.
                 assert!(end.get("returncode").is_none());
-                assert_eq!(end["ok"], "false");
+                assert_eq!(crate::attribution::require_step_end_ok(end), Ok(false));
                 assert_eq!(end["reason"], outcome.reason);
                 assert_eq!(
                     end.get("test_results_error_kind")
@@ -6610,6 +6670,65 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         );
         assert_eq!(res.skipped, vec!["g.dependent"]);
         assert_eq!(res.not_launched, vec!["g.independent"]);
+    }
+
+    #[test]
+    fn journal_uses_boolean_verdicts_and_accounts_for_unrun_steps() {
+        let dir = std::env::temp_dir().join(format!(
+            "dagrun-complete-journal-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut intentional = step("g", "intentional", "exit 99", &[], 0.0, &[]);
+        intentional.skip_reason = Some(IntentionalSkipReason::EmptyManifestBucket);
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "fail", "exit 1", &[], 100.0, &[]),
+                step("g", "dependent", "true", &["g.fail"], 90.0, &[]),
+                step("g", "independent", "true", &[], 80.0, &[]),
+                intentional,
+            ],
+            ..Default::default()
+        };
+        let mut runner = Runner::new(&cfg, 1, 1, false, 0, None, None, None, None, None, None);
+        runner.evidence = RunEvidence::open(Some(dir.clone())).map(Arc::new);
+        let (ok, wall) = runner.run();
+        assert!(!ok);
+        let result = runner.result(wall);
+        assert_eq!(result.skipped, vec!["g.dependent"]);
+        assert_eq!(result.not_launched, vec!["g.independent"]);
+
+        let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+        let rows = journal
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let ends = rows
+            .iter()
+            .filter(|row| row["event"] == "step_end")
+            .collect::<Vec<_>>();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0]["step"], "g.fail");
+        assert_eq!(ends[0]["ok"].as_bool(), Some(false));
+        assert!(!ends[0]["ok"].is_string());
+
+        let skips = rows
+            .iter()
+            .filter(|row| row["event"] == "step_skip")
+            .map(|row| {
+                (
+                    row["step"].as_str().unwrap(),
+                    row["reason"].as_str().unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(skips.get("g.dependent"), Some(&"dependency_failed"));
+        assert_eq!(skips.get("g.independent"), Some(&"not_launched"));
+        assert_eq!(skips.get("g.intentional"), Some(&"empty-manifest-bucket"));
+        assert_eq!(ends.len() + skips.len(), cfg.steps.len());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

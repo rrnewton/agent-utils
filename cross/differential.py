@@ -2018,6 +2018,14 @@ def compare_term_attribution(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok(label)
 
 
+def _journal_step_end_ok(row: Mapping[str, object]) -> bool:
+    """Read a journal verdict without accepting a truthy string as success."""
+    value = row.get("ok")
+    if type(value) is not bool:
+        raise ValueError("journal step_end ok must be a boolean")
+    return value
+
+
 def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report) -> None:
     """Explicit evidence and test-level culprit attribution are paired public behavior."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -2067,7 +2075,9 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
         else:
             rep.ok("attribution:culprit")
 
-        def normalized(directory: str) -> list[tuple[str, str, str, str, str, str]]:
+        def normalized(
+            directory: str,
+        ) -> list[tuple[str, str, str, str, str, str, bool | None]]:
             rows = [
                 json.loads(line)
                 for line in Path(directory, "journal.jsonl").read_text(encoding="utf-8").splitlines()
@@ -2080,12 +2090,19 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
                     str(row.get("verdict", "")),
                     str(row.get("tests_started", "")),
                     str(row.get("tests_completed", "")),
+                    _journal_step_end_ok(row) if row.get("event") == "step_end" else None,
                 )
                 for row in rows
                 if row.get("event") in {"test_start", "test_end", "step_end"}
             ]
 
         try:
+            try:
+                _journal_step_end_ok({"event": "step_end", "ok": "false"})
+            except ValueError:
+                pass
+            else:
+                raise ValueError("journal reader accepted a string step_end verdict")
             py_rows, rs_rows = normalized(dirs["py"]), normalized(dirs["rs"])
             logs = {
                 name: Path(directory, "tests.suite.log").read_text(encoding="utf-8")

@@ -28,6 +28,8 @@ from dagrun.model import (
 )
 from dagrun.scheduler import _cpu_journal_fields
 
+JournalValue = str | bool
+
 
 class _FullCounters(NoopCgroups):
     enabled = True
@@ -53,7 +55,7 @@ def _step_end(
     cgroups: NoopCgroups,
     cpu_timeout: int,
     default_cpu_timeout: int = DEFAULT_SMALL_CPU_TIMEOUT,
-) -> dict[str, str]:
+) -> dict[str, JournalValue]:
     cfg = DagConfig(
         steps=(Step("g", "quick", "does a little", "true", timeout=45, cpu_timeout=cpu_timeout),),
         default_step_cpu_timeout=default_cpu_timeout,
@@ -75,7 +77,7 @@ def _step_end(
     ]
     ends = [r for r in records if r.get("event") == "step_end"]
     assert len(ends) == 1, f"expected exactly one step_end record, got {ends}"
-    record: dict[str, str] = ends[0]
+    record: dict[str, JournalValue] = ends[0]
     return record
 
 
@@ -97,6 +99,9 @@ def test_a_boxed_step_journals_what_it_consumed_and_what_it_was_allowed(
     tmp_path: Path,
 ) -> None:
     record = _step_end(tmp_path / "full", _FullCounters(), cpu_timeout=30)
+
+    assert record["ok"] is True
+    assert type(record["ok"]) is bool
 
     assert record["cpu_usage_usec"] == "259926893"
     assert record["cpu_nr_throttled"] == "994"
@@ -147,7 +152,7 @@ def _records(
     *,
     jobs: int,
     run_timeout_s: int | None = None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, JournalValue]]:
     """Run a real DAG with its journal in ``log_dir`` and return the ``step_end`` records."""
     cfg = DagConfig(steps=steps)
     previous = os.environ.get(LOG_DIR_ENV)
@@ -165,7 +170,7 @@ def _records(
             os.environ.pop(LOG_DIR_ENV, None)
         else:
             os.environ[LOG_DIR_ENV] = previous
-    records: list[dict[str, str]] = [
+    records: list[dict[str, JournalValue]] = [
         json.loads(line)
         for line in (log_dir / "journal.jsonl").read_text().splitlines()
         if line.strip()
@@ -173,7 +178,9 @@ def _records(
     return [r for r in records if r.get("event") == "step_end"]
 
 
-def _by_step(records: list[dict[str, str]], tag: str) -> dict[str, str]:
+def _by_step(
+    records: list[dict[str, JournalValue]], tag: str
+) -> dict[str, JournalValue]:
     match = [r for r in records if r.get("step") == tag]
     assert len(match) == 1, f"expected exactly one step_end for {tag}, got {records}"
     return match[0]
@@ -188,13 +195,13 @@ def test_a_step_that_fails_records_the_cause_it_already_computed(tmp_path: Path)
         jobs=1,
     )
     record = _by_step(records, "a.boom")
-    assert record["ok"] == "false", record
+    assert record["ok"] is False, record
     assert record["reason"] == "exit 3", record
 
 
 def test_a_passing_step_carries_no_reason_key_at_all(tmp_path: Path) -> None:
     record = _step_end(tmp_path / "control", NoopCgroups(), cpu_timeout=30)
-    assert record["ok"] == "true", record
+    assert record["ok"] is True, record
     # Absent rather than empty, for the same reason an unset budget is absent above: a
     # ``"reason": ""`` would read as a cause that was looked for and not found.
     assert "reason" not in record
@@ -213,8 +220,10 @@ def test_a_peer_failure_cancellation_names_the_peer_and_not_the_run_budget(
     )
     record = _by_step(records, "a.slow")
     assert record["aborted"] == "true", record
-    assert "eager-exit after another step failed" in record["reason"], record
-    assert "OUTER run budget" not in record["reason"], record
+    reason = record["reason"]
+    assert isinstance(reason, str), record
+    assert "eager-exit after another step failed" in reason, record
+    assert "OUTER run budget" not in reason, record
 
 
 def test_an_outer_budget_cut_names_the_budget_and_never_a_peer(tmp_path: Path) -> None:
@@ -240,11 +249,13 @@ def test_an_outer_budget_cut_names_the_budget_and_never_a_peer(tmp_path: Path) -
     )
     record = _by_step(records, "a.long")
     assert record["aborted"] == "true", record
-    assert "cut short by the OUTER run budget" in record["reason"], record
+    reason = record["reason"]
+    assert isinstance(reason, str), record
+    assert "cut short by the OUTER run budget" in reason, record
     # The control that makes the assertion above mean something: before the reason distinguished
     # the two cancellations this record claimed a peer had failed, and a reader who only has the
     # record -- the reader it exists for -- would have gone looking for one.
-    assert "eager-exit" not in record["reason"], record
+    assert "eager-exit" not in reason, record
 
 
 class _CleanupAfterDeadline(NoopCgroups):
