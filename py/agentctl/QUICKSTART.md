@@ -59,3 +59,7 @@ The Chat bridge accepts messages from configured senders, acknowledges intake
 with 🤖, and sends the agent's tagged final answer back to its Google Chat
 thread. The agent normally needs no reply-file write or reply command. Thread
 replies also include a command hint for reading the nearest ten prior messages.
+The built-in transport polls the public Google Chat API. For prompt intake from
+a persistent event stream, configure an `event_command` adapter as described in
+`agentctl chat userguide`; ACKs, prompt delivery, and recovery scans then run
+independently.

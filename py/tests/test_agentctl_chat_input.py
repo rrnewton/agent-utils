@@ -1,0 +1,373 @@
+"""Persistent command input framing, backpressure, wakeup, and process cleanup."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from agentctl.chat_input import EventCommandStream, InputStreamError
+
+
+_REQUEST: dict[str, object] = {"action": "subscribe", "space": "spaces/test", "cursor": "opaque+/= cursor"}
+_PREAMBLE = "import json,os,sys,time\nrequest=json.load(sys.stdin)\n"
+
+
+def _stream(program: str, *, max_frame_bytes: int = 1024 * 1024) -> EventCommandStream:
+    return EventCommandStream([sys.executable, "-u", "-c", _PREAMBLE + program], _REQUEST,
+                              max_frame_bytes=max_frame_bytes)
+
+
+def _gone(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2][:1]
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return state == "Z"
+
+
+def _await_file(path: Path) -> None:
+    deadline = time.monotonic() + 5
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert path.exists()
+
+
+def test_one_process_receives_exact_request_and_literal_arguments(tmp_path: Path) -> None:
+    marker = tmp_path / "must-not-exist"
+    literal = f"$(touch {marker}); spaces 'quotes'\nsecond line"
+    program = _PREAMBLE + (
+        "print(json.dumps({'type':'message','request':request,'arguments':sys.argv[1:],'pid':os.getpid()}))\n"
+        "print(json.dumps({'type':'checkpoint','cursor':'next cursor','pid':os.getpid()}))\n"
+        "print(json.dumps({'type':'heartbeat'}))\n"
+        "print(json.dumps({'type':'gap','reason':'resume unavailable'}))\n"
+        "time.sleep(60)\n"
+    )
+    stream = EventCommandStream([sys.executable, "-u", "-c", program, literal], _REQUEST)
+    try:
+        first = stream.wait(5)
+        assert len(first) == 1
+        assert first[0]["request"] == _REQUEST
+        assert first[0]["arguments"] == [literal]
+        second = stream.wait(5)
+        assert second == [{"type": "checkpoint", "cursor": "next cursor", "pid": first[0]["pid"]}]
+        assert stream.wait(5) == [{"type": "heartbeat"}]
+        assert stream.wait(5) == [{"type": "gap", "reason": "resume unavailable"}]
+        assert not marker.exists()
+    finally:
+        stream.close()
+    assert _gone(int(str(first[0]["pid"])))
+
+
+def test_timeout_preserves_a_split_frame_and_zero_timeout_reads_buffered_frames(tmp_path: Path) -> None:
+    started, release = tmp_path / "partial-written", tmp_path / "release"
+    program = (
+        "from pathlib import Path\n"
+        "os.write(1,b'{\"type\":\"message\",')\n"
+        f"Path({str(started)!r}).touch()\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(0.005)\n"
+        "os.write(1,b'\"message\":{\"text\":\"complete\"}}\\n{\"type\":\"checkpoint\",\"cursor\":\"done\"}\\n')\n"
+        "time.sleep(60)\n"
+    )
+    stream = _stream(program)
+    try:
+        _await_file(started)
+        assert stream.wait(0.03) == []
+        release.touch()
+        assert stream.wait(5) == [{"type": "message", "message": {"text": "complete"}}]
+        assert stream.wait(0) == [{"type": "checkpoint", "cursor": "done"}]
+    finally:
+        stream.close()
+
+
+def test_wait_timeout_does_not_turn_into_an_eof_or_kill_the_command() -> None:
+    stream = _stream("print(json.dumps({'pid':os.getpid()}))\ntime.sleep(60)\n")
+    try:
+        pid = int(str(stream.wait(5)[0]["pid"]))
+        assert stream.wait(0) == []
+        assert stream.wait(0.02) == []
+        assert not _gone(pid)
+    finally:
+        stream.close()
+    assert _gone(pid)
+
+
+@pytest.mark.parametrize("exit_status", [0, 7])
+def test_eof_is_explicit_after_complete_pending_frames(exit_status: int) -> None:
+    stream = _stream(f"print('{{\"type\":\"heartbeat\"}}')\nsys.exit({exit_status})\n")
+    try:
+        assert stream.wait(5) == [{"type": "heartbeat"}]
+        with pytest.raises(InputStreamError) as caught:
+            stream.wait(5)
+        assert caught.value.code == "stream_eof"
+        with pytest.raises(InputStreamError, match="stream_closed"):
+            stream.wait(0)
+    finally:
+        stream.close()
+
+
+def test_eof_mid_frame_is_not_a_message_or_timeout() -> None:
+    stream = _stream("os.write(1,b'{\"type\":\"message\"')\n")
+    try:
+        with pytest.raises(InputStreamError) as caught:
+            stream.wait(5)
+        assert caught.value.code == "stream_eof"
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("payload", [
+    b"not-json private-token\n", b"[]\n", b"null\n", b"\xff\n", b"\n",
+    b'{"type":"heartbeat","type":"message"}\n', b'{"value":NaN}\n',
+    b'{"value":Infinity}\n', b'{"value":"\\ud800"}\n',
+])
+def test_invalid_frames_close_the_process_without_echoing_provider_bytes(payload: bytes) -> None:
+    stream = _stream(f"os.write(2,b'private-token\\n')\nos.write(1,{payload!r})\ntime.sleep(60)\n")
+    try:
+        with pytest.raises(InputStreamError) as caught:
+            stream.wait(5)
+        assert caught.value.code == "invalid_frame"
+        assert "private-token" not in str(caught.value)
+        assert stream._process is not None and stream._process.returncode is not None
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("newline", [False, True])
+def test_frame_limit_applies_before_json_parsing_even_without_a_newline(newline: bool) -> None:
+    payload = b"x" * 129 + (b"\n" if newline else b"")
+    stream = _stream(f"os.write(1,{payload!r})\ntime.sleep(60)\n", max_frame_bytes=128)
+    try:
+        with pytest.raises(InputStreamError) as caught:
+            stream.wait(5)
+        assert caught.value.code == "frame_limit_exceeded"
+        assert stream._process is not None and stream._process.returncode is not None
+    finally:
+        stream.close()
+
+
+def test_exact_byte_limit_and_crlf_are_supported() -> None:
+    payload = json.dumps({"value": "x" * 115}, separators=(",", ":")).encode()
+    assert len(payload) == 127
+    stream = _stream(f"os.write(1,{(payload + bytes([13, 10]))!r})\ntime.sleep(60)\n", max_frame_bytes=128)
+    try:
+        assert stream.wait(5) == [{"value": "x" * 115}]
+    finally:
+        stream.close()
+
+
+def test_stderr_larger_than_pipe_capacity_does_not_block_output_or_leak() -> None:
+    program = (
+        "chunk=b'private-token ' * 5000\n"
+        "for _ in range(64): os.write(2,chunk)\n"
+        "print('{\"type\":\"heartbeat\"}')\n"
+        "time.sleep(60)\n"
+    )
+    stream = _stream(program)
+    try:
+        assert stream.wait(5) == [{"type": "heartbeat"}]
+        assert len(stream._buffer) <= stream._max_frame + 1
+    finally:
+        stream.close()
+
+
+def test_subscription_write_drains_early_output_and_stderr_while_input_is_blocked() -> None:
+    request: dict[str, object] = {"action": "subscribe", "cursor": "x" * 196608}
+    program = (
+        "import json,os,sys,time\n"
+        "print('{\"type\":\"heartbeat\"}',flush=True)\n"
+        "for _ in range(32): os.write(2,b'private-token '*5000)\n"
+        "request=json.load(sys.stdin)\n"
+        "print(json.dumps({'type':'checkpoint','cursor_length':len(request['cursor'])}),flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    stream = EventCommandStream([sys.executable, "-u", "-c", program], request)
+    try:
+        assert stream.wait(5) == [{"type": "heartbeat"}]
+        assert stream.wait(5) == [{"type": "checkpoint", "cursor_length": 196608}]
+    finally:
+        stream.close()
+
+
+def test_continuous_stderr_obeys_wait_deadline() -> None:
+    stream = _stream("print('{\"type\":\"heartbeat\"}')\nwhile True: os.write(2,b'x'*65536)\n")
+    try:
+        assert stream.wait(5) == [{"type": "heartbeat"}]
+        start = time.monotonic()
+        assert stream.wait(0.03) == []
+        assert time.monotonic() - start < 1
+    finally:
+        stream.close()
+
+
+def test_wake_interrupts_wait_without_discarding_subsequent_event(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    stream = _stream("from pathlib import Path\nprint('{\"type\":\"heartbeat\"}')\n"
+                     f"while not Path({str(release)!r}).exists(): time.sleep(0.005)\n"
+                     "print('{\"type\":\"checkpoint\",\"cursor\":\"after-wake\"}')\ntime.sleep(60)\n")
+    entered = threading.Event()
+    result: list[list[dict[str, object]]] = []
+
+    def wait() -> None:
+        entered.set()
+        result.append(stream.wait(30))
+
+    try:
+        assert stream.wait(5) == [{"type": "heartbeat"}]
+        worker = threading.Thread(target=wait)
+        worker.start()
+        assert entered.wait(1)
+        stream.wake()
+        worker.join(2)
+        assert not worker.is_alive()
+        assert result == [[]]
+        release.touch()
+        assert stream.wait(5) == [{"type": "checkpoint", "cursor": "after-wake"}]
+    finally:
+        stream.close()
+
+
+def test_close_from_another_thread_interrupts_wait_and_is_idempotent() -> None:
+    stream = _stream("print(json.dumps({'pid':os.getpid()}))\ntime.sleep(60)\n")
+    pid = int(str(stream.wait(5)[0]["pid"]))
+    entered = threading.Event()
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def wait() -> None:
+        entered.set()
+        try:
+            assert stream.wait(30) == []
+        except InputStreamError as exc:
+            if exc.code != "stream_closed":
+                errors.append(exc)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=wait)
+    worker.start()
+    assert entered.wait(1)
+    stream.close()
+    worker.join(2)
+    assert finished.is_set() and not worker.is_alive()
+    assert not errors
+    assert _gone(pid)
+    stream.close()
+    stream.wake()
+
+
+@pytest.mark.parametrize("parent_exits", [False, True])
+def test_cleanup_kills_descendants_even_if_parent_exits_with_output_pipe_open(parent_exits: bool) -> None:
+    program = (
+        "import subprocess\n"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+        "print(json.dumps({'parent':os.getpid(),'child':child.pid}))\n"
+        + ("sys.exit(7)\n" if parent_exits else "time.sleep(60)\n")
+    )
+    stream = _stream(program)
+    try:
+        process = stream.wait(5)[0]
+        parent, child = int(str(process["parent"])), int(str(process["child"]))
+        if parent_exits:
+            started = time.monotonic()
+            with pytest.raises(InputStreamError) as caught:
+                stream.wait(5)
+            assert caught.value.code == "stream_eof"
+            assert time.monotonic() - started < 2
+        else:
+            stream.close()
+        assert _gone(parent)
+        deadline = time.monotonic() + 2
+        while not _gone(child) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert _gone(child)
+    finally:
+        stream.close()
+
+
+def test_subscription_write_is_bounded_if_command_never_reads_stdin(tmp_path: Path) -> None:
+    pidfile = tmp_path / "pid"
+    program = (
+        "import os,time\nfrom pathlib import Path\n"
+        f"Path({str(pidfile)!r}).write_text(str(os.getpid()))\ntime.sleep(60)\n"
+    )
+    start = time.monotonic()
+    with pytest.raises(InputStreamError) as caught:
+        EventCommandStream([sys.executable, "-u", "-c", program], {"cursor": "x" * 524288},
+                           start_timeout=0.5)
+    assert caught.value.code == "subscription_timeout"
+    assert time.monotonic() - start < 3
+    assert pidfile.exists()
+    assert _gone(int(pidfile.read_text()))
+
+
+def test_missing_command_has_explicit_redacted_failure(tmp_path: Path) -> None:
+    command = tmp_path / "private-token-missing"
+    with pytest.raises(InputStreamError) as caught:
+        EventCommandStream([str(command)], _REQUEST)
+    assert caught.value.code == "command_failed"
+    assert "private-token" not in str(caught.value)
+
+
+@pytest.mark.parametrize("timeout", [-1.0, float("inf"), float("nan")])
+def test_invalid_wait_deadline_does_not_close_a_live_stream(timeout: float) -> None:
+    stream = _stream("print('{\"type\":\"heartbeat\"}')\ntime.sleep(60)\n")
+    try:
+        with pytest.raises(ValueError, match="timeout"):
+            stream.wait(timeout)
+        assert stream.wait(5) == [{"type": "heartbeat"}]
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("options", [
+    {"max_frame_bytes": 0}, {"max_frame_bytes": True}, {"start_timeout": 0.0},
+    {"start_timeout": float("nan")}, {"start_timeout": float("inf")},
+])
+def test_invalid_settings_fail_before_starting_a_command(
+    options: dict[str, object], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        pytest.fail("invalid configuration must not launch a process")
+
+    monkeypatch.setattr(subprocess, "Popen", fail)
+    if "max_frame_bytes" in options:
+        value = options["max_frame_bytes"]
+        assert isinstance(value, int)
+        with pytest.raises(ValueError):
+            EventCommandStream(["unused"], _REQUEST, max_frame_bytes=value)
+    else:
+        timeout = options["start_timeout"]
+        assert isinstance(timeout, float)
+        with pytest.raises(ValueError):
+            EventCommandStream(["unused"], _REQUEST, start_timeout=timeout)
+
+
+def test_nonfinite_or_oversized_subscription_is_rejected_before_spawn() -> None:
+    with pytest.raises(ValueError, match="valid JSON"):
+        EventCommandStream(["must-not-run"], {"value": float("nan")})
+    with pytest.raises(ValueError, match="byte limit"):
+        EventCommandStream(["must-not-run"], {"value": "x" * 200}, max_frame_bytes=128)
+
+
+def test_process_exit_detection_without_process_descriptors(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable(pid: int, flags: int = 0) -> int:
+        raise OSError("unsupported")
+
+    monkeypatch.setattr(os, "pidfd_open", unavailable)
+    stream = _stream("print('{\"type\":\"heartbeat\"}')\nsys.exit(7)\n")
+    try:
+        assert stream.wait(5) == [{"type": "heartbeat"}]
+        with pytest.raises(InputStreamError) as caught:
+            stream.wait(5)
+        assert caught.value.code == "stream_eof"
+    finally:
+        stream.close()

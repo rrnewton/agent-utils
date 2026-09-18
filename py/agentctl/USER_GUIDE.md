@@ -215,13 +215,27 @@ prompt delivery or replies.
 
 The Chat bridge is a separate, long-running process. It can target one coordinator
 without any worker team. It requires an interactive coordinator in Herdr and
-uses terminal input; a command transport changes Google Chat access, not the
+uses terminal input; a command or socket transport changes Google Chat access, not the
 harness connection. By default, the coordinator brackets its final answer with
 unique tags from the prompt. The bridge waits on a Herdr subscription, captures
 that block, and posts it durably; no reply file or CLI call is needed from the
 agent. Explicit file replies remain available with `reply_mode: "file"` and for
 recovery. Retained terminal history is bounded, so capture failures remain
 visible for inspection. The bridge does not supervise the coordinator's process.
+
+The built-in Chat transport polls the public REST API. An optional
+`event_command` connects an operator-supplied event stream; messages then wake
+the bridge immediately, while ACKs, Herdr prompt delivery, final replies, and
+recovery scans run independently. A durable cursor and message IDs allow safe
+replay after reconnecting. `run --reconcile-interval` controls background scans
+in streaming mode (default: 300 seconds). Without an event adapter,
+`run --interval` controls the delay after each completed polling cycle
+(default: 3 seconds). The Chat user guide documents the adapter protocol.
+
+One `run` or `tick` process owns each Chat state directory. Stop `run` before
+using `tick` for manual recovery. Explicit `chat reply` submissions remain
+available while it runs; the streaming runner picks up saved replies within
+one second, before provider send time.
 
 Thread replies include a command hint for the nearest ten prior messages:
 `agentctl chat context --state DIR --request KEY_OR_UNIQUE_HEX_PREFIX --limit 10`.

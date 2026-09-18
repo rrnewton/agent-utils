@@ -12,8 +12,10 @@ access.
 
 ## How the connection works
 
-The bridge polls Google Chat, accepts messages from configured senders, and
-stores them in a durable queue. It waits for the target's ready state, then calls
+The bridge accepts messages from configured senders and stores them in a durable
+queue. By default it polls Google Chat's public REST API. An optional
+`event_command` supplies a persistent event stream for prompt intake without
+waiting for the next poll. It waits for the target's ready state, then calls
 `herdr agent prompt PANE TEXT`. **Herdr submits the text through the terminal's
 paste and Enter sequence.** Input does not arrive through a native harness
 channel or protocol connection. Herdr must report the subsequent working state
@@ -96,28 +98,42 @@ refresh, set `token_command` to an argument array such as
 must print only the current token to stdout. `token_env` selects another
 environment variable when needed. Renewing an environment-only token
 requires restarting the bridge with the new environment. Alternatively,
-configure a command transport below to use an existing authenticated client.
+configure a command or socket transport below to use an existing authenticated
+client.
 
 ```sh
 agentctl chat init --config chat.json --state /work/project/.agentctl/.chat
 agentctl chat run --state /work/project/.agentctl/.chat
 ```
 
-Initialization starts at the current time. It does not replay the space's history.
-Use an explicit RFC3339 `--after` on `init` to replay a chosen interval. `run` polls
-Google Chat every three seconds; `--interval` accepts 0.1–60 seconds. Reply
-capture waits on Herdr subscriptions independently of this network polling
-interval. A service manager can restart the process using the same state
-directory. `tick` performs one polling, capture, and delivery cycle, and
-`status` displays each request, delivery phase, ACK retry state, and capture error.
-Choose a longer interval when your authenticated client has a shared read quota.
-Failures double the retry delay up to 60 seconds; successful cycles restore the
-configured interval.
+Initialization sets the message history cutoff to the current time. Messages
+created before that cutoff are excluded from both events and polls. Use an
+explicit RFC3339 `--after` on `init` to replay a chosen interval. Without `event_command`,
+`run` waits three seconds **after each completed polling cycle** before starting
+another; `--interval` accepts 0.1–60 seconds. A cycle includes transport and
+delivery work, so this is not a fixed message latency. Choose a longer interval
+when your authenticated client has a shared read quota. Failures double the
+delay up to 60 seconds; successful cycles restore the configured interval.
+
+With `event_command`, incoming events wake the bridge immediately. A background
+recovery scan runs on connection and every 300 seconds after a completed scan.
+`--reconcile-interval` accepts 10–86400 seconds; `--interval` does not apply in
+this mode. A reported event gap also requests a recovery scan. ACK requests,
+Herdr prompt delivery, final replies, and recovery scans run independently:
+a busy coordinator does not delay an intake ACK, and a slow ACK does not delay
+prompt delivery. Provider and harness latency still determine when those
+operations finish. See the event adapter contract below to enable this mode.
+
+Reply capture waits on Herdr subscriptions in both modes. A service manager can
+restart the process using the same state directory. `status` displays requests,
+delivery phases, ACK retry state, capture errors, and observer state. Only one
+`run` or `tick` process may own a state directory: `.run.lock` enforces this.
+Stop `run` before using `tick` for one polling, capture, and delivery cycle.
 
 Messages are accepted only from the configured sender resource IDs. A distinct
 bot identity for replies makes authorship clearer. Durable reply IDs suppress the
-bridge's own messages even when an adapter posts as an allowlisted user; uncertain
-send acknowledgements are recovered before polling resumes. A command
+bridge's own messages even when an adapter posts as an allowlisted user. Streaming
+intake defers a possible reply echo until its pending send is reconciled. A command
 transport must preserve Google sender IDs rather than replace them with display
 names. The bridge does not authorize messages from everyone in a space.
 
@@ -153,6 +169,10 @@ agentctl chat reply --state /work/project/.agentctl/.chat \
   --request REQUEST_KEY --file answer.txt
 ```
 
+You may run `reply` while the daemon is running. The streaming runner checks for
+saved file replies at least once per second; the polling runner picks them up
+on its next cycle. This pickup interval does not include the provider's send time.
+
 ## Thread context
 
 An actual thread reply includes a prompt hint for reading the nearest ten prior
@@ -180,7 +200,8 @@ The bridge durably saves an authorized input before reacting to its source
 message. The default reaction is 🤖. Set `ack_reaction` to a Unicode emoji such
 as `"😎"`, or to null or an empty string to disable ACKs. The reaction acknowledges
 intake, not completion or guaranteed harness acceptance. Busy coordinators still
-receive ACKs while their prompts remain queued.
+receive ACKs while their prompts remain queued. In streaming mode, ACKs and
+prompt submissions run independently; neither waits for the other to finish.
 
 Each request saves `ack.state` (`pending`, `acked`, or `disabled`), the configured
 emoji, a stable request UUID, attempts, last attempt time, next retry time,
@@ -205,13 +226,17 @@ somebody else's emoji as its own ACK. Keep the OAuth actor stable across retries
 
 State directories are private to the current account. `requests/` holds source
 messages and delivery phases, `queue/` is the existing durable Herdr inbox, and
-`replies/` holds final answers. Immutable message resource names deduplicate polls;
-creation timestamps order pending delivery. Pagination is checkpointed after source
+`replies/` holds final answers. Immutable message resource names deduplicate both
+events and polls; replaying an event does not create a second prompt.
+`input.json` records the stream's durable cursor and connection/recovery state.
+The cursor advances only after its message has been saved or excluded by the
+configured authority. A reconnect passes that saved cursor to the event adapter.
+Source creation timestamps order pending delivery. REST pagination is checkpointed after source
 messages are persisted, with a 60-second overlap for equal timestamps and brief
 indexing delays. Long upstream indexing delays may require an explicit replay with
 a new bridge state directory after checking what was already delivered.
 
-Busy coordinators keep messages queued while polling continues. A crash or lost
+Busy coordinators keep messages queued while intake continues. A crash or lost
 working-state acknowledgement after terminal injection marks `delivery_uncertain`;
 the bridge does not automatically send that prompt again. A keyed final reply
 from the coordinator proves execution and allows reply delivery while preserving
@@ -228,8 +253,9 @@ answer. If all tags have been evicted, the request remains awaiting a reply. Ins
 the pane and `agentctl chat status`. An idle/done event triggers one fresh read
 to recover an early closing tag inside a quoted example; readiness itself is
 never treated as an answer. These subscriptions stay active after capture errors,
-without repeatedly polling the pane. An explicit `agentctl chat tick` also retries
-capture once after inspection. Captures request up to 4,000 retained logical lines
+without repeatedly polling the pane. After stopping `run`, an explicit
+`agentctl chat tick` also retries capture once after inspection. Captures request
+up to 4,000 retained logical lines
 and are bounded to 2 MiB. If the answer cannot be recovered from retained
 history, submit the verified answer with `agentctl chat reply`.
 
@@ -242,7 +268,68 @@ before restarting after a long outage. Poll cursors, allowlisted senders, target
 assertions, and reply identity are bound to the initialized state; use a new state
 directory when changing this authority. Run one bridge per coordinator and space.
 
-## Existing-client command transport
+## Streaming event adapter
+
+Set optional `event_command` in `chat.json` before initialization to receive
+messages from an operator-supplied event adapter:
+
+```json
+{"event_command": ["/absolute/path/to/chat-events-adapter"]}
+```
+
+This is a separate input connection. Keep either the built-in REST transport,
+`transport_command`, or `transport_socket` for reactions, final replies, history,
+and recovery scans.
+The package does not supply a Google Workspace Events subscription or manage its
+credentials. One public implementation can use
+[Google Workspace Events for Chat](https://developers.google.com/workspace/events/guides/events-chat)
+with Google Cloud Pub/Sub, then normalize those notifications to the protocol
+below. The adapter owns subscription creation, renewal, upstream acknowledgements,
+and any provider-specific reconnect rules.
+
+The bridge launches the literal argument array without a shell. It writes one
+JSON object followed by a newline to stdin, then closes stdin:
+
+```json
+{"action":"subscribe","space":"spaces/SPACE","cursor":null}
+```
+
+`cursor` is null on the first connection, otherwise the last durably processed
+cursor string. The adapter must resume from that position or explicitly report
+a gap. Replaying the boundary event inclusively is safe. On a first connection,
+the adapter chooses its initial stream position. The bridge excludes messages
+created before the initialization cutoff, including an explicit `init --after`.
+The REST recovery scan fills available history from that cutoff even when the
+stream begins at its current position.
+
+Write one UTF-8 JSON object per line to stdout and flush each event promptly:
+
+```json
+{"type":"message","message":{"id":"spaces/SPACE/messages/MESSAGE","text":"Please inspect the build","sender":"users/OWNER","thread":"spaces/SPACE/threads/THREAD","created_at":"2026-01-01T00:01:00Z","thread_reply":true},"cursor":"POSITION"}
+{"type":"heartbeat"}
+{"type":"checkpoint","cursor":"NEXT_POSITION"}
+{"type":"gap","reason":"The upstream replay window expired"}
+```
+
+`message` has the same normalized fields and identity requirements as a poll
+result below. Preserve the authenticated sender ID and exact configured space;
+the bridge applies the same sender allowlist to both paths. `thread_reply` must
+come from provider metadata. An optional `cursor` on any event must be a nonempty
+string of at most 8192 characters. A `checkpoint` advances past upstream events
+that do not produce a message. A `heartbeat` reports a live connection; it does
+not prove that no messages were missed. A `gap` requests a background recovery
+scan. Preserve event order and emit preceding inputs before advancing a checkpoint.
+
+Each line is limited to 1 MiB. Invalid UTF-8, duplicate JSON keys, nonfinite
+numbers, or incomplete frames are errors. Stdout must contain only protocol
+records; stderr is drained and discarded. The adapter must keep running until
+stopped. EOF or a framing failure closes its process group and triggers a new
+subscription using the saved cursor, with retry delays increasing up to
+60 seconds. Ordinary idle waits do not reconnect. Provider retention and REST
+history availability still bound recovery; a durable cursor is not an unlimited
+upstream event log.
+
+## Existing-client transports
 
 This adapter replaces Google Chat access, including authentication and polling.
 It does not replace agent delivery: the coordinator must still run in Herdr.
@@ -258,6 +345,29 @@ The bridge launches the command with literal arguments, sends one JSON object on
 stdin, and expects one JSON object on stdout. It never invokes a shell. Each call
 must finish within 60 seconds; diagnostics belong on stderr. The adapter owns its
 credentials and stays separate from the reusable library.
+
+For an already-running local adapter, set `transport_socket` instead of
+`transport_command`:
+
+```json
+{"transport_socket": "/absolute/private/directory/chat-adapter.sock"}
+```
+
+These fields are mutually exclusive. The socket path must be absolute, and both
+the Unix socket and its parent directory must belong to the current account.
+The directory must have no group or other access (mode `0700`); where supported,
+the connection also checks the peer's account. Start and supervise the adapter
+separately; the bridge does not launch its server.
+
+Each operation opens a connection, sends one UTF-8 JSON request followed by a
+newline, and reads one JSON response followed by a newline. Successful payloads
+are identical to the command transport below; a response containing `error` is
+a failed, unconfirmed operation. Socket operations have a 60-second I/O timeout,
+with requests bounded to 1 MiB and responses to 8 MiB. Serve connections
+concurrently to let ACKs, final replies, and scans proceed independently.
+Herdr prompt delivery uses its separate connection. This avoids launching a
+client process for each request; the adapter can retain its own authenticated
+connections.
 
 Poll request and response:
 
