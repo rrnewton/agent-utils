@@ -412,6 +412,8 @@ pub struct GuestLaunch {
 struct GuestLaunchState {
     launch: Mutex<Option<GuestLaunch>>,
     ready: Condvar,
+    #[cfg(test)]
+    wprof_control_events: Mutex<Option<mpsc::SyncSender<&'static str>>>,
 }
 
 /// Cloneable one-shot notification used to anchor profiler windows to guest launch.
@@ -489,6 +491,21 @@ impl GuestLaunchSignal {
             if timeout_result.timed_out() && launch.is_none() {
                 return None;
             }
+        }
+    }
+
+    // A per-trial observer lets lifecycle tests order real process exits against
+    // controller milestones without modifying release builds or relying on sleeps.
+    #[cfg(test)]
+    fn observe_wprof_control(&self, event: &'static str) {
+        let sender = self
+            .state
+            .wprof_control_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(event);
         }
     }
 
@@ -2266,6 +2283,8 @@ fn start_wprof_stop_controller(
             };
             let origin = launch.monotonic;
             let deadline = origin + Duration::from_secs_f64(end_offset_s);
+            #[cfg(test)]
+            guest_launch.observe_wprof_control("launch-observed");
             while Instant::now() < deadline {
                 match workload_finished.try_recv() {
                     Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
@@ -2277,6 +2296,8 @@ fn start_wprof_stop_controller(
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
                 if profiler.exited(Duration::ZERO).unwrap_or(false) {
+                    #[cfg(test)]
+                    guest_launch.observe_wprof_control("early-exit-observed");
                     return WprofStopOutcome {
                         error: "wprof exited before the profiling window ended".to_string(),
                         ..WprofStopOutcome::default()
@@ -3288,17 +3309,24 @@ while :; do sleep 0.01; done
         let root = temp_dir("wprof-early-exit");
         let fake = root.join("early-wprof");
         let descendant_path = root.join("descendant.pid");
+        let exit_gate = root.join("exit.fifo");
+        create_fifo(&exit_gate).unwrap();
         fs::write(
             &fake,
             r#"#!/bin/sh
 child_file=''
+exit_gate=''
 for arg in "$@"; do
-  case "$arg" in --child-file=*) child_file=${arg#--child-file=} ;; esac
+  case "$arg" in
+    --child-file=*) child_file=${arg#--child-file=} ;;
+    --exit-gate=*) exit_gate=${arg#--exit-gate=} ;;
+  esac
 done
 sleep 30 &
 printf '%s\n' "$!" > "$child_file"
 printf 'Running in flight recorder mode, press Ctrl-C to stop...\n'
-sleep 0.02
+IFS= read -r release < "$exit_gate" || exit 125
+[ "$release" = exit ] || exit 125
 exit 0
 "#,
         )
@@ -3308,27 +3336,59 @@ exit 0
         config.wprof_windows = 1;
         config.wprof_window_s = 0.02;
         config.profiler_exit_grace_s = 0.05;
-        config
-            .wprof_args
-            .push(format!("--child-file={}", descendant_path.display()));
+        config.wprof_args.extend([
+            format!("--child-file={}", descendant_path.display()),
+            format!("--exit-gate={}", exit_gate.display()),
+        ]);
         let preflight = BTreeMap::from([(CaptureKind::Wprof, usable(CaptureKind::Wprof, &fake))]);
         let mut run = |request: &IsolatedTrialRequest| {
-            request
-                .notify_guest_launched(&request.step, std::process::id(), Instant::now())
-                .unwrap();
-            thread::sleep(Duration::from_millis(130));
+            // Readiness is already confirmed before this callback. Wait for the
+            // controller to consume guest launch as well, so the deliberate exit
+            // cannot be misclassified as occurring before the window opened.
+            let (events, observed) = mpsc::sync_channel(2);
+            *request
+                .guest_launch
+                .state
+                .wprof_control_events
+                .lock()
+                .unwrap() = Some(events);
+            let started = Instant::now();
+            request.notify_guest_launched(&request.step, std::process::id(), started)?;
+            let await_event = |expected| -> Result<(), String> {
+                match observed.recv_timeout(Duration::from_secs(10)) {
+                    Ok(actual) if actual == expected => Ok(()),
+                    Ok(actual) => Err(format!("expected control event {expected}, got {actual}")),
+                    Err(error) => Err(format!("did not observe control event {expected}: {error}")),
+                }
+            };
+            await_event("launch-observed")?;
+            let mut gate =
+                open_fifo_writer(&exit_gate, Duration::from_secs(10), &AtomicBool::new(false))
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "fake profiler did not wait on its exit gate".to_string())?;
+            gate.write_all(b"exit\n")
+                .map_err(|error| error.to_string())?;
+            // Keep the callback active until the controller observes the exit;
+            // returning first would instead exercise the workload-finished path.
+            await_event("early-exit-observed")?;
             Ok(IsolatedTrialResult {
                 returncode: 0,
-                wall_s: 0.13,
+                wall_s: started.elapsed().as_secs_f64(),
                 detail: String::new(),
             })
         };
-        let error = capture_with_preflight(&selection(0.12), &config, &mut run, |_| Ok(preflight))
+        // The endpoint is only a watchdog. Events, not elapsed sleeps, cause the
+        // tested early-exit path; no test waits for this deliberately distant end.
+        let error = capture_with_preflight(&selection(120.0), &config, &mut run, |_| Ok(preflight))
             .unwrap_err();
         let manifest = error.manifest.unwrap();
-        assert!(manifest.trials[0]
-            .error
-            .contains("wprof exited before the profiling window ended"));
+        assert!(
+            manifest.trials[0]
+                .error
+                .contains("wprof exited before the profiling window ended"),
+            "{}",
+            manifest.trials[0].error,
+        );
         let descendant = fs::read_to_string(&descendant_path)
             .unwrap()
             .trim()
