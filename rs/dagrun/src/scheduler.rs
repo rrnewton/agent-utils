@@ -57,6 +57,7 @@ use crate::model::{
 use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 use crate::resource_caps::{Acquire as SharedResourceAcquire, Coordinator as ResourceCoordinator};
+use crate::test_results::structured_test_results_recovery_path;
 use crate::test_results::TestResult;
 use crate::test_results::TestResults;
 use crate::test_results::TestResultsErrorKind;
@@ -2657,6 +2658,10 @@ fn structured_test_counts_path(
 struct StructuredTestResultsError {
     kind: TestResultsErrorKind,
     message: String,
+    /// Fully validated rows recovered from the scheduler-owned sibling after
+    /// the primary path could not be read.  The primary error remains
+    /// authoritative and still makes the step non-passing.
+    recovered: Option<CapturedTestResults>,
 }
 
 fn read_structured_test_counts(
@@ -2673,6 +2678,7 @@ fn read_structured_test_counts(
                     "cannot read structured test results {}: {error}",
                     path.display()
                 ),
+                recovered: None,
             });
         }
     };
@@ -2686,6 +2692,7 @@ fn read_structured_test_counts(
             "malformed structured test results {}: {error}",
             path.display()
         ),
+        recovered: None,
     })?;
     Ok(Some(CapturedTestResults {
         executed: Some(report.executed_tests),
@@ -2767,6 +2774,40 @@ fn with_captured_tail(message: &str, captured: &[u8]) -> String {
     format!("{message}; last output: {}", tail.join(" | "))
 }
 
+/// Recover valid rows without erasing the primary import failure.
+///
+/// Only absence and read I/O can be publication failures.  An invalid primary
+/// report is itself authoritative evidence and must never be replaced by a
+/// sidecar, even if one exists.  A malformed/unreadable recovery is diagnostic
+/// only: it cannot manufacture rows or change the primary typed kind.
+fn attach_structured_test_recovery(
+    primary_path: &std::path::Path,
+    schema: u64,
+    error: &mut StructuredTestResultsError,
+) {
+    if error.kind == TestResultsErrorKind::InvalidReport {
+        return;
+    }
+    let recovery_path = structured_test_results_recovery_path(primary_path);
+    match read_structured_test_counts(&recovery_path, Some(schema)) {
+        Ok(Some(counts)) => {
+            error.message = format!(
+                "{}; recovered fully validated structured test results from {}",
+                error.message,
+                recovery_path.display()
+            );
+            error.recovered = Some(counts);
+        }
+        Ok(None) => {}
+        Err(recovery_error) => {
+            error.message = format!(
+                "{}; recovery report refused: {}",
+                error.message, recovery_error.message
+            );
+        }
+    }
+}
+
 fn resolved_test_counts(
     mode: TestResultsMode,
     path: Option<&std::path::Path>,
@@ -2781,8 +2822,21 @@ fn resolved_test_counts(
                 // three, not only the one that is easiest to see.
                 match read_structured_test_counts(path, Some(schema)) {
                     Ok(Some(counts)) => return Ok(counts),
-                    Ok(None) => {}
+                    Ok(None) => {
+                        let mut error = StructuredTestResultsError {
+                            kind: TestResultsErrorKind::Missing,
+                            message: format!(
+                                "required structured test results were not written to {}",
+                                path.display()
+                            ),
+                            recovered: None,
+                        };
+                        attach_structured_test_recovery(path, schema, &mut error);
+                        error.message = with_captured_tail(&error.message, captured);
+                        return Err(error);
+                    }
                     Err(mut error) => {
+                        attach_structured_test_recovery(path, schema, &mut error);
                         error.message = with_captured_tail(&error.message, captured);
                         return Err(error);
                     }
@@ -2803,6 +2857,7 @@ fn resolved_test_counts(
                     &format!("required structured test results were not written to {location}"),
                     captured,
                 ),
+                recovered: None,
             })
         }
         TestResultsMode::ExplicitNone => Ok(CapturedTestResults {
@@ -2811,6 +2866,24 @@ fn resolved_test_counts(
             results: None,
         }),
         TestResultsMode::LegacyStdout => Ok(captured_test_counts(captured)),
+    }
+}
+
+fn clear_structured_test_result_paths(path: &std::path::Path, tag: &str) {
+    for candidate in [
+        path.to_path_buf(),
+        structured_test_results_recovery_path(path),
+    ] {
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn(&format!(
+                    "[scheduler] WARNING: cannot clear structured test-result path for {tag} at {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
     }
 }
 
@@ -3233,15 +3306,7 @@ fn run_step(ctx: StepCtx) {
         &nonce,
     );
     if let Some(path) = &test_counts_path {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                warn(&format!(
-                    "[scheduler] WARNING: cannot clear structured test-count path for {tag}: {error}"
-                ));
-            }
-        }
+        clear_structured_test_result_paths(path, &tag);
     }
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(&run_cmd);
@@ -3822,18 +3887,18 @@ fn run_step(ctx: StepCtx) {
     let (test_counts, structured_test_results_error, structured_test_results_error_kind) =
         match resolved_test_counts(test_results_mode, test_counts_path.as_deref(), &combined) {
             Ok(counts) => (counts, None, None),
-            Err(error) => (
-                CapturedTestResults {
+            Err(error) => {
+                let counts = error.recovered.unwrap_or(CapturedTestResults {
                     executed: None,
                     filtered: None,
                     results: None,
-                },
-                Some(error.message),
-                Some(error.kind),
-            ),
+                });
+                (counts, Some(error.message), Some(error.kind))
+            }
         };
     if let Some(path) = &test_counts_path {
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(structured_test_results_recovery_path(path));
     }
     let ok = returncode == Some(0)
         && !timed_out
@@ -5042,6 +5107,92 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         );
     }
 
+    #[test]
+    fn structured_recovery_preserves_rows_without_weakening_primary_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "dagrun-structured-recovery-{}-{}",
+            std::process::id(),
+            TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let primary = root.join("results.json");
+        let recovery = structured_test_results_recovery_path(&primary);
+        let valid_failure = br#"{"schema":2,"executed_tests":2,"filtered_tests":3,"results":[{"id":"suite$passes","result":"pass","attempts":1},{"id":"suite$fails","result":"fail","attempts":1}]}"#;
+
+        // Missing primary plus a fully validated recovery keeps both facts.
+        std::fs::write(&recovery, valid_failure).unwrap();
+        let missing = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            Some(&primary),
+            b"primary publication failed\n",
+        )
+        .unwrap_err();
+        assert_eq!(missing.kind, TestResultsErrorKind::Missing);
+        assert!(missing
+            .message
+            .contains("required structured test results were not written"));
+        assert!(missing
+            .message
+            .contains("recovered fully validated structured test results"));
+        let recovered = missing.recovered.unwrap();
+        assert_eq!((recovered.executed, recovered.filtered), (Some(2), Some(3)));
+        assert_eq!(
+            recovered.results.unwrap()[1],
+            TestResult::new("suite$fails".into(), false, 1).unwrap()
+        );
+
+        // An existing directory makes the primary read fail with typed read I/O;
+        // the same recovery remains usable without erasing that primary kind.
+        std::fs::create_dir(&primary).unwrap();
+        let read_io = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            Some(&primary),
+            b"primary publication failed\n",
+        )
+        .unwrap_err();
+        assert_eq!(read_io.kind, TestResultsErrorKind::ReadIo);
+        assert!(read_io.recovered.is_some());
+        std::fs::remove_dir(&primary).unwrap();
+
+        // Invalid primary bytes are authoritative. A valid recovery cannot turn
+        // them into accepted rows.
+        std::fs::write(&primary, b"not-json").unwrap();
+        let invalid = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            Some(&primary),
+            b"primary report was malformed\n",
+        )
+        .unwrap_err();
+        assert_eq!(invalid.kind, TestResultsErrorKind::InvalidReport);
+        assert!(invalid.recovered.is_none());
+        assert!(!invalid.message.contains("recovered fully validated"));
+        std::fs::remove_file(&primary).unwrap();
+
+        // A malformed recovery is another loud refusal, never a source of rows.
+        std::fs::write(&recovery, b"also-not-json").unwrap();
+        let malformed_recovery = resolved_test_counts(
+            TestResultsMode::Structured(crate::test_results::CURRENT_SCHEMA),
+            Some(&primary),
+            b"primary publication failed\n",
+        )
+        .unwrap_err();
+        assert_eq!(malformed_recovery.kind, TestResultsErrorKind::Missing);
+        assert!(malformed_recovery.recovered.is_none());
+        assert!(malformed_recovery
+            .message
+            .contains("recovery report refused"));
+        assert!(malformed_recovery
+            .message
+            .contains("malformed structured test results"));
+
+        // Both scheduler-owned paths are cleared before an attempt, preventing a
+        // stale sidecar from crossing attempt identity.
+        std::fs::write(&primary, b"stale primary").unwrap();
+        clear_structured_test_result_paths(&primary, "test.fixture");
+        assert!(!primary.exists() && !recovery.exists());
+        std::fs::remove_dir(&root).unwrap();
+    }
+
     fn run_without_evidence(cfg: &DagConfig) -> RunResult {
         let mut runner = Runner::new(cfg, 1, 1, false, 0, None, None, None, None, None, None);
         runner.evidence = None;
@@ -5146,6 +5297,69 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         }
     }
 
+    #[test]
+    fn recovered_structured_rows_reach_the_outcome_with_the_primary_error() {
+        let report = r#"{"schema":2,"executed_tests":2,"filtered_tests":3,"results":[{"id":"suite$passes","result":"pass","attempts":1},{"id":"suite$fails","result":"fail","attempts":1}]}"#;
+        for (name, primary_action, expected_kind) in [
+            ("missing", ":", TestResultsErrorKind::Missing),
+            (
+                "read_io",
+                "mkdir -- \"$DAGRUN_TEST_COUNTS_PATH\"",
+                TestResultsErrorKind::ReadIo,
+            ),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "dagrun-recovered-outcome-{}-{}",
+                std::process::id(),
+                TEST_COUNTS_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let marker = dir.join("marker");
+            let command = format!(
+                "printf '%s\\n' \"$DAGRUN_TEST_COUNTS_PATH\" > \"$TEST_MARKER_PATH\"; \
+                 {primary_action}; printf '%s' '{report}' > \
+                 \"$DAGRUN_TEST_COUNTS_PATH{}\"; printf 'typed publication failed\\n' >&2; exit 100",
+                crate::test_results::TEST_RESULTS_RECOVERY_SUFFIX,
+            );
+            let cfg = structured_producer(&command, &marker);
+            let mut runner = Runner::new(&cfg, 1, 1, false, 0, None, None, None, None, None, None);
+            runner.evidence = Some(Arc::new(RunEvidence::open(Some(dir.clone())).unwrap()));
+            let (_, wall) = runner.run();
+            let result = runner.result(wall);
+            assert!(!result.ok, "{name}: recovery must not erase the failure");
+            let outcome = &result.outcomes[0];
+            assert_eq!(outcome.returncode, Some(100), "{name}");
+            assert_eq!(
+                outcome.test_results_error_kind,
+                Some(expected_kind),
+                "{name}"
+            );
+            assert!(
+                outcome
+                    .test_results_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("recovered fully validated")),
+                "{name}: {:?}",
+                outcome.test_results_error
+            );
+            assert_eq!(
+                (outcome.executed_tests, outcome.filtered_tests),
+                (Some(2), Some(3))
+            );
+            let rows = outcome.test_results.as_ref().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[1],
+                TestResult::new("suite$fails".into(), false, 1).unwrap()
+            );
+            let primary = std::fs::read_to_string(&marker).unwrap();
+            let recovery =
+                structured_test_results_recovery_path(std::path::Path::new(primary.trim()));
+            assert!(!recovery.exists(), "{name}: recovery sidecar leaked");
+            drop(runner);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     fn structured_producer(command: &str, marker: &std::path::Path) -> DagConfig {
         let mut producer = step("test", "counts", command, &[], 0.0, &[]);
         producer.env.insert(
@@ -5165,9 +5379,15 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
     fn assert_scheduler_owned_path_was_removed(marker: &std::path::Path) {
         let path = std::fs::read_to_string(marker).expect("producer observed scheduler path");
         assert!(!path.trim().is_empty());
+        let path = std::path::Path::new(path.trim());
         assert!(
-            !std::path::Path::new(path.trim()).exists(),
+            !path.exists(),
             "scheduler-owned result path survived the run: {path:?}"
+        );
+        let recovery = structured_test_results_recovery_path(path);
+        assert!(
+            !recovery.exists(),
+            "scheduler-owned recovery path survived the run: {recovery:?}"
         );
         std::fs::remove_file(marker).unwrap();
     }

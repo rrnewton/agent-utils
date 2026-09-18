@@ -11,6 +11,21 @@ use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 
+/// Suffix for the scheduler-owned recovery sibling of a structured-result path.
+///
+/// A producer uses this only after the primary report has been fully validated
+/// but cannot be written or atomically published.  Keeping the recovery file in
+/// the same directory preserves existing container bind mounts while the
+/// scheduler's per-attempt nonce keeps it isolated from every other attempt.
+pub const TEST_RESULTS_RECOVERY_SUFFIX: &str = ".publication-recovery";
+
+/// Return the recovery sibling shared by controlled producers and the scheduler.
+pub fn structured_test_results_recovery_path(path: &Path) -> PathBuf {
+    let mut recovery = path.as_os_str().to_owned();
+    recovery.push(TEST_RESULTS_RECOVERY_SUFFIX);
+    PathBuf::from(recovery)
+}
+
 /// A JSON value decoded while every mapping entry is still observable.
 ///
 /// `serde_json::Value` keeps only the last occurrence of a repeated object key. That behavior is

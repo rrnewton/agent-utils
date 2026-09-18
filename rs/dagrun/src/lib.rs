@@ -129,8 +129,9 @@ pub use sweep::{
     stable_topological_order, workload_digest, MachineTopology,
 };
 pub use test_results::{
-    TestAttemptOutcome, TestAttemptResult, TestResult, TestResults, TestResultsErrorKind,
-    TestResultsWriteError, CLASSIFIED_RESULTS_SCHEMA, CURRENT_SCHEMA, RETAINED_RESULTS_SCHEMA,
+    structured_test_results_recovery_path, TestAttemptOutcome, TestAttemptResult, TestResult,
+    TestResults, TestResultsErrorKind, TestResultsWriteError, CLASSIFIED_RESULTS_SCHEMA,
+    CURRENT_SCHEMA, RETAINED_RESULTS_SCHEMA, TEST_RESULTS_RECOVERY_SUFFIX,
 };
 pub use viz::{to_ascii, to_dot};
 
