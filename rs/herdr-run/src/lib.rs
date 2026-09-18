@@ -9,13 +9,10 @@
 //! The crate exposes the policy and transport layers used by the `herdr-run` command so callers
 //! can validate configuration and admission without starting a Herdr session.
 
-pub mod agent;
-pub mod agent_cli;
 pub mod allowlist;
 pub mod audit;
 pub mod cli;
 pub mod client;
-pub mod codex_goal;
 pub mod config;
 pub mod error;
 pub mod identity;
@@ -26,7 +23,6 @@ pub mod retention;
 pub mod runner;
 pub mod session;
 pub mod status;
-pub mod subagents;
 pub mod sweep;
 
 mod state;
@@ -37,6 +33,3 @@ pub const USER_GUIDE: &str = include_str!("embedded_userguide.md");
 
 /// One-screen introduction, printed by `herdr-run quickstart`.
 pub const QUICKSTART: &str = include_str!("embedded_quickstart.md");
-
-/// Full installed messaging reference, also printed by `herdr-agent userguide`.
-pub const AGENT_USER_GUIDE: &str = include_str!("embedded_agent_userguide.md");

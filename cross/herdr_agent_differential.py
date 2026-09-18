@@ -109,7 +109,8 @@ if args[:2] == ["pane", "list"]:
     envelope({"panes": panes})
 elif args[:2] == ["pane", "get"]:
     pane = args[2]
-    if pane != "w1:p1":
+    human = pane == "w1:p2" and state.get("extra_pane")
+    if pane != "w1:p1" and not human:
         print("missing pane", file=sys.stderr)
         save()
         raise SystemExit(1)
@@ -117,15 +118,22 @@ elif args[:2] == ["pane", "get"]:
         "pane_id": pane,
         "workspace_id": "w1",
         "cwd": root,
-        "agent": state.get("harness", "codex"),
-        "agent_status": state.get("status", "idle"),
-        "agent_session": {"agent": state.get("harness", "codex"), "value": "session-1"},
+        "agent": None if human else state.get("harness", "codex"),
+        "agent_status": "unknown" if human else state.get("status", "idle"),
+        "agent_session": None if human else {"agent": state.get("harness", "codex"), "value": "session-1"},
     }})
 elif args[:2] == ["tab", "create"]:
     state["closed"] = False
-    envelope({"tab": {"tab_id": "w1:t1"}})
-elif args[:2] == ["tab", "close"]:
+    envelope({"tab": {"tab_id": "w1:t1"}, "root_pane": {
+        "pane_id":"w1:p1", "tab_id":"w1:t1", "workspace_id":"w1",
+    }})
+elif args[:2] == ["pane", "close"]:
+    if args[2] != "w1:p1":
+        raise SystemExit("refusing unexpected pane close")
     state["closed"] = True
+    state.setdefault("closed_panes", []).append(args[2])
+elif args[:2] in (["agent", "focus"], ["tab", "focus"]):
+    state["focused"] = args[2]
 elif args[:2] == ["agent", "start"]:
     state["name"] = args[2]
     state["harness"] = args[args.index("--kind") + 1]
@@ -174,6 +182,8 @@ elif args[:2] == ["agent", "wait"]:
         raise SystemExit(1)
     print(json.dumps({"result": {"agent": {"pane_id": args[2], "agent_status": "working"}}}, sort_keys=True))
 elif args[:2] == ["pane", "read"]:
+    if state.get("extra_pane_on_read"):
+        state["extra_pane"] = True
     source = args[args.index("--source") + 1]
     if source == "visible" and state.get("screen"):
         sys.stdout.write(state["screen"])
@@ -236,7 +246,7 @@ class Harness:
         existing = environment.get("PYTHONPATH", "")
         local = str(REPO_ROOT / "py")
         environment["PYTHONPATH"] = local if not existing else local + os.pathsep + existing
-        environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "NO_COLOR": "1"})
+        environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "NO_COLOR": "1", "HERDR_WORKSPACE_ID": "w1"})
         try:
             completed = subprocess.run(
                 [*command, *expanded],
@@ -999,7 +1009,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Standalone source-tree entry point used for focused development."""
 
     del argv
-    python = [sys.executable, "-m", "herdr_run.agent_cli"]
+    python = [sys.executable, "-m", "agentctl.legacy_cli"]
     launcher = REPO_ROOT / "rs/bin/herdr-agent"
     environment = dict(os.environ)
     environment["AGENT_UTILS_RS_ENSURE_ONLY"] = "1"

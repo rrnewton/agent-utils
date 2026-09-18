@@ -11,13 +11,13 @@ from typing import cast
 
 import pytest
 
-from herdr_run import __version__
-import herdr_run.agent as agent_api
-from herdr_run.agent import Target, drain, enqueue, read, send, status
-from herdr_run.agent import QueueResult
-import herdr_run.agent_cli as agent_cli
-from herdr_run.client import AgentPaneInfo, HerdrClient, Pane
-from herdr_run.errors import AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable
+from agentctl import __version__
+import agentctl.agent as agent_api
+from agentctl.agent import Target, drain, enqueue, read, send, status
+from agentctl.agent import QueueResult
+import agentctl.legacy_cli as agent_cli
+from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.errors import AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable
 
 
 def test_agent_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -757,7 +757,7 @@ def test_enqueue_and_delivery_state_transitions_fsync(monkeypatch: pytest.Monkey
         calls.append(descriptor)
         real_fsync(descriptor)
 
-    monkeypatch.setattr("herdr_run.agent.os.fsync", recording_fsync)
+    monkeypatch.setattr("agentctl.agent.os.fsync", recording_fsync)
     fake = FakeAgentHerdr(["idle"])
     send(client(fake), target(), str(tmp_path), "durable")
     # Enqueue file+directory, inbox->inflight, inflight update, and

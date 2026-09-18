@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "herdr-run"
 version = "0.2.0"
-description = "Run allowlisted commands and durably message interactive agents through Herdr panes."
+description = "Run allowlisted shell commands through Herdr panes and collect audited results."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -28,14 +28,11 @@ Issues = "https://github.com/rrnewton/agent-utils/issues"
 
 [project.scripts]
 herdr-run = "herdr_run.cli:main"
-herdr-agent = "herdr_run.agent_cli:main"
-herdr-subagents = "herdr_run.foreign_cli:main"
-herdr-chat = "herdr_run.chat:main"
 
 [tool.setuptools]
-packages = ["herdr_run", "herdr_run.foreign", "herdr_run.foreign.mcp"]
+packages = ["herdr_run"]
 package-dir = { herdr_run = "." }
 include-package-data = false
 
 [tool.setuptools.package-data]
-herdr_run = ["py.typed", "README.md", "USER_GUIDE.md", "QUICKSTART.md", "AGENT_USER_GUIDE.md", "FOREIGN_USER_GUIDE.md", "CHAT_USER_GUIDE.md", "config_template.yaml"]
+herdr_run = ["py.typed", "README.md", "USER_GUIDE.md", "QUICKSTART.md", "config_template.yaml"]

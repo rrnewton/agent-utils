@@ -28,9 +28,13 @@ case "$TOOL" in
     PACKAGE="pr-landing-planner"
     PACKAGE_TOOLS=(pr-landing-planner)
     ;;
-  herdr-run|herdr-agent)
+  herdr-run)
     PACKAGE="herdr-run"
-    PACKAGE_TOOLS=(herdr-run herdr-agent)
+    PACKAGE_TOOLS=(herdr-run)
+    ;;
+  agentctl|herdr-agent)
+    PACKAGE="agentctl"
+    PACKAGE_TOOLS=(agentctl herdr-agent)
     ;;
   cargo-runner)
     echo "cargo-runner: invoke through an rs/bin tool symlink" >&2

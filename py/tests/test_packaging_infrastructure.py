@@ -175,11 +175,19 @@ def test_embed_check_rejects_regular_copy_and_wrong_link_target(
 def test_package_docs_and_licenses_are_authoritative_links() -> None:
     docs = _load_script("embed_userguides")
 
-    assert len(docs.PACKAGE_LINKS) == 41
+    assert len(docs.PACKAGE_LINKS) == 45
     assert {
+        "py/agentctl/AGENT_USER_GUIDE.md",
+        "py/agentctl/FOREIGN_USER_GUIDE.md",
+        "rs/agentctl/src/embedded_userguide.md",
+        "rs/agentctl/src/embedded_quickstart.md",
+    } <= {link.destination for link in docs.PACKAGE_LINKS}
+    assert not {
+        "py/herdr_run/AGENT_USER_GUIDE.md",
         "py/herdr_run/CHAT_USER_GUIDE.md",
         "py/herdr_run/FOREIGN_USER_GUIDE.md",
-    } <= {link.destination for link in docs.PACKAGE_LINKS}
+        "rs/herdr-run/src/embedded_agent_userguide.md",
+    } & {link.destination for link in docs.PACKAGE_LINKS}
     for link in docs.PACKAGE_LINKS:
         destination = REPO_ROOT / link.destination
         assert destination.is_symlink(), link.destination
@@ -217,6 +225,24 @@ def test_python_doc_lint_exemption_cannot_hide_a_later_foreign_term() -> None:
 
     assert "foreign-language term 'Rust'" in errors
     assert "foreign-language term 'Cargo'" not in errors
+
+
+def test_agentctl_capability_comparison_exemption_is_scoped_to_its_operator_guide() -> None:
+    python_check = _load_script("check_python_packages")
+    rust_check = _load_script("check_rust_packages")
+    project = next(project for project in python_check.PROJECTS if project.package == "agentctl")
+    crate = next(crate for crate in rust_check.CRATES if crate.name == "agentctl")
+    comparison = "Python includes worker/Chat/MCP capabilities; Rust provides the interactive core."
+    assert not python_check._doc_violations(project, comparison, document_name="USER_GUIDE.md")
+    assert not rust_check._doc_violations(crate, comparison, document_name="src/embedded_userguide.md")
+    assert python_check._doc_violations(project, comparison)
+    assert rust_check._doc_violations(crate, comparison)
+    assert python_check._doc_violations(project, comparison, document_name="README.md")
+    assert rust_check._doc_violations(crate, comparison, document_name="README.md")
+    assert "foreign-language term 'Cargo'" in python_check._doc_violations(
+        project, comparison + " Cargo", document_name="USER_GUIDE.md")
+    assert "foreign-package term 'pip'" in rust_check._doc_violations(
+        crate, comparison + " pip", document_name="src/embedded_userguide.md")
 
 
 def test_python_sibling_dependency_requires_a_project_local_exemption() -> None:

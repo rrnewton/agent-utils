@@ -1,4 +1,4 @@
-# herdr-run and herdr-agent
+# herdr-run
 
 Run an **allowlisted** command in a terminal pane belonging to a separate terminal server, and get
 its real stdout, stderr, and exit code back.
@@ -11,14 +11,6 @@ The pane is not a child of the calling process, so whatever constrains that proc
 constrain the command: not its network policy, not its environment, not its lifetime. A pane also
 outlives the caller, carries a different ambient environment, and can be watched and taken over by
 a person.
-
-The same package also installs `herdr-agent`, a durable FIFO transport for messaging an
-already-running interactive agent without losing or accidentally duplicating a prompt:
-
-```sh
-herdr-agent send --session-agent codex --session "$CODEX_SESSION_ID" \
-  --agent codex --workspace project --cwd /work/project --file ./next-task.md
-```
 
 One common case, kept as an example rather than as the definition: an AI coding agent inside a
 sandbox that blocks the network cannot `git push` or run `gh`, even though it legitimately needs
@@ -55,14 +47,6 @@ says so before it starts.
 - **Visible, best-effort audit.** Refusals, admissions, failures, and completions are appended to a
   private JSONL log. Storage failures warn but never replace a completed command's exit status.
 
-## Interactive-agent messaging
-
-`herdr-agent` binds a private on-disk queue to one exact pane or stable agent session. It waits for
-native `idle` or `done` state, durably marks the prompt in flight, submits the full literal text in
-one operation, and requires a subsequent `working` event. A pre-submission failure stays pending
-and safe to retry; an ambiguous post-submission failure is quarantined and is never automatically
-submitted twice. `status` and `read` inspect a validated target without altering its queue.
-
 ## Configuration
 
 Policy is per project, in the nearest `.herdr-run.yaml`. `herdr-run init` writes an annotated one
@@ -88,11 +72,6 @@ herdr-run reap                   report which command tabs are provably finished
 herdr-run net-doctor             smoke-test one scenario: a caller whose own network is blocked
 herdr-run quickstart             the one-screen introduction
 herdr-run userguide              the full user guide
-herdr-agent send ...             durably submit one prompt to an interactive agent
-herdr-agent drain ...            resume a bound queue without duplicating ambiguous prompts
-herdr-agent status ...           inspect validated agent identity and queue state
-herdr-agent read ...             read recent validated agent output
-herdr-agent userguide            the complete messaging and recovery contract
 ```
 
 Requires Linux with a working systemd user manager and a separately installed
@@ -100,5 +79,4 @@ Requires Linux with a working systemd user manager and a separately installed
 `~/.local/bin`, or `~/bin`. The integration is tested with Herdr 0.8.0; compatible
 newer releases must provide its `status`, `workspace`, `tab`, and `pane` command APIs.
 
-Start with `herdr-run quickstart`, one screen. `herdr-run userguide` is the complete reference,
-and `herdr-agent userguide` covers the messaging contract.
+Start with `herdr-run quickstart`, one screen. `herdr-run userguide` is the complete reference.

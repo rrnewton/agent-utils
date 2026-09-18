@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["dagrun", "tick-hub", "pr-landing-planner", "herdr-run"]
+members = ["dagrun", "tick-hub", "pr-landing-planner", "herdr-run", "agentctl"]
 
 [workspace.package]
 edition = "2021"

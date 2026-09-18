@@ -1,0 +1,768 @@
+//! Direct typed access to Herdr's public CLI for interactive agent control.
+//!
+//! Herdr owns protocol negotiation and terminal processes. This adapter starts no
+//! server and has no shell executor, broker, or allowlist dependency.
+use crate::error::{AdapterError, Result};
+use serde_json::{Map, Value};
+use std::fs;
+use std::io::{self, Read};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) struct BoundedOutput {
+    pub status: ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Capture a subprocess while enforcing a wall-clock bound and draining both pipes concurrently.
+pub(crate) fn bounded_output(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<BoundedOutput> {
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let child_pid = child.id();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("child stdout pipe was not captured"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("child stderr pipe was not captured"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now().checked_add(timeout);
+    let mut observed_status = None;
+    let status = loop {
+        if observed_status.is_none() {
+            observed_status = child.try_wait()?;
+        }
+        // A command can exit while a child retains stdout/stderr. The outer bound
+        // includes pipe draining, so an inherited pipe cannot hang agent control.
+        if stdout_reader.is_finished() && stderr_reader.is_finished() {
+            if let Some(status) = observed_status {
+                break status;
+            }
+        }
+        if deadline.is_some_and(|value| Instant::now() >= value) {
+            // The child owns a fresh process group. Killing the group also closes pipes inherited
+            // by descendants, so reader threads cannot keep this timeout path blocked forever.
+            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("control command timed out after {}s", timeout.as_secs()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("stdout reader thread panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("stderr reader thread panicked"))??;
+    Ok(BoundedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// One terminal pane and its owning tab and workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Pane {
+    /// Herdr pane identifier.
+    pub pane_id: String,
+    /// Herdr tab identifier.
+    pub tab_id: String,
+    /// Herdr workspace identifier.
+    pub workspace_id: String,
+}
+
+/// Identity and readiness fields for one interactive-agent pane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentPaneInfo {
+    /// Herdr pane identifier.
+    pub pane_id: String,
+    /// Owning workspace identifier.
+    pub workspace_id: String,
+    /// Pane working directory as reported by Herdr.
+    pub cwd: String,
+    /// Interactive agent implementation, when Herdr recognizes one.
+    pub agent: Option<String>,
+    /// Native Herdr agent status, or `"unknown"` when no status was reported.
+    pub status: String,
+    /// Agent name carried by the stable session identity, when present.
+    pub session_agent: Option<String>,
+    /// Stable session value, when present.
+    pub session_value: Option<String>,
+}
+
+/// Captured result of one external command invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandOutput {
+    /// Conventional numeric process status; zero denotes success.
+    pub status: i32,
+    /// Captured standard output decoded as UTF-8 with replacement.
+    pub stdout: String,
+    /// Captured standard error decoded as UTF-8 with replacement.
+    pub stderr: String,
+}
+
+/// Direct Herdr CLI adapter; executable availability is checked when used.
+#[derive(Clone, Debug)]
+pub struct HerdrClient {
+    executable: PathBuf,
+}
+impl HerdrClient {
+    /// Select a configured Herdr executable. Only the direct adapter is supported.
+    pub fn with_executable(adapter: &str, executable: &Path) -> Result<Self> {
+        if adapter != "direct" {
+            return Err(AdapterError::unavailable(
+                "agentctl supports direct Herdr access only",
+            ));
+        }
+        Ok(Self {
+            executable: executable.to_owned(),
+        })
+    }
+    fn invoke_with_timeout(&self, args: &[String], timeout: Duration) -> Result<CommandOutput> {
+        let executable = resolve_executable(&self.executable)?;
+        let output = bounded_output(Command::new(executable).args(args), timeout)
+            .map_err(|error| AdapterError::unavailable(format!("cannot invoke Herdr: {error}")))?;
+        Ok(CommandOutput {
+            status: output.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
+        let workspaces = self.workspace_entries()?;
+        unique_label_id(&workspaces, "workspace_id", label, "workspace")
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn create_workspace(&self, label: &str, cwd: &str) -> Result<(String, String, String)> {
+        let result = self.call(
+            &strings(&[
+                "workspace",
+                "create",
+                "--label",
+                label,
+                "--cwd",
+                cwd,
+                "--no-focus",
+            ]),
+            &format!("workspace create {label:?}"),
+        )?;
+        let workspace = required_object(&result, "workspace", "workspace create")?;
+        let tab = required_object(&result, "tab", "workspace create")?;
+        let pane = required_object(&result, "root_pane", "workspace create")?;
+        Ok((
+            required_string(workspace, "workspace_id", "workspace create")?,
+            required_string(tab, "tab_id", "workspace create")?,
+            required_string(pane, "pane_id", "workspace create")?,
+        ))
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn create_tab(&self, workspace_id: &str, label: &str, cwd: &str) -> Result<String> {
+        let result = self.call(
+            &strings(&[
+                "tab",
+                "create",
+                "--workspace",
+                workspace_id,
+                "--label",
+                label,
+                "--cwd",
+                cwd,
+                "--no-focus",
+            ]),
+            &format!("tab create {label:?}"),
+        )?;
+        let tab = match result.get("tab") {
+            Some(value) => value
+                .as_object()
+                .ok_or_else(|| AdapterError::unavailable("tab create: 'tab' is not an object"))?,
+            None => &result,
+        };
+        required_string(tab, "tab_id", "tab create")
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn rename_tab(&self, tab_id: &str, label: &str) -> Result<()> {
+        self.call(
+            &strings(&["tab", "rename", tab_id, label]),
+            &format!("tab rename {tab_id}"),
+        )?;
+        Ok(())
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn close_tab(&self, tab_id: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&["tab", "close", tab_id]),
+            &format!("tab close {tab_id}"),
+        )
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn start_agent(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        arguments: &[String],
+        timeout: Duration,
+    ) -> Result<()> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(AdapterError::unavailable(
+                "agent startup timeout must be between 0 and 300 seconds",
+            ));
+        }
+        let mut args = strings(&[
+            "agent",
+            "start",
+            name,
+            "--kind",
+            kind,
+            "--pane",
+            pane_id,
+            "--timeout",
+        ]);
+        args.extend([timeout.as_millis().max(1).to_string(), "--".to_owned()]);
+        args.extend_from_slice(arguments);
+        let result = self.invoke_with_timeout(&args, timeout + CONTROL_TIMEOUT)?;
+        if result.status != 0 {
+            return Err(AdapterError::unavailable(format!(
+                "agent start {name:?}: {}",
+                stderr_detail(&result)
+            )));
+        }
+        Ok(())
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn agent_pane(&self, name: &str) -> Result<String> {
+        let result = self.call(
+            &strings(&["agent", "get", name]),
+            &format!("agent get {name:?}"),
+        )?;
+        let info = required_object(&result, "agent", "agent get")?;
+        if required_string(info, "name", "agent get")? != name {
+            return Err(AdapterError::unavailable(format!(
+                "agent get: returned a different agent name for {name:?}"
+            )));
+        }
+        required_string(info, "pane_id", "agent get")
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn report_agent_session(
+        &self,
+        name: &str,
+        pane_id: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        if self.agent_pane(name)? != pane_id {
+            return Err(AdapterError::unavailable(
+                "cannot bind a session to a different named agent pane",
+            ));
+        }
+        self.call_ok(
+            &strings(&[
+                "pane",
+                "report-agent-session",
+                pane_id,
+                "--source",
+                "herdr-agent",
+                "--agent",
+                kind,
+                "--agent-session-id",
+                session_id,
+            ]),
+            "report managed agent session",
+        )
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn panes(&self, workspace_id: Option<&str>) -> Result<Vec<Pane>> {
+        let mut args = strings(&["pane", "list"]);
+        if let Some(workspace_id) = workspace_id {
+            args.extend(strings(&["--workspace", workspace_id]));
+        }
+        let result = self.call(&args, "pane list")?;
+        let values = value_array(result.get("panes"), "pane list.panes")?;
+        let entries = object_entries(values, "pane list entry")?;
+        let panes = entries
+            .iter()
+            .map(|pane| {
+                Ok(Pane {
+                    pane_id: required_string(pane, "pane_id", "pane list entry")?,
+                    tab_id: required_string(pane, "tab_id", "pane list entry")?,
+                    workspace_id: required_string(pane, "workspace_id", "pane list entry")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(expected) = workspace_id {
+            if let Some(pane) = panes.iter().find(|pane| pane.workspace_id != expected) {
+                return Err(AdapterError::unavailable(format!(
+                    "pane list: returned pane {:?} from workspace {:?}, expected {expected:?}",
+                    pane.pane_id, pane.workspace_id
+                )));
+            }
+        }
+        Ok(panes)
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn pane_info(&self, pane_id: &str) -> Result<AgentPaneInfo> {
+        let result = self.call(
+            &strings(&["pane", "get", pane_id]),
+            &format!("pane get {pane_id}"),
+        )?;
+        let pane = required_object(&result, "pane", "pane get")?;
+        let returned = required_string(pane, "pane_id", "pane get")?;
+        if returned != pane_id {
+            return Err(AdapterError::unavailable(format!(
+                "pane get: returned pane {returned:?}, expected {pane_id:?}"
+            )));
+        }
+        let (session_agent, session_value) = match pane.get("agent_session") {
+            None | Some(Value::Null) => (None, None),
+            Some(Value::Object(session)) => (
+                optional_string(session, "agent", "pane agent_session")?,
+                optional_string(session, "value", "pane agent_session")?,
+            ),
+            Some(_) => {
+                return Err(AdapterError::unavailable(
+                    "pane get: 'agent_session' is not an object",
+                ));
+            }
+        };
+        Ok(AgentPaneInfo {
+            pane_id: returned,
+            workspace_id: required_string(pane, "workspace_id", "pane get")?,
+            cwd: required_string(pane, "cwd", "pane get")?,
+            agent: optional_string(pane, "agent", "pane get")?,
+            status: optional_string(pane, "agent_status", "pane get")?
+                .unwrap_or_else(|| "unknown".to_owned()),
+            session_agent,
+            session_value,
+        })
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn workspace_label(&self, workspace_id: &str) -> Result<String> {
+        let result = self.call(
+            &strings(&["workspace", "get", workspace_id]),
+            &format!("workspace get {workspace_id}"),
+        )?;
+        let workspace = required_object(&result, "workspace", "workspace get")?;
+        let returned = required_string(workspace, "workspace_id", "workspace get")?;
+        if returned != workspace_id {
+            return Err(AdapterError::unavailable(format!(
+                "workspace get: returned workspace {returned:?}, expected {workspace_id:?}"
+            )));
+        }
+        required_string(workspace, "label", "workspace get")
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn wait_agent_status(&self, pane_id: &str, status: &str, timeout_ms: u64) -> Result<()> {
+        let purpose = format!("wait for pane {pane_id} status {status}");
+        let completed = self.invoke_with_timeout(
+            &[
+                "agent".to_owned(),
+                "wait".to_owned(),
+                pane_id.to_owned(),
+                "--until".to_owned(),
+                status.to_owned(),
+                "--timeout".to_owned(),
+                timeout_ms.to_string(),
+            ],
+            CONTROL_TIMEOUT
+                .max(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(5))),
+        )?;
+        if completed.status != 0 {
+            return Err(AdapterError::unavailable(format!(
+                "{purpose}: {}",
+                stderr_detail(&completed)
+            )));
+        }
+        let document = serde_json::from_str::<Value>(&completed.stdout).map_err(|error| {
+            AdapterError::unavailable(format!("{purpose}: invalid Herdr event response: {error}"))
+        })?;
+        let envelope = document.as_object().ok_or_else(|| {
+            AdapterError::unavailable(format!("{purpose}: event response is not an object"))
+        })?;
+        let result = required_object(envelope, "result", &purpose)?;
+        let data = required_object(result, "agent", &purpose)?;
+        let returned_pane = required_string(data, "pane_id", &purpose)?;
+        let returned_status = required_string(data, "agent_status", &purpose)?;
+        if returned_pane != pane_id || returned_status != status {
+            return Err(AdapterError::unavailable(format!(
+                "{purpose}: event reported pane={returned_pane:?} status={returned_status:?}"
+            )));
+        }
+        Ok(())
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn read(&self, pane_id: &str, source: &str, lines: Option<usize>) -> Result<String> {
+        let mut args = strings(&["pane", "read", pane_id, "--source", source]);
+        if let Some(lines) = lines {
+            args.extend(["--lines".to_owned(), lines.to_string()]);
+        }
+        let completed = self.invoke(&args)?;
+        if completed.status != 0 {
+            return Err(AdapterError::unavailable(format!(
+                "pane read {pane_id}: {}",
+                stderr_detail(&completed)
+            )));
+        }
+        Ok(completed.stdout)
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn prompt_agent(&self, pane_id: &str, text: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&["agent", "prompt", pane_id, text]),
+            &format!("agent prompt {pane_id}"),
+        )
+    }
+    /// Invoke and validate the corresponding Herdr agent-control operation.
+    pub fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&["pane", "send-keys", pane_id, keys]),
+            &format!("pane send-keys {pane_id}"),
+        )
+    }
+    fn workspace_entries(&self) -> Result<Vec<Map<String, Value>>> {
+        let result = self.call(&strings(&["workspace", "list"]), "workspace list")?;
+        let values = value_array(result.get("workspaces"), "workspace list.workspaces")?;
+        object_entries(values, "workspace list entry")
+    }
+    fn invoke(&self, args: &[String]) -> Result<CommandOutput> {
+        self.invoke_with_timeout(args, CONTROL_TIMEOUT)
+    }
+    fn call(&self, args: &[String], purpose: &str) -> Result<Map<String, Value>> {
+        let completed = self.invoke(args)?;
+        if completed.status != 0 {
+            return Err(AdapterError::unavailable(format!(
+                "{purpose}: {}",
+                detail(&completed)
+            )));
+        }
+        let document = serde_json::from_str::<Value>(&completed.stdout).map_err(|_| {
+            let preview: String = completed.stdout.trim().chars().take(200).collect();
+            AdapterError::unavailable(format!(
+                "{purpose}: herdr returned non-JSON output: {preview:?}"
+            ))
+        })?;
+        let envelope = document.as_object().ok_or_else(|| {
+            AdapterError::unavailable(format!("{purpose}: Herdr response is not an object"))
+        })?;
+        envelope
+            .get("result")
+            .and_then(Value::as_object)
+            .cloned()
+            .ok_or_else(|| {
+                AdapterError::unavailable(format!("{purpose}: Herdr response has no result object"))
+            })
+    }
+    fn call_ok(&self, args: &[String], purpose: &str) -> Result<()> {
+        let completed = self.invoke(args)?;
+        if completed.status == 0 {
+            Ok(())
+        } else {
+            Err(AdapterError::unavailable(format!(
+                "{purpose}: {}",
+                detail(&completed)
+            )))
+        }
+    }
+    /// Create a tab and capture its initial pane from the same allocation result.
+    pub fn create_tab_with_pane(
+        &self,
+        workspace: &str,
+        label: &str,
+        cwd: &str,
+    ) -> Result<(String, String)> {
+        let result = self.call(
+            &strings(&[
+                "tab",
+                "create",
+                "--workspace",
+                workspace,
+                "--label",
+                label,
+                "--cwd",
+                cwd,
+                "--no-focus",
+            ]),
+            "tab create",
+        )?;
+        let tab = required_object(&result, "tab", "tab create")?;
+        let pane = required_object(&result, "root_pane", "tab create")?;
+        let tab_id = required_string(tab, "tab_id", "tab create")?;
+        if required_string(pane, "tab_id", "created pane")? != tab_id
+            || required_string(pane, "workspace_id", "created pane")? != workspace
+        {
+            return Err(AdapterError::unavailable(
+                "created pane does not belong to the allocated tab/workspace",
+            ));
+        }
+        Ok((tab_id, required_string(pane, "pane_id", "tab create")?))
+    }
+    /// Close exactly the owned pane; concurrent human-created sibling panes survive.
+    pub fn close_pane(&self, pane: &str) -> Result<()> {
+        self.call_ok(&strings(&["pane", "close", pane]), "pane close")
+    }
+    /// Focus the named pane in its existing Herdr workspace.
+    pub fn focus_pane(&self, pane: &str) -> Result<()> {
+        self.call_ok(&strings(&["agent", "focus", pane]), "agent focus")
+    }
+}
+fn resolve_executable(configured: &Path) -> Result<PathBuf> {
+    let candidates = if configured.components().count() > 1 || configured.is_absolute() {
+        vec![configured.to_owned()]
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join(configured))
+            .collect()
+    };
+    for path in candidates {
+        if fs::metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        {
+            return fs::canonicalize(&path).map_err(|error| {
+                AdapterError::unavailable(format!("cannot resolve Herdr executable: {error}"))
+            });
+        }
+    }
+    Err(AdapterError::unavailable(format!(
+        "Herdr executable not found: {}; install Herdr or pass --herdr-bin",
+        configured.display()
+    )))
+}
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn detail(output: &CommandOutput) -> String {
+    let detail = if output.stderr.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        output.stderr.trim()
+    };
+    if detail.is_empty() {
+        format!("exit {}", output.status)
+    } else {
+        detail.to_owned()
+    }
+}
+
+fn stderr_detail(output: &CommandOutput) -> String {
+    let detail = output.stderr.trim();
+    if detail.is_empty() {
+        format!("exit {}", output.status)
+    } else {
+        detail.to_owned()
+    }
+}
+
+fn value_array<'a>(value: Option<&'a Value>, what: &str) -> Result<&'a [Value]> {
+    match value {
+        Some(Value::Array(values)) => Ok(values),
+        None | Some(_) => Err(AdapterError::unavailable(format!(
+            "{what}: expected an array"
+        ))),
+    }
+}
+
+fn object_entries(values: &[Value], what: &str) -> Result<Vec<Map<String, Value>>> {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| AdapterError::unavailable(format!("{what}: expected an object")))
+        })
+        .collect()
+}
+
+fn required_object<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+    what: &str,
+) -> Result<&'a Map<String, Value>> {
+    object
+        .get(key)
+        .and_then(Value::as_object)
+        .ok_or_else(|| AdapterError::unavailable(format!("{what}: {key:?} is not an object")))
+}
+
+fn required_string(object: &Map<String, Value>, key: &str, what: &str) -> Result<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| AdapterError::unavailable(format!("{what}: {key:?} is not a string")))
+}
+
+fn optional_string(object: &Map<String, Value>, key: &str, what: &str) -> Result<Option<String>> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(AdapterError::unavailable(format!(
+            "{what}: {key:?} is not a string"
+        ))),
+    }
+}
+
+fn unique_label_id(
+    entries: &[Map<String, Value>],
+    id_key: &str,
+    label: &str,
+    kind: &str,
+) -> Result<Option<String>> {
+    let mut matches = Vec::new();
+    for entry in entries {
+        if optional_string(entry, "label", &format!("{kind} list entry"))?.as_deref() == Some(label)
+        {
+            matches.push(required_string(
+                entry,
+                id_key,
+                &format!("{kind} list entry"),
+            )?);
+        }
+    }
+    if matches.len() > 1 {
+        return Err(AdapterError::unavailable(format!(
+            "{kind} label {label:?} is ambiguous: {} matching IDs",
+            matches.len()
+        )));
+    }
+    Ok(matches.into_iter().next())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static EXECUTABLE_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    struct FakeExecutable {
+        root: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    impl FakeExecutable {
+        fn new(response: &str) -> Self {
+            let guard = EXECUTABLE_FIXTURE.lock().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "agentctl-adapter-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let script = format!("#!/usr/bin/python3\nimport json, pathlib, sys\npathlib.Path(__file__).with_name('args').write_text(json.dumps(sys.argv[1:]))\nprint({response:?})\n");
+            fs::write(root.join("herdr"), script).unwrap();
+            fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o700)).unwrap();
+            Self {
+                root,
+                _guard: guard,
+            }
+        }
+        fn client(&self) -> HerdrClient {
+            HerdrClient::with_executable("direct", &self.root.join("herdr")).unwrap()
+        }
+        fn arguments(&self) -> Value {
+            serde_json::from_slice(&fs::read(self.root.join("args")).unwrap()).unwrap()
+        }
+    }
+    impl Drop for FakeExecutable {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn tab_allocation_captures_root_pane_without_a_followup_query() {
+        let executable = FakeExecutable::new(
+            r#"{"result":{"tab":{"tab_id":"tab"},"root_pane":{"pane_id":"pane","tab_id":"tab","workspace_id":"workspace"}}}"#,
+        );
+        assert_eq!(
+            executable
+                .client()
+                .create_tab_with_pane("workspace", "worker", "/tmp")
+                .unwrap(),
+            ("tab".to_owned(), "pane".to_owned())
+        );
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!([
+                "tab",
+                "create",
+                "--workspace",
+                "workspace",
+                "--label",
+                "worker",
+                "--cwd",
+                "/tmp",
+                "--no-focus"
+            ])
+        );
+    }
+
+    #[test]
+    fn focus_uses_agent_focus_and_shutdown_targets_one_exact_pane() {
+        let executable = FakeExecutable::new("{}");
+        executable.client().focus_pane("workspace:pane").unwrap();
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!(["agent", "focus", "workspace:pane"])
+        );
+        executable.client().close_pane("workspace:pane").unwrap();
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!(["pane", "close", "workspace:pane"])
+        );
+    }
+
+    #[test]
+    fn mismatched_pane_identity_is_rejected() {
+        let executable = FakeExecutable::new(
+            r#"{"result":{"pane":{"pane_id":"other","workspace_id":"workspace","cwd":"/tmp","agent":"codex","agent_status":"idle"}}}"#,
+        );
+        assert!(executable
+            .client()
+            .pane_info("expected")
+            .unwrap_err()
+            .to_string()
+            .contains("expected"));
+    }
+
+    #[test]
+    fn control_timeout_includes_pipes_inherited_after_the_parent_exits() {
+        let started = Instant::now();
+        let result = bounded_output(
+            Command::new("/bin/sh").args(["-c", "sleep 30 & exit 0"]),
+            Duration::from_millis(100),
+        );
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}

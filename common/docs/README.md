@@ -1,14 +1,18 @@
 # Shared documentation
 
-The paired tools keep language-neutral prose here and inject only distribution-specific install and
-invocation text:
+This directory holds settled user-facing material and public related-work comparisons.
+Working designs and research belong in dated `ai_docs/transient/` records.
+
+Operator documentation is primarily available through each command’s `quickstart`,
+`userguide`, and subcommand `--help`. Some tools store their authoritative CLI prose
+here and inject distribution-specific installation text:
 
 | Tool | Shared sources | Generated package documents |
 | --- | --- | --- |
 | `dagrun` | `README.template.md`, `USER_GUIDE.template.md` | `rendered/python/`, `rendered/rust/` |
 | `tick-hub` | `README.template.md`, `USER_GUIDE.template.md` | `rendered/python/`, `rendered/rust/` |
 | `pr-landing-planner` | `README.template.md`, `USER_GUIDE.template.md` | `rendered/python/`, `rendered/rust/` |
-| `herdr-run`, `herdr-agent` | `README.template.md`, `USER_GUIDE.template.md`, shared `AGENT_USER_GUIDE.md` | `rendered/python/`, `rendered/rust/` plus exact guide links |
+| `herdr-run` | `README.template.md`, `USER_GUIDE.template.md` | `rendered/python/`, `rendered/rust/` |
 
 Each template contains one `{{DISTRIBUTION}}` placeholder. The corresponding
 `fragments/python/` or `fragments/rust/` document supplies package-specific text. Package trees link
@@ -25,3 +29,9 @@ outputs:
 python3 scripts/embed_userguides.py
 python3 scripts/embed_userguides.py --check
 ```
+
+`agentctl` keeps its maintained CLI guide, quickstart, and Chat guide directly in
+`py/agentctl/`; both implementations embed the same core guide. Its
+[RELATED_WORK.md](agentctl/RELATED_WORK.md) compares public open-source systems.
+The documentation link check also covers those package-owned assets, without
+creating another rendered operator manual here.

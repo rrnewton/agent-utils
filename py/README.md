@@ -11,7 +11,8 @@ own version and documentation, and only the console commands that belong to it.
 | `pr-landing-planner` | `pr_landing_planner` | `pr-landing-planner` | Produce an advisory, conflict-aware pull-request landing plan. |
 | `wrkviz` | `wrkviz` | `wrkviz` | Build a durable, zoomable local timeline from coordinator and subagent transcripts. |
 | `parallel-experiment-runner` | `parallel_experiment_runner` | `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps. |
-| `herdr-run` | `herdr_run` | `herdr-run`, `herdr-agent` | Run policy-admitted commands and durably message interactive agents through Herdr panes. |
+| `herdr-run` | `herdr_run` | `herdr-run` | Execute policy-admitted shell commands through Herdr panes. |
+| `agentctl` | `agentctl` | `agentctl` (plus compatibility aliases) | Control persistent interactive and headless agents; optional Chat and MCP access. |
 | `wrkslots` | `wrkslots` | `wrkslots` | Create, track, hand off, recover, and conservatively remove coding-agent Git worktree slots. |
 
 Install a tool from its project directory during development:
@@ -23,6 +24,7 @@ python3 -m pip install ./py/pr_landing_planner
 python3 -m pip install ./py/wrkviz
 python3 -m pip install ./py/parallel_experiment_runner
 python3 -m pip install ./py/herdr_run
+python3 -m pip install ./py/agentctl
 python3 -m pip install ./py/wrkslots
 ```
 

@@ -30,6 +30,7 @@ class Crate:
     bins: tuple[str, ...]
     library: str
     command_userguides: tuple[tuple[str, str], ...]
+    extra_documents: tuple[str, ...] = ()
 
 
 CRATES: tuple[Crate, ...] = (
@@ -48,12 +49,14 @@ CRATES: tuple[Crate, ...] = (
     ),
     Crate(
         "herdr-run",
-        ("herdr-run", "herdr-agent"),
+        ("herdr-run",),
         "herdr_run",
-        (
-            ("herdr-run", "src/embedded_userguide.md"),
-            ("herdr-agent", "src/embedded_agent_userguide.md"),
-        ),
+        (("herdr-run", "src/embedded_userguide.md"),),
+    ),
+    Crate(
+        "agentctl", ("agentctl", "herdr-agent"), "agentctl",
+        (("agentctl", "src/embedded_userguide.md"), ("herdr-agent", "src/embedded_agent_userguide.md")),
+        ("src/embedded_quickstart.md",),
     ),
 )
 
@@ -96,7 +99,7 @@ _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
 #: A global `--userguide` flag is the norm here, but a command whose surface is
 #: `<command> <subcommand>` says it as a subcommand instead, because a documentation flag sitting
 #: beside a subcommand list is the mixing that surface exists to avoid.
-_USERGUIDE_INVOCATION: dict[str, tuple[str, ...]] = {"herdr-run": ("userguide",)}
+_USERGUIDE_INVOCATION: dict[str, tuple[str, ...]] = {"herdr-run": ("userguide",), "agentctl": ("userguide",)}
 
 
 class CheckError(RuntimeError):
@@ -147,10 +150,14 @@ def _check_missing_docs() -> None:
         ],
         env=env,
     )
-def _doc_violations(crate: Crate, text: str) -> list[str]:
+def _doc_violations(crate: Crate, text: str, *, document_name: str | None = None) -> list[str]:
     errors: list[str] = []
-    foreign = _FOREIGN_DOC_TERMS.search(text)
-    if foreign is not None:
+    for foreign in _FOREIGN_DOC_TERMS.finditer(text):
+        # Only the shared operator guide may name the distribution providing
+        # optional adapters. Public rustdoc and other package docs stay scoped.
+        if (crate.name == "agentctl" and foreign.group(0).lower() == "python"
+                and document_name in ("src/embedded_userguide.md", "src/embedded_agent_userguide.md")):
+            continue
         errors.append(f"foreign-package term {foreign.group(0)!r}")
     for description, pattern in _COMMON_DOC_TERMS:
         match = pattern.search(text)
@@ -200,6 +207,7 @@ def _metadata(crate: Crate) -> tuple[str, set[str], set[str]]:
         "README.md",
         "LICENSE",
         *(relative for _command, relative in crate.command_userguides),
+        *crate.extra_documents,
     }
     for relative in sorted(linked_resources):
         linked = RS_ROOT / crate.name / relative
@@ -288,6 +296,7 @@ def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
             f"{prefix}LICENSE",
             f"{prefix}README.md",
             *(f"{prefix}{relative}" for _command, relative in crate.command_userguides),
+            *(f"{prefix}{relative}" for relative in crate.extra_documents),
         }
         missing = sorted(required - names)
         if missing:
@@ -332,6 +341,7 @@ def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
         document_paths = {
             "README.md",
             *(relative for _command, relative in crate.command_userguides),
+            *crate.extra_documents,
         }
         for relative in sorted(document_paths):
             member = package.extractfile(f"{prefix}{relative}")
@@ -343,7 +353,7 @@ def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
                 raise CheckError(
                     f"{crate.name}: registry {relative} differs from its generated source"
                 )
-            errors = _doc_violations(crate, text)
+            errors = _doc_violations(crate, text, document_name=relative)
             if errors:
                 raise CheckError(
                     f"{crate.name}: {relative} is not standalone: {'; '.join(errors)}"
@@ -397,6 +407,13 @@ def _smoke(
                 raise CheckError(
                     f"{binary} {' '.join(guide_args)} differs from packaged user guide"
                 )
+        if binary == "agentctl":
+            result = _run([str(executable), "quickstart"], cwd=run_root, env=env, timeout=30)
+            expected = documents["src/embedded_quickstart.md"]
+            if result.stdout != expected or result.stderr:
+                raise CheckError("agentctl quickstart differs from packaged CLI documentation")
+            for arguments in (("capabilities",), ("start", "--help"), ("send", "--help"), ("stop", "--help")):
+                _run([str(executable), *arguments], cwd=run_root, env=env, timeout=30)
 
 
 def main() -> int:

@@ -8,11 +8,11 @@ from typing import cast
 
 import pytest
 
-from herdr_run.client import AgentPaneInfo, HerdrClient, Pane
-from herdr_run.errors import AgentDeliveryError, AgentPending, HerdrUnavailable
-from herdr_run.subagents import ManagedAgents, harness_arguments
-import herdr_run.agent_cli as cli
-import herdr_run.codex_goal as native_goal
+from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.errors import AgentDeliveryError, AgentPending, HerdrUnavailable
+from agentctl.subagents import ManagedAgents, harness_arguments
+import agentctl.legacy_cli as cli
+import agentctl.codex_goal as native_goal
 
 
 class FakeManagedClient:
@@ -50,6 +50,10 @@ class FakeManagedClient:
 
     def rename_tab(self, tab_id: str, label: str) -> None:
         del tab_id, label
+
+    def create_tab_with_pane(self, *, workspace_id: str, label: str, cwd: str) -> tuple[str, str]:
+        tab = self.create_tab(workspace_id=workspace_id, label=label, cwd=cwd)
+        return tab, self.presentations[-1].pane_id
 
     def start_agent(self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float) -> None:
         assert timeout > 0
@@ -89,6 +93,14 @@ class FakeManagedClient:
     def close_tab(self, tab_id: str) -> None:
         self.closed.append(tab_id)
         self.presentations = [pane for pane in self.presentations if pane.tab_id != tab_id]
+
+    def close_pane(self, pane_id: str) -> None:
+        tab = next(pane.tab_id for pane in self.presentations if pane.pane_id == pane_id)
+        self.closed.append(tab)
+        self.presentations = [pane for pane in self.presentations if pane.pane_id != pane_id]
+
+    def focus_pane(self, pane_id: str) -> None:
+        assert pane_id in self.infos
 
     def report_agent_session(self, name: str, pane_id: str, kind: str, session_id: str) -> None:
         assert self.agent_pane(name) == pane_id
@@ -320,7 +332,7 @@ def test_explicit_session_binding_preserves_existing_queue_authority(tmp_path: P
 
 @pytest.mark.parametrize("correct_objective", [True, False])
 def test_goal_confirms_only_its_exact_replacement_menu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, correct_objective: bool) -> None:
-    from herdr_run.errors import AgentPossiblySubmitted
+    from agentctl.errors import AgentPossiblySubmitted
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
     keys: list[str] = []
@@ -343,7 +355,7 @@ def test_goal_confirms_only_its_exact_replacement_menu(tmp_path: Path, monkeypat
 
 
 def test_queued_goals_keep_confirmation_authority_across_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from herdr_run.errors import AgentPossiblySubmitted
+    from agentctl.errors import AgentPossiblySubmitted
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="working")

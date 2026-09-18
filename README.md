@@ -2,8 +2,8 @@
 
 A collection of small, standalone command-line tools for build orchestration
 and repository automation. Every established tool has an independently
-installable Python distribution and Rust crate with the same command name and
-observable behavior.
+installable distribution. Paired tools share their core command contracts;
+installation-specific extensions are identified explicitly below.
 
 The implementations are intentionally independent. Shared fixtures,
 differential tests, isolated package checks, and adversarial reviews catch
@@ -18,7 +18,7 @@ schema, CLI, output, error, and state-transition drift.
 | `tick-hub` | Evaluate independently cadenced reminders and freshness checks in one deterministic tick. | `tick-hub` | `tick-hub` |
 | `pr-landing-planner` | Produce advisory, conflict- and CI-aware pull-request landing plans. | `pr-landing-planner` | `pr-landing-planner` |
 | `herdr-run` | Run an allowlisted command in a Herdr pane, outside whatever constrains the caller, with audited, byte-preserving results. An agent whose sandbox blocks the network is one such caller. | `herdr-run` | `herdr-run` |
-| `herdr-agent` | Start, manage, and durably message long-lived interactive agents in Herdr panes. | Companion command in `herdr-run` | Companion binary in `herdr-run` |
+| `agentctl` | Start named coding agents, delegate follow-up work, inspect goals, and retain direct terminal access. Interactive control requires Herdr. | `agentctl` (also worker, Chat, and MCP extensions) | `agentctl` (interactive core) |
 
 Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not
@@ -30,29 +30,41 @@ need this source tree or knowledge of the sibling implementation.
 |---|---|---|
 | `wrkviz` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `wrkviz` |
 | `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps through `dagrun`. | `parallel-experiment-runner` |
-| `herdr-subagents` | Persistent foreign-harness workers, headless and terminal backends, and an MCP interface. | Companion command in `herdr-run` |
-| `herdr-chat` | Connect one native coordinator to Google Chat with a durable inbox and threaded replies. | Companion command in `herdr-run` |
+| `agentctl` extensions | Headless workers in Herdr or tmux, Google Chat with configurable reaction ACKs, and an MCP interface over the same sessions. | Included in `agentctl` |
 
 These tools are independently installable and follow the same package
 documentation and artifact checks. They are explicit exceptions to the
 two-language implementation and behavioral-differential contract.
 
-Install the current `herdr-chat` and `herdr-subagents` companions from this
-checkout, or run their tracked Python entrypoints:
+## Persistent coding agents
+
+`agentctl` gives a person or coordinator one interface for long-lived workers:
 
 ```sh
-python3 -m pip install ./py/herdr_run
-DAGRUN_ENGINE=python ./bin/herdr-chat --help
-DAGRUN_ENGINE=python ./bin/herdr-subagents --help
+python3 -m pip install ./py/agentctl
+DAGRUN_ENGINE=python ./bin/agentctl quickstart
+DAGRUN_ENGINE=python ./bin/agentctl capabilities
+DAGRUN_ENGINE=python ./bin/agentctl chat quickstart
 ```
 
-Both companions require the Python distribution. The repository launcher refuses
-`DAGRUN_ENGINE=rust` for them because they have no Rust implementation.
+The Python package includes interactive and headless workers, Chat, and MCP.
+The Rust crate supplies interactive control. Both provide `agentctl userguide`
+and per-command help; `capabilities` reports the installed adapters. Interactive
+control and the current Chat bridge require Herdr. Headless workers can use
+Herdr or tmux for their transcript view.
+
+`agentctl` has no dependency on the `herdr-run` shell executor. Both call Herdr
+through their own adapters. The compatibility names `herdr-agent`,
+`herdr-subagents`, and `herdr-chat` belong to the agent-control package; the latter
+two require its Python extensions. Start new integrations with `agentctl`.
+See [public related work](common/docs/agentctl/RELATED_WORK.md) for comparisons
+with other session-control and chat approaches.
 
 ## Repository layout
 
 ```text
-common/docs/       authoritative documentation sources and rendered editions
+common/docs/       settled documentation, public related work, and rendered editions
+ai_docs/transient/ dated working designs and temporary research
 cross/             behavioral differential harnesses and shared fixtures
 examples/          runnable DAG examples
 gent-talk/         a deployable service, outside the workspaces (see below)
@@ -62,7 +74,7 @@ scripts/           documentation, package, and dependency contract checks
 skills/            thin agent-facing command discovery files
 ```
 
-For each paired tool, the shared documentation renderer combines:
+Several tools use a shared documentation renderer that combines:
 
 ```text
 common/docs/<tool>/README.template.md
@@ -71,7 +83,8 @@ common/docs/<tool>/fragments/{python,rust}/{README,USER_GUIDE}.md
 ```
 
 It writes authoritative rendered editions under `common/docs/`; package trees
-link to those files. Package builders dereference the links into ordinary files,
+link to those files. `agentctl` instead keeps its CLI documentation assets in
+`py/agentctl/`, with the core guide shared by both implementations. Package builders dereference the links into ordinary files,
 so every installed artifact is self-contained. Check mode verifies the exact
 rendered content, link topology, and absence of sibling-language, source-tree,
 unrelated-project, or development-history references:

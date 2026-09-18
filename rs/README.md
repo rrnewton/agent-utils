@@ -9,7 +9,8 @@ version, license, README, and embedded user guide.
 | `dagrun` | `dagrun`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr-landing-planner` | Produce advisory, conflict-aware pull-request landing plans. |
-| `herdr-run` | `herdr-run`, `herdr-agent` | Run policy-admitted commands and durably message interactive agents through Herdr panes. |
+| `herdr-run` | `herdr-run` | Execute policy-admitted shell commands through Herdr panes. |
+| `agentctl` | `agentctl`, `herdr-agent` | Control persistent interactive Herdr agents through one session registry. |
 
 Install one published command with Cargo:
 
@@ -18,6 +19,7 @@ cargo install dagrun
 cargo install tick-hub
 cargo install pr-landing-planner
 cargo install herdr-run
+cargo install agentctl
 ```
 
 For workspace development:

@@ -89,3 +89,6 @@ gent-talk/cloudflared.deb
 py/tests/js/browser/benchmark-report.txt
 py/tests/js/browser/benchmark-report.json
 py/tests/js/browser/qa-archive-report.txt
+
+# Agent session registry and bridge state
+.agentctl/

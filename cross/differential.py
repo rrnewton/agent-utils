@@ -109,6 +109,7 @@ from cpu_footprint_analysis import (
     load_events as load_cpu_events,
 )
 from herdr_agent_differential import compare_herdr_agent
+from agentctl_differential import compare_agentctl
 from herdr_differential import compare_herdr_run
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -7412,7 +7413,8 @@ def py_command_for(tool: str) -> list[str]:
         "tick-hub": "tick_hub",
         "pr-landing-planner": "pr_landing_planner",
         "herdr-run": "herdr_run",
-        "herdr-agent": "herdr_run.agent_cli",
+        "herdr-agent": "agentctl.legacy_cli",
+        "agentctl": "agentctl",
     }
     module = modules.get(tool)
     if module is None:
@@ -11529,6 +11531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "pr-landing-planner",
             "herdr-run",
             "herdr-agent",
+            "agentctl",
             "all",
         ),
     )
@@ -11550,6 +11553,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return compare_herdr_run(py_command_for(tool), rs_command(tool))
     if tool == "herdr-agent":
         return compare_herdr_agent(py_command_for(tool), rs_command(tool))
+    if tool == "agentctl":
+        return compare_agentctl(py_command_for(tool), rs_command(tool))
     results = (
         compare_dagrun(rand_count, seed),
         compare_cpuset_alloc(),
@@ -11557,6 +11562,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         compare_pr_landing_planner(rand_count, seed),
         compare_herdr_run(py_command_for("herdr-run"), rs_command("herdr-run")),
         compare_herdr_agent(py_command_for("herdr-agent"), rs_command("herdr-agent")),
+        compare_agentctl(py_command_for("agentctl"), rs_command("agentctl")),
     )
     return 1 if any(results) else 0
 

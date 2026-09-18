@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # TRACKED, deterministic engine resolver for repository-local tool commands.
 #
-# The paired commands (`dagrun`, `cpuset-alloc`, `tick-hub`, `pr-landing-planner`, `herdr-run`, and
-# `herdr-agent`) have tracked Python and Cargo-backed Rust launchers under their respective `*/bin`
+# The paired commands (`dagrun`, `cpuset-alloc`, `tick-hub`, `pr-landing-planner`, `herdr-run`, `herdr-agent`, and `agentctl`) have tracked Python and Cargo-backed Rust launchers under their respective `*/bin`
 # directories. `wrkviz`, `parallel-experiment-runner`, and `wrkslots` are intentionally Python-only.
 # Every tracked command link in this directory points here, so the top-level `./bin` symlink exposes
 # one consistent command surface after any setup mode.

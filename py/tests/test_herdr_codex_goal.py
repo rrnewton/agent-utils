@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-import herdr_run.codex_goal as goal_module
-from herdr_run.codex_goal import CodexGoalError, _main, clear_goal, get_goal, set_goal
-from herdr_run.jsonx import as_mapping
+import agentctl.codex_goal as goal_module
+from agentctl.codex_goal import CodexGoalError, _main, clear_goal, get_goal, set_goal
+from agentctl.jsonx import as_mapping
 
 _SERVER = r'''
 import json, pathlib, subprocess, sys, time

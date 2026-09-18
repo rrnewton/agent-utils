@@ -27,9 +27,10 @@ ENTRYPOINT_MODULES = [
     "parallel_experiment_runner",
     "wrkviz",
     "herdr_run",
-    "herdr_run.agent_cli",
-    "herdr_run.chat",
-    "herdr_run.foreign",
+    "agentctl",
+    "agentctl.legacy_cli",
+    "agentctl.chat",
+    "agentctl.foreign",
     "wrkslots",
 ]
 

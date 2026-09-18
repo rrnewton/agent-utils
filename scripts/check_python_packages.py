@@ -53,6 +53,8 @@ class Project:
     doc_term_exemptions: tuple[str, ...] = ()
     #: Sibling distributions this package deliberately composes with and therefore must name.
     sibling_package_exemptions: tuple[str, ...] = ()
+    #: CLI-first documentation may live directly in its owning package.
+    package_owned_docs: bool = False
 
 
 PROJECTS: tuple[Project, ...] = (
@@ -131,7 +133,7 @@ PROJECTS: tuple[Project, ...] = (
         directory="herdr_run",
         distribution="herdr-run",
         package="herdr_run",
-        commands=("herdr-run", "herdr-agent", "herdr-subagents", "herdr-chat"),
+        commands=("herdr-run",),
         # The distribution allowlists `cargo` as a target program, so its docs must name it. This is
         # user-visible subject matter, not a reference to the sibling implementation.
         doc_term_exemptions=("cargo",),
@@ -139,12 +141,6 @@ PROJECTS: tuple[Project, ...] = (
             "README.md",
             "USER_GUIDE.md",
             "QUICKSTART.md",
-            "AGENT_USER_GUIDE.md",
-            "FOREIGN_USER_GUIDE.md",
-            "CHAT_USER_GUIDE.md",
-            "foreign/lib.py",
-            "foreign/agent_runner.py",
-            "foreign/mcp/server.py",
             # There is deliberately no `examples/` here. `config_template.yaml` is what
             # `herdr-run init` writes, and it is the configuration reference; a second, partial
             # example file in the wheel would be a duplicate free to drift away from it.
@@ -152,7 +148,16 @@ PROJECTS: tuple[Project, ...] = (
             "py.typed",
         ),
         required_dependencies=("pyyaml",),
-        command_userguides=(("herdr-agent", "AGENT_USER_GUIDE.md"), ("herdr-subagents", "FOREIGN_USER_GUIDE.md"), ("herdr-chat", "CHAT_USER_GUIDE.md")),
+    ),
+    Project(
+        directory="agentctl", distribution="agentctl", package="agentctl",
+        commands=("agentctl", "herdr-agent", "herdr-subagents", "herdr-chat"),
+        resources=("README.md", "USER_GUIDE.md", "QUICKSTART.md", "py.typed",
+                   "AGENT_USER_GUIDE.md", "FOREIGN_USER_GUIDE.md", "CHAT_USER_GUIDE.md"),
+        required_dependencies=(),
+        command_userguides=(("herdr-agent", "USER_GUIDE.md"),
+                           ("herdr-subagents", "USER_GUIDE.md"), ("herdr-chat", "CHAT_USER_GUIDE.md")),
+        package_owned_docs=True,
     ),
     Project(
         directory="wrkslots",
@@ -183,6 +188,7 @@ _FOREIGN_DOC_TERMS = re.compile(
 _USERGUIDE_INVOCATION: dict[str, tuple[str, ...]] = {
     "herdr-run": ("userguide",),
     "herdr_run": ("userguide",),
+    "agentctl": ("userguide",),
 }
 
 
@@ -369,7 +375,7 @@ def _source_resources(project: Project, source: Path) -> tuple[tuple[str, bytes]
                 raise CheckError(
                     f"{project.distribution}: documentation resource {relative} is not UTF-8"
                 ) from exc
-            errors = _doc_violations(project, document)
+            errors = _doc_violations(project, document, document_name=relative)
             if errors:
                 raise CheckError(
                     f"{project.distribution}: documentation resource {relative} is not standalone: "
@@ -395,13 +401,18 @@ def _unexpected_package_members(
     )
 
 
-def _doc_violations(project: Project, text: str) -> list[str]:
+def _doc_violations(project: Project, text: str, *, document_name: str | None = None) -> list[str]:
     errors: list[str] = []
     checked_text = text
     if project.distribution == "dagrun":
         for value in ("cargo-build", "cargo-test", "cargo-nextest"):
             checked_text = checked_text.replace(value, " " * len(value))
     for foreign in _FOREIGN_DOC_TERMS.finditer(checked_text):
+        # The unified operator guide deliberately names the distributions whose
+        # supported adapters differ. This does not waive public API/README lint.
+        if (project.package == "agentctl" and foreign.group(0).lower() == "rust"
+                and document_name in ("USER_GUIDE.md", "AGENT_USER_GUIDE.md", "FOREIGN_USER_GUIDE.md")):
+            continue
         if foreign.group(0).lower() not in project.doc_term_exemptions:
             errors.append(f"foreign-language term {foreign.group(0)!r}")
     for description, pattern in _COMMON_DOC_TERMS:
@@ -470,6 +481,8 @@ def _copy_project(project: Project, destination: Path) -> Path:
         raise CheckError(f"{source}: missing pyproject.toml")
     for relative in ("README.md", "USER_GUIDE.md", "LICENSE"):
         linked = source / relative
+        if project.package_owned_docs and relative != "LICENSE" and linked.is_file():
+            continue
         if not linked.is_symlink() or not linked.resolve().is_file():
             raise CheckError(
                 f"{project.distribution}: source {relative} must be a valid authoritative symlink"
@@ -760,7 +773,7 @@ def _inspect_wheel(project: Project, wheel: Path) -> _WheelInspection:
                 raise CheckError(
                     f"{project.distribution}: wheel {document} differs from its authoritative source"
                 )
-            errors = _doc_violations(project, artifact_text)
+            errors = _doc_violations(project, artifact_text, document_name=document)
             if errors:
                 raise CheckError(
                     f"{project.distribution}: wheel {document} is not standalone: "
@@ -937,6 +950,25 @@ def _smoke_wheel(
                 raise CheckError(
                     f"{command} {' '.join(guide_args)} differs from packaged {expected_guide_name}"
                 )
+
+    if project.package == "agentctl":
+        # These invocations run in the wheel-only environment whose import
+        # checks above proved every sibling, including herdr_run, absent.
+        agentctl_command = str(bindir / "agentctl")
+        for arguments, expected in (
+            (["quickstart"], resource_text["QUICKSTART.md"]),
+            (["chat", "userguide"], resource_text["CHAT_USER_GUIDE.md"]),
+        ):
+            result = _run([agentctl_command, *arguments], env=env, cwd=run_root)
+            if result.stdout != expected or result.stderr:
+                raise CheckError(f"agentctl {' '.join(arguments)} differs from packaged CLI documentation")
+        for arguments in (["capabilities"], ["chat", "--help"], ["chat", "quickstart"],
+                          ["chat", "init", "--help"], ["chat", "run", "--help"],
+                          ["chat", "tick", "--help"], ["chat", "reply", "--help"],
+                          ["start", "--help"], ["mcp", "--help"]):
+            _run([agentctl_command, *arguments], env=env, cwd=run_root, timeout=30)
+        _run([str(python), "-c", "import agentctl.chat, agentctl.sessions, agentctl.mcp; "
+              "import agentctl.foreign.agent_runner, agentctl.foreign.mcp.server"], env=env, cwd=run_root)
 
 
 def main() -> int:

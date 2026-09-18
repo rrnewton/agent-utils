@@ -17,14 +17,14 @@ from urllib.request import Request
 
 import pytest
 
-import herdr_run.chat as chat_module
-from herdr_run.agent import Target
-from herdr_run.chat import (
+import agentctl.chat as chat_module
+from agentctl.agent import Target
+from agentctl.chat import (
     Bridge, CommandTransport, Config, GoogleChatTransport,
     _read, _run_command, _write, submit_reply,
 )
-from herdr_run.client import AgentPaneInfo, HerdrClient, Pane
-from herdr_run.errors import AgentDeliveryError, HerdrUnavailable
+from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 
 _SPACE = "spaces/test"
 _THREAD = "spaces/test/threads/thread-one"
@@ -275,7 +275,7 @@ def _bridge(state: Path, transport: Pages, *, target: Target | None = None) -> B
     if not (state / "bridge.json").exists():
         target = target or Target(pane_id="w1:p1", expected_agent="codex",
                                   expected_cwd="/work/project", expected_workspace="project")
-        Bridge.initialize(state, Config(_SPACE, ("users/owner",), target, "fixture-agent"), after=_START)
+        Bridge.initialize(state, Config(_SPACE, ("users/owner",), target, "fixture-agent", ack_reaction=None), after=_START)
     return Bridge(state, transport=transport)
 
 
@@ -374,7 +374,7 @@ def _named_bridge(state: Path, client: NamedHarness, transport: Pages) -> Bridge
     target = Target(pane_id="w1:p1", expected_agent="codex",
                     expected_cwd="/work/project", expected_workspace="project")
     Bridge.initialize(state, Config(_SPACE, ("users/owner",), target, "fixture-agent",
-                                    agent_name="coordinator"), after=_START)
+                                    agent_name="coordinator", ack_reaction=None), after=_START)
     return Bridge(state, client, transport)
 
 

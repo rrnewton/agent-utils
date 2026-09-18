@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from herdr_run.agent import Target
-from herdr_run.chat import Bridge, Config, _read, submit_reply
-from herdr_run.client import AgentPaneInfo, HerdrClient
-from herdr_run.errors import AgentDeliveryError, HerdrUnavailable
+from agentctl.agent import Target
+from agentctl.chat import Bridge, Config, _read, submit_reply
+from agentctl.client import AgentPaneInfo, HerdrClient
+from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 
 
 class Harness(HerdrClient):
@@ -46,6 +46,8 @@ class Chat:
         self.calls.append(request)
         if request["action"] == "poll":
             return {"messages": self.messages, "cursor": None}
+        if request["action"] == "react":
+            return {"id": str(request["message"]) + "/reactions/robot"}
         self.sent[str(request["request_id"])] = request
         if self.echo_as_owner and not any(message["id"] == "spaces/test/messages/bot-reply"
                                           for message in self.messages):

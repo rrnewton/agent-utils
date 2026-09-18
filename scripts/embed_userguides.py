@@ -3,7 +3,8 @@
 
 Each tool keeps language-neutral prose in ``common/docs/<tool>/*.template.md``
 and distribution-specific prose in ``common/docs/<tool>/fragments/<language>/``.
-Rendered README and user-guide files live under ``common/docs``.  Package trees
+Rendered README and user-guide files live under ``common/docs``. CLI-first tools
+may instead keep their authoritative assets in the owning package. Package trees
 link to those committed artifacts; package builders dereference the links so
 installed wheels and crates remain self-contained.  Edit templates, fragments,
 or a single-language source document, then run this script.
@@ -172,28 +173,16 @@ class PackageLink:
 
 
 STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
-    StandaloneDocument(
-        tool="herdr-run", document="CHAT_USER_GUIDE", language="python",
-        source="common/docs/herdr-run/CHAT_USER_GUIDE.md",
-    ),
-    StandaloneDocument(
-        tool="herdr-run", document="FOREIGN_USER_GUIDE", language="python",
-        source="common/docs/herdr-run/FOREIGN_USER_GUIDE.md",
-    ),
-    # This guide is shared byte-for-byte by both herdr-run packages. Linting it under both rule
-    # sets ensures it contains neither edition's package-manager or implementation language.
-    StandaloneDocument(
-        tool="herdr-run",
-        document="AGENT_USER_GUIDE",
-        language="python",
-        source="common/docs/herdr-run/AGENT_USER_GUIDE.md",
-    ),
-    StandaloneDocument(
-        tool="herdr-run",
-        document="AGENT_USER_GUIDE",
-        language="rust",
-        source="common/docs/herdr-run/AGENT_USER_GUIDE.md",
-    ),
+    # agentctl keeps its operator reference as package-owned CLI assets. The
+    # shared core guide is checked under both language rules; Chat is an extension.
+    *(StandaloneDocument(tool="agentctl", document=document, language=language,
+        source=f"py/agentctl/{document}.md",
+        # This shared guide must identify which distribution supplies each
+        # capability; implementation names are its explicit subject matter.
+        exemptions=("other implementation language",) if document == "USER_GUIDE" else ())
+      for document in ("README", "USER_GUIDE", "QUICKSTART") for language in ("python", "rust")),
+    StandaloneDocument(tool="agentctl", document="CHAT_USER_GUIDE", language="python",
+        source="py/agentctl/CHAT_USER_GUIDE.md"),
     # The quickstart is shared byte-for-byte by both herdr-run packages, so it is linted under
     # both rule sets and must name neither edition's toolchain.
     StandaloneDocument(
@@ -296,22 +285,14 @@ def _package_links() -> tuple[PackageLink, ...]:
         )
     links.extend(
         (
-            PackageLink(
-                "py/herdr_run/AGENT_USER_GUIDE.md",
-                "common/docs/herdr-run/AGENT_USER_GUIDE.md",
-            ),
-            PackageLink(
-                "py/herdr_run/CHAT_USER_GUIDE.md",
-                "common/docs/herdr-run/CHAT_USER_GUIDE.md",
-            ),
-            PackageLink(
-                "py/herdr_run/FOREIGN_USER_GUIDE.md",
-                "common/docs/herdr-run/FOREIGN_USER_GUIDE.md",
-            ),
-            PackageLink(
-                "rs/herdr-run/src/embedded_agent_userguide.md",
-                "common/docs/herdr-run/AGENT_USER_GUIDE.md",
-            ),
+            PackageLink("py/agentctl/LICENSE", "LICENSE"),
+            PackageLink("py/agentctl/AGENT_USER_GUIDE.md", "py/agentctl/USER_GUIDE.md"),
+            PackageLink("py/agentctl/FOREIGN_USER_GUIDE.md", "py/agentctl/USER_GUIDE.md"),
+            PackageLink("rs/agentctl/LICENSE", "LICENSE"),
+            PackageLink("rs/agentctl/README.md", "py/agentctl/README.md"),
+            PackageLink("rs/agentctl/src/embedded_userguide.md", "py/agentctl/USER_GUIDE.md"),
+            PackageLink("rs/agentctl/src/embedded_agent_userguide.md", "py/agentctl/USER_GUIDE.md"),
+            PackageLink("rs/agentctl/src/embedded_quickstart.md", "py/agentctl/QUICKSTART.md"),
             PackageLink(
                 "rs/herdr-run/src/config_template.yaml",
                 "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",

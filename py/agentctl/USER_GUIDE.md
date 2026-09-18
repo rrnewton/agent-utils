@@ -1,0 +1,251 @@
+# agentctl user guide
+
+`agentctl` lets a person or coordinator agent manage persistent coding sessions:
+start them, submit follow-up work, inspect results, and take over their terminals.
+The sessions keep their own native tools, instructions, and conversation. This
+is useful when one coordinator needs several long-lived workers that a human
+can still examine and steer directly.
+
+## Dependencies and available adapters
+
+The core interactive adapter calls Herdr's public CLI directly. Install Herdr
+and the selected Codex or Claude harness separately, and authenticate the
+harness before launching workers. The integration uses Herdr's pane, tab,
+workspace, agent prompt, agent wait, and session inspection APIs.
+
+The manager itself is a short-lived command. Herdr owns an interactive agent's
+terminal process. There is no manager daemon or hosted coordination service to
+keep alive. The manager is independent of shell-command execution utilities.
+
+Run `agentctl capabilities` to inspect the modes, backends, harnesses, and
+services present in this installation. **The Python distribution includes the
+interactive core, headless workers, Chat, and MCP. The Rust distribution provides the
+interactive core only.** The worker, Chat, and MCP extensions are bundled
+capabilities of the Python distribution, not separately installable package
+extras or runtime-loaded plugins.
+
+| Mode or service | What it controls | Additional dependency |
+| --- | --- | --- |
+| Interactive | A native Codex or Claude TUI that remains directly accessible | Herdr |
+| Headless worker extension | Resumable Codex or AGY structured turns; a terminal shows the transcript | Herdr or tmux and the chosen harness |
+| Chat extension | One Google Chat space connected to an interactive coordinator | Google Chat access and Herdr |
+| MCP extension | The same session operations over local MCP stdio | An MCP client |
+
+Extension commands are not available in every installation. An interactive
+agent requires Herdr; selecting tmux does not provide interactive agent control.
+A headless transcript view is not a native interactive harness interface.
+
+## Names, state, and shared workspaces
+
+Commands use a human-readable session `NAME`, made of lowercase letters, digits,
+and hyphens. State defaults to `.agentctl` in the current directory. Use
+`--registry /absolute/path` to give multiple callers the same registry. The
+`--state` spelling is an alias for the session registry; Chat has a separate
+state directory and separate `--state` option.
+
+A name identifies one generation of a session. The registry also records its
+runtime identity, selected adapter, native conversation when known, and delivery
+artifacts. Reusing a name requires stopping its current session first. The tool
+refuses a changed or unverified owner rather than treating a matching directory
+or pane title as proof that it found the same agent.
+
+Workers run in the directory given by `--cwd` (default: the current directory).
+They share its files and credentials. Separate Git worktrees are an operator
+choice when simultaneous edits need isolation; agent control does not require
+creating worktrees.
+
+## Start and delegate
+
+```sh
+agentctl start reviewer --harness codex --cwd /work/project \
+  --brief 'Review the current changes and report actionable findings'
+agentctl start implementer --harness claude --cwd /work/project \
+  --file /tmp/implementation-task.txt
+agentctl list
+agentctl status reviewer
+agentctl send reviewer 'Focus on cancellation and restart behavior'
+```
+
+`--model` selects an accessible model; omission preserves the harness default.
+`--harness-arg=ARG` passes a literal argument to an interactive harness and may
+be repeated. `--resume SESSION` resumes an explicitly identified conversation.
+Use `--workspace-id` to choose an exact Herdr workspace.
+
+`send` accepts literal text or `--file`. In interactive mode, the instruction is
+persisted before submission. The manager waits for native readiness, records an
+in-flight barrier, and asks Herdr to submit the text with paste plus Enter. It
+requires evidence of a subsequent working state to confirm acceptance.
+
+The default readiness wait is 900 seconds. For a responsive coordinator loop:
+
+```sh
+agentctl send reviewer --file /tmp/follow-up.txt --ready-timeout 0
+agentctl drain reviewer --ready-timeout 0
+```
+
+Known-unsubmitted work remains queued. Uncertain submission is quarantined and
+is not automatically injected again. `--message-id` gives an interactive
+request a caller-selected identity; duplicate IDs are rejected, not interpreted
+as permission to execute again. Inspect the saved artifact before deciding
+whether a new instruction is needed.
+
+The interactive queue has four durable directories:
+
+| Directory | Meaning | Recovery |
+| --- | --- | --- |
+| `inbox/` | The request is safely pending and has not crossed the submission barrier | Run `agentctl drain NAME` against the same registry and queue |
+| `inflight/` | Submission may have begun; a crash here leaves acceptance uncertain | Inspect the harness; restart quarantines it without replay |
+| `failed/` | Quarantined input, with an error record distinguishing invalid input from `possibly_submitted` | Inspect the error and conversation; never automatically replay uncertain work |
+| `processed/` | The target's working transition confirmed submission | Await the agent's result; this is not proof of task completion |
+
+`send` reports `outcome: pending` with exit 75 for safely queued work and
+`outcome: possibly_submitted` with exit 76 for uncertain delivery, including the
+request ID and artifact path. Preserve that ID and use `drain` for pending
+work. Sending the same task under a new ID creates a second request and can
+duplicate work; it is not a recovery operation.
+
+## Observe and take over
+
+```sh
+agentctl read reviewer --lines 100
+agentctl wait reviewer --timeout 60
+agentctl pause reviewer
+agentctl attach reviewer
+agentctl resume reviewer
+```
+
+`read` returns a terminal snapshot for an interactive agent. It does not claim
+that the snapshot is the final answer. `wait` observes readiness, which can occur
+between steps of an active goal. Neither readiness nor successful delivery
+proves completion of the task.
+
+`pause` blocks automated input through the session manager; it lets an active
+turn finish. `attach` focuses the terminal and does not itself transfer input
+ownership. Pause before typing directly, coordinate with any separate input
+producer, and clear unfinished composer text before `resume`. The native
+harness remains usable directly in Herdr.
+
+## Goals and native conversation identity
+
+```sh
+agentctl goal reviewer 'Complete the cancellation review'
+agentctl goal reviewer
+agentctl bind-session reviewer NATIVE_SESSION_ID
+```
+
+Setting a goal submits a native `/goal` command for Codex or an ordinary goal
+instruction for other harnesses. It records the requested objective separately
+from the native goal result. Native inspection requires a supporting harness,
+a known conversation ID, and a working goal RPC interface. If the ID was not
+reported automatically, use `bind-session` with the ID reported by that exact
+agent. A shared working directory is not sufficient evidence of identity.
+
+`goal`, `bind-session`, and `drain` apply to the native interactive adapter.
+Headless turn runners expose their supported operations in `agentctl status`;
+they do not acquire native goal RPC support by using Herdr for presentation.
+
+An installation can select its native goal RPC with
+`--goal-command-json '["/absolute/path/to/goal-rpc"]'`. `status` and `goal` expose
+whether the native state is available; unverified intent is not reported as a
+completed native goal.
+
+## Stop and recover
+
+```sh
+agentctl stop reviewer
+```
+
+Stopping closes only the runtime owned by the session and archives its state.
+An unavailable terminal server is not proof that an agent died. A lost terminal
+view is not proof that a headless runner stopped. Preserve the registry and
+inspect `status` when ownership checks refuse an operation.
+
+Interactive prompt delivery distinguishes pending input from uncertain input.
+Do not delete a queue or resubmit an uncertain request simply because no final
+answer is visible. Check the native terminal, conversation, and durable artifact.
+A generation change prevents old work from being silently redirected to a new
+worker with the same name.
+
+Most commands print JSON; `read` prints text and documentation commands print
+prose. Successful operations exit 0. Pending interactive work exits 75 and
+uncertain submission exits 76; failures include a diagnostic. Read the reported
+outcome and saved artifact instead of treating every nonzero exit as a request
+to submit again.
+
+## Headless worker extension
+
+When listed by `agentctl capabilities`, headless workers use the same names and
+registry as interactive sessions:
+
+```sh
+agentctl start worker --mode headless --backend tmux --harness codex \
+  --cwd /work/project --brief 'Investigate the failing tests'
+agentctl send worker 'Summarize the remaining failures'
+agentctl read worker --output last
+agentctl read worker --output since_turn --since-turn 2
+```
+
+The long-lived runner invokes structured harness turns and retains the native
+conversation ID between turns. The presentation terminal displays status and
+transcripts. Pause automated input before direct intervention. `reset` clears
+an idle worker's conversation context; `repair` recreates a missing presentation
+for a live runner. `migrate --backend herdr|tmux` moves an idle worker while
+preserving its conversation and queue, subject to supported mode transitions.
+The source and destination must retain compatible harness permissions.
+
+The worker inbox marks claimed turns before execution. After an interruption,
+inspect uncertain turn state and the native conversation rather than assuming
+that rerunning a command is harmless. Stop and migration operations verify
+ownership and preserve recoverable state on failure.
+
+## Chat and MCP extensions
+
+`agentctl chat quickstart` and `agentctl chat userguide` describe the Chat
+extension. It accepts authorized messages into durable state and reacts with
+🤖 by default, before waiting for the coordinator to become ready. A reaction
+means the bridge ingested the message; the final answer arrives separately.
+Configure another emoji with `ack_reaction`, or disable reactions with null or
+an empty string. Reaction failures remain visible and retryable without aborting
+prompt delivery or replies.
+
+The Chat bridge is a separate polling process. It can target one coordinator
+without any worker team. It requires an interactive coordinator in Herdr and
+uses terminal input; a command transport changes Google Chat access, not the
+harness connection. Chat and the coordinator must share the local reply-state
+filesystem. The bridge does not supervise the coordinator's process.
+
+`agentctl mcp --registry /absolute/path` serves session operations over stdio
+when the MCP extension is available. The coordinator can use either CLI or MCP;
+workers do not need individual Chat connections.
+
+## Compatibility entry points
+
+The agent-control package supplies `herdr-agent` as a compatibility entry point.
+Installations with worker and Chat extensions also supply `herdr-subagents` and
+`herdr-chat`. Prefer the single `agentctl` command for new integrations:
+
+| Existing entry point | Unified operation |
+| --- | --- |
+| `herdr-agent start NAME` | `agentctl start NAME` |
+| `herdr-agent send --name NAME TEXT` | `agentctl send NAME TEXT` |
+| `herdr-agent status --name NAME` | `agentctl status NAME` |
+| `herdr-subagents up NAME ...` | `agentctl start NAME --mode headless ...` |
+| `herdr-subagents send NAME ...` | `agentctl send NAME ...` |
+| `herdr-chat COMMAND ...` | `agentctl chat COMMAND ...` |
+
+Compatibility commands retain their state-directory defaults: `herdr-agent`
+uses `.herdr-agents` for managed sessions and `.herdr-agent` for an explicit
+delivery queue; `herdr-chat` uses `.herdr-chat`. The worker compatibility command
+uses `HERDR_SUBAGENTS_HOME`, or `$XDG_STATE_HOME/herdr-agent/foreign` (default:
+`~/.local/state/herdr-agent/foreign`).
+
+Use `agentctl --registry .herdr-agents` to continue a managed interactive
+registry. An independent worker-compatibility registry retains its own command
+and environment until those workers are stopped and started through the unified
+interface. Creating a new registry does not adopt an agent by matching its name.
+Low-level compatibility arguments remain discoverable with each entry point's
+`--help`.
+
+Use `agentctl COMMAND --help` for argument descriptions, defaults, units, and
+examples. These installed documentation commands are the operator reference;
+they do not require access to a source checkout or a web manual.
