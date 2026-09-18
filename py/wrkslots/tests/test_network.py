@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -66,6 +67,29 @@ def proxy_commands(log: Path) -> list[list[str]]:
     return commands
 
 
+def install_credential_helper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    helper = tmp_path / "real-gh"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        + textwrap.dedent(
+            """\
+            import sys
+
+            assert sys.argv[1:] == ['auth', 'git-credential', 'get']
+            request = sys.stdin.read()
+            assert 'protocol=https' in request
+            assert 'host=github.com' in request
+            print('username=test-user')
+            print('password=test-password')
+            """
+        ),
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    monkeypatch.setenv("FLEET_REAL_GH", str(helper))
+    return helper.resolve()
+
+
 def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -73,6 +97,7 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
     expected = lifecycle.git(repository, "rev-parse", "HEAD").stdout.strip()
     lifecycle.git(repository, "update-ref", "-d", "refs/remotes/origin/main")
     log = install_proxy_wrapper(tmp_path, monkeypatch)
+    helper = install_credential_helper(tmp_path, monkeypatch)
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "unrelated-git-directory"))
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.useReplaceRefs")
@@ -88,12 +113,58 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
     assert vcs.status(repository) == ""
 
     commands = proxy_commands(log)
-    assert [command[6] for command in commands] == [
+    assert [command[command.index("-C") + 2] for command in commands] == [
         "fetch", "ls-remote", "push", "ls-remote"
     ]
     assert all(command[:4] == [
         "git", "--no-replace-objects", "-c", "core.useReplaceRefs=false"
     ] for command in commands)
+    expected_helper = f"credential.helper=!{helper} auth git-credential"
+    assert all(
+        command[4:8]
+        == ["-c", "credential.helper=", "-c", expected_helper]
+        for command in commands
+    )
+
+
+def test_github_credential_helper_works_with_global_git_config_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper = install_credential_helper(tmp_path, monkeypatch)
+    arguments = wrkslots._github_credential_helper_args(os.environ)
+
+    completed = subprocess.run(
+        ["git", *arguments, "credential", "fill"],
+        input="protocol=https\nhost=github.com\n\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [
+        "protocol=https",
+        "host=github.com",
+        "username=test-user",
+        "password=test-password",
+    ]
+    assert arguments == (
+        "-c",
+        "credential.helper=",
+        "-c",
+        f"credential.helper=!{helper} auth git-credential",
+    )
+
+
+def test_invalid_configured_github_cli_refuses_before_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "missing-gh"
+    monkeypatch.setenv("FLEET_REAL_GH", str(missing))
+
+    with pytest.raises(wrkslots.Refusal, match="configured GitHub CLI is unavailable"):
+        wrkslots._github_credential_helper_args(os.environ)
 
 
 def test_create_hooks_and_recursive_submodules_inherit_wrapper_environment(
@@ -135,7 +206,7 @@ def test_create_hooks_and_recursive_submodules_inherit_wrapper_environment(
     assert len(lifecycle.active_slots(project)) == 1
     commands = proxy_commands(log)
     assert [command[0] for command in commands] == ["git", "/bin/sh", "/bin/sh"]
-    assert commands[0][6] == "fetch"
+    assert commands[0][commands[0].index("-C") + 2] == "fetch"
     assert secret not in made.stdout + made.stderr + log.read_text(encoding="utf-8")
 
 
@@ -155,7 +226,7 @@ def test_failed_fetch_wrapper_never_retries_direct_or_registers_slot(
     assert not lifecycle.create_journal_path(project).exists()
     commands = proxy_commands(log)
     assert len(commands) == 1
-    assert commands[0][6] == "fetch"
+    assert commands[0][commands[0].index("-C") + 2] == "fetch"
 
 
 def test_failed_hook_wrapper_preserves_journal_and_recovery_uses_wrapper(

@@ -141,6 +141,9 @@ readback, and post-provision hooks. The hook's children, including recursive sub
 inherit the wrapper's environment. A wrapper failure stops the operation; Wrkslots does not retry
 without it. On hosts without `with-proxy`, commands use the caller's network environment. Local
 Git inspection uses no wrapper, and Wrkslots does not change global Git or proxy configuration.
+Network Git commands keep global and system Git configuration disabled, but explicitly use the
+GitHub CLI credential helper when an executable `FLEET_REAL_GH` or `gh` is available. This permits
+authenticated HTTPS salvage without admitting unrelated global Git configuration into a removal.
 
 A repository path is resolved from the configured project root, not from the caller's current
 directory, and must be relative. Use an ordinary path inside the project root, or path components of

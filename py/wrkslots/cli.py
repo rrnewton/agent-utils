@@ -6640,6 +6640,32 @@ def _with_proxy(command: Sequence[str], env: Mapping[str, str]) -> list[str]:
     return [str(Path(wrapper).absolute()), *command] if wrapper is not None else list(command)
 
 
+def _github_credential_helper_args(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Return an explicit GitHub credential helper without loading global Git config."""
+
+    configured = env.get("FLEET_REAL_GH")
+    candidate = configured or shutil.which("gh", path=env.get("PATH"))
+    if candidate is None:
+        return ()
+    path = Path(candidate)
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        if configured is not None:
+            raise Refusal(f"configured GitHub CLI is unavailable: {path}: {exc}") from exc
+        return ()
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        if configured is not None:
+            raise Refusal(f"configured GitHub CLI is not executable: {resolved}")
+        return ()
+    return (
+        "-c",
+        "credential.helper=",
+        "-c",
+        f"credential.helper=!{shlex.quote(str(resolved))} auth git-credential",
+    )
+
+
 class _GitVcs:
     """The small Git boundary used by slot operations."""
 
@@ -6664,16 +6690,18 @@ class _GitVcs:
         env["GIT_NO_REPLACE_OBJECTS"] = "1"
         if env_overrides:
             env.update(env_overrides)
+        network_operation = bool(args and args[0] in {"fetch", "push", "ls-remote"})
         command = [
             "git",
             "--no-replace-objects",
             "-c",
             "core.useReplaceRefs=false",
+            *(_github_credential_helper_args(env) if network_operation else ()),
             "-C",
             str(repository),
             *args,
         ]
-        if args and args[0] in {"fetch", "push", "ls-remote"}:
+        if network_operation:
             command = _with_proxy(command, env)
         try:
             completed = subprocess.run(
