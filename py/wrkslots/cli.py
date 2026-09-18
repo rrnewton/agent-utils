@@ -5308,6 +5308,43 @@ def _retirement_candidates(
     )
 
 
+def _retired_handoff_temp_path(
+    target: Path, identity: _RegularFileIdentity
+) -> Path:
+    key = hashlib.sha256(target.name.encode("utf-8")).hexdigest()[:16]
+    return target.parent / (
+        f"HANDOFF-DUPLICATE.{key}.{identity.device:x}.{identity.inode:x}."
+        f"{identity.sha256}.json"
+    )
+
+
+def _retired_legacy_handoff_path(
+    config: Config,
+    record: ActiveRecord,
+    identity: _RegularFileIdentity,
+) -> Path:
+    key = hashlib.sha256(
+        f"{record.machine}\0{record.slot}\0{record.generation}".encode("utf-8")
+    ).hexdigest()[:16]
+    return config.control / (
+        f"HANDOFF-LEGACY-RETIRED.{key}.{identity.device:x}.{identity.inode:x}."
+        f"{identity.sha256}.md"
+    )
+
+
+def _validate_retired_legacy_handoff(
+    path: Path,
+    identity: _RegularFileIdentity,
+) -> None:
+    contents, observed = _read_regular_file_identity(
+        path, "retired legacy HANDOFF.md", HANDOFF_BYTES_LIMIT
+    )
+    if observed != identity or hashlib.sha256(contents).hexdigest() != identity.sha256:
+        raise StateError(
+            f"retired legacy HANDOFF.md identity changed; preserve it for recovery: {path}"
+        )
+
+
 def _retired_handoff_prefix(sidecar_path: Path) -> str:
     name_digest = hashlib.sha256(sidecar_path.name.encode("utf-8")).hexdigest()[:16]
     return f"HANDOFF-RETIRED.{name_digest}."
@@ -15944,7 +15981,30 @@ def _finish_remove_paths(
         _interrupt_for_test("after-remove-worktree")
     if _record_layout(config, record) == "nested" and record.slot_type == "agent":
         handoff = fenced_slot / "HANDOFF.md"
-        if handoff.exists() or handoff.is_symlink():
+        latest = _latest_handoff_read(
+            record, _load_events(config, record.machine)
+        )
+        expected_source_path = (
+            _slot_directory(config, record.slot, record.slot_type) / "HANDOFF.md"
+        ).resolve(strict=False)
+        expected_identity = (
+            latest.source_identity
+            if latest is not None
+            and latest.provenance_complete
+            and latest.source == "legacy-slot-file"
+            and latest.source_path == expected_source_path
+            else None
+        )
+        retired = (
+            None
+            if expected_identity is None
+            else _retired_legacy_handoff_path(config, record, expected_identity)
+        )
+        handoff_present = handoff.exists() or handoff.is_symlink()
+        retired_present = bool(
+            retired is not None and (retired.exists() or retired.is_symlink())
+        )
+        if handoff_present:
             if handoff.is_symlink() or not handoff.is_file():
                 raise Refusal(
                     f"fenced HANDOFF.md became unsafe: {handoff}; preserve the fenced slot "
@@ -15956,30 +16016,57 @@ def _finish_remove_paths(
                 HANDOFF_BYTES_LIMIT,
             )
             digest = hashlib.sha256(contents).hexdigest()
-            latest = _latest_handoff_read(
-                record, _load_events(config, record.machine)
-            )
-            expected_source_path = (
-                _slot_directory(config, record.slot, record.slot_type) / "HANDOFF.md"
-            ).resolve(strict=False)
             if (
-                latest is None
-                or not latest.provenance_complete
+                expected_identity is None
+                or latest is None
                 or latest.sha256 != digest
-                or latest.source != "legacy-slot-file"
-                or latest.source_path != expected_source_path
-                or latest.source_identity != identity
+                or expected_identity != identity
+                or retired is None
             ):
                 raise Refusal(
                     f"fenced HANDOFF.md changed after its exact provenance-bearing read: "
                     f"{handoff}; preserve the slot and rerun coordinator-authorized "
                     "'wrkslots read-handoff' before recovery"
                 )
+            if retired_present:
+                raise StateError(
+                    f"both fenced and retired legacy HANDOFF.md paths exist for "
+                    f"slot {record.slot}; preserve both for recovery"
+                )
+            _interrupt_for_test("before-legacy-handoff-quarantine")
+            _rename_noreplace(
+                handoff,
+                retired,
+                f"quarantine legacy HANDOFF.md for slot {record.slot}",
+            )
+            _fsync_directory(fenced_slot)
+            _fsync_directory(config.control)
             try:
-                handoff.unlink()
-                _fsync_directory(fenced_slot)
-            except OSError as exc:
-                raise Refusal(f"cannot remove recorded HANDOFF.md {handoff}: {exc}") from exc
+                _validate_retired_legacy_handoff(retired, identity)
+            except (Refusal, StateError) as exc:
+                if not handoff.exists() and not handoff.is_symlink():
+                    try:
+                        _rename_noreplace(
+                            retired,
+                            handoff,
+                            f"restore raced legacy HANDOFF.md for slot {record.slot}",
+                        )
+                        _fsync_directory(fenced_slot)
+                        _fsync_directory(config.control)
+                    except Refusal as restore:
+                        raise StateError(
+                            f"{exc}; raced replacement also could not be restored: {restore}"
+                        ) from restore
+                raise Refusal(
+                    f"legacy HANDOFF.md pathname changed at its quarantine boundary; "
+                    f"the replacement was preserved at {handoff}"
+                ) from exc
+            _interrupt_for_test("after-legacy-handoff-quarantine")
+            if handoff.exists() or handoff.is_symlink():
+                raise Refusal(
+                    f"legacy HANDOFF.md pathname was recreated during quarantine for "
+                    f"slot {record.slot}; preserved both {handoff} and {retired}"
+                )
             _write_event_file(
                 config,
                 record.machine,
@@ -15988,7 +16075,18 @@ def _finish_remove_paths(
                     "slot": record.slot,
                     "generation": record.generation,
                     "sha256": digest,
+                    "retired_path": retired.name,
+                    "source_identity": _regular_file_identity_to_obj(identity),
                 },
+            )
+        elif retired_present:
+            assert retired is not None
+            assert expected_identity is not None
+            _validate_retired_legacy_handoff(retired, expected_identity)
+        elif expected_identity is not None:
+            raise Refusal(
+                f"legacy HANDOFF.md disappeared without its exact retired quarantine: "
+                f"{handoff}; preserve the fenced slot and run 'wrkslots recover'"
             )
     _remove_fenced_directory(config, fenced_slot)
     _interrupt_for_test("after-remove-fenced-directory")
@@ -17065,26 +17163,86 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 "preserve both files for explicit inspection"
             )
         elif handoff_sidecar:
-            machine = _as_str(
-                _as_mapping(
-                    _read_json(target, "handoff sidecar"), "handoff sidecar"
-                ).get("machine"),
-                "handoff sidecar machine",
+            target_contents, target_identity = _read_regular_file_identity(
+                target, "handoff sidecar", HANDOFF_SIDECAR_BYTES_LIMIT
             )
-            slot = _as_str(
-                _as_mapping(
-                    _read_json(target, "handoff sidecar"), "handoff sidecar"
-                ).get("slot"),
-                "handoff sidecar slot",
+            target_raw = _as_mapping(
+                _strict_json_object(target_contents, "handoff sidecar"),
+                "handoff sidecar",
             )
+            machine = _as_str(target_raw.get("machine"), "handoff sidecar machine")
+            slot = _as_str(target_raw.get("slot"), "handoff sidecar slot")
             record = _find_record(
                 _load_active(config, machine, require_repository=False), slot
             )
-            _load_handoff_sidecar(config, record)
-            leftover.unlink()
+            target_artifact = _handoff_artifact_from_obj(
+                config, record, target_raw, target, target_identity
+            )
+            temp_contents, temp_identity = _read_regular_file_identity(
+                leftover, "handoff sidecar temp file", HANDOFF_SIDECAR_BYTES_LIMIT
+            )
+            temp_artifact = _handoff_artifact_from_obj(
+                config,
+                record,
+                _strict_json_object(temp_contents, "handoff sidecar temp file"),
+                target,
+                temp_identity,
+            )
+            if _handoff_artifact_to_obj(temp_artifact) != _handoff_artifact_to_obj(
+                target_artifact
+            ):
+                raise StateError(
+                    f"handoff sidecar temp file disagrees with durable target; "
+                    f"preserved both {leftover} and {target}"
+                )
+            retired = _retired_handoff_temp_path(target, temp_identity)
+            if retired.exists() or retired.is_symlink():
+                raise StateError(
+                    f"retired duplicate handoff temp already exists: {retired}"
+                )
+            _interrupt_for_test("before-handoff-temp-quarantine")
+            _rename_noreplace(
+                leftover, retired, "quarantine duplicate handoff temp file"
+            )
             _fsync_directory(leftover.parent)
+            try:
+                retired_contents, retired_identity = _read_regular_file_identity(
+                    retired,
+                    "retired duplicate handoff temp file",
+                    HANDOFF_SIDECAR_BYTES_LIMIT,
+                )
+                if retired_identity != temp_identity or retired_contents != temp_contents:
+                    raise StateError(
+                        "duplicate handoff temp identity changed at quarantine boundary"
+                    )
+            except (Refusal, StateError) as exc:
+                if not leftover.exists() and not leftover.is_symlink():
+                    try:
+                        _rename_noreplace(
+                            retired,
+                            leftover,
+                            "restore raced duplicate handoff temp file",
+                        )
+                        _fsync_directory(leftover.parent)
+                    except Refusal as restore:
+                        raise StateError(
+                            f"{exc}; raced temp also could not be restored: {restore}"
+                        ) from restore
+                raise StateError(
+                    f"handoff sidecar temp changed at quarantine boundary; "
+                    f"preserved it at {leftover}"
+                ) from exc
+            current_contents, current_identity = _read_regular_file_identity(
+                target, "handoff sidecar", HANDOFF_SIDECAR_BYTES_LIMIT
+            )
+            if current_identity != target_identity or current_contents != target_contents:
+                raise StateError(
+                    f"durable handoff sidecar changed during temp recovery; "
+                    f"preserved both {target} and {retired}"
+                )
             print(
-                f"discarded incomplete handoff update {leftover.name}; kept {target.name}"
+                f"quarantined exact duplicate handoff temp {leftover.name}; "
+                f"kept durable {target.name}"
             )
             continue
         else:

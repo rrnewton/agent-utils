@@ -14637,6 +14637,67 @@ def test_legacy_projection_noreplace_does_not_enqueue_planted_destination(
 
 
 
+def test_recover_preserves_conflicting_planted_sidecar_and_owner_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "external-handoff.md"
+    source.write_text("owner-authored continuation\n", encoding="utf-8")
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+
+    def plant_valid_conflict(point: str) -> None:
+        if point != "before-handoff-sidecar-publish":
+            return
+        temps = list(config.control.glob(f"{sidecar.name}.tmp.*"))
+        assert len(temps) == 1
+        payload = json.loads(temps[0].read_text(encoding="utf-8"))
+        planted = b"conflicting planted sidecar\n"
+        digest = hashlib.sha256(planted).hexdigest()
+        payload["contents_utf8"] = planted.decode("utf-8")
+        payload["sha256"] = digest
+        payload["source_identity"]["size"] = len(planted)
+        payload["source_identity"]["sha256"] = digest
+        sidecar.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", plant_valid_conflict)
+    args = argparse.Namespace(
+        project_root=str(project),
+        machine="testhost",
+        slot="slot01",
+        agent="codex-1",
+        owner_pid=os.getpid(),
+        expected_generation=1,
+        from_file=str(source),
+        wait_lock=0.0,
+    )
+    with pytest.raises(wrkslots.Refusal, match="destination already exists"):
+        wrkslots._cmd_write_handoff(args)
+    temps = list(config.control.glob(f"{sidecar.name}.tmp.*"))
+    assert len(temps) == 1
+    attempted = temps[0].read_bytes()
+    planted = sidecar.read_bytes()
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    recovered = raw_command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--discard-partial",
+    )
+
+    assert recovered.returncode == 3
+    assert "temp file disagrees with durable target" in recovered.stderr
+    assert temps[0].read_bytes() == attempted
+    assert sidecar.read_bytes() == planted
+    assert source.read_text(encoding="utf-8") == "owner-authored continuation\n"
+
+
+
 def test_schema_one_write_handoff_matching_source_remains_manual_only(
     tmp_path: Path,
 ) -> None:
@@ -15366,6 +15427,59 @@ def test_retire_pending_uses_remove_and_cleans_sidecar(
     assert payload["retained"] == []
     assert not checkout(project).exists()
     assert not sidecar.exists()
+
+
+def test_legacy_handoff_quarantine_preserves_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text("original legacy handoff\n", encoding="utf-8")
+    assert raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    ).returncode == 0
+    assert finish(project).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+
+    def replace_at_boundary(point: str) -> None:
+        if point != "before-legacy-handoff-quarantine":
+            return
+        fenced = list(slots_directory(project).glob(".slot01.fenced.*"))
+        assert len(fenced) == 1
+        selected = fenced[0] / "HANDOFF.md"
+        replacement = fenced[0] / "replacement.tmp"
+        replacement.write_text("replacement must survive\n", encoding="utf-8")
+        os.replace(replacement, selected)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", replace_at_boundary)
+    code = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert code == 3
+    assert "replacement was preserved" in capsys.readouterr().err
+    fenced = list(slots_directory(project).glob(".slot01.fenced.*"))
+    assert len(fenced) == 1
+    assert (fenced[0] / "HANDOFF.md").read_text(encoding="utf-8") == (
+        "replacement must survive\n"
+    )
+    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
+
 
 
 def test_sidecar_cleanup_preserves_canonical_path_recreation(
