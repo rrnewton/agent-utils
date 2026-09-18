@@ -121,13 +121,36 @@ owner-death condition, even after its heartbeat expires. `recover-unbound-owner`
 inspected but does not turn unavailable process evidence into proof of death. Preserve such a slot
 and name it in the migration remainder rather than inventing an owner.
 
-## HANDOFF.md
+## Handoffs and retirement
 
-An agent slot may contain an untracked `HANDOFF.md` beside its checkouts. Its absence says nothing
-about liveness. If it exists, reclaim refuses until `wrkslots read-handoff SLOT --coordinator-pid
-PID` prints its exact UTF-8 contents and appends the contents and digest to the slot history. A
-changed handoff must be read again. The recorded bytes remain in the history after the slot is
-removed.
+Write a new handoff outside the checkout while its exact owner is still live:
+
+```sh
+wrkslots write-handoff SLOT --agent AGENT --owner-pid PID \
+  --expected-generation N --from-file /path/to/HANDOFF.md
+```
+
+The bounded UTF-8 contents go to a generation-bound control-plane sidecar, so writing the handoff
+does not make a clean checkout dirty. The sidecar is immutable after `finish`; `finish` still
+refuses every tracked, untracked, or ignored checkout change. In particular, it does not exempt a
+pre-sidecar `HANDOFF.md` inside a flat-layout checkout.
+
+`wrkslots read-handoff SLOT --coordinator-pid PID` prints the exact sidecar contents and durably
+enqueues that slot generation for later retirement. Reading never removes the sidecar, an existing
+checkout file, or the slot. If no sidecar exists, the command copies a direct-child `HANDOFF.md` into
+the sidecar without moving or unlinking the old file. If both exist, their bytes must agree.
+When the checkout file genuinely changed after an earlier read, ordinary read still refuses and keeps
+both copies. After inspecting both versions, a coordinator may use the explicit adoption option
+shown by `wrkslots read-handoff --help`, with coordinator authorization and the expected generation.
+The command records the newly displayed bytes before atomically updating the sidecar and still
+removes nothing.
+
+Inspect the queue with `wrkslots retirement-queue --format json`. A coordinator may attempt a
+bounded group with `wrkslots retire-pending --limit N --coordinator-pid PID --format json`. Each
+item runs the ordinary removal state machine independently; a live owner, fresh heartbeat, hold,
+process use, changed handoff, dirty or unpublished work that cannot be salvaged, remote mismatch,
+or path-fence race retains the slot in the queue. Successful archived removal clears its sidecar.
+The exact handoff bytes remain in append-only history.
 
 ## Git remotes and salvage
 
