@@ -14596,12 +14596,21 @@ def test_sidecar_cleanup_preserves_path_replacement_and_recovers_quarantine(
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
     config = wrkslots._load_config(str(project), "testhost")
     sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    retired_path: Path | None = None
+    preserved_original = config.control / "attacker-preserved-sidecar"
 
-    def replace_after_quarantine(point: str) -> None:
-        if point == "after-handoff-sidecar-quarantine":
-            sidecar.write_text("replacement must survive\n", encoding="utf-8")
+    def replace_retired_path_before_finalize(point: str) -> None:
+        nonlocal retired_path
+        if point == "before-handoff-retired-sidecar-finalize":
+            matches = list(config.control.glob("HANDOFF-RETIRED.*"))
+            assert len(matches) == 1
+            retired_path = matches[0]
+            os.replace(retired_path, preserved_original)
+            retired_path.write_text("replacement must survive\n", encoding="utf-8")
 
-    monkeypatch.setattr(wrkslots, "_interrupt_for_test", replace_after_quarantine)
+    monkeypatch.setattr(
+        wrkslots, "_interrupt_for_test", replace_retired_path_before_finalize
+    )
     code = wrkslots.main(
         [
             "--project-root",
@@ -14616,15 +14625,17 @@ def test_sidecar_cleanup_preserves_path_replacement_and_recovers_quarantine(
     )
 
     assert code == 3
-    assert "preserved both identities" in capsys.readouterr().err
-    assert sidecar.read_text(encoding="utf-8") == "replacement must survive\n"
-    quarantines = list(config.control.glob("HANDOFF-CLEANUP.*"))
-    assert len(quarantines) == 1
+    assert "retired handoff sidecar" in capsys.readouterr().err
+    assert retired_path is not None
+    assert retired_path.read_text(encoding="utf-8") == "replacement must survive\n"
+    assert preserved_original.is_file()
+    assert not sidecar.exists()
     assert not wrkslots._load_active(config).slots
     assert wrkslots._load_archive(config).records[-1]["slot"] == "slot01"
     assert (config.control / "ACTIVE.testhost.journal").is_file()
 
-    sidecar.unlink()
+    retired_path.unlink()
+    os.replace(preserved_original, retired_path)
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
     assert (
         wrkslots.main(
@@ -14639,7 +14650,7 @@ def test_sidecar_cleanup_preserves_path_replacement_and_recovers_quarantine(
         )
         == 0
     )
-    assert not quarantines[0].exists()
+    assert retired_path.is_file()
     assert not (config.control / "ACTIVE.testhost.journal").exists()
 
 
