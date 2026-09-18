@@ -18,6 +18,9 @@ from agentctl.errors import HerdrUnavailable
 from agentctl.jsonx import as_mapping
 
 
+_CLOSE_GRACE_SECONDS = 2.0
+
+
 class InputStreamError(HerdrUnavailable):
     """An explicit command or framing failure, distinct from an ordinary timeout."""
 
@@ -55,7 +58,8 @@ class EventCommandStream:
     block the event pipe or expose credentials through exception messages.
 
     One thread owns wait. Other threads may call wake or close.
-    Closing or a protocol failure kills and reaps the command's process group.
+    Closing or a protocol failure gives the command up to two seconds after
+    SIGTERM to unsubscribe, then kills and reaps its remaining process group.
     Partial frames survive ordinary timeouts; EOF is always an explicit error.
     """
 
@@ -297,8 +301,48 @@ class EventCommandStream:
         except (BlockingIOError, OSError):
             pass
 
+    def _terminate_leader(self, process: subprocess.Popen[bytes]) -> None:
+        # Popen.terminate/send_signal poll the child first, which can reap it
+        # and release its PID before we have killed the remaining group.
+        try:
+            os.kill(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + _CLOSE_GRACE_SECONDS
+        while not self._child_exited():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            readers = [pipe.fileno() for pipe in (self._stdout, self._stderr) if pipe is not None]
+            if self._pidfd is not None:
+                readers.append(self._pidfd)
+            try:
+                readable, _, _ = select.select(
+                    readers, [], [], remaining if self._pidfd is not None else min(remaining, 0.1),
+                )
+            except InterruptedError:
+                continue
+            # Cleanup may flush output before unsubscribing. Discard bounded
+            # chunks without decoding or buffering shutdown frames, so a full
+            # pipe cannot prevent the command from completing its cleanup.
+            for attribute in ("_stdout", "_stderr"):
+                pipe = self._stdout if attribute == "_stdout" else self._stderr
+                if pipe is not None and pipe.fileno() in readable:
+                    try:
+                        chunk = os.read(pipe.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        pipe.close()
+                        if attribute == "_stdout":
+                            self._stdout = None
+                        else:
+                            self._stderr = None
+            if self._pidfd is not None and self._pidfd in readable:
+                self._exited = True
+
     def close(self) -> None:
-        """Stop and reap the owned process group and release all pipes; idempotent."""
+        """Allow bounded command cleanup, then kill its remaining group and reap."""
         self._closed.set()
         self.wake()
         with self._io_lock:
@@ -311,13 +355,16 @@ class EventCommandStream:
                     # Keep the child unreaped until its entire group is killed:
                     # its PID cannot be reused for an unrelated process group.
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired as exc:
-                        raise InputStreamError("cleanup_timeout", "event command did not exit after termination") from exc
+                        self._terminate_leader(process)
+                    finally:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired as exc:
+                            raise InputStreamError("cleanup_timeout", "event command did not exit after termination") from exc
             finally:
                 for pipe in (self._stdin, self._stdout, self._stderr):
                     if pipe is not None:

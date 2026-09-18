@@ -323,7 +323,9 @@ scan. Preserve event order and emit preceding inputs before advancing a checkpoi
 Each line is limited to 1 MiB. Invalid UTF-8, duplicate JSON keys, nonfinite
 numbers, or incomplete frames are errors. Stdout must contain only protocol
 records; stderr is drained and discarded. The adapter must keep running until
-stopped. EOF or a framing failure closes its process group and triggers a new
+stopped. Handle SIGTERM to unsubscribe and stop owned children: the runner allows
+up to two seconds for cleanup before killing the remaining process group.
+EOF or a framing failure closes its process group and triggers a new
 subscription using the saved cursor, with retry delays increasing up to
 60 seconds. Ordinary idle waits do not reconnect. Provider retention and REST
 history availability still bound recovery; a durable cursor is not an unlimited

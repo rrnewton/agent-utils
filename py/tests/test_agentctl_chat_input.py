@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -262,6 +263,90 @@ def test_close_from_another_thread_interrupts_wait_and_is_idempotent() -> None:
     assert _gone(pid)
     stream.close()
     stream.wake()
+
+
+@pytest.mark.parametrize("without_pidfd", [False, True])
+def test_close_allows_durable_unsubscribe_and_drains_shutdown_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, without_pidfd: bool,
+) -> None:
+    if without_pidfd:
+        def unavailable(pid: int, flags: int = 0) -> int:
+            raise OSError("unsupported")
+
+        monkeypatch.setattr(os, "pidfd_open", unavailable)
+    marker = tmp_path / "unsubscribed"
+    program = (
+        "import signal\n"
+        "def unsubscribe(signum, frame):\n"
+        "    for descriptor in (1,2):\n"
+        "        for _ in range(8): os.write(descriptor,b'private shutdown output '*4096)\n"
+        f"    with open({str(marker)!r},'w') as target:\n"
+        "        target.write('unsubscribed')\n"
+        "        target.flush()\n"
+        "        os.fsync(target.fileno())\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM,unsubscribe)\n"
+        "print(json.dumps({'pid':os.getpid()}))\n"
+        "while True: time.sleep(60)\n"
+    )
+    stream = _stream(program, max_frame_bytes=128)
+    try:
+        pid = int(str(stream.wait(5)[0]["pid"]))
+        stream.close()
+        assert marker.read_text() == "unsubscribed"
+        assert stream._process is not None and stream._process.returncode == 0
+        assert _gone(pid)
+    finally:
+        stream.close()
+
+
+def test_close_bounds_uncooperative_group_without_reaping_owner_before_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    program = (
+        "import signal\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "child=os.fork()\n"
+        "if child: print(json.dumps({'parent':os.getpid(),'child':child}))\n"
+        "while True: time.sleep(60)\n"
+    )
+    stream = _stream(program)
+    try:
+        identifiers = stream.wait(5)[0]
+        parent, child = int(str(identifiers["parent"])), int(str(identifiers["child"]))
+        assert stream._process is not None
+        process = stream._process
+        group_signals: list[tuple[int, int]] = []
+        original_killpg, original_wait = os.killpg, process.wait
+
+        def killpg(pid: int, signum: int) -> None:
+            assert process.returncode is None
+            group_signals.append((pid, signum))
+            original_killpg(pid, signum)
+
+        def wait(timeout: float | None = None) -> int:
+            assert group_signals == [(parent, signal.SIGKILL)]
+            return original_wait(timeout)
+
+        def poll() -> int | None:
+            pytest.fail("cleanup must retain the owner's PID until group termination")
+
+        monkeypatch.setattr(os, "killpg", killpg)
+        monkeypatch.setattr(process, "wait", wait)
+        monkeypatch.setattr(process, "poll", poll)
+        started = time.monotonic()
+        stream.close()
+        assert time.monotonic() - started < 3
+        assert group_signals == [(parent, signal.SIGKILL)]
+        assert process.returncode == -signal.SIGKILL
+        deadline = time.monotonic() + 1
+        while not _gone(child) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert _gone(parent) and _gone(child)
+        stream.close()
+        assert len(group_signals) == 1
+    finally:
+        stream.close()
 
 
 @pytest.mark.parametrize("parent_exits", [False, True])
