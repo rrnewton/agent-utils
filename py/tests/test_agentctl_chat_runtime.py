@@ -14,12 +14,13 @@ import pytest
 
 import agentctl.chat as chat_module
 import agentctl.chat_runtime as runtime_module
-from agentctl.agent import Target
+from agentctl.agent import Target, enqueue
 from agentctl.chat import Bridge, Config, _read, _write, submit_reply
 from agentctl.chat_input import InputStreamError
 from agentctl.chat_output import PaneOutputSnapshot
 from agentctl.chat_runtime import _Notice, _Runtime
 from agentctl.client import AgentPaneInfo
+from agentctl.errors import AgentDeliveryError
 from agentctl.jsonx import as_mapping
 from tests.test_herdr_chat import Harness
 
@@ -251,6 +252,9 @@ def test_blocked_cursor_commit_does_not_delay_ack_or_native_delivery(
         assert len(rig.harness.prompts) == 1
         assert rig.transport.calls("poll") == []
         assert not (rig.state / "output.json").exists()
+        submit_reply(rig.state, _key(), "Finished before the cursor commit")
+        assert rig.record() == saved, "file replies must not advance the owner's request phase"
+        assert _read(rig.state / "replies" / f"{_key()}.json")["text"] == "Finished before the cursor commit"
     finally:
         checkpoint.release.set()
         owner.join(timeout=5)
@@ -260,7 +264,101 @@ def test_blocked_cursor_commit_does_not_delay_ack_or_native_delivery(
     assert failures == []
     assert _read(rig.state / "input.json")["cursor"] == "cursor-one"
     rig.runtime.reconcile_requested = False
-    rig.until(lambda: rig.phase() == "awaiting_reply" and rig.ack() == "acked")
+    rig.until(lambda: rig.phase() == "replied" and rig.ack() == "acked")
+    assert [call["text"] for call in rig.transport.calls("send")] == [
+        "[fixture-agent] Finished before the cursor commit",
+    ]
+
+
+def test_received_but_undispatched_request_cannot_accept_a_file_reply(rig: Rig) -> None:
+    rig.bridge._ingest_result({"messages": [_message()]})
+    assert rig.phase() == "received"
+    with pytest.raises(ValueError, match="not awaiting a reply"):
+        submit_reply(rig.state, _key(), "Too early")
+    assert list((rig.state / "replies").glob("*.json")) == []
+    assert rig.phase() == "received"
+
+
+@pytest.mark.parametrize("phase", ["inbox", "inflight", "processed", "failed"])
+def test_received_request_accepts_a_file_reply_from_its_matching_queue_artifact(
+    rig: Rig, phase: str,
+) -> None:
+    rig.bridge._ingest_result({"messages": [_message()]})
+    record = rig.record()
+    queue_id = str(record["queue_id"])
+    enqueue(str(rig.state / "queue"), rig.bridge._prompt(record), message_id=queue_id)
+    if phase != "inbox":
+        (rig.state / "queue" / "inbox" / f"{queue_id}.json").rename(
+            rig.state / "queue" / phase / f"{queue_id}.json")
+    submit_reply(rig.state, _key(), "Completed")
+    submit_reply(rig.state, _key(), "Completed")
+    assert rig.record() == record
+    assert _read(rig.state / "replies" / f"{_key()}.json")["text"] == "Completed"
+
+
+@pytest.mark.parametrize("queue_id", ["../escape", "/absolute", "0" * 20 + "-" + "f" * 64])
+def test_received_reply_rejects_unsafe_or_unrelated_queue_ids_before_path_use(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, queue_id: str,
+) -> None:
+    rig.bridge._ingest_result({"messages": [_message()]})
+    record = rig.record()
+    record["queue_id"] = queue_id
+    _write(rig.state / "requests" / f"{_key()}.json", record)
+
+    def forbidden_lookup(root: str) -> None:
+        raise AssertionError("invalid queue identity reached filesystem lookup")
+
+    monkeypatch.setattr(chat_module, "_validate_existing_queue", forbidden_lookup)
+    with pytest.raises(ValueError, match="queue identity"):
+        submit_reply(rig.state, _key(), "Must not be accepted")
+    assert list((rig.state / "replies").glob("*.json")) == []
+
+
+@pytest.mark.parametrize("tamper", ["wrong-id", "symlink", "directory-symlink"])
+def test_received_reply_requires_an_owned_matching_queue_artifact(rig: Rig, tamper: str) -> None:
+    rig.bridge._ingest_result({"messages": [_message()]})
+    record = rig.record()
+    queue_id = str(record["queue_id"])
+    enqueue(str(rig.state / "queue"), rig.bridge._prompt(record), message_id=queue_id)
+    inbox = rig.state / "queue" / "inbox"
+    artifact = inbox / f"{queue_id}.json"
+    if tamper == "wrong-id":
+        document = _read(artifact)
+        document["id"] = "different-request"
+        _write(artifact, document)
+    elif tamper == "symlink":
+        moved = artifact.with_suffix(".saved")
+        artifact.rename(moved)
+        artifact.symlink_to(moved)
+    else:
+        moved = inbox.with_name("saved-inbox")
+        inbox.rename(moved)
+        inbox.symlink_to(moved, target_is_directory=True)
+    with pytest.raises((ValueError, AgentDeliveryError)):
+        submit_reply(rig.state, _key(), "Must not be accepted")
+    assert list((rig.state / "replies").glob("*.json")) == []
+
+
+def test_received_reply_follows_an_artifact_that_moves_during_lookup(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig.bridge._ingest_result({"messages": [_message()]})
+    record = rig.record()
+    queue_id = str(record["queue_id"])
+    enqueue(str(rig.state / "queue"), rig.bridge._prompt(record), message_id=queue_id)
+    inbox = rig.state / "queue" / "inbox" / f"{queue_id}.json"
+    processed = rig.state / "queue" / "processed" / f"{queue_id}.json"
+
+    def moving_read(path: Path) -> dict[str, object]:
+        if path == inbox:
+            inbox.rename(processed)
+        return _read(path)
+
+    monkeypatch.setattr(chat_module, "_read", moving_read)
+    submit_reply(rig.state, _key(), "Completed")
+    assert rig.record() == record
+    assert processed.exists()
+    assert _read(rig.state / "replies" / f"{_key()}.json")["text"] == "Completed"
 
 
 @pytest.mark.parametrize("failed_commit", ["request", "ack-attempt"])

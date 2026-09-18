@@ -36,12 +36,12 @@ if _PKG_PARENT not in sys.path:
 from agentctl import __version__
 from agentctl.agent import (
     Target, _atomic_json, _open_private_lock, _read_queue_json,
-    _validate_private_directory, drain, enqueue, resolve_target,
+    _validate_existing_queue, _validate_private_directory, drain, enqueue, resolve_target,
 )
 from agentctl.client import AgentPaneInfo, HerdrClient, Pane
 from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutputStream
 from agentctl.chat_replies import extract_replies
-from agentctl.errors import HerdrRunError, HerdrUnavailable
+from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 from agentctl.jsonx import as_mapping, as_sequence, get_str
 
 
@@ -836,6 +836,28 @@ def _run_polling(bridge: Bridge, interval: float, prog: str) -> None:
             stream.close()
 
 
+def _request_is_enqueued(state: Path, key: str, record: dict[str, object]) -> bool:
+    """Recognize delivery while the owner's saved request phase lags behind it."""
+    queue_id = get_str(record, "queue_id", "request")
+    if record.get("key") != key or re.fullmatch(r"[0-9]{20}-" + key, queue_id) is None:
+        raise ValueError("invalid request queue identity")
+    root = state / "queue"
+    _validate_existing_queue(str(root))
+    # Delivery moves artifacts forward through these directories. A concurrent
+    # rename between lookup and open should continue at the later location.
+    for phase in ("inbox", "inflight", "processed", "failed"):
+        try:
+            queued = _read(root / phase / f"{queue_id}.json")
+        except AgentDeliveryError as exc:
+            if isinstance(exc.__cause__, FileNotFoundError):
+                continue
+            raise
+        if queued.get("id") != queue_id or not get_str(queued, "text", "queued request"):
+            raise ValueError("queue artifact does not match the request")
+        return True
+    return False
+
+
 def submit_reply(state: Path, key: str, text: str) -> None:
     """Commit one final answer locally; the bridge alone has transport credentials."""
     if re.fullmatch(r"[0-9a-f]{64}", key) is None:
@@ -849,7 +871,9 @@ def submit_reply(state: Path, key: str, text: str) -> None:
         if _read(path).get("text") == text:
             return
         raise ValueError("a different reply already exists for this request")
-    if record.get("phase") not in ("queued", "awaiting_reply", "reply_pending", "delivery_uncertain"):
+    phase = record.get("phase")
+    if (phase not in ("queued", "awaiting_reply", "reply_pending", "delivery_uncertain")
+            and not (phase == "received" and _request_is_enqueued(state, key, record))):
         raise ValueError("request is not awaiting a reply")
     from agentctl.agent import _atomic_json_create
     try:
