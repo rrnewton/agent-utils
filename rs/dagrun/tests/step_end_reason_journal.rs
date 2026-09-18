@@ -110,6 +110,12 @@ fn record_for<'a>(records: &'a [(String, String)], step: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no step_end for {step} in {records:?}"))
 }
 
+fn strict_ok(record: &str) -> Result<bool, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(record).map_err(|error| format!("invalid journal JSON: {error}"))?;
+    dagrun::require_step_end_ok(&value)
+}
+
 #[test]
 fn a_step_that_fails_on_its_own_records_its_own_cause() {
     let fx = Fixture::new("fail");
@@ -119,10 +125,7 @@ fn a_step_that_fails_on_its_own_records_its_own_cause() {
     );
     let records = step_end_records(&fx, &dag, "1", &[]);
     let record = record_for(&records, "a.boom");
-    assert!(
-        record.contains(r#""ok":"false""#),
-        "the fixture must really have failed: {record}"
-    );
+    assert_eq!(strict_ok(record), Ok(false), "{record}");
     assert!(
         record.contains(r#""reason":"exit 3""#),
         "a failed step must record the cause it already computed: {record}"
@@ -200,10 +203,7 @@ fn a_passing_step_carries_no_reason_key_at_all() {
     );
     let records = step_end_records(&fx, &dag, "1", &[]);
     let record = record_for(&records, "a.fine");
-    assert!(
-        record.contains(r#""ok":"true""#),
-        "the control must really have passed: {record}"
-    );
+    assert_eq!(strict_ok(record), Ok(true), "{record}");
     // Absent rather than empty, for the same reason an unset budget is absent: `"reason":""` in
     // the record would read as a cause that was looked for and not found.
     assert!(

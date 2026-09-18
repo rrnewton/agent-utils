@@ -13,6 +13,7 @@ import stat
 import sys
 import threading
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Literal
@@ -43,6 +44,16 @@ TRUNCATION_MARKER = (
     "(raise or lift it with DAGRUN_LOG_MAX_BYTES; 0 = unlimited). "
     "Test classification and attribution CONTINUE; only durable capture stopped.\n"
 )
+
+
+def require_step_end_ok(record: Mapping[str, object]) -> bool:
+    """Return a ``step_end`` verdict, refusing absent or non-boolean values."""
+    if record.get("event") != "step_end":
+        raise ValueError("journal record is not a step_end event")
+    value = record.get("ok")
+    if type(value) is not bool:
+        raise ValueError("journal step_end ok must be a boolean")
+    return value
 
 
 CAPTURE_MAX_BYTES_ENV = "DAGRUN_CAPTURE_MAX_BYTES"
@@ -231,10 +242,10 @@ class RunEvidence:
             return None
         return cls(directory, journal)
 
-    def record(self, event: str, fields: list[tuple[str, str]]) -> None:
+    def record(self, event: str, fields: Sequence[tuple[str, object]]) -> None:
         """Append and flush one structured journal record."""
         millis = time.time_ns() // 1_000_000
-        payload: dict[str, str] = {
+        payload: dict[str, object] = {
             "ts": f"{millis // 1000}.{millis % 1000:03}",
             "event": event,
         }
