@@ -3199,6 +3199,48 @@ def _remove_control_file(path: Path) -> None:
         raise Refusal(f"cannot remove control file {path}: {exc}") from exc
 
 
+def _rename_noreplace(source: Path, destination: Path, label: str) -> None:
+    """Atomically move one path without ever replacing the destination."""
+
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise Refusal(
+            f"cannot {label}: atomic no-replace rename is unavailable"
+        ) from exc
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        1,  # RENAME_NOREPLACE
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise Refusal(
+            f"cannot {label}: destination already exists; preserved both paths: "
+            f"{source} and {destination}"
+        )
+    if error in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+        raise Refusal(
+            f"cannot {label}: filesystem lacks atomic no-replace rename support"
+        )
+    raise Refusal(
+        f"cannot {label}: {os.strerror(error)}: {source} -> {destination}"
+    )
+
+
 def _identity_to_obj(owner: ProcessIdentity | None) -> object:
     if owner is None:
         return None
@@ -4962,6 +5004,19 @@ def _retirement_candidates(
     )
 
 
+def _retired_handoff_prefix(sidecar_path: Path) -> str:
+    name_digest = hashlib.sha256(sidecar_path.name.encode("utf-8")).hexdigest()[:16]
+    return f"HANDOFF-RETIRED.{name_digest}."
+
+
+def _retired_handoff_path(sidecar: _HandoffArtifact) -> Path:
+    identity = sidecar.storage_identity
+    return sidecar.path.parent / (
+        f"{_retired_handoff_prefix(sidecar.path)}{identity.device:x}.{identity.inode:x}."
+        f"{sidecar.sha256}.{identity.sha256}.json"
+    )
+
+
 def _remove_handoff_sidecar_after_archive(
     config: Config, record: ActiveRecord
 ) -> None:
@@ -4970,8 +5025,7 @@ def _remove_handoff_sidecar_after_archive(
     sidecar_path = _handoff_sidecar_path(
         config, record.slot, record.generation, record.machine
     )
-    name_digest = hashlib.sha256(sidecar_path.name.encode("utf-8")).hexdigest()[:16]
-    prefix = f"HANDOFF-RETIRED.{name_digest}."
+    prefix = _retired_handoff_prefix(sidecar_path)
     retired_paths = sorted(config.control.glob(f"{prefix}*"))
     if len(retired_paths) > 1:
         raise StateError(
@@ -5027,17 +5081,21 @@ def _remove_handoff_sidecar_after_archive(
             "preserve it and run 'wrkslots recover'"
         )
     identity = sidecar.storage_identity
-    retired = config.control / (
-        f"{prefix}{identity.device:x}.{identity.inode:x}.{sidecar.sha256}."
-        f"{identity.sha256}.json"
-    )
+    retired = _retired_handoff_path(sidecar)
     if retired.exists() or retired.is_symlink():
         raise StateError(
             f"retired handoff destination already exists for slot {record.slot}: {retired}"
         )
+    _interrupt_for_test("before-handoff-sidecar-retire")
     try:
-        os.rename(sidecar_path, retired)
+        _rename_noreplace(
+            sidecar_path,
+            retired,
+            f"retire handoff sidecar for slot {record.slot}",
+        )
         _fsync_directory(config.control)
+    except Refusal:
+        raise
     except OSError as exc:
         raise Refusal(
             f"cannot quarantine handoff sidecar {sidecar_path}: {exc}"
