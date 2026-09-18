@@ -26,7 +26,7 @@
 //!   without copying the content anywhere.
 
 use crate::auth::{self, Scope};
-use crate::config::AuthConfig;
+use crate::config::{AuthConfig, Secret};
 
 /// The tracing target every access line carries, so an operator can filter for exactly these:
 /// `RUST_LOG=vibe_talk::access=info`.
@@ -47,6 +47,8 @@ pub enum Credential {
     Read,
     /// The write-scope token.
     Write,
+    /// The adapter-only live-event ingestion token.
+    Ingest,
 }
 
 impl Credential {
@@ -64,6 +66,23 @@ impl Credential {
         }
     }
 
+    /// Classify an ordinary API token or the optional adapter-only credential.
+    #[must_use]
+    pub fn classify_request(
+        header: Option<&str>,
+        config: &AuthConfig,
+        ingest: Option<&Secret>,
+    ) -> Self {
+        let classified = Self::classify(header, config);
+        if classified != Self::Unrecognized {
+            return classified;
+        }
+        match (auth::bearer_token(header), ingest) {
+            (Some(presented), Some(expected)) if expected.matches(presented) => Self::Ingest,
+            _ => Self::Unrecognized,
+        }
+    }
+
     /// The word that appears in a log line.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -72,6 +91,7 @@ impl Credential {
             Self::Unrecognized => "unrecognized",
             Self::Read => "read",
             Self::Write => "write",
+            Self::Ingest => "ingest",
         }
     }
 }
@@ -233,11 +253,20 @@ mod tests {
             Credential::classify(Some("Bearer write-token-that-is-long-enough"), &config()),
             Credential::Write
         );
+        assert_eq!(
+            Credential::classify_request(
+                Some("Bearer ingest-token-that-is-long-enough"),
+                &config(),
+                Some(&Secret::new("ingest-token-that-is-long-enough")),
+            ),
+            Credential::Ingest
+        );
         for class in [
             Credential::Absent,
             Credential::Unrecognized,
             Credential::Read,
             Credential::Write,
+            Credential::Ingest,
         ] {
             let rendered = format!("{class}");
             assert!(

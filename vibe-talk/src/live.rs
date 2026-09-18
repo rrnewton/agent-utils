@@ -1,10 +1,15 @@
-//! Inbound Discord ingestion, and the fan-out that lets a page be TOLD rather than have to ask.
+//! Inbound chat ingestion, and the fan-out that lets a page be TOLD rather than have to ask.
 //!
 //! Everything else in this crate is pulled: a question arrives, a channel is read, an answer goes
 //! back. This module is the one place that runs without being asked, so the two decisions behind
 //! it are written down here rather than left to be inferred from the code.
 //!
-//! # Decision one: ingestion is bounded POLLING, not a Gateway connection
+//! There are two mutually exclusive producers. The built-in Discord path is bounded polling; an
+//! external provider adapter can instead push normalized create, update, and delete events through
+//! the authenticated `/api/v1/live/events` endpoint. Both publish into the same [`LiveHub`], and
+//! the browser always consumes the same SSE stream.
+//!
+//! # The built-in Discord source is bounded POLLING, not a Gateway connection
 //!
 //! Discord's real-time mechanism is the Gateway, and this server does not use it. It keeps a
 //! per-channel snowflake cursor, seeds it with
@@ -33,10 +38,9 @@
 //! introducing a stateful always-connected client in the same change is two untested things at
 //! once, and when it misbehaves there is no way to tell which one is wrong.
 //!
-//! **The Gateway is the upgrade path, behind this same seam.** Everything above this module sees
-//! [`LiveHub`]: a channel-keyed publish/subscribe with a replay tail. A Gateway implementation
-//! would publish into exactly that and delete [`poll_forever`]; no route, no page and no test
-//! above the hub would change.
+//! **A Gateway remains an upgrade path behind this same seam.** Everything above this module sees
+//! [`LiveHub`]: a channel-keyed publish/subscribe with a replay tail. The external adapter endpoint
+//! already publishes into it; a native Gateway implementation would do the same.
 //!
 //! ## What polling costs, stated plainly
 //!
@@ -44,9 +48,10 @@
 //! forever, whether or not anybody is listening. A 429 is no longer simply passed on: the client
 //! obeys Discord's `Retry-After` within a bounded budget, and only a limit it could not clear
 //! reaches this loop — see [`crate::discord::ratelimit`]. That makes a tick cheaper to get wrong,
-//! not free. So ingestion is still **off unless configured** (`discord.live_poll_seconds`, default
+//! not free. So polling is still **off unless configured** (`discord.live_poll_seconds`, default
 //! 0), the interval still has a floor the configuration refuses to go below, and a failing channel
-//! still backs off rather than hammering — see [`backoff`].
+//! still backs off rather than hammering — see [`backoff`]. Push ingestion is separately opt-in
+//! with `ingest.token`, and configuration refuses to enable both sources at once.
 //!
 //! The two waits nest rather than compete: the client's is the inner, precise one Discord asked
 //! for, and [`backoff`] is the outer one, which never waits LESS than Discord's outstanding
@@ -127,6 +132,20 @@ pub const BROADCAST_CAPACITY: usize = 64;
 /// it is a message arriving from a poll seconds after this server posted it.
 pub const SELF_POSTED_MEMORY: usize = 256;
 
+/// How many adapter event ids are remembered per channel for retry de-duplication.
+///
+/// This is deliberately larger than [`REPLAY_TAIL`]: an adapter may retry an acknowledged event
+/// after it has fallen out of a reconnecting browser's tail, and that retry must still be a no-op.
+/// It is nevertheless a bound rather than durable storage. Adapters must give every distinct
+/// create, update, and delete its own stable id and retry the same id only for the same event.
+pub const INGEST_DEDUPE_MEMORY: usize = 1_024;
+
+/// Largest accepted adapter event id, in bytes.
+pub const MAX_EVENT_ID_BYTES: usize = 256;
+
+/// Namespace that keeps an adapter's numeric event id from being mistaken for a message cursor.
+const INGEST_EVENT_PREFIX: &str = "push:";
+
 /// The smallest polling interval the configuration will accept, in seconds.
 ///
 /// Not a preference. One request per channel per interval goes against a rate limit this server
@@ -134,9 +153,30 @@ pub const SELF_POSTED_MEMORY: usize = 256;
 /// quietly given a request storm.
 pub const MIN_POLL_SECONDS: u64 = 5;
 
-/// One message, as it is published to live subscribers.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+/// What happened to the message carried by a live event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveKind {
+    /// A message appeared for the first time.
+    Create,
+    /// The provider changed an existing message.
+    Update,
+    /// The provider removed an existing message.
+    Delete,
+}
+
+/// One provider-neutral event, as it is published to live subscribers.
+///
+/// Deletes carry a private tombstone in `message`: only its channel and message ids are rendered
+/// on the wire. Keeping one envelope type lets polling retain its small `LiveMessage` interface
+/// while typed adapter events share the same ordered broadcast and replay tail.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveMessage {
+    /// Stable id of this provider event. Retries reuse it; distinct changes must not.
+    pub event_id: String,
+    /// Create, update, or delete.
+    pub kind: LiveKind,
+    /// Whether the adapter classified this as catch-up/history rather than a new live event.
+    pub historical: bool,
     /// The message itself. UNTRUSTED: written by whoever is in the channel.
     pub message: Message,
     /// Whether THIS SERVER posted it, through [`crate::ops::reply`].
@@ -151,11 +191,15 @@ pub struct Subscription {
     pub replay: Vec<LiveMessage>,
     /// Everything published from the instant of attachment onwards.
     pub receiver: broadcast::Receiver<LiveMessage>,
+    /// Whether the requested opaque cursor has fallen out of the bounded tail.
+    pub reset_on_attach: bool,
 }
 
 struct Feed {
     sender: broadcast::Sender<LiveMessage>,
     tail: VecDeque<LiveMessage>,
+    dedupe_order: VecDeque<String>,
+    dedupe: BTreeSet<String>,
 }
 
 /// The fan-out: one publisher per channel, each with a bounded replay tail.
@@ -209,16 +253,58 @@ impl LiveHub {
     pub fn publish(&self, channel: &ChannelId, message: Message) {
         let self_posted = self.is_self_posted(&message.id);
         let live = LiveMessage {
+            event_id: message.id.as_str().to_owned(),
+            kind: LiveKind::Create,
+            historical: false,
             message,
             self_posted,
         };
+        self.publish_inner(channel, live, false);
+    }
+
+    /// Publish one event delivered by an external adapter.
+    ///
+    /// Returns `false` when this channel has already accepted `event_id` inside the bounded
+    /// de-duplication window. The duplicate is not broadcast or added to the replay tail.
+    pub fn publish_ingested(
+        &self,
+        event_id: String,
+        kind: LiveKind,
+        historical: bool,
+        channel: &ChannelId,
+        message: Message,
+    ) -> bool {
+        let self_posted = kind != LiveKind::Delete && self.is_self_posted(&message.id);
+        let live = LiveMessage {
+            event_id: format!("{INGEST_EVENT_PREFIX}{event_id}"),
+            kind,
+            historical,
+            message,
+            self_posted,
+        };
+        self.publish_inner(channel, live, true)
+    }
+
+    fn publish_inner(&self, channel: &ChannelId, live: LiveMessage, deduplicate: bool) -> bool {
         let mut feeds = lock(&self.feeds);
         let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
+        if deduplicate {
+            if !feed.dedupe.insert(live.event_id.clone()) {
+                return false;
+            }
+            feed.dedupe_order.push_back(live.event_id.clone());
+            while feed.dedupe_order.len() > INGEST_DEDUPE_MEMORY {
+                if let Some(evicted) = feed.dedupe_order.pop_front() {
+                    feed.dedupe.remove(&evicted);
+                }
+            }
+        }
         feed.tail.push_back(live.clone());
         while feed.tail.len() > REPLAY_TAIL {
             feed.tail.pop_front();
         }
         let _ = feed.sender.send(live);
+        true
     }
 
     /// Attach to a channel, replaying what was published after `after`.
@@ -229,25 +315,39 @@ impl LiveHub {
     /// gone — the one outcome the recovery story is supposed to rule out. Holding the lock across
     /// both is what makes it atomic with respect to [`LiveHub::publish`].
     ///
-    /// `after` is a message id the caller has already seen. Only strictly-newer held messages come
-    /// back; an `after` that does not parse as a snowflake replays the whole tail, because the
-    /// alternative — silently replaying nothing — looks identical to "you are up to date".
+    /// `after` is an event id the caller has already seen. When it is still in the tail, exactly
+    /// what follows it is replayed. Every missing id forces a reset, including a numeric id from the
+    /// polling producer: once the bounded tail has evicted the cursor, numeric ordering can identify
+    /// newer retained creates but cannot prove that nothing was lost before them. It also cannot
+    /// place push updates and deletes. Replaying either a partial tail or nothing would therefore
+    /// hide a gap.
     #[must_use]
     pub fn subscribe(&self, channel: &ChannelId, after: Option<&MessageId>) -> Subscription {
         let mut feeds = lock(&self.feeds);
         let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
         let receiver = feed.sender.subscribe();
-        let cursor = after.and_then(MessageId::numeric);
-        let replay = feed
-            .tail
-            .iter()
-            .filter(|held| match (cursor, held.message.id.numeric()) {
-                (Some(seen), Some(id)) => id > seen,
-                _ => true,
-            })
-            .cloned()
-            .collect();
-        Subscription { replay, receiver }
+        let (replay, reset_on_attach) = match after {
+            None => (feed.tail.iter().cloned().collect(), false),
+            Some(after) => {
+                if let Some(position) = feed
+                    .tail
+                    .iter()
+                    .rposition(|held| held.event_id == after.as_str())
+                {
+                    (
+                        feed.tail.iter().skip(position + 1).cloned().collect(),
+                        false,
+                    )
+                } else {
+                    (Vec::new(), true)
+                }
+            }
+        };
+        Subscription {
+            replay,
+            receiver,
+            reset_on_attach,
+        }
     }
 }
 
@@ -256,11 +356,17 @@ fn new_feed() -> Feed {
     Feed {
         sender,
         tail: VecDeque::new(),
+        dedupe_order: VecDeque::new(),
+        dedupe: BTreeSet::new(),
     }
 }
 
 /// The SSE event name every arriving message carries.
 pub const EVENT_MESSAGE: &str = "message";
+/// The SSE event name for a changed message.
+pub const EVENT_MESSAGE_UPDATE: &str = "message_update";
+/// The SSE event name for a removed message.
+pub const EVENT_MESSAGE_DELETE: &str = "message_delete";
 
 /// The SSE event name that ends a stream a subscriber fell too far behind on.
 ///
@@ -271,9 +377,9 @@ pub const EVENT_RESET: &str = "reset";
 
 /// Turn one [`Subscription`] into the body of a Server-Sent Events response.
 ///
-/// The replay tail goes out first, oldest first, then everything live. Each event carries
-/// `id: <message id>` so a reconnecting browser's `Last-Event-ID` has something to send back, and
-/// `event: message` so the page branches on the type rather than on the payload's shape.
+/// The replay tail goes out first, oldest first, then everything live. Each event carries an
+/// `id:` cursor so a reconnecting browser's `Last-Event-ID` has something to send back, and a
+/// typed event name so the page does not have to guess create/update/delete from payload shape.
 ///
 /// **Every event says whether it came out of the tail (`replayed: true`) or arrived live
 /// (`replayed: false`).** Without that the two are indistinguishable on the wire, and a page that
@@ -293,14 +399,21 @@ pub fn events(
     struct State {
         replay: VecDeque<LiveMessage>,
         receiver: broadcast::Receiver<LiveMessage>,
+        reset_on_attach: bool,
         done: bool,
     }
     let start = State {
         replay: subscription.replay.into_iter().collect(),
         receiver: subscription.receiver,
+        reset_on_attach: subscription.reset_on_attach,
         done: false,
     };
     futures_util::stream::unfold(start, |mut state| async move {
+        if state.reset_on_attach {
+            state.reset_on_attach = false;
+            state.done = true;
+            return Some((Ok(reset_event(0)), state));
+        }
         if let Some(held) = state.replay.pop_front() {
             return Some((Ok(message_event(&held, true)), state));
         }
@@ -320,20 +433,32 @@ pub fn events(
 
 fn message_event(live: &LiveMessage, replayed: bool) -> axum::response::sse::Event {
     let event = axum::response::sse::Event::default()
-        .id(live.message.id.as_str())
-        .event(EVENT_MESSAGE);
-    event
-        .json_data(serde_json::json!({
+        .id(&live.event_id)
+        .event(match live.kind {
+            LiveKind::Create => EVENT_MESSAGE,
+            LiveKind::Update => EVENT_MESSAGE_UPDATE,
+            LiveKind::Delete => EVENT_MESSAGE_DELETE,
+        });
+    // A catch-up event is history even on its first trip through this process. Folding the
+    // adapter's classification into the wire's existing `replayed` flag ensures the browser may
+    // render it but never announce it to a live voice conversation as something that just
+    // happened.
+    let replayed = replayed || live.historical;
+    let payload = match live.kind {
+        LiveKind::Create | LiveKind::Update => serde_json::json!({
             "message": live.message,
             "self_posted": live.self_posted,
-            // Whether this came out of the replay tail rather than off the wire just now. See
-            // [`events`]: the page renders both and announces only the second.
             "replayed": replayed,
-            // The SAME standing reminder `MessagesResponse` carries. A pushed message is
-            // third-party text exactly as a fetched one is, and a stream is not a reason for the
-            // boundary to go quiet.
             "untrusted_content_notice": crate::untrusted::NOTICE,
-        }))
+        }),
+        LiveKind::Delete => serde_json::json!({
+            "channel_id": live.message.channel_id,
+            "message_id": live.message.id,
+            "replayed": replayed,
+        }),
+    };
+    event
+        .json_data(payload)
         // A `Message` is plain data and cannot fail to serialize. If that ever stops being true,
         // ending the stream with a reset is the honest answer: the page re-reads and sees the
         // message, rather than being handed a frame it cannot parse.
@@ -1153,6 +1278,41 @@ mod tests {
     }
 
     #[test]
+    fn adapter_retry_deduplication_is_bounded_and_evicts_oldest_first() {
+        let channel = ChannelId("1111".to_owned());
+        let hub = hub_for(&channel);
+        for n in 0..=INGEST_DEDUPE_MEMORY {
+            assert!(hub.publish_ingested(
+                format!("event-{n}"),
+                LiveKind::Create,
+                false,
+                &channel,
+                message(&channel, n as u64 + 1, "m"),
+            ));
+        }
+        assert!(
+            hub.publish_ingested(
+                "event-0".to_owned(),
+                LiveKind::Create,
+                false,
+                &channel,
+                message(&channel, 1, "retried after the window"),
+            ),
+            "the oldest id must eventually leave the bounded de-duplication window"
+        );
+        assert!(
+            !hub.publish_ingested(
+                format!("event-{INGEST_DEDUPE_MEMORY}"),
+                LiveKind::Create,
+                false,
+                &channel,
+                message(&channel, INGEST_DEDUPE_MEMORY as u64 + 1, "recent retry"),
+            ),
+            "a recent retry must still be suppressed"
+        );
+    }
+
+    #[test]
     fn subscribing_after_an_id_replays_only_what_is_strictly_newer() {
         let channel = ChannelId("1111".to_owned());
         let hub = hub_for(&channel);
@@ -1172,15 +1332,36 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_that_is_not_a_snowflake_replays_everything_rather_than_nothing() {
+    fn any_cursor_missing_from_the_tail_forces_a_reset_instead_of_resuming_over_a_gap() {
         let channel = ChannelId("1111".to_owned());
         let hub = hub_for(&channel);
         hub.publish(&channel, message(&channel, 10, "m"));
-        let subscription = hub.subscribe(&channel, Some(&MessageId("garbage".to_owned())));
-        assert_eq!(
-            subscription.replay.len(),
-            1,
-            "replaying nothing would be indistinguishable from being up to date"
+        for missing in ["garbage", "9", "11"] {
+            let subscription = hub.subscribe(&channel, Some(&MessageId(missing.to_owned())));
+            assert!(
+                subscription.replay.is_empty(),
+                "missing cursor {missing:?} cannot identify a safe replay boundary"
+            );
+            assert!(
+                subscription.reset_on_attach,
+                "missing cursor {missing:?} must force an authoritative re-read"
+            );
+        }
+    }
+
+    #[test]
+    fn an_evicted_numeric_cursor_resets_instead_of_replaying_a_partial_tail() {
+        let channel = ChannelId("1111".to_owned());
+        let hub = hub_for(&channel);
+        for id in 1..=(REPLAY_TAIL as u64 + 1) {
+            hub.publish(&channel, message(&channel, id, "m"));
+        }
+
+        let subscription = hub.subscribe(&channel, Some(&MessageId("1".to_owned())));
+        assert!(subscription.replay.is_empty());
+        assert!(
+            subscription.reset_on_attach,
+            "the numeric comparison cannot reveal the event evicted between the cursor and tail"
         );
     }
 

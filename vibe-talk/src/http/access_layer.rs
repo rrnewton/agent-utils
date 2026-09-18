@@ -21,12 +21,13 @@ pub async fn log_requests(State(state): State<AppState>, request: Request, next:
     let path = request.uri().path().to_owned();
     // Classified here and dropped immediately; the header value itself is never held, formatted,
     // or passed on.
-    let credential = Credential::classify(
+    let credential = Credential::classify_request(
         request
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok()),
         &state.config.auth,
+        state.config.ingest.token.as_ref(),
     );
     let started = Instant::now();
     let response = next.run(request).await;

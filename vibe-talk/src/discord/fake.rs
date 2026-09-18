@@ -70,6 +70,8 @@ struct State {
     fetches: usize,
     messages: Vec<Message>,
     posted: Vec<PostedMessage>,
+    upstream_read_marks_enabled: bool,
+    upstream_read_marks: Vec<(ChannelId, MessageId)>,
     next_id: u64,
     /// Author display name -> snowflake, so one author keeps one id and two authors never share
     /// one. A fake that handed every author the same id would let a test pass while the server
@@ -151,6 +153,17 @@ impl FakeDiscord {
     /// channel a bot cannot see.
     pub fn register_channel(&self, channel: &ChannelId) {
         self.lock().known.insert(channel.clone());
+    }
+
+    /// Enable the optional provider read cursor for a test that exercises that capability.
+    pub fn enable_upstream_read_marks(&self) {
+        self.lock().upstream_read_marks_enabled = true;
+    }
+
+    /// Provider read boundaries accepted by this fake, in call order.
+    #[must_use]
+    pub fn upstream_read_marks(&self) -> Vec<(ChannelId, MessageId)> {
+        self.lock().upstream_read_marks.clone()
     }
 
     /// Seed a message into a channel, registering the channel as a side effect. Returns its
@@ -356,6 +369,10 @@ impl FakeDiscord {
 
 #[async_trait]
 impl ChatClient for FakeDiscord {
+    fn supports_upstream_read_mark(&self) -> bool {
+        self.lock().upstream_read_marks_enabled
+    }
+
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
         // Through the real URL builder, so this fake cannot drift from the endpoint the live
         // client calls, and through the same limiter, so a queued 429 is spent here too.
@@ -498,6 +515,29 @@ impl ChatClient for FakeDiscord {
                 Ok(Attempt::Done(message, self.success_headers()))
             })
             .await
+    }
+
+    async fn mark_read_upstream(
+        &self,
+        channel: &ChannelId,
+        through: &MessageId,
+    ) -> Result<(), ChatError> {
+        let mut state = self.lock();
+        if !state.upstream_read_marks_enabled {
+            return Err(ChatError::Refused(
+                "the configured chat provider does not support upstream read marks".to_owned(),
+            ));
+        }
+        if !state.known.contains(channel) {
+            return Err(ChatError::Status {
+                status: 404,
+                body: "Unknown Channel".to_owned(),
+            });
+        }
+        state
+            .upstream_read_marks
+            .push((channel.clone(), through.clone()));
+        Ok(())
     }
 }
 

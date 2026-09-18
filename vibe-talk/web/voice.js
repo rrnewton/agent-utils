@@ -5005,6 +5005,25 @@ function discordNode(messages) {
   // hanging off it, and threading a reply under the tail would put the answer under a fragment.
   reply.addEventListener("click", () => openReply(messages));
   meta.append(reply);
+  // A provider write, distinct from the reversible local Done/archive below. Most providers do
+  // not expose this operation, so the server advertises it explicitly and the control stays out
+  // of the interface unless the selected provider supports it.
+  const upstreamRead = document.createElement("button");
+  upstreamRead.className = "upstream-read-button";
+  upstreamRead.setAttribute("type", "button");
+  upstreamRead.setAttribute(
+    "title",
+    "Move the source chat service's read cursor through this message. Thread behavior depends on the provider."
+  );
+  upstreamRead.textContent = "Mark read through here";
+  upstreamRead.hidden = !upstreamReadMarkSupported;
+  // A combined row stands for every constituent in order. Marking through the NEWEST one includes
+  // the complete row; using its first id would leave an invisible tail unread upstream.
+  const upstreamBoundary = messages[messages.length - 1];
+  upstreamRead.addEventListener("click", () =>
+    guardQuietly(() => markReadUpstream(String(upstreamBoundary.id)))()
+  );
+  meta.append(upstreamRead);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
   // On EVERY channel row rather than only on rows built while the mode is on: the mode is a
   // filter over the same list, and a control that exists in one rendering and not another is a
@@ -5520,7 +5539,7 @@ let discordNewestId = null;
  *
  * @param {Array<{id: string}>} messages the list as it was just read, oldest first
  * @param {{keepPosition: boolean, wasAtNewest: boolean, area: object, previousTop: number,
- *          ownAct?: boolean}} how
+ *          anchorId?: string|null, anchorTop?: number, ownAct?: boolean}} how
  */
 function settleAfterRead(messages, how) {
   const newest = messages.length ? String(messages[messages.length - 1].id) : null;
@@ -5528,7 +5547,18 @@ function settleAfterRead(messages, how) {
   const arrived = moved && how.ownAct !== true;
   discordNewestId = newest;
   if (how.keepPosition && !how.wasAtNewest) {
-    how.area.scrollTop = how.previousTop;
+    // A pixel offset is not a place in a conversation: an edit or deletion above it changes which
+    // message occupies that pixel. Prefer the same rendered message at the same viewport offset.
+    // A deleted anchor has no semantic destination, so only that case falls back to the old offset.
+    const anchor = how.anchorId
+      ? [...el("discord-log").children].find((row) => idsOf(row).includes(how.anchorId))
+      : null;
+    if (anchor && Number.isFinite(how.anchorTop)) {
+      how.area.scrollTop = how.previousTop;
+      how.area.scrollTop += anchor.getBoundingClientRect().top - how.anchorTop;
+    } else {
+      how.area.scrollTop = how.previousTop;
+    }
     if (arrived) {
       setJumpNewest(true, "discord");
     }
@@ -5536,6 +5566,18 @@ function settleAfterRead(messages, how) {
     scrollToNewest();
     setJumpNewest(false, "discord");
   }
+}
+
+/** Capture the channel row the reader is looking at before an authoritative replacement. */
+function channelReadPosition(area) {
+  const anchor = currentView === "discord" ? scrollAnchor(area) : null;
+  const anchorIds = anchor ? idsOf(anchor) : [];
+  return {
+    wasAtNewest: currentView === "discord" && atBottom(area),
+    previousTop: area.scrollTop,
+    anchorId: anchorIds.length > 0 ? anchorIds[0] : null,
+    anchorTop: anchor ? anchor.getBoundingClientRect().top : 0,
+  };
 }
 
 /**
@@ -5553,17 +5595,20 @@ async function loadDiscord(options) {
   if (todoMode) {
     return loadTodo(options);
   }
+  const generation = ++discordLoadGeneration;
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = el("discord-channel").value;
   if (!channel) {
     setStatus("no channel to read — this server has none configured.");
     return;
   }
-  if (discordFetchInFlight) return;
+  if (discordFetchInFlight) {
+    queueDiscordLoad(options);
+    return;
+  }
   discordFetchInFlight = true;
   const area = el("scroll-area");
-  const wasAtNewest = atBottom(area);
-  const previousTop = area.scrollTop;
+  const position = channelReadPosition(area);
   try {
     if (!keepPosition) {
       setStatus("fetching the channel…");
@@ -5571,20 +5616,23 @@ async function loadDiscord(options) {
     const payload = await api(
       `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}`
     );
+    if (!currentDiscordLoad(generation, channel, false)) {
+      return;
+    }
     const loaded = applyNewestPage(payload);
     // Inline, at the head of the list, rather than on the transient strip. `#63
     // status-line-placement`: this is a standing fact about what you are looking at, and the strip
     // takes itself away after a few seconds.
     renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
     const messages = payload.messages || [];
-    settleAfterRead(messages, { keepPosition, wasAtNewest, area, previousTop });
+    settleAfterRead(messages, { keepPosition, area, ...position });
     renderScrollTools();
     // Every row here is new — `applyNewestPage` replaced the list — so the ones on screen have to
     // be asked about again. `summariesAsked` is what stops that being a second request for a
     // message already answered, which matters most here: this runs every DISCORD_POLL_MS.
     requestVisibleSummaries();
   } finally {
-    discordFetchInFlight = false;
+    await finishDiscordLoad();
   }
 }
 
@@ -5703,17 +5751,20 @@ function armBacklog() {
  * a mixture of two answers.
  */
 async function loadTodo(options) {
+  const generation = ++discordLoadGeneration;
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = el("discord-channel").value;
   if (!channel) {
     setStatus("no channel to read — this server has none configured.");
     return;
   }
-  if (discordFetchInFlight) return;
+  if (discordFetchInFlight) {
+    queueDiscordLoad(options);
+    return;
+  }
   discordFetchInFlight = true;
   const area = el("scroll-area");
-  const wasAtNewest = atBottom(area);
-  const previousTop = area.scrollTop;
+  const position = channelReadPosition(area);
   try {
     // The SAME window the unfiltered read uses, and it is sent rather than left to the server's
     // default because the bulk clear has to send it back: `{through}` is resolved against a window
@@ -5722,6 +5773,9 @@ async function loadTodo(options) {
     const payload = await api(
       `/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`
     );
+    if (!currentDiscordLoad(generation, channel, true)) {
+      return;
+    }
     // THE QUEUE, minus the reader's own words when they have said those are already read.
     //
     // Filtered HERE rather than on the server: this is a preference held in one browser, and the
@@ -5747,15 +5801,14 @@ async function loadTodo(options) {
     renderTodoControls();
     settleAfterRead(messages, {
       keepPosition,
-      wasAtNewest,
       area,
-      previousTop,
+      ...position,
       ownAct: Boolean(options && options.ownAct),
     });
     renderScrollTools();
     requestVisibleSummaries();
   } finally {
-    discordFetchInFlight = false;
+    await finishDiscordLoad();
   }
 }
 
@@ -5902,6 +5955,22 @@ async function dismissMessages(body) {
     `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in the source chat service.`
   );
   renderTodoControls();
+}
+
+/** Move the source provider's monotone read cursor without changing local Done/archive state. */
+async function markReadUpstream(messageId) {
+  const channel = el("discord-channel").value;
+  const payload = await api(
+    `/api/v1/channels/${encodeURIComponent(channel)}/upstream-read`,
+    {
+      method: "POST",
+      body: { message_id: String(messageId) },
+    }
+  );
+  setStatus(
+    payload.upstream_read_notice ||
+      "The source chat service marked messages read through this one."
+  );
 }
 
 /**
@@ -6191,12 +6260,42 @@ async function sendReply() {
 // first time you looked. On the owner's phone that meant a view hours out of date, presented with
 // no hint that it was stale — which is worse than an empty view, because it reads as current.
 //
-// There is no webhook and no push path yet (#44 live-push), so until there is, the view PULLS:
-// once on every entry, and then on a timer for as long as it is the view being looked at.
+// The view still re-reads once on every entry and on a timer while it is visible. A configured
+// adapter may additionally PUSH changes into the server; the timer is the authoritative fallback
+// if that adapter or the browser's stream is interrupted.
 
 const DISCORD_POLL_MS = 45000;
 let discordPollTimer = null;
 let discordFetchInFlight = false;
+// Every requested replacement gets a generation, including one that arrives while another request
+// is in flight. Only the newest generation may draw. The newest blocked request is queued so a
+// channel switch cannot be swallowed by a refresh of the channel the reader just left.
+let discordLoadGeneration = 0;
+let discordQueuedLoad = null;
+
+/** Remember the newest read requested while another channel read is in flight. */
+function queueDiscordLoad(options) {
+  discordQueuedLoad = { options };
+}
+
+/** Release the fetch lock, then perform the newest read that was requested while it was held. */
+async function finishDiscordLoad() {
+  discordFetchInFlight = false;
+  const queued = discordQueuedLoad;
+  discordQueuedLoad = null;
+  if (queued) {
+    await loadDiscord(queued.options);
+  }
+}
+
+/** Whether a completed read still describes the channel and mode currently selected. */
+function currentDiscordLoad(generation, channel, readingTodo) {
+  return (
+    generation === discordLoadGeneration &&
+    String(channel) === String(el("discord-channel").value) &&
+    readingTodo === todoMode
+  );
+}
 
 function stopDiscordPolling() {
   if (discordPollTimer !== null) {
@@ -6409,9 +6508,9 @@ async function fetchResume() {
 // now TELL us, over `GET /api/v1/channels/{id}/stream`, and two decisions behind that are worth
 // restating where the code that depends on them lives (the full argument is in src/live.rs):
 //
-//   * INGESTION IS POLLING on the server, not a Discord Gateway connection. So "live" here means
-//     "within one server-side interval", never "the instant it was typed", and the Settings copy
-//     says so rather than showing a light that implies more.
+//   * INGESTION MAY BE POLLING OR ADAPTER PUSH. The server reports which transport is configured;
+//     an open browser stream proves only that this page can hear the server, not that an external
+//     adapter is healthy. Settings keeps that distinction visible.
 //   * THIS PAGE KEEPS THE CONVERSATION SOCKET. The server relays nothing to ElevenLabs, so an
 //     arriving message reaches the agent only while this tab is open. That is a real limitation
 //     and it is stated on the Settings screen instead of being discovered.
@@ -6447,6 +6546,11 @@ const RELAY_KEY = "vibe-talk.voice.relay";
 
 /** Seconds between the server's own reads of the channel; 0 means it is not watching at all. */
 let livePollSeconds = 0;
+/** `off`, `poll`, or `push`, as reported by the server. */
+let liveDelivery = "off";
+
+/** Whether the selected provider can move its own read cursor. Default-off for older servers. */
+let upstreamReadMarkSupported = false;
 /** The channel the stream is following, or null when nothing is attached. */
 let liveChannel = null;
 /**
@@ -6486,10 +6590,18 @@ function renderLiveState() {
   if (!state) {
     return;
   }
-  if (livePollSeconds <= 0) {
+  if (liveDelivery === "off") {
     state.textContent =
       "Live updates are OFF on this server. The channel view re-reads on its own timer while you " +
       "are looking at it, and nothing reaches the agent between your questions.";
+    return;
+  }
+  if (liveDelivery === "push") {
+    state.textContent = liveAttached
+      ? "Live updates are configured for adapter push, and this page is connected to the server " +
+        "stream. This does not verify that the external adapter is healthy."
+      : "Live updates are configured for adapter push, but this page is not connected to the " +
+        "server stream at the moment. It keeps trying; adapter health is not verified here.";
     return;
   }
   state.textContent = liveAttached
@@ -6514,7 +6626,7 @@ function startChannelStream(channelId) {
   if (!channelId || !token()) {
     return;
   }
-  if (livePollSeconds <= 0) {
+  if (liveDelivery === "off") {
     // Nothing publishes, so this would be a held-open connection that can never deliver anything.
     // Not attaching is also what makes the OFF state observable: the page says the server is not
     // watching AND is not pretending to listen. Turning ingestion on is a server restart, and the
@@ -6660,7 +6772,7 @@ function onStreamFrame(frame) {
     guardQuietly(() => loadDiscord({ keepPosition: true }))();
     return;
   }
-  if (frame.event !== "message" || !frame.data) {
+  if (!frame.data) {
     return;
   }
   let payload = null;
@@ -6669,11 +6781,49 @@ function onStreamFrame(frame) {
   } catch (_error) {
     return; // a frame this page cannot read is not a reason to tear the stream down.
   }
+  if (frame.event === "message_update" || frame.event === "message_delete") {
+    // A fetched row may combine several messages and the update may change whether they still
+    // combine. Re-reading the authoritative page is safer than trying to patch that derived DOM
+    // structure in place, and `keepPosition` preserves where the reader was.
+    refreshAfterLiveMutation();
+    return;
+  }
+  if (frame.event !== "message") {
+    return;
+  }
   const message = payload && payload.message;
   if (!message || message.id === undefined || message.id === null) {
     return;
   }
   receiveLiveMessage(message, payload.self_posted === true, payload.replayed === true);
+}
+
+let liveMutationRefreshRunning = false;
+let liveMutationRefreshNeeded = false;
+
+/** Coalesce a burst of edits/deletes into authoritative re-reads without leaving a stale tail. */
+function refreshAfterLiveMutation() {
+  liveMutationRefreshNeeded = true;
+  if (liveMutationRefreshRunning) {
+    return;
+  }
+  liveMutationRefreshRunning = true;
+  guardQuietly(async () => {
+    try {
+      while (liveMutationRefreshNeeded) {
+        liveMutationRefreshNeeded = false;
+        // If an ordinary page read is already in flight, wait for it. It may have started before
+        // the adapter applied this mutation, so treating it as the refresh could preserve a stale
+        // row forever.
+        while (discordFetchInFlight) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await loadDiscord({ keepPosition: true });
+      }
+    } finally {
+      liveMutationRefreshRunning = false;
+    }
+  })();
 }
 
 /**
@@ -7069,7 +7219,13 @@ function applyClientConfig(config) {
   // Without it the page would have to infer "live" from a stream that is attached and silent —
   // which is exactly what a quiet channel looks like, so the indicator would be a guess.
   livePollSeconds = Number(config.live_poll_seconds) || 0;
+  liveDelivery = ["off", "poll", "push"].includes(config.live_delivery)
+    ? config.live_delivery
+    : livePollSeconds > 0
+      ? "poll"
+      : "off";
   renderLiveState();
+  upstreamReadMarkSupported = config.upstream_read_mark_supported === true;
   // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
   // has asked for — and the screen has to be able to say which of the two is stopping it.
   resumeAllowed = config.replay_enabled === true;

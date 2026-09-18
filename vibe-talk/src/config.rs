@@ -27,6 +27,8 @@ pub const ENV_LIVE_POLL_SECONDS: &str = "VIBE_TALK_LIVE_POLL_SECONDS";
 pub const ENV_READ_TOKEN: &str = "VIBE_TALK_READ_TOKEN";
 /// Environment variable carrying the write-scope API token.
 pub const ENV_WRITE_TOKEN: &str = "VIBE_TALK_WRITE_TOKEN";
+/// Environment variable carrying the dedicated live-event ingestion token.
+pub const ENV_INGEST_TOKEN: &str = "VIBE_TALK_INGEST_TOKEN";
 /// Environment variable carrying the ElevenLabs API key.
 pub const ENV_ELEVENLABS_API_KEY: &str = "VIBE_TALK_ELEVENLABS_API_KEY";
 /// Environment variable carrying the ElevenLabs agent id.
@@ -135,6 +137,8 @@ pub struct Config {
     pub replay: ReplayConfig,
     /// API credentials for callers (the voice agent, and the web app).
     pub auth: AuthConfig,
+    /// Optional authenticated adapter-to-server live-event input.
+    pub ingest: IngestConfig,
     /// Channels this server will read.
     pub channels: Vec<ChannelInfo>,
     /// ElevenLabs wiring, when configured.
@@ -293,6 +297,11 @@ pub struct DiscordConfig {
     /// makes with that in front of them, not a thing that happens because they upgraded. Refused
     /// below [`crate::live::MIN_POLL_SECONDS`].
     pub live_poll_seconds: u64,
+    /// Whether the configured HTTP bridge implements the optional upstream read endpoint.
+    ///
+    /// Off by default because Discord itself does not provide this operation. An operator must
+    /// opt in only when `api_base` names a compatible bridge.
+    pub upstream_read_marks: bool,
 }
 
 /// API credentials this server requires of its callers.
@@ -302,6 +311,21 @@ pub struct AuthConfig {
     pub read_token: Secret,
     /// Token permitting reads AND posting.
     pub write_token: Secret,
+}
+
+/// Authentication for provider-neutral live-event ingestion.
+#[derive(Debug, Default)]
+pub struct IngestConfig {
+    /// Dedicated bearer token. `None` means the ingestion route is disabled.
+    pub token: Option<Secret>,
+}
+
+impl IngestConfig {
+    /// Whether an adapter may deliver events to this server.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.token.is_some()
+    }
 }
 
 /// ElevenLabs wiring.
@@ -380,6 +404,8 @@ struct FileConfig {
     #[serde(default)]
     auth: FileAuth,
     #[serde(default)]
+    ingest: FileIngest,
+    #[serde(default)]
     channels: Vec<FileChannel>,
     #[serde(default)]
     elevenlabs: FileElevenLabs,
@@ -418,6 +444,7 @@ struct FileDiscord {
     max_fetch_limit: Option<u16>,
     max_count_scan: Option<u32>,
     live_poll_seconds: Option<u64>,
+    upstream_read_marks: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -425,6 +452,12 @@ struct FileDiscord {
 struct FileAuth {
     read_token: Option<Secret>,
     write_token: Option<Secret>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileIngest {
+    token: Option<Secret>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -571,6 +604,18 @@ impl Config {
                     .to_owned(),
             });
         }
+        let ingest_token = get(ENV_INGEST_TOKEN).map(Secret::new).or(file.ingest.token);
+        if let Some(token) = ingest_token.as_ref() {
+            check_token_strength("ingest.token", token)?;
+            if token == &read_token || token == &write_token {
+                return Err(ConfigError::Invalid {
+                    field: "ingest.token".to_owned(),
+                    detail: "must differ from both API tokens, because an adapter credential has \
+                             no browser read or write scope"
+                        .to_owned(),
+                });
+            }
+        }
 
         let channels = match get(ENV_CHANNELS) {
             Some(spec) => parse_channel_spec(spec)?,
@@ -636,6 +681,14 @@ impl Config {
                 ),
             });
         }
+        if live_poll_seconds != 0 && ingest_token.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "discord.live_poll_seconds".to_owned(),
+                detail: "cannot be combined with ingest.token: choose one live source or every \
+                         provider event may be delivered twice"
+                    .to_owned(),
+            });
+        }
         if default_fetch_limit > max_fetch_limit {
             return Err(ConfigError::Invalid {
                 field: "discord.default_fetch_limit".to_owned(),
@@ -680,10 +733,14 @@ impl Config {
                 max_fetch_limit,
                 max_count_scan,
                 live_poll_seconds,
+                upstream_read_marks: file.discord.upstream_read_marks.unwrap_or(false),
             },
             auth: AuthConfig {
                 read_token,
                 write_token,
+            },
+            ingest: IngestConfig {
+                token: ingest_token,
             },
             channels,
             elevenlabs: ElevenLabsConfig {
@@ -1301,6 +1358,66 @@ writable = true
                 if field == "discord.live_poll_seconds"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn adapter_ingestion_is_opt_in_with_a_dedicated_strong_token() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(!cfg.ingest.enabled());
+
+        let text = format!("{FULL}\n[ingest]\ntoken = \"adapter-token-that-is-long-enough\"\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert!(cfg.ingest.enabled());
+        assert_eq!(
+            cfg.ingest.token.as_ref().map(Secret::expose),
+            Some("adapter-token-that-is-long-enough")
+        );
+
+        let cfg = Config::from_toml_and_env(
+            FULL,
+            &env(&[(ENV_INGEST_TOKEN, "environment-adapter-token-long-enough")]),
+        )
+        .expect("valid config");
+        assert_eq!(
+            cfg.ingest.token.as_ref().map(Secret::expose),
+            Some("environment-adapter-token-long-enough")
+        );
+    }
+
+    #[test]
+    fn adapter_token_cannot_reuse_a_browser_token_or_run_beside_polling() {
+        let weak = format!("{FULL}\n[ingest]\ntoken = \"too-short\"\n");
+        let err = Config::from_toml_and_env(&weak, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "ingest.token"),
+            "unexpected error: {err}"
+        );
+
+        let reused = format!("{FULL}\n[ingest]\ntoken = \"read-token-that-is-long-enough\"\n");
+        let err = Config::from_toml_and_env(&reused, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "ingest.token"),
+            "unexpected error: {err}"
+        );
+
+        let both = FULL.replace("[discord]", "[discord]\nlive_poll_seconds = 30")
+            + "\n[ingest]\ntoken = \"adapter-token-that-is-long-enough\"\n";
+        let err = Config::from_toml_and_env(&both, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. }
+                if field == "discord.live_poll_seconds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn upstream_read_marks_are_an_explicit_bridge_opt_in() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(!cfg.discord.upstream_read_marks);
+
+        let text = FULL.replace("[discord]", "[discord]\nupstream_read_marks = true");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert!(cfg.discord.upstream_read_marks);
     }
 
     #[test]

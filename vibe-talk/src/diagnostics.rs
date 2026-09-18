@@ -491,6 +491,9 @@ pub fn secrets_of(state: &AppState) -> Vec<Secret> {
         state.config.auth.read_token.clone(),
         state.config.auth.write_token.clone(),
     ];
+    if let Some(token) = &state.config.ingest.token {
+        secrets.push(token.clone());
+    }
     if let Some(key) = &state.config.elevenlabs.api_key {
         secrets.push(key.clone());
     }

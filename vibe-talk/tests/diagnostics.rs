@@ -28,6 +28,7 @@ use vibe_talk::store::StateStore as _;
 use vibe_talk::testing::{READ_TOKEN, WRITE_TOKEN};
 
 const PATH: &str = "/api/v1/diagnostics";
+const INGEST_TOKEN: &str = "diagnostics-ingest-token-that-must-stay-secret";
 
 /// Ask for the report, as a caller with the read token would.
 async fn report(state: AppState) -> Value {
@@ -105,6 +106,9 @@ bot_token = "{READ_TOKEN}-DISCORD-BOT-SECRET"
 [auth]
 read_token = "{READ_TOKEN}"
 write_token = "{WRITE_TOKEN}"
+
+[ingest]
+token = "{INGEST_TOKEN}"
 
 [[channels]]
 id = "{UNINVITED_READ_CHANNEL}"
@@ -226,6 +230,7 @@ async fn no_credential_reaches_the_report_even_when_the_vendor_quotes_one_back()
         &format!("{READ_TOKEN}-DISCORD-BOT-SECRET"),
         READ_TOKEN,
         WRITE_TOKEN,
+        INGEST_TOKEN,
     ] {
         assert!(
             !rendered.contains(secret),
@@ -253,7 +258,8 @@ async fn the_report_redacts_a_credential_the_vendor_error_types_never_saw() {
     let store = Arc::new(FakeStore::new());
     let bot_token = format!("{READ_TOKEN}-DISCORD-BOT-SECRET");
     store.fail_next(&format!(
-        "could not open the database: authentication failed for token {bot_token}"
+        "could not open the database: authentication failed for tokens {bot_token} and \
+         {INGEST_TOKEN}"
     ));
     let (state, _discord, _elevenlabs) =
         vibe_talk::testing::state_from_toml(&toml_with("[elevenlabs]"));
@@ -264,6 +270,11 @@ async fn the_report_redacts_a_credential_the_vendor_error_types_never_saw() {
     assert!(
         !body.to_string().contains(&bot_token),
         "a bot token reached the report through a store backend error, which nothing upstream \
+         of the report redacts: {body:#}"
+    );
+    assert!(
+        !body.to_string().contains(INGEST_TOKEN),
+        "an ingest token reached the report through a store backend error, which nothing upstream \
          of the report redacts: {body:#}"
     );
     // The rest of the backend's sentence must survive, or the operator has been handed a

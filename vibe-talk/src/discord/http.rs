@@ -139,6 +139,24 @@ pub fn identity_request(api_base: &str) -> PreparedRequest {
     }
 }
 
+/// Build the optional bridge request that moves its provider read cursor through one message.
+#[must_use]
+pub fn mark_read_request(
+    api_base: &str,
+    channel: &ChannelId,
+    through: &MessageId,
+) -> PreparedRequest {
+    PreparedRequest {
+        method: "POST",
+        url: format!(
+            "{}/channels/{}/read",
+            api_base.trim_end_matches('/'),
+            channel.as_str()
+        ),
+        body: Some(serde_json::json!({ "message_id": through.as_str() })),
+    }
+}
+
 /// Read a [`BotIdentity`] out of Discord's answer to [`identity_request`].
 ///
 /// # Errors
@@ -323,6 +341,7 @@ pub struct HttpDiscordClient {
     client: reqwest::Client,
     api_base: String,
     authorization: String,
+    upstream_read_marks: bool,
     /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
     /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
     /// global 429 stop all of them. See [`super::ratelimit`].
@@ -349,6 +368,7 @@ impl HttpDiscordClient {
             client,
             api_base: config.api_base.clone(),
             authorization: authorization_header(&config.bot_token),
+            upstream_read_marks: config.upstream_read_marks,
             limiter: RateLimiter::new(),
         })
     }
@@ -407,8 +427,15 @@ impl HttpDiscordClient {
                         body,
                     });
                 }
-                let value: serde_json::Value =
-                    serde_json::from_str(&text).map_err(|e| ChatError::Shape(e.to_string()))?;
+                // Write-only provider operations commonly answer with 204 No Content. Represent
+                // an empty successful body as JSON null: callers that need a payload will still
+                // reject it in their shape parser, while actions such as an upstream read mark can
+                // accept the success without inventing a response-body requirement.
+                let value = if text.trim().is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(&text).map_err(|e| ChatError::Shape(e.to_string()))?
+                };
                 Ok(Attempt::Done(value, headers))
             })
             .await
@@ -417,6 +444,10 @@ impl HttpDiscordClient {
 
 #[async_trait]
 impl ChatClient for HttpDiscordClient {
+    fn supports_upstream_read_mark(&self) -> bool {
+        self.upstream_read_marks
+    }
+
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
         let value = self.send(identity_request(&self.api_base)).await?;
         parse_identity(&value)
@@ -443,6 +474,23 @@ impl ChatClient for HttpDiscordClient {
         let request = post_request(&self.api_base, channel, content, reply_to)?;
         let value = self.send(request).await?;
         parse_message(&value)
+    }
+
+    async fn mark_read_upstream(
+        &self,
+        channel: &ChannelId,
+        through: &MessageId,
+    ) -> Result<(), ChatError> {
+        if !self.upstream_read_marks {
+            return Err(ChatError::Refused(
+                "upstream read marks are disabled; set discord.upstream_read_marks = true only for a compatible bridge"
+                    .to_owned(),
+            ));
+        }
+        let _ = self
+            .send(mark_read_request(&self.api_base, channel, through))
+            .await?;
+        Ok(())
     }
 }
 
@@ -562,6 +610,62 @@ mod tests {
             request.url,
             "https://example.test/api/v10/channels/123/messages?limit=5"
         );
+    }
+
+    #[test]
+    fn upstream_read_request_names_an_inclusive_message_boundary() {
+        let request = mark_read_request(
+            "https://bridge.example/api/v10/",
+            &channel(),
+            &MessageId("999".to_owned()),
+        );
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.url,
+            "https://bridge.example/api/v10/channels/123/read"
+        );
+        assert_eq!(
+            request.body,
+            Some(serde_json::json!({ "message_id": "999" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_read_accepts_an_empty_success_response() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await.expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /channels/123/read HTTP/1.1"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("\r\nauthorization: bot abc\r\n"));
+            assert!(request.contains(r#"{"message_id":"999"}"#));
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write response");
+        });
+
+        let client = HttpDiscordClient {
+            client: reqwest::Client::new(),
+            api_base: format!("http://{address}"),
+            authorization: authorization_header(&Secret::new("abc")),
+            upstream_read_marks: true,
+            limiter: RateLimiter::new(),
+        };
+        client
+            .mark_read_upstream(&channel(), &MessageId("999".to_owned()))
+            .await
+            .expect("an empty 204 is a successful write");
+        server.await.expect("mock server");
     }
 
     #[test]

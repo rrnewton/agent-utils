@@ -16,9 +16,11 @@ door than hand it to a vendor.
 
 ## What it does in v0
 
-**Pull, not push.** There is no webhook receiver, no public ingress requirement, no signature
-verification, and no "what if we weren't running" problem. When you ask, it fetches; between
-questions it does nothing.
+**Pull by default, with optional adapter push.** Reads and replies use the configured chat HTTP
+API. A deployment may separately give an external provider adapter a dedicated ingestion token;
+that adapter pushes normalized events into vibe-talk so an open page can update immediately. The
+adapter endpoint is authenticated but does not itself make the deployment public or verify a
+provider signature, so any external subscription receiver remains the adapter's responsibility.
 
 **Both summary and full text.** Speech cannot be skimmed, so a digest exists — one short line per
 message. But the capability that actually matters is **semantic random access**: describe a message
@@ -566,6 +568,8 @@ code path the startup probe uses, which is itself in the same position — see *
 | Time zone | `server.timezone` | `VIBE_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
 | Count ceiling | `discord.max_count_scan` | — | how many messages a count may walk, default `500` |
 | Live poll interval | `discord.live_poll_seconds` | `VIBE_TALK_LIVE_POLL_SECONDS` | seconds between inbound reads per channel; **`0` (default) is OFF**, and under `5` is refused |
+| Live push token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; enables adapter push and cannot be combined with live polling |
+| Upstream read marks | `discord.upstream_read_marks` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels/{id}/read` |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -627,7 +631,7 @@ passed — a lie you cannot diagnose, since nothing on the row would say why it 
 an expired summary is merely regenerated. The count bound is enough on its own here for a reason
 it is not enough for a summary: this is the one table that holds nobody's words.
 
-### Read state is ours, and is never synchronised with Discord
+### Local read state is ours; upstream read state is an optional provider capability
 
 Discord does not share read state with bots. There is no ack route a bot may call, no read-state
 field on the channel object a bot can see, and no `read_state` in the gateway `READY` payload for
@@ -640,6 +644,13 @@ vibe-talk's own record, and the rule is stated once rather than left to be infer
 
 Anything that shows a read mark to a person has to say that, because "read" already means
 something else to a Discord user.
+
+A compatible provider bridge may separately implement `POST /channels/{id}/read` and opt in with
+`discord.upstream_read_marks = true`. The web app then offers **Mark read through here** on each
+message. That action advances the provider's monotone cursor through the selected message; it does
+not write vibe-talk's local read mark and does not archive the message. Thread-level behavior is
+defined by the provider. The bridge may return JSON or an empty successful response such as `204
+No Content`. Direct Discord deployments must leave the setting off.
 
 ### Where it lives
 
@@ -873,14 +884,16 @@ not exist — a client pointed at the wrong URL is exactly the case this log exi
 
 ## The API
 
-All `/api/` routes require `Authorization: Bearer <token>`. `/healthz` and the static web app do
-not, and neither reveals anything about the configuration.
+All `/api/` routes require `Authorization: Bearer <token>`. The live-event ingestion route uses
+its own adapter-only token; every other route uses the read/write tokens described above.
+`/healthz` and the static web app require neither, and neither reveals configuration.
 
 | Method | Path | Scope | Purpose |
 |---|---|---|---|
 | GET | `/healthz` | none | liveness |
 | GET | `/api/v1/channels` | read | configured channels |
 | GET | `/api/v1/client-config` | read | what the web app needs at startup |
+| POST | `/api/v1/live/events` | ingest | accept one normalized create/update/delete event from an external provider adapter |
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |
 | GET | `/api/v1/signed-url` | **write** | mint a short-lived signed conversation URL — see below |
@@ -906,6 +919,7 @@ not, and neither reveals anything about the configuration.
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` — the undo, restoring exactly that set |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
+| POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…"}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined |
 | PUT | `/api/v1/channels/{id}/alias` | **write** | `{alias:"…"}` — what THIS app calls the channel; see "What to call a channel" |
 | DELETE | `/api/v1/channels/{id}/alias` | **write** | drop it, putting the configured label back |
 | DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries, channel aliases |
@@ -926,9 +940,10 @@ file: a read token is served from the cache when there is a hit and its answer i
 back. `/inbox` is the single durable READ a read token may make, because how far you have
 read is the thing the voice agent has to be able to say out loud.
 
-**`/api/v1/inbox` carries `read_state_notice` on every answer**, including the mutating ones,
+**`/api/v1/inbox` carries `read_state_notice` on every answer**, including the local mutating ones,
 saying that this read state is vibe-talk's own and is synchronised with Discord in neither
-direction. See **Durable state** above.
+direction. `/upstream-read` is a separate provider write, advertised to the web app through
+`upstream_read_mark_supported` in `/client-config`. See **Durable state** above.
 
 **Every message this API renders carries `author_id` next to `author`** — in the scrollback, in
 one-message reads, in `resolve` results, in the posted message echoed back by `reply`, and as a
@@ -1073,10 +1088,59 @@ is the exception, and it exists for two things — the channel view on `/voice` 
 messages arrive rather than when something happens to poll, and a reply that lands mid-conversation
 should be able to reach the voice agent on its own instead of waiting to be asked about.
 
-Two design decisions sit under it. Both were made before any of it was built, and both are written
-here and in the module documentation of `src/live.rs` rather than left to be inferred from a diff.
+There are two mutually exclusive ways to feed the same channel-keyed `LiveHub`:
 
-### Decision one: ingestion is bounded POLLING, not a Discord Gateway connection
+* `discord.live_poll_seconds` keeps the built-in Discord polling source.
+* `ingest.token` enables an external provider adapter to push normalized events to
+  `POST /api/v1/live/events`.
+
+The browser learns `live_delivery: "off" | "poll" | "push"` from `/api/v1/client-config`, so a
+push-only deployment with a zero poll interval still attaches its SSE stream. In push mode the
+screen distinguishes "configured and connected to this server" from adapter health, which the
+server cannot observe. Configuration refuses to enable both producers at once: duplicate delivery
+must not depend on two unrelated cursors happening to agree.
+
+### Provider-adapter push
+
+The adapter route has its own bearer token, distinct from both browser tokens. It accepts only
+allowlisted channel ids, limits each JSON body to 64 KiB, and remembers the newest 1,024 event ids
+per channel in memory. A retry is idempotent only while its id remains in that window in the same
+server process: a restart or 1,024 later events permits it again, so consumers must still tolerate
+an occasional duplicate. An accepted event answers `202`; a known retry answers `200` with
+`{"accepted":false,"duplicate":true}`. A producer retries only a transport failure, `429`, or `5xx`,
+never a permanent `4xx` refusal.
+
+Delivery order is request-acceptance order. The adapter must keep at most one request per channel in
+flight, wait for its response, and settle an uncertain result before sending the next event for that
+channel. Event ids are opaque de-duplication keys, not sequence numbers, so concurrent requests
+cannot be put back into provider order by the server.
+
+Every event carries an opaque, stable `event_id` and a mandatory `historical` boolean. The latter
+is a safety boundary: subscription catch-up is rendered but leaves the SSE payload's `replayed`
+flag true, so old channel text is never announced to a live voice conversation as news. A producer
+must say `historical: false` only when it knows the event arrived after its live subscription was
+established.
+
+```json
+{"event_id":"provider-event-42","historical":false,"kind":"create","message":{"id":"9001","channel_id":"123","author":"Ada","author_id":"7","author_is_bot":false,"timestamp":"2026-09-18T12:00:00Z","spoken_time":"","reply_to":null,"content":"done"}}
+```
+
+Updates use `kind: "update"` with the complete current message. Deletes use
+`{"event_id":"…","historical":false,"kind":"delete","channel_id":"123","message_id":"9001"}`.
+They become `event: message_update` and `event: message_delete`; the page re-reads the authoritative
+window while preserving its scroll position, rather than leaving a stale row or trying to patch a
+derived combined row in place. Creates remain `event: message`, so existing polling producers and
+older clients keep their wire contract.
+
+SSE resume ids are event ids, not message-order cursors. Adapter ids are namespaced with `push:` on
+that internal wire so even a numeric provider event id cannot be mistaken for a numeric message
+cursor. If `Last-Event-ID` is still in the bounded tail, the hub replays exactly what followed it,
+including edits and deletes. If an opaque id has fallen out, the server emits `event: reset` and
+ends the stream; guessing a partial replay would hide a gap. The same rule applies to polling's
+numeric ids: numeric comparison cannot prove that the bounded tail did not evict an intervening
+message.
+
+### Built-in Discord ingestion is bounded polling, not a Gateway connection
 
 Discord's real-time mechanism is the Gateway. **This server does not use it.** With
 `discord.live_poll_seconds` set, a background task reads each allowlisted channel on that interval
@@ -1100,10 +1164,9 @@ never run against live Discord.** Making first contact and introducing a statefu
 client in the same change is two untested things at once, and when it misbehaves there is no way
 to tell which one is wrong.
 
-**The Gateway is the upgrade path, behind this same seam.** Everything above `src/live.rs` sees a
-`LiveHub` — a channel-keyed publish/subscribe with a bounded replay tail. A Gateway implementation
-would publish into exactly that and delete the poll loop; no route, no page and no test above the
-hub would change.
+**A Gateway remains an upgrade path behind this same seam.** Everything above `src/live.rs` sees a
+`LiveHub` — a channel-keyed publish/subscribe with a bounded replay tail. External adapters already
+publish into it; a native Gateway implementation would do the same.
 
 Three rules in the loop are correctness, not tuning:
 
@@ -1138,7 +1201,7 @@ scales rather than two rival opinions about when to come back. That is measured 
 single failure the doubling alone says twenty seconds, which is not long enough for a limit that
 asked for forty-five.
 
-### Decision two: the PAGE keeps the ElevenLabs conversation socket
+### The page keeps the ElevenLabs conversation socket
 
 The server relays nothing to the vendor. It mints a signed URL and that is the end of its
 involvement; the browser holds the conversation. Moving that socket server-side would turn
@@ -1309,12 +1372,11 @@ sub-toggle of the channel view — the same list filtered, not a third tab — a
 different route rather than filtering the rows already on screen, so there is one definition of
 "dealt with" and it lives on the server.
 
-**Read/unread is OURS, and this is the screen that has to say so.** `#61 unread-status` settled it:
-Discord shares no read state with a bot, so there is no ack to send and no field to read. Marking
-something dealt with here does **not** mark it read in Discord, and reading it in the Discord app
-does **not** clear it here. The page says that on screen — quoting `store::INBOX_NOTICE` from the
-server's own answer rather than restating it, so the two cannot drift — because the alternative is
-that you meet the divergence first and have to guess which of the two is broken.
+**Done/archive is OURS, and this is the screen that has to say so.** `#61 unread-status` settled the
+direct Discord case: a bot has no ack to send and no read-state field to read. Marking something
+dealt with here does **not** mark it read in the source service, and reading it there does **not**
+clear it here. A deployment whose provider bridge explicitly supports upstream read marks gets a
+separate **Mark read through here** action; it never changes Done/archive state.
 
 **The store is single-tenant.** Every mark is yours, with no column saying whose. Sharing
 one deployment between two people would silently merge their inboxes; that is not a
@@ -2561,7 +2623,7 @@ src/summary.rs        the extractive digest/preview helper (NOT a summariser: it
 src/retrieval.rs      semantic random access, behind the Ranker trait
 src/untrusted.rs      the data-not-instructions boundary
 src/ops.rs            the operations both front doors share: allowlist, fetch, transform
-src/live.rs           inbound ingestion (bounded polling), the per-channel fan-out, and the SSE body
+src/live.rs           bounded polling and adapter push, per-channel fan-out, replay, and SSE bodies
 src/replay.rs         rebuilding continuity across a hang-up: the preamble, the budget, the fence
 src/probe.rs          the startup channel reachability probe and its failure taxonomy
 src/diagnostics.rs    those same checks on demand, structured, redacted, and time-bounded
@@ -2710,14 +2772,12 @@ Beyond the security list above:
   A configuration change is picked up by restarting, and the client re-lists on its next connect.
 * This crate is intentionally outside the repository's Rust workspace and is not part of
   `make check` / `make test`; it has its own CI workflow.
-* **Discord's read state is still unreachable, and always will be.** Discord shares it with
+* **A direct Discord bot still cannot reach Discord's read state.** Discord shares it with
   clients, not with bots — no ack route, no read-state field on the channel object, no
-  `read_state` in the gateway READY payload. The evidence and the code anchors are in
-  `ai_docs/UNREAD_STATUS_20260819.md`. What `#48 transcript-storage` added is a *different*
-  record: vibe-talk's own read marks, set through `/api/v1/channels/{id}/read` and never
-  synchronised with Discord in either direction. Nothing yet **uses** them — no digest is
-  scoped by one, and the `/voice` page does not set one — so "since I last read" is still not
-  a question this server answers. The entity exists; the feature built on it does not.
+  `read_state` in the gateway READY payload. The evidence and code anchors are in
+  `ai_docs/UNREAD_STATUS_20260819.md`. A compatible provider bridge may expose the separately
+  configured `/upstream-read` capability, but that does not turn vibe-talk's own `/read` record or
+  its Done/archive state into provider state.
 
 ## License
 

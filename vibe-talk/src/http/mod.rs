@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/channels", get(api::list_channels))
         .route("/api/v1/agent-tools", get(api::agent_tools))
         .route("/api/v1/client-config", get(api::client_config))
+        .route("/api/v1/live/events", post(api::ingest_event))
         // READ scope. It reports configuration health and never a credential, it writes nothing
         // durable, and it always answers 200 — the report is the answer, so a failing check is
         // not an HTTP failure. See `api::diagnostics`.
@@ -129,6 +130,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/channels/{channel_id}/read",
             post(api::mark_read).delete(api::forget_read_mark),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/upstream-read",
+            post(api::mark_read_upstream),
         )
         // `#39 channel-alias`. The operator's own local name for a channel. WRITE scope both
         // ways, because it outlives the process — and NO MCP TOOL at all, which is the part that

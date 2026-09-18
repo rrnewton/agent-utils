@@ -422,7 +422,13 @@ async fn main() -> anyhow::Result<()> {
     // one line in a file the operator is not looking at.
     let live = Arc::new(vibe_talk::live::LiveHub::new());
     let poll_seconds = config.discord.live_poll_seconds;
-    if poll_seconds == 0 {
+    if config.ingest.enabled() {
+        tracing::info!(
+            route = "/api/v1/live/events",
+            "live ingestion is ON in PUSH mode: an authenticated provider adapter publishes \
+             normalized events, which are fanned out to channel streams"
+        );
+    } else if poll_seconds == 0 {
         tracing::info!(
             setting = "discord.live_poll_seconds",
             "live ingestion is OFF. GET /api/v1/channels/{{id}}/stream accepts subscribers and \

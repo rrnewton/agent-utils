@@ -209,6 +209,11 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
             format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
             None,
         ),
+        (
+            "POST",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/upstream-read"),
+            Some(serde_json::json!({"message_id": "1000000000000000200"})),
+        ),
         // `#50 todo-view`. The to-do list is the owner's own inbox state, and the two acts that
         // change it are durable writes. All three belong in this table for the same reason
         // everything above does.
@@ -267,6 +272,87 @@ async fn a_bad_token_is_refused() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn upstream_read_is_a_separate_default_off_provider_capability() {
+    let harness = harness();
+    let (status, config) = call(
+        &harness,
+        "GET",
+        "/api/v1/client-config",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["upstream_read_mark_supported"], false);
+
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/upstream-read"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"message_id": "1000000000000000200"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(payload["error"], "refused");
+    assert!(payload["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("does not support upstream read marks")));
+}
+
+#[tokio::test]
+async fn upstream_read_moves_only_the_provider_cursor_and_reports_its_contract() {
+    let harness = harness();
+    seed_lead_channel(&harness);
+    harness.discord.enable_upstream_read_marks();
+    let boundary = "1000000000000000002";
+
+    let (status, config) = call(
+        &harness,
+        "GET",
+        "/api/v1/client-config",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["upstream_read_mark_supported"], true);
+
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/upstream-read"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"message_id": boundary})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["through"], boundary);
+    assert!(payload["upstream_read_notice"]
+        .as_str()
+        .is_some_and(|notice| notice.contains("only move forward") && notice.contains("provider")));
+    assert_eq!(
+        harness.discord.upstream_read_marks(),
+        vec![(
+            ChannelId(WRITE_CHANNEL.to_owned()),
+            vibe_talk::model::MessageId(boundary.to_owned()),
+        )]
+    );
+
+    // The provider action does not smuggle in a local archive operation.
+    let (_, messages) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(messages["dismissed"], serde_json::json!([]));
 }
 
 #[tokio::test]

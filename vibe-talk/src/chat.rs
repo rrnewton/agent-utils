@@ -109,6 +109,14 @@ pub struct ChatIdentity {
 /// Read and post access to configured chat channels.
 #[async_trait]
 pub trait ChatClient: Send + Sync {
+    /// Whether this provider can move its own read cursor forward.
+    ///
+    /// False by default so existing providers and test doubles do not acquire a write capability
+    /// merely by upgrading vibe-talk.
+    fn supports_upstream_read_mark(&self) -> bool {
+        false
+    }
+
     /// Ask the provider which account the configured credential belongs to.
     ///
     /// # Errors
@@ -157,4 +165,18 @@ pub trait ChatClient: Send + Sync {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError>;
+
+    /// Move the provider's read cursor through one message.
+    ///
+    /// Providers define how threads participate in that cursor. This is deliberately separate
+    /// from vibe-talk's local read mark and its reversible Done/archive state.
+    async fn mark_read_upstream(
+        &self,
+        _channel: &ChannelId,
+        _through: &MessageId,
+    ) -> Result<(), ChatError> {
+        Err(ChatError::Refused(
+            "the configured chat provider does not support upstream read marks".to_owned(),
+        ))
+    }
 }

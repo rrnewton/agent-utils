@@ -857,6 +857,13 @@
                 have dealt with and change your mind. <strong>Hide archived</strong> takes them out
                 of the list entirely, which is what turns the channel from a log into a queue.
               </p>
+              <p class="hint">
+                When the configured chat provider supports it, a separate
+                <strong>Mark read through here</strong> button advances that provider's read
+                cursor. Read cursors only move forward, and thread behavior depends on the
+                provider. This does not archive anything here; <strong>Done</strong> remains local
+                and undoable.
+              </p>
             </article>
 
             <article id="help-mark-own" class="help-entry">
@@ -978,8 +985,8 @@
               <h2>Live messages</h2>
               <p class="hint">
                 When this server is set to watch the channel, new messages appear on their own
-                rather than at the next refresh. It is a poll, not a push from Discord: the newest
-                message can be up to one interval old, and the interval is set on the server.
+                rather than at the next refresh. A deployment can use bounded polling or push
+                delivery from a provider adapter; Settings says which mode this server is using.
               </p>
               <p class="hint">
                 <strong>Telling the agent</strong> about arriving messages sends each one into a

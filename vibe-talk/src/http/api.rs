@@ -5,7 +5,7 @@
 //! them in that order means an unauthenticated caller cannot use error messages to discover which
 //! channel snowflakes are configured.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{self, AuthError, Scope};
 use crate::chat::ChatError;
 use crate::elevenlabs::{SignedUrl, SignedUrlError, SpeechError};
-use crate::model::{ChannelInfo, Message, MessageId};
+use crate::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
 use crate::ops::{self, OpError};
 use crate::retrieval::Resolution;
 use crate::state::AppState;
@@ -187,6 +187,200 @@ fn require(headers: &HeaderMap, state: &AppState, scope: Scope) -> Result<Scope,
     Ok(auth::authorize(header, &state.config.auth, scope)?)
 }
 
+fn require_ingest(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
+    let configured = state.config.ingest.token.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "ingest_disabled",
+            "live event ingestion is not configured",
+        )
+    })?;
+    let header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let presented = auth::bearer_token(header).ok_or(AuthError::Unauthenticated)?;
+    if !configured.matches(presented) {
+        return Err(AuthError::Unauthenticated.into());
+    }
+    Ok(())
+}
+
+/// A normalized event delivered by an external chat adapter.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IngestChange {
+    /// A new message, in the same normalized form returned by channel reads.
+    Create {
+        /// The newly created message.
+        message: Message,
+    },
+    /// A complete replacement for an existing message.
+    Update {
+        /// The message after the update.
+        message: Message,
+    },
+    /// Removal of a message.
+    Delete {
+        /// Channel containing the removed message.
+        channel_id: ChannelId,
+        /// Provider-normalized id of the removed message.
+        message_id: MessageId,
+    },
+}
+
+/// One adapter delivery, de-duplicated within this process's bounded recent-event window.
+///
+/// Producers MUST send at most one request per channel at a time and wait for its response before
+/// sending the next event for that channel. `event_id` is opaque, so arrival order is the only
+/// ordering information this endpoint has; concurrent requests can arrive in either order.
+#[derive(Debug, Deserialize)]
+pub struct IngestEventRequest {
+    /// Stable retry key for this one provider event.
+    pub event_id: String,
+    /// True for catch-up/history delivered while a subscription resumes, false only for an event
+    /// the adapter knows arrived live.
+    pub historical: bool,
+    /// The normalized change.
+    #[serde(flatten)]
+    pub change: IngestChange,
+}
+
+/// Acknowledgement returned to an adapter.
+#[derive(Debug, Serialize)]
+pub struct IngestEventResponse {
+    /// True only when this request entered the live hub.
+    pub accepted: bool,
+    /// True when the same event id was already accepted for this channel.
+    pub duplicate: bool,
+}
+
+/// Maximum decoded JSON request size for one event.
+pub const MAX_INGEST_BODY_BYTES: usize = 64 * 1024;
+
+/// `POST /api/v1/live/events` — authenticated provider-neutral push ingestion.
+///
+/// This credential is deliberately separate from both browser tokens. The route accepts only
+/// configured channels, caps the body before JSON extraction, and retains no message history
+/// beyond the live hub's bounded reconnect tail. A repeated event id is acknowledged without
+/// broadcasting it again while its id remains in this process's bounded de-duplication window.
+/// The memory is not durable: a restart, or more than the window's worth of later channel events,
+/// permits the retry again. Producers and consumers must therefore tolerate an occasional duplicate.
+/// A producer must keep at most one request per channel in flight and settle an uncertain result
+/// before sending a later event, because the opaque event id carries no ordering information.
+pub async fn ingest_event(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    // Authenticate before reading or parsing the body. Besides bounding unauthorized work, this
+    // keeps a caller without the adapter credential from using parse errors to probe the schema.
+    require_ingest(request.headers(), &state)?;
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json")) {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "live events require Content-Type: application/json",
+        ));
+    }
+    let body = axum::body::to_bytes(request.into_body(), MAX_INGEST_BODY_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                format!("a live event may be at most {MAX_INGEST_BODY_BYTES} bytes"),
+            )
+        })?;
+    let request: IngestEventRequest = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("the live event body is not valid JSON for this API"))?;
+
+    let IngestEventRequest {
+        event_id,
+        historical,
+        change,
+    } = request;
+    let (kind, channel_id, mut message) = match change {
+        IngestChange::Create { message } => (
+            crate::live::LiveKind::Create,
+            message.channel_id.clone(),
+            message,
+        ),
+        IngestChange::Update { message } => (
+            crate::live::LiveKind::Update,
+            message.channel_id.clone(),
+            message,
+        ),
+        IngestChange::Delete {
+            channel_id,
+            message_id,
+        } => {
+            let tombstone = Message {
+                id: message_id,
+                channel_id: channel_id.clone(),
+                author: String::new(),
+                author_id: UserId(String::new()),
+                author_is_bot: false,
+                timestamp: String::new(),
+                spoken_time: String::new(),
+                reply_to: None,
+                content: String::new(),
+            };
+            (crate::live::LiveKind::Delete, channel_id, tombstone)
+        }
+    };
+
+    validate_ingest_id("event_id", &event_id, crate::live::MAX_EVENT_ID_BYTES)?;
+    validate_ingest_id("message id", message.id.as_str(), 512)?;
+    if state.channel(channel_id.as_str()).is_none() {
+        return Err(OpError::UnknownChannel.into());
+    }
+    // The configured zone is an application concern, not something every adapter should have to
+    // reproduce. Deletes carry no timestamp and never render this field.
+    if kind != crate::live::LiveKind::Delete {
+        message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
+    }
+    let accepted = state
+        .live
+        .publish_ingested(event_id, kind, historical, &channel_id, message);
+    let status = if accepted {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(IngestEventResponse {
+            accepted,
+            duplicate: !accepted,
+        }),
+    )
+        .into_response())
+}
+
+fn validate_ingest_id(field: &str, value: &str, max_bytes: usize) -> Result<(), ApiError> {
+    if value.is_empty() || value.trim() != value {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be non-empty and have no surrounding whitespace"
+        )));
+    }
+    if value.len() > max_bytes {
+        return Err(ApiError::bad_request(format!(
+            "{field} exceeds the {max_bytes}-byte limit"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(format!(
+            "{field} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
 /// `GET /healthz` — liveness only. Deliberately says nothing about the configuration.
 pub async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({
@@ -329,6 +523,10 @@ pub struct ClientConfigResponse {
     /// not have. Not a secret: it is a property of this deployment, and the caller already holds
     /// a token.
     pub live_poll_seconds: u64,
+    /// How changes reach the SSE hub: `off`, `poll`, or provider-neutral `push` ingestion.
+    pub live_delivery: &'static str,
+    /// Whether the selected provider exposes a write-through read cursor.
+    pub upstream_read_mark_supported: bool,
 }
 
 /// `GET /api/v1/client-config`
@@ -342,6 +540,14 @@ pub async fn client_config(
         elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
         version: env!("CARGO_PKG_VERSION"),
         live_poll_seconds: state.config.discord.live_poll_seconds,
+        live_delivery: if state.config.ingest.enabled() {
+            "push"
+        } else if state.config.discord.live_poll_seconds > 0 {
+            "poll"
+        } else {
+            "off"
+        },
+        upstream_read_mark_supported: state.chat.supports_upstream_read_mark(),
         replay_enabled: state.config.replay.enabled,
         self_author_id: crate::discord::self_user_id_from_token(
             state.config.discord.bot_token.expose(),
@@ -1535,6 +1741,38 @@ pub struct MarkReadResponse {
     /// See [`crate::store::INBOX_NOTICE`]. Repeated on the mutating route too, because this is
     /// exactly where someone expects the Discord badge to clear.
     pub read_state_notice: &'static str,
+}
+
+/// The result of moving the source provider's read cursor.
+#[derive(Debug, Serialize)]
+pub struct UpstreamReadResponse {
+    /// Channel whose provider cursor moved.
+    pub channel: ChannelInfo,
+    /// Inclusive message boundary requested by the caller.
+    pub through: MessageId,
+    /// The contract common to every provider implementation.
+    pub upstream_read_notice: &'static str,
+}
+
+/// What a successful source-provider read mark means.
+pub const UPSTREAM_READ_NOTICE: &str = "The source chat provider's read cursor was moved through this message. Read cursors only move forward; thread-level behavior is defined by the provider.";
+
+/// `POST /api/v1/channels/{channel_id}/upstream-read`
+pub async fn mark_read_upstream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(request): Json<MarkReadRequest>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+    let through = MessageId(request.message_id);
+    state.chat.mark_read_upstream(&channel.id, &through).await?;
+    Ok(no_store(Json(UpstreamReadResponse {
+        channel,
+        through,
+        upstream_read_notice: UPSTREAM_READ_NOTICE,
+    })))
 }
 
 /// `POST /api/v1/channels/{channel_id}/read`

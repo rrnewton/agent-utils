@@ -25,6 +25,9 @@ bind = "0.0.0.0:8080"
 # timezone = "America/New_York"
 
 [discord]
+# Enable only when api_base names a compatible bridge with POST /channels/{id}/read.
+# This moves the source provider's read cursor; Done/archive remains local and reversible.
+upstream_read_marks = false
 # Bot token for the SECOND, dedicated bot — not the one your coding agents use.
 # Environment: VIBE_TALK_DISCORD_BOT_TOKEN
 bot_token = "REPLACE-ME"
@@ -71,6 +74,16 @@ live_poll_seconds = 0
 # Environment: VIBE_TALK_READ_TOKEN / VIBE_TALK_WRITE_TOKEN
 read_token = "REPLACE-ME-at-least-24-characters"
 write_token = "REPLACE-ME-different-and-at-least-24-characters"
+
+# Optional provider-neutral PUSH input for an external adapter. Leave this whole section absent
+# to disable POST /api/v1/live/events. The token is deliberately separate from both browser
+# credentials and must be at least 24 characters. The endpoint is bounded to 64 KiB per event and
+# still accepts only channels from the allowlist below.
+#
+# Do not combine this with discord.live_poll_seconds: configure exactly one live source, so one
+# upstream change cannot reach the page twice. Environment: VIBE_TALK_INGEST_TOKEN
+# [ingest]
+# token = "REPLACE-ME-third-distinct-token-at-least-24-characters"
 
 # Channels this server may touch. This list is an ALLOWLIST: a channel that is not here cannot be
 # read or posted to through the API even with a valid token, however many channels the bot is in.

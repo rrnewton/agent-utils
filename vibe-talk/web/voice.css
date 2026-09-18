@@ -1159,7 +1159,8 @@ body {
  * either direction. It is quiet because it is a standing fact rather than a message, and it
  * scrolls away with the top of the history rather than holding a strip of a phone screen.
  */
-.done-button {
+.done-button,
+.upstream-read-button {
   flex: 0 0 auto;
   padding: 0.05rem 0.5rem;
   background: none;
@@ -1403,7 +1404,8 @@ body {
   }
 
   #discord-log li.discord-message:hover .reply-button,
-  #discord-log li.discord-message:hover .done-button {
+  #discord-log li.discord-message:hover .done-button,
+  #discord-log li.discord-message:hover .upstream-read-button {
     color: var(--ink);
     border-color: var(--accent);
   }

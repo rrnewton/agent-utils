@@ -1,8 +1,8 @@
 //! Discord implementation of the provider-neutral chat interface.
 //!
-//! v0 needs exactly two operations: read the recent messages of a channel, and post one message
-//! back. Both are pulled on demand — this server has no gateway connection and no webhook
-//! receiver, so it never needs to be running for a message to survive.
+//! The Discord implementation reads recent messages and posts replies on demand. It has no
+//! Gateway connection or Discord webhook receiver; provider-neutral push ingestion, when a
+//! deployment enables it, enters through the separate adapter endpoint in [`crate::live`].
 
 pub mod fake;
 pub mod http;
