@@ -13403,7 +13403,9 @@ def test_validate_batch_flat_finish_recovers_after_worktree_removed(
         env={"WRKSLOTS_TEST_INTERRUPT": interrupt},
     )
 
-    assert interrupted.returncode == 86, interrupted.stderr
+    assert interrupted.returncode == 86, (
+        f"stdout:\n{interrupted.stdout}\nstderr:\n{interrupted.stderr}"
+    )
     finish_journal = wrkslots._journal_path(config)
     seal_journal = wrkslots._validate_batch_seal_journal_path(config)
     assert finish_journal.is_file()
