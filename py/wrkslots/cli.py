@@ -19926,13 +19926,16 @@ def _recover_ownerless_validation(
     path: Path,
     raw: Mapping[str, object],
     coordinator: ProcessIdentity,
+    runner: ProcessIdentity,
+    handoff_writer: ProcessIdentity | None,
+    proof_fd: int | None,
     *,
     batch_cleanup: _OwnerlessValidationBatchContext | None = None,
     emit: bool = True,
 ) -> None:
     if path != _journal_path(config):
         raise StateError("ownerless validation journal filename is invalid")
-    _assert_caller_process(coordinator, "coordinator")
+    _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
     initial_authorization, _target, _fenced, _phase = _ownerless_validation_paths(
         config, raw
     )
@@ -24610,13 +24613,16 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         if canonical_proofs
         else tuple(None for _checkout in checkouts)
     )
-    _capture_caller_process(args.coordinator_pid, "coordinator")
+    coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
+        args.coordinator_pid
+    )
     retained: list[dict[str, object]] = []
     removed: list[dict[str, object]] = []
     prepared: list[
         tuple[str, str, str, str | None, Path, _PrivateCleanupIdentity]
     ] = []
     with _mutation_locks(config, args.wait_lock):
+        _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         if _outstanding_journals(config) or _validate_batch_seal_journals(config):
             raise Refusal(
@@ -25081,8 +25087,11 @@ def _cmd_recover(
     emit: bool = True,
 ) -> int:
     config = _load_config(args.project_root, args.machine)
-    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
+        args.coordinator_pid
+    )
     with _mutation_locks(config, args.wait_lock):
+        _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         recovered_partial = _recover_partial_updates(config, args.discard_partial)
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         if (
@@ -25360,6 +25369,9 @@ def _cmd_recover(
                 path,
                 raw,
                 coordinator,
+                runner,
+                handoff_writer,
+                proof_fd,
                 batch_cleanup=ownerless_batch_cleanup,
                 emit=emit,
             )

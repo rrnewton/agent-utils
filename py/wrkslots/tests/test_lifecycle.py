@@ -14609,6 +14609,54 @@ def test_host_context_runner_validate_batch_preserves_actor_and_runner(
         os.close(proof_fd)
 
 
+def test_host_context_runner_recovers_ownerless_validation_cargo_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    cargo_home = project / "ignored/validate/cargo-homes/validate-cargo-host"
+    cargo_home.mkdir(parents=True)
+    cargo_home.chmod(0o700)
+    (cargo_home / "cache-entry").write_text("regenerable\n", encoding="utf-8")
+    record = prepare_terminal_validation_record(
+        project, cargo_home, field="cargo_home"
+    )
+    install_validation_exclusion_fixture(project, monkeypatch, request)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda *_args, **_kwargs: wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=False
+        ),
+    )
+    coordinator, proof_fd = start_host_context_coordinator()
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+
+        removed = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(coordinator.pid),
+                "--ownerless-validate-cargo-home",
+                cargo_home.relative_to(project).as_posix(),
+                "--completed-record",
+                record.relative_to(project).as_posix(),
+            ]
+        )
+
+        assert removed == 0
+        assert not cargo_home.exists()
+    finally:
+        terminate_process(coordinator)
+        os.close(proof_fd)
+
+
 def test_host_context_runner_removes_live_validate_owner_with_pipe_proof(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
