@@ -36,9 +36,10 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    free. `--validate-complete` lets the exact live owner remove its completed validation slot, or
    lets a later participant remove it after proven owner death without waiting out the heartbeat.
    Process-use, path, and Git checks still run.
-6. Before removing an agent slot, `remove` publishes unpushed commits and tracked, untracked, and
-   ignored files outside configured regenerable cache paths to the recorded remote. It records and
-   rechecks the exact remote ref and commit before deletion. A validate slot skips this step.
+6. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
+   untracked files outside configured regenerable cache paths to the recorded remote. It never
+   uploads gitignored content. It records and rechecks the exact remote ref and commit before
+   deletion. A validate slot skips this step.
 7. `recover` lets any later participant complete an interrupted create or removal from the durable
    history. It is not tied to the participant that began the operation.
 
@@ -150,10 +151,15 @@ including `../NAME` for a sibling. Worktree destinations remain confined to the 
 worktrees directory.
 
 For a dirty or unpushed agent checkout, reclaim constructs a commit without changing the checkout's
-ordinary index or branch. It includes tracked, untracked, and ignored files except configured cache
+ordinary index or branch. It includes tracked and ordinary untracked files except configured cache
 paths, pushes the commit to `refs/heads/salvage/<machine>/<slot>/...`, reads that exact ref back, and
 records the result. If the checkout was already clean and published, the existing remote containment
 is recorded instead. A failed or unverifiable push preserves the checkout.
+
+Gitignored content is excluded by repository policy, not by size. It is never added with `--force`,
+never included in the salvage status digest, and never uploaded to the recorded remote. Authored work
+that must survive belongs in tracked or ordinary untracked paths, or in a separately recorded
+artifact store; an ignored build tree is not remote preservation evidence.
 
 Initialized Git submodules are checked separately against the corresponding source repository's
 remote URL. Each nested repository gets its own salvage commit and remote readback, so an
@@ -317,10 +323,10 @@ plan agrees. The worktree must be one direct child of the managed agent root. A 
 the exact digest supplied after the coordinator reads it; the command rechecks it before every
 destructive boundary and preserves it through the same remote salvage path. An unread or changed
 handoff, any live process or user unit reference, a path or inode change, non-ordinary Git state, or
-an ACTIVE/archive identity collision refuses. Tracked, untracked, ignored files outside configured
-cache paths, and initialized nested repositories are committed to verified salvage refs before the
-exact inode is fenced and removed. Any later participant can resume the journal with ordinary
-`recover`.
+an ACTIVE/archive identity collision refuses. Tracked and ordinary untracked files outside
+configured cache paths, and initialized nested repositories are committed to verified salvage refs
+before the exact inode is fenced and removed. Any later participant can resume the journal with
+ordinary `recover`.
 
 The `worktrees/slots/ignored` path is not an agent worktree. Only when it contains the command's
 one exact supported cache hierarchy can it be relocated intact outside the managed slot root:
@@ -350,7 +356,7 @@ it does not trust the earlier participant's conclusion.
 
 The source package includes deterministic and stress tests for concurrent creation, owner and
 time-to-live disagreement, unavailable liveness, dirty and unpublished salvage, ignored-file
-capture, validate deletion without salvage, unread handoffs, process use, path fencing, interrupted
+exclusion, validate deletion without salvage, unread handoffs, process use, path fencing, interrupted
 operations, hash-chain corruption, missing compatibility views, and later-participant recovery.
 
 The default test run uses a PID namespace for tests that only need isolated process evidence and

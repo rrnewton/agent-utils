@@ -6867,22 +6867,20 @@ class _GitVcs:
         checkout: Path,
         cache_globs: Sequence[str] = (),
         *,
+        include_ignored: bool = True,
         refresh_index: bool = True,
     ) -> str:
         pathspecs = ["."]
         for pattern in cache_globs:
             pathspecs.append(f":(exclude,glob){pattern}")
             pathspecs.append(f":(exclude,glob){pattern}/**")
+        arguments = ["status", "--porcelain=v2", "--untracked-files=all"]
+        if include_ignored:
+            arguments.append("--ignored=matching")
+        arguments.extend(("--", *pathspecs))
         result = self._run(
             checkout,
-            [
-                "status",
-                "--porcelain=v2",
-                "--untracked-files=all",
-                "--ignored=matching",
-                "--",
-                *pathspecs,
-            ],
+            arguments,
             env_overrides=(
                 None if refresh_index else {"GIT_OPTIONAL_LOCKS": "0"}
             ),
@@ -8659,9 +8657,10 @@ def _salvage_candidate(
 ) -> tuple[str, str, str, bool]:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
 
-    A temporary index captures tracked, untracked, and ignored files outside the
-    configured regenerable caches. It never changes the checkout's branch or
-    ordinary index, so a failed push leaves the author's tree untouched.
+    A temporary index captures tracked and ordinary untracked files outside the
+    configured regenerable caches. Gitignored content is never uploaded. The
+    temporary index never changes the checkout's branch or ordinary index, so a
+    failed push leaves the author's tree untouched.
     """
 
     path = path_override or _stored_path(config, checkout.path, "checkout path")
@@ -8705,7 +8704,11 @@ def _salvage_candidate(
             f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
             "recorded remote before reclaim so salvage cannot be sent elsewhere"
         )
-    status = vcs.status(path, _cache_globs_for(config, checkout.name))
+    status = vcs.status(
+        path,
+        _cache_globs_for(config, checkout.name),
+        include_ignored=False,
+    )
     status_digest = hashlib.sha256(status.encode("utf-8")).hexdigest()
     if not status:
         return head, status_digest, head, False
@@ -8733,26 +8736,6 @@ def _salvage_candidate(
                 path,
                 ["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
                 input_text=untracked,
-                env_overrides=env,
-            )
-        ignored = vcs._run(
-            path,
-            [
-                "ls-files",
-                "--others",
-                "--ignored",
-                "--exclude-standard",
-                "-z",
-                "--",
-                *pathspecs,
-            ],
-            env_overrides=env,
-        ).stdout
-        if ignored:
-            vcs._run(
-                path,
-                ["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
-                input_text=ignored,
                 env_overrides=env,
             )
         tree = vcs._run(path, ["write-tree"], env_overrides=env).stdout.strip()
@@ -21055,8 +21038,9 @@ def _absent_agent_archive_entry(
             ),
         ],
         "limitations": [
-            "working-tree contents were absent before recovery; uncommitted, untracked, "
-            "ignored, and HANDOFF contents could not be inspected or salvaged"
+            "working-tree contents were absent before recovery; tracked and ordinary "
+            "untracked content and HANDOFF could not be inspected or salvaged; ignored "
+            "content could not be inspected and would not have been uploaded"
         ],
         "continuation": "physical storage was already absent; inspect the verified rescue refs",
         "salvage": [dict(receipt) for receipt in receipts],

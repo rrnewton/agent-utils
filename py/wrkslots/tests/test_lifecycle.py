@@ -10689,7 +10689,7 @@ def test_remote_and_landed_ancestry_records_handoff_then_allows_removal(
     assert archive["records"][0]["validation"] == ["pytest"]
 
 
-def test_agent_reclaim_pushes_unpushed_commits_and_uncommitted_files(
+def test_agent_reclaim_pushes_unpushed_commits_and_nonignored_files(
     tmp_path: Path,
 ) -> None:
     project, _repository, remote = make_project(tmp_path, cache_globs=("target",))
@@ -10739,11 +10739,11 @@ def test_agent_reclaim_pushes_unpushed_commits_and_uncommitted_files(
     names = set(git(remote, "ls-tree", "-r", "--name-only", salvage_commit).stdout.splitlines())
     assert {
         ".gitignore",
-        "ignored.txt",
         "local.txt",
         "seed.txt",
         "untracked.txt",
     } <= names
+    assert "ignored.txt" not in names
     assert "target/build-output" not in names
     assert git(remote, "show", f"{salvage_commit}:seed.txt").stdout == "dirty tracked file\n"
     events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
@@ -10752,6 +10752,100 @@ def test_agent_reclaim_pushes_unpushed_commits_and_uncommitted_files(
     payload = started[0]["payload"]
     assert isinstance(payload, dict)
     assert payload["coordinator_authorized"] is False
+
+
+def test_agent_reclaim_never_uploads_oversized_ignored_file(
+    tmp_path: Path,
+) -> None:
+    project, _repository, remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    (tree / ".gitignore").write_text("oversized.bin\n", encoding="utf-8")
+    git(tree, "add", ".gitignore")
+    git(tree, "commit", "-m", "ignore generated artifact")
+    git(tree, "push", "origin", "HEAD:main")
+    oversized = tree / "oversized.bin"
+    with oversized.open("wb") as output:
+        output.truncate(100 * 1024**2 + 1)
+    (tree / "seed.txt").write_text("authored tracked change\n", encoding="utf-8")
+    (tree / "untracked.txt").write_text("authored untracked change\n", encoding="utf-8")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    receipt = archive["records"][0]["salvage"][0]
+    assert receipt["disposition"] == "salvaged"
+    salvage_commit = receipt["salvage_commit"]
+    remote_ref = receipt["remote_ref"]
+    assert git(remote, "rev-parse", remote_ref).stdout.strip() == salvage_commit
+    names = set(git(remote, "ls-tree", "-r", "--name-only", salvage_commit).stdout.splitlines())
+    assert "seed.txt" in names
+    assert "untracked.txt" in names
+    assert "oversized.bin" not in names
+    assert git(remote, "show", f"{salvage_commit}:seed.txt").stdout == "authored tracked change\n"
+
+
+def test_agent_reclaim_does_not_salvage_ignored_only_payload(
+    tmp_path: Path,
+) -> None:
+    project, _repository, remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    (tree / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    git(tree, "add", ".gitignore")
+    git(tree, "commit", "-m", "ignore generated artifacts")
+    git(tree, "push", "origin", "HEAD:main")
+    generated = tree / "generated"
+    generated.mkdir()
+    for index in range(22):
+        name = f"artifact-{index:02}.bin"
+        with (generated / name).open("wb") as output:
+            output.truncate(100 * 1024**2)
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    removed = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    assert git(
+        remote,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/heads/salvage",
+    ).stdout == ""
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    receipt = archive["records"][0]["salvage"][0]
+    assert receipt["disposition"] == "already-published"
 
 
 def test_agent_reclaim_salvages_uncommitted_submodule_files_before_removal(
@@ -20150,8 +20244,9 @@ def test_recover_absent_agent_row_preserves_commit_before_registry_repair(
     archived = wrkslots._load_archive(config).records[-1]
     assert archived["slot"] == record.slot
     assert archived["limitations"] == [
-        "working-tree contents were absent before recovery; uncommitted, untracked, "
-        "ignored, and HANDOFF contents could not be inspected or salvaged"
+        "working-tree contents were absent before recovery; tracked and ordinary "
+        "untracked content and HANDOFF could not be inspected or salvaged; ignored "
+        "content could not be inspected and would not have been uploaded"
     ]
     rescue_ref = wrkslots._absent_agent_rescue_ref(record, record.checkouts[0])
     assert git(remote, "rev-parse", rescue_ref).stdout.strip() == record.checkouts[0].head
