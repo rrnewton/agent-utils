@@ -38,35 +38,37 @@ dist/
 # it is machine-local runtime output, not source.
 ignored/
 
-# --- gent-talk (Discord/voice bridge service) ---
-# Its own build tree: gent-talk is outside the rs/ workspace and has its own target dir.
-/gent-talk/target/
+# --- vibe-talk (Discord/voice bridge service) ---
+# Its own build tree: vibe-talk is outside the rs/ workspace and has its own target dir. Keep the
+# wildcard so ignored artifacts left in a pre-rename checkout remain ignored after an update.
+/*-talk/target/
 # A filled-in configuration holds the Discord bot token and this server's API tokens.
-# Only gent-talk.example.toml is tracked; a real one must never be committed.
-/gent-talk/gent-talk.toml
-/gent-talk/*.local.toml
-/gent-talk/.env
+# Only vibe-talk.example.toml is tracked; a real one must never be committed.
+/*-talk/*-talk.toml
+/*-talk/*.local.toml
+/*-talk/.env
 # Local QA output: screenshots, traces, console/network logs from Playwright runs against
-# a locally running gent-talk. Evidence, never source; images must never be committed.
-/gent-talk/debug/
+# a locally running vibe-talk. Evidence, never source; images must never be committed.
+/*-talk/debug/
 
 # --- editor / os ---
 *.swp
 .DS_Store
 
-# gent-talk local credentials and scratch — never commit these.
+# vibe-talk local credentials and scratch — never commit these.
 # token1/token2 are the read/write bearer tokens.
 #
-# KEEP the .gent-talk.env rule even though nothing reads that path any more:
+# KEEP the per-checkout credential-file rule even though nothing reads that path any more:
 # scripts/run.sh no longer has a per-checkout config layer, so a file there is
 # inert — but it is exactly where someone would put credentials out of habit,
 # and an ignore rule costs nothing. Do not "clean this up" as dead config.
 # The *~ rule at the bottom matters for the same reason: an editor backup of a
-# credential file (.gent-talk.env~) is just as sensitive as the original.
-gent-talk/.gent-talk.env
-gent-talk/token1
-gent-talk/token2
-gent-talk/cloudflared.deb
+# credential file is just as sensitive as the original. Wildcards keep artifacts
+# from a pre-rename checkout protected too.
+/*-talk/.*-talk.env
+/*-talk/token1
+/*-talk/token2
+/*-talk/cloudflared.deb
 *~
 
 # Agent worktrees created for parallel work. Never tracked: they are checkouts of

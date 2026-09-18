@@ -12,9 +12,9 @@ name: repository-ci
 # Only two things are listed, and each is here because this gate provably
 # cannot observe it:
 #
-#   * `gent-talk/**` is outside the Rust workspace, has no Python package, is
+#   * `vibe-talk/**` is outside the Rust workspace, has no Python package, is
 #     in neither `make check` nor `make test`, and is covered end to end by its
-#     own `gent-talk.yml`. Building the workspace tells you nothing about it.
+#     own `vibe-talk.yml`. Building the workspace tells you nothing about it.
 #   * prose directories ship in no distribution and are embedded nowhere.
 #
 # `AGENTS.md`, the Makefile, `setup`, `scripts/**` and every workflow are
@@ -24,13 +24,13 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - 'gent-talk/**'
+      - 'vibe-talk/**'
       - 'ai_docs/**'
       - 'reviews/**'
       - 'skills/**'
   pull_request:
     paths-ignore:
-      - 'gent-talk/**'
+      - 'vibe-talk/**'
       - 'ai_docs/**'
       - 'reviews/**'
       - 'skills/**'
@@ -94,7 +94,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: install python deps
-        # PyYAML is a workspace runtime dep; Playwright and websockets are optional gent-talk
+        # PyYAML is a workspace runtime dep; Playwright and websockets are optional vibe-talk
         # runtime deps. All three must be installed for the repository-wide strict mypy gate.
         run: python -m pip install --upgrade 'setuptools>=77' mypy 'playwright>=1.40' pytest pyyaml types-PyYAML 'websockets>=12'
       - name: embedded user guides in sync with their single source

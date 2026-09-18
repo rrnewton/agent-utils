@@ -2,13 +2,13 @@ name: nightly (everything)
 
 # WHY A NIGHTLY, WHEN EVERY TOOL ALREADY HAS ITS OWN WORKFLOW
 #
-# The per-tool workflows are path-routed: a change under `gent-talk/` runs gent-talk's gate and
+# The per-tool workflows are path-routed: a change under `vibe-talk/` runs vibe-talk's gate and
 # nothing else, which is what makes this repository behave like a collection of independent tools
 # rather than one monolith that takes twenty minutes to tell you about a typo.
 #
 # Path routing has one blind spot, and it is not hypothetical here: the tools DEPEND on each other.
-# gent-talk's CI is chosen by `gent-talk/**`, so a change to `rs/dagrun/` that breaks a consumer
-# runs dagrun's suite and never gent-talk's. Each workflow is green, main is broken, and nobody
+# vibe-talk's CI is chosen by `vibe-talk/**`, so a change to `rs/dagrun/` that breaks a consumer
+# runs dagrun's suite and never vibe-talk's. Each workflow is green, main is broken, and nobody
 # learns until the next change to the consumer -- which then looks like the culprit.
 #
 # So this runs the ENTIRE contract, on a schedule, with no path filter and nothing selected. It is
@@ -102,10 +102,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 90
 
-      # gent-talk is outside the Rust workspace and outside `make validate-all`'s workspace half,
+      # vibe-talk is outside the Rust workspace and outside `make validate-all`'s workspace half,
       # so its own gate is named here as well. Its Makefile is the same one a developer runs.
-      - name: gent-talk
-        working-directory: gent-talk
+      - name: vibe-talk
+        working-directory: vibe-talk
         run: make validate
 
       # A failure here is about MAIN, not about a pull request, so it has to reach somebody. An

@@ -4,7 +4,7 @@
 The repository contract is expensive. A full run builds every Rust crate twice, executes the
 Python and Rust suites, runs the cross-language differential over every paired tool, and then
 packages and smoke-installs six distributions and four crates. That is the right price for a
-change to `rs/` or `py/`. It is the wrong price for a change to `gent-talk/`, which is
+change to `rs/` or `py/`. It is the wrong price for a change to `vibe-talk/`, which is
 deliberately outside the Rust workspace and shares no code with any of it: none of those checks
 can observe the edit, so all they do is make the author wait.
 
@@ -53,7 +53,7 @@ DOCS = "docs"
 WORKSPACE = "workspace"
 CROSS = "cross"
 PACKAGES = "packages"
-GENT_TALK = "gent-talk"
+VIBE_TALK = "vibe-talk"
 TIMELINE_BROWSER = "timeline-browser"
 HYGIENE = "hygiene"
 
@@ -102,15 +102,15 @@ GROUPS: dict[str, tuple[Check, ...]] = {
         # interaction ten times slower; this can.
         Check("timeline-benchmark", ("make", "-C", "py/wrkviz", "benchmark")),
     ),
-    GENT_TALK: (
-        Check("gent-talk-fmt", ("cargo", "fmt", "--check"), cwd="gent-talk"),
-        Check("gent-talk-clippy", ("cargo", "clippy", "--all-targets", "--", "-D", "warnings"), cwd="gent-talk"),
-        Check("gent-talk-test", ("cargo", "test"), cwd="gent-talk"),
-        # EVERY page suite, not a named file. gent-talk serves two pages -- `/` and `/voice` --
+    VIBE_TALK: (
+        Check("vibe-talk-fmt", ("cargo", "fmt", "--check"), cwd="vibe-talk"),
+        Check("vibe-talk-clippy", ("cargo", "clippy", "--all-targets", "--", "-D", "warnings"), cwd="vibe-talk"),
+        Check("vibe-talk-test", ("cargo", "test"), cwd="vibe-talk"),
+        # EVERY page suite, not a named file. vibe-talk serves two pages -- `/` and `/voice` --
         # and naming one of them here is how the second suite comes to exist without ever running.
         # The pattern is expanded by node, not by a shell, so there is no glob for a shell to eat.
         # `cargo test` runs both through their own harnesses too; this keeps the fast loop honest.
-        Check("gent-talk-page", ("node", "--test", "tests/js/*.test.mjs"), cwd="gent-talk"),
+        Check("vibe-talk-page", ("node", "--test", "tests/js/*.test.mjs"), cwd="vibe-talk"),
         # The boxed graph, CHECKED but not run -- offline and instant. Running it here would be
         # running the same suites a second time.
         #
@@ -121,7 +121,7 @@ GROUPS: dict[str, tuple[Check, ...]] = {
         # `common/bin/dagrun`, which is TRACKED. `./bin/` is gitignored and only exists after
         # `./setup` has run, so shelling out to it made this check fail on a fresh clone --
         # for a reason that has nothing to do with whatever the author changed.
-        Check("gent-talk-dag", ("common/bin/dagrun", "list", "--dag", "gent-talk/tests.dag.yaml")),
+        Check("vibe-talk-dag", ("common/bin/dagrun", "list", "--dag", "vibe-talk/tests.dag.yaml")),
     ),
 }
 
@@ -137,7 +137,7 @@ WHY: dict[str, str] = {
     WORKSPACE: "workspace Rust or Python source changed",
     CROSS: "code with a paired cross-language implementation changed",
     PACKAGES: "something that ships inside a distribution changed",
-    GENT_TALK: "gent-talk changed (it is outside the Rust workspace and has its own suite)",
+    VIBE_TALK: "vibe-talk changed (it is outside the Rust workspace and has its own suite)",
     TIMELINE_BROWSER: (
         "the timeline's browser-facing assets or its browser suite changed; these drive a real"
         " Chromium and are the only checks that can see a rendering or interaction regression"
@@ -150,13 +150,13 @@ WHY: dict[str, str] = {
 
 #: Longest prefix wins, so `scripts/embed_userguides.py` beats the bare `scripts/` catch-all.
 PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
-    # gent-talk is outside the Rust workspace, but its PYTHON is not outside the repository's
-    # type check: `make check` runs mypy over `.`, which walks `gent-talk/scripts/`. Selecting
-    # only the gent-talk group for those files let a real type error reach main — the scan for
+    # vibe-talk is outside the Rust workspace, but its PYTHON is not outside the repository's
+    # type check: `make check` runs mypy over `.`, which walks `vibe-talk/scripts/`. Selecting
+    # only the vibe-talk group for those files let a real type error reach main — the scan for
     # leaked credentials in smoke-agent.py called a method that does not exist, and nothing that
-    # ran locally could see it. Longest-prefix wins, so this beats the bare `gent-talk/` rule.
-    ("gent-talk/scripts/", frozenset({GENT_TALK, WORKSPACE})),
-    ("gent-talk/", frozenset({GENT_TALK})),
+    # ran locally could see it. Longest-prefix wins, so this beats the bare `vibe-talk/` rule.
+    ("vibe-talk/scripts/", frozenset({VIBE_TALK, WORKSPACE})),
+    ("vibe-talk/", frozenset({VIBE_TALK})),
     ("rs/", frozenset({WORKSPACE, CROSS, PACKAGES})),
     # Longest prefix wins, so these beat the bare `py/` rule below. They add the browser group
     # WITHOUT removing the others: the static bundle is packaged and type-checked like the rest
@@ -173,7 +173,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # and covered by `py/tests/test_agent_log_archive_fetcher.py`, so it owes the workspace
     # group -- and nothing else: it ships in no distribution and has no cross-language twin.
     # Before this rule it read as unclassified and selected EVERY group, which is the safe
-    # direction to be wrong in but meant a one-line fetcher change ran gent-talk's Rust suite.
+    # direction to be wrong in but meant a one-line fetcher change ran vibe-talk's Rust suite.
     ("scripts/agent-log-archive/", frozenset({WORKSPACE})),
     ("scripts/embed_userguides.py", frozenset({DOCS, PACKAGES})),
     ("scripts/check_python_packages.py", frozenset({PACKAGES})),
@@ -276,12 +276,12 @@ def self_test() -> int:
                 f"{why}\n    paths={paths}\n    want={sorted(expected)}\n    got ={sorted(got)}"
             )
 
-    expect(["gent-talk/src/ops.rs"], {GENT_TALK}, "a gent-talk change must not drag in the workspace contract")
-    expect(["gent-talk/web/voice.js", "gent-talk/README.md"], {GENT_TALK}, "gent-talk docs are still gent-talk")
+    expect(["vibe-talk/src/ops.rs"], {VIBE_TALK}, "a vibe-talk change must not drag in the workspace contract")
+    expect(["vibe-talk/web/voice.js", "vibe-talk/README.md"], {VIBE_TALK}, "vibe-talk docs are still vibe-talk")
     expect(
-        ["gent-talk/scripts/smoke-agent.py"],
-        {GENT_TALK, WORKSPACE},
-        "gent-talk PYTHON is inside the repository mypy run, so it must select the workspace too",
+        ["vibe-talk/scripts/smoke-agent.py"],
+        {VIBE_TALK, WORKSPACE},
+        "vibe-talk PYTHON is inside the repository mypy run, so it must select the workspace too",
     )
     expect(["rs/tick-hub/src/lib.rs"], {WORKSPACE, CROSS, PACKAGES}, "a workspace crate needs the full chain")
     expect(["py/dagrun/sizing.py"], {WORKSPACE, CROSS, PACKAGES}, "python source needs the full chain")
@@ -293,8 +293,8 @@ def self_test() -> int:
     expect(["scripts/something_new.py"], set(ALL_GROUPS), "an unclassified script must select EVERYTHING")
     expect(["brand_new_toplevel/x"], set(ALL_GROUPS), "an unclassified top level must select EVERYTHING")
     expect(
-        ["gent-talk/src/ops.rs", "rs/tick-hub/src/lib.rs"],
-        {GENT_TALK, WORKSPACE, CROSS, PACKAGES},
+        ["vibe-talk/src/ops.rs", "rs/tick-hub/src/lib.rs"],
+        {VIBE_TALK, WORKSPACE, CROSS, PACKAGES},
         "a change spanning two areas is the UNION, never the smaller of the two",
     )
     expect(["scripts/check_client_names.py"], set(), "the hygiene guard needs only its own always-on group")

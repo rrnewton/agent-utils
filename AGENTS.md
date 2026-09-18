@@ -59,8 +59,8 @@ second time it put an unformatted commit on `main`. Run it bare, or redirect to
 a file and check `$?` — never through a pipe.
 
 That runs **only the checks your change can actually affect**, and prints the
-rest as skipped, by name, with the reason. A change confined to `gent-talk/`
-runs the gent-talk suite and nothing else, because gent-talk is outside the
+rest as skipped, by name, with the reason. A change confined to `vibe-talk/`
+runs the vibe-talk suite and nothing else, because vibe-talk is outside the
 Rust workspace and shares no code with it — the workspace build, the
 cross-language differential and the packaging smoke tests cannot observe that
 edit, so running them only makes you wait.
@@ -183,7 +183,7 @@ can act on without a round trip.
 ### What this does not change
 
 Commit **titles** keep the existing `<project>: <sentence>` form —
-`gent-talk: make /voice read as an application`. They are not slugged, because
+`vibe-talk: make /voice read as an application`. They are not slugged, because
 the project prefix already does that job and commit titles should stay
 readable as prose. When a commit closes or advances an issue, name it in the
 **body** as `#<number> <slug>`, alongside the agent identifier required by

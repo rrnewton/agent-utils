@@ -67,7 +67,7 @@ common/docs/       settled documentation, public related work, and rendered edit
 ai_docs/transient/ dated working designs and temporary research
 cross/             behavioral differential harnesses and shared fixtures
 examples/          runnable DAG examples
-gent-talk/         a deployable service, outside the workspaces (see below)
+vibe-talk/         a deployable service, outside the workspaces (see below)
 py/                independently publishable Python distributions
 rs/                independently publishable Rust crates
 scripts/           documentation, package, and dependency contract checks
@@ -124,12 +124,12 @@ evidence are recorded under [`reviews/`](reviews/README.md).
 
 ## Services
 
-`gent-talk/` is a **service**, not a command-line tool: a Rust web server that bridges a voice agent
+`vibe-talk/` is a **service**, not a command-line tool: a Rust web server that bridges a voice agent
 to Discord channels, deployed as a container rather than installed from a package index. It is
 therefore an explicit exception to the two-language, two-package contract above — it has one
 implementation, its own Cargo workspace and lockfile, and its own CI workflow rather than a place in
 `make check` / `make test`, so its web-server dependency tree cannot perturb the published tools'
-MSRV or lockfile. See [`gent-talk/README.md`](gent-talk/README.md).
+MSRV or lockfile. See [`vibe-talk/README.md`](vibe-talk/README.md).
 
 ## Package documentation
 

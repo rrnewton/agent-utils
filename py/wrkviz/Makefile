@@ -5,7 +5,7 @@
 # without knowing anything about the repository around it, by someone standing in the tool's
 # source directory. The two do not disagree -- the root's `timeline-browser` group runs the same
 # browser and benchmark targets defined here -- but they answer different questions. "Is my change
-# to this tool sound" should not require running gent-talk's Rust suite to find out.
+# to this tool sound" should not require running vibe-talk's Rust suite to find out.
 #
 # EVERY step is boxed. `dagrun box` puts a command under cgroup-v2 CPU, memory and wall limits, so
 # a test that leaks memory or wedges is killed and reported rather than taking the machine with
