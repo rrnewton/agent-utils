@@ -14560,7 +14560,7 @@ def test_retire_pending_uses_remove_and_cleans_sidecar(
     assert not sidecar.exists()
 
 
-def test_sidecar_cleanup_preserves_path_replacement_and_recovers_quarantine(
+def test_sidecar_cleanup_preserves_canonical_path_recreation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -14597,20 +14597,16 @@ def test_sidecar_cleanup_preserves_path_replacement_and_recovers_quarantine(
     config = wrkslots._load_config(str(project), "testhost")
     sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
     retired_path: Path | None = None
-    preserved_original = config.control / "attacker-preserved-sidecar"
 
-    def replace_retired_path_before_finalize(point: str) -> None:
+    def recreate_canonical_after_retire(point: str) -> None:
         nonlocal retired_path
-        if point == "before-handoff-retired-sidecar-finalize":
+        if point == "after-handoff-sidecar-quarantine":
             matches = list(config.control.glob("HANDOFF-RETIRED.*"))
             assert len(matches) == 1
             retired_path = matches[0]
-            os.replace(retired_path, preserved_original)
-            retired_path.write_text("replacement must survive\n", encoding="utf-8")
+            sidecar.write_text("replacement must survive\n", encoding="utf-8")
 
-    monkeypatch.setattr(
-        wrkslots, "_interrupt_for_test", replace_retired_path_before_finalize
-    )
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", recreate_canonical_after_retire)
     code = wrkslots.main(
         [
             "--project-root",
@@ -14625,17 +14621,15 @@ def test_sidecar_cleanup_preserves_path_replacement_and_recovers_quarantine(
     )
 
     assert code == 3
-    assert "retired handoff sidecar" in capsys.readouterr().err
+    assert "preserved both identities" in capsys.readouterr().err
     assert retired_path is not None
-    assert retired_path.read_text(encoding="utf-8") == "replacement must survive\n"
-    assert preserved_original.is_file()
-    assert not sidecar.exists()
+    assert retired_path.is_file()
+    assert sidecar.read_text(encoding="utf-8") == "replacement must survive\n"
     assert not wrkslots._load_active(config).slots
     assert wrkslots._load_archive(config).records[-1]["slot"] == "slot01"
     assert (config.control / "ACTIVE.testhost.journal").is_file()
 
-    retired_path.unlink()
-    os.replace(preserved_original, retired_path)
+    sidecar.unlink()
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
     assert (
         wrkslots.main(
@@ -14651,6 +14645,91 @@ def test_sidecar_cleanup_preserves_path_replacement_and_recovers_quarantine(
         == 0
     )
     assert retired_path.is_file()
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+
+
+def test_sidecar_cleanup_noreplace_preserves_planted_retired_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    source = tmp_path / "handoff-input.md"
+    source.write_text("original sidecar\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    ).returncode == 0
+    assert finish(project).returncode == 0
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar_path = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+    sidecar = wrkslots._load_handoff_sidecar(config, record)
+    assert sidecar is not None
+    retired = wrkslots._retired_handoff_path(sidecar)
+
+    def plant_destination_before_move(point: str) -> None:
+        if point == "before-handoff-sidecar-retire":
+            retired.write_text("planted destination\n", encoding="utf-8")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", plant_destination_before_move)
+    code = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert code == 3
+    assert "destination already exists" in capsys.readouterr().err
+    assert sidecar_path.is_file()
+    assert retired.read_text(encoding="utf-8") == "planted destination\n"
+    assert (config.control / "ACTIVE.testhost.journal").is_file()
+
+    retired.unlink()
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert not sidecar_path.exists()
+    assert retired.is_file()
     assert not (config.control / "ACTIVE.testhost.journal").exists()
 
 
