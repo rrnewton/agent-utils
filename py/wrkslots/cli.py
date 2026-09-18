@@ -3173,6 +3173,41 @@ def _atomic_write_json(path: Path, payload: object) -> None:
         raise
 
 
+def _atomic_write_handoff_noreplace(path: Path, payload: object) -> None:
+    """Durably publish a new sidecar without replacing any pathname occupant."""
+
+    _refuse_symlink(path, "handoff sidecar")
+    if path.exists():
+        raise Refusal(f"handoff sidecar already exists and is immutable: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prefix = f"{path.name}.tmp."
+    leftovers = sorted(path.parent.glob(f"{prefix}*"))
+    if leftovers:
+        raise StateError(
+            f"partial handoff sidecar publication exists: {leftovers[0]}; "
+            "inspect it and use 'wrkslots recover'"
+        )
+    temp = path.parent / f"{prefix}{os.getpid()}.{uuid.uuid4().hex}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    try:
+        descriptor = os.open(temp, flags, 0o644)
+        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_directory(path.parent)
+        _interrupt_for_test("before-handoff-sidecar-publish")
+        _rename_noreplace(temp, path, "publish handoff sidecar")
+        _fsync_directory(path.parent)
+    except Refusal:
+        # The complete temp file is recovery evidence. Never unlink its pathname
+        # after caller-controlled code had an opportunity to replace it.
+        raise
+    except OSError as exc:
+        raise Refusal(f"cannot durably publish handoff sidecar {path}: {exc}") from exc
+
+
 def _json_equal(left: object, right: object) -> bool:
     return json.dumps(
         left, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -3646,10 +3681,13 @@ def _legacy_handoff_artifact(
         raise Refusal(
             f"slot {record.slot} HANDOFF.md cannot be read as UTF-8: {exc}"
         ) from exc
-    source_path = _canonical_handoff_source(
+    actual_source_path = _canonical_handoff_source(
         path, contents, identity, f"slot {record.slot} HANDOFF.md"
     )
-    _assert_legacy_handoff_is_not_tracked(source_path)
+    _assert_legacy_handoff_is_not_tracked(actual_source_path)
+    source_path = (
+        _slot_directory(config, record.slot, record.slot_type) / "HANDOFF.md"
+    ).resolve(strict=False)
     return _HandoffArtifact(
         path=path,
         machine=record.machine,
@@ -3674,33 +3712,26 @@ def _resolve_handoff_artifact(
     sidecar = _load_handoff_sidecar(config, record)
     legacy = _legacy_handoff_artifact(config, record, slot_path)
     if sidecar is not None and not sidecar.provenance_complete:
-        if sidecar.source == "write-handoff":
-            raise Refusal(
-                f"slot {record.slot} handoff sidecar schema 1 lacks auditable "
-                "write-handoff source provenance; its exact owner must rewrite it "
-                "from a matching external source"
-            )
-        if legacy is None:
-            raise Refusal(
-                f"slot {record.slot} schema 1 legacy handoff cannot be upgraded: "
-                "its live direct-child HANDOFF.md is absent"
-            )
-        if (
-            sidecar.contents != legacy.contents
-            or sidecar.sha256 != legacy.sha256
-            or sidecar.source_identity != legacy.source_identity
-        ):
-            raise Refusal(
-                f"slot {record.slot} schema 1 legacy handoff cannot be upgraded: "
-                "its live direct-child HANDOFF.md no longer has the recorded identity and content"
-            )
-        return legacy
+        raise Refusal(
+            f"slot {record.slot} handoff sidecar schema 1 lacks auditable source "
+            "provenance and is permanently manual-only; preserve it for inspection "
+            "rather than replacing or using it as removal authority"
+        )
     if sidecar is not None and legacy is not None:
         if sidecar.contents != legacy.contents or sidecar.sha256 != legacy.sha256:
             raise Refusal(
                 f"slot {record.slot} contains an unread HANDOFF.md: its handoff sidecar "
                 "disagrees with the legacy file; "
                 "preserve both files and reconcile their exact contents"
+            )
+        if sidecar.source == "legacy-slot-file" and (
+            sidecar.source_path != legacy.source_path
+            or sidecar.source_identity != legacy.source_identity
+        ):
+            raise Refusal(
+                f"slot {record.slot} contains an unread HANDOFF.md: its legacy file "
+                "identity changed even though its bytes are unchanged; preserve both "
+                "files for manual recovery; published sidecars are immutable"
             )
         return sidecar
     if sidecar is not None:
@@ -10041,27 +10072,31 @@ def _assert_handoff_read(
     slot_path: Path,
     *,
     events: Sequence[Mapping[str, object]] | None = None,
-) -> None:
+) -> _HandoffRead | None:
     if record.slot_type != "agent":
-        return
-    recorded_digest = _recorded_handoff_digest(config, record, events=events)
+        return None
+    selected_events = (
+        _load_events(config, record.machine) if events is None else events
+    )
+    latest = _latest_handoff_read(record, selected_events)
     artifact = _resolve_handoff_artifact(config, record, slot_path)
     if artifact is None:
-        if recorded_digest is not None:
+        if latest is not None:
             raise Refusal(
                 f"slot {record.slot} handoff artifact disappeared after it was read. "
                 "state: REFUSED -- no checkout was salvaged or removed. remedy: restore "
                 "the exact generation-bound sidecar or legacy HANDOFF.md"
             )
-        return
-    if recorded_digest != artifact.sha256:
+        return None
+    if latest is None or not _handoff_read_matches_artifact(latest, artifact):
         raise Refusal(
             f"slot {record.slot} contains an unread HANDOFF.md or handoff sidecar. "
-            "state: REFUSED -- no "
-            "checkout was salvaged or removed. remedy: run 'wrkslots read-handoff "
-            f"{record.slot} --coordinator-authorized --coordinator-pid <current-coordinator-pid>' "
-            "and read its output, then retry remove"
+            "state: REFUSED -- no checkout was salvaged or removed. remedy: run "
+            f"'wrkslots read-handoff {record.slot} --coordinator-authorized "
+            "--coordinator-pid <current-coordinator-pid>' and read its output, then "
+            "retry remove"
         )
+    return latest
 
 
 def _handoff_preconditions(
@@ -12374,8 +12409,11 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
     _validate_name(args.slot, "slot")
     reader = _capture_caller_process(args.coordinator_pid, "coordinator")
     _assert_caller_process(reader, "coordinator")
-    adopt_legacy_change = bool(args.adopt_legacy_change)
-    sidecar_snapshot: _HandoffArtifact | None = None
+    if bool(args.adopt_legacy_change):
+        raise Refusal(
+            "--adopt-legacy-change is unavailable because handoff sidecars are "
+            "immutable once published; preserve both artifacts for manual review"
+        )
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
@@ -12391,35 +12429,18 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
         _assert_target_record_storage_consistent(config, states, record)
         slot_path = _slot_directory(config, record.slot, record.slot_type)
         artifact: _HandoffArtifact | None
-        if adopt_legacy_change:
-            _require_coordinator_authorized(args, "legacy handoff adoption")
-            if args.expected_generation is None:
-                raise Refusal("--adopt-legacy-change requires --expected-generation")
-            _expected_generation(record, args.expected_generation)
-            sidecar_snapshot = _load_handoff_sidecar(config, record)
-            legacy = _legacy_handoff_artifact(config, record, slot_path)
-            if sidecar_snapshot is None or legacy is None:
-                raise Refusal(
-                    "--adopt-legacy-change requires both the generation-bound sidecar "
-                    "and a safe regular legacy HANDOFF.md"
-                )
-            if sidecar_snapshot.contents == legacy.contents:
-                raise Refusal(
-                    "--adopt-legacy-change requires an actual sidecar/legacy disagreement"
-                )
-            artifact = legacy
-        else:
-            if args.expected_generation is not None:
-                raise Refusal(
-                    "--expected-generation applies only with --adopt-legacy-change"
-                )
-            try:
-                artifact = _resolve_handoff_artifact(config, record, slot_path)
-            except Refusal as exc:
-                raise Refusal(
-                    f"{exc}. state: REFUSED -- no read was recorded; preserve both the "
-                    "slot and any handoff sidecar"
-                ) from exc
+        if args.expected_generation is not None:
+            raise Refusal(
+                "--expected-generation applies only with the unavailable "
+                "--adopt-legacy-change compatibility flag"
+            )
+        try:
+            artifact = _resolve_handoff_artifact(config, record, slot_path)
+        except Refusal as exc:
+            raise Refusal(
+                f"{exc}. state: REFUSED -- no read was recorded; preserve both the "
+                "slot and any handoff sidecar"
+            ) from exc
         if artifact is None:
             raise Refusal(
                 f"slot {record.slot} has no handoff sidecar or legacy HANDOFF.md. "
@@ -12464,87 +12485,91 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
                 f"slot {args.slot} handoff read history changed while its contents were "
                 "displayed; no superseding read was recorded"
             )
-        current_sidecar: _HandoffArtifact | None = None
-        if adopt_legacy_change:
-            current_sidecar = _load_handoff_sidecar(config, current_record)
-            current_artifact = _legacy_handoff_artifact(
-                config, current_record, current_slot_path
-            )
-            if current_sidecar is None or current_artifact is None:
-                raise Refusal(
-                    f"slot {args.slot} handoff changed while it was displayed; no read "
-                    "or retirement queue event was recorded"
-                )
-            assert sidecar_snapshot is not None
-            if (
-                not _same_handoff_snapshot(current_sidecar, sidecar_snapshot)
-                or not _same_handoff_snapshot(current_artifact, artifact)
-                or current_sidecar.contents == current_artifact.contents
-            ):
-                raise Refusal(
-                    f"slot {args.slot} handoff changed while it was displayed; no read "
-                    "or retirement queue event was recorded"
-                )
-        else:
-            current_artifact = _resolve_handoff_artifact(
-                config, current_record, current_slot_path
-            )
-            if current_artifact is None or not _same_handoff_snapshot(
-                current_artifact, artifact
-            ):
-                raise Refusal(
-                    f"slot {args.slot} handoff changed while it was displayed; no read "
-                    "or retirement queue event was recorded"
-                )
-        _assert_caller_process(reader, "coordinator")
-        already_queued = bool(
-            current_latest is not None
-            and current_latest.retirement_enqueued is True
-            and _handoff_read_matches_artifact(current_latest, current_artifact)
+        current_sidecar = _load_handoff_sidecar(config, current_record)
+        current_artifact = _resolve_handoff_artifact(
+            config, current_record, current_slot_path
         )
+        if current_artifact is None or not _same_handoff_snapshot(
+            current_artifact, artifact
+        ):
+            raise Refusal(
+                f"slot {args.slot} handoff changed while it was displayed; no read "
+                "or retirement queue event was recorded"
+            )
+        _assert_caller_process(reader, "coordinator")
         if (
             not current_artifact.provenance_complete
             or current_artifact.source_path is None
             or current_artifact.source_identity is None
         ):
             raise StateError("cannot record a handoff read without source provenance")
+        latest_matches = bool(
+            current_latest is not None
+            and _handoff_read_matches_artifact(current_latest, current_artifact)
+        )
+        already_queued = bool(
+            latest_matches
+            and current_latest is not None
+            and current_latest.retirement_enqueued is True
+        )
+        sidecar_path = _handoff_sidecar_path(
+            config,
+            current_record.slot,
+            current_record.generation,
+            current_record.machine,
+        )
+        projection_needed = (
+            current_artifact.source == "legacy-slot-file"
+            and current_sidecar is None
+        )
+        event_payload = {
+            "slot": current_record.slot,
+            "generation": current_record.generation,
+            "sha256": current_artifact.sha256,
+            "contents_utf8": rendered,
+            "source": current_artifact.source,
+            "source_path": str(current_artifact.source_path),
+            "source_identity": _regular_file_identity_to_obj(
+                current_artifact.source_identity
+            ),
+            "reader": _identity_to_obj(reader),
+            "coordinator_authorized": bool(args.coordinator_authorized),
+        }
+        if projection_needed and not latest_matches:
+            _ensure_event_log(config, current_record.machine, require_repository=False)
+            _write_event_file(
+                config,
+                current_record.machine,
+                "handoff-read",
+                {**event_payload, "retirement_enqueued": False},
+            )
+            _interrupt_for_test("after-handoff-read-event")
+        if projection_needed:
+            projected = dataclasses.replace(current_artifact, path=sidecar_path)
+            _atomic_write_handoff_noreplace(
+                sidecar_path, _handoff_artifact_to_obj(projected)
+            )
+            _interrupt_for_test("after-handoff-sidecar-write")
+            published = _load_handoff_sidecar(config, current_record)
+            if published is None or (
+                published.contents != projected.contents
+                or published.sha256 != projected.sha256
+                or published.source != projected.source
+                or published.source_path != projected.source_path
+                or published.source_identity != projected.source_identity
+            ):
+                raise StateError(
+                    "handoff sidecar changed after its no-replace publication"
+                )
         if not already_queued:
             _ensure_event_log(config, current_record.machine, require_repository=False)
             _write_event_file(
                 config,
                 current_record.machine,
                 "handoff-read",
-                {
-                    "slot": current_record.slot,
-                    "generation": current_record.generation,
-                    "sha256": current_artifact.sha256,
-                    "contents_utf8": rendered,
-                    "source": current_artifact.source,
-                    "source_path": str(current_artifact.source_path),
-                    "source_identity": _regular_file_identity_to_obj(
-                        current_artifact.source_identity
-                    ),
-                    "reader": _identity_to_obj(reader),
-                    "coordinator_authorized": bool(args.coordinator_authorized),
-                    "retirement_enqueued": True,
-                },
+                {**event_payload, "retirement_enqueued": True},
             )
-            _interrupt_for_test("after-handoff-read-event")
-        if current_artifact.source == "legacy-slot-file":
-            if adopt_legacy_change:
-                _interrupt_for_test("after-handoff-adopt-read")
-                assert current_sidecar is not None
-                sidecar_path = current_sidecar.path
-            else:
-                sidecar_path = _handoff_sidecar_path(
-                    config,
-                    current_record.slot,
-                    current_record.generation,
-                    current_record.machine,
-                )
-            projected = dataclasses.replace(current_artifact, path=sidecar_path)
-            _atomic_write_json(sidecar_path, _handoff_artifact_to_obj(projected))
-            _interrupt_for_test("after-handoff-sidecar-write")
+            _interrupt_for_test("after-handoff-read-enqueued")
         digest = current_artifact.sha256
         record = current_record
     print(f"recorded HANDOFF.md read slot={record.slot} sha256={digest}")
@@ -12612,37 +12637,24 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
             storage_identity=_source_identity,
         )
         if existing is not None and not existing.provenance_complete:
-            if existing.source != "write-handoff":
-                raise Refusal(
-                    f"slot {record.slot} has a schema 1 legacy handoff sidecar; "
-                    "a coordinator must read its live validated legacy source"
-                )
-            if existing.contents != artifact.contents or existing.sha256 != artifact.sha256:
-                raise Refusal(
-                    f"slot {record.slot} schema 1 handoff differs from the proposed "
-                    "external source; preserve both and reconcile their exact bytes"
-                )
-            upgrade_snapshot = existing
-            _interrupt_for_test("before-handoff-sidecar-provenance-upgrade")
-            current = _load_handoff_sidecar(config, record)
-            if current is None or not _same_handoff_snapshot(current, upgrade_snapshot):
-                raise Refusal(
-                    f"slot {record.slot} schema 1 handoff changed before its provenance "
-                    "upgrade; preserve the current sidecar and retry from fresh state"
-                )
-            _atomic_write_json(sidecar_path, _handoff_artifact_to_obj(artifact))
-            _interrupt_for_test("after-handoff-sidecar-write")
-            written = _load_handoff_sidecar(config, record)
-            if written is None or not written.provenance_complete:
-                raise StateError("handoff sidecar disappeared after its atomic upgrade")
-            artifact = written
-        elif existing is None or existing.contents != artifact.contents:
-            _atomic_write_json(sidecar_path, _handoff_artifact_to_obj(artifact))
+            raise Refusal(
+                f"slot {record.slot} handoff sidecar schema 1 lacks auditable source "
+                "provenance and is permanently manual-only; preserve it for inspection"
+            )
+        if existing is None:
+            _atomic_write_handoff_noreplace(
+                sidecar_path, _handoff_artifact_to_obj(artifact)
+            )
             _interrupt_for_test("after-handoff-sidecar-write")
             written = _load_handoff_sidecar(config, record)
             if written is None:
                 raise StateError("handoff sidecar disappeared after its atomic write")
             artifact = written
+        elif existing.contents != artifact.contents:
+            raise Refusal(
+                f"slot {record.slot} already has an immutable handoff sidecar with "
+                "different contents; preserve both versions for manual review"
+            )
         else:
             artifact = existing
         if (
@@ -15938,17 +15950,30 @@ def _finish_remove_paths(
                     f"fenced HANDOFF.md became unsafe: {handoff}; preserve the fenced slot "
                     "and run 'wrkslots recover'"
                 )
-            try:
-                contents = handoff.read_bytes()
-            except OSError as exc:
-                raise Refusal(
-                    f"cannot reread fenced HANDOFF.md before removal: {handoff}: {exc}"
-                ) from exc
+            contents, identity = _read_regular_file_identity(
+                handoff,
+                "fenced HANDOFF.md before removal",
+                HANDOFF_BYTES_LIMIT,
+            )
             digest = hashlib.sha256(contents).hexdigest()
-            if _recorded_handoff_digest(config, record) != digest:
+            latest = _latest_handoff_read(
+                record, _load_events(config, record.machine)
+            )
+            expected_source_path = (
+                _slot_directory(config, record.slot, record.slot_type) / "HANDOFF.md"
+            ).resolve(strict=False)
+            if (
+                latest is None
+                or not latest.provenance_complete
+                or latest.sha256 != digest
+                or latest.source != "legacy-slot-file"
+                or latest.source_path != expected_source_path
+                or latest.source_identity != identity
+            ):
                 raise Refusal(
-                    f"fenced HANDOFF.md changed after it was read: {handoff}; preserve the "
-                    "slot and rerun 'wrkslots read-handoff' before recovery"
+                    f"fenced HANDOFF.md changed after its exact provenance-bearing read: "
+                    f"{handoff}; preserve the slot and rerun coordinator-authorized "
+                    "'wrkslots read-handoff' before recovery"
                 )
             try:
                 handoff.unlink()
@@ -16973,7 +16998,9 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 record = _find_record(state, slot)
                 _expected_generation(record, generation)
                 _handoff_artifact_from_obj(config, record, raw, target, identity)
-                os.replace(leftover, target)
+                _rename_noreplace(
+                    leftover, target, "recover handoff sidecar publication"
+                )
                 _fsync_directory(target.parent)
                 print(
                     f"recovered handoff sidecar {target.name} from {leftover.name}"
@@ -27777,15 +27804,15 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--adopt-legacy-change",
         action="store_true",
         help=(
-            "after ordinary read refuses a real sidecar/legacy mismatch, explicitly adopt "
-            "the current safe legacy bytes; requires coordinator authorization and generation"
+            "deprecated compatibility flag that always refuses; published handoff "
+            "sidecars are immutable"
         ),
     )
     read_handoff.add_argument(
         "--expected-generation",
         type=int,
         metavar="N",
-        help="exact current generation; required only with --adopt-legacy-change",
+        help="exact current generation; accepted only with the deprecated adoption flag",
     )
     read_handoff.set_defaults(handler=_cmd_read_handoff)
 

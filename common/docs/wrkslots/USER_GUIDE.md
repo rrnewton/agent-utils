@@ -138,8 +138,8 @@ file remains readable for migration.
 The bounded UTF-8 contents go to a generation-bound control-plane sidecar, so writing the handoff
 does not make a clean checkout dirty. The sidecar records the source classification, absolute path,
 and exact file identity alongside its bytes. The same provenance is copied into write and read
-events. The sidecar is immutable after `finish`; `finish` still
-refuses every tracked, untracked, or ignored checkout change. In particular, it does not exempt a
+events. The sidecar is immutable once published; `finish` still refuses every tracked,
+untracked, or ignored checkout change. In particular, it does not exempt a
 pre-sidecar `HANDOFF.md` inside a flat-layout checkout.
 
 `wrkslots read-handoff SLOT --coordinator-pid PID` prints the exact sidecar contents and durably
@@ -149,11 +149,10 @@ the sidecar without moving or unlinking the old file. If both exist, their bytes
 The command does not hold the state lock while it writes up to 1 MiB to the caller: it snapshots the
 exact generation and file identity, writes and flushes the bytes, then reacquires the lock and
 revalidates both before recording the read. A failed flush or concurrent change records no new read.
-When the checkout file genuinely changed after an earlier read, ordinary read still refuses and keeps
-both copies. After inspecting both versions, a coordinator may use the explicit adoption option
-shown by `wrkslots read-handoff --help`, with coordinator authorization and the expected generation.
-The command records the newly displayed bytes before atomically updating the sidecar and still
-removes nothing.
+When the checkout file genuinely changed after an earlier read, ordinary read refuses and keeps
+both copies. Published sidecars are immutable: the deprecated adoption option also refuses, so no
+command silently replaces either artifact. An operator must preserve and reconcile the disagreement
+outside this destructive workflow before a fresh slot can provide new retirement evidence.
 
 Inspect the queue with `wrkslots retirement-queue --format json`. A coordinator may attempt a
 bounded group with `wrkslots retire-pending --limit N --coordinator-pid PID --format json`. Each
