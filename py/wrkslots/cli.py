@@ -4965,57 +4965,57 @@ def _retirement_candidates(
 def _remove_handoff_sidecar_after_archive(
     config: Config, record: ActiveRecord
 ) -> None:
-    """Quarantine and remove only the identity-fenced archived sidecar."""
+    """Move an archived sidecar to durable identity-bound retired storage."""
 
     sidecar_path = _handoff_sidecar_path(
         config, record.slot, record.generation, record.machine
     )
     name_digest = hashlib.sha256(sidecar_path.name.encode("utf-8")).hexdigest()[:16]
-    prefix = f"HANDOFF-CLEANUP.{name_digest}."
-    quarantines = sorted(config.control.glob(f"{prefix}*"))
-    if len(quarantines) > 1:
+    prefix = f"HANDOFF-RETIRED.{name_digest}."
+    retired_paths = sorted(config.control.glob(f"{prefix}*"))
+    if len(retired_paths) > 1:
         raise StateError(
-            f"multiple handoff cleanup quarantines exist for slot {record.slot}"
+            f"multiple retired handoff sidecars exist for slot {record.slot}"
         )
     digest = _recorded_handoff_digest(config, record)
-    if quarantines:
-        quarantine = quarantines[0]
+    if retired_paths:
+        retired = retired_paths[0]
         if sidecar_path.exists() or sidecar_path.is_symlink():
             raise StateError(
                 f"handoff sidecar was replaced during archived cleanup for slot "
-                f"{record.slot}; preserve both {sidecar_path} and {quarantine}"
+                f"{record.slot}; preserve both {sidecar_path} and {retired}"
             )
         match = re.fullmatch(
-            rf"{re.escape(prefix)}([0-9a-f]+)\.([0-9a-f]+)\.([0-9a-f]{{64}})\."
-            r"([0-9a-f]{32})",
-            quarantine.name,
+            rf"{re.escape(prefix)}([0-9a-f]+)\.([0-9a-f]+)\."
+            r"([0-9a-f]{64})\.([0-9a-f]{64})\.json",
+            retired.name,
         )
         if match is None:
-            raise StateError(f"invalid handoff cleanup quarantine: {quarantine}")
+            raise StateError(f"invalid retired handoff sidecar: {retired}")
         contents, identity = _read_regular_file_identity(
-            quarantine, "handoff cleanup quarantine", HANDOFF_SIDECAR_BYTES_LIMIT
+            retired, "retired handoff sidecar", HANDOFF_SIDECAR_BYTES_LIMIT
         )
         if (
             identity.device != int(match.group(1), 16)
             or identity.inode != int(match.group(2), 16)
-            or identity.sha256 != match.group(3)
+            or digest != match.group(3)
+            or identity.sha256 != match.group(4)
         ):
             raise StateError(
-                f"handoff cleanup quarantine identity changed: {quarantine}"
+                f"retired handoff sidecar identity changed: {retired}"
             )
         artifact = _handoff_artifact_from_obj(
             config,
             record,
-            _strict_json_object(contents, "handoff cleanup quarantine"),
+            _strict_json_object(contents, "retired handoff sidecar"),
             sidecar_path,
             identity,
         )
         if digest != artifact.sha256:
             raise Refusal(
-                f"handoff cleanup quarantine does not match the exact read for slot "
+                f"retired handoff sidecar does not match the exact read for slot "
                 f"{record.slot}; preserve it and run 'wrkslots recover'"
             )
-        _remove_control_file(quarantine)
         return
 
     sidecar = _load_handoff_sidecar(config, record)
@@ -5027,51 +5027,45 @@ def _remove_handoff_sidecar_after_archive(
             "preserve it and run 'wrkslots recover'"
         )
     identity = sidecar.storage_identity
-    quarantine = config.control / (
-        f"{prefix}{identity.device:x}.{identity.inode:x}.{identity.sha256}."
-        f"{uuid.uuid4().hex}"
+    retired = config.control / (
+        f"{prefix}{identity.device:x}.{identity.inode:x}.{sidecar.sha256}."
+        f"{identity.sha256}.json"
     )
+    if retired.exists() or retired.is_symlink():
+        raise StateError(
+            f"retired handoff destination already exists for slot {record.slot}: {retired}"
+        )
     try:
-        os.rename(sidecar_path, quarantine)
+        os.rename(sidecar_path, retired)
         _fsync_directory(config.control)
     except OSError as exc:
         raise Refusal(
             f"cannot quarantine handoff sidecar {sidecar_path}: {exc}"
         ) from exc
     _interrupt_for_test("after-handoff-sidecar-quarantine")
-    contents, quarantined_identity = _read_regular_file_identity(
-        quarantine, "handoff cleanup quarantine", HANDOFF_SIDECAR_BYTES_LIMIT
+    _interrupt_for_test("before-handoff-retired-sidecar-finalize")
+    contents, retired_identity = _read_regular_file_identity(
+        retired, "retired handoff sidecar", HANDOFF_SIDECAR_BYTES_LIMIT
     )
-    quarantined = _handoff_artifact_from_obj(
+    retired_artifact = _handoff_artifact_from_obj(
         config,
         record,
-        _strict_json_object(contents, "handoff cleanup quarantine"),
+        _strict_json_object(contents, "retired handoff sidecar"),
         sidecar_path,
-        quarantined_identity,
+        retired_identity,
     )
     if (
-        quarantined_identity.device != identity.device
-        or quarantined_identity.inode != identity.inode
-        or quarantined_identity.sha256 != identity.sha256
-        or quarantined.sha256 != digest
+        retired_identity != identity
+        or retired_artifact.sha256 != digest
     ):
-        if not sidecar_path.exists() and not sidecar_path.is_symlink():
-            os.replace(quarantine, sidecar_path)
-            _fsync_directory(config.control)
         raise StateError(
-            f"handoff sidecar identity changed at its cleanup boundary for slot "
-            f"{record.slot}; preserved it for recovery"
+            f"retired handoff sidecar identity changed at its archive boundary for slot "
+            f"{record.slot}; preserved it for inspection"
         )
     if sidecar_path.exists() or sidecar_path.is_symlink():
         raise StateError(
             f"handoff sidecar pathname was replaced during cleanup for slot "
             f"{record.slot}; preserved both identities for recovery"
-        )
-    _remove_control_file(quarantine)
-    if sidecar_path.exists() or sidecar_path.is_symlink():
-        raise StateError(
-            f"handoff sidecar pathname reappeared during cleanup for slot {record.slot}; "
-            "preserve it and run 'wrkslots recover'"
         )
 
 

@@ -156,7 +156,9 @@ or path-fence race retains the slot in the queue. Successful archived removal cl
 Attempt events rotate blocked entries behind never-attempted and less-recently-attempted entries, so
 one retained slot cannot starve the rest of a bounded queue. Lock contention is deferred; corrupt,
 partial, or indeterminate state stops the batch and requires recovery instead of being mislabeled as
-retained. The exact handoff bytes remain in append-only history.
+retained. Sidecar cleanup atomically renames the exact inode into content-addressed retired control
+storage and never unlinks that retired pathname, so a same-UID replacement cannot be mistaken for
+the acknowledged artifact. The exact handoff bytes remain in append-only history.
 
 ## Git remotes and salvage
 
