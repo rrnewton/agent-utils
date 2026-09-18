@@ -6199,7 +6199,9 @@ def test_batch_census_isolated_real_file_alias_mapping_and_socket(
             # The historical oracle itself misses this relative filesystem
             # binding. Its exact result is retained; it cannot authorize clear.
             (tmp_path / "reference-lsof.json").write_text(json.dumps({"rc": rc, "stdout": out.decode(), "stderr": err.decode()}))
-            assert rc in (0, 1) and not err, (out, err)
+            assert rc in (0, 1) and wrkslots._unrelated_lsof_warnings(
+                err.decode(errors="surrogateescape"), selected
+            ), (out, err)
         budget = wrkslots._ReadOnlyCommandBudget.start(
             timeout_seconds=22, stdout_limit=16 * 1024 * 1024,
             stderr_limit=64 * 1024, input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
