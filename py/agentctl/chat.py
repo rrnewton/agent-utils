@@ -623,7 +623,7 @@ class Bridge:
                                _closing_pattern(nonces) if nonces else "", watch_settled=True)
 
     def capture_event(self, event: PaneOutputSnapshot | PaneAgentStatus) -> dict[str, object]:
-        """Treat settled-state events as a hint to recheck previously incomplete replies."""
+        """Treat settled-state events as a hint to recheck incomplete replies."""
         if isinstance(event, PaneOutputSnapshot):
             return self.capture_output(event)
         info = resolve_target(self.client, self.config.target)

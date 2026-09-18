@@ -56,8 +56,8 @@ class PaneAgentStatus:
 class PaneOutputStream:
     """Subscribe immediately, then block with ``wait`` until output or a deadline.
 
-    ``pattern`` is a Rust regex matched against individual rendered lines. ``lines``
-    bounds the requested retained snapshot; ``max_frame_bytes`` independently caps
+    ``pattern`` is a regular expression Herdr matches against individual rendered
+    lines. ``lines`` bounds the requested retained snapshot; ``max_frame_bytes`` independently caps
     each JSON wire frame. Connection and subscription acknowledgement share the
     ``connect_timeout`` deadline, in seconds. ``wake`` may interrupt ``wait`` from
     another thread; other methods must be called by the single owning thread.
