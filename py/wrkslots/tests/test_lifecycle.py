@@ -1096,11 +1096,15 @@ def remove(project: Path, slot: str = "slot01") -> subprocess.CompletedProcess[s
 
 
 def mark_owner_dead(
-    project: Path, machine: str = "testhost", *, expire: bool = True
+    project: Path,
+    machine: str = "testhost",
+    *,
+    expire: bool = True,
+    slot: str | None = None,
 ) -> None:
     config = wrkslots._load_config(str(project), machine)
     state = wrkslots._load_active(config)
-    record = state.slots[0]
+    record = state.slots[0] if slot is None else wrkslots._find_record(state, slot)
     assert record.owner is not None
     owner = replace(
         record.owner,
@@ -14556,6 +14560,89 @@ def test_retire_pending_uses_remove_and_cleans_sidecar(
     assert not sidecar.exists()
 
 
+def test_sidecar_cleanup_preserves_path_replacement_and_recovers_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    commit_task(repository, checkout(project), "codex/task")
+    source = tmp_path / "handoff-input.md"
+    source.write_text("original sidecar\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(source),
+    ).returncode == 0
+    assert finish(project).returncode == 0
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ).returncode == 0
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+
+    def replace_after_quarantine(point: str) -> None:
+        if point == "after-handoff-sidecar-quarantine":
+            sidecar.write_text("replacement must survive\n", encoding="utf-8")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", replace_after_quarantine)
+    code = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert code == 3
+    assert "preserved both identities" in capsys.readouterr().err
+    assert sidecar.read_text(encoding="utf-8") == "replacement must survive\n"
+    quarantines = list(config.control.glob("HANDOFF-CLEANUP.*"))
+    assert len(quarantines) == 1
+    assert not wrkslots._load_active(config).slots
+    assert wrkslots._load_archive(config).records[-1]["slot"] == "slot01"
+    assert (config.control / "ACTIVE.testhost.journal").is_file()
+
+    sidecar.unlink()
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert not quarantines[0].exists()
+    assert not (config.control / "ACTIVE.testhost.journal").exists()
+
+
 def test_retire_pending_retains_live_slot_and_queue_entry(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -14762,6 +14849,69 @@ def test_retirement_attempt_event_is_crash_safe_and_rotates_queue(
     assert payload["reason"] == "selected by bounded retirement queue"
 
 
+def test_same_digest_reenqueue_has_fresh_attempt_identity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text("same bytes\n", encoding="utf-8")
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ).returncode == 0
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "retire-pending",
+                "--limit",
+                "1",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    config = wrkslots._load_config(str(project), "testhost")
+    first = wrkslots._retirement_candidates(
+        config, wrkslots._load_active(config), wrkslots._load_events(config)
+    )[0]
+    assert first.last_attempt_sequence is not None
+    wrkslots._write_event_file(
+        config,
+        "testhost",
+        "handoff-read",
+        {
+            "slot": "slot01",
+            "generation": 1,
+            "sha256": first.sha256,
+            "retirement_enqueued": False,
+        },
+    )
+    assert raw_command(
+        project,
+        "read-handoff",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ).returncode == 0
+
+    refreshed = wrkslots._retirement_candidates(
+        config, wrkslots._load_active(config), wrkslots._load_events(config)
+    )[0]
+    assert refreshed.sha256 == first.sha256
+    assert refreshed.event_sequence > first.event_sequence
+    assert refreshed.last_attempt_sequence is None
+
+
 def test_retire_pending_reclassifies_post_completion_refusal_as_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -14876,9 +15026,12 @@ def test_retire_pending_distinguishes_corrupt_state_from_lock_deferral(
     output = capsys.readouterr()
     if failure_type == "state":
         assert code == 3
-        assert "outcome=could-not-determine" in output.err
-        assert "recovery_required=true" in output.err
-        assert '"retained"' not in output.out
+        payload = json.loads(output.out)
+        assert payload["removed"] == []
+        assert payload["retained"] == []
+        assert payload["recovery_required"] is True
+        assert payload["could_not_determine"][0]["outcome"] == "could-not-determine"
+        assert payload["could_not_determine"][0]["recovery_required"] is True
     else:
         assert code == 0
         payload = json.loads(output.out)
@@ -14944,6 +15097,99 @@ def test_retire_pending_uses_one_end_to_end_lock_deadline(
     assert len(observed) == 2
     assert observed[0][0] == observed[1][0]
     assert 0 <= observed[1][1] <= observed[0][1] <= 30
+
+
+def test_retire_pending_json_preserves_success_before_partial_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    for slot, agent, branch in (
+        ("slot01", "codex-1", "codex/one"),
+        ("slot02", "codex-2", "codex/two"),
+    ):
+        assert create(project, slot=slot, agent=agent, branch=branch).returncode == 0
+        commit_task(repository, checkout(project, slot=slot), branch)
+        source = tmp_path / f"{slot}.md"
+        source.write_text(f"retire {slot}\n", encoding="utf-8")
+        assert raw_command(
+            project,
+            "write-handoff",
+            slot,
+            "--agent",
+            agent,
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--from-file",
+            str(source),
+        ).returncode == 0
+        assert finish(project, slot=slot, agent=agent).returncode == 0
+        assert raw_command(
+            project,
+            "read-handoff",
+            slot,
+            "--coordinator-pid",
+            str(os.getpid()),
+        ).returncode == 0
+        mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    original_remove = wrkslots._cmd_remove
+
+    def remove_then_corrupt(
+        args: argparse.Namespace,
+        *,
+        private_cleanup: wrkslots._PrivateCleanupContext | None = None,
+        validation_removal_proof: wrkslots._ValidationRemovalProof | None = None,
+        emit: bool = True,
+    ) -> int:
+        if args.slot == "slot02":
+            partial = config.control / "ACTIVE.testhost.json.tmp.injected"
+            partial.write_text("partial\n", encoding="utf-8")
+            raise wrkslots.StateError(f"partial state update exists: {partial}")
+        return original_remove(
+            args,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=validation_removal_proof,
+            emit=emit,
+        )
+
+    monkeypatch.setattr(wrkslots, "_cmd_remove", remove_then_corrupt)
+    code = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "retire-pending",
+            "--limit",
+            "2",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert code == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["slot"] for row in payload["removed"]] == ["slot01"]
+    assert payload["retained"] == []
+    assert payload["deferred"] == []
+    assert payload["recovery_required"] is True
+    assert payload["could_not_determine"] == [
+        {
+            "generation": 1,
+            "machine": "testhost",
+            "outcome": "could-not-determine",
+            "reason": f"partial state update exists: {config.control / 'ACTIVE.testhost.json.tmp.injected'}",
+            "recovery_required": True,
+            "sha256": hashlib.sha256(b"retire slot02\n").hexdigest(),
+            "slot": "slot02",
+        }
+    ]
 
 
 def test_finish_still_refuses_a_legacy_flat_handoff(tmp_path: Path) -> None:

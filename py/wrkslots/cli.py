@@ -4881,7 +4881,7 @@ def _retirement_candidates(
     state: ActiveState,
     events: Sequence[Mapping[str, object]],
 ) -> tuple[_RetirementCandidate, ...]:
-    last_attempts: dict[tuple[str, int, str], int] = {}
+    last_attempts: dict[tuple[str, int, str, int], int] = {}
     for event in events:
         if event.get("kind") != "retirement-attempted":
             continue
@@ -4893,7 +4893,13 @@ def _retirement_candidates(
         digest = _as_str(payload.get("sha256"), "retirement-attempted event sha256")
         if not DIGEST_RE.fullmatch(digest):
             raise StateError("retirement-attempted event sha256 is not a SHA-256 digest")
-        key = (slot, generation, digest)
+        read_sequence = _as_int(
+            payload.get("handoff_read_sequence"),
+            "retirement-attempted event handoff_read_sequence",
+            minimum=1,
+        )
+        _as_str(payload.get("reason"), "retirement-attempted event reason")
+        key = (slot, generation, digest, read_sequence)
         last_attempts[key] = _as_int(
             event["sequence"], "retirement-attempted event sequence", minimum=1
         )
@@ -4936,7 +4942,7 @@ def _retirement_candidates(
                 event_sequence=sequence,
                 enqueued_at=recorded_at,
                 last_attempt_sequence=last_attempts.get(
-                    (record.slot, record.generation, digest)
+                    (record.slot, record.generation, digest, sequence)
                 ),
                 artifact_path=artifact_path,
                 artifact_source=artifact_source,
@@ -4959,18 +4965,114 @@ def _retirement_candidates(
 def _remove_handoff_sidecar_after_archive(
     config: Config, record: ActiveRecord
 ) -> None:
-    """Remove only the exact sidecar of an already archived generation."""
+    """Quarantine and remove only the identity-fenced archived sidecar."""
+
+    sidecar_path = _handoff_sidecar_path(
+        config, record.slot, record.generation, record.machine
+    )
+    name_digest = hashlib.sha256(sidecar_path.name.encode("utf-8")).hexdigest()[:16]
+    prefix = f"HANDOFF-CLEANUP.{name_digest}."
+    quarantines = sorted(config.control.glob(f"{prefix}*"))
+    if len(quarantines) > 1:
+        raise StateError(
+            f"multiple handoff cleanup quarantines exist for slot {record.slot}"
+        )
+    digest = _recorded_handoff_digest(config, record)
+    if quarantines:
+        quarantine = quarantines[0]
+        if sidecar_path.exists() or sidecar_path.is_symlink():
+            raise StateError(
+                f"handoff sidecar was replaced during archived cleanup for slot "
+                f"{record.slot}; preserve both {sidecar_path} and {quarantine}"
+            )
+        match = re.fullmatch(
+            rf"{re.escape(prefix)}([0-9a-f]+)\.([0-9a-f]+)\.([0-9a-f]{{64}})\."
+            r"([0-9a-f]{32})",
+            quarantine.name,
+        )
+        if match is None:
+            raise StateError(f"invalid handoff cleanup quarantine: {quarantine}")
+        contents, identity = _read_regular_file_identity(
+            quarantine, "handoff cleanup quarantine", HANDOFF_SIDECAR_BYTES_LIMIT
+        )
+        if (
+            identity.device != int(match.group(1), 16)
+            or identity.inode != int(match.group(2), 16)
+            or identity.sha256 != match.group(3)
+        ):
+            raise StateError(
+                f"handoff cleanup quarantine identity changed: {quarantine}"
+            )
+        artifact = _handoff_artifact_from_obj(
+            config,
+            record,
+            _strict_json_object(contents, "handoff cleanup quarantine"),
+            sidecar_path,
+            identity,
+        )
+        if digest != artifact.sha256:
+            raise Refusal(
+                f"handoff cleanup quarantine does not match the exact read for slot "
+                f"{record.slot}; preserve it and run 'wrkslots recover'"
+            )
+        _remove_control_file(quarantine)
+        return
 
     sidecar = _load_handoff_sidecar(config, record)
     if sidecar is None:
         return
-    digest = _recorded_handoff_digest(config, record)
     if digest != sidecar.sha256:
         raise Refusal(
             f"handoff sidecar changed before archived cleanup for slot {record.slot}; "
             "preserve it and run 'wrkslots recover'"
         )
-    _remove_control_file(sidecar.path)
+    identity = sidecar.storage_identity
+    quarantine = config.control / (
+        f"{prefix}{identity.device:x}.{identity.inode:x}.{identity.sha256}."
+        f"{uuid.uuid4().hex}"
+    )
+    try:
+        os.rename(sidecar_path, quarantine)
+        _fsync_directory(config.control)
+    except OSError as exc:
+        raise Refusal(
+            f"cannot quarantine handoff sidecar {sidecar_path}: {exc}"
+        ) from exc
+    _interrupt_for_test("after-handoff-sidecar-quarantine")
+    contents, quarantined_identity = _read_regular_file_identity(
+        quarantine, "handoff cleanup quarantine", HANDOFF_SIDECAR_BYTES_LIMIT
+    )
+    quarantined = _handoff_artifact_from_obj(
+        config,
+        record,
+        _strict_json_object(contents, "handoff cleanup quarantine"),
+        sidecar_path,
+        quarantined_identity,
+    )
+    if (
+        quarantined_identity.device != identity.device
+        or quarantined_identity.inode != identity.inode
+        or quarantined_identity.sha256 != identity.sha256
+        or quarantined.sha256 != digest
+    ):
+        if not sidecar_path.exists() and not sidecar_path.is_symlink():
+            os.replace(quarantine, sidecar_path)
+            _fsync_directory(config.control)
+        raise StateError(
+            f"handoff sidecar identity changed at its cleanup boundary for slot "
+            f"{record.slot}; preserved it for recovery"
+        )
+    if sidecar_path.exists() or sidecar_path.is_symlink():
+        raise StateError(
+            f"handoff sidecar pathname was replaced during cleanup for slot "
+            f"{record.slot}; preserved both identities for recovery"
+        )
+    _remove_control_file(quarantine)
+    if sidecar_path.exists() or sidecar_path.is_symlink():
+        raise StateError(
+            f"handoff sidecar pathname reappeared during cleanup for slot {record.slot}; "
+            "preserve it and run 'wrkslots recover'"
+        )
 
 
 def _empty_state_repair_payload(
@@ -12262,7 +12364,9 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
     removed: list[dict[str, object]] = []
     retained: list[dict[str, object]] = []
     deferred: list[dict[str, object]] = []
-    for candidate in selected:
+    could_not_determine: list[dict[str, object]] = []
+    stopped_at: int | None = None
+    for index, candidate in enumerate(selected):
         identity = {
             "machine": candidate.machine,
             "slot": candidate.slot,
@@ -12284,14 +12388,32 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
         try:
             _cmd_remove(remove_args, emit=False)
         except StateError as exc:
-            raise StateError(
-                "retire-pending outcome=could-not-determine recovery_required=true: "
-                f"{exc}"
-            ) from exc
-        except Refusal as exc:
-            outcome, reason = _retirement_outcome_after_refusal(
-                config, candidate, exc, deadline
+            could_not_determine.append(
+                {
+                    **identity,
+                    "outcome": "could-not-determine",
+                    "reason": str(exc),
+                    "recovery_required": True,
+                }
             )
+            stopped_at = index
+            break
+        except Refusal as exc:
+            try:
+                outcome, reason = _retirement_outcome_after_refusal(
+                    config, candidate, exc, deadline
+                )
+            except StateError as state_error:
+                could_not_determine.append(
+                    {
+                        **identity,
+                        "outcome": "could-not-determine",
+                        "reason": str(state_error),
+                        "recovery_required": True,
+                    }
+                )
+                stopped_at = index
+                break
             destination = (
                 retained
                 if outcome == "retained"
@@ -12310,6 +12432,18 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                     "reason": "ordinary remove completed",
                 }
             )
+    if stopped_at is not None:
+        deferred.extend(
+            {
+                "machine": candidate.machine,
+                "slot": candidate.slot,
+                "generation": candidate.generation,
+                "sha256": candidate.sha256,
+                "outcome": "deferred",
+                "reason": "batch stopped after an indeterminate retirement outcome",
+            }
+            for candidate in selected[stopped_at + 1 :]
+        )
     deferred.extend(
         [
             {
@@ -12326,13 +12460,15 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
         "removed": removed,
         "retained": retained,
         "deferred": deferred,
+        "could_not_determine": could_not_determine,
+        "recovery_required": bool(could_not_determine),
     }
     if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         print(
             f"removed={len(removed)} retained={len(retained)} "
-            f"deferred={len(deferred)}"
+            f"deferred={len(deferred)} could_not_determine={len(could_not_determine)}"
         )
         for item in removed:
             print(
@@ -12349,7 +12485,13 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 f"DEFERRED: {item['machine']}/{item['slot']} "
                 f"generation={item['generation']} reason={item['reason']}"
             )
-    return 0
+        for item in could_not_determine:
+            print(
+                f"COULD_NOT_DETERMINE: {item['machine']}/{item['slot']} "
+                f"generation={item['generation']} recovery_required=true "
+                f"reason={item['reason']}"
+            )
+    return 3 if could_not_determine else 0
 
 
 def _cache_directories_for_path(
@@ -15616,7 +15758,12 @@ def _cmd_remove(
     )
     scoped_validation_finish = bool(args.validate_complete) and private_cleanup is None
     wait_deadline = getattr(args, "_wait_deadline", None)
-    with _mutation_locks(config, args.wait_lock, deadline=wait_deadline):
+    lock_scope = (
+        _mutation_locks(config, args.wait_lock)
+        if wait_deadline is None
+        else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+    )
+    with lock_scope:
         _refuse_partial_state(
             config,
             allow_validate_batch_seals=private_cleanup is not None,
