@@ -16,6 +16,7 @@ from dagrun.attribution import (
     bind_process_tests,
     log_max_bytes,
     recognize,
+    require_step_end_ok,
 )
 
 
@@ -87,6 +88,14 @@ def test_evidence_is_private_and_records_boundaries(tmp_path: Path) -> None:
     assert (directory / "g~3aj.log").stat().st_mode & 0o777 == 0o600
     records = [json.loads(line) for line in (directory / "journal.jsonl").read_text().splitlines()]
     assert [record["event"] for record in records] == ["test_start", "test_end", "done"]
+
+
+def test_step_end_reader_refuses_string_verdicts() -> None:
+    assert require_step_end_ok({"event": "step_end", "ok": False}) is False
+    assert require_step_end_ok({"event": "step_end", "ok": True}) is True
+    for malformed in ("false", "true", 0, 1, None):
+        with pytest.raises(ValueError, match="ok must be a boolean"):
+            require_step_end_ok({"event": "step_end", "ok": malformed})
 
 
 def test_evidence_refuses_symlinks_and_fifos_without_blocking(tmp_path: Path) -> None:
