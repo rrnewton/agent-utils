@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -12,6 +13,7 @@ import time
 import pytest
 
 from dagrun.cgroup import NoopCgroups
+from dagrun.attribution import LOG_DIR_ENV
 from dagrun.model import (
     DEFAULT_SMALL_CPU_COUNT,
     DEFAULT_SMALL_CPU_TIMEOUT,
@@ -234,6 +236,52 @@ def test_fail_fast_reports_independent_step_as_not_launched() -> None:
     assert [o.tag for o in res.outcomes] == ["g.fail"]
     assert res.skipped == ("g.dependent",)
     assert res.not_launched == ("g.independent",)
+
+
+def test_journal_uses_boolean_verdicts_and_accounts_for_unrun_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable journal alone must expose failure and the whole planned population."""
+    log_dir = tmp_path / "journal"
+    monkeypatch.setenv(LOG_DIR_ENV, str(log_dir))
+    cfg = DagConfig(
+        steps=(
+            _step("g", "fail", "exit 1", est=100.0),
+            _step("g", "dependent", "true", deps=["g.fail"], est=90.0),
+            _step("g", "independent", "true", est=80.0),
+            _step(
+                "g",
+                "intentional",
+                "exit 99",
+                skip_reason=IntentionalSkipReason.EMPTY_MANIFEST_BUCKET,
+            ),
+        )
+    )
+
+    result = run_dag(cfg, jobs=1, keep_going=False, verbosity=0)
+    assert not result.ok
+    records = [
+        json.loads(line)
+        for line in (log_dir / "journal.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    ends = [row for row in records if row.get("event") == "step_end"]
+    assert len(ends) == 1
+    assert ends[0]["step"] == "g.fail"
+    assert ends[0]["ok"] is False
+    assert type(ends[0]["ok"]) is bool
+
+    skips = {
+        row["step"]: row["reason"]
+        for row in records
+        if row.get("event") == "step_skip"
+    }
+    assert skips == {
+        "g.dependent": "dependency_failed",
+        "g.independent": "not_launched",
+        "g.intentional": "empty-manifest-bucket",
+    }
+    assert {row["step"] for row in ends} | set(skips) == {step.tag for step in cfg.steps}
 
 
 def test_scoped_eager_exit_cancels_its_family_and_completes_an_independent_family() -> None:

@@ -246,6 +246,23 @@ pub struct RunEvidence {
     journal: Mutex<Option<File>>,
 }
 
+/// A typed field in the JSONL evidence stream.
+pub(crate) enum JournalValue {
+    Text(String),
+    Boolean(bool),
+}
+
+/// Return a `step_end` verdict, refusing absent or non-boolean values.
+pub fn require_step_end_ok(record: &serde_json::Value) -> Result<bool, String> {
+    if record.get("event").and_then(serde_json::Value::as_str) != Some("step_end") {
+        return Err("journal record is not a step_end event".to_string());
+    }
+    record
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "journal step_end ok must be a boolean".to_string())
+}
+
 impl RunEvidence {
     /// Create the evidence directory and open the journal. Returns `None` when logging is disabled
     /// or the directory cannot be created; evidence capture must never be able to fail a run.
@@ -314,9 +331,25 @@ impl RunEvidence {
 
     /// Append one record and flush it. Fields are emitted in the given order after `ts`/`event`.
     pub fn record(&self, event: &str, fields: &[(&str, String)]) {
+        let fields: Vec<(&str, JournalValue)> = fields
+            .iter()
+            .map(|(key, value)| (*key, JournalValue::Text(value.clone())))
+            .collect();
+        self.record_values(event, &fields);
+    }
+
+    /// Append one record with explicit JSON value types and flush it.
+    pub(crate) fn record_values(&self, event: &str, fields: &[(&str, JournalValue)]) {
         let mut line = format!("{{\"ts\":\"{}\",\"event\":\"{}\"", now_s(), jesc(event));
         for (k, v) in fields {
-            line.push_str(&format!(",\"{}\":\"{}\"", jesc(k), jesc(v)));
+            match v {
+                JournalValue::Text(value) => {
+                    line.push_str(&format!(",\"{}\":\"{}\"", jesc(k), jesc(value)));
+                }
+                JournalValue::Boolean(value) => {
+                    line.push_str(&format!(",\"{}\":{}", jesc(k), value));
+                }
+            }
         }
         line.push_str("}\n");
         if let Ok(mut guard) = self.journal.lock() {
@@ -1239,6 +1272,29 @@ mod tests {
         // else compares them, because the differential sets the environment override and so never
         // observes the default at all.
         assert_eq!(DEFAULT_CAPTURE_MAX_BYTES, 4_194_304);
+    }
+
+    #[test]
+    fn step_end_reader_refuses_string_verdicts() {
+        assert_eq!(
+            require_step_end_ok(&serde_json::json!({"event": "step_end", "ok": false})),
+            Ok(false)
+        );
+        assert_eq!(
+            require_step_end_ok(&serde_json::json!({"event": "step_end", "ok": true})),
+            Ok(true)
+        );
+        for malformed in [
+            serde_json::json!("false"),
+            serde_json::json!("true"),
+            serde_json::json!(0),
+            serde_json::Value::Null,
+        ] {
+            let error =
+                require_step_end_ok(&serde_json::json!({"event": "step_end", "ok": malformed}))
+                    .expect_err("a non-boolean verdict must be refused");
+            assert!(error.contains("ok must be a boolean"), "{error}");
+        }
     }
 
     #[test]

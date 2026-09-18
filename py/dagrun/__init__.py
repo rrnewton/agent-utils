@@ -25,6 +25,7 @@ from dagrun.ambient import (
     ambient_bucket,
     capture_ambient_snapshot,
 )
+from dagrun.attribution import require_step_end_ok
 from dagrun.analyze import summarize
 from dagrun.capabilities import (
     ENFORCEMENT_REGISTRY,

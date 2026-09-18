@@ -1291,6 +1291,29 @@ class Runner:
             time.sleep(_LOOP_SLEEP_S)
         for t, _step in threads:
             t.join()
+        if self.evidence is not None:
+            # Intentional skips were recorded before scheduling. Once all supervisors have
+            # joined, the dependency-skip closure and remaining not-launched set are stable, so
+            # the journal can account for every step in the plan.
+            with self.lock:
+                dependency_skips = tuple(sorted(self._skipped()))
+                not_launched = tuple(
+                    sorted(
+                        tag
+                        for tag in self.order
+                        if tag not in self.done
+                        and tag not in dependency_skips
+                        and tag not in self.intentional_skip_tags
+                    )
+                )
+            for tag in dependency_skips:
+                self.evidence.record(
+                    "step_skip", [("step", tag), ("reason", "dependency_failed")]
+                )
+            for tag in not_launched:
+                self.evidence.record(
+                    "step_skip", [("step", tag), ("reason", "not_launched")]
+                )
         self.wall = time.time() - wall_start
         return not self.failed
 
@@ -2061,7 +2084,7 @@ class Runner:
             counts = sink.counts()
             fields = [
                 ("step", step.tag),
-                ("ok", str(ok).lower()),
+                ("ok", ok),
                 ("aborted", str(outcome.aborted).lower()),
                 ("timed_out", str(timed_out).lower()),
                 ("cpu_timed_out", str(cpu_timed_out).lower()),
