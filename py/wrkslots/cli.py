@@ -727,9 +727,31 @@ class _HandoffArtifact:
     sha256: str
     recorded_at: str
     source: str
-    source_path: Path
-    source_identity: _RegularFileIdentity
+    source_path: Path | None
+    source_identity: _RegularFileIdentity | None
+    provenance_complete: bool
     storage_identity: _RegularFileIdentity
+
+
+@dataclasses.dataclass(frozen=True)
+class _HandoffRead:
+    """Latest read evidence, including whether its source was authenticated."""
+
+    sha256: str
+    retirement_enqueued: bool
+    sequence: int
+    recorded_at: str
+    source: str | None
+    source_path: Path | None
+    source_identity: _RegularFileIdentity | None
+
+    @property
+    def provenance_complete(self) -> bool:
+        return (
+            self.source is not None
+            and self.source_path is not None
+            and self.source_identity is not None
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3323,6 +3345,14 @@ def _handoff_artifact_to_obj(artifact: _HandoffArtifact) -> dict[str, object]:
         contents = artifact.contents.decode("utf-8")
     except UnicodeError as exc:
         raise StateError("handoff artifact contains invalid UTF-8") from exc
+    if (
+        not artifact.provenance_complete
+        or artifact.source_path is None
+        or artifact.source_identity is None
+    ):
+        raise StateError(
+            "legacy handoff sidecar must be provenance-upgraded before it is written"
+        )
     return {
         "schema": HANDOFF_SIDECAR_SCHEMA,
         "machine": artifact.machine,
@@ -3382,23 +3412,31 @@ def _handoff_artifact_from_obj(
     expected_legacy_path = (
         _slot_directory(config, record.slot, record.slot_type) / "HANDOFF.md"
     ).resolve(strict=False)
+    provenance_complete = schema == HANDOFF_SIDECAR_SCHEMA
     if schema == HANDOFF_SIDECAR_LEGACY_SCHEMA:
-        if source != "legacy-slot-file" or raw["source_identity"] is None:
-            raise StateError(
-                f"{label} schema 1 lacks auditable write-handoff source provenance; "
-                "preserve it and rewrite it from an external source"
-            )
-        source_path = expected_legacy_path
+        source_path: Path | None = (
+            expected_legacy_path if source == "legacy-slot-file" else None
+        )
     else:
         source_path = Path(_as_str(raw["source_path"], f"{label}.source_path"))
         if not source_path.is_absolute() or ".." in source_path.parts:
             raise StateError(f"{label}.source_path must be a normalized absolute path")
-    if raw["source_identity"] is None:
-        raise StateError(f"{label} lacks source file identity")
-    source_identity = _regular_file_identity_from_obj(
-        _as_mapping(raw["source_identity"], f"{label}.source_identity"),
-        f"{label}.source_identity",
+    source_identity = (
+        None
+        if raw["source_identity"] is None
+        else _regular_file_identity_from_obj(
+            _as_mapping(raw["source_identity"], f"{label}.source_identity"),
+            f"{label}.source_identity",
+        )
     )
+    if schema == HANDOFF_SIDECAR_SCHEMA and source_identity is None:
+        raise StateError(f"{label} lacks source file identity")
+    if (
+        schema == HANDOFF_SIDECAR_LEGACY_SCHEMA
+        and source == "legacy-slot-file"
+        and source_identity is None
+    ):
+        raise StateError(f"{label} lacks its historical legacy file identity")
     if source == "legacy-slot-file" and source_path != expected_legacy_path:
         raise StateError(f"{label} legacy source path does not match its slot")
     contents_text = _as_str(raw["contents_utf8"], f"{label}.contents_utf8")
@@ -3408,7 +3446,7 @@ def _handoff_artifact_from_obj(
     digest = _as_str(raw["sha256"], f"{label}.sha256")
     if not DIGEST_RE.fullmatch(digest) or hashlib.sha256(contents).hexdigest() != digest:
         raise StateError(f"{label} digest does not match its content")
-    if source_identity.sha256 != digest:
+    if source_identity is not None and source_identity.sha256 != digest:
         raise StateError(f"{label} source digest does not match its content")
     return _HandoffArtifact(
         path=path,
@@ -3421,6 +3459,7 @@ def _handoff_artifact_from_obj(
         source=source,
         source_path=source_path,
         source_identity=source_identity,
+        provenance_complete=provenance_complete,
         storage_identity=storage_identity,
     )
 
@@ -3463,9 +3502,40 @@ def _canonical_handoff_source(
     return canonical
 
 
+def _ancestor_git_marker(path: Path, label: str) -> Path | None:
+    """Find an ancestor .git marker without following or trusting it."""
+
+    for directory in (path.parent, *path.parent.parents):
+        marker = directory / ".git"
+        try:
+            metadata = marker.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise Refusal(
+                f"cannot determine Git provenance for {label} {path}: "
+                f"cannot inspect ancestor marker {marker}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise Refusal(
+                f"cannot determine Git provenance for {label} {path}: "
+                f"ancestor marker is a symlink: {marker}"
+            )
+        if stat.S_ISREG(metadata.st_mode):
+            _read_regular_file_identity(marker, "Git marker", 64 * 1024)
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise Refusal(
+                f"cannot determine Git provenance for {label} {path}: "
+                f"ancestor marker is not a regular file or directory: {marker}"
+            )
+        return marker
+    return None
+
+
 def _git_worktree_root_for_handoff_source(path: Path, label: str) -> Path | None:
     """Return the containing Git worktree, refusing an indeterminate probe."""
 
+    marker_before = _ancestor_git_marker(path, label)
     result = _GitVcs._run(
         path.parent,
         (
@@ -3504,6 +3574,13 @@ def _git_worktree_root_for_handoff_source(path: Path, label: str) -> Path | None
         and not stdout
         and stderr.startswith("fatal: not a git repository")
     ):
+        marker_after = _ancestor_git_marker(path, label)
+        marker = marker_after or marker_before
+        if marker is not None:
+            raise Refusal(
+                f"cannot determine Git provenance for {label} {path}: Git rejected "
+                f"ancestor marker {marker}; preserve the input and repair Git metadata"
+            )
         return None
     detail = stderr or stdout or f"Git exited {result.returncode} without diagnostics"
     raise Refusal(f"cannot determine Git provenance for {label} {path}: {detail}")
@@ -3584,6 +3661,7 @@ def _legacy_handoff_artifact(
         source="legacy-slot-file",
         source_path=source_path,
         source_identity=identity,
+        provenance_complete=True,
         storage_identity=identity,
     )
 
@@ -3595,6 +3673,28 @@ def _resolve_handoff_artifact(
 ) -> _HandoffArtifact | None:
     sidecar = _load_handoff_sidecar(config, record)
     legacy = _legacy_handoff_artifact(config, record, slot_path)
+    if sidecar is not None and not sidecar.provenance_complete:
+        if sidecar.source == "write-handoff":
+            raise Refusal(
+                f"slot {record.slot} handoff sidecar schema 1 lacks auditable "
+                "write-handoff source provenance; its exact owner must rewrite it "
+                "from a matching external source"
+            )
+        if legacy is None:
+            raise Refusal(
+                f"slot {record.slot} schema 1 legacy handoff cannot be upgraded: "
+                "its live direct-child HANDOFF.md is absent"
+            )
+        if (
+            sidecar.contents != legacy.contents
+            or sidecar.sha256 != legacy.sha256
+            or sidecar.source_identity != legacy.source_identity
+        ):
+            raise Refusal(
+                f"slot {record.slot} schema 1 legacy handoff cannot be upgraded: "
+                "its live direct-child HANDOFF.md no longer has the recorded identity and content"
+            )
+        return legacy
     if sidecar is not None and legacy is not None:
         if sidecar.contents != legacy.contents or sidecar.sha256 != legacy.sha256:
             raise Refusal(
@@ -5020,8 +5120,8 @@ def _recorded_handoff_digest(
 def _latest_handoff_read(
     record: ActiveRecord,
     events: Sequence[Mapping[str, object]],
-) -> tuple[str, bool, int, str] | None:
-    latest: tuple[str, bool, int, str] | None = None
+) -> _HandoffRead | None:
+    latest: _HandoffRead | None = None
     for event in events:
         if event.get("kind") != "handoff-read":
             continue
@@ -5034,13 +5134,55 @@ def _latest_handoff_read(
         enqueued_value = payload.get("retirement_enqueued", False)
         if not isinstance(enqueued_value, bool):
             raise StateError("handoff-read event retirement_enqueued must be boolean")
-        latest = (
-            digest,
-            enqueued_value,
-            _as_int(event["sequence"], "handoff-read event sequence", minimum=1),
-            _as_str(event["recorded_at"], "handoff-read event recorded_at"),
+        values = (
+            payload.get("source"),
+            payload.get("source_path"),
+            payload.get("source_identity"),
+        )
+        if all(value is None for value in values):
+            source = None
+            source_path = None
+            source_identity = None
+        elif any(value is None for value in values):
+            raise StateError("handoff-read event has incomplete source provenance")
+        else:
+            source = _as_str(values[0], "handoff-read event source")
+            if source not in {"write-handoff", "legacy-slot-file"}:
+                raise StateError("handoff-read event source is invalid")
+            source_path = Path(_as_str(values[1], "handoff-read event source_path"))
+            if not source_path.is_absolute() or ".." in source_path.parts:
+                raise StateError(
+                    "handoff-read event source_path must be a normalized absolute path"
+                )
+            source_identity = _regular_file_identity_from_obj(
+                _as_mapping(values[2], "handoff-read event source_identity"),
+                "handoff-read event source_identity",
+            )
+            if source_identity.sha256 != digest:
+                raise StateError("handoff-read source digest does not match its content")
+        latest = _HandoffRead(
+            sha256=digest,
+            retirement_enqueued=enqueued_value,
+            sequence=_as_int(event["sequence"], "handoff-read event sequence", minimum=1),
+            recorded_at=_as_str(event["recorded_at"], "handoff-read event recorded_at"),
+            source=source,
+            source_path=source_path,
+            source_identity=source_identity,
         )
     return latest
+
+
+def _handoff_read_matches_artifact(
+    read: _HandoffRead, artifact: _HandoffArtifact
+) -> bool:
+    return (
+        read.provenance_complete
+        and artifact.provenance_complete
+        and read.sha256 == artifact.sha256
+        and read.source == artifact.source
+        and read.source_path == artifact.source_path
+        and read.source_identity == artifact.source_identity
+    )
 
 
 def _retirement_candidates(
@@ -5075,9 +5217,15 @@ def _retirement_candidates(
         if record.slot_type != "agent":
             continue
         latest = _latest_handoff_read(record, events)
-        if latest is None or latest[1] is not True:
+        if (
+            latest is None
+            or latest.retirement_enqueued is not True
+            or not latest.provenance_complete
+        ):
             continue
-        digest, _enqueued, sequence, recorded_at = latest
+        digest = latest.sha256
+        sequence = latest.sequence
+        recorded_at = latest.recorded_at
         artifact_path: str | None = None
         artifact_source: str | None = None
         blocked_reason: str | None = None
@@ -5089,9 +5237,9 @@ def _retirement_candidates(
             )
             if artifact is None:
                 blocked_reason = "the exact handoff artifact is missing"
-            elif artifact.sha256 != digest:
+            elif not _handoff_read_matches_artifact(latest, artifact):
                 blocked_reason = (
-                    "the current handoff digest differs from the enqueued read"
+                    "the current handoff provenance differs from the enqueued read"
                 )
             else:
                 artifact_path = str(artifact.path)
@@ -12189,6 +12337,7 @@ def _same_handoff_snapshot(
         left.source,
         left.source_path,
         left.source_identity,
+        left.provenance_complete,
         left.storage_identity,
     ) == (
         right.path,
@@ -12200,6 +12349,7 @@ def _same_handoff_snapshot(
         right.source,
         right.source_path,
         right.source_identity,
+        right.provenance_complete,
         right.storage_identity,
     )
 
@@ -12349,9 +12499,15 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
         _assert_caller_process(reader, "coordinator")
         already_queued = bool(
             current_latest is not None
-            and current_latest[0] == current_artifact.sha256
-            and current_latest[1] is True
+            and current_latest.retirement_enqueued is True
+            and _handoff_read_matches_artifact(current_latest, current_artifact)
         )
+        if (
+            not current_artifact.provenance_complete
+            or current_artifact.source_path is None
+            or current_artifact.source_identity is None
+        ):
+            raise StateError("cannot record a handoff read without source provenance")
         if not already_queued:
             _ensure_event_log(config, current_record.machine, require_repository=False)
             _write_event_file(
@@ -12452,9 +12608,35 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
             source="write-handoff",
             source_path=source,
             source_identity=_source_identity,
+            provenance_complete=True,
             storage_identity=_source_identity,
         )
-        if existing is None or existing.contents != artifact.contents:
+        if existing is not None and not existing.provenance_complete:
+            if existing.source != "write-handoff":
+                raise Refusal(
+                    f"slot {record.slot} has a schema 1 legacy handoff sidecar; "
+                    "a coordinator must read its live validated legacy source"
+                )
+            if existing.contents != artifact.contents or existing.sha256 != artifact.sha256:
+                raise Refusal(
+                    f"slot {record.slot} schema 1 handoff differs from the proposed "
+                    "external source; preserve both and reconcile their exact bytes"
+                )
+            upgrade_snapshot = existing
+            _interrupt_for_test("before-handoff-sidecar-provenance-upgrade")
+            current = _load_handoff_sidecar(config, record)
+            if current is None or not _same_handoff_snapshot(current, upgrade_snapshot):
+                raise Refusal(
+                    f"slot {record.slot} schema 1 handoff changed before its provenance "
+                    "upgrade; preserve the current sidecar and retry from fresh state"
+                )
+            _atomic_write_json(sidecar_path, _handoff_artifact_to_obj(artifact))
+            _interrupt_for_test("after-handoff-sidecar-write")
+            written = _load_handoff_sidecar(config, record)
+            if written is None or not written.provenance_complete:
+                raise StateError("handoff sidecar disappeared after its atomic upgrade")
+            artifact = written
+        elif existing is None or existing.contents != artifact.contents:
             _atomic_write_json(sidecar_path, _handoff_artifact_to_obj(artifact))
             _interrupt_for_test("after-handoff-sidecar-write")
             written = _load_handoff_sidecar(config, record)
@@ -12463,6 +12645,12 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
             artifact = written
         else:
             artifact = existing
+        if (
+            not artifact.provenance_complete
+            or artifact.source_path is None
+            or artifact.source_identity is None
+        ):
+            raise StateError("cannot record a handoff write without source provenance")
         _ensure_event_log(config, record.machine, require_repository=False)
         _write_event_file(
             config,
@@ -12578,7 +12766,9 @@ def _retirement_outcome_after_refusal(
                     current, _load_events(config, current.machine)
                 )
                 if latest is None or (
-                    latest[0], latest[1], latest[2]
+                    latest.sha256,
+                    latest.retirement_enqueued,
+                    latest.sequence,
                 ) != (candidate.sha256, True, candidate.event_sequence):
                     return "deferred", "retirement candidate was superseded"
                 return "retained", str(refusal)
@@ -16073,7 +16263,9 @@ def _cmd_remove(
                 record, _load_events(config, record.machine)
             )
             if latest is None or (
-                latest[0], latest[1], latest[2]
+                latest.sha256,
+                latest.retirement_enqueued,
+                latest.sequence,
             ) != (
                 retirement_candidate.sha256,
                 True,
