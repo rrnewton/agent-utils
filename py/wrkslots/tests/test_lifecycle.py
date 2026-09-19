@@ -14637,6 +14637,70 @@ def test_legacy_projection_noreplace_does_not_enqueue_planted_destination(
 
 
 
+@pytest.mark.parametrize("storage", ["canonical", "temp"])
+def test_wrong_writer_intent_cannot_authorize_sidecar_or_recovery(
+    tmp_path: Path, storage: str
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    assert record.owner is not None
+    source = tmp_path / "external-handoff.md"
+    source.write_text("wrong writer must not authorize\n", encoding="utf-8")
+    contents, identity = wrkslots._read_regular_file_identity(
+        source, "wrong-writer source", wrkslots.HANDOFF_BYTES_LIMIT
+    )
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    artifact = wrkslots._HandoffArtifact(
+        path=sidecar, machine=record.machine, slot=record.slot,
+        generation=record.generation, contents=contents, sha256=identity.sha256,
+        recorded_at=wrkslots._utc_now(), source="write-handoff",
+        source_path=source.resolve(), source_identity=identity,
+        provenance_complete=True, storage_identity=identity,
+    )
+    target = sidecar if storage == "canonical" else sidecar.with_name(
+        f"{sidecar.name}.tmp.wrong-writer"
+    )
+    target.write_text(
+        json.dumps(wrkslots._handoff_artifact_to_obj(artifact), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    wrong_writer = replace(record.owner, boot_id="wrong-writer-boot")
+    wrkslots._ensure_event_log(config)
+    wrkslots._write_event_file(
+        config,
+        record.machine,
+        "handoff-write-intended",
+        {
+            "slot": record.slot,
+            "generation": record.generation,
+            "artifact": wrkslots._handoff_artifact_to_obj(artifact),
+            "writer": wrkslots._identity_to_obj(wrong_writer),
+        },
+    )
+
+    if storage == "canonical":
+        refused = raw_command(
+            project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+        )
+    else:
+        refused = raw_command(
+            project,
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--discard-partial",
+        )
+
+    assert refused.returncode == 3
+    assert "writer does not match the recorded slot owner" in refused.stderr
+    assert target.is_file()
+    if storage == "temp":
+        assert not sidecar.exists()
+
+
+
 @pytest.mark.parametrize("target_present", [False, True])
 def test_write_intent_prevents_legacy_temp_recovery_in_both_branches(
     tmp_path: Path, target_present: bool

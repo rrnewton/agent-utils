@@ -5324,10 +5324,15 @@ def _handoff_write_publication(
                 or artifact.get("source") != "write-handoff"
             ):
                 raise StateError("handoff write intent has an invalid artifact identity")
-            if _identity_from_obj(
+            writer = _identity_from_obj(
                 payload.get("writer"), "handoff write intent writer"
-            ) is None:
+            )
+            if writer is None:
                 raise StateError("handoff write intent lacks an owner identity")
+            if record.owner is None or writer != record.owner:
+                raise StateError(
+                    "handoff write intent writer does not match the recorded slot owner"
+                )
             intents[_as_int(event["sequence"], "handoff write intent sequence", minimum=1)] = artifact
         elif kind == "handoff-write-completed":
             if payload.get("slot") != record.slot or payload.get("generation") != record.generation:
