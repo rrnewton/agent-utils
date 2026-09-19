@@ -10295,13 +10295,15 @@ def _assert_salvage_still_matches(
     vcs: _GitVcs,
     *,
     paths: Mapping[str, Path] | None = None,
+    checkouts: Sequence[Checkout] | None = None,
 ) -> None:
     by_name = {
         _as_str(value.get("checkout"), "salvage receipt.checkout"): value
         for value in receipts
     }
     targets: list[tuple[Checkout, Path, bool]] = []
-    for checkout in record.checkouts:
+    selected_checkouts = record.checkouts if checkouts is None else checkouts
+    for checkout in selected_checkouts:
         path = (
             _stored_path(config, checkout.path, "checkout path")
             if paths is None
@@ -10314,8 +10316,13 @@ def _assert_salvage_still_matches(
                 config, checkout, vcs, path_override=path
             )
         )
-    if set(by_name) != {checkout.name for checkout, _path, _detached in targets}:
-        raise StateError("salvage receipts do not name every recorded checkout exactly once")
+    expected_names = {checkout.name for checkout, _path, _detached in targets}
+    if (
+        set(by_name) != expected_names
+        if checkouts is None
+        else not expected_names <= set(by_name)
+    ):
+        raise StateError("salvage receipts do not name every selected checkout exactly once")
     for checkout, path, allow_detached in targets:
         receipt = by_name[checkout.name]
         head, status_digest, commit, _dirty = _salvage_candidate(
@@ -10415,10 +10422,13 @@ def _uncommitted_handoff_paths(
     record: ActiveRecord,
     slot_path: Path,
     vcs: _GitVcs,
+    *,
+    checkouts: Sequence[Checkout] | None = None,
 ) -> tuple[str, ...]:
     legacy = (slot_path / "HANDOFF.md").absolute()
     unprotected: set[str] = set()
-    for checkout in record.checkouts:
+    selected_checkouts = record.checkouts if checkouts is None else checkouts
+    for checkout in selected_checkouts:
         _moved, checkout_path = _checkout_at_slot(
             config, record, checkout, slot_path
         )
@@ -10448,8 +10458,12 @@ def _assert_no_uncommitted_handoffs(
     record: ActiveRecord,
     slot_path: Path,
     vcs: _GitVcs,
+    *,
+    checkouts: Sequence[Checkout] | None = None,
 ) -> None:
-    unprotected = _uncommitted_handoff_paths(config, record, slot_path, vcs)
+    unprotected = _uncommitted_handoff_paths(
+        config, record, slot_path, vcs, checkouts=checkouts
+    )
     if unprotected:
         shown = ", ".join(unprotected)
         raise Refusal(
@@ -16283,11 +16297,18 @@ def _finish_remove_paths(
                     )
                 moved_checkouts.append(moved)
                 moved_paths[checkout.name] = moved_path
-            _assert_no_uncommitted_handoffs(config, record, fenced_slot, vcs)
+            _assert_no_uncommitted_handoffs(
+                config, record, fenced_slot, vcs, checkouts=remaining
+            )
             _assert_handoff_read(config, record, fenced_slot)
             if record.slot_type == "agent" and salvage:
                 _assert_salvage_still_matches(
-                    config, record, salvage, vcs, paths=moved_paths
+                    config,
+                    record,
+                    salvage,
+                    vcs,
+                    paths=moved_paths,
+                    checkouts=remaining,
                 )
             use_check_record = _record_for_slot_use_check(
                 record,

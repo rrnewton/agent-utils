@@ -9908,6 +9908,122 @@ def test_interrupted_finish_recovers_archive_and_removal(tmp_path: Path) -> None
     assert len(archive["records"]) == 1
 
 
+def test_interrupted_multicheckout_remove_rechecks_only_remaining_handoffs(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    second_repository = project / "repo-two"
+    subprocess.run(
+        ["git", "clone", str(remote), str(second_repository)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    remote_url = git(repository, "remote", "get-url", "origin").stdout.strip()
+    made = command(
+        project,
+        "create",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-slot01",
+        "--purpose",
+        "resume a partially removed multi-checkout slot",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--repo",
+        "first=repo",
+        "--remote-url",
+        f"first={remote_url}",
+        "--branch",
+        "first=codex/first",
+        "--repo",
+        "second=repo-two",
+        "--remote-url",
+        f"second={remote_url}",
+        "--branch",
+        "second=codex/second",
+    )
+    assert made.returncode == 0, made.stderr
+    first = checkout(project, name="first")
+    second = checkout(project, name="second")
+    for name, tree, branch in (
+        ("first", first, "codex/first"),
+        ("second", second, "codex/second"),
+    ):
+        git(tree, "config", "user.name", "Wrkslots Test")
+        git(tree, "config", "user.email", "wrkslots@example.invalid")
+        (tree / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
+        git(tree, "add", f"{name}.txt")
+        git(tree, "commit", "-m", f"publish {name}")
+        git(tree, "push", "-u", "origin", branch)
+    git(repository, "fetch", "origin")
+    git(repository, "merge", "--no-ff", "origin/codex/first", "-m", "land first")
+    git(repository, "merge", "--no-ff", "origin/codex/second", "-m", "land second")
+    git(repository, "push", "origin", "main")
+    for tree in (first, second):
+        git(tree, "fetch", "origin", "main")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    journal_path = wrkslots._journal_path(config)
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["removed"] == ["first"]
+    fenced = wrkslots._finish_fenced_slot(
+        config,
+        wrkslots._record_from_obj(journal["record"], "finish journal.record"),
+        journal,
+    )
+    assert not (fenced / "first").exists()
+    remaining = fenced / "second"
+    assert remaining.is_dir()
+
+    dirty = remaining / "notes" / "HANDOFF-resume.md"
+    dirty.parent.mkdir()
+    dirty.write_text("preserve this continuation\n", encoding="utf-8")
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert refused.returncode == 3
+    assert "HANDOFF-resume.md" in refused.stderr
+    assert dirty.read_text(encoding="utf-8") == "preserve this continuation\n"
+    assert journal_path.is_file()
+    assert len(active_slots(project)) == 1
+
+    dirty.unlink()
+    dirty.parent.rmdir()
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    assert not fenced.exists()
+    assert not journal_path.exists()
+
+
 def test_crash_after_git_removal_before_journal_update_recovers(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     made = create(project)
