@@ -1,173 +1,525 @@
-"""Boxing-independent CPU-time accounting for a step's process group, read from procfs.
+"""Generation-bound, best-effort process-group CPU observations.
 
-WHY THIS EXISTS
----------------
-The per-step ``cpu_timeout`` budget is normally enforced from the step's cgroup
-``cpu.stat`` ``usage_usec``, which is exact and kernel-accounted. But
-``CgroupManager.cpu_stats`` returns ``None`` whenever boxing is not established, and
-the scheduler's guard is then simply skipped — the budget is declared and enforces
-nothing.
+Each member contributes its original own plus waited-child ticks. All samples precede
+all lifecycle validations: a child credited to a sampled parent must subsequently be
+excluded. A pidfd alone is insufficient: an unreaped zombie still owns its CPU. For a
+terminal pidfd we therefore reread the *held, paired* stat file and retain only Z.
 
-That is not an exotic corner. A caller that passes ``--allow-cgroup-failure`` (which
-an originating CI wrapper does unconditionally under ``GITHUB_ACTIONS``/``CI``) runs
-UNBOXED by construction, so on that lane every ``cpu_timeout`` was inert: measured, a
-step with ``cpu_timeout: 3`` burned 60 CPU-seconds and exited green.
-
-The 2026-08-03 decision that chose cgroup polling over ``RLIMIT_CPU`` discounted
-rlimit's "works unboxed" advantage with *"boxing is default-on, unboxed = opted out of
-enforcement."* That premise does not hold for a lane where unboxed is the norm rather
-than an opt-out, so the fallback below restores a bound there — WITHOUT displacing the
-cgroup reading, which remains the primary and is strictly better where available.
-
-WHAT IT MEASURES, AND WHAT IT MISSES
-------------------------------------
-The scheduler starts each step with ``start_new_session=True``, so the step and its
-descendants share one process group whose pgid equals the step leader's pid. This sums,
-over every live member of that group:
-
-    utime + stime            CPU burned by that process itself
-  + cutime + cstime          CPU of descendants it has already REAPED
-
-``cutime``/``cstime`` roll up recursively on ``wait``, and a reaped process is by
-definition no longer in the live set, so the two terms do not double-count. That makes
-this an AGGREGATE measure — the property that made cgroup polling win over per-process
-``RLIMIT_CPU`` in the first place, and the one that matters for parallel command fan-out.
-
-Known gaps, all strictly narrower than "no enforcement at all":
-
-* A descendant that calls ``setpgid`` or ``setsid`` leaves the process group and stops
-  being counted. Nonce-aware teardown may still find and kill it, so accounting is weaker
-  than teardown on this edge.
-* CPU burned by an exited descendant is invisible before its parent reaps it.
-* Sampling is at the monitor interval and live snapshots are cached for up to half a
-  second, so overshoot up to one tick plus that cache window is expected.
-
-Accuracy is therefore a lower bound on true CPU use: weaker than the cgroup reading,
-but materially more informative than no measurement. The scheduler names the source in its
-operator-facing diagnostic whenever this fallback triggers.
+This is not cgroup accounting. Escaped process groups and activity between samples
+can be missed. Missing, ambiguous or resource-limited observations are unavailable,
+never zero. Successful observations are shared for at most half a second.
 """
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
+import resource
+import select
 import threading
 import time
+import weakref
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Protocol
 
-__all__ = ["CPU_SOURCE_CGROUP", "CPU_SOURCE_PROCFS", "subtree_cpu_seconds"]
+__all__ = ["CPU_SOURCE_CGROUP", "CPU_SOURCE_PROCFS", "ProcessGroupCpu", "Unavailable", "subtree_cpu_seconds"]
 
-# Stable identifiers for the accounting that produced a CPU reading. The scheduler uses
-# these in its operator-facing timeout diagnostic so the active mechanism is explicit.
 CPU_SOURCE_CGROUP = "cgroup"
 CPU_SOURCE_PROCFS = "procfs-subtree"
-
-_PROC = Path("/proc")
-
-# /proc/<pid>/stat field indices, 0-based, AFTER the comm field has been split off.
-# The raw layout is `pid (comm) state ppid pgrp ...`; comm can contain spaces and
-# parentheses, so it must be removed by taking the text after the LAST ')' before any
-# field splitting. Relative to that remainder, field 0 is `state`:
-#   state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
-#     0     1    2      3      4      5     6     7       8       9      10
-#   utime stime cutime cstime
-#    11    12     13     14
-_F_PGRP = 2
-_F_UTIME = 11
-_F_STIME = 12
-_F_CUTIME = 13
-_F_CSTIME = 14
-
-try:
-    _CLK_TCK = os.sysconf("SC_CLK_TCK") or 100
-except (ValueError, OSError):  # pragma: no cover - every Linux defines SC_CLK_TCK
-    _CLK_TCK = 100
-
-
-def _read_stat_fields(pid_dir: Path) -> list[str] | None:
-    """Return the whitespace-split tail of ``/proc/<pid>/stat`` after the comm field.
-
-    Returns ``None`` for any process that disappeared mid-scan or whose stat line is
-    malformed. A racing exit is the normal case, not an error: the caller simply does
-    not count a process it cannot read.
-    """
-    try:
-        raw = (pid_dir / "stat").read_text()
-    except (OSError, UnicodeDecodeError):
-        return None
-    close = raw.rfind(")")
-    if close == -1:
-        return None
-    fields = raw[close + 1 :].split()
-    if len(fields) <= _F_CSTIME:
-        return None
-    return fields
-
-
-def _scan_group_ticks(root: Path) -> dict[int, int] | None:
-    """Read one procfs snapshot and aggregate CPU ticks by process group."""
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return None
-
-    groups: dict[int, int] = {}
-    for entry in entries:
-        name = entry.name
-        if not name.isdigit():
-            continue
-        fields = _read_stat_fields(entry)
-        if fields is None:
-            continue
-        try:
-            pgrp = int(fields[_F_PGRP])
-            ticks = (
-                int(fields[_F_UTIME])
-                + int(fields[_F_STIME])
-                + int(fields[_F_CUTIME])
-                + int(fields[_F_CSTIME])
-            )
-        except (ValueError, IndexError):
-            continue
-        groups[pgrp] = groups.get(pgrp, 0) + ticks
-    return groups
-
-
-# All active uncontained steps share one short-lived procfs snapshot. Without this cache, N
-# concurrent steps each scan every process once per second: O(N * host processes) monitor work.
-# Half a second is below the scheduler's one-second polling interval, so peers waking in the same
-# tick share a scan without extending the documented sampling granularity.
+_MAX_RECORD = 16384
+_MAX_MEMBERS = 1024
+_MAX_GROUPS = 256
+_MAX_ENTRIES = 65536
+_FD_RESERVE = 64
+_MAX_INTERRUPTS = 16
+_SCAN_SECONDS = 1.0
 _SNAPSHOT_TTL_S = 0.5
-_snapshot_lock = threading.Lock()
+_U64_MAX = (1 << 64) - 1
+_CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+class Unavailable(Exception):
+    """No complete, authenticated CPU observation is available."""
+
+
+def _check(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise Unavailable("scan deadline")
+
+
+def _native(call: Callable[[], int], deadline: float) -> int:
+    for _ in range(_MAX_INTERRUPTS + 1):
+        _check(deadline)
+        result = call()
+        if result >= 0:
+            return result
+        code = ctypes.get_errno()
+        if code != errno.EINTR:
+            raise OSError(code, os.strerror(code))
+    raise Unavailable("system call interrupted repeatedly")
+
+
+def _libc() -> ctypes.CDLL:
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def _openat(directory: int, path: str, deadline: float) -> int:
+    libc = _libc()
+    libc.openat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    libc.openat.restype = ctypes.c_int
+    return _native(lambda: int(libc.openat(directory, os.fsencode(path), os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)), deadline)
+
+
+def _pidfd(pid: int, deadline: float) -> int:
+    # CPython's pidfd_open is one direct syscall, including on older libc versions
+    # without a pidfd_open symbol. Bound its EINTR handling here, without an ABI table.
+    for _ in range(_MAX_INTERRUPTS + 1):
+        _check(deadline)
+        try:
+            return os.pidfd_open(pid, 0)
+        except InterruptedError:
+            continue
+        except AttributeError as exc:
+            raise Unavailable("pidfd_open unavailable") from exc
+    raise Unavailable("pidfd_open interrupted repeatedly")
+
+
+class _Pollfd(ctypes.Structure):
+    _fields_ = [("fd", ctypes.c_int), ("events", ctypes.c_short), ("revents", ctypes.c_short)]
+
+
+def _poll(fd: int, deadline: float) -> int:
+    libc = _libc()
+    libc.poll.argtypes = [ctypes.POINTER(_Pollfd), ctypes.c_ulong, ctypes.c_int]
+    libc.poll.restype = ctypes.c_int
+    event = _Pollfd(fd, select.POLLIN, 0)
+    count = _native(lambda: int(libc.poll(ctypes.byref(event), 1, 0)), deadline)
+    return 0 if count == 0 else int(event.revents)
+
+
+def _read(fd: int, deadline: float) -> str:
+    """Offset zero is essential: procfs must regenerate the phase-two record."""
+    data = bytearray()
+    libc = _libc()
+    libc.pread64.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_longlong]
+    libc.pread64.restype = ctypes.c_ssize_t
+    while len(data) <= _MAX_RECORD:
+        buffer = ctypes.create_string_buffer(1024)
+        size = _native(lambda: int(libc.pread64(fd, buffer, len(buffer), len(data))), deadline)
+        if size == 0:
+            return data.decode("ascii", errors="surrogateescape")
+        data.extend(buffer.raw[:size])
+    raise Unavailable("oversized proc record")
+
+
+@dataclass(frozen=True)
+class _Stat:
+    pid: int
+    group: int
+    state: str
+    ticks: int
+
+
+def _stat(text: str) -> _Stat:
+    try:
+        opening = text.index(" (")
+        close = text.rindex(")")
+        pid = int(text[:opening])
+        fields = text[close + 1 :].split()
+        group = int(fields[2])
+        cpu = [int(fields[index]) for index in (11, 12, 13, 14)]
+        if close < opening or pid <= 0 or group < 0 or len(fields[0]) != 1:
+            raise ValueError("identity")
+        if any(value < 0 or value > _U64_MAX for value in cpu) or sum(cpu) > _U64_MAX:
+            raise ValueError("CPU overflow")
+        return _Stat(pid, group, fields[0], sum(cpu))
+    except (ValueError, IndexError) as exc:
+        raise Unavailable("malformed stat") from exc
+
+
+def _fd_pid(text: str) -> int:
+    values = [line[4:].strip() for line in text.splitlines() if line.startswith("Pid:")]
+    try:
+        if len(values) != 1:
+            raise ValueError("missing or duplicate Pid")
+        value = int(values[0])
+        if value < -1 or value == 0:
+            raise ValueError("invalid Pid")
+        return value
+    except ValueError as exc:
+        raise Unavailable("malformed pidfd fdinfo") from exc
+
+
+def _gone(exc: OSError) -> bool:
+    return exc.errno in (errno.ENOENT, errno.ESRCH)
+
+
+def _allow_fds(required: int) -> None:
+    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY:
+        return
+    used = 0
+    with os.scandir("/proc/self/fd") as entries:
+        for _ in entries:
+            used += 1
+            if used > _MAX_ENTRIES:
+                raise Unavailable("descriptor census bound")
+    if used + required + _FD_RESERVE > soft:
+        raise Unavailable("descriptor reserve")
+
+
+class _Proc:
+    def __init__(self, path: Path) -> None:
+        _allow_fds(2)
+        self.fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            # A real procfs has a kernel-generated mount identity; ordinary fixture trees
+            # cannot authenticate processes. PID equality also refuses a foreign PID view.
+            libc = ctypes.CDLL(None, use_errno=True)
+            buffer = ctypes.create_string_buffer(256)
+            libc.fstatfs.argtypes = [ctypes.c_int, ctypes.c_void_p]
+            libc.fstatfs.restype = ctypes.c_int
+            if libc.fstatfs(self.fd, buffer) != 0:
+                code = ctypes.get_errno()
+                raise OSError(code, os.strerror(code))
+            if ctypes.c_long.from_buffer(buffer).value != 0x9FA0:
+                raise Unavailable("root is not procfs")
+            statusfd = self.open("self/status")
+            try:
+                status = _read(statusfd, time.monotonic() + _SCAN_SECONDS)
+            finally:
+                os.close(statusfd)
+            namespaces = [line.split()[1:] for line in status.splitlines() if line.startswith("NSpid:")]
+            if namespaces != [[str(os.getpid())]]:
+                raise Unavailable("procfs PID namespace mismatch")
+            with os.fdopen(self.open("self/stat"), "rb") as record:
+                own = _stat(_read(record.fileno(), time.monotonic() + _SCAN_SECONDS))
+            if own.pid != os.getpid():
+                raise Unavailable("procfs PID namespace mismatch")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def open(self, path: str, deadline: float | None = None) -> int:
+        return _openat(self.fd, path, time.monotonic() + _SCAN_SECONDS if deadline is None else deadline)
+
+    def pid(self, pidfd: int, deadline: float) -> int:
+        fd = self.open(f"self/fdinfo/{pidfd}", deadline)
+        try:
+            return _fd_pid(_read(fd, deadline))
+        finally:
+            os.close(fd)
+
+    def pair(self, pid: int, deadline: float) -> _Pair:
+        _check(deadline)
+        _allow_fds(3)
+        pidfd = _pidfd(pid, deadline)
+        statfd = -1
+        try:
+            statfd = self.open(f"{pid}/stat", deadline)
+            original = _stat(_read(statfd, deadline))
+            # Read AFTER opening stat. A detached original pidfd must never authenticate
+            # the stat of a recycled numeric PID, including a new zombie.
+            if self.pid(pidfd, deadline) != pid or original.pid != pid:
+                raise Unavailable("pidfd/stat generation mismatch")
+            return _Pair(pidfd, statfd, original)
+        except BaseException:
+            os.close(pidfd)
+            if statfd >= 0:
+                os.close(statfd)
+            raise
+
+
+class _Pair:
+    def __init__(self, pidfd: int, statfd: int, original: _Stat) -> None:
+        self.pidfd = pidfd
+        self.statfd = statfd
+        self.original = original
+
+    def close(self) -> None:
+        if self.pidfd >= 0:
+            os.close(self.pidfd)
+            os.close(self.statfd)
+            self.pidfd = self.statfd = -1
+
+    def valid(self, deadline: float) -> bool:
+        _check(deadline)
+        bits = _poll(self.pidfd, deadline)
+
+        def fresh() -> _Stat | None:
+            try:
+                return _stat(_read(self.statfd, deadline))
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    return None
+                raise
+
+        return _accept(bits, self.original, fresh)
+
+
+def _accept(bits: int, original: _Stat, fresh: Callable[[], _Stat | None]) -> bool:
+    if bits == 0:
+        return True  # flags=0 pidfd includes a live worker after leader exit.
+    if bits & ~(select.POLLIN | select.POLLHUP | select.POLLRDNORM):
+        raise Unavailable("unexpected pidfd poll result")
+    if not bits & (select.POLLIN | select.POLLHUP):
+        raise Unavailable("ambiguous pidfd poll result")
+    current = fresh()
+    if current is None:
+        return False
+    if current.pid != original.pid:
+        raise Unavailable("held stat identity changed")
+    if current.state == "Z":
+        return True
+    if current.state == "X":
+        return False
+    raise Unavailable("terminal pidfd with ambiguous task state")
+
+
+class _Observation(Protocol):
+    original: _Stat
+
+    def valid(self, deadline: float) -> bool: ...
+    def close(self) -> None: ...
+
+
+class _Source(Protocol):
+    def samples(self, groups: set[int], deadline: float) -> list[_Observation]: ...
+
+
+class _KernelSource:
+    def __init__(self, proc: _Proc) -> None:
+        self.proc = proc
+
+    def samples(self, groups: set[int], deadline: float) -> list[_Observation]:
+        rows: list[_Observation] = []
+        try:
+            with os.scandir(self.proc.fd) as entries:
+                for index, entry in enumerate(entries):
+                    _check(deadline)
+                    if index >= _MAX_ENTRIES:
+                        raise Unavailable("proc entry bound")
+                    if not entry.name.isascii() or not entry.name.isdigit():
+                        continue
+                    pid = int(entry.name)
+                    try:
+                        fd = self.proc.open(f"{pid}/stat", deadline)
+                        try:
+                            hint = _stat(_read(fd, deadline))
+                        finally:
+                            os.close(fd)
+                        if hint.group not in groups:
+                            continue
+                        if len(rows) >= _MAX_MEMBERS:
+                            raise Unavailable("member bound")
+                        pair = self.proc.pair(pid, deadline)
+                    except OSError as exc:
+                        if _gone(exc):
+                            continue
+                        raise
+                    if pair.original.group not in groups:
+                        pair.close()
+                    else:
+                        rows.append(pair)
+            return rows
+        except BaseException:
+            for row in rows:
+                row.close()
+            raise
+
+
+def _scan(source: _Source, groups: set[int], deadline: float) -> dict[int, int]:
+    rows = source.samples(groups, deadline)
+    try:
+        # This barrier is global to the whole aggregate. Do not validate chunks while
+        # later members' original counters can still be sampled after CPU transfer.
+        totals: dict[int, int] = {}
+        for row in rows:
+            _check(deadline)
+            if row.valid(deadline):
+                group = row.original.group
+                value = totals.get(group, 0) + row.original.ticks
+                if value > _U64_MAX:
+                    raise Unavailable("aggregate overflow")
+                totals[group] = value
+        return totals
+    finally:
+        for row in rows:
+            row.close()
+
+
+_lock = threading.RLock()
+_owners: weakref.WeakValueDictionary[int, ProcessGroupCpu] = weakref.WeakValueDictionary()
+_compat: dict[int, tuple[ProcessGroupCpu, float]] = {}
+_next_owner = 0
 _snapshot_at = float("-inf")
-_snapshot_groups: dict[int, int] | None = None
+_snapshot: dict[int, int] = {}
+_snapshot_keys: set[int] = set()
+_snapshot_error: str | None = None
+_snapshot_started = float("-inf")
 
 
-def _default_snapshot() -> dict[int, int] | None:
-    global _snapshot_at, _snapshot_groups
-    now = time.monotonic()
-    with _snapshot_lock:
-        if _snapshot_groups is not None and now - _snapshot_at <= _SNAPSHOT_TTL_S:
-            return _snapshot_groups
-        groups = _scan_group_ticks(_PROC)
-        _snapshot_at = time.monotonic()
-        _snapshot_groups = groups
-        return groups
+def _expire_compatibility(now: float) -> None:
+    # Called under _lock by either API so abandoned compatibility registrations
+    # cannot consume the owned-reader capacity indefinitely.
+    for key, (old, used) in list(_compat.items()):
+        if now - used > _SNAPSHOT_TTL_S:
+            old.close()
+            del _compat[key]
+
+
+class ProcessGroupCpu:
+    """Owned invocation identity. Create at spawn and close after its monitor stops.
+
+    ``seconds`` returns a measurement or raises ``Unavailable``. The object never
+    rebinds to a later occupant of the same PID/process-group number.
+    """
+
+    def __init__(self, pgid: int, *, proc_root: Path = Path("/proc")) -> None:
+        global _next_owner
+        self.proc: _Proc | None = None
+        self.owner: _Pair | None = None
+        self.pgid = pgid
+        self.key = -1
+        self.shared = proc_root == Path("/proc")
+        if not 1 < pgid <= 2147483647:
+            raise Unavailable("invalid process group")
+        try:
+            with _lock:
+                _expire_compatibility(time.monotonic())
+                if len(_owners) >= _MAX_GROUPS:
+                    raise Unavailable("owner bound")
+                proc = _Proc(proc_root)
+                self.proc = proc
+                owner = proc.pair(pgid, time.monotonic() + _SCAN_SECONDS)
+                self.owner = owner
+                if owner.original.group != pgid:
+                    raise Unavailable("owner is not the process-group leader")
+                _next_owner += 1
+                self.key = _next_owner
+                if self.shared:
+                    _owners[self.key] = self
+        except (OSError, Unavailable) as exc:
+            self.close()
+            raise Unavailable(str(exc)) from exc
+
+    def close(self) -> None:
+        """Release only this observation's descriptors, never signal the process."""
+        with _lock:
+            _owners.pop(self.key, None)
+            if self.owner is not None:
+                self.owner.close()
+                self.owner = None
+            if self.proc is not None:
+                self.proc.close()
+                self.proc = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def _authenticate(self, deadline: float) -> None:
+        if self.owner is None or self.proc is None:
+            raise Unavailable("closed owner")
+        if self.proc.pid(self.owner.pidfd, deadline) != self.pgid:
+            raise Unavailable("owner generation gone")
+        current = _stat(_read(self.owner.statfd, deadline))
+        if current.pid != self.pgid or current.group != self.pgid:
+            raise Unavailable("owner identity changed")
+        if not self.owner.valid(deadline):
+            raise Unavailable("owner dead")
+
+    def seconds(self) -> float:
+        """Return checked own+waited CPU seconds from one authenticated observation."""
+        global _snapshot_at, _snapshot, _snapshot_keys, _snapshot_error, _snapshot_started
+        try:
+            with _lock:
+                deadline = time.monotonic() + _SCAN_SECONDS
+                self._authenticate(deadline)
+                assert self.proc is not None
+                if not self.shared:
+                    totals = _scan(_KernelSource(self.proc), {self.pgid}, deadline)
+                    self._authenticate(deadline)
+                    if self.pgid not in totals:
+                        raise Unavailable("no measured members")
+                    return totals[self.pgid] / _CLK_TCK
+                if self.key not in _snapshot_keys or time.monotonic() - _snapshot_at > _SNAPSHOT_TTL_S:
+                    owners = list(_owners.values())
+                    active: list[ProcessGroupCpu] = []
+                    for owner in owners:
+                        try:
+                            owner._authenticate(deadline)
+                        except (OSError, Unavailable):
+                            continue
+                        active.append(owner)
+                    _snapshot_started = time.monotonic()
+                    _snapshot_keys = {owner.key for owner in owners}
+                    try:
+                        totals = _scan(_KernelSource(self.proc), {owner.pgid for owner in active}, deadline)
+                    except (OSError, Unavailable) as exc:
+                        _snapshot = {}
+                        _snapshot_error = str(exc)
+                    else:
+                        values: dict[int, int] = {}
+                        for owner in active:
+                            try:
+                                owner._authenticate(deadline)
+                            except (OSError, Unavailable):
+                                continue
+                            if owner.pgid in totals:
+                                values[owner.key] = totals[owner.pgid]
+                        _snapshot = values
+                        _snapshot_error = None
+                    _snapshot_at = time.monotonic()
+                self._authenticate(deadline)
+                if _snapshot_at - _snapshot_started > _SCAN_SECONDS:
+                    raise Unavailable("scan deadline")
+                if _snapshot_error is not None:
+                    raise Unavailable(_snapshot_error)
+                if self.key not in _snapshot:
+                    raise Unavailable("no measured members")
+                return _snapshot[self.key] / _CLK_TCK
+        except OSError as exc:
+            raise Unavailable(str(exc)) from exc
 
 
 def subtree_cpu_seconds(pgid: int, *, proc_root: Path | None = None) -> float | None:
-    """Lower bound of CPU-seconds observed for process group ``pgid``.
+    """Compatibility projection; live callers should retain ``ProcessGroupCpu``.
 
-    ``None`` means the procfs snapshot was unreadable or contained no readable member of the
-    target group. ``0.0`` therefore means a real readable member was observed with zero ticks;
-    missing evidence is never fabricated as a zero reading. Custom roots bypass the shared live
-    cache so tests and callers receive an exact snapshot of the supplied tree.
+    Custom roots must expose the same authentic procfs/PID view, not synthetic stat
+    files. Failed authentication and unsupported pidfds return None, never old sums.
     """
-    if pgid <= 1:
+    if not 1 < pgid <= 2147483647:
         return None
-    groups = _default_snapshot() if proc_root is None else _scan_group_ticks(proc_root)
-    if groups is None:
+    try:
+        if proc_root is not None:
+            owner = ProcessGroupCpu(pgid, proc_root=proc_root)
+            try:
+                return owner.seconds()
+            finally:
+                owner.close()
+        with _lock:
+            now = time.monotonic()
+            _expire_compatibility(now)
+            entry = _compat.get(pgid)
+            if entry is not None:
+                try:
+                    entry[0]._authenticate(now + _SCAN_SECONDS)
+                except (OSError, Unavailable):
+                    entry[0].close()
+                    del _compat[pgid]
+                    entry = None
+            if entry is None:
+                owner = ProcessGroupCpu(pgid)
+            else:
+                owner = entry[0]
+            _compat[pgid] = (owner, now)
+            return owner.seconds()
+    except (OSError, Unavailable):
         return None
-    ticks = groups.get(pgid)
-    if ticks is None:
-        return None
-    return ticks / _CLK_TCK

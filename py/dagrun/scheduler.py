@@ -66,7 +66,8 @@ from dagrun.model import (
 from dagrun.proccpu import (
     CPU_SOURCE_CGROUP,
     CPU_SOURCE_PROCFS,
-    subtree_cpu_seconds,
+    ProcessGroupCpu,
+    Unavailable,
 )
 from dagrun.profile_enrich import (
     resolve_effective_inner_jobs,
@@ -371,7 +372,7 @@ def uncontained_cpu_budget_warning(cfg: DagConfig) -> str | None:
 
     Without a cgroup, the exact ``cpu.stat`` counter is unavailable. The runner instead samples
     a best-effort procfs process-group floor. It can reap an ordinary over-budget process tree,
-    but it misses processes that leave the group and CPU from exited descendants until reaped.
+    but it misses processes that leave the group and activity between observations.
     The warning must name that weaker guarantee rather than equate it with cgroup accounting.
 
     Returns ``None`` when no step carries a live budget, so a graph that has genuinely disabled
@@ -392,7 +393,7 @@ def uncontained_cpu_budget_warning(cfg: DagConfig) -> str | None:
     return (
         "UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort "
         f"procfs process-group CPU floor will police {len(live)} step(s) (largest {max(live)}s), "
-        "but it can miss processes that leave the group and not-yet-reaped exits. "
+        "but it can miss processes that leave the group and activity between observations. "
         "`capabilities` cannot express that quality difference."
     )
 
@@ -1631,6 +1632,14 @@ class Runner:
             except Exception:
                 pass  # a broken/held pipe must never crash the supervisor
 
+        # Retain the launched generation for the whole monitor lifetime.
+        process_cpu: ProcessGroupCpu | None = None
+        if not boxed and cpu_budget > 0:
+            try:
+                process_cpu = ProcessGroupCpu(proc.pid)
+            except Unavailable:
+                pass  # Existing monitor warning retains the unavailable-evidence policy.
+
         monitor_stop = threading.Event()
         thread_peak: int | None = None
         trace_sample_index = 0
@@ -1710,6 +1719,9 @@ class Runner:
                     "ENFORCED for this step; only the wall timeout still applies."
                 )
                 print(traceback.format_exc(), file=sys.stderr)
+            finally:
+                if process_cpu is not None:
+                    process_cpu.close()
 
         def _monitor_body() -> None:
             # Poll the step's cgroup descendant-thread count for a per-step peak (metrics
@@ -1758,7 +1770,10 @@ class Runner:
                         measured = None if cs is None else _cpu_seconds_from_stats(cs)
                         source = CPU_SOURCE_CGROUP
                     else:
-                        measured = subtree_cpu_seconds(proc.pid)
+                        try:
+                            measured = None if process_cpu is None else process_cpu.seconds()
+                        except Unavailable:
+                            measured = None
                         source = CPU_SOURCE_PROCFS
 
                     # ABSENT IS NOT ZERO. Say so once rather than leaving a configured
@@ -1791,7 +1806,7 @@ class Runner:
                             f"({cpu_used_s:.1f}s observed >= {cpu_budget}s) measured by "
                             "PROCFS SUBTREE accounting because cgroup boxing is not "
                             "established; this misses processes that leave the group and "
-                            "not-yet-reaped exits, so it is a floor on true CPU use."
+                            "activity between observations, so it is a floor on true CPU use."
                         )
                     termination_culprit = self._capture_termination_evidence(
                         sink=sink,

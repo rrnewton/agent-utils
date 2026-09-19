@@ -54,7 +54,7 @@ use crate::model::{
     ABORTED_BY_PEER_FAILURE_REASON, ABORTED_BY_RUN_BUDGET_REASON, DAGRUN_EXTRA_ARGS_ENV,
     JOBS_ENV_ENV,
 };
-use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
+use crate::proccpu::{ProcessGroupCpu, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 use crate::resource_caps::{Acquire as SharedResourceAcquire, Coordinator as ResourceCoordinator};
 use crate::test_results::structured_test_results_recovery_path;
@@ -897,7 +897,7 @@ fn ungrantable_resources(
 ///
 /// Without a cgroup, the exact `cpu.stat` counter is unavailable. The runner instead samples a
 /// best-effort procfs process-group floor. It can reap an ordinary over-budget process tree, but
-/// it misses processes that leave the group and CPU from exited descendants until reaped. The
+/// it misses processes that leave the group and activity between observations. The
 /// warning must name that weaker guarantee rather than equate it with cgroup accounting.
 ///
 /// Returns `None` when no step carries a live budget, so a graph that has genuinely disabled the
@@ -919,7 +919,7 @@ pub fn uncontained_cpu_budget_warning(cfg: &DagConfig) -> Option<String> {
     Some(format!(
         "UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort \
          procfs process-group CPU floor will police {} step(s) (largest {largest}s), but it can \
-         miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot \
+         miss processes that leave the group and activity between observations. `capabilities` cannot \
          express that quality difference.",
         live.len()
     ))
@@ -3427,6 +3427,12 @@ fn run_step(ctx: StepCtx) {
         }
     };
     let pid = child.id();
+    // Bind the invocation before monitor startup; never reauthenticate a recycled PGID.
+    let process_cpu = if !boxed && cpu_budget > 0 {
+        ProcessGroupCpu::new(pid).ok()
+    } else {
+        None
+    };
     let abort_after_spawn = {
         let mut sh = lock_shared(&shared);
         sh.running_pids.insert(tag.clone(), pid);
@@ -3684,7 +3690,12 @@ fn run_step(ctx: StepCtx) {
                             CPU_SOURCE_CGROUP,
                         )
                     } else {
-                        (subtree_cpu_seconds(mpid), CPU_SOURCE_PROCFS)
+                        (
+                            process_cpu
+                                .as_ref()
+                                .and_then(|reader| reader.seconds().ok()),
+                            CPU_SOURCE_PROCFS,
+                        )
                     };
 
                     let Some(cpu_used_s) = measured else {
@@ -3713,7 +3724,7 @@ fn run_step(ctx: StepCtx) {
                             "[scheduler] \u{26a0} step {t:?} exceeded its CPU budget \
                              ({cpu_used_s:.1}s observed >= {cpu_timeout}s) measured by PROCFS \
                              SUBTREE accounting because cgroup boxing is not established; this \
-                             misses processes that leave the group and not-yet-reaped exits, so \
+                             misses processes that leave the group and activity between observations, so \
                              it is a floor on true CPU use."
                         );
                     }
