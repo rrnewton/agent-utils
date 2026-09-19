@@ -92,7 +92,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
         ToolDescriptor {
             name: "list_channels",
             description: format!(
-                "List the Discord channels this bridge can read. Configured channels: {directory}."
+                "List the chat channels this bridge can read. Configured channels: {directory}."
             ),
             method: "GET",
             path: "/api/v1/channels",
@@ -158,8 +158,8 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
         ToolDescriptor {
             name: "count_messages",
             description: "Count the messages in a channel, or the ones since a given ISO-8601 \
-                          instant. USE THIS RATHER THAN COUNTING A PAGE. Discord publishes no \
-                          message count, so this walks backwards until the channel runs out or a \
+                          instant. USE THIS RATHER THAN COUNTING A PAGE. To establish a count, \
+                          this walks backwards until the channel runs out or a \
                           cost ceiling stops it: WHEN THE ANSWER SAYS \"at least\", IT IS A LOWER \
                           BOUND AND YOU MUST SAY SO — never round it off into a total."
                 .to_owned(),

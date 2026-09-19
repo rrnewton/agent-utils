@@ -19,7 +19,7 @@ use vibe_talk::store::sqlite::SqliteStore;
 use vibe_talk::store::StateStore;
 
 const USAGE: &str = "\
-vibe-talk — a Discord bridge for a voice agent
+vibe-talk — a chat bridge for a voice agent
 
 USAGE:
     vibe-talk [--config PATH] [--fake-discord] [--skip-startup-probe]
@@ -246,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
         }
         fake
     } else {
-        Arc::new(HttpDiscordClient::new(&config.discord).context("building the Discord client")?)
+        Arc::new(HttpDiscordClient::new(&config.discord).context("building the chat client")?)
     };
 
     // Open the store BEFORE the probe and before the listener: a storage path that cannot be
@@ -265,13 +265,14 @@ async fn main() -> anyhow::Result<()> {
             let retention = config.storage.retention;
             tracing::info!(
                 path = %path.display(),
+                provider = chat.provider_name(),
                 max_conversations = retention.max_conversations,
                 max_turns_per_conversation = retention.max_turns_per_conversation,
                 max_summaries = retention.max_summaries,
                 retain_days = retention.retain_days,
                 "durable state is ON. Conversation transcripts and read marks are written to \
                  this file at 0600 and survive a restart. Read marks are THIS SERVER'S OWN: \
-                 nothing is read from or written back to Discord."
+                 nothing is read from or written back to the chat provider."
             );
             Arc::new(opened)
         }
@@ -431,18 +432,19 @@ async fn main() -> anyhow::Result<()> {
     } else if poll_seconds == 0 {
         tracing::info!(
             setting = "discord.live_poll_seconds",
+            provider = chat.provider_name(),
             "live ingestion is OFF. GET /api/v1/channels/{{id}}/stream accepts subscribers and \
              nothing publishes to them, so the page falls back to its own timed re-read. Set an \
-             interval to turn it on; every tick is one Discord request per channel."
+             interval to turn it on; every tick is one chat-provider request per channel."
         );
     } else {
         tracing::info!(
             interval_seconds = poll_seconds,
+            provider = chat.provider_name(),
             channels = config.channels.len(),
             "live ingestion is ON: each configured channel is polled on this interval and what is \
-             new is pushed to GET /api/v1/channels/{{id}}/stream. This is POLLING, not a Discord \
-             Gateway connection -- see the module doc of src/live.rs for why -- and it spends one \
-             Discord request per channel per tick against rate limits this server does not handle."
+             new is pushed to GET /api/v1/channels/{{id}}/stream. Polling spends one request to \
+             the chat provider per channel per tick."
         );
     }
 
@@ -531,9 +533,9 @@ async fn run_startup_probe(
         }
         probe::StartupCheck::Passed(report) => {
             if report.warnings().is_empty() {
-                tracing::info!("{}", report.render());
+                tracing::info!("{}", report.render_for(chat.provider_name()));
             } else {
-                tracing::warn!("{}", report.render());
+                tracing::warn!("{}", report.render_for(chat.provider_name()));
             }
         }
         probe::StartupCheck::Failed(report) => {
@@ -547,7 +549,7 @@ async fn run_startup_probe(
                 configured = config.channels.len(),
                 "startup channel probe FAILED; the per-channel diagnosis is on stderr"
             );
-            eprintln!("{}", report.render());
+            eprintln!("{}", report.render_for(chat.provider_name()));
             anyhow::bail!(
                 "{failed} of {} configured channel(s) could not be read; refusing to start. Fix \
                  the configuration above, or re-run with {} if you know the check is wrong.",

@@ -25,6 +25,9 @@ bind = "0.0.0.0:8080"
 # timezone = "America/New_York"
 
 [discord]
+# Source service named in errors, diagnostics, and the app. A compatible bridge can set
+# this to "Google Chat"; the HTTP wire format and existing configuration keys stay the same.
+provider_name = "Discord"
 # Enable only when api_base names a compatible bridge with POST /channels/{id}/read.
 # This moves the source provider's read cursor; Done/archive remains local and reversible.
 upstream_read_marks = false

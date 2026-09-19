@@ -936,6 +936,7 @@ function newPage(store = new Map(), script = SCRIPT) {
     clientConfig: async () =>
       json(200, {
         version: "test",
+        chat_provider_name: page.chatProviderName,
         channels: page.channels,
         elevenlabs_agent_id: "agent_test",
         live_poll_seconds: page.livePollSeconds,
@@ -955,6 +956,8 @@ function newPage(store = new Map(), script = SCRIPT) {
      * aliases existed sees what it always saw.
      */
     channels: [{ ...CHANNEL }],
+    /** Human-facing platform name, provided by the selected backend rather than inferred here. */
+    chatProviderName: "Discord",
     /** Every add request, so "the id and name reached the server" is testable. */
     addChannelCalls: [],
     /** Every remove request. */
@@ -2176,6 +2179,22 @@ test("a token the server accepts leads to the main interface", async () => {
   assert.equal(page.screen(), "main");
   assert.equal(page.el("control-pane").hidden, false, "the controls must be reachable");
   assert.equal(page.el("view-switch").hidden, false);
+});
+
+test("settings and help name the selected chat backend, with a neutral fallback", async () => {
+  for (const name of ["Google Chat", "Discord", undefined, null, "   ", "<img src=x>"]) {
+    const page = newPage();
+    page.chatProviderName = name;
+    await signIn(page);
+    const expected = typeof name === "string" ? name.trim() || "Chat" : "Chat";
+    for (const id of ["chat-provider-settings", "chat-provider-help"]) {
+      assert.equal(page.el(id).textContent, expected);
+    }
+    assert.ok(!page.createdTags.includes("img"), "a backend name was interpreted as markup");
+  }
+  // Include hidden help/settings prose: users can open it after the initial page has loaded.
+  // Internal DOM identifiers and implementation comments do not name a platform to the reader.
+  assert.doesNotMatch(HTML_CODE.replace(/<[^>]+>/g, " "), /discord/i);
 });
 
 test("a token the server REFUSES sends you back to sign in, and says which thing was wrong", async () => {
@@ -9642,11 +9661,12 @@ test("a browser that refuses to store a DRAFT says so, rather than promising a r
   assert.equal(kept.el("reply-state").textContent, "", "a stored draft was reported as lost");
 });
 
-test("A SEND THAT FAILS LOSES NOTHING THE READER TYPED", async () => {
+test("a failed Google Chat send names the backend and loses nothing the reader typed", async () => {
   const page = newPage();
+  page.chatProviderName = "Google Chat";
   await signIn(page);
   await openReplyOn(page, [message({ id: "333", content: "the one being answered" })]);
-  page.replyResponse = errorResponse(502, "discord_error", "discord returned HTTP 500");
+  page.replyResponse = errorResponse(502, "chat_error", "Google Chat returned HTTP 502");
 
   page.el("reply-text").value = "this took a while to write";
   await page.el("reply-text").dispatch("input");
@@ -9661,8 +9681,10 @@ test("A SEND THAT FAILS LOSES NOTHING THE READER TYPED", async () => {
   );
   assert.match(page.el("reply-state").textContent, /Not posted/);
   assert.match(page.el("reply-state").textContent, /502/, "it does not say what went wrong");
+  assert.match(page.el("reply-state").textContent, /Google Chat returned HTTP 502/);
+  assert.doesNotMatch(page.el("reply-state").textContent, /discord/i);
   assert.equal(page.el("reply-send").disabled, false, "Send is stuck disabled after a failure");
-  // Nothing was appended: the channel must not show a message Discord never accepted.
+  // Nothing was appended: the channel must not show a message the provider never accepted.
   assert.equal(page.el("discord-log").children.length, 1);
 });
 

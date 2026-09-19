@@ -177,17 +177,17 @@ impl Diagnosis {
                 suspect_message_content_intent: true,
                 ..
             } => "readable, but every message came back with EMPTY CONTENT",
-            Self::InvalidToken => "Discord rejected the bot token (HTTP 401)",
-            Self::NoAccess => "the bot cannot see this channel at all (Discord: Missing Access)",
+            Self::InvalidToken => "the provider rejected the bot token (HTTP 401)",
+            Self::NoAccess => "the bot cannot see this channel at all (missing access)",
             Self::MissingReadHistory => {
                 "the bot can see this channel but may not read its history \
-                 (Discord: Missing Permissions)"
+                 (missing permissions)"
             }
-            Self::UnknownChannel => "Discord does not know this channel id (HTTP 404)",
+            Self::UnknownChannel => "the provider does not know this channel id (HTTP 404)",
             Self::RateLimited => {
-                "Discord rate-limited the probe (HTTP 429); readability is unknown"
+                "the provider rate-limited the probe (HTTP 429); readability is unknown"
             }
-            Self::UnexpectedStatus { .. } => "Discord answered with an unexpected status",
+            Self::UnexpectedStatus { .. } => "the provider answered with an unexpected status",
             Self::Unreachable(_) => "the request never reached the vendor",
             Self::Unintelligible(_) => "the vendor's answer could not be understood",
             Self::Refused(_) => "the request was refused before it was sent",
@@ -205,6 +205,15 @@ impl Diagnosis {
         }
     }
 
+    /// The headline with the checked provider's display name, supplied by its backend.
+    #[must_use]
+    pub fn headline_for(&self, provider: &str) -> String {
+        let headline = self.headline();
+        headline
+            .strip_prefix("the provider")
+            .map_or_else(|| headline.to_owned(), |rest| format!("{provider}{rest}"))
+    }
+
     /// What the operator should actually do about it.
     ///
     /// A [`Cow`] rather than a `&'static str` because two of the remedies have to NAME something
@@ -216,6 +225,45 @@ impl Diagnosis {
     /// passed.
     #[must_use]
     pub fn remedy(&self) -> Cow<'static, str> {
+        self.remedy_for("the chat provider")
+    }
+
+    /// Advice for the configured provider, without giving another provider's setup steps.
+    #[must_use]
+    pub fn remedy_for(&self, provider: &str) -> Cow<'static, str> {
+        // The detailed portal and permission instructions below apply only to Discord.
+        // Other adapters may share its wire protocol, but they do not share its setup flow.
+        if provider != "Discord" {
+            let advice = match self {
+                Self::Readable {
+                    suspect_message_content_intent: true,
+                    ..
+                } => Some(format!(
+                    "Check that {provider} grants this account access to message content. \
+                     If access is correct, the recent messages may contain only attachments."
+                )),
+                Self::InvalidToken => Some(format!(
+                    "Check the configured {provider} credential and renew or replace it if it \
+                     expired or was revoked. No channel can be read until authentication works."
+                )),
+                Self::NoAccess => Some(format!(
+                    "Check that the configured account has been added to the intended {provider} \
+                     channel and is allowed to view it. Private channels may need an explicit invite."
+                )),
+                Self::MissingReadHistory => Some(format!(
+                    "Grant the configured account permission to read message history in this \
+                     {provider} channel. It can see the channel but cannot read its messages."
+                )),
+                Self::UnknownChannel => Some(format!(
+                    "Check the channel identifier in VIBE_TALK_CHANNELS (or [[channels]]) against \
+                     {provider}, and confirm that the configured account can access that channel."
+                )),
+                _ => None,
+            };
+            if let Some(advice) = advice {
+                return Cow::Owned(advice);
+            }
+        }
         Cow::Borrowed(match self {
             Self::NotConfigured(setting) => {
                 return Cow::Owned(format!(
@@ -274,21 +322,21 @@ impl Diagnosis {
                  re-check the invite."
             }
             Self::RateLimited => {
-                "Wait and restart. The client already waited the time Discord asked for and the \
+                "Wait and restart. The client already waited the time the provider asked for and the \
                  limit did not clear inside its budget, so something else is very likely sharing \
                  this bot token and burning its rate limit."
             }
             Self::UnexpectedStatus { .. } => {
-                "Read the status and body above. A 5xx is Discord's own outage and a restart in a \
-                 few minutes is the right response; anything else is worth reporting."
+                "Read the status and body above. A 5xx means the provider or a gateway failed; \
+                 check the provider and any adapter service, then retry the probe."
             }
             Self::Unreachable(_) => {
-                "This process could not reach the vendor (discord.com, or api.elevenlabs.io). \
-                 Check egress from the container or host: DNS, outbound HTTPS, and any proxy."
+                "This process could not reach the provider. Check egress from the container or \
+                 host: DNS, outbound HTTPS, and any proxy or adapter service."
             }
             Self::Unintelligible(_) => {
-                "The vendor returned something this server cannot parse. If discord.api_base or \
-                 elevenlabs.api_base is pointed at a proxy, that proxy is the first suspect."
+                "The provider returned something this server cannot parse. If its API endpoint \
+                 points at a proxy or adapter, check that service first."
             }
             Self::Refused(_) => {
                 "This is a bug in this server rather than a configuration problem: the probe only \
@@ -405,6 +453,12 @@ impl ProbeReport {
     /// actually check" is the first question a refusal raises.
     #[must_use]
     pub fn render(&self) -> String {
+        self.render_for("the chat provider")
+    }
+
+    /// Render with the display name supplied by the checked chat backend.
+    #[must_use]
+    pub fn render_for(&self, provider: &str) -> String {
         let mut out = String::new();
         out.push_str("startup channel probe (a one-message read per configured channel):\n");
         for outcome in &self.outcomes {
@@ -419,12 +473,12 @@ impl ProbeReport {
                 "  [{mark}] channel {} ({}): {}\n",
                 outcome.channel.id,
                 outcome.channel.label,
-                outcome.diagnosis.headline()
+                outcome.diagnosis.headline_for(provider)
             ));
             if let Some(detail) = outcome.diagnosis.detail() {
                 out.push_str(&format!("           detail: {detail}\n"));
             }
-            let remedy = outcome.diagnosis.remedy();
+            let remedy = outcome.diagnosis.remedy_for(provider);
             if !remedy.is_empty() {
                 out.push_str(&format!("           fix: {remedy}\n"));
             }
@@ -459,7 +513,8 @@ fn discord_error_code(body: &str) -> Option<u64> {
 /// disagreed with the channel checks about what a 401 means would be worse than no token check.
 #[must_use]
 pub fn classify(error: &ChatError) -> Diagnosis {
-    match error {
+    match error.cause() {
+        ChatError::Provider { .. } => unreachable!("cause removes provider wrappers"),
         ChatError::Transport(detail) => Diagnosis::Unreachable(detail.clone()),
         ChatError::Shape(detail) => Diagnosis::Unintelligible(detail.clone()),
         ChatError::Refused(detail) => Diagnosis::Refused(detail.clone()),
@@ -645,7 +700,7 @@ mod tests {
         assert!(report.is_failure(), "{}", report.render());
         assert_eq!(report.failures().len(), 1);
         assert_eq!(report.outcomes[0].diagnosis, Diagnosis::UnknownChannel);
-        let rendered = report.render();
+        let rendered = report.render_for(fake.provider_name());
         assert!(rendered.contains("404404404"), "{rendered}");
         assert!(rendered.contains("typo'd"), "{rendered}");
         assert!(rendered.contains("Copy Channel ID"), "{rendered}");
@@ -734,16 +789,62 @@ mod tests {
     }
 
     #[test]
+    fn provider_diagnostics_do_not_inherit_another_platforms_setup_instructions() {
+        for diagnosis in [
+            Diagnosis::Readable {
+                messages: 1,
+                suspect_message_content_intent: true,
+            },
+            Diagnosis::InvalidToken,
+            Diagnosis::NoAccess,
+            Diagnosis::MissingReadHistory,
+            Diagnosis::UnknownChannel,
+            Diagnosis::RateLimited,
+            Diagnosis::UnexpectedStatus {
+                status: 502,
+                body: "gateway failure".into(),
+            },
+            Diagnosis::Unreachable("offline".into()),
+            Diagnosis::Unintelligible("invalid response".into()),
+        ] {
+            for text in [
+                diagnosis.headline().to_owned(),
+                diagnosis.remedy().into_owned(),
+                diagnosis.headline_for("Google Chat"),
+                diagnosis.remedy_for("Google Chat").into_owned(),
+            ] {
+                assert!(!text.to_lowercase().contains("discord"), "{text}");
+            }
+        }
+        let report = ProbeReport {
+            outcomes: vec![ChannelProbe {
+                channel: info("1", "team", true),
+                diagnosis: classify(&status(401, "").with_provider("Google Chat")),
+            }],
+            aborted: true,
+        };
+        let rendered = report.render_for("Google Chat");
+        assert!(
+            rendered.contains("Google Chat rejected the bot token"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Discord"), "{rendered}");
+        assert!(!rendered.contains("Reset Token"), "{rendered}");
+    }
+
+    #[test]
     fn missing_access_and_missing_permissions_give_different_advice() {
         // If these two ever collapse into one message the probe stops being worth having: one is
         // "invite the bot", the other is "the invite is fine, grant one permission".
         let no_access = Diagnosis::NoAccess;
         let no_history = Diagnosis::MissingReadHistory;
         assert_ne!(no_access.remedy(), no_history.remedy());
-        assert!(no_access.remedy().contains("OAuth2"));
-        assert!(no_history.remedy().contains("Read Message History"));
+        assert!(no_access.remedy_for("Discord").contains("OAuth2"));
+        assert!(no_history
+            .remedy_for("Discord")
+            .contains("Read Message History"));
         assert!(
-            !no_history.remedy().contains("OAuth2"),
+            !no_history.remedy_for("Discord").contains("OAuth2"),
             "a permission-override problem must not send the operator back to the invite flow"
         );
     }
@@ -752,7 +853,9 @@ mod tests {
     fn a_bad_token_stops_the_probe_rather_than_repeating_itself() {
         // Not a per-channel fault, so it must not be reported once per channel.
         assert!(Diagnosis::InvalidToken.is_failure());
-        assert!(Diagnosis::InvalidToken.remedy().contains("Reset Token"));
+        assert!(Diagnosis::InvalidToken
+            .remedy_for("Discord")
+            .contains("Reset Token"));
     }
 
     #[tokio::test]
@@ -839,7 +942,7 @@ mod tests {
             report.render()
         );
         assert_eq!(report.warnings().len(), 1);
-        let rendered = report.render();
+        let rendered = report.render_for("Discord");
         assert!(rendered.contains("EMPTY CONTENT"), "{rendered}");
         assert!(rendered.contains("MESSAGE CONTENT INTENT"), "{rendered}");
     }

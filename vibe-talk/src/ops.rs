@@ -86,9 +86,8 @@ impl OpError {
             Self::InvalidCursor => "invalid_cursor",
             Self::InvalidRange => "invalid_range",
             Self::PartiallyPosted { .. } => "partially_posted",
-            Self::Chat(ChatError::Refused(_)) => "refused",
-            // Retained for API compatibility while Discord is the only configured provider.
-            Self::Chat(_) => "discord_error",
+            Self::Chat(error) if matches!(error.cause(), ChatError::Refused(_)) => "refused",
+            Self::Chat(_) => "chat_error",
             Self::Store(inner) => inner.code(),
             Self::Summarizer(inner) => inner.code(),
         }
@@ -1822,7 +1821,19 @@ mod tests {
         );
         assert_eq!(
             OpError::Chat(ChatError::Transport("down".to_owned())).code(),
-            "discord_error"
+            "chat_error"
+        );
+        assert_eq!(
+            OpError::Chat(
+                ChatError::Refused("unsupported".to_owned()).with_provider("Google Chat")
+            )
+            .code(),
+            "refused"
+        );
+        assert_eq!(
+            OpError::Chat(ChatError::Transport("down".to_owned()).with_provider("Google Chat"))
+                .code(),
+            "chat_error"
         );
     }
 }

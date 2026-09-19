@@ -383,6 +383,10 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
     struct BlankContent;
     #[async_trait::async_trait]
     impl ChatClient for BlankContent {
+        fn provider_name(&self) -> &str {
+            "Discord"
+        }
+
         async fn identity(&self) -> Result<ChatIdentity, ChatError> {
             Ok(ChatIdentity {
                 id: "3000000000000000009".to_owned(),

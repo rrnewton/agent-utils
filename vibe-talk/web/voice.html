@@ -458,6 +458,7 @@
                 <h2>Channels</h2>
                 <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="What this changes, and what it does not">?</button>
               </div>
+              <p class="hint">Chat service: <span id="chat-provider-settings">Chat</span></p>
               <label for="settings-channel">Channel</label>
               <select id="settings-channel" aria-describedby="channel-facts"></select>
               <!-- What this channel IS: the name in force, and where it came from. -->
@@ -501,8 +502,8 @@
 
               <div id="add-channel-fields" hidden>
                 <p class="hint">
-                  In Discord: User Settings → Advanced → Developer Mode, then right-click the
-                  channel → Copy Channel ID. The bot has to already be able to see it.
+                  Enter the channel ID supplied by this deployment. The bridge must already
+                  have access to the channel in your chat service.
                 </p>
                 <label for="new-channel-id">Channel ID</label>
                 <input
@@ -798,11 +799,9 @@
               </p>
               <p class="hint">
                 <strong>Sumry</strong> deliberately says <strong>recent messages</strong> and not
-                "my unread messages since I last spoke". Discord gives a bot no read state at all,
-                and this bridge cannot work out where you last spoke either — your own replies are
-                posted as the bot, and the only author signal is a display name anyone can set to
-                anything. A button that claimed that scoping would produce confident, wrong
-                summaries. See <code>ai_docs/UNREAD_STATUS_20260819.md</code>.
+                "my unread messages since I last spoke". Read state and account identity depend on
+                the configured chat service, and the bridge may post on your behalf. This prompt
+                therefore asks about the recent messages available to the agent.
               </p>
               <p class="hint">
                 <strong>Blockers makes the coding agent do work.</strong> It is not a question about
@@ -816,8 +815,8 @@
               <h2>Who is who in the channel</h2>
               <p class="hint">
                 The call transcript tells its two speakers apart by side, colour and corner. The
-                channel can do the same, but only once it knows which account is which — Discord
-                offers no such thing, and a display name is chosen by whoever owns the account.
+                channel can do the same, but only once it knows which account is which. A display
+                name alone cannot reliably distinguish you, the bridge and the coding agent.
                 Everyone who has spoken in a channel you have opened is listed, with what this page
                 guessed shown in italics; change any of them and the channel is redrawn.
               </p>
@@ -835,15 +834,16 @@
             <article id="help-channel" class="help-entry">
               <h2>The channel, and the inbox</h2>
               <p class="hint">
-                The Discord view shows the channel as Discord holds it, rendered from a small, fixed
-                markdown subset. Message text is written by other people and bots: it is escaped
+                The channel view shows messages from <span id="chat-provider-help">Chat</span>,
+                rendered from a small, fixed markdown subset. Message text is written by other
+                people and bots: it is escaped
                 before anything else happens and is never treated as markup or as an instruction.
                 Every line shows its author and its message id, so a message the agent describes can
                 be checked against a real one — or shown not to exist.
               </p>
               <p class="hint">
                 A message somebody has <strong>answered</strong> is dimmed. That is derived from the
-                channel itself — Discord records a reply only on the answering message — so it can
+                reply references on the answering messages — so it can
                 only see answers that are <strong>loaded</strong>: a reply further back than you have
                 walked is invisible, and a message can be dimmed later than it should have been,
                 never earlier.
@@ -885,15 +885,15 @@
             <article id="help-combining" class="help-entry">
               <h2>Combining messages</h2>
               <p class="hint">
-                Discord refuses a message past a fixed length, so a client sending a long one
-                <strong>splits it in two</strong>. The second half begins mid-sentence — often
+                Chat services limit message length, so a client sending a long one may
+                <strong>split it into parts</strong>. The next part can begin mid-sentence — often
                 mid-word — and lands a fraction of a second after the first. With this on, messages
                 from the <strong>same author within five seconds</strong> of each other are drawn as
                 one, with a line break between them. A person almost never sends twice that fast.
               </p>
               <p class="hint">
                 It is <strong>display only</strong>. Nothing is merged anywhere else: each part is
-                still its own Discord message with its own id, and this app still holds them that
+                still its own chat message with its own id, and this app still holds them that
                 way. Marking a combined row as dealt with marks <strong>every</strong> message in
                 it, reading it aloud reads all of it, and a row counts as dealt with only when all
                 of its messages are — so a half-archived row shows as still waiting rather than
@@ -901,7 +901,7 @@
                 message of the group, which is the one the rest is a continuation of.
               </p>
               <p class="hint">
-                Turn it off to see the channel exactly as Discord has it, one row per message. That
+                Turn it off to see the original messages, one row per message. That
                 is worth doing when you are checking whether a specific message exists — press and
                 hold a row to see every id it is showing.
               </p>
@@ -914,11 +914,9 @@
                 the top of it. Every other setting on the screen applies to the whole app.
               </p>
               <p class="hint">
-                <strong>Adding a channel</strong> needs its id: in Discord, turn on
-                <em>User Settings → Advanced → Developer Mode</em>, then right-click the channel and
-                choose <em>Copy Channel ID</em>. The bot must already be able to see it — adding the
-                bot to a <em>server</em> is not the same as adding it to a private
-                <em>channel</em>, and that is the usual reason this fails. The channel is
+                <strong>Adding a channel</strong> needs the channel ID supplied by this deployment.
+                The bridge must already have access to that channel in your chat service.
+                The channel is
                 <strong>read before it is accepted</strong>, so a mistyped id or a channel the bot
                 cannot see is refused straight away rather than joining the list and failing later.
               </p>
@@ -941,7 +939,7 @@
                 the voice agent is given</strong>, so what you say out loud is what it was told.
               </p>
               <p class="hint">
-                It is <strong>ours and local</strong>: it is kept on this server, Discord is never
+                It is <strong>ours and local</strong>: it is kept on this server, the chat service is never
                 told, the channel is not renamed there, and nobody outside this deployment sees it
                 — the same standing as which messages you have dealt with. Clearing it puts the
                 configured label back.
@@ -974,7 +972,7 @@
               </p>
               <p class="hint">
                 It <strong>re-sends earlier conversation content to the voice vendor on every new
-                call</strong> — your own speech, and any Discord text the agent read out to you,
+                call</strong> — your own speech, and any channel text the agent read out to you,
                 which was written by other people. That is why it is off by default. The record is
                 capped by the server; when it does not all fit, the oldest lines are dropped and
                 both you and the agent are told the reconstruction is partial.

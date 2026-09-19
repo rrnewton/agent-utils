@@ -18,7 +18,7 @@ use crate::model::ChannelId;
 #[derive(Debug, thiserror::Error)]
 pub enum AgentBackendError {
     /// No backend is configured in this deployment.
-    #[error("no coding-agent backend is configured: this deployment can read and post to Discord, but cannot ask an agent directly")]
+    #[error("no coding-agent backend is configured: this deployment can read and post to chat, but cannot ask an agent directly")]
     Unavailable,
     /// A configured backend failed.
     #[error("coding-agent backend failed: {0}")]

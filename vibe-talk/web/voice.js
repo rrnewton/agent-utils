@@ -7191,6 +7191,13 @@ function setTokenState(text) {
 const NO_TOKEN_YET = "no token saved in this browser — paste your write-scope token above.";
 
 function applyClientConfig(config) {
+  // The selected backend owns its display name. An older server leaves it unspecified, so the
+  // page stays neutral instead of guessing a platform from channel IDs or deployment details.
+  const providerName =
+    typeof config.chat_provider_name === "string" ? config.chat_provider_name.trim() : "";
+  for (const id of ["chat-provider-settings", "chat-provider-help"]) {
+    el(id).textContent = providerName || "Chat";
+  }
   // WHO THIS BRIDGE IS, from the server, before a single message is drawn.
   //
   // The page used to learn this only as a side effect of the reader replying from the app, or of

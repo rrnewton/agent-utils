@@ -145,8 +145,11 @@ async function loadConfig() {
   state.channels = config.channels;
   state.agentId = config.elevenlabs_agent_id;
   fillChannelSelects();
+  const providerName =
+    typeof config.chat_provider_name === "string" ? config.chat_provider_name.trim() : "";
   el("server-info").textContent =
     `server version ${config.version}; ` +
+    `chat service ${providerName || "Chat"}; ` +
     `${config.channels.length} channel${config.channels.length === 1 ? "" : "s"}; ` +
     `voice agent ${config.elevenlabs_agent_id ? "configured" : "not configured"}`;
   mountVoiceAgent();

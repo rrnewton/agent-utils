@@ -88,9 +88,11 @@ impl From<AuthError> for ApiError {
 
 impl From<ChatError> for ApiError {
     fn from(value: ChatError) -> Self {
-        match value {
-            ChatError::Refused(detail) => Self::new(StatusCode::BAD_REQUEST, "refused", detail),
-            other => Self::new(StatusCode::BAD_GATEWAY, "discord_error", other.to_string()),
+        match value.cause() {
+            ChatError::Refused(_) => {
+                Self::new(StatusCode::BAD_REQUEST, "refused", value.to_string())
+            }
+            _ => Self::new(StatusCode::BAD_GATEWAY, "chat_error", value.to_string()),
         }
     }
 }
@@ -433,7 +435,7 @@ pub struct AliasResponse {
 
 /// The standing statement that a channel alias is local and ours.
 pub const ALIAS_NOTICE: &str = "A channel alias is vibe-talk's own name for the channel. It is \
-                                stored on this server only: Discord is not told, the channel is \
+                                stored on this server only: the source chat service is not told, the channel is \
                                 not renamed there, and nobody outside this deployment sees it. \
                                 Clearing it puts the configured label back.";
 
@@ -486,6 +488,8 @@ pub async fn agent_tools(
 /// What the web app needs to know at startup.
 #[derive(Debug, Serialize)]
 pub struct ClientConfigResponse {
+    /// Source chat service's human-readable name, supplied by the selected backend.
+    pub chat_provider_name: String,
     /// Configured channels.
     pub channels: Vec<ChannelInfo>,
     /// ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public
@@ -536,6 +540,7 @@ pub async fn client_config(
 ) -> Result<Json<ClientConfigResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
     Ok(Json(ClientConfigResponse {
+        chat_provider_name: state.chat.provider_name().to_owned(),
         channels: ops::channels(&state).await,
         elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
         version: env!("CARGO_PKG_VERSION"),
@@ -2205,8 +2210,10 @@ pub async fn add_channel(
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_channel_id",
-            "a Discord channel id is 17 to 20 digits. In Discord, turn on Developer Mode and \
-             right-click the channel, then Copy Channel ID.",
+            format!(
+                "{} requires a numeric channel id through this chat adapter. Ask the deployment operator for the channel ID.",
+                state.chat.provider_name()
+            ),
         ));
     }
     if label.is_empty() {
@@ -2247,7 +2254,7 @@ pub async fn add_channel(
             "channel_unreadable",
             // The PROBE'S own remedy, not a sentence written here. One explanation of "the bot
             // cannot see this channel", used by the startup check and by this route alike.
-            outcome.diagnosis.remedy().to_string(),
+            outcome.diagnosis.remedy_for(state.chat.provider_name()),
         ));
     }
 

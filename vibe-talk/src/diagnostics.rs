@@ -253,13 +253,22 @@ impl Check {
     }
 
     fn finish(self, state: &AppState) -> CheckReport {
-        let remedy = self.diagnosis.remedy();
+        // The stable check ids are retained for existing API consumers. Display names and
+        // remedies describe the actual backend, including compatible provider adapters.
+        let provider = if self.id.starts_with("discord.") {
+            state.chat.provider_name()
+        } else if self.id.starts_with("elevenlabs.") {
+            "ElevenLabs"
+        } else {
+            "the provider"
+        };
+        let remedy = self.diagnosis.remedy_for(provider);
         CheckReport {
             id: self.id,
             title: self.title,
             subject: self.subject,
             status: Status::of(&self.diagnosis),
-            summary: self.diagnosis.headline().to_owned(),
+            summary: self.diagnosis.headline_for(provider),
             detail: self
                 .diagnosis
                 .detail()
@@ -321,15 +330,16 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
 /// are the two most common ways this deployment is wrong, and a channel read reports both as a
 /// channel that cannot be read.
 async fn discord_token(state: &AppState, deadline: &Deadline) -> Check {
+    let provider = state.chat.provider_name();
     let diagnosis = match within(deadline, state.chat.identity()).await {
         Err(timed_out) => timed_out,
         Ok(Ok(identity)) => Diagnosis::Confirmed(format!(
-            "Discord accepted the bot token; it belongs to {} ({})",
+            "{provider} accepted the bot token; it belongs to {} ({})",
             identity.username, identity.id
         )),
         Ok(Err(error)) => probe::classify(&error),
     };
-    Check::new("discord.token", "Discord bot token", diagnosis)
+    Check::new("discord.token", format!("{provider} bot token"), diagnosis)
 }
 
 /// Can the bot read each configured channel? The five causes, told apart.
@@ -343,7 +353,11 @@ async fn discord_channels(state: &AppState, deadline: &Deadline) -> Vec<Check> {
         .map(|outcome| {
             Check::new(
                 "discord.channel",
-                format!("Discord channel: {}", outcome.channel.label),
+                format!(
+                    "{} channel: {}",
+                    state.chat.provider_name(),
+                    outcome.channel.label
+                ),
                 outcome.diagnosis,
             )
             .about(outcome.channel.id.as_str())
@@ -504,6 +518,66 @@ pub fn secrets_of(state: &AppState) -> Vec<Secret> {
 mod tests {
     use super::*;
     use crate::testing;
+
+    struct NamedChat(std::sync::Arc<crate::discord::fake::FakeDiscord>);
+
+    #[async_trait::async_trait]
+    impl crate::chat::ChatClient for NamedChat {
+        fn provider_name(&self) -> &str {
+            "Google Chat"
+        }
+
+        async fn identity(&self) -> Result<crate::chat::ChatIdentity, crate::chat::ChatError> {
+            self.0.identity().await
+        }
+
+        async fn fetch_page(
+            &self,
+            channel: &crate::model::ChannelId,
+            limit: u16,
+            before: Option<&crate::model::MessageId>,
+            after: Option<&crate::model::MessageId>,
+        ) -> Result<Vec<crate::model::Message>, crate::chat::ChatError> {
+            self.0.fetch_page(channel, limit, before, after).await
+        }
+
+        async fn post_message(
+            &self,
+            _channel: &crate::model::ChannelId,
+            _content: &str,
+            _reply_to: Option<&crate::model::MessageId>,
+        ) -> Result<crate::model::Message, crate::chat::ChatError> {
+            panic!("diagnostics must never post")
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_checks_take_their_platform_name_from_the_backend() {
+        let (mut state, fake) = testing::state();
+        state.chat = std::sync::Arc::new(NamedChat(std::sync::Arc::clone(&fake)));
+        for rejected in [false, true] {
+            if rejected {
+                fake.revoke_token();
+            }
+            let report = run(&state).await;
+            for check in report
+                .checks
+                .iter()
+                .filter(|check| check.id.starts_with("discord."))
+            {
+                assert!(check.title.starts_with("Google Chat"), "{check:?}");
+                let text = format!(
+                    "{} {} {:?} {:?}",
+                    check.title, check.summary, check.detail, check.remedy
+                );
+                assert!(!text.contains("Discord"), "{text}");
+                assert!(!text.contains("Reset Token"), "{text}");
+            }
+        }
+        let rate_limited =
+            Check::new("elevenlabs.key", "ElevenLabs key", Diagnosis::RateLimited).finish(&state);
+        assert!(rate_limited.summary.starts_with("ElevenLabs"));
+    }
 
     #[tokio::test]
     async fn a_correctly_wired_deployment_reports_every_check_green() {

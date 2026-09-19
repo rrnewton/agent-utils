@@ -32,6 +32,12 @@ pub struct RateLimitExhausted {
 
 impl std::fmt::Display for RateLimitExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.format_for(self.provider))
+    }
+}
+
+impl RateLimitExhausted {
+    fn format_for(&self, provider: &str) -> String {
         let scope = if self.global {
             "GLOBAL, the whole bot token"
         } else {
@@ -42,11 +48,9 @@ impl std::fmt::Display for RateLimitExhausted {
         } else {
             format!("gave up after {} attempt(s)", self.attempts)
         };
-        write!(
-            f,
+        format!(
             "{provider} RATE LIMIT ({scope}) on {route}: {gave_up}; waited {waited:.1}s of a \
              {budget:.0}s budget and {provider} still wants {retry_after:.1}s more",
-            provider = self.provider,
             route = self.route,
             waited = self.waited.as_secs_f64(),
             budget = self.budget.as_secs_f64(),
@@ -59,15 +63,13 @@ impl std::fmt::Display for RateLimitExhausted {
 #[derive(Debug, thiserror::Error)]
 pub enum ChatError {
     /// The request never completed.
-    // Keep the established wording while Discord is the only selectable provider. A future
-    // provider-aware configuration can carry the provider name without changing this enum again.
-    #[error("discord request failed: {0}")]
+    #[error("chat request failed: {0}")]
     Transport(String),
     /// The provider answered with a non-success status.
     ///
     /// **Not 429.** A rate limit is [`ChatError::RateLimited`] and only ever appears after the
     /// client has waited it out and failed; a bare 429 never reaches a caller.
-    #[error("discord returned HTTP {status}: {body}")]
+    #[error("chat returned HTTP {status}: {body}")]
     Status {
         /// HTTP status code.
         status: u16,
@@ -79,18 +81,56 @@ pub enum ChatError {
     #[error("{0}")]
     RateLimited(RateLimitExhausted),
     /// The response did not have the shape this server expects.
-    #[error("discord response could not be understood: {0}")]
+    #[error("chat response could not be understood: {0}")]
     Shape(String),
     /// The server refused the operation before contacting the provider.
     #[error("refused: {0}")]
     Refused(String),
+    /// A failure labeled by the backend that actually handled the request.
+    #[error("{}", source.format_for(provider))]
+    Provider {
+        /// Human-readable name supplied by [`ChatClient::provider_name`].
+        provider: String,
+        /// Original typed failure, retained for classification and retry handling.
+        #[source]
+        source: Box<ChatError>,
+    },
 }
 
 impl ChatError {
+    /// Attach the backend's display name without losing the typed failure.
+    #[must_use]
+    pub fn with_provider(self, provider: &str) -> Self {
+        Self::Provider {
+            provider: provider.to_owned(),
+            source: Box::new(self),
+        }
+    }
+
+    /// The underlying failure, independent of its provider label.
+    #[must_use]
+    pub fn cause(&self) -> &Self {
+        match self {
+            Self::Provider { source, .. } => source.cause(),
+            other => other,
+        }
+    }
+
+    fn format_for(&self, provider: &str) -> String {
+        match self.cause() {
+            Self::Transport(detail) => format!("{provider} request failed: {detail}"),
+            Self::Status { status, body } => format!("{provider} returned HTTP {status}: {body}"),
+            Self::Shape(detail) => format!("{provider} response could not be understood: {detail}"),
+            Self::Refused(detail) => format!("{provider} refused: {detail}"),
+            Self::RateLimited(detail) => detail.format_for(provider),
+            Self::Provider { .. } => unreachable!("cause removes provider context"),
+        }
+    }
+
     /// How long the provider still wants us to wait, when this failure is a rate limit.
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
-        match self {
+        match self.cause() {
             Self::RateLimited(detail) => Some(detail.retry_after),
             _ => None,
         }
@@ -109,6 +149,11 @@ pub struct ChatIdentity {
 /// Read and post access to configured chat channels.
 #[async_trait]
 pub trait ChatClient: Send + Sync {
+    /// Human-readable name of the source chat service, including when accessed through a bridge.
+    fn provider_name(&self) -> &str {
+        "Chat"
+    }
+
     /// Whether this provider can move its own read cursor forward.
     ///
     /// False by default so existing providers and test doubles do not acquire a write capability

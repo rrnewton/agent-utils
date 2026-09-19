@@ -426,7 +426,7 @@ impl RateLimiter {
                 tracing::debug!(
                     route = %route,
                     wait_ms = gate.as_millis(),
-                    "holding a discord request back: that bucket is known to be empty"
+                    "holding a chat request back: that bucket is known to be empty"
                 );
                 tokio::time::sleep(gate).await;
                 waited += gate;
@@ -456,7 +456,7 @@ impl RateLimiter {
                         attempt = attempts,
                         wait_ms = wait.as_millis(),
                         global = limit.global,
-                        "discord rate-limited this request; waiting the time it asked for"
+                        "the chat provider rate-limited this request; waiting the time it asked for"
                     );
                     tokio::time::sleep(wait).await;
                     waited += wait;
@@ -474,7 +474,7 @@ impl RateLimiter {
         global: bool,
     ) -> ChatError {
         let detail = RateLimitExhausted {
-            provider: "discord",
+            provider: "chat",
             route: route.to_owned(),
             attempts,
             waited,
@@ -482,7 +482,7 @@ impl RateLimiter {
             retry_after,
             global,
         };
-        tracing::warn!(%detail, "giving up on a discord request: the rate limit did not clear");
+        tracing::warn!(%detail, "giving up on a chat request: the rate limit did not clear");
         ChatError::RateLimited(detail)
     }
 }

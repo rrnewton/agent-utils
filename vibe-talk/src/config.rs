@@ -261,6 +261,8 @@ impl Default for ReplayConfig {
 /// Discord access parameters.
 #[derive(Debug)]
 pub struct DiscordConfig {
+    /// Source service's display name. Bridges set this to the service they represent.
+    pub provider_name: String,
     /// Bot token. Sent as `Authorization: Bot <token>`.
     pub bot_token: Secret,
     /// The reader's own Discord user id, when they have said what it is.
@@ -437,6 +439,7 @@ struct FileServer {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileDiscord {
+    provider_name: Option<String>,
     bot_token: Option<Secret>,
     owner_user_id: Option<String>,
     api_base: Option<String>,
@@ -636,6 +639,19 @@ impl Config {
         };
         validate_channels(&channels)?;
 
+        let provider_name = file
+            .discord
+            .provider_name
+            .unwrap_or_else(|| "Discord".to_owned())
+            .trim()
+            .to_owned();
+        if provider_name.is_empty() || provider_name.chars().any(char::is_control) {
+            return Err(ConfigError::Invalid {
+                field: "discord.provider_name".to_owned(),
+                detail: "use a non-empty display name without control characters".to_owned(),
+            });
+        }
+
         let default_fetch_limit = file
             .discord
             .default_fetch_limit
@@ -719,6 +735,7 @@ impl Config {
                 .or(file.server.public_base_url),
             timezone,
             discord: DiscordConfig {
+                provider_name,
                 bot_token,
                 owner_user_id: get(ENV_DISCORD_OWNER_USER_ID)
                     .map(str::to_owned)

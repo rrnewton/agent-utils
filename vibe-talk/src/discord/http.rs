@@ -94,7 +94,7 @@ pub fn page_request(
 ) -> Result<PreparedRequest, ChatError> {
     if before.is_some() && after.is_some() {
         return Err(ChatError::Refused(
-            "before and after cannot both be given: discord does not define what that means"
+            "before and after cannot both be given: the chat API does not define what that means"
                 .to_owned(),
         ));
     }
@@ -200,7 +200,7 @@ pub fn post_request(
     }
     if content.chars().count() > DISCORD_MAX_CONTENT_LEN {
         return Err(ChatError::Refused(format!(
-            "message content is {} characters; discord accepts at most {DISCORD_MAX_CONTENT_LEN}",
+            "message content is {} characters; the chat API accepts at most {DISCORD_MAX_CONTENT_LEN}",
             content.chars().count()
         )));
     }
@@ -338,6 +338,7 @@ fn rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Headers {
 /// A live Discord client.
 #[derive(Debug)]
 pub struct HttpDiscordClient {
+    provider_name: String,
     client: reqwest::Client,
     api_base: String,
     authorization: String,
@@ -363,8 +364,11 @@ impl HttpDiscordClient {
             ))
             .timeout(std::time::Duration::from_secs(20))
             .build()
-            .map_err(|e| ChatError::Transport(e.to_string()))?;
+            .map_err(|e| {
+                ChatError::Transport(e.to_string()).with_provider(&config.provider_name)
+            })?;
         Ok(Self {
+            provider_name: config.provider_name.clone(),
             client,
             api_base: config.api_base.clone(),
             authorization: authorization_header(&config.bot_token),
@@ -420,8 +424,7 @@ impl HttpDiscordClient {
                 if !status.is_success() {
                     // Truncate: a Discord error body is short, but an intermediary's error page is
                     // not, and this string ends up in a log.
-                    let mut body = text;
-                    body.truncate(500);
+                    let body = text.chars().take(500).collect();
                     return Err(ChatError::Status {
                         status: status.as_u16(),
                         body,
@@ -444,13 +447,21 @@ impl HttpDiscordClient {
 
 #[async_trait]
 impl ChatClient for HttpDiscordClient {
+    fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
     fn supports_upstream_read_mark(&self) -> bool {
         self.upstream_read_marks
     }
 
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
-        let value = self.send(identity_request(&self.api_base)).await?;
-        parse_identity(&value)
+        async {
+            let value = self.send(identity_request(&self.api_base)).await?;
+            parse_identity(&value)
+        }
+        .await
+        .map_err(|error| error.with_provider(self.provider_name()))
     }
 
     async fn fetch_page(
@@ -460,9 +471,13 @@ impl ChatClient for HttpDiscordClient {
         before: Option<&MessageId>,
         after: Option<&MessageId>,
     ) -> Result<Vec<Message>, ChatError> {
-        let request = page_request(&self.api_base, channel, limit, before, after)?;
-        let value = self.send(request).await?;
-        parse_message_list(&value)
+        async {
+            let request = page_request(&self.api_base, channel, limit, before, after)?;
+            let value = self.send(request).await?;
+            parse_message_list(&value)
+        }
+        .await
+        .map_err(|error| error.with_provider(self.provider_name()))
     }
 
     async fn post_message(
@@ -471,9 +486,13 @@ impl ChatClient for HttpDiscordClient {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        let request = post_request(&self.api_base, channel, content, reply_to)?;
-        let value = self.send(request).await?;
-        parse_message(&value)
+        async {
+            let request = post_request(&self.api_base, channel, content, reply_to)?;
+            let value = self.send(request).await?;
+            parse_message(&value)
+        }
+        .await
+        .map_err(|error| error.with_provider(self.provider_name()))
     }
 
     async fn mark_read_upstream(
@@ -481,6 +500,7 @@ impl ChatClient for HttpDiscordClient {
         channel: &ChannelId,
         through: &MessageId,
     ) -> Result<(), ChatError> {
+        async {
         if !self.upstream_read_marks {
             return Err(ChatError::Refused(
                 "upstream read marks are disabled; set discord.upstream_read_marks = true only for a compatible bridge"
@@ -491,6 +511,9 @@ impl ChatClient for HttpDiscordClient {
             .send(mark_read_request(&self.api_base, channel, through))
             .await?;
         Ok(())
+        }
+        .await
+        .map_err(|error| error.with_provider(self.provider_name()))
     }
 }
 
@@ -655,6 +678,7 @@ mod tests {
         });
 
         let client = HttpDiscordClient {
+            provider_name: "Discord".to_owned(),
             client: reqwest::Client::new(),
             api_base: format!("http://{address}"),
             authorization: authorization_header(&Secret::new("abc")),

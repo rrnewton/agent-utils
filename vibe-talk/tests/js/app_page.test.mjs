@@ -194,7 +194,8 @@ class FakeElement {
  */
 function newPage(
   channels = [{ ...CHANNEL }],
-  store = new Map([["vibe-talk.token", "read-token-aaaaaaaaaaaaaaaa"]])
+  store = new Map([["vibe-talk.token", "read-token-aaaaaaaaaaaaaaaa"]]),
+  chatProviderName = undefined
 ) {
   const elements = new Map();
   for (const [id, markup] of PAGE_ELEMENTS) {
@@ -302,6 +303,7 @@ function newPage(
       if (url.startsWith("/api/v1/client-config")) {
         return json(200, {
           version: "test",
+          chat_provider_name: chatProviderName,
           channels: page.channels,
           elevenlabs_agent_id: null,
           live_poll_seconds: 30,
@@ -366,6 +368,16 @@ test("the page and the script agree about which elements exist", async () => {
   await page.el("refresh-text").click();
   await page.settle();
   assert.equal(page.el("status").textContent, "1 message");
+});
+
+test("server information names the selected chat backend, with a neutral fallback", async () => {
+  for (const name of ["Google Chat", "Discord", undefined, null, "   ", "<img src=x>"]) {
+    const page = newPage(undefined, undefined, name);
+    await page.settle();
+    const expected = typeof name === "string" ? name.trim() || "Chat" : "Chat";
+    assert.ok(page.el("server-info").textContent.includes(`chat service ${expected};`));
+    assert.ok(!page.createdTags.includes("img"), "a backend name was interpreted as markup");
+  }
 });
 
 // --- `#39 channel-alias`: one channel, one name ------------------------------------------------

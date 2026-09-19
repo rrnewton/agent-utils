@@ -893,7 +893,7 @@ async fn a_discord_failure_is_reported_as_a_gateway_error_not_as_empty_success()
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(payload["error"], "discord_error");
+    assert_eq!(payload["error"], "chat_error");
 }
 
 #[tokio::test]
@@ -2934,7 +2934,7 @@ async fn adding_a_channel_checks_the_shape_of_what_it_was_given() {
     assert!(
         body["detail"]
             .as_str()
-            .is_some_and(|d| d.contains("Developer Mode")),
+            .is_some_and(|d| d.contains("deployment operator") && d.contains("channel ID")),
         "the refusal does not say where to get an id: {body}"
     );
 

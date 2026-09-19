@@ -369,6 +369,10 @@ impl FakeDiscord {
 
 #[async_trait]
 impl ChatClient for FakeDiscord {
+    fn provider_name(&self) -> &str {
+        "Discord"
+    }
+
     fn supports_upstream_read_mark(&self) -> bool {
         self.lock().upstream_read_marks_enabled
     }
