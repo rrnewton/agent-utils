@@ -219,7 +219,7 @@ def test_native_unreaped_zombie_and_reaping_keep_cpu_and_close_fds(native_helper
                 assert cpu._poll(pair.pidfd, time.monotonic() + 1) & select.POLLIN
                 assert pair.valid(time.monotonic() + 1)
                 first = reader.seconds()
-                assert first >= pair.original.ticks / cpu._CLK_TCK
+                assert first >= pair.original.ticks / cpu._clk_tck()
                 child.stdin.write("r"); child.stdin.flush()
                 assert _line(child) == "reaped"
                 assert not pair.valid(time.monotonic() + 1)
@@ -442,3 +442,128 @@ def test_native_ptrace_reparent_keeps_zombie_until_real_parent_reaps(native_help
             reader.close()
             if child.poll() is None:
                 child.kill(); child.wait(timeout=5)
+
+
+def test_native_public_compatibility_and_unusual_comm(native_helper: Path) -> None:
+    with subprocess.Popen([str(native_helper), "comm"], start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+        assert child.stdin is not None
+        zombie = int(_line(child))
+        raw = Path(f"/proc/{zombie}/stat").read_bytes()
+        assert b"p\xff)\n(\x80" in raw
+        first = cpu.subtree_cpu_seconds(child.pid)
+        assert first is not None and first > 0
+        key = cpu._compat[child.pid][0].key
+        assert cpu.subtree_cpu_seconds(child.pid) == first
+        assert cpu._compat[child.pid][0].key == key
+        explicit = cpu.subtree_cpu_seconds(child.pid, proc_root=Path("/proc"))
+        assert explicit is not None and explicit >= first
+        time.sleep(cpu._SNAPSHOT_TTL_S + .05)
+        later = cpu.subtree_cpu_seconds(child.pid)
+        assert later is not None and later >= first
+        assert cpu._compat[child.pid][0].key != key
+        child.stdin.write("r"); child.stdin.flush()
+        assert _line(child) == "reaped"
+        child.stdin.write("x"); child.stdin.flush()
+        child.wait(timeout=5)
+        assert cpu.subtree_cpu_seconds(child.pid) is None
+        assert child.pid not in cpu._compat
+
+
+def test_clock_rate_errors_are_typed_at_owned_and_compatibility_apis(native_helper: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with subprocess.Popen([str(native_helper), "zombie"], start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+        assert child.stdin is not None
+        _line(child)
+        reader = cpu.ProcessGroupCpu(child.pid)
+        try:
+            assert reader.seconds() > 0
+            for value in (100, 250):
+                with monkeypatch.context() as patch:
+                    patch.setattr(os, "sysconf", lambda name, value=value: value)
+                    assert cpu._clk_tck() == float(value)
+            for value in (0, -1):
+                with monkeypatch.context() as patch:
+                    patch.setattr(os, "sysconf", lambda name, value=value: value)
+                    with pytest.raises(cpu.Unavailable, match="SC_CLK_TCK unavailable"):
+                        reader.seconds()
+                    assert cpu.subtree_cpu_seconds(child.pid) is None
+            for error in (OSError(errno.EIO, "injected query error"), ValueError("injected unsupported name")):
+                def fail(name: str, error: Exception = error) -> int:
+                    raise error
+                with monkeypatch.context() as patch:
+                    patch.setattr(os, "sysconf", fail)
+                    with pytest.raises(cpu.Unavailable, match="SC_CLK_TCK unavailable"):
+                        reader.seconds()
+                    assert cpu.subtree_cpu_seconds(child.pid) is None
+            assert reader.seconds() > 0
+        finally:
+            reader.close()
+            child.stdin.write("r"); child.stdin.flush()
+            assert _line(child) == "reaped"
+            child.stdin.write("x"); child.stdin.flush()
+            child.wait(timeout=5)
+            assert cpu.subtree_cpu_seconds(child.pid) is None
+
+
+def test_missing_namespace_metadata_is_distinct_and_closes_fds(native_helper: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original = cpu._read
+    def without_namespace(fd: int, deadline: float) -> str:
+        text = original(fd, deadline)
+        if os.readlink(f"/proc/self/fd/{fd}").endswith("/status"):
+            return "\n".join(line for line in text.splitlines() if not line.startswith("NSpid:"))
+        return text
+    with subprocess.Popen([str(native_helper), "zombie"], start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+        assert child.stdin is not None
+        _line(child)
+        before = len(list(Path("/proc/self/fd").iterdir()))
+        with monkeypatch.context() as patch:
+            patch.setattr(cpu, "_read", without_namespace)
+            with pytest.raises(cpu.Unavailable, match="namespace metadata unavailable: NSpid missing"):
+                cpu.ProcessGroupCpu(child.pid)
+            assert cpu.subtree_cpu_seconds(child.pid) is None
+        assert len(list(Path("/proc/self/fd").iterdir())) == before
+        child.stdin.write("r"); child.stdin.flush()
+        assert _line(child) == "reaped"
+        child.stdin.write("x"); child.stdin.flush()
+        child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("groups", [1, 4, 16])
+def test_native_shared_sampling_cost_and_availability(native_helper: Path, groups: int) -> None:
+    children: list[subprocess.Popen[str]] = []
+    readers: list[cpu.ProcessGroupCpu] = []
+    before = len(list(Path("/proc/self/fd").iterdir()))
+    try:
+        for _ in range(groups):
+            child = subprocess.Popen([str(native_helper), "zombie"], start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            children.append(child)
+            _line(child)
+            readers.append(cpu.ProcessGroupCpu(child.pid))
+        with cpu._lock:
+            cpu._snapshot_at = float("-inf")
+        first_start = time.perf_counter(); first_cpu = time.process_time()
+        values = [reader.seconds() for reader in readers]
+        first_cpu = time.process_time() - first_cpu; first_seconds = time.perf_counter() - first_start
+        assert all(value > 0 for value in values)
+        captured = cpu._snapshot_at
+        cached_start = time.perf_counter(); cached_cpu = time.process_time()
+        for _ in range(10):
+            for reader in readers:
+                assert reader.seconds() > 0
+        cached_cpu = time.process_time() - cached_cpu; cached_seconds = time.perf_counter() - cached_start
+        # Report whether this batch fit in one cache interval instead of changing its TTL.
+        one_snapshot = cpu._snapshot_at == captured
+        held = len(list(Path("/proc/self/fd").iterdir()))
+        print("PROCCPU_COST " + json.dumps({"edition": "python", "groups": groups, "matching_processes": 2 * groups, "first_wall_s": first_seconds, "first_self_cpu_s": first_cpu, "cached_wall_s": cached_seconds, "cached_self_cpu_s": cached_cpu, "cached_calls": groups * 10, "one_cached_snapshot": one_snapshot, "fd_before": before, "fd_held": held, "rlimit_nofile": resource.getrlimit(resource.RLIMIT_NOFILE)}))
+    finally:
+        for reader in readers:
+            reader.close()
+        for child in children:
+            assert child.stdin is not None
+            child.stdin.write("r"); child.stdin.flush()
+            assert _line(child) == "reaped"
+            child.stdin.write("x"); child.stdin.flush()
+            child.wait(timeout=5)
+            child.stdin.close()
+            assert child.stdout is not None
+            child.stdout.close()
+    assert len(list(Path("/proc/self/fd").iterdir())) == before

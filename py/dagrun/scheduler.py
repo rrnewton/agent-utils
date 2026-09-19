@@ -394,6 +394,9 @@ def uncontained_cpu_budget_warning(cfg: DagConfig) -> str | None:
         "UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort "
         f"procfs process-group CPU floor will police {len(live)} step(s) (largest {max(live)}s), "
         "but it can miss processes that leave the group and activity between observations. "
+        "A shared snapshot is limited to 1024 process records across 256 groups, a 1s scan, "
+        "and available descriptors with a 64-FD reserve; a shared refusal is unavailable "
+        "for all its readers and is reported separately. "
         "`capabilities` cannot express that quality difference."
     )
 
@@ -1634,11 +1637,15 @@ class Runner:
 
         # Retain the launched generation for the whole monitor lifetime.
         process_cpu: ProcessGroupCpu | None = None
+        process_cpu_registration_error: str | None = None
         if not boxed and cpu_budget > 0:
             try:
                 process_cpu = ProcessGroupCpu(proc.pid)
-            except Unavailable:
-                pass  # Existing monitor warning retains the unavailable-evidence policy.
+            except Unavailable as exc:
+                process_cpu_registration_error = (
+                    f"registration failed: {exc}; invocation identity was not retained, "
+                    "so registration is not retried after waiting starts"
+                )
 
         monitor_stop = threading.Event()
         thread_peak: int | None = None
@@ -1765,6 +1772,7 @@ class Runner:
                     and not cpu_timed_out
                     and (lane is Lane.UNCONTAINED or is_enforced("cpu_timeout", lane))
                 ):
+                    unavailable_reason: str | None = None
                     if boxed:
                         cs = self.cgroups.cpu_stats(step.tag)
                         measured = None if cs is None else _cpu_seconds_from_stats(cs)
@@ -1772,8 +1780,11 @@ class Runner:
                     else:
                         try:
                             measured = None if process_cpu is None else process_cpu.seconds()
-                        except Unavailable:
+                            if process_cpu is None:
+                                unavailable_reason = process_cpu_registration_error
+                        except Unavailable as exc:
                             measured = None
+                            unavailable_reason = f"observation failed: {exc}"
                         source = CPU_SOURCE_PROCFS
 
                     # ABSENT IS NOT ZERO. Say so once rather than leaving a configured
@@ -1790,6 +1801,7 @@ class Runner:
                                 f"step {step.tag!r}: {mechanism} is unavailable, so the "
                                 f"{cpu_budget}s CPU-time budget CANNOT be enforced for this "
                                 "step; only the wall timeout still applies."
+                                + (f" Reason: {unavailable_reason}." if unavailable_reason else "")
                             )
                         continue
 

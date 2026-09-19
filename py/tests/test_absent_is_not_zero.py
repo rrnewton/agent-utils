@@ -161,3 +161,34 @@ def test_an_unenforceable_cpu_budget_says_so_once(
     )
     # Once per step, not once per poll: the monitor ticks about twice during this step.
     assert message.count("CANNOT be enforced") == 1
+
+
+@pytest.mark.parametrize("stage", ["registration", "observation"])
+def test_uncontained_cpu_failure_reason_is_reported_once(
+    stage: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from dagrun import scheduler
+    from dagrun.proccpu import Unavailable
+
+    class RefusingReader:
+        def __init__(self, pid: int) -> None:
+            if stage == "registration":
+                raise Unavailable("injected registration descriptor reserve")
+
+        def seconds(self) -> float:
+            raise Unavailable("injected observation member bound")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(scheduler, "ProcessGroupCpu", RefusingReader)
+    cfg = DagConfig(steps=(Step("g", "quiet", "known refusal", "sleep 2.5", cpu_timeout=1, timeout=30),))
+    result = run_dag(cfg, jobs=1, cgroups=NoopCgroups(), verbosity=0)
+    assert result.ok
+    message = capsys.readouterr().err
+    assert message.count("CANNOT be enforced") == 1
+    assert f"{stage} failed: injected {stage}" in message
+    if stage == "registration":
+        assert "identity was not retained" in message
+        assert "not retried after waiting starts" in message
+    assert "only the wall timeout still applies" in message
