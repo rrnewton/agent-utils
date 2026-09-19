@@ -137,10 +137,12 @@ file remains readable for migration.
 
 The bounded UTF-8 contents go to a generation-bound control-plane sidecar, so writing the handoff
 does not make a clean checkout dirty. The sidecar records the source classification, absolute path,
-and exact file identity alongside its bytes. The same provenance is copied into write and read
-events. The sidecar is immutable once published; `finish` still refuses every tracked,
-untracked, or ignored checkout change. In particular, it does not exempt a
-pre-sidecar `HANDOFF.md` inside a flat-layout checkout.
+and exact file identity alongside its bytes. Before exposing a publication temporary file,
+`write-handoff` records an owner-authenticated intent containing that complete deterministic
+envelope; only exact canonical verification records completion. Reads accept the sidecar only when
+both events match it. The sidecar is immutable once published; `finish` still refuses every tracked,
+untracked, or ignored checkout change. In particular, it does not exempt a pre-sidecar `HANDOFF.md`
+inside a flat-layout checkout.
 
 `wrkslots read-handoff SLOT --coordinator-pid PID` prints the exact sidecar contents and durably
 enqueues that slot generation for later retirement. Reading never removes the sidecar, an existing
@@ -388,8 +390,10 @@ Every mutation appends a numbered, hash-linked JSON event before refreshing the 
 ARCHIVED, hold, or journal view. Readers derive state from the event history whenever it exists, so
 a stale compatibility view cannot override later evidence. A complete event left at an atomic-write
 temporary path can be promoted by `recover --discard-partial`; handoff publication temps use
-no-replace promotion, and a temp beside a conflicting durable sidecar is preserved and refused.
-Malformed or ambiguous files refuse.
+no-replace promotion and require independent durable authority. Owner-written temps must match an
+outstanding full-envelope write intent, while checkout-file projections must match a prior
+provenance-bearing nonqueued read. An orphan temp or a temp beside a conflicting durable sidecar is
+preserved and refused. Malformed or ambiguous files refuse.
 
 Create and removal journals contain the exact paths, Git identities, completed steps, salvage
 receipts, and remaining work. If the mutable journal view is missing, `recover` reconstructs the
