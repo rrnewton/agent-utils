@@ -346,7 +346,7 @@ async fn a_channel_added_in_the_app_is_included_in_on_demand_diagnostics() {
     let added = ChannelId("7777777777777777777".to_owned());
     discord.seed(&added, "codex-eng", "readable after restart");
     store
-        .add_channel(&added, "added team", false, 1)
+        .add_channel(&added, "added team", false, None, 1)
         .await
         .expect("store added channel");
     assert_eq!(
@@ -401,6 +401,7 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
             _after: Option<&MessageId>,
         ) -> Result<Vec<Message>, ChatError> {
             Ok(vec![Message {
+                thread: None,
                 id: MessageId("1".to_owned()),
                 channel_id: channel.clone(),
                 author: "somebody".to_owned(),

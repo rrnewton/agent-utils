@@ -263,6 +263,8 @@ impl Default for ReplayConfig {
 pub struct DiscordConfig {
     /// Source service's display name. Bridges set this to the service they represent.
     pub provider_name: String,
+    /// Thread protocol: `native` (default), normalized `bridge`, or `off`.
+    pub thread_api: crate::threads::ThreadApi,
     /// Bot token. Sent as `Authorization: Bot <token>`.
     pub bot_token: Secret,
     /// The reader's own Discord user id, when they have said what it is.
@@ -299,6 +301,11 @@ pub struct DiscordConfig {
     /// makes with that in front of them, not a thing that happens because they upgraded. Refused
     /// below [`crate::live::MIN_POLL_SECONDS`].
     pub live_poll_seconds: u64,
+    /// Whether the configured HTTP bridge manages channel registration.
+    ///
+    /// Off by default because Discord itself does not provide these endpoints. An operator opts in
+    /// only when `api_base` names a compatible bridge.
+    pub channel_registration: bool,
     /// Whether the configured HTTP bridge implements the optional upstream read endpoint.
     ///
     /// Off by default because Discord itself does not provide this operation. An operator must
@@ -440,6 +447,7 @@ struct FileServer {
 #[serde(deny_unknown_fields)]
 struct FileDiscord {
     provider_name: Option<String>,
+    thread_api: Option<crate::threads::ThreadApi>,
     bot_token: Option<Secret>,
     owner_user_id: Option<String>,
     api_base: Option<String>,
@@ -447,6 +455,7 @@ struct FileDiscord {
     max_fetch_limit: Option<u16>,
     max_count_scan: Option<u32>,
     live_poll_seconds: Option<u64>,
+    channel_registration: Option<bool>,
     upstream_read_marks: Option<bool>,
 }
 
@@ -512,6 +521,13 @@ struct FileStorage {
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
 /// Default Discord API base.
 pub const DEFAULT_DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+pub(crate) fn is_official_discord_api_base(api_base: &str) -> bool {
+    reqwest::Url::parse(api_base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| matches!(host.as_str(), "discord.com" | "discordapp.com"))
+}
+
 /// Default ElevenLabs API base.
 pub const DEFAULT_ELEVENLABS_API_BASE: &str = "https://api.elevenlabs.io/v1";
 /// Default operator time zone.
@@ -690,8 +706,8 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "discord.live_poll_seconds".to_owned(),
                 detail: format!(
-                    "{live_poll_seconds} is below the {} second floor. Every tick is one Discord \
-                     request per channel against a shared rate limit, and obeying Retry-After \
+                    "{live_poll_seconds} is below the {} second floor. Every tick is one request to the chat provider \
+                     per channel against a shared rate limit, and obeying Retry-After \
                      buys time, not quota; use 0 to turn live ingestion off.",
                     crate::live::MIN_POLL_SECONDS
                 ),
@@ -709,6 +725,29 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "discord.default_fetch_limit".to_owned(),
                 detail: format!("{default_fetch_limit} exceeds max_fetch_limit {max_fetch_limit}"),
+            });
+        }
+
+        let channel_registration = file.discord.channel_registration.unwrap_or(false);
+        let discord_api_base = file
+            .discord
+            .api_base
+            .unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned());
+        let official_discord_host = is_official_discord_api_base(&discord_api_base);
+        if channel_registration && official_discord_host {
+            return Err(ConfigError::Invalid {
+                field: "discord.channel_registration".to_owned(),
+                detail: "cannot be enabled with Discord's official API base: Discord does not implement the managed POST /channels and DELETE /channels/{id} contract; set discord.api_base to a compatible bridge"
+                    .to_owned(),
+            });
+        }
+
+        if file.discord.thread_api == Some(crate::threads::ThreadApi::Bridge)
+            && official_discord_host
+        {
+            return Err(ConfigError::Invalid {
+                field: "discord.thread_api".to_owned(),
+                detail: "bridge threading requires the API base of a compatible bridge".to_owned(),
             });
         }
 
@@ -736,20 +775,19 @@ impl Config {
             timezone,
             discord: DiscordConfig {
                 provider_name,
+                thread_api: file.discord.thread_api.unwrap_or_default(),
                 bot_token,
                 owner_user_id: get(ENV_DISCORD_OWNER_USER_ID)
                     .map(str::to_owned)
                     .or(file.discord.owner_user_id)
                     .map(|id| id.trim().to_owned())
                     .filter(|id| !id.is_empty()),
-                api_base: file
-                    .discord
-                    .api_base
-                    .unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned()),
+                api_base: discord_api_base,
                 default_fetch_limit,
                 max_fetch_limit,
                 max_count_scan,
                 live_poll_seconds,
+                channel_registration,
                 upstream_read_marks: file.discord.upstream_read_marks.unwrap_or(false),
             },
             auth: AuthConfig {
@@ -1428,6 +1466,46 @@ writable = true
     }
 
     #[test]
+    fn channel_registration_is_an_explicit_bridge_opt_in() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(!cfg.discord.channel_registration);
+
+        let text = FULL.replace(
+            "[discord]",
+            "[discord]\nchannel_registration = true\napi_base = \"https://bridge.example/v1\"",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid bridge config");
+        assert!(cfg.discord.channel_registration);
+    }
+
+    #[test]
+    fn channel_registration_refuses_the_official_discord_api_base() {
+        for api_base in [
+            None,
+            Some("https://discord.com/api/v10/"),
+            Some("https://discord.com/api/v9"),
+            Some("https://discordapp.com/api/v10"),
+        ] {
+            let replacement = match api_base {
+                Some(api_base) => {
+                    format!("[discord]\nchannel_registration = true\napi_base = \"{api_base}\"")
+                }
+                None => "[discord]\nchannel_registration = true".to_owned(),
+            };
+            let text = FULL.replace("[discord]", &replacement);
+            let error = Config::from_toml_and_env(&text, &env(&[]))
+                .expect_err("the official API must never receive managed lifecycle requests");
+            assert!(
+                matches!(&error, ConfigError::Invalid { field, detail }
+                    if field == "discord.channel_registration"
+                        && detail.contains("official API base")
+                        && detail.contains("compatible bridge")),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn upstream_read_marks_are_an_explicit_bridge_opt_in() {
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
         assert!(!cfg.discord.upstream_read_marks);
@@ -1855,5 +1933,42 @@ writable = true
         assert!(!secret.matches("abcdefghi"));
         assert!(!secret.matches("abcdefgH"));
         assert!(!secret.matches(""));
+    }
+
+    #[test]
+    fn thread_protocol_is_explicit_and_bridge_routes_cannot_target_the_native_api() {
+        use crate::threads::ThreadApi;
+        assert_eq!(
+            Config::from_toml_and_env(FULL, &env(&[]))
+                .expect("default")
+                .discord
+                .thread_api,
+            ThreadApi::Native
+        );
+        for (mode, expected) in [
+            ("native", ThreadApi::Native),
+            ("bridge", ThreadApi::Bridge),
+            ("off", ThreadApi::Off),
+        ] {
+            let text = FULL.replace(
+                "[discord]",
+                &format!(
+                    "[discord]\nthread_api = \"{mode}\"\napi_base = \"http://127.0.0.1:9876\""
+                ),
+            );
+            assert_eq!(
+                Config::from_toml_and_env(&text, &env(&[]))
+                    .expect("explicit mode")
+                    .discord
+                    .thread_api,
+                expected
+            );
+        }
+        let invalid = FULL.replace("[discord]", "[discord]\nthread_api = \"bridge\"");
+        assert!(
+            matches!(Config::from_toml_and_env(&invalid,&env(&[])),Err(ConfigError::Invalid{field,..}) if field=="discord.thread_api")
+        );
+        let invalid = FULL.replace("[discord]", "[discord]\nthread_api = \"guess\"");
+        assert!(Config::from_toml_and_env(&invalid, &env(&[])).is_err());
     }
 }

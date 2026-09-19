@@ -299,8 +299,12 @@ const FIXTURE_TREE = {
     "inbox-note",
     "clear-backlog",
     "load-older",
+    "timeline-notice",
+    "thread-list",
     "discord-log",
+    "channel-composer",
   ],
+  "channel-composer": ["channel-compose-label", "channel-compose-text", "channel-send", "channel-compose-state"],
   // `#59 text-entry-button` and `#60 canned-prompt-buttons` put their buttons in the pack, and
   // web/voice.js hides and shows them by ITERATING it rather than by name — which is what makes a
   // third button one list entry rather than a new code path. So the fixture has to really nest
@@ -941,6 +945,8 @@ function newPage(store = new Map(), script = SCRIPT) {
         elevenlabs_agent_id: "agent_test",
         live_poll_seconds: page.livePollSeconds,
         live_delivery: page.liveDelivery,
+        channel_registration_supported: page.channelRegistrationSupported,
+        threading_supported: page.threadingSupported,
         upstream_read_mark_supported: page.upstreamReadMarkSupported,
         replay_enabled: page.replayEnabled,
         self_author_id: page.selfAuthorId,
@@ -976,6 +982,12 @@ function newPage(store = new Map(), script = SCRIPT) {
     livePollSeconds: 30,
     /** Whether live events are off, polled by the server, or pushed by an adapter. */
     liveDelivery: "poll",
+    /** Whether Add sends a provider-neutral source for the bridge to resolve. */
+    channelRegistrationSupported: false,
+    /** Stable id the fake registration bridge returns for a source. */
+    registeredChannelId: "1110000000000000099",
+    /** Whether the fake registration bridge permits posting into the registered channel. */
+    registeredChannelWritable: false,
     /** Whether the provider can move its own read cursor. Default false, like production. */
     upstreamReadMarkSupported: false,
     /** Every explicit provider read-boundary request. Separate from local Done/archive calls. */
@@ -983,6 +995,25 @@ function newPage(store = new Map(), script = SCRIPT) {
     /** Channel route used by every provider read-boundary request. */
     upstreamReadPaths: [],
     messages: [],
+    threadingSupported: false,
+    threads: [],
+    timelineCalls: [],
+    timeline: async (path) => {
+      const url = new URL(path, "http://fixture.test");
+      const view = url.searchParams.get("view");
+      const threadId = url.searchParams.get("thread_id");
+      const messages = page.messages.filter((m) => view === "flat" ||
+        (view === "thread" && m.thread && m.thread.id === threadId) ||
+        (view === "main" && (!m.thread || m.thread.is_root)));
+      return json(200, {
+        channel: page.channels[0], messages,
+        threads: view === "threads" ? page.threads : [],
+        thread: view === "thread" ? page.threads.find((thread) => thread.id === threadId) : null,
+        has_threads: page.threads.length > 0,
+        has_more: false, next_before: null,
+        dismissed: messages.map((m) => String(m.id)).filter((id) => page.dealtWith.has(id)),
+      });
+    },
     /**
      * One step of a walk, shaped exactly as `PageResponse` serializes one.
      *
@@ -1050,6 +1081,7 @@ function newPage(store = new Map(), script = SCRIPT) {
     repliesPosted: [],
     /** `#49 cached-summaries`: every summary the page has asked for, in order. */
     summaryAsks: [],
+    summaryPaths: [],
     /** `#50 todo-view`: the message ids this fake server considers dealt with. */
     dealtWith: new Set(),
     /** How many times the page has read the to-do list. */
@@ -1340,6 +1372,10 @@ function newPage(store = new Map(), script = SCRIPT) {
       if (String(path).startsWith("/api/v1/client-config")) {
         return page.clientConfig(path, options);
       }
+      if (/\/timeline\?/.test(String(path))) {
+        page.timelineCalls.push(String(path));
+        return page.timeline(path, options);
+      }
       // `#65 scrollback-paging` moved the channel read onto the CURSORED route. `/messages` is
       // deliberately not served any more: it is a window with no way past its own oldest message,
       // and a page that went back to it should fail here loudly rather than quietly lose the walk.
@@ -1383,9 +1419,11 @@ function newPage(store = new Map(), script = SCRIPT) {
           return json(502, { error: "channel_unreadable", detail: page.addChannelError });
         }
         const created = {
-          id: String(asked.id),
+          id: String(page.channelRegistrationSupported ? page.registeredChannelId : asked.id),
           label: String(asked.label),
-          writable: asked.writable === true,
+          writable: page.channelRegistrationSupported
+            ? page.registeredChannelWritable
+            : asked.writable === true,
           added: true,
         };
         page.channels = [...page.channels, created];
@@ -1517,6 +1555,7 @@ function newPage(store = new Map(), script = SCRIPT) {
       const wantsSummary =
         /^\/api\/v1\/channels\/([^/]+)\/messages\/([^/]+)\/summary(\?|$)/.exec(String(path));
       if (wantsSummary) {
+        page.summaryPaths.push(String(path));
         // `with` recorded too: a glommed row must summarise the whole group, and an ask that
         // silently dropped the tail would otherwise look identical to a correct one here.
         const withParam = /[?&]with=([^&]*)/.exec(String(path));
@@ -12848,6 +12887,40 @@ test("A CHANNEL CAN BE ADDED FROM INSIDE THE APP, AND APPEARS IN THE PICKER", as
   assert.equal(page.el("new-channel-id").value, "", "the form kept the id it had just used");
 });
 
+test("MANAGED REGISTRATION HIDES THE CHECKBOX AND ACCEPTS BRIDGE WRITE POLICY", async () => {
+  const page = newPage();
+  page.channelRegistrationSupported = true;
+  page.registeredChannelWritable = true;
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.el("open-add-channel").click();
+
+  assert.match(page.el("new-channel-id-label").text(), /Channel link or provider reference/);
+  assert.match(page.el("new-channel-help").text(), /bridge resolves it/);
+  assert.equal(
+    page.el("new-channel-writable-row").hidden,
+    true,
+    "managed registration exposed a posting capability it does not accept"
+  );
+
+  const source = "https://chat.example/space/thread";
+  page.el("new-channel-id").value = source;
+  page.el("new-channel-label").value = "release thread";
+  await page.el("add-channel").click();
+  await page.settle();
+
+  assert.deepEqual(page.addChannelCalls, [{ source, label: "release thread" }]);
+  assert.equal(
+    page.channels.find((channel) => channel.id === page.registeredChannelId).writable,
+    true,
+    "the managed response lost the bridge-declared write policy"
+  );
+  assert.ok(
+    page.el("discord-channel").children.some((option) => option.value === page.registeredChannelId),
+    "the picker used the source instead of the bridge-issued id"
+  );
+});
+
 test("...and letting the bridge POST there is a deliberate act, off by default", async () => {
   // The one control on this screen that widens what the bridge can SAY rather than what it reads.
   const page = newPage();
@@ -13379,6 +13452,7 @@ test("A REPLY TO A COMBINED ROW GOES TO THE FIRST MESSAGE'S REAL DISCORD ID", as
 
 test("READING A COMBINED ROW ALOUD READS ALL OF IT, and archives it only when the last part ends", async () => {
   const page = newPage();
+  page.prepareFails = true; // Exercise the audio-blob fallback, even when all parts can be prepared.
   await signIn(page);
   const rows = await inReadingMode(page, splitPost());
 
@@ -13412,6 +13486,7 @@ test("READING A COMBINED ROW ALOUD READS ALL OF IT, and archives it only when th
 
 test("...and stopping a combined read part-way releases EVERY audio URL it fetched", async () => {
   const page = newPage();
+  page.prepareFails = true; // This test owns the blob-URL lifecycle, not prepared streaming URLs.
   await signIn(page);
   const rows = await inReadingMode(page, splitPost());
 
@@ -13684,6 +13759,7 @@ test("NO ID THIS PAGE INVENTED EVER REACHES THE SERVER OR THE STORE", async () =
 
   const sent = [
     ...page.speakCalls,
+    ...page.prepareCalls.flatMap((call) => call.ids),
     ...page.dismissCalls.flatMap((call) => call.messages || []),
     ...page.repliesPosted.map((call) => call.body.reply_to),
   ];
@@ -13697,4 +13773,429 @@ test("NO ID THIS PAGE INVENTED EVER REACHES THE SERVER OR THE STORE", async () =
     /[ +,]/,
     "a combined id reached storage"
   );
+});
+
+// Thread metadata comes from the provider; reply_to is deliberately irrelevant to membership.
+function threadData() {
+  const first = { id: "spaces/A/threads/one & two", root_message_id: "201", is_root: true,
+    reply_count: 1, reply_count_exact: true };
+  const second = { id: "spaces/A/threads/another", root_message_id: "203", is_root: true,
+    reply_count: 1, reply_count_exact: false };
+  const messages = [
+    message({ id: "200", content: "main channel announcement" }),
+    message({ id: "201", content: "first thread root", thread: first }),
+    message({ id: "202", content: "first thread answer", thread: { ...first, is_root: false } }),
+    message({ id: "203", content: "second thread root", thread: second }),
+    message({ id: "204", content: "second thread answer", thread: { ...second, is_root: false } }),
+  ];
+  const threads = [first, second].map((thread) => ({
+    id: thread.id, root: messages.find((m) => m.id === thread.root_message_id),
+    title: thread.root_message_id === "201" ? "First discussion" : "Second discussion",
+    reply_count: thread.reply_count, reply_count_exact: thread.reply_count_exact,
+    updated_at: messages.find((m) => m.thread && m.thread.id === thread.id && !m.thread.is_root).timestamp,
+  }));
+  return { messages, threads };
+}
+
+async function threadPage() {
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  return page;
+}
+
+const threadButton = (row) => row.descendants().find((node) => node.className === "thread-replies");
+const threadBadge = (row) => row.descendants().find((node) => node.className === "thread-badge");
+
+test("thread views show roots in Main and expose the selector only when threads exist", async () => {
+  const page = await threadPage();
+  assert.equal(page.el("channel-view-tabs").hidden, false);
+  assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["200", "201", "203"]);
+  assert.equal(threadButton(page.el("discord-log").children[1]).textContent, "1 reply");
+  const rootRow = page.el("discord-log").children[1];
+  assert.ok(rootRow.children.indexOf(threadButton(rootRow)) > rootRow.children.findIndex((child) => child.className === "body"),
+    "the thread reply-count decorator must sit underneath the root message");
+  assert.equal(threadButton(page.el("discord-log").children[2]).textContent, "about 1 reply");
+  assert.match(page.timelineCalls[0], /view=main/);
+  assert.equal(page.pageReads, 0);
+  const empty = newPage();
+  empty.threadingSupported = true;
+  await signIn(empty);
+  await showDiscord(empty, [message({ content: "no threads yet" })]);
+  assert.equal(empty.el("channel-view-tabs").hidden, true);
+});
+
+test("Threads is ordered oldest to newest, opens at bottom and returns to its saved place", async () => {
+  const page = await threadPage();
+  page.el("scroll-area").clientHeight = 50;
+  await page.el("channel-view-threads").click();
+  const list = page.el("thread-list");
+  assert.equal(list.hidden, false);
+  assert.equal(page.el("discord-log").hidden, true);
+  assert.deepEqual(list.children.map((row) => row.getAttribute("data-context-id")), page.threads.map((t) => t.id));
+  const area = page.el("scroll-area");
+  assert.equal(area.scrollTop, area.scrollHeight - area.clientHeight);
+  area.scrollTop = 30;
+  await list.children[0].children[0].click();
+  assert.equal(page.el("thread-heading").hidden, false);
+  assert.equal(page.el("thread-title").textContent, "First discussion");
+  assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["201", "202"]);
+  assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("thread_id"), page.threads[0].id);
+  await page.el("thread-back").click();
+  assert.equal(list.hidden, false);
+  assert.equal(area.scrollTop, 30, "returning from a thread discarded the list's position");
+});
+
+test("a rightward swipe leaves a thread and restores Main without archiving a message", async () => {
+  const page = await threadPage();
+  page.el("scroll-area").clientHeight = 40;
+  page.el("scroll-area").scrollTop = 20;
+  await threadButton(page.el("discord-log").children[1]).click();
+  const row = page.el("discord-log").children[0];
+  const point = (x) => ({ pointerType: "touch", clientX: x, clientY: 30 });
+  await row.dispatch("pointerdown", point(10));
+  await row.dispatch("pointermove", point(180));
+  await row.dispatch("pointerup", point(180));
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, true);
+  assert.equal(page.el("channel-view-main").getAttribute("aria-pressed"), "true");
+  assert.equal(page.el("scroll-area").scrollTop, 20);
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("All marks every threaded message with a stable colored Thread button and never combines across threads", async () => {
+  const page = await threadPage();
+  // These two IDs collide under the common hash = hash * 31 + character scheme. They must still
+  // receive separated colors, and every message within one thread must retain that color.
+  for (const m of page.messages) {
+    if (m.thread) m.thread.id = m.thread.root_message_id === "201" ? "Aa" : "BB";
+  }
+  page.threads[0].id = "Aa";
+  page.threads[1].id = "BB";
+  for (const m of page.messages) m.timestamp = "2026-09-19T00:00:00Z";
+  await page.el("channel-view-flat").click();
+  const rows = page.el("discord-log").children;
+  assert.equal(rows.length, 5, "messages crossed a thread boundary while combining");
+  assert.equal(threadBadge(rows[0]), undefined);
+  for (const row of rows.slice(1)) assert.equal(threadBadge(row).textContent, "Thread");
+  const color = (row) => threadBadge(row).style.getPropertyValue("--thread-hue");
+  assert.equal(color(rows[1]), color(rows[2]));
+  assert.notEqual(color(rows[1]), color(rows[3]));
+  const distance = Math.abs(Number(color(rows[1])) - Number(color(rows[3])));
+  assert.ok(Math.min(distance, 360 - distance) >= 30, "two visible threads received almost identical hues");
+  await threadBadge(rows[2]).click();
+  assert.equal(page.el("thread-heading").hidden, false);
+  await page.el("thread-back").click();
+  assert.equal(page.el("channel-view-flat").getAttribute("aria-pressed"), "true");
+});
+
+test("the normal composer lives after history and posts standalone messages without a reply target", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ content: "history" })]);
+  assertMarkupContains("pane-discord", "channel-composer");
+  assert.ok(markupPlace("channel-composer").at > markupPlace("discord-log").at);
+  assert.doesNotMatch(cssBlock("#channel-composer"), /position:\s*(fixed|sticky|absolute)/);
+  page.el("channel-compose-text").value = "a fresh main message";
+  await page.el("channel-compose-text").dispatch("input");
+  await page.el("channel-send").click();
+  assert.deepEqual(page.repliesPosted[0].body, { text: "a fresh main message" });
+  assert.equal(page.el("channel-compose-text").value, "");
+  assert.equal(page.sockets.length, 0, "posting to chat started a voice conversation");
+});
+
+test("read-only channels keep drafts but disable main and thread sends, including Enter", async () => {
+  const page = newPage();
+  const data = threadData();
+  page.channels = [{ ...CHANNEL, writable: false }];
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  assert.equal(page.el("channel-send").disabled, true);
+  assert.match(page.el("channel-compose-state").textContent, /This channel is read-only/);
+  page.el("channel-compose-text").value = "keep this main draft";
+  await page.el("channel-compose-text").dispatch("input");
+  await page.el("channel-compose-text").dispatch("keydown", { key: "Enter", preventDefault() {} });
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 0);
+  await threadButton(page.el("discord-log").children[1]).click();
+  assert.equal(page.el("channel-send").disabled, true);
+  assert.match(page.el("channel-compose-state").textContent, /This channel is read-only/);
+  page.el("channel-compose-text").value = "keep this thread draft";
+  await page.el("channel-compose-text").dispatch("input");
+  await page.el("channel-compose-text").dispatch("keydown", { key: "Enter", preventDefault() {} });
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 0);
+  await page.el("thread-back").click();
+  assert.equal(page.el("channel-compose-text").value, "keep this main draft");
+  await threadButton(page.el("discord-log").children[1]).click();
+  assert.equal(page.el("channel-compose-text").value, "keep this thread draft");
+});
+
+test("removing the selected channel cannot carry its thread or composer draft into another channel", async () => {
+  const page = newPage();
+  const data = threadData();
+  const other = { id: "2220000000000000002", label: "another channel", writable: true, added: true };
+  page.channels = [{ ...CHANNEL, added: true }, other];
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await threadButton(page.el("discord-log").children[1]).click();
+  page.el("channel-compose-text").value = "belongs only in the original thread";
+  await page.el("channel-compose-text").dispatch("input");
+  await page.el("open-settings").click();
+  await page.el("remove-channel").click();
+  await page.settle();
+  assert.equal(page.el("discord-channel").value, other.id);
+  assert.equal(page.el("channel-compose-text").value, "");
+  assert.equal(page.el("thread-heading").hidden, true);
+  assert.match(page.storage.get("vibe-talk.channel-drafts"), /belongs only in the original thread/);
+  page.el("channel-compose-text").value = "a new message for the remaining channel";
+  await page.el("channel-send").click();
+  assert.deepEqual(page.repliesPosted[0].body, { text: "a new message for the remaining channel" });
+  assert.equal(page.repliesPosted[0].path, `/api/v1/channels/${other.id}/reply`);
+  await page.el("remove-channel").click();
+  await page.settle();
+  assert.equal(page.el("discord-channel").value, "");
+  assert.equal(page.el("channel-send").disabled, true);
+});
+
+test("main and thread composer drafts survive navigation, partial sends and reload", async () => {
+  const page = await threadPage();
+  page.el("channel-compose-text").value = "main draft";
+  await page.el("channel-compose-text").dispatch("input");
+  await threadButton(page.el("discord-log").children[1]).click();
+  assert.equal(page.el("channel-compose-text").value, "");
+  page.el("channel-compose-text").value = "thread draft";
+  await page.el("channel-compose-text").dispatch("input");
+  page.replyResponse = async () => json(207, { error: "partially_posted", posted: 1, unsent: "unsent tail", detail: "Google Chat returned HTTP 502" });
+  await page.el("channel-send").click();
+  assert.deepEqual(page.repliesPosted[0].body, { text: "thread draft", thread_id: page.threads[0].id });
+  assert.equal(page.el("channel-compose-text").value, "unsent tail");
+  assert.match(page.el("channel-compose-state").textContent, /Google Chat returned HTTP 502/);
+  await page.el("thread-back").click();
+  assert.equal(page.el("channel-compose-text").value, "main draft");
+  const again = newPage(page.storage);
+  again.threadingSupported = true;
+  again.threads = page.threads;
+  await signIn(again);
+  await showDiscord(again, page.messages);
+  assert.equal(again.el("channel-compose-text").value, "main draft");
+  await threadButton(again.el("discord-log").children[1]).click();
+  assert.equal(again.el("channel-compose-text").value, "unsent tail");
+});
+
+test("a send completing after leaving a thread cannot clear or paint the main context", async () => {
+  const page = await threadPage();
+  page.el("channel-compose-text").value = "keep main draft";
+  await page.el("channel-compose-text").dispatch("input");
+  await threadButton(page.el("discord-log").children[1]).click();
+  page.el("channel-compose-text").value = "thread send";
+  let finish;
+  page.replyResponse = () => new Promise((resolve) => { finish = resolve; });
+  const pending = page.el("channel-send").click();
+  await page.settle();
+  await page.el("thread-back").click();
+  finish(json(200, { posted: message({ id: "999", content: "late thread response", thread: { ...page.messages[1].thread, is_root: false } }) }));
+  await pending;
+  assert.equal(page.el("channel-compose-text").value, "keep main draft");
+  assert.doesNotMatch(page.el("discord-log").text(), /late thread response/);
+  assert.equal(page.el("channel-send").disabled, false);
+});
+
+test("thread paging encodes opaque cursors and ignores a response after context navigation", async () => {
+  const page = await threadPage();
+  const standard = page.timeline;
+  let finishOlder;
+  page.timeline = async (path) => {
+    const url = new URL(path, "http://fixture.test");
+    if (url.searchParams.has("before")) return new Promise((resolve) => { finishOlder = resolve; });
+    if (url.searchParams.get("view") === "thread") return json(200, {
+      channel: CHANNEL, messages: [page.messages[2]], thread: page.threads[0],
+      threads: [], has_threads: true, has_more: true, next_before: "opaque cursor /&?",
+    });
+    return standard(path);
+  };
+  await threadButton(page.el("discord-log").children[1]).click();
+  const pending = page.el("load-older").click();
+  await page.settle();
+  assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("before"), "opaque cursor /&?");
+  await page.el("thread-back").click();
+  finishOlder(json(200, { channel: CHANNEL, messages: [message({ id: "old", content: "stale thread page" })], has_threads: true, has_more: false }));
+  await pending;
+  assert.doesNotMatch(page.el("discord-log").text(), /stale thread page/);
+  assert.equal(page.el("load-older").hidden, true);
+});
+
+test("thread replies retain thread context on the existing message Reply control", async () => {
+  const page = await threadPage();
+  await threadButton(page.el("discord-log").children[1]).click();
+  const button = page.el("discord-log").children[1].descendants().find((node) => node.className === "reply-button");
+  await button.click();
+  page.el("reply-text").value = "specific answer";
+  await page.el("reply-send").click();
+  assert.deepEqual(page.repliesPosted[0].body, { text: "specific answer", reply_to: "202", thread_id: page.threads[0].id });
+});
+
+test("live replies refresh only the active thread instead of leaking across contexts", async () => {
+  const page = await threadPage();
+  await threadButton(page.el("discord-log").children[1]).click();
+  const arriving = message({ id: "205", content: "other discussion only", thread: { ...page.messages[3].thread, is_root: false } });
+  page.messages.push(arriving);
+  const before = page.timelineCalls.length;
+  await deliver(page, page.stream(), sseMessage(arriving));
+  await page.settle();
+  assert.ok(page.timelineCalls.length > before);
+  assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("thread_id"), page.threads[0].id);
+  assert.doesNotMatch(page.el("discord-log").text(), /other discussion only/);
+  assert.equal(page.el("thread-heading").hidden, false);
+});
+
+test("a slow mode response cannot replace the view chosen after it", async () => {
+  const page = await threadPage();
+  const standard = page.timeline;
+  let finish;
+  page.timeline = (path) => path.includes("view=threads")
+    ? new Promise((resolve) => { finish = resolve; }) : standard(path);
+  const pending = page.el("channel-view-threads").click();
+  await page.settle();
+  await page.el("channel-view-flat").click();
+  finish(json(200, { channel: CHANNEL, threads: [{ id: "stale", title: "stale card" }], messages: [], has_threads: true }));
+  await pending;
+  assert.equal(page.el("channel-view-flat").getAttribute("aria-pressed"), "true");
+  assert.equal(page.el("discord-log").children.length, 5);
+  assert.doesNotMatch(page.el("thread-list").text(), /stale card/);
+});
+
+test("prepending older thread messages preserves the visible message and viewport offset", async () => {
+  const page = await threadPage();
+  const old = page.messages[1];
+  const recent = page.messages[2];
+  recent.content = longMessage("recent answer");
+  page.timeline = async (path) => json(200, {
+    channel: CHANNEL, messages: path.includes("before=") ? [old] : [recent],
+    threads: [], thread: page.threads[0], has_threads: true,
+    has_more: !path.includes("before="), next_before: path.includes("before=") ? null : "step:one",
+  });
+  await threadButton(page.el("discord-log").children[1]).click();
+  const held = page.el("discord-log").children[0];
+  const area = page.el("scroll-area");
+  area.clientHeight = 30;
+  area.scrollTop = held.offsetTop() + 5;
+  const top = held.getBoundingClientRect().top;
+  await page.el("load-older").click();
+  assert.equal(page.el("discord-log").children[1], held);
+  assert.equal(held.getBoundingClientRect().top, top);
+  assert.equal(page.el("load-older").hidden, true);
+});
+
+test("thread-aware speech batches never mix threads and summaries and read marks carry the same context", async () => {
+  const page = newPage();
+  const data = threadData();
+  data.messages.forEach((m) => { m.content = longMessage(m.id); });
+  page.threadingSupported = true;
+  page.upstreamReadMarkSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.el("channel-view-flat").click();
+  await readButton(page).click();
+  await page.settle();
+  assert.equal(page.prepareCalls.length, 3);
+  assert.deepEqual(page.prepareCalls.map((call) => [call.thread_id || null, call.ids]), [
+    [null, ["200"]], [data.threads[0].id, ["201", "202"]], [data.threads[1].id, ["203", "204"]],
+  ]);
+  await page.el("summarise").click();
+  await page.settle();
+  assert.ok(page.summaryPaths.some((path) => new URL(path, "http://fixture.test").searchParams.get("thread_id") === data.threads[0].id));
+  const row = page.el("discord-log").children[2];
+  await upstreamReadButton(row).click();
+  assert.deepEqual(page.upstreamReadCalls.at(-1), { message_id: "202", thread_id: data.threads[0].id });
+});
+
+test("a failed standalone send keeps its draft and send controls usable", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  page.replyResponse = errorResponse(502, "chat_error", "Google Chat returned HTTP 502");
+  page.el("channel-compose-text").value = "do not lose this";
+  await page.el("channel-send").click();
+  assert.equal(page.el("channel-compose-text").value, "do not lose this");
+  assert.match(page.el("channel-compose-state").textContent, /Google Chat returned HTTP 502/);
+  assert.equal(page.el("channel-send").disabled, false);
+  assert.equal(page.el("channel-compose-text").disabled, false);
+});
+
+test("an expired older-thread cursor starts a fresh snapshot and makes older paging usable again", async () => {
+  const page = await threadPage();
+  let snapshots = 0;
+  page.timeline = async (path) => {
+    const before = new URL(path, "http://fixture.test").searchParams.get("before");
+    if (before === "expired:cursor") {
+      return json(400, { error: "refused", detail: "this timeline cursor has expired; refresh the channel" });
+    }
+    if (!before) snapshots += 1;
+    return json(200, {
+      channel: CHANNEL, messages: before ? [page.messages[1]] : [page.messages[2]],
+      thread: page.threads[0], threads: [], has_threads: true, has_more: !before,
+      next_before: before ? null : snapshots === 1 ? "expired:cursor" : "fresh:cursor",
+    });
+  };
+  await threadButton(page.el("discord-log").children[1]).click();
+  await page.el("load-older").click();
+  assert.equal(snapshots, 2, "the expired snapshot was never replaced");
+  assert.match(page.el("status").textContent, /snapshot expired.*Refreshed/);
+  assert.equal(page.el("error").hidden, true);
+  assert.equal(page.el("load-older").disabled, false);
+  await page.el("load-older").click();
+  assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("before"), "fresh:cursor");
+  assert.deepEqual(page.el("discord-log").children.map((row) => row.getAttribute("data-id")), ["201", "202"]);
+  assert.equal(page.el("load-older").hidden, true);
+});
+
+test("background polling keeps walked thread history but an explicit refresh replaces its snapshot", async () => {
+  const page = await threadPage();
+  let snapshots = 0;
+  page.timeline = async (path) => {
+    const before = new URL(path, "http://fixture.test").searchParams.get("before");
+    if (!before) snapshots += 1;
+    return json(200, {
+      channel: CHANNEL, messages: [before ? page.messages[1] : page.messages[2]],
+      thread: page.threads[0], threads: [], has_threads: true, has_more: true,
+      next_before: before ? "walked:cursor" : `fresh:${snapshots}`,
+    });
+  };
+  await threadButton(page.el("discord-log").children[1]).click();
+  await page.el("load-older").click();
+  assert.equal(page.el("discord-log").children.length, 2);
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  assert.equal(page.el("discord-log").children.length, 2, "polling threw away the walked history");
+  page.el("scroll-area").scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX);
+  assert.equal(page.el("discord-log").children.length, 1, "explicit refresh retained the old snapshot");
+  const fresh = `fresh:${snapshots}`;
+  await page.el("load-older").click();
+  assert.equal(new URL(page.timelineCalls.at(-1), "http://fixture.test").searchParams.get("before"), fresh);
+});
+
+test("a failed fetch from a context already left cannot raise an error over the new view", async () => {
+  const page = await threadPage();
+  const standard = page.timeline;
+  let finish;
+  page.timeline = (path) => path.includes("view=threads")
+    ? new Promise((resolve) => { finish = resolve; }) : standard(path);
+  const pending = page.el("channel-view-threads").click();
+  await page.settle();
+  await page.el("channel-view-flat").click();
+  finish(json(502, { error: "chat_error", detail: "the abandoned request failed" }));
+  await pending;
+  assert.equal(page.el("channel-view-flat").getAttribute("aria-pressed"), "true");
+  assert.equal(page.el("discord-log").children.length, 5);
+  assert.equal(page.el("error").hidden, true);
 });

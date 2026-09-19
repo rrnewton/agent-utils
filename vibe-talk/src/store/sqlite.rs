@@ -137,6 +137,11 @@ pub const MIGRATIONS: &[&str] = &[
         added_at_ms INTEGER NOT NULL
     ) STRICT;
     ",
+    // v6 — which provider namespace owns an added channel's registration lifecycle.
+    // Existing rows predate managed registration and therefore remain direct (`NULL`).
+    "
+    ALTER TABLE added_channels ADD COLUMN registration_provider TEXT DEFAULT NULL;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -687,8 +692,8 @@ impl StateStore for SqliteStore {
         self.with_connection(|connection| {
             let mut statement = connection
                 .prepare(
-                    "SELECT channel_id, label, writable, added_at_ms FROM added_channels
-                     ORDER BY added_at_ms ASC, channel_id ASC",
+                    "SELECT channel_id, label, writable, registration_provider, added_at_ms
+                     FROM added_channels ORDER BY added_at_ms ASC, channel_id ASC",
                 )
                 .map_err(backend)?;
             let rows = statement
@@ -697,7 +702,8 @@ impl StateStore for SqliteStore {
                         channel: ChannelId(row.get::<_, String>(0)?),
                         label: row.get::<_, String>(1)?,
                         writable: row.get::<_, i64>(2)? != 0,
-                        added_at_ms: row.get::<_, i64>(3)?,
+                        registration_provider: row.get::<_, Option<String>>(3)?,
+                        added_at_ms: row.get::<_, i64>(4)?,
                     })
                 })
                 .map_err(backend)?;
@@ -711,17 +717,27 @@ impl StateStore for SqliteStore {
         channel: &ChannelId,
         label: &str,
         writable: bool,
+        registration_provider: Option<&str>,
         at_ms: i64,
     ) -> Result<(), StoreError> {
         let channel = channel.0.clone();
         let label = label.to_owned();
+        let registration_provider = registration_provider.map(str::to_owned);
         self.with_connection(move |connection| {
             connection
                 .execute(
-                    "INSERT INTO added_channels (channel_id, label, writable, added_at_ms)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(channel_id) DO UPDATE SET label = ?2, writable = ?3",
-                    rusqlite::params![channel, label, i64::from(writable), at_ms],
+                    "INSERT INTO added_channels
+                        (channel_id, label, writable, registration_provider, added_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(channel_id) DO UPDATE SET
+                        label = ?2, writable = ?3, registration_provider = ?4",
+                    rusqlite::params![
+                        channel,
+                        label,
+                        i64::from(writable),
+                        registration_provider,
+                        at_ms
+                    ],
                 )
                 .map_err(backend)?;
             Ok(())
@@ -1921,6 +1937,60 @@ mod tests {
             store.channel_aliases().await.expect("read back").is_empty(),
             "a purge that leaves the aliases behind has not erased everything"
         );
+    }
+
+    #[tokio::test]
+    async fn added_channel_provenance_migrates_default_off_and_survives_restart() {
+        let dir = TempDir::new("sqlite-added-channel-provenance");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..5] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .execute(
+                    "INSERT INTO added_channels (channel_id, label, writable, added_at_ms)
+                     VALUES ('direct-old', 'old direct row', 1, 7)",
+                    [],
+                )
+                .expect("insert old row");
+            connection
+                .pragma_update(None, "user_version", 5_i64)
+                .expect("stamp old schema");
+        }
+
+        let store = SqliteStore::open(&file, Retention::default()).expect("migrate");
+        let rows = store.added_channels().await.expect("load migrated row");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].registration_provider.is_none(),
+            "pre-managed rows must remain direct"
+        );
+        store
+            .add_channel(
+                &ChannelId("managed-new".to_owned()),
+                "managed row",
+                false,
+                Some("https://bridge.example/v1"),
+                8,
+            )
+            .await
+            .expect("store managed row");
+        drop(store);
+
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        let rows = reopened.added_channels().await.expect("reload rows");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| row.channel.as_str() == "direct-old"
+                    && row.registration_provider.is_none())
+        );
+        assert!(rows.iter().any(|row| row.channel.as_str() == "managed-new"
+            && row.registration_provider.as_deref() == Some("https://bridge.example/v1")));
     }
 
     #[test]

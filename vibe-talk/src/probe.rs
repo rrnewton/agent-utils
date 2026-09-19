@@ -565,7 +565,7 @@ pub async fn probe_channels_within(
     let mut outcomes = Vec::with_capacity(channels.len());
     let mut aborted = false;
     for channel in channels {
-        let read = chat.fetch_recent(&channel.id, PROBE_LIMIT);
+        let read = chat.probe_channel(&channel.id, PROBE_LIMIT);
         let answered = match budget {
             Some(budget) => match tokio::time::timeout(budget, read).await {
                 Ok(answered) => answered,
@@ -915,6 +915,7 @@ mod tests {
                 _after: Option<&crate::model::MessageId>,
             ) -> Result<Vec<crate::model::Message>, ChatError> {
                 Ok(vec![crate::model::Message {
+                    thread: None,
                     id: crate::model::MessageId("1".to_owned()),
                     channel_id: channel.clone(),
                     author: "codex-eng".to_owned(),

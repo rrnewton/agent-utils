@@ -1,9 +1,10 @@
 # vibe-talk
 
-A small Rust web server that lets you talk to a voice agent about your coding agents' Discord
-channels — from a phone, while driving — and, with explicit approval, post a reply back.
+A small Rust web server for reading, discussing, and replying to your coding agents' chat messages
+from a phone. It supports Discord directly and other services, including Google Chat, through a
+compatible HTTP bridge. Voice conversations use an optional ElevenLabs agent.
 
-It is a **bridge, not an agent host**. It holds a Discord bot token, answers questions about
+It is a **bridge, not an agent host**. It holds the chat backend's credential, answers questions about
 channels over an authenticated HTTP API, and serves a phone web app. It is deliberately **not**
 co-located with the coding agents: it needs no access to any development workspace, and nothing in
 it is tied to the machine it currently runs on. It starts in Podman on a laptop and is expected to
@@ -11,7 +12,7 @@ move to a small cloud host unchanged.
 
 The design decision behind it, stated plainly: composing hosted products would also work (see
 [`RELATED_WORK.md`](RELATED_WORK.md), which recommended exactly that), but a server is
-needed either way to hold the Discord credential, and this project would rather own that front
+needed either way to hold the chat credential, and this project would rather own that front
 door than hand it to a vendor.
 
 ## What it does in v0
@@ -28,7 +29,22 @@ in your own words ("the one about the mac runner") and get *that* message back *
 `POST /api/v1/channels/{id}/resolve`, and it is the reason this exists rather than a
 text-to-speech bot.
 
-**A text tab.** The web app has a plain scrollback view for when you can look at the screen.
+**Messages and threads.** The web app starts in the main channel. When the backend finds threads,
+three controls appear above the history:
+
+* **Main** shows channel messages, with a reply-count button below each thread root.
+* **Threads** lists root-message previews and reply counts, ordered by most recent activity at the
+  bottom. Opening the list starts at that end; scrolling upward loads older entries.
+* **All** interleaves channel and thread messages chronologically. Colored **Thread** badges
+  distinguish conversations; tapping a badge opens that thread.
+
+Tap a root's reply count or a thread-list entry to open its history. **Back**, or a swipe right,
+returns to the view and scroll position you came from. The selected thread has its own history,
+draft, and posting destination. Reply counts marked approximate come from the provider's estimate.
+
+**A normal text box at the bottom.** Scroll below the newest message to write to the channel or
+selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately
+for each channel and thread; a failed send preserves the text. This composer scrolls with history.
 
 ## Setting it up
 
@@ -60,6 +76,7 @@ Two things are worth knowing before you begin, because they shape everything els
 | Per-message summaries, from the ElevenLabs agent | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS — and it is now the only summariser there is.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. The extractive truncating summariser that used to be the default has been **deleted**, so there is nothing to fall back to: a deployment without ElevenLabs credentials still starts, and shows every long message as a **failed** summary — a red row — instead of handing you its opening lines and calling that a summary. |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Web app: text tab, digest, find-a-message, local speech | **works** |
+| Main, Threads, All, selected-thread history, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
 | **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, seven tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
 | ElevenLabs voice agent | **reachable, and currently NOT invoking tools.** A real agent has now been driven headlessly (`scripts/run.sh --smoke-agent`): the signed URL mints, the conversation opens, the agent answers — and it calls no tool, saying its tools "appear to be out of date". In the same conversation ElevenLabs reports our MCP server connected with all five tools visible, so the fault is in the agent's own configuration rather than in this server. |
 | **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and `/voice` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
@@ -569,8 +586,10 @@ code path the startup probe uses, which is itself in the same position — see *
 | Count ceiling | `discord.max_count_scan` | — | how many messages a count may walk, default `500` |
 | Live poll interval | `discord.live_poll_seconds` | `VIBE_TALK_LIVE_POLL_SECONDS` | seconds between inbound reads per channel; **`0` (default) is OFF**, and under `5` is refused |
 | Live push token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; enables adapter push and cannot be combined with live polling |
+| Channel registration | `discord.channel_registration` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels` and `DELETE /channels/{id}` |
 | Upstream read marks | `discord.upstream_read_marks` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels/{id}/read` |
 | Chat service name | `discord.provider_name` | — | `Discord`; set to the source service's name (for example, `Google Chat`) when using a compatible HTTP bridge |
+| Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` for older bridges without thread support |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -632,6 +651,40 @@ passed — a lie you cannot diagnose, since nothing on the row would say why it 
 an expired summary is merely regenerated. The count bound is enough on its own here for a reason
 it is not enough for a summary: this is the one table that holds nobody's words.
 
+### Thread backend contract
+
+Thread discovery, membership checks, message lookup, and posting go through `ChatClient`. The
+browser uses `threading_supported` and `chat_provider_name` from `/api/v1/client-config`; it does
+not infer capabilities or branding from a service name. Existing `[discord]` configuration keys
+remain compatible with earlier deployments.
+
+With `thread_api = "bridge"`, a compatible HTTP bridge implements these paths relative to
+`discord.api_base`:
+
+* `GET /channels/{id}/timeline?view=main|threads|flat|thread&thread_id=…&before=…&limit=…`
+* `GET /channels/{id}/threads/{thread_id}/messages/{message_id}`
+* `POST /channels/{id}/threads/{thread_id}/messages`
+
+Thread identifiers and pagination cursors are opaque. Each path segment is percent encoded;
+neither callers nor bridges should interpret a thread as a quoted-message reference. Thread reads
+and writes must verify membership in the registered parent channel, including any narrower scope
+that registration imposes. Posts use the existing message body and nonce contract. Lookup and
+post responses use the existing message wire format.
+
+Timeline responses follow `src/threads.rs`: messages and thread summaries are oldest first,
+`has_more` pairs with `next_before`, and `has_threads` controls navigation. Message wire objects
+carry an optional `thread` object with `id`, `root_message_id`, `is_root`, `reply_count`, and
+`reply_count_exact`. Summary roots use the same message wire format. Discovery must finish before
+claiming global chronology or exact counts; a cap or provider failure must report an error instead
+of returning a plausible but incomplete flattened page. A notice can explain registration scope.
+
+The native backend includes accessible active and archived threads. It bounds discovery at 256
+threads and 100 pages per archived collection, retains pagination inventories for five minutes,
+and bounds a timeline request at 90 seconds. Exceeding those limits returns an explicit error.
+Native reply counts are marked approximate because older provider counters may be capped. An
+expired cursor reloads the newest history with a fresh continuation. Forum and media channel Main
+views show thread roots; open a thread to post in these thread-only containers.
+
 ### Local read state is ours; upstream read state is an optional provider capability
 
 Discord does not share read state with bots. There is no ack route a bot may call, no read-state
@@ -645,6 +698,24 @@ vibe-talk's own record, and the rule is stated once rather than left to be infer
 
 Anything that shows a read mark to a person has to say that, because "read" already means
 something else to a Discord user.
+
+A compatible provider bridge may also implement `POST /channels` with
+`{"source":"...","label":"..."}`. Its JSON response has required path-safe string `id` and
+boolean `created` fields plus an optional boolean `writable` field, for example
+`{"id":"path-safe-stable-id","created":true,"writable":true}`. `created` is `false` when the
+bridge reused an existing registration. `writable` defaults to `false` when omitted for compatibility
+with older bridges; a present non-boolean value rejects the response and, when `created` is true,
+triggers a compensating delete. It is the bridge's policy: vibe-talk persists it and never accepts a
+managed-mode writable choice from the UI. Managed message posts carry a path-safe `nonce` generated
+once per logical post and kept unchanged across internal HTTP retries; bridges must pass that value
+through as their provider request id. Direct Discord posts do not carry this bridge-only field. The bridge must
+implement idempotent `DELETE /channels/{id}`: deleting an already-absent registration still succeeds
+with `204 No Content`. Opt in with `discord.channel_registration = true`. Settings then accepts a
+channel link or provider reference, lets the bridge resolve it to the stable id used by vibe-talk,
+checks that id is readable, and hides the writable checkbox. Only rows originally registered through
+this managed flow are unregistered upstream on removal; direct and pre-migration rows remain local-only.
+Direct Discord deployments keep the existing id, label, default-off explicit writable switch, and must
+leave this setting off.
 
 A compatible provider bridge may separately implement `POST /channels/{id}/read` and opt in with
 `discord.upstream_read_marks = true`. The web app then offers **Mark read through here** on each
@@ -893,6 +964,8 @@ its own adapter-only token; every other route uses the read/write tokens describ
 |---|---|---|---|
 | GET | `/healthz` | none | liveness |
 | GET | `/api/v1/channels` | read | configured channels |
+| POST | `/api/v1/channels` | **write** | direct mode: `{id,label,writable}`; managed mode: `{source,label}` — validate and add a tracked channel |
+| DELETE | `/api/v1/channels/{id}` | **write** | remove a channel added in the app; managed mode also unregisters it upstream |
 | GET | `/api/v1/client-config` | read | what the web app needs at startup |
 | POST | `/api/v1/live/events` | ingest | accept one normalized create/update/delete event from an external provider adapter |
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
@@ -903,9 +976,10 @@ its own adapter-only token; every other route uses the read/write tokens describ
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
 | GET | `/api/v1/channels/{id}/messages/{message_id}/summary` | read | one message summarised, from cache when it can be |
 | GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=` | read | **one step of a walk**, saying that it is one |
+| GET | `/api/v1/channels/{id}/timeline?view=&thread_id=&limit=&before=` | read | main channel, thread list, flattened history, or one thread; opaque backward cursor |
 | GET | `/api/v1/channels/{id}/count?since=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
-| POST | `/api/v1/channels/{id}/reply` | **write** | post as the bot |
+| POST | `/api/v1/channels/{id}/reply` | **write** | `{text, thread_id?, reply_to?}` — post to the channel or selected thread; quoting a message is optional |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
 | GET | `/api/v1/conversations` | **write** | stored `/voice` transcripts, most recent first |

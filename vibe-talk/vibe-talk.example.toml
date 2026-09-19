@@ -28,9 +28,20 @@ bind = "0.0.0.0:8080"
 # Source service named in errors, diagnostics, and the app. A compatible bridge can set
 # this to "Google Chat"; the HTTP wire format and existing configuration keys stay the same.
 provider_name = "Discord"
+# Thread protocol: "native" for Discord, "bridge" for compatible normalized thread endpoints,
+# or "off" for an older bridge without thread support. Thread ids and cursors are opaque.
+thread_api = "native"
 # Enable only when api_base names a compatible bridge with POST /channels/{id}/read.
 # This moves the source provider's read cursor; Done/archive remains local and reversible.
 upstream_read_marks = false
+# Enable only when api_base names a compatible bridge with POST /channels and DELETE /channels/{id}.
+# POST /channels must return {"id":"path-safe-stable-id","created":true|false}; it may also
+# return boolean "writable", which defaults to false when omitted. The bridge owns that policy.
+# DELETE /channels/{id} must be idempotent and return 204 even when the id is already absent.
+# The web app then accepts a provider-neutral channel link or reference and lets the bridge resolve it.
+# The bridge also receives a path-safe nonce on message POSTs and must pass it through as its
+# provider request id; one logical post keeps the same nonce across internal retries.
+channel_registration = false
 # Bot token for the SECOND, dedicated bot — not the one your coding agents use.
 # Environment: VIBE_TALK_DISCORD_BOT_TOKEN
 bot_token = "REPLACE-ME"

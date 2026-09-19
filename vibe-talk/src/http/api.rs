@@ -322,6 +322,7 @@ pub async fn ingest_event(
             message_id,
         } => {
             let tombstone = Message {
+                thread: None,
                 id: message_id,
                 channel_id: channel_id.clone(),
                 author: String::new(),
@@ -529,8 +530,12 @@ pub struct ClientConfigResponse {
     pub live_poll_seconds: u64,
     /// How changes reach the SSE hub: `off`, `poll`, or provider-neutral `push` ingestion.
     pub live_delivery: &'static str,
+    /// Whether the selected provider accepts channel links or references and manages registration.
+    pub channel_registration_supported: bool,
     /// Whether the selected provider exposes a write-through read cursor.
     pub upstream_read_mark_supported: bool,
+    /// Whether the backend supports channel, thread-list, and flattened timelines.
+    pub threading_supported: bool,
 }
 
 /// `GET /api/v1/client-config`
@@ -552,7 +557,9 @@ pub async fn client_config(
         } else {
             "off"
         },
+        channel_registration_supported: state.chat.supports_channel_registration(),
         upstream_read_mark_supported: state.chat.supports_upstream_read_mark(),
+        threading_supported: state.chat.supports_threading(),
         replay_enabled: state.config.replay.enabled,
         self_author_id: crate::discord::self_user_id_from_token(
             state.config.discord.bot_token.expose(),
@@ -646,8 +653,14 @@ pub async fn speak(
     // the split can be read off a real deployment against real messages rather than guessed at
     // from a local run against fakes where both round trips are free.
     let began = std::time::Instant::now();
-    let (_channel, message) =
-        ops::message_by_id(&state, &channel_id, &message_id, query.limit).await?;
+    let (_channel, message) = ops::message_by_id_scoped(
+        &state,
+        &channel_id,
+        &message_id,
+        query.limit,
+        query.thread_id.as_deref(),
+    )
+    .await?;
     let looked_up_ms = began.elapsed().as_millis();
     // WHAT IS SENT IS NOT THE RAW MESSAGE. Markdown, hashes, snowflakes and ISO timestamps are all
     // noise when spoken — the voice said "asterisk asterisk deploy asterisk asterisk" and spelled
@@ -673,12 +686,12 @@ pub async fn speak(
         message = %message_id,
         characters,
         bytes,
-        discord_ms = %looked_up_ms,
+        chat_ms = %looked_up_ms,
         vendor_ms = %generated_ms,
         "read a message aloud"
     );
     let timing = format!(
-        "discord;dur={looked_up_ms}, tts;dur={generated_ms}, \
+        "chat;dur={looked_up_ms}, tts;dur={generated_ms}, \
          audio;desc=\"{bytes} bytes for {characters} characters\""
     );
     Ok((
@@ -702,6 +715,8 @@ pub async fn speak(
 /// Query parameters for reading a message aloud.
 #[derive(Debug, Default, Deserialize)]
 pub struct SpeakQuery {
+    /// Thread containing the message, when reading a thread or a flattened timeline.
+    pub thread_id: Option<String>,
     /// How many recent messages to look through for the id.
     pub limit: Option<u16>,
     /// How fast to read, overriding the agent's own pace for this one request.
@@ -715,6 +730,8 @@ pub struct SpeakQuery {
 /// Query parameters for the read endpoints.
 #[derive(Debug, Default, Deserialize)]
 pub struct LimitQuery {
+    /// Thread containing the message, when the operation addresses a thread message.
+    pub thread_id: Option<String>,
     /// How many recent messages to consider.
     pub limit: Option<u16>,
     /// Width of a digest line, in characters.
@@ -840,6 +857,89 @@ pub async fn page(
     }))
 }
 
+/// Query parameters for browsing a channel or its threads.
+#[derive(Debug, Default, Deserialize)]
+pub struct TimelineQuery {
+    /// Main channel, thread list, flattened history, or a selected thread.
+    #[serde(default)]
+    pub view: crate::threads::TimelineView,
+    /// Thread to read; required exactly when `view=thread`.
+    pub thread_id: Option<String>,
+    /// Opaque backward continuation returned by the previous page.
+    pub before: Option<String>,
+    /// Entries requested, clamped to the configured limit and 99.
+    pub limit: Option<u16>,
+}
+
+/// A provider-neutral timeline plus this application's channel and read-state metadata.
+#[derive(Debug, Serialize)]
+pub struct TimelineResponse {
+    /// Configured parent channel, including its local alias and write policy.
+    pub channel: ChannelInfo,
+    /// View represented by this page.
+    pub view: crate::threads::TimelineView,
+    /// Page size actually requested.
+    pub limit: u16,
+    /// Entries on this page, never a channel-wide total.
+    pub returned: usize,
+    /// Thread and message data, ordered by the backend.
+    #[serde(flatten)]
+    pub page: crate::threads::TimelinePage,
+    /// Messages on this page that the reader has archived locally.
+    pub dismissed: Vec<MessageId>,
+    /// Channel content remains untrusted data in every view.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// `GET /api/v1/channels/{channel_id}/timeline` — all views share one allowlist boundary.
+pub async fn timeline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Query(query): Query<TimelineQuery>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    if (query.view == crate::threads::TimelineView::Thread) != query.thread_id.is_some() {
+        return Err(ApiError::bad_request(
+            "thread_id is required exactly when view=thread",
+        ));
+    }
+    if query.thread_id.as_ref().is_some_and(|id| {
+        id.trim().is_empty() || id.len() > 1024 || id.chars().any(char::is_control)
+    }) {
+        return Err(ApiError::bad_request(
+            "thread_id must be a non-empty thread identifier",
+        ));
+    }
+    if query
+        .before
+        .as_ref()
+        .is_some_and(|cursor| cursor.is_empty() || cursor.len() > 16384)
+    {
+        return Err(ApiError::bad_request(
+            "before must be a continuation returned by this view",
+        ));
+    }
+    let limit = state.effective_limit(query.limit).min(ops::MAX_PAGE);
+    let request = crate::threads::TimelineRequest {
+        view: query.view,
+        thread_id: query.thread_id,
+        before: query.before,
+        limit,
+    };
+    let (channel, page) = ops::timeline(&state, &channel_id, &request).await?;
+    let dismissed = ops::dismissed_within(&state, &channel.id, &page.messages).await?;
+    Ok(no_store(Json(TimelineResponse {
+        returned: page.messages.len() + page.threads.len(),
+        channel,
+        view: request.view,
+        limit,
+        page,
+        dismissed,
+        untrusted_content_notice: untrusted::NOTICE,
+    })))
+}
+
 /// Query parameters for a bounded count.
 #[derive(Debug, Default, Deserialize)]
 pub struct CountQuery {
@@ -907,8 +1007,14 @@ pub async fn message_by_id(
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessageResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
-    let (channel, message) =
-        ops::message_by_id(&state, &channel_id, &message_id, query.limit).await?;
+    let (channel, message) = ops::message_by_id_scoped(
+        &state,
+        &channel_id,
+        &message_id,
+        query.limit,
+        query.thread_id.as_deref(),
+    )
+    .await?;
     Ok(Json(MessageResponse {
         channel,
         message,
@@ -1007,6 +1113,8 @@ pub struct ReplyRequest {
     pub text: String,
     /// Message being replied to, when any.
     pub reply_to: Option<String>,
+    /// The destination thread; absent posts directly to the configured channel.
+    pub thread_id: Option<String>,
 }
 
 /// The result of posting.
@@ -1046,11 +1154,12 @@ pub async fn reply(
     Json(request): Json<ReplyRequest>,
 ) -> Result<Response, ApiError> {
     require(&headers, &state, Scope::Write)?;
-    match ops::reply(
+    match ops::reply_scoped(
         &state,
         &channel_id,
         &request.text,
         request.reply_to.as_deref(),
+        request.thread_id.as_deref(),
     )
     .await
     {
@@ -1733,6 +1842,8 @@ pub async fn inbox(
 pub struct MarkReadRequest {
     /// The newest message the owner has been shown.
     pub message_id: String,
+    /// Selected thread, when the message came from a thread timeline.
+    pub thread_id: Option<String>,
 }
 
 /// The mark after the move.
@@ -1772,6 +1883,10 @@ pub async fn mark_read_upstream(
     require(&headers, &state, Scope::Write)?;
     let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
     let through = MessageId(request.message_id);
+    if let Some(thread_id) = request.thread_id.as_deref() {
+        ops::message_by_id_scoped(&state, &channel_id, through.as_str(), None, Some(thread_id))
+            .await?;
+    }
     state.chat.mark_read_upstream(&channel.id, &through).await?;
     Ok(no_store(Json(UpstreamReadResponse {
         channel,
@@ -2003,9 +2118,16 @@ pub async fn message_summary(
         .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect();
-    let answer =
-        ops::summarize_message(&state, caller, &channel_id, &message_id, &also, query.limit)
-            .await?;
+    let answer = ops::summarize_message_scoped(
+        &state,
+        caller,
+        &channel_id,
+        &message_id,
+        &also,
+        query.limit,
+        query.thread_id.as_deref(),
+    )
+    .await?;
     Ok(Json(MessageSummaryResponse {
         channel: answer.channel,
         message_id,
@@ -2030,6 +2152,8 @@ fn no_store<T: IntoResponse>(body: T) -> Response {
 /// What read-aloud mode asks for the moment it is turned on.
 #[derive(Debug, Deserialize)]
 pub struct PrepareSpeechRequest {
+    /// Thread shared by these messages; absent uses the ordinary channel window.
+    pub thread_id: Option<String>,
     /// The messages currently on screen, in the order they are drawn.
     pub ids: Vec<String>,
     /// The pace the reader has chosen, if they have chosen one.
@@ -2078,7 +2202,28 @@ pub async fn prepare_speech(
     Json(request): Json<PrepareSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
-    let window = ops::messages(&state, &channel_id, request.limit).await?;
+    let window = if let Some(thread_id) = request.thread_id.as_deref() {
+        if request.ids.len() > usize::from(ops::MAX_PAGE) {
+            return Err(ApiError::bad_request(
+                "too many messages in one speech preparation",
+            ));
+        }
+        let channel = state.channel(&channel_id).ok_or(OpError::UnknownChannel)?;
+        let mut messages = Vec::new();
+        for id in &request.ids {
+            let (_, message) =
+                ops::message_by_id_scoped(&state, &channel_id, id, request.limit, Some(thread_id))
+                    .await?;
+            messages.push(message);
+        }
+        ops::Window {
+            channel,
+            messages,
+            limit: state.effective_limit(request.limit),
+        }
+    } else {
+        ops::messages(&state, &channel_id, request.limit).await?
+    };
     let now = jiff::Timestamp::now().as_millisecond();
     let mut prepared = Vec::new();
     for id in &request.ids {
@@ -2164,16 +2309,51 @@ pub async fn play_speech(
         .into_response())
 }
 
+#[derive(Debug)]
+struct Present<T> {
+    present: bool,
+    value: Option<T>,
+}
+
+impl<T> Default for Present<T> {
+    fn default() -> Self {
+        Self {
+            present: false,
+            value: None,
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Present<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self {
+            present: true,
+            value: Option::<T>::deserialize(deserializer)?,
+        })
+    }
+}
+
 /// Adding a channel from inside the app.
 #[derive(Debug, Deserialize)]
 pub struct AddChannelRequest {
-    /// The Discord snowflake, as copied from the client with Developer Mode on.
-    pub id: String,
-    /// What to call it. The configured channels get theirs from the file; this one gets it here.
-    pub label: String,
-    /// Whether the bridge may POST here. Defaults to false, and see [`add_channel`] for why.
+    /// A direct Discord snowflake. Used when provider-managed registration is disabled.
     #[serde(default)]
-    pub writable: bool,
+    id: Present<String>,
+    /// A provider-neutral channel link or reference. Used when managed registration is enabled.
+    #[serde(default)]
+    source: Present<String>,
+    /// What to call it. The configured channels get theirs from the file; this one gets it here.
+    label: String,
+    /// Whether the bridge may POST here. Omission defaults to false for direct targets. Managed
+    /// targets must omit the field entirely because their bridge declares the policy.
+    #[serde(default)]
+    writable: Present<bool>,
 }
 
 /// What happened when a channel was added.
@@ -2204,9 +2384,93 @@ pub async fn add_channel(
     Json(request): Json<AddChannelRequest>,
 ) -> Result<Response, ApiError> {
     require(&headers, &state, Scope::Write)?;
-    let id = request.id.trim();
     let label = request.label.trim();
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+    if label.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_channel_label",
+            "give the channel a name so it can be told apart in the picker",
+        ));
+    }
+
+    let managed = state.chat.supports_channel_registration();
+    let registration_provider =
+        managed.then(|| state.config.discord.api_base.trim_end_matches('/'));
+    // One transaction spans an upstream registration plus the local probe/store update. The two
+    // systems cannot commit atomically, so serialize the whole managed lifecycle and make rollback
+    // compensation unable to race another add or removal.
+    let _managed_lifecycle = if managed {
+        Some(state.channel_registration_lock.lock().await)
+    } else {
+        None
+    };
+    let registered = if managed {
+        if request.id.present || request.writable.present {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_channel_registration",
+                "this provider manages channel registration; send a source and label, without an id or writable field",
+            ));
+        }
+        let source = request
+            .source
+            .value
+            .as_deref()
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_channel_source",
+                    "give a channel link or provider reference",
+                )
+            })?;
+        let source_is_static = state
+            .config
+            .channels
+            .iter()
+            .any(|channel| channel.id.as_str() == source);
+        let source_is_direct = state.added_channels.read().ok().is_some_and(|added| {
+            added.iter().any(|channel| {
+                channel.channel.as_str() == source && channel.registration_provider.is_none()
+            })
+        });
+        if source_is_static || source_is_direct {
+            let (code, detail) = if source_is_static {
+                (
+                    "channel_is_configured",
+                    "that source is already a channel owned by the static configuration",
+                )
+            } else {
+                (
+                    "channel_already_present",
+                    "that source is already a directly managed local channel",
+                )
+            };
+            return Err(ApiError::new(StatusCode::CONFLICT, code, detail));
+        }
+        Some(state.chat.register_channel(source, label).await?)
+    } else {
+        if request.source.present {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "channel_registration_unsupported",
+                format!("{} requires a channel id through this chat adapter; channel links and provider references are not supported", state.chat.provider_name()),
+            ));
+        }
+        None
+    };
+
+    let id = match registered.as_ref() {
+        Some(channel) => channel.id.as_str(),
+        None => request
+            .id
+            .value
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default(),
+    };
+    if id.is_empty() || (!managed && !id.chars().all(|c| c.is_ascii_digit())) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_channel_id",
@@ -2216,39 +2480,74 @@ pub async fn add_channel(
             ),
         ));
     }
-    if label.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_channel_label",
-            "give the channel a name so it can be told apart in the picker",
-        ));
+    if state
+        .config
+        .channels
+        .iter()
+        .any(|channel| channel.id.as_str() == id)
+    {
+        // A colliding id is already owned outside this registration transaction. Never issue a
+        // compensating DELETE for it, even if the bridge incorrectly claims it was just created.
+        let (code, detail) = if managed {
+            (
+                "channel_is_configured",
+                "the bridge resolved this source to a channel owned by the static configuration; managed registration cannot replace it",
+            )
+        } else {
+            (
+                "channel_already_present",
+                "that channel is already in the list",
+            )
+        };
+        return Err(ApiError::new(StatusCode::CONFLICT, code, detail));
     }
-    if state.channel(id).is_some() {
+    let existing = state.added_channels.read().ok().and_then(|added| {
+        added
+            .iter()
+            .find(|channel| channel.channel.as_str() == id)
+            .cloned()
+    });
+    if existing
+        .as_ref()
+        .is_some_and(|channel| channel.registration_provider.as_deref() != registration_provider)
+    {
+        // As above, the colliding row belongs to another lifecycle. Do not let the new bridge's
+        // `created` claim authorize deletion of that pre-existing channel id.
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "channel_already_present",
-            "that channel is already in the list",
+            "that channel is already in the list under a different registration policy",
         ));
     }
 
     let candidate = ChannelInfo {
         id: crate::model::ChannelId(id.to_owned()),
         label: label.to_owned(),
-        writable: request.writable,
+        writable: registered.as_ref().map_or_else(
+            || request.writable.value.unwrap_or(false),
+            |channel| channel.writable,
+        ),
         alias: None,
         added: true,
+    };
+    let rollback_if_failed = if existing.is_none() {
+        registered.as_ref()
+    } else {
+        None
     };
     // The same read the startup check makes, against the one channel being added.
     let report =
         crate::probe::probe_channels(state.chat.as_ref(), std::slice::from_ref(&candidate)).await;
-    let outcome = report.outcomes.first().ok_or_else(|| {
-        ApiError::new(
+    let Some(outcome) = report.outcomes.first() else {
+        rollback_registration(&state, rollback_if_failed).await;
+        return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
             "channel_unprobed",
             "the channel could not be checked",
-        )
-    })?;
+        ));
+    };
     if !matches!(outcome.diagnosis, crate::probe::Diagnosis::Readable { .. }) {
+        rollback_registration(&state, rollback_if_failed).await;
         return Err(ApiError::new(
             StatusCode::BAD_GATEWAY,
             "channel_unreadable",
@@ -2258,25 +2557,60 @@ pub async fn add_channel(
         ));
     }
 
-    state
+    let added_at_ms = existing.as_ref().map_or_else(
+        || jiff::Timestamp::now().as_millisecond(),
+        |channel| channel.added_at_ms,
+    );
+    if let Err(error) = state
         .store
         .add_channel(
             &candidate.id,
             &candidate.label,
             candidate.writable,
-            jiff::Timestamp::now().as_millisecond(),
+            registration_provider,
+            added_at_ms,
         )
-        .await?;
+        .await
+    {
+        rollback_registration(&state, rollback_if_failed).await;
+        return Err(error.into());
+    }
     // The store first, then the live list. Written the other way round, a store that refused would
     // leave a channel reachable until the next restart and then silently gone.
+    let stored = crate::store::AddedChannel {
+        channel: candidate.id.clone(),
+        label: candidate.label.clone(),
+        writable: candidate.writable,
+        registration_provider: registration_provider.map(str::to_owned),
+        added_at_ms,
+    };
     if let Ok(mut added) = state.added_channels.write() {
-        added.push(candidate.clone());
+        if let Some(current) = added
+            .iter_mut()
+            .find(|channel| channel.channel == stored.channel)
+        {
+            *current = stored;
+        } else {
+            added.push(stored);
+        }
     }
-    tracing::info!(channel = %candidate.id, writable = candidate.writable, "channel added in the app");
+    tracing::info!(channel = %candidate.id, writable = candidate.writable, managed, "channel added or reconciled in the app");
     Ok(no_store(Json(AddChannelResponse {
         channel: candidate,
         channels: ops::channels(&state).await,
     })))
+}
+
+async fn rollback_registration(
+    state: &AppState,
+    registered: Option<&crate::chat::RegisteredChannel>,
+) {
+    let Some(registered) = registered.filter(|registration| registration.created) else {
+        return;
+    };
+    if let Err(error) = state.chat.unregister_channel(&registered.id).await {
+        tracing::warn!(channel = %registered.id, %error, "could not roll back channel registration");
+    }
 }
 
 /// `DELETE /api/v1/channels/{channel_id}` — take back a channel added in the app.
@@ -2290,6 +2624,7 @@ pub async fn remove_channel(
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
     require(&headers, &state, Scope::Write)?;
+    let _managed_lifecycle = state.channel_registration_lock.lock().await;
     if state
         .config
         .channels
@@ -2303,12 +2638,42 @@ pub async fn remove_channel(
              from the app. Take it out of the file and restart.",
         ));
     }
+    let added_channel = state.added_channels.read().ok().and_then(|added| {
+        added
+            .iter()
+            .find(|channel| channel.channel.as_str() == channel_id)
+            .cloned()
+    });
+    let Some(added_channel) = added_channel else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_channel",
+            "that channel is not in the added-channel list",
+        ));
+    };
+    if let Some(provider) = added_channel.registration_provider.as_deref() {
+        let active_provider = state.registration_provider();
+        if Some(provider) != active_provider {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "channel_provider_mismatch",
+                "that channel belongs to a different provider registration; restore its original bridge configuration before removing it",
+            ));
+        }
+        // The bridge contract makes DELETE idempotent and answers 204 even when an earlier attempt
+        // already removed the upstream registration. This ordering deliberately permits retry when
+        // the upstream delete succeeds but the following local store write fails.
+        state
+            .chat
+            .unregister_channel(&added_channel.channel)
+            .await?;
+    }
     state
         .store
-        .remove_added_channel(&crate::model::ChannelId(channel_id.clone()))
+        .remove_added_channel(&added_channel.channel)
         .await?;
     if let Ok(mut added) = state.added_channels.write() {
-        added.retain(|c| c.id.as_str() != channel_id);
+        added.retain(|channel| channel.channel != added_channel.channel);
     }
     tracing::info!(channel = %channel_id, "channel removed in the app");
     Ok(no_store(Json(AddChannelResponse {

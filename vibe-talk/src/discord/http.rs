@@ -10,13 +10,16 @@
 //! by its own tests and by [`super::fake::FakeDiscord`]. What remains here is reading the headers
 //! off a reqwest response and handing them over.
 
+#[path = "threads.rs"]
+mod threading;
+
 use async_trait::async_trait;
 use serde_json::json;
 
 use super::ratelimit::{parse_rate_limit, Attempt, Headers, RateLimiter};
 #[cfg(test)]
 use crate::chat::ChatError as DiscordError;
-use crate::chat::{ChatClient, ChatError, ChatIdentity};
+use crate::chat::{ChatClient, ChatError, ChatIdentity, RegisteredChannel};
 use crate::config::{DiscordConfig, Secret};
 use crate::model::{ChannelId, Message, MessageId, UserId};
 
@@ -139,6 +142,82 @@ pub fn identity_request(api_base: &str) -> PreparedRequest {
     }
 }
 
+/// Build the optional bridge request that registers a provider-neutral channel reference.
+#[must_use]
+pub fn register_channel_request(api_base: &str, source: &str, label: &str) -> PreparedRequest {
+    PreparedRequest {
+        method: "POST",
+        url: format!("{}/channels", api_base.trim_end_matches('/')),
+        body: Some(serde_json::json!({ "source": source, "label": label })),
+    }
+}
+
+fn parse_registration_identity(value: &serde_json::Value) -> Result<(ChannelId, bool), ChatError> {
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && *id != "."
+                && *id != ".."
+                && id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+                })
+        })
+        .ok_or_else(|| {
+            ChatError::Shape(
+                "channel registration answer has no path-safe string \"id\" field".to_owned(),
+            )
+        })?;
+    let created = value
+        .get("created")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            ChatError::Shape(
+                "channel registration answer has no boolean \"created\" field".to_owned(),
+            )
+        })?;
+    Ok((ChannelId(id.to_owned()), created))
+}
+
+/// Read the stable channel id, creation status, and optional write policy returned by a registration
+/// bridge. An omitted `writable` field remains false for compatibility with older bridges.
+///
+/// # Errors
+///
+/// Returns [`ChatError::Shape`] when a required field or the optional write policy is malformed.
+pub fn parse_registered_channel(value: &serde_json::Value) -> Result<RegisteredChannel, ChatError> {
+    let (id, created) = parse_registration_identity(value)?;
+    let writable = match value.get("writable") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            ChatError::Shape(
+                "channel registration answer has a non-boolean \"writable\" field".to_owned(),
+            )
+        })?,
+    };
+    Ok(RegisteredChannel {
+        id,
+        created,
+        writable,
+    })
+}
+
+/// Build the optional bridge request that removes a registered channel.
+#[must_use]
+pub fn unregister_channel_request(api_base: &str, channel: &ChannelId) -> PreparedRequest {
+    PreparedRequest {
+        method: "DELETE",
+        url: format!(
+            "{}/channels/{}",
+            api_base.trim_end_matches('/'),
+            channel.as_str()
+        ),
+        body: None,
+    }
+}
+
 /// Build the optional bridge request that moves its provider read cursor through one message.
 #[must_use]
 pub fn mark_read_request(
@@ -195,6 +274,16 @@ pub fn post_request(
     content: &str,
     reply_to: Option<&MessageId>,
 ) -> Result<PreparedRequest, ChatError> {
+    post_request_with_nonce(api_base, channel, content, reply_to, None)
+}
+
+fn post_request_with_nonce(
+    api_base: &str,
+    channel: &ChannelId,
+    content: &str,
+    reply_to: Option<&MessageId>,
+    nonce: Option<&str>,
+) -> Result<PreparedRequest, ChatError> {
     if content.trim().is_empty() {
         return Err(ChatError::Refused("message content is empty".to_owned()));
     }
@@ -223,6 +312,19 @@ pub fn post_request(
     });
     if let Some(target) = reply_to {
         body["message_reference"] = json!({ "message_id": target.as_str() });
+    }
+    if let Some(nonce) = nonce {
+        if nonce.is_empty()
+            || nonce.len() > 128
+            || !nonce.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            })
+        {
+            return Err(ChatError::Refused(
+                "message nonce must be 1 to 128 path-safe ASCII characters".to_owned(),
+            ));
+        }
+        body["nonce"] = json!(nonce);
     }
     Ok(PreparedRequest {
         method: "POST",
@@ -261,6 +363,31 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| ChatError::Shape("author has no id".to_owned()))?;
     Ok(Message {
+        thread: value
+            .get("thread")
+            .filter(|thread| !thread.is_null())
+            .map(|thread| {
+                if thread.get("is_root").is_some() {
+                    serde_json::from_value(thread.clone()).map_err(|error| {
+                        ChatError::Shape(format!("invalid thread membership: {error}"))
+                    })
+                } else {
+                    let id = thread
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| ChatError::Shape("thread object has no id".to_owned()))?;
+                    Ok(crate::threads::MessageThread {
+                        id: id.to_owned(),
+                        root_message_id: Some(MessageId(field("id")?)),
+                        is_root: true,
+                        reply_count: thread
+                            .get("message_count")
+                            .and_then(serde_json::Value::as_u64),
+                        reply_count_exact: false,
+                    })
+                }
+            })
+            .transpose()?,
         id: MessageId(field("id")?),
         channel_id: ChannelId(field("channel_id")?),
         author: name.to_owned(),
@@ -335,13 +462,33 @@ fn rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Headers {
     out
 }
 
+fn fresh_post_nonce() -> String {
+    use base64::Engine as _;
+
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).expect("the system CSPRNG must be available to mint a post nonce");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn redact_provider_text(text: &str, bot_token: &Secret) -> String {
+    let secret = bot_token.expose();
+    if secret.is_empty() {
+        text.to_owned()
+    } else {
+        text.replace(secret, "<redacted>")
+    }
+}
+
 /// A live Discord client.
 #[derive(Debug)]
 pub struct HttpDiscordClient {
     provider_name: String,
+    thread_api: crate::threads::ThreadApi,
+    thread_inventory: threading::InventoryCache,
     client: reqwest::Client,
     api_base: String,
-    authorization: String,
+    bot_token: Secret,
+    channel_registration: bool,
     upstream_read_marks: bool,
     /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
     /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
@@ -356,6 +503,21 @@ impl HttpDiscordClient {
     ///
     /// Returns [`DiscordError::Transport`] when the underlying HTTP client cannot be built.
     pub fn new(config: &DiscordConfig) -> Result<Self, ChatError> {
+        if config.channel_registration
+            && crate::config::is_official_discord_api_base(&config.api_base)
+        {
+            return Err(ChatError::Refused(
+                "channel registration cannot target Discord's official API".to_owned(),
+            ));
+        }
+        if config.thread_api == crate::threads::ThreadApi::Bridge
+            && crate::config::is_official_discord_api_base(&config.api_base)
+        {
+            return Err(ChatError::Refused(
+                "bridge threading requires the API base of a compatible bridge".to_owned(),
+            )
+            .with_provider(&config.provider_name));
+        }
         let client = reqwest::Client::builder()
             .user_agent(concat!(
                 "vibe-talk (https://github.com/rrnewton/agent-utils, ",
@@ -369,9 +531,12 @@ impl HttpDiscordClient {
             })?;
         Ok(Self {
             provider_name: config.provider_name.clone(),
+            thread_api: config.thread_api,
+            thread_inventory: threading::InventoryCache::default(),
             client,
             api_base: config.api_base.clone(),
-            authorization: authorization_header(&config.bot_token),
+            bot_token: config.bot_token.clone(),
+            channel_registration: config.channel_registration,
             upstream_read_marks: config.upstream_read_marks,
             limiter: RateLimiter::new(),
         })
@@ -389,9 +554,19 @@ impl HttpDiscordClient {
     /// a per-caller retry would have every route rediscovering the same closed window one rejected
     /// request at a time.
     async fn send(&self, request: PreparedRequest) -> Result<serde_json::Value, ChatError> {
+        self.send_with_timeout(request, std::time::Duration::from_secs(20))
+            .await
+    }
+
+    async fn send_with_timeout(
+        &self,
+        request: PreparedRequest,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, ChatError> {
         let method = match request.method {
             "GET" => reqwest::Method::GET,
             "POST" => reqwest::Method::POST,
+            "DELETE" => reqwest::Method::DELETE,
             other => return Err(ChatError::Refused(format!("unsupported method {other}"))),
         };
         let url = &request.url;
@@ -401,7 +576,11 @@ impl HttpDiscordClient {
                 let mut builder = self
                     .client
                     .request(method.clone(), url)
-                    .header(reqwest::header::AUTHORIZATION, &self.authorization);
+                    .timeout(timeout)
+                    .header(
+                        reqwest::header::AUTHORIZATION,
+                        authorization_header(&self.bot_token),
+                    );
                 if let Some(body) = body {
                     builder = builder.json(body);
                 }
@@ -424,7 +603,10 @@ impl HttpDiscordClient {
                 if !status.is_success() {
                     // Truncate: a Discord error body is short, but an intermediary's error page is
                     // not, and this string ends up in a log.
-                    let body = text.chars().take(500).collect();
+                    let body = redact_provider_text(&text, &self.bot_token)
+                        .chars()
+                        .take(500)
+                        .collect();
                     return Err(ChatError::Status {
                         status: status.as_u16(),
                         body,
@@ -451,8 +633,127 @@ impl ChatClient for HttpDiscordClient {
         &self.provider_name
     }
 
+    fn supports_threading(&self) -> bool {
+        self.thread_api != crate::threads::ThreadApi::Off
+    }
+
+    async fn fetch_timeline(
+        &self,
+        channel: &ChannelId,
+        request: &crate::threads::TimelineRequest,
+    ) -> Result<crate::threads::TimelinePage, ChatError> {
+        self.timeline(channel, request)
+            .await
+            .map_err(|error| error.with_provider(self.provider_name()))
+    }
+
+    async fn post_in_thread(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        self.thread_post(channel, thread_id, content, reply_to)
+            .await
+            .map_err(|error| error.with_provider(self.provider_name()))
+    }
+
+    async fn fetch_thread_message(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        message_id: &MessageId,
+    ) -> Result<Message, ChatError> {
+        self.thread_message(channel, thread_id, message_id)
+            .await
+            .map_err(|error| error.with_provider(self.provider_name()))
+    }
+
+    fn supports_channel_registration(&self) -> bool {
+        self.channel_registration
+    }
+
+    async fn register_channel(
+        &self,
+        source: &str,
+        label: &str,
+    ) -> Result<RegisteredChannel, ChatError> {
+        async {
+            if !self.channel_registration {
+                return Err(ChatError::Refused(
+                    "channel registration is disabled; ask the deployment operator to enable it for this backend"
+                        .to_owned(),
+                ));
+            }
+            let value = self
+                .send(register_channel_request(&self.api_base, source, label))
+                .await?;
+            match parse_registered_channel(&value) {
+                Ok(registered) => {
+                    if registered.id.as_str() == self.bot_token.expose() {
+                        return Err(ChatError::Shape(
+                            "channel registration answer used the configured credential as its id"
+                                .to_owned(),
+                        ));
+                    }
+                    Ok(registered)
+                }
+                Err(error) => {
+                    // A bridge can create the registration and then answer with a malformed optional
+                    // policy. Once the stable id and `created` bit are trustworthy, compensate before
+                    // returning the shape error so the failed local add does not leak an upstream row.
+                    if let Ok((id, true)) = parse_registration_identity(&value) {
+                        if id.as_str() != self.bot_token.expose() {
+                            if let Err(cleanup) = self
+                                .send(unregister_channel_request(&self.api_base, &id))
+                                .await
+                            {
+                                tracing::warn!(channel = %id, %cleanup, "could not roll back malformed channel registration response");
+                            }
+                        }
+                    }
+                    Err(error)
+                }
+            }
+        }
+        .await
+        .map_err(|error| error.with_provider(self.provider_name()))
+    }
+
+    async fn unregister_channel(&self, channel: &ChannelId) -> Result<(), ChatError> {
+        async {
+            if !self.channel_registration {
+                return Err(ChatError::Refused(
+                    "channel registration is disabled; ask the deployment operator to enable it for this backend"
+                        .to_owned(),
+                ));
+            }
+            let _ = self
+                .send(unregister_channel_request(&self.api_base, channel))
+                .await?;
+            Ok(())
+        }
+        .await
+        .map_err(|error| error.with_provider(self.provider_name()))
+    }
+
     fn supports_upstream_read_mark(&self) -> bool {
         self.upstream_read_marks
+    }
+
+    async fn probe_channel(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, ChatError> {
+        if self.thread_api == crate::threads::ThreadApi::Native {
+            self.native_probe(channel, limit)
+                .await
+                .map_err(|error| error.with_provider(self.provider_name()))
+        } else {
+            self.fetch_recent(channel, limit).await
+        }
     }
 
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
@@ -487,7 +788,15 @@ impl ChatClient for HttpDiscordClient {
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
         async {
-            let request = post_request(&self.api_base, channel, content, reply_to)?;
+            self.validate_main_post(channel)?;
+            let nonce = self.channel_registration.then(fresh_post_nonce);
+            let request = post_request_with_nonce(
+                &self.api_base,
+                channel,
+                content,
+                reply_to,
+                nonce.as_deref(),
+            )?;
             let value = self.send(request).await?;
             parse_message(&value)
         }
@@ -503,7 +812,7 @@ impl ChatClient for HttpDiscordClient {
         async {
         if !self.upstream_read_marks {
             return Err(ChatError::Refused(
-                "upstream read marks are disabled; set discord.upstream_read_marks = true only for a compatible bridge"
+                "upstream read marks are disabled; ask the deployment operator to enable them for this backend"
                     .to_owned(),
             ));
         }
@@ -525,6 +834,22 @@ mod tests {
 
     fn channel() -> ChannelId {
         ChannelId("123".to_owned())
+    }
+
+    fn client_config(api_base: &str, channel_registration: bool) -> DiscordConfig {
+        DiscordConfig {
+            thread_api: crate::threads::ThreadApi::Native,
+            provider_name: "Google Chat".to_owned(),
+            bot_token: Secret::new("abc"),
+            owner_user_id: None,
+            api_base: api_base.to_owned(),
+            default_fetch_limit: 25,
+            max_fetch_limit: 100,
+            max_count_scan: 500,
+            live_poll_seconds: 0,
+            channel_registration,
+            upstream_read_marks: false,
+        }
     }
 
     #[test]
@@ -555,6 +880,90 @@ mod tests {
             None,
             "a header struct that ends up in a log must not carry a credential"
         );
+    }
+
+    #[test]
+    fn registration_requests_use_the_bridge_contract_exactly() {
+        let request = register_channel_request(
+            "https://bridge.example/v1/",
+            "https://chat.example/room/thread",
+            "release thread",
+        );
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.url, "https://bridge.example/v1/channels");
+        assert_eq!(
+            request.body,
+            Some(json!({
+                "source": "https://chat.example/room/thread",
+                "label": "release thread",
+            }))
+        );
+
+        let removed = unregister_channel_request(
+            "https://bridge.example/v1/",
+            &ChannelId("managed-123".to_owned()),
+        );
+        assert_eq!(removed.method, "DELETE");
+        assert_eq!(
+            removed.url,
+            "https://bridge.example/v1/channels/managed-123"
+        );
+        assert_eq!(removed.body, None);
+
+        let bridged = post_request_with_nonce(
+            "https://bridge.example/v1",
+            &ChannelId("managed-123".to_owned()),
+            "hello",
+            None,
+            Some("nonce_ABC-123~"),
+        )
+        .expect("valid bridge post");
+        assert_eq!(bridged.body.expect("body")["nonce"], "nonce_ABC-123~");
+    }
+
+    #[test]
+    fn registration_answers_require_an_id_and_created_flag_and_default_to_read_only() {
+        assert_eq!(
+            parse_registered_channel(&json!({"id": "managed-123", "created": true}))
+                .expect("legacy answer remains valid"),
+            RegisteredChannel {
+                id: ChannelId("managed-123".to_owned()),
+                created: true,
+                writable: false,
+            }
+        );
+        assert_eq!(
+            parse_registered_channel(
+                &json!({"id": "managed-456", "created": false, "writable": true})
+            )
+            .expect("bridge may declare the channel writable"),
+            RegisteredChannel {
+                id: ChannelId("managed-456".to_owned()),
+                created: false,
+                writable: true,
+            }
+        );
+        for invalid in [
+            json!({"created": true}),
+            json!({"id": "managed-123"}),
+            json!({"id": "", "created": true}),
+            json!({"id": "spaces/unsafe", "created": true}),
+            json!({"id": "..", "created": true}),
+            json!({"id": "managed-123", "created": "yes"}),
+            json!({"id": "managed-123", "created": true, "writable": "yes"}),
+        ] {
+            assert!(matches!(
+                parse_registered_channel(&invalid),
+                Err(ChatError::Shape(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn http_client_refuses_managed_mode_on_official_discord() {
+        let error = HttpDiscordClient::new(&client_config(BASE, true))
+            .expect_err("the client constructor must preserve the official-host guard");
+        assert!(matches!(error, ChatError::Refused(detail) if detail.contains("official API")));
     }
 
     #[test]
@@ -678,10 +1087,13 @@ mod tests {
         });
 
         let client = HttpDiscordClient {
+            thread_api: crate::threads::ThreadApi::Off,
+            thread_inventory: threading::InventoryCache::default(),
             provider_name: "Discord".to_owned(),
             client: reqwest::Client::new(),
             api_base: format!("http://{address}"),
-            authorization: authorization_header(&Secret::new("abc")),
+            bot_token: Secret::new("abc"),
+            channel_registration: false,
             upstream_read_marks: true,
             limiter: RateLimiter::new(),
         };
@@ -690,6 +1102,340 @@ mod tests {
             .await
             .expect("an empty 204 is a successful write");
         server.await.expect("mock server");
+    }
+
+    #[tokio::test]
+    async fn channel_registration_uses_the_live_bridge_contract() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept registration");
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await.expect("read registration");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /channels HTTP/1.1"));
+            assert!(request.contains(
+                r#"{"label":"release thread","source":"https://chat.example/space/thread"}"#
+            ));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 51\r\nConnection: close\r\n\r\n{\"id\":\"managed-123\",\"created\":true,\"writable\":true}",
+                )
+                .await
+                .expect("write registration response");
+
+            let (mut socket, _) = listener.accept().await.expect("accept removal");
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await.expect("read removal");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("DELETE /channels/managed-123 HTTP/1.1"));
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write removal response");
+        });
+
+        let client = HttpDiscordClient {
+            thread_api: crate::threads::ThreadApi::Off,
+            thread_inventory: threading::InventoryCache::default(),
+            provider_name: "Google Chat".to_owned(),
+            client: reqwest::Client::new(),
+            api_base: format!("http://{address}"),
+            bot_token: Secret::new("abc"),
+            channel_registration: true,
+            upstream_read_marks: false,
+            limiter: RateLimiter::new(),
+        };
+        let registered = client
+            .register_channel("https://chat.example/space/thread", "release thread")
+            .await
+            .expect("registration succeeds");
+        assert_eq!(registered.id.as_str(), "managed-123");
+        assert!(registered.created);
+        assert!(registered.writable);
+        client
+            .unregister_channel(&registered.id)
+            .await
+            .expect("removal succeeds");
+        server.await.expect("mock server");
+    }
+
+    #[tokio::test]
+    async fn malformed_writable_rolls_back_a_new_registration() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept registration");
+            let mut request = vec![0_u8; 4096];
+            let _read = socket.read(&mut request).await.expect("read registration");
+            let body = r#"{"id":"managed-bad","created":true,"writable":"yes"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write malformed response");
+
+            let (mut socket, _) = listener.accept().await.expect("accept compensation");
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await.expect("read compensation");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("DELETE /channels/managed-bad HTTP/1.1"));
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write compensation response");
+        });
+
+        let client = HttpDiscordClient {
+            thread_api: crate::threads::ThreadApi::Off,
+            thread_inventory: threading::InventoryCache::default(),
+            provider_name: "Google Chat".to_owned(),
+            client: reqwest::Client::new(),
+            api_base: format!("http://{address}"),
+            bot_token: Secret::new("abc"),
+            channel_registration: true,
+            upstream_read_marks: false,
+            limiter: RateLimiter::new(),
+        };
+        assert!(matches!(
+            client.register_channel("source", "label").await.expect_err("invalid policy").cause(),
+            ChatError::Shape(detail) if detail.contains("writable")
+        ));
+        server.await.expect("mock server");
+    }
+
+    #[tokio::test]
+    async fn malformed_policy_does_not_delete_a_reused_registration() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept registration");
+            let mut request = vec![0_u8; 4096];
+            let _read = socket.read(&mut request).await.expect("read registration");
+            let body = r#"{"id":"managed-existing","created":false,"writable":"yes"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write malformed response");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "a reused registration was deleted"
+            );
+        });
+
+        let client = HttpDiscordClient {
+            thread_api: crate::threads::ThreadApi::Off,
+            thread_inventory: threading::InventoryCache::default(),
+            provider_name: "Google Chat".to_owned(),
+            client: reqwest::Client::new(),
+            api_base: format!("http://{address}"),
+            bot_token: Secret::new("abc"),
+            channel_registration: true,
+            upstream_read_marks: false,
+            limiter: RateLimiter::new(),
+        };
+        assert!(matches!(
+            client.register_channel("source", "label").await.expect_err("invalid policy").cause(),
+            ChatError::Shape(detail) if detail.contains("writable")
+        ));
+        server.await.expect("mock server");
+    }
+
+    #[tokio::test]
+    async fn registration_ids_cannot_equal_the_bot_token() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const TOKEN: &str = "path-safe-bot-token-123456789";
+        for body in [
+            format!(r#"{{"id":"{TOKEN}","created":false,"writable":true}}"#),
+            format!(r#"{{"id":"{TOKEN}","created":true,"writable":"yes"}}"#),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            let address = listener.local_addr().expect("listener address");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept registration");
+                let mut request = vec![0_u8; 4096];
+                let _read = socket.read(&mut request).await.expect("read registration");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "the credential-shaped id was sent back in a DELETE path"
+                );
+            });
+
+            let client = HttpDiscordClient {
+                thread_api: crate::threads::ThreadApi::Off,
+                thread_inventory: threading::InventoryCache::default(),
+                provider_name: "Google Chat".to_owned(),
+                client: reqwest::Client::new(),
+                api_base: format!("http://{address}"),
+                bot_token: Secret::new(TOKEN),
+                channel_registration: true,
+                upstream_read_marks: false,
+                limiter: RateLimiter::new(),
+            };
+            let error = client
+                .register_channel("source", "label")
+                .await
+                .expect_err("credential-shaped ids must be rejected");
+            assert!(!error.to_string().contains(TOKEN));
+            server.await.expect("mock server");
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_error_bodies_cannot_echo_the_bot_token() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const TOKEN: &str = "bridge-secret-token-123456789";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept registration");
+            let mut request = vec![0_u8; 4096];
+            let _read = socket.read(&mut request).await.expect("read registration");
+            let body = format!("bridge rejected Authorization: Bot {TOKEN}; token={TOKEN}");
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write rejection");
+        });
+
+        let client = HttpDiscordClient {
+            thread_api: crate::threads::ThreadApi::Off,
+            thread_inventory: threading::InventoryCache::default(),
+            provider_name: "Google Chat".to_owned(),
+            client: reqwest::Client::new(),
+            api_base: format!("http://{address}"),
+            bot_token: Secret::new(TOKEN),
+            channel_registration: true,
+            upstream_read_marks: false,
+            limiter: RateLimiter::new(),
+        };
+        let error = client
+            .register_channel("source", "label")
+            .await
+            .expect_err("bridge rejects registration");
+        let rendered = error.to_string();
+        assert!(rendered.contains("HTTP 401"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains(TOKEN), "token leaked: {rendered}");
+        server.await.expect("mock server");
+    }
+
+    #[tokio::test]
+    async fn bridge_post_retries_reuse_one_path_safe_nonce() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept post");
+                let mut request = vec![0_u8; 4096];
+                let read = socket.read(&mut request).await.expect("read post");
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.starts_with("POST /channels/managed-123/messages HTTP/1.1"));
+                bodies.push(
+                    request
+                        .split("\r\n\r\n")
+                        .nth(1)
+                        .expect("request body")
+                        .to_owned(),
+                );
+                if attempt == 0 {
+                    let body = r#"{"retry_after":0.001,"global":false}"#;
+                    let response = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write rate limit");
+                } else {
+                    let body = r#"{"id":"9001","channel_id":"managed-123","content":"hello","timestamp":"2026-09-19T00:00:00Z","author":{"id":"7","username":"bot","bot":true}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write post response");
+                }
+            }
+            bodies
+        });
+
+        let client = HttpDiscordClient {
+            thread_api: crate::threads::ThreadApi::Off,
+            thread_inventory: threading::InventoryCache::default(),
+            provider_name: "Google Chat".to_owned(),
+            client: reqwest::Client::new(),
+            api_base: format!("http://{address}"),
+            bot_token: Secret::new("abc"),
+            channel_registration: true,
+            upstream_read_marks: false,
+            limiter: RateLimiter::new(),
+        };
+        client
+            .post_message(&ChannelId("managed-123".to_owned()), "hello", None)
+            .await
+            .expect("retry succeeds");
+        let bodies = server.await.expect("mock server");
+        let first: serde_json::Value = serde_json::from_str(&bodies[0]).expect("first JSON");
+        let second: serde_json::Value = serde_json::from_str(&bodies[1]).expect("second JSON");
+        let nonce = first["nonce"].as_str().expect("bridge nonce");
+        assert_eq!(second["nonce"], nonce, "a retry minted a different nonce");
+        assert!(
+            !nonce.is_empty()
+                && nonce.len() <= 128
+                && nonce.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'.' | b'_' | b'~')),
+            "nonce is not path-safe: {nonce:?}"
+        );
     }
 
     #[test]
@@ -709,6 +1455,10 @@ mod tests {
             "a message that mentions nobody must not authorize any ping"
         );
         assert!(body.get("message_reference").is_none());
+        assert!(
+            body.get("nonce").is_none(),
+            "official Discord must not receive the provider bridge nonce"
+        );
         assert_eq!(
             request.url,
             "https://discord.com/api/v10/channels/123/messages"

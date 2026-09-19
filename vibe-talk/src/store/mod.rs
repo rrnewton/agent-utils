@@ -270,12 +270,18 @@ pub struct ChannelAlias {
 /// A channel the owner added from inside the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddedChannel {
-    /// The Discord snowflake.
+    /// Provider-stable channel identifier.
     pub channel: ChannelId,
     /// The name to show, as the owner typed it when adding.
     pub label: String,
-    /// Whether the bridge may POST here, chosen explicitly when it was added.
+    /// Whether the bridge may POST here.
     pub writable: bool,
+    /// Provider namespace that owns this row's upstream registration lifecycle.
+    ///
+    /// `None` means a direct Discord add, including rows created before managed registration
+    /// existed. A stored namespace must match the active bridge before its write authority or
+    /// upstream removal behavior is used.
+    pub registration_provider: Option<String>,
     /// When it was added, for the record rather than for any policy.
     pub added_at_ms: i64,
 }
@@ -602,6 +608,9 @@ pub trait StateStore: Send + Sync {
 
     /// Add a channel, or update the one already stored under that id.
     ///
+    /// `registration_provider` records which bridge owns removal. Existing rows and direct Discord
+    /// additions use `None`; this must never be inferred from the current provider.
+    ///
     /// # Errors
     ///
     /// [`StoreError`] when the backend cannot be written.
@@ -610,6 +619,7 @@ pub trait StateStore: Send + Sync {
         channel: &ChannelId,
         label: &str,
         writable: bool,
+        registration_provider: Option<&str>,
         at_ms: i64,
     ) -> Result<(), StoreError>;
 

@@ -579,6 +579,7 @@ mod tests {
 
     fn message(content: &str) -> Message {
         Message {
+            thread: None,
             id: MessageId("1".to_owned()),
             channel_id: crate::model::ChannelId("100".to_owned()),
             author: "codex-eng".to_owned(),

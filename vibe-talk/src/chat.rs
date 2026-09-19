@@ -146,12 +146,106 @@ pub struct ChatIdentity {
     pub username: String,
 }
 
+/// A channel created or resolved by a provider-side registration bridge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredChannel {
+    /// Stable channel id used by all subsequent vibe-talk routes.
+    pub id: ChannelId,
+    /// Whether this call created the upstream registration rather than finding an existing one.
+    pub created: bool,
+    /// Whether the provider bridge permits posting into this channel.
+    ///
+    /// Registration responses that omit this field remain read-only for backward compatibility.
+    pub writable: bool,
+}
+
 /// Read and post access to configured chat channels.
 #[async_trait]
 pub trait ChatClient: Send + Sync {
     /// Human-readable name of the source chat service, including when accessed through a bridge.
     fn provider_name(&self) -> &str {
         "Chat"
+    }
+
+    /// Whether this backend supports channel and thread timeline views.
+    fn supports_threading(&self) -> bool {
+        false
+    }
+
+    /// Read one backward page of a channel view, with backend-owned opaque cursors.
+    ///
+    /// The backend must verify thread membership before any thread-specific read. Discovery that
+    /// cannot be completed must fail rather than returning an apparently complete flat history.
+    async fn fetch_timeline(
+        &self,
+        _channel: &ChannelId,
+        _request: &crate::threads::TimelineRequest,
+    ) -> Result<crate::threads::TimelinePage, ChatError> {
+        Err(ChatError::Refused(
+            "thread timelines are not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// Post inside a thread after verifying that it belongs to the configured parent channel.
+    ///
+    /// The caller also enforces the parent channel's write allowlist. A reply-to message does not
+    /// implicitly select a thread: the destination is always explicit.
+    async fn post_in_thread(
+        &self,
+        _channel: &ChannelId,
+        _thread_id: &str,
+        _content: &str,
+        _reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        Err(ChatError::Refused(
+            "thread posting is not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// Fetch an exact message after verifying its thread belongs to the configured channel.
+    async fn fetch_thread_message(
+        &self,
+        _channel: &ChannelId,
+        _thread_id: &str,
+        _message_id: &MessageId,
+    ) -> Result<Message, ChatError> {
+        Err(ChatError::Refused(
+            "thread message lookup is not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// Whether this provider accepts operator-supplied channel references and manages them upstream.
+    ///
+    /// False by default so direct providers and existing test doubles keep the established
+    /// `{id, label, writable}` registration flow.
+    fn supports_channel_registration(&self) -> bool {
+        false
+    }
+
+    /// Register an operator-supplied channel reference and return its stable local id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatError`] when registration is disabled, rejected, or fails.
+    async fn register_channel(
+        &self,
+        _source: &str,
+        _label: &str,
+    ) -> Result<RegisteredChannel, ChatError> {
+        Err(ChatError::Refused(
+            "the configured chat provider does not support channel registration".to_owned(),
+        ))
+    }
+
+    /// Remove a channel previously registered through the provider bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatError`] when registration is disabled, rejected, or fails.
+    async fn unregister_channel(&self, _channel: &ChannelId) -> Result<(), ChatError> {
+        Err(ChatError::Refused(
+            "the configured chat provider does not support channel registration".to_owned(),
+        ))
     }
 
     /// Whether this provider can move its own read cursor forward.
@@ -185,6 +279,18 @@ pub trait ChatClient: Send + Sync {
         before: Option<&MessageId>,
         after: Option<&MessageId>,
     ) -> Result<Vec<Message>, ChatError>;
+
+    /// Read a minimal sample for channel reachability checks.
+    ///
+    /// Backends with thread-only containers can probe their root-message view instead of calling
+    /// a main-message endpoint that the provider does not support for those containers.
+    async fn probe_channel(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.fetch_recent(channel, limit).await
+    }
 
     /// Fetch up to `limit` most recent messages, returned oldest first.
     ///

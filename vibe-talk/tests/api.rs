@@ -286,6 +286,7 @@ async fn upstream_read_is_a_separate_default_off_provider_capability() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["channel_registration_supported"], false);
     assert_eq!(config["upstream_read_mark_supported"], false);
 
     let (status, payload) = call(
@@ -1138,6 +1139,42 @@ async fn every_rendered_message_carries_its_authors_snowflake() {
 
 fn store_harness() -> (Harness, std::sync::Arc<vibe_talk::store::fake::FakeStore>) {
     let (state, discord, store, elevenlabs) = vibe_talk::testing::state_with_store_and_voice();
+    (
+        Harness {
+            router: router(state),
+            discord,
+            elevenlabs: Some(elevenlabs),
+        },
+        store,
+    )
+}
+
+async fn restored_channel_harness(
+    channel: &ChannelId,
+    writable: bool,
+    managed: bool,
+) -> (Harness, std::sync::Arc<vibe_talk::store::fake::FakeStore>) {
+    let (state, discord, store, elevenlabs) = vibe_talk::testing::state_with_store_and_voice();
+    let provider = managed.then(|| state.config.discord.api_base.clone());
+    if managed {
+        discord.enable_channel_registration(channel, false, writable);
+    } else {
+        discord.register_channel(channel);
+    }
+    store
+        .add_channel(
+            channel,
+            "restored channel",
+            writable,
+            provider.as_deref(),
+            1,
+        )
+        .await
+        .expect("store channel");
+    state
+        .restore_added_channels()
+        .await
+        .expect("restore channel");
     (
         Harness {
             router: router(state),
@@ -2667,10 +2704,7 @@ async fn reading_a_message_aloud_reports_where_the_time_went() {
         .expect("the route must say where the time went");
     // The two round trips are named SEPARATELY. One number for the whole request would say the
     // thing everybody already knows and none of the thing that decides what to fix.
-    assert!(
-        timing.contains("discord;dur="),
-        "no Discord timing: {timing}"
-    );
+    assert!(timing.contains("chat;dur="), "no Discord timing: {timing}");
     assert!(timing.contains("tts;dur="), "no vendor timing: {timing}");
     // And the SIZE, which is the third cause and the one no clock on this server can see: the
     // reader waits for the last byte of this before hearing the first word of it.
@@ -2818,6 +2852,465 @@ async fn preparing_a_message_that_scrolled_away_loses_that_one_and_keeps_the_res
     assert_eq!(entries[0]["message_id"], ids[0]);
 }
 
+/// A provider-managed reference is registered upstream before joining the local allowlist.
+#[tokio::test]
+async fn a_managed_channel_reference_is_registered_and_removed_upstream() {
+    let (harness, store, _ids) = todo_harness();
+    let managed = ChannelId("3333333333333333999".to_owned());
+    harness
+        .discord
+        .enable_channel_registration(&managed, true, true);
+    harness
+        .discord
+        .seed(&managed, "coding-agent", "registered and readable");
+
+    let (status, config) = call(
+        &harness,
+        "GET",
+        "/api/v1/client-config",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["channel_registration_supported"], true);
+
+    let source = "https://chat.example/space/thread";
+    let (status, added) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "source": source, "label": "release thread" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert_eq!(added["channel"]["id"], managed.as_str());
+    assert_eq!(added["channel"]["writable"], true);
+    assert_eq!(
+        harness.discord.registration_calls(),
+        vec![(source.to_owned(), "release thread".to_owned())]
+    );
+    let stored = store.added_channels().await.expect("stored");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].registration_provider.as_deref(),
+        Some("https://discord.com/api/v10"),
+        "managed provenance was not persisted"
+    );
+    assert!(
+        stored[0].writable,
+        "the bridge's write policy was not persisted"
+    );
+
+    let (status, removed) = call(
+        &harness,
+        "DELETE",
+        &format!("/api/v1/channels/{}", managed.as_str()),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(harness.discord.unregistration_calls(), vec![managed]);
+    assert!(store.added_channels().await.expect("removed").is_empty());
+}
+
+#[tokio::test]
+async fn managed_re_registration_reconciles_the_bridge_write_policy() {
+    let (harness, store, _ids) = todo_harness();
+    let managed = ChannelId("3333333333333333995".to_owned());
+    harness
+        .discord
+        .enable_channel_registration(&managed, true, true);
+    harness
+        .discord
+        .seed(&managed, "coding-agent", "registered and readable");
+
+    let add = |label: &'static str| {
+        call(
+            &harness,
+            "POST",
+            "/api/v1/channels",
+            Some(WRITE_TOKEN),
+            Some(serde_json::json!({ "source": "same-source", "label": label })),
+        )
+    };
+    let (status, first) = add("first label").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["channel"]["writable"], true);
+
+    harness
+        .discord
+        .enable_channel_registration(&managed, false, false);
+    let (status, reconciled) = add("current label").await;
+    assert_eq!(status, StatusCode::OK, "{reconciled}");
+    assert_eq!(reconciled["channel"]["label"], "current label");
+    assert_eq!(reconciled["channel"]["writable"], false);
+    let rows = store.added_channels().await.expect("stored");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].registration_provider.as_deref(),
+        Some("https://discord.com/api/v10")
+    );
+    assert!(!rows[0].writable);
+
+    let (status, refused) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{}/reply", managed.as_str()),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"text": "must stay local"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["error"], "channel_not_writable");
+}
+
+#[tokio::test]
+async fn managed_requests_reject_present_direct_fields_and_static_aliases() {
+    let (harness, _store, _ids) = todo_harness();
+    let managed = ChannelId("3333333333333333994".to_owned());
+    harness
+        .discord
+        .enable_channel_registration(&managed, false, false);
+
+    for body in [
+        serde_json::json!({"source": "provider-ref", "label": "x", "id": ""}),
+        serde_json::json!({"source": "provider-ref", "label": "x", "id": null}),
+        serde_json::json!({"source": "provider-ref", "label": "x", "writable": false}),
+        serde_json::json!({"source": "provider-ref", "label": "x", "writable": null}),
+    ] {
+        let (status, refused) = call(
+            &harness,
+            "POST",
+            "/api/v1/channels",
+            Some(WRITE_TOKEN),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["error"], "invalid_channel_registration");
+    }
+    assert!(harness.discord.registration_calls().is_empty());
+
+    let (status, refused) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"source": WRITE_CHANNEL, "label": "static alias"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "channel_is_configured");
+    assert!(harness.discord.registration_calls().is_empty());
+
+    harness
+        .discord
+        .enable_channel_registration(&ChannelId(WRITE_CHANNEL.to_owned()), true, true);
+    let (status, refused) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({
+            "source": "provider-link-resolving-to-static",
+            "label": "static alias"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "channel_is_configured");
+    assert!(
+        harness.discord.unregistration_calls().is_empty(),
+        "a colliding configured channel must never be deleted upstream"
+    );
+}
+
+#[tokio::test]
+async fn managed_registration_never_converts_or_deletes_a_direct_row() {
+    let direct = ChannelId("3333333333333333951".to_owned());
+    let (harness, store) = restored_channel_harness(&direct, true, false).await;
+    harness
+        .discord
+        .enable_channel_registration(&direct, true, false);
+
+    let (status, refused) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({
+            "source": direct.as_str(),
+            "label": "literal direct id"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "channel_already_present");
+    assert!(harness.discord.registration_calls().is_empty());
+
+    let (status, refused) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({
+            "source": "provider-link-resolving-to-direct",
+            "label": "must not convert"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"], "channel_already_present");
+    assert!(
+        harness.discord.unregistration_calls().is_empty(),
+        "a colliding direct channel must never be deleted upstream"
+    );
+    let rows = store.added_channels().await.expect("direct row remains");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].registration_provider.is_none());
+    assert!(rows[0].writable);
+}
+
+#[tokio::test]
+async fn restored_write_policy_controls_reply_for_managed_channels() {
+    for (suffix, writable, expected) in [
+        ("1", false, StatusCode::FORBIDDEN),
+        ("2", true, StatusCode::OK),
+    ] {
+        let channel = ChannelId(format!("333333333333333398{suffix}"));
+        let (harness, _store) = restored_channel_harness(&channel, writable, true).await;
+        let (status, body) = call(
+            &harness,
+            "POST",
+            &format!("/api/v1/channels/{}/reply", channel.as_str()),
+            Some(WRITE_TOKEN),
+            Some(serde_json::json!({"text": "bridge policy decides"})),
+        )
+        .await;
+        assert_eq!(status, expected, "writable={writable}: {body}");
+        assert_eq!(harness.discord.posted().is_empty(), !writable);
+    }
+}
+
+#[tokio::test]
+async fn restored_managed_authority_fails_closed_without_its_original_provider() {
+    for (suffix, enable_current_provider) in [("1", false), ("2", true)] {
+        let channel = ChannelId(format!("333333333333333396{suffix}"));
+        let (state, discord, store, elevenlabs) = vibe_talk::testing::state_with_store_and_voice();
+        store
+            .add_channel(
+                &channel,
+                "old bridge channel",
+                true,
+                Some("https://old-bridge.example/v1"),
+                1,
+            )
+            .await
+            .expect("store old provider row");
+        if enable_current_provider {
+            discord.enable_channel_registration(&channel, false, true);
+        } else {
+            discord.register_channel(&channel);
+        }
+        state
+            .restore_added_channels()
+            .await
+            .expect("restore channel");
+        let harness = Harness {
+            router: router(state),
+            discord,
+            elevenlabs: Some(elevenlabs),
+        };
+
+        let (status, body) = call(
+            &harness,
+            "POST",
+            &format!("/api/v1/channels/{}/reply", channel.as_str()),
+            Some(WRITE_TOKEN),
+            Some(serde_json::json!({"text": "must fail closed"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "channel_not_writable");
+
+        let (status, body) = call(
+            &harness,
+            "DELETE",
+            &format!("/api/v1/channels/{}", channel.as_str()),
+            Some(WRITE_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "channel_provider_mismatch");
+        assert!(harness.discord.unregistration_calls().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn removal_uses_each_restored_rows_managed_provenance() {
+    let direct = ChannelId("3333333333333333971".to_owned());
+    let (direct_harness, direct_store) = restored_channel_harness(&direct, false, false).await;
+    direct_harness.discord.enable_channel_registration(
+        &ChannelId("unused-provider-answer".to_owned()),
+        false,
+        false,
+    );
+    let (status, body) = call(
+        &direct_harness,
+        "DELETE",
+        &format!("/api/v1/channels/{}", direct.as_str()),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(direct_harness.discord.unregistration_calls().is_empty());
+    assert!(direct_store
+        .added_channels()
+        .await
+        .expect("removed")
+        .is_empty());
+
+    let managed = ChannelId("3333333333333333972".to_owned());
+    let (managed_harness, managed_store) = restored_channel_harness(&managed, false, true).await;
+    managed_harness
+        .discord
+        .enable_channel_registration(&managed, false, false);
+    let (status, body) = call(
+        &managed_harness,
+        "DELETE",
+        &format!("/api/v1/channels/{}", managed.as_str()),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        managed_harness.discord.unregistration_calls(),
+        vec![managed]
+    );
+    assert!(managed_store
+        .added_channels()
+        .await
+        .expect("removed")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_new_upstream_registration_is_rolled_back_when_its_probe_fails() {
+    let (harness, store, _ids) = todo_harness();
+    let managed = ChannelId("3333333333333333998".to_owned());
+    harness
+        .discord
+        .enable_channel_registration(&managed, true, false);
+    harness
+        .discord
+        .fail_next("the registered channel cannot be read");
+
+    let (status, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({
+            "source": "opaque-provider-reference",
+            "label": "unreadable thread"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"], "channel_unreadable");
+    assert_eq!(harness.discord.unregistration_calls(), vec![managed]);
+    assert!(store.added_channels().await.expect("not stored").is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_managed_adds_are_serial_and_reconcile_one_row() {
+    let (harness, store, _ids) = todo_harness();
+    let managed = ChannelId("3333333333333333997".to_owned());
+    harness
+        .discord
+        .enable_channel_registration(&managed, true, false);
+    harness
+        .discord
+        .set_channel_registration_delay(std::time::Duration::from_millis(25));
+    harness
+        .discord
+        .seed(&managed, "coding-agent", "registered and readable");
+
+    let first = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({
+            "source": "same-provider-reference",
+            "label": "first name"
+        })),
+    );
+    let second = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({
+            "source": "same-provider-reference",
+            "label": "second name"
+        })),
+    );
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(first.0, StatusCode::OK, "{first:?}");
+    assert_eq!(second.0, StatusCode::OK, "{second:?}");
+    assert_eq!(harness.discord.max_registrations_in_flight(), 1);
+    assert!(
+        harness.discord.unregistration_calls().is_empty(),
+        "one add rolled back the registration kept by the other"
+    );
+    assert_eq!(store.added_channels().await.expect("stored once").len(), 1);
+}
+
+#[tokio::test]
+async fn managed_removal_retries_after_the_local_store_fails() {
+    let (harness, store, _ids) = todo_harness();
+    let managed = ChannelId("3333333333333333996".to_owned());
+    harness
+        .discord
+        .enable_channel_registration(&managed, true, false);
+    harness
+        .discord
+        .seed(&managed, "coding-agent", "registered and readable");
+    let (status, added) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({
+            "source": "retry-safe-reference",
+            "label": "retry-safe channel"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+
+    store.fail_next("disk unavailable after upstream deletion");
+    let path = format!("/api/v1/channels/{}", managed.as_str());
+    let (status, failed) = call(&harness, "DELETE", &path, Some(WRITE_TOKEN), None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{failed}");
+    assert_eq!(store.added_channels().await.expect("still local").len(), 1);
+
+    let (status, removed) = call(&harness, "DELETE", &path, Some(WRITE_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert_eq!(
+        harness.discord.unregistration_calls(),
+        vec![managed.clone(), managed]
+    );
+    assert!(store.added_channels().await.expect("removed").is_empty());
+}
+
 /// A channel can be added from inside the app, and is reachable the moment it is.
 ///
 /// The point of the feature is that adding one needs no file edit and no redeploy, so the test is
@@ -2882,7 +3375,12 @@ async fn a_channel_added_in_the_app_joins_the_allowlist_immediately() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // ...and it survives a restart, because the store is what carries it across one.
-    assert_eq!(store.added_channels().await.expect("read back").len(), 1);
+    let rows = store.added_channels().await.expect("read back");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].registration_provider.is_none(),
+        "a direct add acquired provider ownership"
+    );
 }
 
 /// A channel the bot cannot read is REFUSED, in the probe's own words.

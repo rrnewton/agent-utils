@@ -99,6 +99,7 @@ mod tests {
 
     fn message(author: &str, content: &str) -> Message {
         Message {
+            thread: None,
             id: MessageId("1000000000000000001".to_owned()),
             channel_id: ChannelId("c".to_owned()),
             author: author.to_owned(),

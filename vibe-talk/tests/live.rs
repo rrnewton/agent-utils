@@ -206,7 +206,7 @@ async fn a_channel_restored_at_startup_is_polled_and_publishes_new_messages() {
     let (state, discord, store) = vibe_talk::testing::state_with_store();
     let fresh = ChannelId("4444444444444444444".to_owned());
     store
-        .add_channel(&fresh, "restored team", false, 1)
+        .add_channel(&fresh, "restored team", false, None, 1)
         .await
         .expect("store added channel");
     assert_eq!(

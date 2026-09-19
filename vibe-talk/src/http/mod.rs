@@ -66,6 +66,7 @@ pub fn router(state: AppState) -> Router {
             get(api::message_summary),
         )
         .route("/api/v1/channels/{channel_id}/page", get(api::page))
+        .route("/api/v1/channels/{channel_id}/timeline", get(api::timeline))
         .route("/api/v1/channels/{channel_id}/count", get(api::count))
         .route("/api/v1/channels/{channel_id}/digest", get(api::digest))
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))

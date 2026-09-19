@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use super::ratelimit::{Attempt, Headers, RateLimit, RateLimiter, RetryPolicy};
 #[cfg(test)]
 use crate::chat::ChatError as DiscordError;
-use crate::chat::{ChatClient, ChatError, ChatIdentity};
+use crate::chat::{ChatClient, ChatError, ChatIdentity, RegisteredChannel};
 use crate::config::DEFAULT_DISCORD_API_BASE;
 use crate::model::{sort_oldest_first, ChannelId, Message, MessageId, UserId};
 
@@ -70,6 +70,13 @@ struct State {
     fetches: usize,
     messages: Vec<Message>,
     posted: Vec<PostedMessage>,
+    channel_registration_enabled: bool,
+    registered_channel: Option<RegisteredChannel>,
+    registration_calls: Vec<(String, String)>,
+    registration_delay: Option<Duration>,
+    registrations_in_flight: usize,
+    max_registrations_in_flight: usize,
+    unregistration_calls: Vec<ChannelId>,
     upstream_read_marks_enabled: bool,
     upstream_read_marks: Vec<(ChannelId, MessageId)>,
     next_id: u64,
@@ -155,6 +162,41 @@ impl FakeDiscord {
         self.lock().known.insert(channel.clone());
     }
 
+    /// Enable provider-managed channel registration and choose the bridge's response.
+    pub fn enable_channel_registration(&self, channel: &ChannelId, created: bool, writable: bool) {
+        let mut state = self.lock();
+        state.channel_registration_enabled = true;
+        state.known.insert(channel.clone());
+        state.registered_channel = Some(RegisteredChannel {
+            id: channel.clone(),
+            created,
+            writable,
+        });
+    }
+
+    /// Delay each managed registration response, allowing concurrency tests to force overlap.
+    pub fn set_channel_registration_delay(&self, delay: Duration) {
+        self.lock().registration_delay = Some(delay);
+    }
+
+    /// Most simultaneous managed registration calls observed by this fake.
+    #[must_use]
+    pub fn max_registrations_in_flight(&self) -> usize {
+        self.lock().max_registrations_in_flight
+    }
+
+    /// Provider-neutral source and label pairs sent to registration, in call order.
+    #[must_use]
+    pub fn registration_calls(&self) -> Vec<(String, String)> {
+        self.lock().registration_calls.clone()
+    }
+
+    /// Channel ids sent to provider unregistration, in call order.
+    #[must_use]
+    pub fn unregistration_calls(&self) -> Vec<ChannelId> {
+        self.lock().unregistration_calls.clone()
+    }
+
     /// Enable the optional provider read cursor for a test that exercises that capability.
     pub fn enable_upstream_read_marks(&self) {
         self.lock().upstream_read_marks_enabled = true;
@@ -182,6 +224,7 @@ impl FakeDiscord {
             .or_insert_with(|| UserId(next_author.to_string()))
             .clone();
         state.messages.push(Message {
+            thread: None,
             id: id.clone(),
             channel_id: channel.clone(),
             author: author.to_owned(),
@@ -371,6 +414,56 @@ impl FakeDiscord {
 impl ChatClient for FakeDiscord {
     fn provider_name(&self) -> &str {
         "Discord"
+    }
+
+    fn supports_channel_registration(&self) -> bool {
+        self.lock().channel_registration_enabled
+    }
+
+    async fn register_channel(
+        &self,
+        source: &str,
+        label: &str,
+    ) -> Result<RegisteredChannel, ChatError> {
+        let (answer, delay) = {
+            let mut state = self.lock();
+            if !state.channel_registration_enabled {
+                return Err(ChatError::Refused(
+                    "the configured chat provider does not support channel registration".to_owned(),
+                ));
+            }
+            state
+                .registration_calls
+                .push((source.to_owned(), label.to_owned()));
+            state.registrations_in_flight += 1;
+            state.max_registrations_in_flight = state
+                .max_registrations_in_flight
+                .max(state.registrations_in_flight);
+            let answer = state.registered_channel.clone();
+            if let Some(registration) = state.registered_channel.as_mut() {
+                registration.created = false;
+            }
+            (answer, state.registration_delay)
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.lock().registrations_in_flight -= 1;
+        answer.ok_or_else(|| {
+            ChatError::Shape("the fake has no channel registration answer".to_owned())
+        })
+    }
+
+    async fn unregister_channel(&self, channel: &ChannelId) -> Result<(), ChatError> {
+        let mut state = self.lock();
+        if !state.channel_registration_enabled {
+            return Err(ChatError::Refused(
+                "the configured chat provider does not support channel registration".to_owned(),
+            ));
+        }
+        state.unregistration_calls.push(channel.clone());
+        state.known.remove(channel);
+        Ok(())
     }
 
     fn supports_upstream_read_mark(&self) -> bool {

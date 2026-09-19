@@ -316,6 +316,22 @@ let currentView = "voice";
  */
 const viewScroll = { voice: null, discord: null };
 
+let threadingSupported = false;
+let channelHasThreads = false;
+let channelView = "main";
+let selectedThreadId = null;
+let selectedThread = null;
+let threadOrigin = "main";
+let timelineMessages = [];
+let timelineThreads = [];
+const channelContexts = new Map();
+const threadColors = new Map();
+const channelDrafts = new Map();
+const channelSendStates = new Map();
+const channelSends = new Set();
+let activeComposerKey = "";
+const CHANNEL_DRAFTS_KEY = "vibe-talk.channel-drafts";
+
 /** Whether the last `showView` put the reader back rather than taking them to the newest. */
 let viewRestored = false;
 
@@ -377,6 +393,7 @@ function showView(name) {
   // ends this way: the bar decides what it shows from the view that is now up. `#83
   // channel-selector-in-bar`.
   renderControlBar();
+  renderChannelNavigation();
 }
 
 // --- connection details -------------------------------------------------------------------------
@@ -451,7 +468,9 @@ function atBottom(area, slack = BOTTOM_SLACK_PX) {
 
 /** The list the reader is actually looking at. Both panes share one scrolling element. */
 function visibleList() {
-  return el(currentView === "discord" ? "discord-log" : "transcript");
+  return el(currentView === "discord"
+    ? (channelView === "threads" ? "thread-list" : "discord-log")
+    : "transcript");
 }
 
 /**
@@ -1043,7 +1062,7 @@ async function fetchSummary(id, alsoIds = []) {
   let payload = null;
   try {
     payload = await api(
-      `/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary${also}`
+      withThreadQuery(`/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary${also}`, threadForMessageId(id))
     );
   } catch (error) {
     // The CODE, not the sentence. `summarizer_not_configured` is a fact about the deployment and
@@ -3343,6 +3362,391 @@ function guard(fn) {
     });
 }
 
+// --- channel views, threads and the channel composer ------------------------------------------
+
+function channelContextKey() {
+  return JSON.stringify([el("discord-channel").value, channelView, selectedThreadId]);
+}
+
+function channelComposerKey() {
+  return JSON.stringify([el("discord-channel").value, selectedThreadId]);
+}
+
+function threadOf(message) {
+  return message && message.thread && typeof message.thread.id === "string"
+    ? message.thread.id : null;
+}
+
+function threadForMessageId(id) {
+  for (const row of el("discord-log").children) {
+    const found = rowMessages(row).find((message) => String(message.id) === String(id));
+    if (found) return threadOf(found);
+  }
+  return selectedThreadId;
+}
+
+function withThreadQuery(path, threadId) {
+  return threadId ? `${path}${path.includes("?") ? "&" : "?"}thread_id=${encodeURIComponent(threadId)}` : path;
+}
+
+function threadHue(id) {
+  const key = String(id);
+  if (threadColors.has(key)) return threadColors.get(key);
+  // Split the largest unused arc: the next thread gets the most separated available color.
+  // Keep allocations while paging and moving between views, so a thread never changes color
+  // merely because another one arrived. Unlike hashing IDs, adjacent or colliding IDs do not
+  // receive indistinguishable colors.
+  const used = [...threadColors.values()].sort((a, b) => a - b);
+  let hue = 210;
+  let widest = -1;
+  for (let i = 0; i < used.length; i += 1) {
+    const next = i + 1 < used.length ? used[i + 1] : used[0] + 360;
+    if (next - used[i] > widest) {
+      widest = next - used[i];
+      hue = (used[i] + widest / 2) % 360;
+    }
+  }
+  threadColors.set(key, hue);
+  return hue;
+}
+
+function threadCount(count, exact) {
+  if (typeof count !== "number") return "Replies";
+  return `${exact === false ? "about " : ""}${count} ${count === 1 ? "reply" : "replies"}`;
+}
+
+function renderChannelNavigation() {
+  const inChannel = currentView === "discord";
+  el("channel-navigation").hidden = !inChannel || (!channelHasThreads && channelView !== "thread");
+  el("channel-view-tabs").hidden = !channelHasThreads || channelView === "thread";
+  el("thread-heading").hidden = channelView !== "thread";
+  for (const view of ["main", "threads", "flat"]) {
+    el(`channel-view-${view}`).setAttribute("aria-pressed", channelView === view ? "true" : "false");
+  }
+  el("thread-title").textContent = selectedThread && selectedThread.title ? selectedThread.title : "Thread";
+  el("thread-list").hidden = channelView !== "threads";
+  el("discord-log").hidden = channelView === "threads";
+  el("channel-compose-label").textContent = selectedThreadId ? "Reply in this thread" : "Message the main channel";
+  el("channel-compose-text").placeholder = selectedThreadId ? "Write a thread reply…" : "Write a message…";
+}
+
+function saveChannelDrafts() {
+  try {
+    const encoded = JSON.stringify(Object.fromEntries(channelDrafts));
+    localStorage.setItem(CHANNEL_DRAFTS_KEY, encoded);
+    return localStorage.getItem(CHANNEL_DRAFTS_KEY) === encoded;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function rememberChannelDraft() {
+  if (!activeComposerKey) return;
+  const text = el("channel-compose-text").value;
+  if (text) channelDrafts.set(activeComposerKey, text);
+  else channelDrafts.delete(activeComposerKey);
+  if (!saveChannelDrafts()) {
+    el("channel-compose-state").textContent = "This browser could not save the draft. Keep this page open until you send it.";
+  }
+}
+
+function restoreChannelComposer() {
+  activeComposerKey = channelComposerKey();
+  const channel = el("discord-channel").value;
+  const readOnly = knownChannel(channel)?.writable === false;
+  el("channel-compose-text").value = channelDrafts.get(activeComposerKey) || "";
+  el("channel-compose-state").textContent = readOnly
+    ? "This channel is read-only."
+    : channelSendStates.get(activeComposerKey) || "";
+  el("channel-compose-text").disabled = channelSends.has(activeComposerKey);
+  el("channel-send").disabled = !channel || readOnly || channelSends.has(activeComposerKey);
+  renderChannelNavigation();
+}
+
+function rememberChannelContext() {
+  channelContexts.set(channelContextKey(), {
+    messages: timelineMessages,
+    threads: timelineThreads,
+    selected: selectedThread,
+    rows: [...el("discord-log").children],
+    cards: [...el("thread-list").children],
+    seam: [...el("channel-summary").children],
+    more: discordMoreAbove,
+    cursor: discordOlderCursor,
+    newest: discordNewestId,
+    position: captureScroll(),
+    top: el("scroll-area").scrollTop,
+  });
+}
+
+async function changeChannelView(view, threadId = null, summary = null) {
+  rememberChannelDraft();
+  rememberChannelContext();
+  if (view === "thread" && channelView !== "thread") threadOrigin = channelView;
+  channelView = view;
+  selectedThreadId = view === "thread" ? threadId : null;
+  selectedThread = view === "thread" ? summary : null;
+  ++discordLoadGeneration;
+  stopReading();
+  readingMode = false;
+  const held = channelContexts.get(channelContextKey());
+  timelineMessages = held ? held.messages : [];
+  timelineThreads = held ? held.threads : [];
+  selectedThread = summary || (held && held.selected) || null;
+  discordMoreAbove = held ? held.more : false;
+  discordOlderCursor = held ? held.cursor : null;
+  discordNewestId = held ? held.newest : null;
+  el("discord-log").replaceChildren(...(held ? held.rows : []));
+  el("thread-list").replaceChildren(...(held ? held.cards : []));
+  el("channel-summary").replaceChildren(...(held ? held.seam : []));
+  el("timeline-notice").hidden = true;
+  restoreChannelComposer();
+  renderOlderControl();
+  renderControls();
+  if (held) {
+    el("scroll-area").scrollTop = held.top;
+    restoreScroll(held.position);
+  } else {
+    scrollToNewest();
+  }
+  await loadDiscord({ keepPosition: Boolean(held) });
+}
+
+function openThread(id, summary = null) {
+  if (!threadingSupported || !id) return;
+  return changeChannelView("thread", String(id), summary);
+}
+
+function closeThread() {
+  if (channelView !== "thread") return;
+  return changeChannelView(threadOrigin);
+}
+
+function threadCard(summary) {
+  const row = document.createElement("li");
+  row.className = "thread-card";
+  row.setAttribute("data-context-id", String(summary.id));
+  row.style.setProperty("--thread-hue", threadHue(summary.id));
+  const button = document.createElement("button");
+  button.className = "thread-open";
+  button.setAttribute("type", "button");
+  const title = document.createElement("strong");
+  title.textContent = summary.title || "Thread";
+  const meta = document.createElement("span");
+  meta.className = "meta";
+  meta.textContent = threadCount(summary.reply_count, summary.reply_count_exact);
+  const preview = document.createElement("span");
+  preview.className = "thread-preview";
+  preview.textContent = summary.root ? String(summary.root.content || "").slice(0, 240) : "Open this thread";
+  button.append(title, meta, preview);
+  button.addEventListener("click", () => guardQuietly(() => openThread(summary.id, summary))());
+  row.append(button);
+  return row;
+}
+
+function addThreadDecoration(meta, message, row) {
+  const id = threadOf(message);
+  if (!threadingSupported || !id || channelView === "thread") return;
+  if (channelView === "flat") {
+    const badge = document.createElement("button");
+    badge.className = "thread-badge";
+    badge.setAttribute("type", "button");
+    badge.setAttribute("title", "Open this thread");
+    badge.style.setProperty("--thread-hue", threadHue(id));
+    badge.textContent = "Thread";
+    badge.addEventListener("click", () => guardQuietly(() => openThread(id))());
+    meta.append(badge);
+  }
+  if (message.thread.is_root) {
+    const replies = document.createElement("button");
+    replies.className = "thread-replies";
+    replies.setAttribute("type", "button");
+    replies.setAttribute("title", "Open this thread");
+    replies.style.setProperty("--thread-hue", threadHue(id));
+    replies.textContent = threadCount(message.thread.reply_count, message.thread.reply_count_exact);
+    replies.addEventListener("click", () => guardQuietly(() => openThread(id))());
+    row.append(replies);
+  }
+}
+
+function timelinePath(before = null) {
+  let path = `/api/v1/channels/${encodeURIComponent(el("discord-channel").value)}/timeline` +
+    `?view=${channelView}&limit=${DISCORD_PAGE_LIMIT}`;
+  path = withThreadQuery(path, selectedThreadId);
+  if (before) path += `&before=${encodeURIComponent(before)}`;
+  return path;
+}
+
+function mergeTimelineItems(previous, arriving, older, hasMore, timeField) {
+  const incoming = new Set(arriving.map((item) => String(item.id)));
+  if (older) return [...arriving, ...previous.filter((item) => !incoming.has(String(item.id)))];
+  const edge = arriving.length ? Date.parse(arriving[0][timeField]) : NaN;
+  const kept = hasMore && Number.isFinite(edge)
+    ? previous.filter((item) => !incoming.has(String(item.id)) && Date.parse(item[timeField]) < edge)
+    : [];
+  return [...kept, ...arriving];
+}
+
+function applyTimelinePage(payload, older = false) {
+  const previousCount = channelView === "threads" ? timelineThreads.length : timelineMessages.length;
+  const incoming = channelView === "threads" ? payload.threads || [] : payload.messages || [];
+  const merged = mergeTimelineItems(
+    channelView === "threads" ? timelineThreads : timelineMessages,
+    incoming, older, payload.has_more === true,
+    channelView === "threads" ? "updated_at" : "timestamp"
+  );
+  if (channelView === "threads") timelineThreads = merged;
+  else timelineMessages = merged;
+  // Retain the oldest cursor when a refresh retained the history already walked back to.
+  if (older || merged.length <= incoming.length || previousCount === 0) {
+    discordMoreAbove = payload.has_more === true;
+    discordOlderCursor = payload.next_before || null;
+  }
+  channelHasThreads = payload.has_threads === true || channelView === "thread";
+  if (payload.thread) selectedThread = payload.thread;
+  noteArchived(payload, !older && merged.length <= incoming.length);
+  const shown = timelineMessages.filter((message) => !todoMode ||
+    (!archivedIds.has(String(message.id)) && (!markOwnRead || bucketFor(message.author_id, message.author_is_bot) !== "me")));
+  if (older) {
+    // Keep existing elements attached to the same messages: scroll restoration holds one of
+    // those elements as its anchor, and recreating it would throw away the reader's position.
+    const list = el("discord-log");
+    const heldIds = new Set([...list.children].flatMap(idsOf));
+    list.replaceChildren(...glom(shown.filter((m) => !heldIds.has(String(m.id)))).map(discordNode), ...list.children);
+    const cards = el("thread-list");
+    const heldThreads = new Set([...cards.children].map((row) => row.getAttribute("data-context-id")));
+    cards.replaceChildren(...timelineThreads.filter((t) => !heldThreads.has(String(t.id))).map(threadCard), ...cards.children);
+  } else {
+    el("discord-log").replaceChildren(...glom(shown).map(discordNode));
+    el("thread-list").replaceChildren(...timelineThreads.map(threadCard));
+  }
+  renderChannelRows();
+  renderChannelNavigation();
+  renderOlderControl();
+  el("timeline-notice").textContent = payload.notice || "";
+  el("timeline-notice").hidden = !payload.notice;
+  el("inbox-note").textContent = payload.read_state_notice || "";
+  backlogSize = shown.length;
+  renderTodoControls();
+  el("clear-backlog").hidden = true;
+  const label = channelView === "threads"
+    ? `${timelineThreads.length} recent thread${timelineThreads.length === 1 ? "" : "s"}`
+    : channelSummary(shown.length, loadedIsWhole(), channelView === "thread"
+      ? (selectedThread && selectedThread.title) || "this thread" : channelName(payload.channel));
+  renderChannelSeam(label);
+  return channelView === "threads" ? timelineThreads : shown;
+}
+
+async function loadTimeline(options) {
+  const generation = ++discordLoadGeneration;
+  const context = channelContextKey();
+  if (!el("discord-channel").value) return;
+  if (discordFetchInFlight) {
+    queueDiscordLoad(options);
+    return;
+  }
+  discordFetchInFlight = true;
+  const area = el("scroll-area");
+  const position = channelReadPosition(area);
+  try {
+    const payload = await api(timelinePath());
+    if (generation !== discordLoadGeneration || context !== channelContextKey()) return;
+    if (!(options && options.keepPosition)) {
+      // An explicit refresh starts a fresh provider snapshot. Retaining old pages here would
+      // retain their expiring cursor forever, even though the newest request made a new one.
+      timelineMessages = [];
+      timelineThreads = [];
+      discordOlderCursor = null;
+      discordMoreAbove = false;
+    }
+    const messages = applyTimelinePage(payload);
+    settleAfterRead(messages, { keepPosition: Boolean(options && options.keepPosition), area, ...position });
+    renderScrollTools();
+    requestVisibleSummaries();
+  } catch (error) {
+    if (generation === discordLoadGeneration && context === channelContextKey()) throw error;
+  } finally {
+    await finishDiscordLoad();
+  }
+}
+
+async function loadOlderTimeline() {
+  if (!discordMoreAbove || !discordOlderCursor || olderFetchInFlight) return;
+  const context = channelContextKey();
+  const generation = discordLoadGeneration;
+  olderFetchInFlight = true;
+  renderOlderControl();
+  try {
+    const payload = await api(timelinePath(discordOlderCursor));
+    if (context !== channelContextKey() || generation !== discordLoadGeneration) return;
+    olderFetchInFlight = false;
+    preservingScroll(() => applyTimelinePage(payload, true));
+    renderScrollTools();
+    requestVisibleSummaries();
+  } catch (error) {
+    if (generation !== discordLoadGeneration || context !== channelContextKey()) return;
+    if (/cursor.*expired|snapshot.*expired/i.test(error.detail || error.message)) {
+      olderFetchInFlight = false;
+      discordOlderCursor = null;
+      discordMoreAbove = false;
+      await loadTimeline({ keepPosition: false });
+      if (context === channelContextKey()) {
+        setStatus("This history snapshot expired. Refreshed the newest messages; scroll up to load older history again.");
+      }
+      return;
+    }
+    throw error;
+  } finally {
+    olderFetchInFlight = false;
+    renderOlderControl();
+  }
+}
+
+async function sendChannelMessage() {
+  const key = activeComposerKey;
+  const channel = el("discord-channel").value;
+  const threadId = selectedThreadId;
+  const context = channelContextKey();
+  const text = el("channel-compose-text").value.trim();
+  if (knownChannel(channel)?.writable === false) {
+    el("channel-compose-state").textContent = "This channel is read-only.";
+    return;
+  }
+  if (!text || !channel || channelSends.has(key)) return;
+  rememberChannelDraft();
+  channelSends.add(key);
+  channelSendStates.set(key, "Sending…");
+  restoreChannelComposer();
+  try {
+    const body = { text };
+    if (threadId) body.thread_id = threadId;
+    const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/reply`, { method: "POST", body });
+    if (payload && payload.error === "partially_posted") {
+      channelDrafts.set(key, payload.unsent || "");
+      channelSendStates.set(key, `${Number(payload.posted) || 0} parts sent. ${redact(payload.detail || "The rest failed")}. The unsent text is kept here.`);
+    } else {
+      channelDrafts.delete(key);
+      channelSendStates.set(key, "Sent.");
+    }
+    saveChannelDrafts();
+    if (context === channelContextKey()) {
+      if (payload && payload.posted && typeof payload.posted === "object") {
+        noteSelfAuthor(payload.posted.author_id);
+        for (const part of payload.parts || [payload.posted]) appendChannelRow(part);
+      }
+      if (threadingSupported) {
+        try { await loadDiscord({ keepPosition: true }); }
+        catch (error) { setStatus(`The send result is saved, but history could not refresh: ${redact(error.message)}`); }
+      } else scrollToNewest();
+    }
+  } catch (error) {
+    channelSendStates.set(key, `Not sent: ${redact(error.message)}`);
+  } finally {
+    channelSends.delete(key);
+    if (activeComposerKey === key) restoreChannelComposer();
+  }
+}
+
 // --- raw Discord, rendered ------------------------------------------------------------------
 //
 // The value of this view is being able to point at a specific real message — the agent has
@@ -4257,7 +4661,7 @@ async function prepareSpeech() {
   }
   const ids = [];
   for (const li of el("discord-log").children) {
-    for (const id of (li.getAttribute("data-ids") || "").split(",")) {
+    for (const id of idsOf(li)) {
       if (id && !preparedSpeech.has(id)) {
         ids.push(id);
       }
@@ -4268,10 +4672,19 @@ async function prepareSpeech() {
   }
   let payload = null;
   try {
-    payload = await api(
+    const groups = new Map();
+    for (const id of ids) {
+      const threadId = threadForMessageId(id);
+      if (!groups.has(threadId)) groups.set(threadId, []);
+      groups.get(threadId).push(id);
+    }
+    const batches = await Promise.all([...groups].map(([threadId, messageIds]) => api(
       `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
-      { method: "POST", body: { ids, speed: readSpeed === null ? null : readSpeed / 100 } }
-    );
+      { method: "POST", body: { ids: messageIds, speed: readSpeed === null ? null : readSpeed / 100,
+        ...(threadId ? { thread_id: threadId } : {}) } }
+    )));
+    payload = { prepared: batches.flatMap((batch) => batch.prepared || []),
+      expires_in_seconds: Math.min(...batches.map((batch) => batch.expires_in_seconds || 0)) };
   } catch (_error) {
     // PREPARING IS AN OPTIMISATION AND FAILS LIKE ONE. The tap still works without it, by the
     // older and slower route, so taking the channel away over this would trade a slow feature for
@@ -4385,7 +4798,7 @@ async function fetchSpeech(channel, id) {
   // silently OVERRIDE an agent configured to speak faster, which is the bug this avoids.
   const pace = readSpeed === null ? "" : `?speed=${(readSpeed / 100).toFixed(2)}`;
   const response = await fetch(
-    `/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/speak${pace}`,
+    withThreadQuery(`/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/speak${pace}`, threadForMessageId(id)),
     { method: "POST", headers: { Authorization: `Bearer ${token()}` } }
   );
   if (!response.ok) {
@@ -4671,7 +5084,8 @@ function swipeable(li, messages) {
       // A swipe on an ALREADY archived row puts it back, so the gesture is its own undo on the row
       // the reader is looking at. Symmetric deliberately: a gesture that only ever went one way
       // would make the greyed rows a trap.
-      guardQuietly(() => toggleArchived(ids))();
+      if (channelView === "thread" && dx > 0) guardQuietly(closeThread)();
+      else guardQuietly(() => toggleArchived(ids))();
     }
   };
 
@@ -4802,6 +5216,10 @@ function storedCombineMessages() {
  */
 function joinsGroup(previous, message) {
   if (!combineMessages || !previous) {
+    return false;
+  }
+  if (threadOf(previous) !== threadOf(message) ||
+      (previous.thread && previous.thread.is_root) || (message.thread && message.thread.is_root)) {
     return false;
   }
   if (String(previous.author_id || "") !== String(message.author_id || "")) {
@@ -5005,6 +5423,7 @@ function discordNode(messages) {
   // hanging off it, and threading a reply under the tail would put the answer under a fragment.
   reply.addEventListener("click", () => openReply(messages));
   meta.append(reply);
+  addThreadDecoration(meta, message, li);
   // A provider write, distinct from the reversible local Done/archive below. Most providers do
   // not expose this operation, so the server advertises it explicitly and the control stays out
   // of the interface unless the selected provider supports it.
@@ -5226,10 +5645,12 @@ function applyNewestPage(payload) {
  * event, and a phone produces a lot of those.
  */
 async function loadOlder() {
+  if (threadingSupported) return loadOlderTimeline();
   if (discordMoreAbove !== true || !discordOlderCursor || olderFetchInFlight) {
     return;
   }
   const channel = el("discord-channel").value;
+  const generation = discordLoadGeneration;
   if (!channel) {
     return;
   }
@@ -5240,6 +5661,7 @@ async function loadOlder() {
       `/api/v1/channels/${encodeURIComponent(channel)}/page` +
         `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}`
     );
+    if (generation !== discordLoadGeneration || channel !== el("discord-channel").value) return;
     const list = el("discord-log");
     const arriving = glom(payload.messages || []).map(discordNode);
     // The step is OVER before the anchored mutation, so that every consequence of it — the rows,
@@ -5551,7 +5973,8 @@ function settleAfterRead(messages, how) {
     // message occupies that pixel. Prefer the same rendered message at the same viewport offset.
     // A deleted anchor has no semantic destination, so only that case falls back to the old offset.
     const anchor = how.anchorId
-      ? [...el("discord-log").children].find((row) => idsOf(row).includes(how.anchorId))
+      ? [...visibleList().children].find((row) =>
+        row.getAttribute("data-context-id") === how.anchorId || idsOf(row).includes(how.anchorId))
       : null;
     if (anchor && Number.isFinite(how.anchorTop)) {
       how.area.scrollTop = how.previousTop;
@@ -5575,7 +5998,7 @@ function channelReadPosition(area) {
   return {
     wasAtNewest: currentView === "discord" && atBottom(area),
     previousTop: area.scrollTop,
-    anchorId: anchorIds.length > 0 ? anchorIds[0] : null,
+    anchorId: anchor ? anchor.getAttribute("data-context-id") || anchorIds[0] || null : null,
     anchorTop: anchor ? anchor.getBoundingClientRect().top : 0,
   };
 }
@@ -5588,6 +6011,7 @@ function channelReadPosition(area) {
  *   arriving at the top of a long history means scrolling past everything already read.
  */
 async function loadDiscord(options) {
+  if (threadingSupported) return loadTimeline(options);
   // `#50 todo-view`. Every path that re-reads the channel comes through here — the background
   // poll, Refresh, entering the view, changing channel — so the mode is honoured HERE rather than
   // at four call sites, one of which would eventually be forgotten and overwrite the filtered
@@ -5714,7 +6138,7 @@ function renderTodoControls() {
   el("todo-filter").setAttribute("aria-pressed", todoMode ? "true" : "false");
   el("inbox-note").hidden = !todoMode;
   const clear = el("clear-backlog");
-  clear.hidden = !todoMode || backlogSize === 0;
+  clear.hidden = threadingSupported || !todoMode || backlogSize === 0;
   clear.textContent = backlogIsArmed()
     ? `Clear ${backlogSize}?`
     : `Clear the backlog (${backlogSize})`;
@@ -5751,6 +6175,7 @@ function armBacklog() {
  * a mixture of two answers.
  */
 async function loadTodo(options) {
+  if (threadingSupported) return loadTimeline(options);
   const generation = ++discordLoadGeneration;
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = el("discord-channel").value;
@@ -5868,6 +6293,13 @@ function todoSummary() {
  * Outside the mode this is an ordinary append, because nothing on screen is claiming a count.
  */
 function appendChannelRow(message) {
+  if (threadingSupported) {
+    const id = threadOf(message);
+    if (channelView === "threads" ||
+        (channelView === "thread" && id !== selectedThreadId) ||
+        (channelView === "main" && id && !message.thread.is_root)) return;
+    if (!timelineMessages.some((held) => String(held.id) === String(message.id))) timelineMessages.push(message);
+  }
   const list = el("discord-log");
   // A LIVE ARRIVAL CAN JOIN THE ROW ABOVE IT, and it has to be given the chance: the second half
   // of a split post usually arrives over the stream a fraction of a second after the first, so
@@ -5964,7 +6396,8 @@ async function markReadUpstream(messageId) {
     `/api/v1/channels/${encodeURIComponent(channel)}/upstream-read`,
     {
       method: "POST",
-      body: { message_id: String(messageId) },
+      body: { message_id: String(messageId),
+        ...(threadForMessageId(messageId) ? { thread_id: threadForMessageId(messageId) } : {}) },
     }
   );
   setStatus(
@@ -6119,6 +6552,8 @@ function persistDrafts() {
 }
 
 let replyTarget = null;
+let replyChannelId = null;
+let replyThreadId = null;
 // Where the reader was in the channel when they opened this. Captured with the SAME mechanism the
 // fold control uses (`#47 scrollback-stability`), not a second one.
 let replyScrollMark = null;
@@ -6157,6 +6592,8 @@ function rememberDraft() {
 function openReply(messages) {
   const message = messages[0];
   replyTarget = message;
+  replyChannelId = el("discord-channel").value;
+  replyThreadId = threadOf(message) || selectedThreadId;
   // BEFORE the screen changes: once #screen-main is hidden nothing in it has a rectangle, so the
   // anchor has to be taken while the reader can still see it.
   replyScrollMark = captureScroll();
@@ -6200,14 +6637,15 @@ async function sendReply() {
     el("reply-state").textContent = "Nothing to send yet — write something first.";
     return;
   }
-  const channel = el("discord-channel").value;
+  const channel = replyChannelId;
   const target = replyTarget;
+  const context = channelContextKey();
   el("reply-state").textContent = "Posting…";
   el("reply-send").disabled = true;
   try {
     const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/reply`, {
       method: "POST",
-      body: { text, reply_to: target.id },
+      body: { text, reply_to: target.id, ...(replyThreadId ? { thread_id: replyThreadId } : {}) },
     });
     // A LONG REPLY IS SPLIT, and it can get halfway. The server answers 207 for that, which
     // `fetch` reports as `ok` — so this has to be checked BEFORE anything is cleared. Treating it
@@ -6234,8 +6672,8 @@ async function sendReply() {
       // now on, so the next `/todo` read will count it, and a list that counted it one read later
       // would disagree with itself in between. `appendChannelRow` also re-derives the row states,
       // which is what dims the message just answered on the spot rather than at the next poll.
-      for (const part of payload.parts || [payload.posted]) {
-        appendChannelRow(part);
+      if (context === channelContextKey()) {
+        for (const part of payload.parts || [payload.posted]) appendChannelRow(part);
       }
     }
     // Cleared LAST, and only here: every path that did not fully succeed returns above with the
@@ -6845,6 +7283,13 @@ function receiveLiveMessage(message, selfPosted, replayed) {
   if (String(message.channel_id) !== String(el("discord-channel").value)) {
     return;
   }
+  if (threadingSupported) {
+    relayToAgent(message, selfPosted, replayed);
+    // The server owns thread membership, counts and activity ordering. Re-read the active
+    // context instead of dropping a reply from another thread into the visible conversation.
+    guardQuietly(() => loadDiscord({ keepPosition: true }))();
+    return;
+  }
   const list = el("discord-log");
   const id = String(message.id);
   // Against EVERY id on screen: a message already combined into a row is on screen, and a dedupe
@@ -6960,6 +7405,9 @@ function channelName(channel) {
 /** What the server last said the channels were, including the names the owner gave them. */
 let knownChannels = [];
 
+/** Whether the provider bridge resolves channel links or references into stable channel ids. */
+let channelRegistrationSupported = false;
+
 function knownChannel(id) {
   return knownChannels.find((channel) => String(channel.id) === String(id)) || null;
 }
@@ -6985,6 +7433,8 @@ function fillChannelSelect(id) {
     select.value = chosen;
   } else if (knownChannels.length > 0) {
     select.value = knownChannels[0].id;
+  } else {
+    select.value = "";
   }
 }
 
@@ -7010,15 +7460,22 @@ async function addChannel() {
   const label = el("new-channel-label").value.trim();
   const said = el("add-channel-state");
   if (!id || !label) {
-    said.textContent = "Both the id and a name are needed.";
+    said.textContent = channelRegistrationSupported
+      ? "Both the channel reference and a name are needed."
+      : "Both the id and a name are needed.";
     return;
   }
-  said.textContent = "Checking that the bot can read it…";
+  said.textContent = channelRegistrationSupported
+    ? "Registering and checking that it can be read…"
+    : "Checking that the bot can read it…";
   let payload = null;
+  const body = channelRegistrationSupported
+    ? { source: id, label }
+    : { id, label, writable: el("new-channel-writable").checked };
   try {
     payload = await api("/api/v1/channels", {
       method: "POST",
-      body: { id, label, writable: el("new-channel-writable").checked },
+      body,
     });
   } catch (error) {
     // THE SERVER'S OWN SENTENCE, not a rewrite of it. It is the one that knows whether this was a
@@ -7032,7 +7489,8 @@ async function addChannel() {
   knownChannels = payload.channels || knownChannels;
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
-  el("settings-channel").value = id;
+  const addedId = String((payload.channel && payload.channel.id) || id);
+  el("settings-channel").value = addedId;
   renderAliasEditor();
   el("new-channel-id").value = "";
   el("new-channel-label").value = "";
@@ -7056,11 +7514,13 @@ async function removeChannel() {
     said.textContent = error.message;
     return;
   }
+  const previousChannel = el("discord-channel").value;
   knownChannels = payload.channels || [];
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
   renderAliasEditor();
   said.textContent = "Removed. It is no longer in the picker.";
+  if (el("discord-channel").value !== previousChannel) await changeSelectedChannel();
 }
 
 /** What the editor says about the channel it is pointed at, including the label underneath. */
@@ -7191,6 +7651,7 @@ function setTokenState(text) {
 const NO_TOKEN_YET = "no token saved in this browser — paste your write-scope token above.";
 
 function applyClientConfig(config) {
+  threadingSupported = config.threading_supported === true;
   // The selected backend owns its display name. An older server leaves it unspecified, so the
   // page stays neutral instead of guessing a platform from channel IDs or deployment details.
   const providerName =
@@ -7216,12 +7677,29 @@ function applyClientConfig(config) {
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
   // rule, so the name in the bar and the name in Settings are one answer rather than two.
   knownChannels = config.channels || [];
+  channelRegistrationSupported = config.channel_registration_supported === true;
+  el("new-channel-help").textContent = channelRegistrationSupported
+    ? "Paste a channel link or provider reference. The configured bridge resolves it and checks that it can be read."
+    : `Enter the channel ID supplied by this deployment. The bridge must already have access to the channel in ${providerName || "your chat service"}.`;
+  el("new-channel-id-label").textContent = channelRegistrationSupported
+    ? "Channel link or provider reference"
+    : "Channel ID";
+  el("new-channel-id").inputMode = channelRegistrationSupported ? "url" : "numeric";
+  el("new-channel-id").maxLength = channelRegistrationSupported ? 2048 : 20;
+  el("new-channel-id").placeholder = channelRegistrationSupported
+    ? "paste a channel link or reference"
+    : "17 to 20 digits";
+  el("new-channel-writable-row").hidden = channelRegistrationSupported;
+  if (channelRegistrationSupported) {
+    el("new-channel-writable").checked = false;
+  }
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
   renderAliasEditor();
   if (knownChannels.length > 0) {
     select.value = knownChannels[0].id;
   }
+  restoreChannelComposer();
   // `#44 live-push`. The server says whether it is watching the channel at all, and how often.
   // Without it the page would have to infer "live" from a stream that is attached and silent —
   // which is exactly what a quiet channel looks like, so the indicator would be a guess.
@@ -7544,6 +8022,44 @@ for (const topic of HELP_TOPICS) {
 // `#51 reply-view`. Both ways out of the reply screen go through `closeReply`, so neither can be
 // the one that forgets to put the reader back where they were reading.
 loadDrafts();
+try {
+  const saved = JSON.parse(localStorage.getItem(CHANNEL_DRAFTS_KEY) || "{}");
+  for (const [key, value] of Object.entries(saved || {})) {
+    if (typeof value === "string") channelDrafts.set(key, value);
+  }
+} catch (_error) {
+  // Storage may be absent or contain a interrupted write; composing still works in this page.
+}
+for (const view of ["main", "threads", "flat"]) {
+  el(`channel-view-${view}`).addEventListener("click", guardQuietly(() => changeChannelView(view)));
+}
+el("thread-back").addEventListener("click", guardQuietly(closeThread));
+el("channel-compose-text").addEventListener("input", rememberChannelDraft);
+el("channel-send").addEventListener("click", guardQuietly(sendChannelMessage));
+el("channel-compose-text").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    guardQuietly(sendChannelMessage)();
+  }
+});
+let threadBackGesture = null;
+el("scroll-area").addEventListener("pointerdown", (event) => {
+  if (channelView !== "thread" || event.pointerType === "mouse") return;
+  if (["TEXTAREA", "INPUT", "BUTTON"].includes(String(event.target && event.target.tagName).toUpperCase())) return;
+  threadBackGesture = { x: event.clientX, y: event.clientY };
+});
+el("scroll-area").addEventListener("pointerup", (event) => {
+  const start = threadBackGesture;
+  threadBackGesture = null;
+  if (!start || channelView !== "thread") return;
+  const dx = event.clientX - start.x;
+  const dy = event.clientY - start.y;
+  if (dx >= SWIPE_COMMIT_PX && dx > Math.abs(dy)) {
+    suppressNextRowClick = true;
+    guardQuietly(closeThread)();
+  }
+});
+el("scroll-area").addEventListener("pointercancel", () => { threadBackGesture = null; });
 // Before the first channel read, so the very first list of rows is already filtered rather
 // than appearing unfiltered for a frame and then rearranging under the reader.
 loadIdentities();
@@ -7590,25 +8106,34 @@ el("view-switch").addEventListener("click", () => {
 // Changing channel is not a re-read; it is a different history, and its bottom is where to start.
 // The walk back resets with it: a cursor from one channel means nothing in another, and carrying
 // one across would ask the server to step back from a message that is not there.
-el("discord-channel").addEventListener(
-  "change",
-  guardQuietly(() => {
-    discordMoreAbove = false;
-    discordOlderCursor = null;
-    discordNewestId = null;
-    el("discord-log").replaceChildren();
-    // The summary goes with the rows it is about. It is written only inside `loadDiscord`, which
-    // THROWS when the read fails — so leaving it standing means a failed change of channel shows
-    // the previous channel's name and a count of messages that are no longer on the screen, which
-    // is the most confident possible way of being wrong.
-    el("channel-summary").replaceChildren();
-    renderOlderControl();
-    // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
-    // the same reason the walk-back cursor is dropped two lines above.
-    startChannelStream(el("discord-channel").value);
-    return loadDiscord();
-  })
-);
+function changeSelectedChannel() {
+  rememberChannelDraft();
+  channelView = "main";
+  selectedThreadId = null;
+  selectedThread = null;
+  channelHasThreads = false;
+  timelineMessages = [];
+  timelineThreads = [];
+  channelContexts.clear();
+  threadColors.clear();
+  el("thread-list").replaceChildren();
+  restoreChannelComposer();
+  discordMoreAbove = false;
+  discordOlderCursor = null;
+  discordNewestId = null;
+  el("discord-log").replaceChildren();
+  // The summary goes with the rows it is about. It is written only inside `loadDiscord`, which
+  // THROWS when the read fails — so leaving it standing means a failed change of channel shows
+  // the previous channel's name and a count of messages that are no longer on the screen, which
+  // is the most confident possible way of being wrong.
+  el("channel-summary").replaceChildren();
+  renderOlderControl();
+  // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
+  // the same reason the walk-back cursor is dropped two lines above.
+  startChannelStream(el("discord-channel").value);
+  return loadDiscord();
+}
+el("discord-channel").addEventListener("change", guardQuietly(changeSelectedChannel));
 // `#39 channel-alias`. Pointing the editor at another channel shows THAT channel's name; it does
 // not change which channel the Discord view is reading, which is the picker on the bar.
 // Changing channel closes whatever was open: the panels belong to the channel that was chosen

@@ -461,6 +461,7 @@ async fn main() -> anyhow::Result<()> {
         speech,
         store,
         added_channels: Arc::new(std::sync::RwLock::new(Vec::new())),
+        channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),
         live: Arc::clone(&live),
         summarizer,

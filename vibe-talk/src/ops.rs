@@ -285,6 +285,46 @@ pub async fn message_by_id(
     Ok((window.channel, message))
 }
 
+/// Look up a message within an explicitly selected thread, or the ordinary channel window.
+///
+/// The parent channel allowlist is checked before the backend verifies thread membership.
+pub async fn message_by_id_scoped(
+    state: &AppState,
+    channel_id: &str,
+    message_id: &str,
+    limit: Option<u16>,
+    thread_id: Option<&str>,
+) -> Result<(ChannelInfo, Message), OpError> {
+    let Some(thread_id) = thread_id else {
+        return message_by_id(state, channel_id, message_id, limit).await;
+    };
+    let channel = allowed(state, channel_id).await?;
+    validate_thread_id(thread_id)?;
+    let mut message = state
+        .chat
+        .fetch_thread_message(&channel.id, thread_id, &MessageId(message_id.to_owned()))
+        .await?;
+    stamp(state, std::slice::from_mut(&mut message));
+    Ok((channel, message))
+}
+
+/// Browse a channel or its threads through the provider's own pagination contract.
+pub async fn timeline(
+    state: &AppState,
+    channel_id: &str,
+    request: &crate::threads::TimelineRequest,
+) -> Result<(ChannelInfo, crate::threads::TimelinePage), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let mut page = state.chat.fetch_timeline(&channel.id, request).await?;
+    stamp(state, &mut page.messages);
+    for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
+        if let Some(root) = &mut summary.root {
+            stamp(state, std::slice::from_mut(root));
+        }
+    }
+    Ok((channel, page))
+}
+
 /// One speakable line per recent message. Read scope.
 ///
 /// The trailing flag is [`Window::is_whole_channel`]: true when the entries are the entire
@@ -647,9 +687,23 @@ pub async fn reply(
     text: &str,
     reply_to: Option<&str>,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
+    reply_scoped(state, channel_id, text, reply_to, None).await
+}
+
+/// Post to the channel or to one of its threads, preserving write policy and partial progress.
+pub async fn reply_scoped(
+    state: &AppState,
+    channel_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    thread_id: Option<&str>,
+) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
     let info = allowed(state, channel_id).await?;
     if !info.writable {
         return Err(OpError::ChannelNotWritable);
+    }
+    if let Some(thread) = thread_id {
+        validate_thread_id(thread)?;
     }
     let reply_to = reply_to.map(|id| MessageId(id.to_owned()));
 
@@ -669,7 +723,16 @@ pub async fn reply(
         // pointing every part at the same parent would render as several separate answers to the
         // same thing rather than as one answer that ran long.
         let parent = if index == 0 { reply_to.as_ref() } else { None };
-        match state.chat.post_message(&info.id, part, parent).await {
+        let sent = match thread_id {
+            Some(thread) => {
+                state
+                    .chat
+                    .post_in_thread(&info.id, thread, part, parent)
+                    .await
+            }
+            None => state.chat.post_message(&info.id, part, parent).await,
+        };
+        match sent {
             Ok(mut one) => {
                 stamp(state, std::slice::from_mut(&mut one));
                 // Remember that WE posted this, before anything can observe it. `#44 live-push`:
@@ -695,6 +758,19 @@ pub async fn reply(
     }
     let first = posted.first().cloned().expect("at least one part posted");
     Ok((info, first, posted))
+}
+
+fn validate_thread_id(thread_id: &str) -> Result<(), OpError> {
+    if thread_id.trim().is_empty()
+        || thread_id.len() > 1024
+        || thread_id.chars().any(char::is_control)
+    {
+        return Err(ChatError::Refused(
+            "thread_id must be a non-empty thread identifier".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Attach to a channel's live feed. Read scope.
@@ -1095,7 +1171,39 @@ pub async fn summarize_message(
     also: &[String],
     limit: Option<u16>,
 ) -> Result<Summarised, OpError> {
-    let window = messages(state, channel_id, limit).await?;
+    summarize_message_scoped(state, caller, channel_id, message_id, also, limit, None).await
+}
+
+/// Summarize messages from a selected thread without mixing in other threads' context.
+pub async fn summarize_message_scoped(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel_id: &str,
+    message_id: &str,
+    also: &[String],
+    limit: Option<u16>,
+    thread_id: Option<&str>,
+) -> Result<Summarised, OpError> {
+    let window = if let Some(thread_id) = thread_id {
+        if also.len() >= usize::from(MAX_PAGE) {
+            return Err(ChatError::Refused("too many messages in one summary".to_owned()).into());
+        }
+        let (channel, target) =
+            message_by_id_scoped(state, channel_id, message_id, limit, Some(thread_id)).await?;
+        let mut messages = vec![target];
+        for id in also {
+            let (_, message) =
+                message_by_id_scoped(state, channel_id, id, limit, Some(thread_id)).await?;
+            messages.push(message);
+        }
+        Window {
+            channel,
+            messages,
+            limit: state.effective_limit(limit),
+        }
+    } else {
+        messages(state, channel_id, limit).await?
+    };
     let position = window
         .messages
         .iter()

@@ -9,7 +9,7 @@ use crate::elevenlabs::{SignedUrlProvider, SpeechProvider};
 use crate::live::LiveHub;
 use crate::model::{ChannelId, ChannelInfo};
 use crate::retrieval::Ranker;
-use crate::store::StateStore;
+use crate::store::{AddedChannel, StateStore};
 use crate::summarize::Summarizer;
 
 /// Everything a request handler needs.
@@ -71,7 +71,27 @@ pub struct AppState {
     /// channel-scoped request, including from [`AppState::channel`], which is synchronous by
     /// design. Loaded once at startup and kept in step by the add and remove routes; the store is
     /// what makes it survive a restart, not what is read on the hot path.
-    pub added_channels: Arc<std::sync::RwLock<Vec<ChannelInfo>>>,
+    pub added_channels: Arc<std::sync::RwLock<Vec<AddedChannel>>>,
+    /// Serializes managed register/probe/persist and unregister/remove transactions.
+    ///
+    /// The provider and local store cannot share a transaction. Holding this lock across both
+    /// sides ensures concurrent requests cannot observe the same channel as absent and then undo
+    /// one another's upstream registration during compensation.
+    pub channel_registration_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+fn added_channel_info(row: &AddedChannel, active_provider: Option<&str>) -> ChannelInfo {
+    let provider_matches = row
+        .registration_provider
+        .as_deref()
+        .is_none_or(|provider| Some(provider) == active_provider);
+    ChannelInfo {
+        id: row.channel.clone(),
+        label: row.label.clone(),
+        writable: row.writable && provider_matches,
+        alias: None,
+        added: true,
+    }
 }
 
 impl AppState {
@@ -81,20 +101,7 @@ impl AppState {
     /// restored set visible to request handlers, diagnostics, and the live poller instead of
     /// requiring each consumer to rebuild its own copy.
     pub async fn restore_added_channels(&self) -> Result<usize, crate::store::StoreError> {
-        let restored: Vec<_> = self
-            .store
-            .added_channels()
-            .await?
-            .into_iter()
-            .map(|row| ChannelInfo {
-                id: row.channel,
-                label: row.label,
-                writable: row.writable,
-                alias: None,
-                // Added in the app, which is what makes it removable there.
-                added: true,
-            })
-            .collect();
+        let restored = self.store.added_channels().await?;
         let count = restored.len();
         let mut slot = self.added_channels.write().map_err(|_| {
             crate::store::StoreError::Backend(
@@ -103,6 +110,14 @@ impl AppState {
         })?;
         *slot = restored;
         Ok(count)
+    }
+
+    /// Canonical namespace for provider-managed registrations in the active configuration.
+    #[must_use]
+    pub fn registration_provider(&self) -> Option<&str> {
+        self.chat
+            .supports_channel_registration()
+            .then(|| self.config.discord.api_base.trim_end_matches('/'))
     }
 
     /// Look up a configured channel.
@@ -118,12 +133,13 @@ impl AppState {
         if let Some(found) = self.config.channels.iter().find(|c| c.id.as_str() == id) {
             return Some(found.clone());
         }
+        let active_provider = self.registration_provider();
         self.added_channels
             .read()
             .ok()?
             .iter()
-            .find(|c| c.id.as_str() == id)
-            .cloned()
+            .find(|c| c.channel.as_str() == id)
+            .map(|row| added_channel_info(row, active_provider))
     }
 
     /// Every channel this server will answer for: configured first, then added, in that order.
@@ -131,9 +147,13 @@ impl AppState {
     pub fn all_channels(&self) -> Vec<ChannelInfo> {
         let mut all = self.config.channels.clone();
         if let Ok(added) = self.added_channels.read() {
-            for channel in added.iter() {
+            let active_provider = self.registration_provider();
+            for channel in added
+                .iter()
+                .map(|row| added_channel_info(row, active_provider))
+            {
                 if !all.iter().any(|c| c.id == channel.id) {
-                    all.push(channel.clone());
+                    all.push(channel);
                 }
             }
         }

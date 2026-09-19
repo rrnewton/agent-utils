@@ -84,7 +84,14 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
-    async fn add_channel(&self, _: &ChannelId, _: &str, _: bool, _: i64) -> Result<(), StoreError> {
+    async fn add_channel(
+        &self,
+        _: &ChannelId,
+        _: &str,
+        _: bool,
+        _: Option<&str>,
+        _: i64,
+    ) -> Result<(), StoreError> {
         refuse()
     }
 

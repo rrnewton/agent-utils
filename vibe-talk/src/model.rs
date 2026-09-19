@@ -113,6 +113,9 @@ impl std::fmt::Display for UserId {
 /// One chat message as the rest of the server sees it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
+    /// Thread membership supplied by the backend; independent of a reply-to message reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<crate::threads::MessageThread>,
     /// Snowflake of this message.
     pub id: MessageId,
     /// Channel the message was read from, in the provider-neutral application namespace.
@@ -262,6 +265,7 @@ mod tests {
 
     fn msg(id: &str) -> Message {
         Message {
+            thread: None,
             id: MessageId(id.to_owned()),
             channel_id: ChannelId("c".to_owned()),
             author: "a".to_owned(),

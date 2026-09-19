@@ -996,12 +996,12 @@ mod tests {
             .added_channels
             .write()
             .expect("added-channel allowlist")
-            .push(crate::model::ChannelInfo {
-                id: channel.clone(),
+            .push(crate::store::AddedChannel {
+                channel: channel.clone(),
                 label: "temporary".to_owned(),
                 writable: false,
-                alias: None,
-                added: true,
+                registration_provider: None,
+                added_at_ms: 1,
             });
         let mut cursors = BTreeMap::new();
         poll_state_loop(&state, 50, Duration::ZERO, &mut cursors, Some(1)).await;
@@ -1026,12 +1026,12 @@ mod tests {
             .added_channels
             .write()
             .expect("added-channel allowlist")
-            .push(crate::model::ChannelInfo {
-                id: channel.clone(),
+            .push(crate::store::AddedChannel {
+                channel: channel.clone(),
                 label: "temporary again".to_owned(),
                 writable: false,
-                alias: None,
-                added: true,
+                registration_provider: None,
+                added_at_ms: 2,
             });
         poll_state_loop(&state, 50, Duration::ZERO, &mut cursors, Some(1)).await;
         assert!(
@@ -1416,6 +1416,7 @@ mod tests {
 
     fn message(channel: &ChannelId, id: u64, content: &str) -> Message {
         Message {
+            thread: None,
             id: MessageId(id.to_string()),
             channel_id: channel.clone(),
             author: "codex".to_owned(),

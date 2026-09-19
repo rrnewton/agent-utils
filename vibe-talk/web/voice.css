@@ -182,7 +182,7 @@ body {
 }
 
 #scroll-area {
-  grid-row: 2;
+  grid-row: 3;
 }
 
 /* `hidden` has to beat the layout modes below, all of which set `display`. */
@@ -435,12 +435,112 @@ body {
 
 #screen-main {
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto minmax(0, 1fr);
   min-height: 0;
   /* The anchor for #scroll-tools, which floats over the bottom corner of the list. It has to be
      THIS element rather than #scroll-area: a child of the scroll area would be faded by the mask
      below and would scroll away with the content. */
   position: relative;
+}
+
+#channel-navigation {
+  grid-row: 2;
+  padding: 0.4rem max(0.75rem, env(safe-area-inset-right)) 0.4rem
+    max(0.75rem, env(safe-area-inset-left));
+  border-bottom: 1px solid var(--edge);
+}
+
+#channel-view-tabs {
+  display: flex;
+  gap: 0.25rem;
+  max-width: 28rem;
+  margin-inline: auto;
+}
+
+#channel-view-tabs button {
+  flex: 1;
+  min-height: 2.5rem;
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--edge);
+}
+
+#channel-view-tabs button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+#thread-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  max-width: var(--reading-width);
+  margin-inline: auto;
+}
+
+#thread-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-badge,
+.thread-replies {
+  border: 1px solid hsl(var(--thread-hue, 210) 55% 50%);
+  border-radius: 1rem;
+  background: hsl(var(--thread-hue, 210) 55% 50% / 0.12);
+  color: inherit;
+  padding: 0.2rem 0.65rem;
+  min-height: 2rem;
+  font-size: 0.85rem;
+}
+
+.thread-replies {
+  display: block;
+  width: fit-content;
+  margin-top: 0.6rem;
+}
+
+#thread-list .thread-card {
+  border-inline-start: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+}
+
+.thread-open {
+  display: block;
+  width: 100%;
+  text-align: start;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  padding: 0.65rem;
+}
+
+.thread-preview {
+  display: block;
+  margin-top: 0.4rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#channel-composer {
+  display: grid;
+  gap: 0.5rem;
+  padding: 1rem 0.75rem max(1rem, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--edge);
+}
+
+#channel-compose-text {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 5rem;
+  resize: vertical;
+  font: inherit;
+  font-size: max(1rem, 16px);
+}
+
+#channel-send {
+  justify-self: end;
+  min-width: 5rem;
 }
 
 /* ------------------------------------------------------------------------ the reply screen -- */

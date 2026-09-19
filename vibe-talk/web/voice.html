@@ -137,6 +137,18 @@
             <button id="dismiss-banner" class="chip" type="button">Dismiss</button>
           </div>
 
+          <div id="channel-navigation" hidden>
+            <div id="channel-view-tabs" role="group" aria-label="Channel view" hidden>
+              <button id="channel-view-main" type="button" aria-pressed="true">Main</button>
+              <button id="channel-view-threads" type="button" aria-pressed="false">Threads</button>
+              <button id="channel-view-flat" type="button" aria-pressed="false">All</button>
+            </div>
+            <div id="thread-heading" hidden>
+              <button id="thread-back" class="secondary" type="button">← Back</button>
+              <span id="thread-title">Thread</span>
+            </div>
+          </div>
+
           <!-- THE one scrolling element on the page. -->
           <div id="scroll-area">
             <div id="pane-voice">
@@ -230,7 +242,15 @@
                 step is in flight.
               -->
               <button id="load-older" class="chip" type="button" hidden>Older messages</button>
+              <p id="timeline-notice" class="hint" hidden></p>
+              <ol id="thread-list" class="messages" hidden></ol>
               <ol id="discord-log" class="messages"></ol>
+              <div id="channel-composer">
+                <label id="channel-compose-label" for="channel-compose-text">Message the channel</label>
+                <textarea id="channel-compose-text" rows="3" placeholder="Write a message…" aria-describedby="channel-compose-state"></textarea>
+                <button id="channel-send" type="button">Send</button>
+                <p id="channel-compose-state" class="hint" role="status" aria-live="polite"></p>
+              </div>
             </div>
           </div>
 
@@ -501,11 +521,11 @@
               </div>
 
               <div id="add-channel-fields" hidden>
-                <p class="hint">
+                <p id="new-channel-help" class="hint">
                   Enter the channel ID supplied by this deployment. The bridge must already
                   have access to the channel in your chat service.
                 </p>
-                <label for="new-channel-id">Channel ID</label>
+                <label id="new-channel-id-label" for="new-channel-id">Channel ID</label>
                 <input
                   id="new-channel-id"
                   type="text"
@@ -528,7 +548,7 @@
                   SAY rather than what it can read. Left as a deliberate act rather than a
                   convenience.
                 -->
-                <label class="row" for="new-channel-writable">
+                <label id="new-channel-writable-row" class="row" for="new-channel-writable">
                   <input id="new-channel-writable" type="checkbox" />
                   <span>Let the bridge post here</span>
                 </label>

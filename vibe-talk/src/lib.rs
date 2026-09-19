@@ -57,4 +57,5 @@ pub mod store;
 pub mod summarize;
 pub mod summary;
 pub mod testing;
+pub mod threads;
 pub mod untrusted;

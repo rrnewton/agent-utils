@@ -236,6 +236,7 @@ fn state_pieces_with(
         // timer. Sleeping for a poll interval would make the suite slow and flaky for no extra
         // coverage — the timer is `live::poll_forever`, and what it does per tick is `poll_once`.
         added_channels: Arc::new(std::sync::RwLock::new(Vec::new())),
+        channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         speech_tickets: Arc::new(crate::speech_tickets::SpeechTickets::new()),
         live: Arc::new(crate::live::LiveHub::new()),
         summarizer: Arc::clone(&summarizer),

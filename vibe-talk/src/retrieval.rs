@@ -189,6 +189,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (author, content))| Message {
+                thread: None,
                 id: MessageId(format!("{}", 1_000_000_000_000_000_000_u64 + i as u64)),
                 channel_id: ChannelId("c".to_owned()),
                 author: (*author).to_owned(),
