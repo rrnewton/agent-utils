@@ -14068,6 +14068,105 @@ def test_later_participant_finishes_interrupted_validate_removal(
     ).returncode == 1
 
 
+@pytest.mark.parametrize("slot_type", ("agent", "validate"))
+@pytest.mark.parametrize(
+    "handoff_state",
+    (
+        "absent",
+        "tracked",
+        "modified",
+        "untracked",
+        "gitignored",
+        "configured-cache",
+    ),
+)
+def test_remove_guards_uncommitted_handoffs_for_every_slot_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slot_type: str,
+    handoff_state: str,
+) -> None:
+    project, repository, remote = make_project(
+        tmp_path,
+        cache_globs=("generated",) if handoff_state == "configured-cache" else (),
+    )
+    directory = "generated" if handoff_state in {"gitignored", "configured-cache"} else "notes"
+    handoff_relative = Path(directory) / "HANDOFF-codex-20260918.md"
+    if handoff_state == "gitignored":
+        (repository / ".gitignore").write_text("generated/\n", encoding="utf-8")
+        git(repository, "add", ".gitignore")
+        git(repository, "commit", "-m", "ignore generated output")
+        git(repository, "push", "origin", "main")
+    if handoff_state in {"tracked", "modified"}:
+        source_handoff = repository / handoff_relative
+        source_handoff.parent.mkdir()
+        source_handoff.write_text("published handoff\n", encoding="utf-8")
+        git(repository, "add", str(handoff_relative))
+        git(repository, "commit", "-m", "publish handoff")
+        git(repository, "push", "origin", "main")
+    made = create(
+        project,
+        slot_type=slot_type,
+        branch=None if slot_type == "validate" else "codex/task",
+    )
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot_type=slot_type)
+    if slot_type == "agent":
+        commit_task(repository, tree, "codex/task")
+        handed_off = finish(project)
+        assert handed_off.returncode == 0, handed_off.stderr
+        mark_owner_dead(project)
+        set_liveness(project, "dead")
+    handoff = tree / handoff_relative
+    if handoff_state in {"untracked", "gitignored", "configured-cache"}:
+        handoff.parent.mkdir()
+        handoff.write_text("continue from this exact state\n", encoding="utf-8")
+    elif handoff_state == "modified":
+        handoff.write_text("continue from changed state\n", encoding="utf-8")
+    monkeypatch.setattr(
+        wrkslots,
+        "_assert_slot_unused",
+        lambda *_args, **_kwargs: None,
+    )
+    args = [
+        "--project-root",
+        str(project),
+        "remove",
+        "slot01",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    ]
+    if slot_type == "validate":
+        args.append("--validate-complete")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = wrkslots.main(args)
+    removed = subprocess.CompletedProcess(
+        args,
+        returncode,
+        stdout.getvalue(),
+        stderr.getvalue(),
+    )
+
+    if handoff_state in {"absent", "tracked", "gitignored", "configured-cache"}:
+        assert removed.returncode == 0, removed.stderr
+        assert not tree.exists()
+    else:
+        assert removed.returncode == 3
+        assert handoff.name in removed.stderr
+        assert "slot and every checkout were retained" in removed.stderr
+        assert handoff.is_file()
+        assert tree.is_dir()
+        assert (
+            git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/salvage").stdout
+            == ""
+        )
+
+
 def test_unread_handoff_blocks_reclaim_until_its_exact_contents_are_read(
     tmp_path: Path,
 ) -> None:

@@ -7448,6 +7448,39 @@ class _GitVcs:
         )
         return result.stdout
 
+    def uncommitted_handoff_paths(
+        self, checkout: Path, cache_globs: Sequence[str] = ()
+    ) -> tuple[str, ...]:
+        """Return non-ignored, uncommitted paths whose basename starts HANDOFF."""
+
+        pathspecs = [":(glob)HANDOFF*", ":(glob)**/HANDOFF*"]
+        for pattern in cache_globs:
+            pathspecs.append(f":(exclude,glob){pattern}")
+            pathspecs.append(f":(exclude,glob){pattern}/**")
+        changed = self._run(
+            checkout,
+            ["diff", "--name-only", "-z", "HEAD", "--", *pathspecs],
+        ).stdout
+        untracked = self._run(
+            checkout,
+            [
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                *pathspecs,
+            ],
+        ).stdout
+        return tuple(
+            sorted(
+                path
+                for output in (changed, untracked)
+                for path in output.split("\x00")
+                if path
+            )
+        )
+
     def tracked_cache_paths(
         self, checkout: Path, cache_globs: Sequence[str]
     ) -> tuple[str, ...]:
@@ -9679,6 +9712,56 @@ def _assert_slot_contents_values(
     return slot_path
 
 
+def _uncommitted_handoff_paths(
+    config: Config,
+    record: ActiveRecord,
+    slot_path: Path,
+    vcs: _GitVcs,
+) -> tuple[str, ...]:
+    legacy = (slot_path / "HANDOFF.md").absolute()
+    unprotected: set[str] = set()
+    for checkout in record.checkouts:
+        _moved, checkout_path = _checkout_at_slot(
+            config, record, checkout, slot_path
+        )
+        repositories = [(checkout.name, checkout_path)]
+        repositories.extend(
+            (f"{checkout.name}/{submodule}", checkout_path / submodule)
+            for submodule in vcs.initialized_submodules(checkout_path)
+        )
+        for checkout_name, repository in repositories:
+            for relative in vcs.uncommitted_handoff_paths(
+                repository, _cache_globs_for(config, checkout_name)
+            ):
+                candidate = (repository / relative).absolute()
+                if record.slot_type == "agent" and candidate == legacy:
+                    continue
+                if not _path_is_within(candidate, slot_path):
+                    raise StateError(
+                        f"Git reported handoff path outside slot {record.slot}: {candidate}"
+                    )
+                if candidate.exists() or candidate.is_symlink():
+                    unprotected.add(candidate.relative_to(slot_path).as_posix())
+    return tuple(sorted(unprotected))
+
+
+def _assert_no_uncommitted_handoffs(
+    config: Config,
+    record: ActiveRecord,
+    slot_path: Path,
+    vcs: _GitVcs,
+) -> None:
+    unprotected = _uncommitted_handoff_paths(config, record, slot_path, vcs)
+    if unprotected:
+        shown = ", ".join(unprotected)
+        raise Refusal(
+            f"slot {record.slot} contains uncommitted handoff path(s): {shown}. "
+            "state: REFUSED -- the slot and every checkout were retained. remedy: "
+            "preserve each handoff, then commit and publish it or move its contents "
+            "into the generation-bound handoff before retrying removal"
+        )
+
+
 def _assert_handoff_read(
     config: Config,
     record: ActiveRecord,
@@ -9750,6 +9833,7 @@ def _reclaim_preconditions(
 ) -> tuple[Path, tuple[Checkout, ...]]:
     _assert_record_paths(config, record)
     slot_path = _assert_slot_contents(config, record)
+    _assert_no_uncommitted_handoffs(config, record, slot_path, vcs)
     _assert_handoff_read(config, record, slot_path)
     use_check_record = _record_for_slot_use_check(
         record,
@@ -15397,6 +15481,7 @@ def _finish_remove_paths(
                     )
                 moved_checkouts.append(moved)
                 moved_paths[checkout.name] = moved_path
+            _assert_no_uncommitted_handoffs(config, record, fenced_slot, vcs)
             _assert_handoff_read(config, record, fenced_slot)
             if record.slot_type == "agent" and salvage:
                 _assert_salvage_still_matches(
@@ -15924,6 +16009,7 @@ def _cmd_remove(
                 "slot as free"
             )
         slot_path = _assert_slot_contents(config, record)
+        _assert_no_uncommitted_handoffs(config, record, slot_path, _GitVcs())
         _assert_handoff_read(config, record, slot_path)
         if private_cleanup is not None:
             if private_cleanup.target.path != slot_path:
