@@ -3773,7 +3773,12 @@ def _resolve_handoff_artifact(
     config: Config,
     record: ActiveRecord,
     slot_path: Path,
+    *,
+    events: Sequence[Mapping[str, object]] | None = None,
 ) -> _HandoffArtifact | None:
+    selected_events = (
+        _load_events(config, record.machine) if events is None else events
+    )
     sidecar = _load_handoff_sidecar(config, record)
     if sidecar is not None and not sidecar.provenance_complete:
         raise Refusal(
@@ -3781,9 +3786,7 @@ def _resolve_handoff_artifact(
             "provenance and is permanently manual-only; preserve it for inspection "
             "rather than replacing or using it as removal authority"
         )
-    publication = _handoff_write_publication(
-        record, _load_events(config, record.machine)
-    )
+    publication = _handoff_write_publication(record, selected_events)
     if sidecar is None and publication is not None:
         state = "completed" if publication[2] else "outstanding"
         remedy = (
@@ -3802,7 +3805,9 @@ def _resolve_handoff_artifact(
                 f"slot {record.slot} has a {state} owner-authenticated write intent; "
                 "a legacy projection cannot supersede it"
             )
-        _assert_handoff_sidecar_publication(config, record, sidecar)
+        _assert_handoff_sidecar_publication(
+            config, record, sidecar, events=selected_events
+        )
     legacy = _legacy_handoff_artifact(config, record, slot_path)
     if sidecar is not None and legacy is not None:
         if sidecar.contents != legacy.contents or sidecar.sha256 != legacy.sha256:
@@ -5450,13 +5455,16 @@ def _assert_handoff_sidecar_publication(
     artifact: _HandoffArtifact,
     *,
     allow_outstanding_write: bool = False,
+    events: Sequence[Mapping[str, object]] | None = None,
 ) -> tuple[str, int | None, Mapping[str, object] | None]:
     if not artifact.provenance_complete:
         raise Refusal("handoff sidecar lacks complete source provenance")
-    events = _load_events(config, record.machine)
+    selected_events = (
+        _load_events(config, record.machine) if events is None else events
+    )
     artifact_obj = _handoff_artifact_to_obj(artifact)
     if artifact.source == "write-handoff":
-        publication = _handoff_write_publication(record, events)
+        publication = _handoff_write_publication(record, selected_events)
         if publication is None or not _json_equal(publication[1], artifact_obj):
             raise Refusal(
                 f"slot {record.slot} handoff sidecar has no matching owner-authenticated "
@@ -5468,14 +5476,14 @@ def _assert_handoff_sidecar_publication(
                 "sidecar and have its exact owner retry write-handoff"
             )
         return "write-handoff", publication[0], None
-    publication = _handoff_write_publication(record, events)
+    publication = _handoff_write_publication(record, selected_events)
     if publication is not None:
         state = "completed" if publication[2] else "outstanding"
         raise Refusal(
             f"slot {record.slot} has a {state} owner-authenticated write intent; "
             "legacy sidecar recovery cannot supersede it"
         )
-    legacy = _legacy_projection_read(record, events, artifact)
+    legacy = _legacy_projection_read(record, selected_events, artifact)
     if legacy is None:
         raise Refusal(
             f"slot {record.slot} projected legacy sidecar has no matching "
@@ -5580,6 +5588,7 @@ def _retirement_candidates(
                 config,
                 record,
                 _slot_directory(config, record.slot, record.slot_type),
+                events=events,
             )
             if artifact is None:
                 blocked_reason = "the exact handoff artifact is missing"
@@ -10464,7 +10473,9 @@ def _assert_handoff_read(
         _load_events(config, record.machine) if events is None else events
     )
     latest = _latest_handoff_read(record, selected_events)
-    artifact = _resolve_handoff_artifact(config, record, slot_path)
+    artifact = _resolve_handoff_artifact(
+        config, record, slot_path, events=selected_events
+    )
     if artifact is None:
         if latest is not None:
             raise Refusal(
