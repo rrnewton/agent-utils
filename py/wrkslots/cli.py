@@ -5303,6 +5303,56 @@ def _handoff_read_matches_artifact(
     )
 
 
+def _owner_before_handoff_write_intent(
+    record: ActiveRecord,
+    events: Sequence[Mapping[str, object]],
+    intent_sequence: int,
+) -> ProcessIdentity | None:
+    """Return this generation's owner immediately before one intent event."""
+
+    owner: ProcessIdentity | None = None
+    for event in events:
+        sequence = _as_int(event["sequence"], "append-only event sequence", minimum=1)
+        if sequence >= intent_sequence:
+            break
+        kind = event.get("kind")
+        payload = _as_mapping(event["payload"], f"{kind} event payload")
+        if kind == "state-imported":
+            imported = _as_mapping(
+                payload.get("active"), "append-only imported active state"
+            )
+            owner = None
+            for index, value in enumerate(
+                _as_list(imported.get("slots"), "append-only imported active state.slots")
+            ):
+                candidate = _record_from_obj(
+                    value, f"append-only imported active state.slots[{index}]"
+                )
+                if (
+                    candidate.machine == record.machine
+                    and candidate.slot == record.slot
+                    and candidate.generation == record.generation
+                ):
+                    owner = candidate.owner
+                    break
+        elif kind == "active-state-recorded" and payload.get("slot") == record.slot:
+            raw_record = payload.get("record")
+            if raw_record is None:
+                owner = None
+                continue
+            candidate = _record_from_obj(
+                raw_record, "append-only active-record event.record"
+            )
+            owner = (
+                candidate.owner
+                if candidate.machine == record.machine
+                and candidate.slot == record.slot
+                and candidate.generation == record.generation
+                else None
+            )
+    return owner
+
+
 def _handoff_write_publication(
     record: ActiveRecord,
     events: Sequence[Mapping[str, object]],
@@ -5329,11 +5379,17 @@ def _handoff_write_publication(
             )
             if writer is None:
                 raise StateError("handoff write intent lacks an owner identity")
-            if record.owner is None or writer != record.owner:
+            intent_sequence = _as_int(
+                event["sequence"], "handoff write intent sequence", minimum=1
+            )
+            owner_at_intent = _owner_before_handoff_write_intent(
+                record, events, intent_sequence
+            )
+            if owner_at_intent is None or writer != owner_at_intent:
                 raise StateError(
                     "handoff write intent writer does not match the recorded slot owner"
                 )
-            intents[_as_int(event["sequence"], "handoff write intent sequence", minimum=1)] = artifact
+            intents[intent_sequence] = artifact
         elif kind == "handoff-write-completed":
             if payload.get("slot") != record.slot or payload.get("generation") != record.generation:
                 continue
