@@ -26,6 +26,7 @@ def test_real_process_and_git_invariants() -> None:
         check=False,
     )
     if namespace.returncode == 0:
+        init = Path(__file__).resolve().parents[3] / "scripts" / "pid_namespace_init.py"
         command = [
             "unshare",
             "--user",
@@ -33,6 +34,9 @@ def test_real_process_and_git_invariants() -> None:
             "--pid",
             "--fork",
             "--mount-proc",
+            str(Path(sys.executable).resolve()),
+            str(init),
+            "--",
             *command,
         ]
     completed = subprocess.run(
