@@ -3775,15 +3775,35 @@ def _resolve_handoff_artifact(
     slot_path: Path,
 ) -> _HandoffArtifact | None:
     sidecar = _load_handoff_sidecar(config, record)
-    legacy = _legacy_handoff_artifact(config, record, slot_path)
     if sidecar is not None and not sidecar.provenance_complete:
         raise Refusal(
             f"slot {record.slot} handoff sidecar schema 1 lacks auditable source "
             "provenance and is permanently manual-only; preserve it for inspection "
             "rather than replacing or using it as removal authority"
         )
+    publication = _handoff_write_publication(
+        record, _load_events(config, record.machine)
+    )
+    if sidecar is None and publication is not None:
+        state = "completed" if publication[2] else "outstanding"
+        remedy = (
+            "restore the exact completed sidecar"
+            if publication[2]
+            else "have the exact owner retry write-handoff or recover its authenticated temp"
+        )
+        raise Refusal(
+            f"slot {record.slot} has a {state} owner-authenticated handoff write intent "
+            f"but no canonical sidecar; preserve the slot and {remedy}"
+        )
     if sidecar is not None:
+        if sidecar.source == "legacy-slot-file" and publication is not None:
+            state = "completed" if publication[2] else "outstanding"
+            raise Refusal(
+                f"slot {record.slot} has a {state} owner-authenticated write intent; "
+                "a legacy projection cannot supersede it"
+            )
         _assert_handoff_sidecar_publication(config, record, sidecar)
+    legacy = _legacy_handoff_artifact(config, record, slot_path)
     if sidecar is not None and legacy is not None:
         if sidecar.contents != legacy.contents or sidecar.sha256 != legacy.sha256:
             raise Refusal(
@@ -5387,6 +5407,13 @@ def _assert_handoff_sidecar_publication(
                 "sidecar and have its exact owner retry write-handoff"
             )
         return "write-handoff", publication[0], None
+    publication = _handoff_write_publication(record, events)
+    if publication is not None:
+        state = "completed" if publication[2] else "outstanding"
+        raise Refusal(
+            f"slot {record.slot} has a {state} owner-authenticated write intent; "
+            "legacy sidecar recovery cannot supersede it"
+        )
     legacy = _legacy_projection_read(record, events, artifact)
     if legacy is None:
         raise Refusal(
@@ -12957,6 +12984,7 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
                 intent_sequence = _as_int(
                     intent["sequence"], "handoff write intent sequence", minimum=1
                 )
+                _interrupt_for_test("after-handoff-write-intent")
             else:
                 intent_sequence, intended, completed = publication
                 if completed:

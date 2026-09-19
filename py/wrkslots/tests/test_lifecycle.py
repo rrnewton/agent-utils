@@ -14637,6 +14637,145 @@ def test_legacy_projection_noreplace_does_not_enqueue_planted_destination(
 
 
 
+@pytest.mark.parametrize("target_present", [False, True])
+def test_write_intent_prevents_legacy_temp_recovery_in_both_branches(
+    tmp_path: Path, target_present: bool
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text("legacy projection bytes\n", encoding="utf-8")
+    interrupted = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid()),
+        env={"WRKSLOTS_TEST_INTERRUPT": "before-handoff-sidecar-publish"},
+    )
+    assert interrupted.returncode == 86
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    temps = list(config.control.glob(f"{sidecar.name}.tmp.*"))
+    assert len(temps) == 1
+    if target_present:
+        sidecar.write_bytes(temps[0].read_bytes())
+    source = tmp_path / "owner-intended.md"
+    source.write_text("owner intent wins\n", encoding="utf-8")
+    contents, identity = wrkslots._read_regular_file_identity(
+        source, "owner intent source", wrkslots.HANDOFF_BYTES_LIMIT
+    )
+    artifact = wrkslots._HandoffArtifact(
+        path=sidecar, machine=record.machine, slot=record.slot,
+        generation=record.generation, contents=contents, sha256=identity.sha256,
+        recorded_at=wrkslots._utc_now(), source="write-handoff",
+        source_path=source.resolve(), source_identity=identity,
+        provenance_complete=True, storage_identity=identity,
+    )
+    wrkslots._write_event_file(
+        config,
+        record.machine,
+        "handoff-write-intended",
+        {
+            "slot": record.slot,
+            "generation": record.generation,
+            "artifact": wrkslots._handoff_artifact_to_obj(artifact),
+            "writer": wrkslots._identity_to_obj(
+                wrkslots._read_process_identity(os.getpid())
+            ),
+        },
+    )
+
+    refused = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--discard-partial"
+    )
+
+    assert refused.returncode == 3
+    assert "legacy sidecar recovery cannot supersede" in refused.stderr
+    assert temps[0].is_file()
+    assert sidecar.exists() is target_present
+
+
+
+def test_outstanding_write_intent_prevents_legacy_projection_until_owner_retry(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    contents = "owner-selected continuation\n"
+    source = tmp_path / "external-handoff.md"
+    source.write_text(contents, encoding="utf-8")
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text(contents, encoding="utf-8")
+    write_args = (
+        "write-handoff", "slot01", "--agent", "codex-1", "--owner-pid",
+        str(os.getpid()), "--expected-generation", "1", "--from-file", str(source),
+    )
+    interrupted = raw_command(
+        project,
+        *write_args,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-handoff-write-intent"},
+    )
+    assert interrupted.returncode == 86
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    assert not sidecar.exists()
+    assert not list(config.control.glob(f"{sidecar.name}.tmp.*"))
+
+    refused = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    )
+    assert refused.returncode == 3
+    assert "outstanding owner-authenticated handoff write intent" in refused.stderr
+    assert not any(
+        event["kind"] == "handoff-read" for event in wrkslots._load_events(config)
+    )
+    assert json.loads(
+        raw_command(project, "retirement-queue", "--format", "json").stdout
+    )["pending"] == []
+
+    retried = raw_command(project, *write_args)
+    assert retried.returncode == 0, retried.stderr
+    publication = wrkslots._handoff_write_publication(
+        wrkslots._load_active(config).slots[0], wrkslots._load_events(config)
+    )
+    assert publication is not None and publication[2] is True
+    read = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    )
+    assert read.returncode == 0, read.stderr
+
+
+def test_completed_write_intent_with_missing_sidecar_precedes_legacy(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    contents = "owner-selected continuation\n"
+    source = tmp_path / "external-handoff.md"
+    source.write_text(contents, encoding="utf-8")
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text(contents, encoding="utf-8")
+    written = raw_command(
+        project, "write-handoff", "slot01", "--agent", "codex-1", "--owner-pid",
+        str(os.getpid()), "--expected-generation", "1", "--from-file", str(source),
+    )
+    assert written.returncode == 0, written.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    sidecar.unlink()
+
+    refused = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert refused.returncode == 3
+    assert "completed owner-authenticated handoff write intent" in refused.stderr
+    assert "restore the exact completed sidecar" in refused.stderr
+    assert legacy.is_file()
+    assert not any(
+        event["kind"] == "handoff-read" for event in wrkslots._load_events(config)
+    )
+
+
+
 def test_write_handoff_rejects_pre_snapshot_temp_substitution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
