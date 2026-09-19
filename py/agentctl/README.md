@@ -35,6 +35,8 @@ The documentation is installed with the command and works offline:
 - `agentctl COMMAND --help` describes that command's arguments and examples.
 - `agentctl chat quickstart` and `agentctl chat userguide` explain Google Chat setup
   when the Chat extension is available.
+- `agentctl chat launch --config chat.json` starts a coordinator in the current
+  Herdr shell pane with a bridge supervised for that session.
 
 Paused or uncertain work remains visible. A delivered instruction or an idle
 terminal does not establish that the agent's task is complete.

@@ -223,6 +223,14 @@ agent. Explicit file replies remain available with `reply_mode: "file"` and for
 recovery. Retained terminal history is bounded, so capture failures remain
 visible for inspection. The bridge does not supervise the coordinator's process.
 
+For an operator-created Herdr tab, `agentctl chat launch --config chat.json`
+provides the supervised exception to that separate-process model: it discovers
+the current pane and workspace, runs the native coordinator there, and owns a
+bridge child for exactly that coordinator's lifetime. The inherited
+`HERDR_WORKSPACE_ID` also keeps the coordinator's default `agentctl start`
+subagents in the same Herdr workspace. The reusable launch config contains Chat
+authority and transport settings; the command supplies the target identity.
+
 The built-in Chat transport polls the public REST API. An optional
 `event_command` connects an operator-supplied event stream; messages then wake
 the bridge immediately, while ACKs, Herdr prompt delivery, final replies, and

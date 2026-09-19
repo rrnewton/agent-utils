@@ -409,7 +409,7 @@ def test_command_adapter_react_contract() -> None:
     assert CommandTransport((sys.executable, "-c", script))(_react()) == {"id": _REACTION, "request": _react()}
 
 
-@pytest.mark.parametrize("command", ["init", "tick", "run", "status", "reply", "quickstart", "userguide"])
+@pytest.mark.parametrize("command", ["launch", "init", "tick", "run", "status", "reply", "quickstart", "userguide"])
 def test_each_chat_subcommand_has_specific_help(command: str, capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as result:
         chat_module.run_cli([command, "--help"])
@@ -417,14 +417,14 @@ def test_each_chat_subcommand_has_specific_help(command: str, capsys: pytest.Cap
     text = capsys.readouterr().out
     assert f"agentctl chat {command}" in text
     assert "Example:" in text
-    if command != "run":
+    if command not in ("launch", "run"):
         assert "--interval" not in text
     if command != "reply":
         assert "--request" not in text
 
 
 def test_init_and_reply_required_options_are_parser_errors() -> None:
-    for arguments in (["init"], ["reply", "--file", "answer.txt"]):
+    for arguments in (["launch"], ["init"], ["reply", "--file", "answer.txt"]):
         with pytest.raises(SystemExit) as result:
             chat_module.run_cli(arguments)
         assert result.value.code == 2

@@ -60,6 +60,56 @@ integrations expose session identity but leave the reported state idle during a
 turn. In that case the bridge records `delivery_uncertain`; a reply artifact
 still proves execution and permits the threaded response without reinjection.
 
+### Launch from the Herdr tab you created
+
+The shortest normal path is to create a shell tab in the desired Herdr workspace,
+change to the coordinator's working directory, and run one command there:
+
+```sh
+agentctl chat launch --config chat.json --state .agentctl/chat-coordinator \
+  --model gpt-6-astra
+```
+
+`launch` discovers `HERDR_PANE_ID` and `HERDR_WORKSPACE_ID`, replaces any stale
+target in the reusable configuration, initializes new bridge state, starts the
+bridge, and runs the native coordinator in that same pane. The bridge lives for
+the coordinator's normal lifetime. Its diagnostics go to `bridge.log` under the
+state directory. Exiting the coordinator stops the bridge and returns to the
+shell; after killing the launcher externally, check for and stop any surviving
+bridge process before reusing its state.
+
+The launched coordinator inherits `HERDR_WORKSPACE_ID`. Consequently, its
+ordinary `agentctl start NAME ...` calls create subagent tabs in the same Herdr
+workspace unless it explicitly supplies `--workspace-id`.
+
+For `launch`, `chat.json` is reusable and does not need a `target` or
+`agent_name`; those fields are replaced from the current pane. A compact public
+REST configuration is:
+
+```json
+{
+  "space": "spaces/YOUR_SPACE_ID",
+  "allowed_senders": ["users/YOUR_GOOGLE_USER_ID"],
+  "agent_label": "codex-coordinator",
+  "ack_reaction": "🤖"
+}
+```
+
+Transport settings such as `token_command`, `transport_socket`, and
+`event_command` belong in the same file. `--model` becomes the reply label by
+default; use `--agent-label` when the visible label should differ. `--resume`
+resumes a native conversation, and repeated `--harness-arg` values pass literal
+extra arguments to the harness.
+
+Run `launch` only from an idle Herdr shell pane. It refuses a non-Herdr terminal,
+a mismatched workspace environment, a pane already hosting an agent, a missing
+harness executable, or an already initialized state directory. Use one bridge
+per Chat space: stop the old coordinator before launching a replacement against
+the same space, and give the replacement a new state directory.
+
+The explicit two-process setup below remains useful when a service manager owns
+the bridge independently of the coordinator.
+
 ```json
 {
   "space": "spaces/YOUR_SPACE_ID",

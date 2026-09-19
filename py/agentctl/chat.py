@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -44,6 +45,7 @@ from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutput
 from agentctl.chat_replies import extract_replies, unknown_reply_ids
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 from agentctl.jsonx import as_mapping, as_sequence, get_str
+from agentctl.subagents import harness_arguments
 
 
 class Transport(Protocol):
@@ -55,6 +57,11 @@ class Transport(Protocol):
     """
 
     def __call__(self, request: dict[str, object]) -> dict[str, object]: ...
+
+
+class _LaunchClient(Protocol):
+    def pane_info(self, pane_id: str) -> AgentPaneInfo: ...
+    def workspace_label(self, workspace_id: str) -> str: ...
 
 
 def _utc() -> str:
@@ -1079,6 +1086,119 @@ def submit_reply(state: Path, key: str, text: str) -> None:
             raise ValueError("a different reply already exists for this request") from None
 
 
+def _launch_config(
+    document: dict[str, object], client: _LaunchClient, *, harness: str,
+    model: str | None, agent_label: str | None,
+) -> Config:
+    """Bind reusable Chat authority to the shell pane invoking ``launch``."""
+    pane_id = os.environ.get("HERDR_PANE_ID")
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID")
+    if os.environ.get("HERDR_ENV") != "1" or not pane_id or not workspace_id:
+        raise ValueError("chat launch must run inside the Herdr shell pane that will host the coordinator")
+    info = client.pane_info(pane_id)
+    if info.workspace_id != workspace_id:
+        raise ValueError("current Herdr pane and workspace environment do not match")
+    if info.agent is not None:
+        raise ValueError("current Herdr pane already hosts an agent; run chat launch from a shell pane")
+    executable = shutil.which(harness)
+    if executable is None:
+        raise ValueError(f"cannot find {harness!r} on PATH")
+    configured = dict(document)
+    configured["target"] = {
+        "pane_id": pane_id,
+        "session_agent": None,
+        "session_value": None,
+        "expected_agent": harness,
+        "expected_workspace": client.workspace_label(workspace_id),
+        "expected_cwd": info.cwd,
+    }
+    # This coordinator is owned by the invoking shell rather than agentctl's
+    # named-session registry. The exact pane/workspace/cwd assertions remain.
+    configured.pop("agent_name", None)
+    if agent_label is not None:
+        configured["agent_label"] = agent_label
+    elif model is not None:
+        configured["agent_label"] = model
+    elif not configured.get("agent_label"):
+        configured["agent_label"] = harness
+    return Config.parse(configured)
+
+
+def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Stop the detached bridge without leaving its adapter children behind."""
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=5)
+
+
+def _launch_here(
+    state: Path, config_path: Path, *, harness: str, model: str | None,
+    resume: str | None, harness_args: Sequence[str], agent_label: str | None,
+    after: str | None, interval: float, reconcile_interval: float, prog: str,
+) -> int:
+    """Run one coordinator and its bridge for the lifetime of this Herdr pane."""
+    with config_path.open(encoding="utf-8") as handle:
+        document = as_mapping(json.load(handle), "chat launch config")
+    client = HerdrClient()
+    config = _launch_config(document, client, harness=harness, model=model, agent_label=agent_label)
+    command = [harness, *harness_arguments(harness, model=model, resume=resume, extra=harness_args)]
+    Bridge.initialize(state, config, after=after)
+    log_path = state.absolute() / "bridge.log"
+    descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    log = os.fdopen(descriptor, "ab", buffering=0)
+    bridge_command = [sys.executable, str(Path(__file__).resolve()), "run", "--state", str(state.absolute()),
+                      "--interval", str(interval), "--reconcile-interval", str(reconcile_interval)]
+    bridge = subprocess.Popen(bridge_command, stdin=subprocess.DEVNULL, stdout=log,
+                              stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        print(f"{prog}: bridge state {state.absolute()} (log {log_path}); starting {shlex.join(command)}",
+              file=sys.stderr, flush=True)
+        coordinator = subprocess.Popen(command)
+        try:
+            while True:
+                result = coordinator.poll()
+                if result is not None:
+                    return result
+                bridge_result = bridge.poll()
+                if bridge_result is None:
+                    time.sleep(0.2)
+                    continue
+                coordinator.terminate()
+                try:
+                    coordinator.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    coordinator.kill()
+                    coordinator.wait(timeout=5)
+                try:
+                    detail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:].strip()
+                except OSError:
+                    detail = ""
+                raise ValueError(f"chat bridge exited {bridge_result} while the coordinator was running"
+                                 + (f": {detail}" if detail else ""))
+        finally:
+            if coordinator.poll() is None:
+                coordinator.terminate()
+                try:
+                    coordinator.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    coordinator.kill()
+                    coordinator.wait(timeout=5)
+    finally:
+        _stop_process_group(bridge)
+        log.close()
+
+
 def run_cli(argv: Sequence[str] | None = None, *, prog: str = "agentctl chat",
          default_state: Path = Path(".agentctl/.chat")) -> int:
     """Initialize, inspect, run, or reply through a coordinator bridge."""
@@ -1089,7 +1209,8 @@ def run_cli(argv: Sequence[str] | None = None, *, prog: str = "agentctl chat",
             "Authorized messages enter a durable queue and receive a configurable reaction ACK\n"
             "(default: 🤖). Bracketed final replies are harvested from terminal output and sent durably."
         ),
-        epilog=f"""Examples:
+    epilog=f"""Examples:
+  {prog} launch --config chat.json --model gpt-6-astra
   {prog} init --config chat.json
   {prog} run --interval 10
   {prog} status
@@ -1109,6 +1230,7 @@ and '{prog} COMMAND --help' for command-specific options.
                         help=f"private bridge state directory (default: {default_state}); also accepted after the command")
     commands = parser.add_subparsers(dest="command", title="commands", metavar="COMMAND")
     descriptions = {
+        "launch": "Launch a coordinator in this Herdr pane and bridge it to Chat for its lifetime.",
         "init": "Create private bridge state from configuration and check the pinned target.",
         "tick": "Poll one page, ACK accepted messages, deliver ready prompts, and inspect retained tagged replies once.",
         "run": "Stream Chat events when event_command is configured, otherwise poll; deliver prompts, ACKs, and tagged replies.",
@@ -1119,7 +1241,7 @@ and '{prog} COMMAND --help' for command-specific options.
         "userguide": "Print the complete setup, authentication, adapter, and recovery guide.",
     }
     subparsers: dict[str, argparse.ArgumentParser] = {}
-    examples = {"init": "--config chat.json", "tick": "", "run": "--interval 10", "status": "",
+    examples = {"launch": "--config chat.json --model gpt-6-astra", "init": "--config chat.json", "tick": "", "run": "--interval 10", "status": "",
                 "reply": '--request "$REQUEST_KEY" --file answer.txt', "quickstart": "", "userguide": "",
                 "context": '--request "$REQUEST_KEY" --limit 10'}
     for name, description in descriptions.items():
@@ -1133,6 +1255,25 @@ and '{prog} COMMAND --help' for command-specific options.
         help="JSON configuration with the space, allowed senders, pinned target, and authentication")
     subparsers["init"].add_argument("--after", metavar="RFC3339_TIME",
         help="earliest message time, including timezone (default: current time; no history replay)")
+    launch = subparsers["launch"]
+    launch.add_argument("--config", type=Path, required=True, metavar="JSON_FILE",
+        help="reusable Chat authority and transport config; launch supplies the current pane target")
+    launch.add_argument("--harness", choices=("codex", "claude"), default="codex",
+        help="native coordinator harness to run in this pane (default: codex)")
+    launch.add_argument("--model", metavar="MODEL",
+        help="native model name and default Chat reply label (default: harness configuration)")
+    launch.add_argument("--resume", metavar="SESSION",
+        help="resume an explicit native conversation instead of starting a new one")
+    launch.add_argument("--harness-arg", action="append", default=[], metavar="ARG",
+        help="literal harness argument; repeat and use = for flags")
+    launch.add_argument("--agent-label", metavar="LABEL",
+        help="Chat reply prefix label (default: model, config agent_label, or harness)")
+    launch.add_argument("--after", metavar="RFC3339_TIME",
+        help="earliest message time, including timezone (default: launch time; no history replay)")
+    launch.add_argument("--interval", type=float, default=3, metavar="SECONDS",
+        help="poll delay in seconds, 0.1–60 (default: 3); ignored by event-command intake")
+    launch.add_argument("--reconcile-interval", type=float, default=300, metavar="SECONDS",
+        help="event-stream recovery scan interval, 10–86400 seconds (default: 300)")
     subparsers["run"].add_argument("--interval", type=float, default=3, metavar="SECONDS",
         help="delay after each poll cycle in seconds, 0.1–60 (default: 3); used without event_command; failures back off to 60 seconds")
     subparsers["run"].add_argument("--reconcile-interval", type=float, default=300, metavar="SECONDS",
@@ -1155,21 +1296,22 @@ and '{prog} COMMAND --help' for command-specific options.
     if args.command == "quickstart":
         print(f"""Google Chat a coordinator running in Herdr
 
-1. Start a Codex or Claude coordinator in Herdr. Record its pane ID, workspace
-   label, working directory, and (when available) native conversation ID.
+1. In Herdr, create a shell tab in the workspace where the coordinator and its
+   subagents should live.
 2. Configure user OAuth access to read/send Google Chat messages and create
    reactions. Set the access token in HERDR_CHAT_TOKEN, or use token_command.
-3. Save chat.json, replacing the example IDs and paths with your own:
+3. Save reusable chat.json authority and transport settings:
    {{
      "space": "spaces/SPACE_ID",
      "allowed_senders": ["users/YOUR_USER_ID"],
      "agent_label": "codex-coordinator",
-     "target": {{"pane_id": "PANE_ID", "expected_agent": "codex",
-                "expected_cwd": "/work/project", "expected_workspace": "project"}},
      "ack_reaction": "🤖"
    }}
-4. Run: {prog} init --config chat.json
-   Then: {prog} run --interval 3
+4. From that shell tab, run one command:
+   {prog} launch --config chat.json --model gpt-6-astra
+   It discovers and pins the current pane, runs the coordinator there, and owns
+   the bridge for the coordinator's lifetime. Its subagents default to the same
+   Herdr workspace.
 5. Send a message in the configured space. The reaction acknowledges durable
    intake; the agent brackets its final answer with the unique tags in its prompt.
    The daemon captures that block and posts it in the same thread. No reply tool
@@ -1192,14 +1334,24 @@ In this mode ACKs, prompts, and replies run independently; --reconcile-interval
 Use transport_socket for a persistent private Unix adapter, or transport_command
 for a per-request command. The built-in REST transport needs neither.
 
-Keep the bridge process running independently of the coordinator's pane.
-Inspect delivery and reaction retry errors with '{prog} status'.
-See '{prog} userguide' for exact scopes and the command-adapter protocol.""")
+While `launch` is active, inspect delivery and reaction retry errors from another
+pane with '{prog} status'. For service-managed deployments, use the separate
+'{prog} init' and '{prog} run'
+commands. See '{prog} userguide' for exact scopes, lifecycle, and adapter protocols.""")
         return 0
     if args.command is None:
         parser.print_help()
         return 0
     try:
+        if args.command == "launch":
+            if not 0.1 <= args.interval <= 60:
+                raise ValueError("interval must be between 0.1 and 60 seconds")
+            if not 10 <= args.reconcile_interval <= 86400:
+                raise ValueError("reconcile interval must be between 10 and 86400 seconds")
+            return _launch_here(args.state, args.config, harness=args.harness, model=args.model,
+                                resume=args.resume, harness_args=args.harness_arg,
+                                agent_label=args.agent_label, after=args.after, interval=args.interval,
+                                reconcile_interval=args.reconcile_interval, prog=prog)
         if args.command == "init":
             with args.config.open(encoding="utf-8") as handle:
                 config = Config.parse(as_mapping(json.load(handle), "chat config"))

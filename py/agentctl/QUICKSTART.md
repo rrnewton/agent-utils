@@ -54,7 +54,20 @@ and the other subcommand help pages describe every option. Worker, Chat, and
 MCP extensions are installation-dependent; inspect `agentctl capabilities`
 before using their commands.
 
-To message one of these agents remotely, run `agentctl chat quickstart`.
+To launch a coordinator directly in the current Herdr shell pane and bridge it
+for the lifetime of that session, run:
+
+```sh
+agentctl chat launch --config chat.json --model gpt-6-astra
+```
+
+The reusable Chat config supplies the space, allowed senders, and transport;
+`launch` supplies the current pane, workspace, and working directory. Subagents
+started by that coordinator inherit the same Herdr workspace. Run
+`agentctl chat quickstart` for the compact configuration and
+`agentctl chat userguide` for authentication, recovery, and the separate-daemon
+alternative.
+
 The Chat bridge accepts messages from configured senders, acknowledges intake
 with 🤖, and sends the agent's tagged replies back to their originating chat
 thread. One request can receive multiple replies, including progress updates.
