@@ -14275,6 +14275,7 @@ def _audit_record(
             agent_running,
         )
     reasons: list[str] = []
+    process_census_unknown = False
     if not heartbeat_expired:
         reasons.append(
             f"heartbeat age {int(heartbeat_age)}s has not exceeded the "
@@ -14322,7 +14323,7 @@ def _audit_record(
     ):
         if process_census_error is not None:
             reasons.append(process_census_error)
-            agent_running = True
+            process_census_unknown = True
         else:
             try:
                 _assert_slot_unused(
@@ -14347,7 +14348,11 @@ def _audit_record(
             "slot_type": record.slot_type,
             "generation": record.generation,
             "record_sha256": _event_digest(_record_to_obj(record)),
-            "verdict": "DELETABLE" if not reasons else "BLOCKED",
+            "verdict": (
+                "UNKNOWN"
+                if process_census_unknown
+                else ("DELETABLE" if not reasons else "BLOCKED")
+            ),
             "reasons": reasons,
             "owner_state": owner_state,
             "liveness_state": liveness_state,
@@ -24116,13 +24121,17 @@ def _mountinfo_path_references_with_retry(
         try:
             return _mountinfo_path_references(process.pid, budget, cache)
         except Refusal as exc:
+            # A process that exits after the snapshot can retain its procfs
+            # directory and start ticks until its parent reaps it.  Linux then
+            # returns EINVAL for mountinfo, so generation equality alone does
+            # not distinguish that ordinary race from unreadable live evidence.
+            if not _process_observation_is_active(process):
+                raise _ProcessEvidenceChanged(
+                    f"PID {process.pid} exited during mountinfo census"
+                ) from exc
             cause = exc.__cause__
             if not isinstance(cause, OSError) or cause.errno != errno.EINVAL:
                 raise
-            if not _process_generation_is_current(process):
-                raise _ProcessEvidenceChanged(
-                    f"PID {process.pid} generation changed during mountinfo retry"
-                ) from exc
             if attempt:
                 raise
     raise AssertionError("unreachable mountinfo retry")
@@ -24548,6 +24557,19 @@ def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
     return _process_start_ticks(Path("/proc") / str(process.pid)) == process.start_ticks
 
 
+def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
+    """Return whether the observed generation still names a non-zombie process."""
+
+    pid_dir = Path("/proc") / str(process.pid)
+    before = _read_process_stat(pid_dir)
+    if before is None or before.start_ticks != process.start_ticks:
+        return False
+    if _process_is_zombie(pid_dir):
+        return False
+    after = _read_process_stat(pid_dir)
+    return after is not None and after.start_ticks == process.start_ticks
+
+
 def _allow_only_vanished_process_diagnostics(
     program: str,
     returncode: int,
@@ -24574,7 +24596,7 @@ def _allow_only_vanished_process_diagnostics(
     for line in lines:
         match = pattern.fullmatch(line)
         process = processes.get(int(match.group("pid"))) if match else None
-        if process is None or _process_generation_is_current(process):
+        if process is None or _process_observation_is_active(process):
             raise Refusal(f"privileged {program} census produced diagnostics: {line}")
 
 
@@ -24610,7 +24632,7 @@ def _same_uid_indeterminate_processes(
         missing = missing_pattern.fullmatch(line)
         if missing is not None:
             process = processes.get(int(missing.group("pid")))
-            if process is None or _process_generation_is_current(process):
+            if process is None or _process_observation_is_active(process):
                 raise Refusal(
                     f"same-UID {program} census produced diagnostics: {line}"
                 )
@@ -24619,10 +24641,10 @@ def _same_uid_indeterminate_processes(
         process = (
             None if denied is None else processes.get(int(denied.group("pid")))
         )
-        if process is None or not _process_generation_is_current(process):
-            if process is not None:
-                continue
+        if process is None:
             raise Refusal(f"same-UID {program} census produced diagnostics: {line}")
+        if not _process_observation_is_active(process):
+            continue
         indeterminate[process.pid] = process
     return tuple(indeterminate.values())
 

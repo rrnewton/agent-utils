@@ -21870,6 +21870,118 @@ def test_audit_uses_one_process_path_census_for_all_rows(
     assert any("live process 12345" in reason for reason in rows["in-use"]["reasons"])
 
 
+def test_audit_keeps_genuinely_indeterminate_census_out_of_deletable_and_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    expire_heartbeat(project)
+
+    def unreadable(_paths: Sequence[Path]) -> wrkslots._ProcessPathCensus:
+        raise wrkslots.Refusal(
+            "mount evidence is indeterminate for live PID 123: Permission denied"
+        )
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", unreadable)
+
+    assert (
+        wrkslots.main(
+            ["--project-root", str(project), "audit", "--gate", "--format", "json"]
+        )
+        == 2
+    )
+    payload = json.loads(capsys.readouterr().out)
+    row = next(row for row in payload["slots"] if row["slot"] == "slot01")
+    assert row["verdict"] == "UNKNOWN"
+    assert row["reasons"] == [
+        "process/path census failed: mount evidence is indeterminate for live "
+        "PID 123: Permission denied"
+    ]
+    assert payload["attention_slots"] == []
+    assert payload["unknown_slots"] == ["slot01"]
+    assert payload["running_agent_count"] == 0
+
+
+def test_audit_process_exit_race_preserves_other_deletable_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slots = ("slot01", "slot02")
+    prepare_dead_validate_slots(project, slots)
+    config = wrkslots._load_config(str(project), "testhost")
+    for slot in slots:
+        state = wrkslots._load_active(config)
+        record = next(item for item in state.slots if item.slot == slot)
+        wrkslots._write_active_state(
+            config,
+            wrkslots._replace_record(
+                state,
+                replace(
+                    record,
+                    heartbeat_at=(
+                        dt.datetime.now(dt.timezone.utc)
+                        - dt.timedelta(seconds=record.heartbeat_ttl_seconds + 1)
+                    ).isoformat(timespec="seconds"),
+                ),
+            ),
+            action="test-ttl-expired",
+            slot=slot,
+        )
+
+    read_fd, release_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(release_fd)
+        try:
+            os.read(read_fd, 1)
+        finally:
+            os._exit(0)
+    os.close(read_fd)
+    try:
+        generation = wrkslots._read_process_stat(Path("/proc") / str(pid))
+        assert generation is not None
+        process = wrkslots._AbsentProcessObservation(
+            pid,
+            generation.start_ticks,
+            "/fixture",
+            "mnt:[fixture]",
+        )
+        os.close(release_fd)
+        release_fd = -1
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        snapshots = iter(((process,), ()))
+        monkeypatch.setattr(
+            wrkslots, "_absent_validate_process_snapshot", lambda: next(snapshots)
+        )
+
+        assert (
+            wrkslots.main(
+                ["--project-root", str(project), "audit", "--format", "json"]
+            )
+            == 0
+        )
+        payload = json.loads(capsys.readouterr().out)
+        rows = {row["slot"]: row for row in payload["slots"]}
+        assert {slot: rows[slot]["verdict"] for slot in slots} == {
+            "slot01": "DELETABLE",
+            "slot02": "DELETABLE",
+        }
+        assert payload["attention_slots"] == ["slot01", "slot02"]
+        assert payload["unknown_slots"] == []
+        assert payload["running_agent_count"] == 0
+    finally:
+        if release_fd >= 0:
+            os.close(release_fd)
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
 def test_audit_reuses_one_git_worktree_list_for_shared_repository(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -25256,6 +25368,106 @@ def test_mount_namespace_reselects_after_representative_generation_changes(
     assert inspected == [123, 124]
 
 
+def test_process_census_retries_when_mountinfo_owner_becomes_a_zombie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, release_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(release_fd)
+        try:
+            os.read(read_fd, 1)
+        finally:
+            os._exit(0)
+    os.close(read_fd)
+    try:
+        generation = wrkslots._read_process_stat(Path("/proc") / str(pid))
+        assert generation is not None
+        process = wrkslots._AbsentProcessObservation(
+            pid,
+            generation.start_ticks,
+            "/fixture",
+            "mnt:[fixture]",
+        )
+        os.close(release_fd)
+        release_fd = -1
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        assert wrkslots._process_is_zombie(Path("/proc") / str(pid))
+
+        snapshots = iter(((process,), ()))
+        monkeypatch.setattr(
+            wrkslots, "_absent_validate_process_snapshot", lambda: next(snapshots)
+        )
+        monkeypatch.setattr(
+            wrkslots, "_absent_validate_find_matches", lambda *_args: ()
+        )
+        monkeypatch.setattr(
+            wrkslots, "_absent_validate_maps_matches", lambda *_args: ()
+        )
+
+        census = wrkslots._capture_process_path_census(
+            (Path("/fixture/slot-a"), Path("/fixture/slot-b"))
+        )
+
+        assert census.processes == ()
+        assert census.matches == ()
+    finally:
+        if release_fd >= 0:
+            os.close(release_fd)
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
+def test_mountinfo_census_refuses_genuinely_unreadable_live_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, release_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(release_fd)
+        try:
+            os.read(read_fd, 1)
+        finally:
+            os._exit(0)
+    os.close(read_fd)
+    try:
+        generation = wrkslots._read_process_stat(Path("/proc") / str(pid))
+        assert generation is not None
+        process = wrkslots._AbsentProcessObservation(
+            pid,
+            generation.start_ticks,
+            "/fixture",
+            "mnt:[fixture]",
+        )
+
+        def unreadable(
+            _pid: int,
+            _budget: wrkslots._ReadOnlyCommandBudget,
+            _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
+        ) -> tuple[tuple[Path, str], ...]:
+            try:
+                raise PermissionError(errno.EACCES, "fixture denies mount evidence")
+            except PermissionError as cause:
+                raise wrkslots.Refusal("mount evidence is genuinely unreadable") from cause
+
+        monkeypatch.setattr(wrkslots, "_mountinfo_path_references", unreadable)
+        budget = wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=30,
+            stdout_limit=1024,
+            stderr_limit=1024,
+        )
+        with pytest.raises(
+            wrkslots.Refusal, match="mount evidence is genuinely unreadable"
+        ):
+            wrkslots._mountinfo_path_references_with_retry(process, budget)
+    finally:
+        os.close(release_fd)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
 @pytest.mark.parametrize("persistent", (False, True))
 def test_mountinfo_census_retries_only_transient_stable_einval(
     monkeypatch: pytest.MonkeyPatch,
@@ -25281,6 +25493,9 @@ def test_mountinfo_census_retries_only_transient_stable_einval(
 
     monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
     monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    monkeypatch.setattr(
+        wrkslots, "_process_observation_is_active", lambda _process: True
+    )
     if persistent:
         with pytest.raises(wrkslots.Refusal, match="cannot read mountinfo"):
             wrkslots._absent_validate_mount_matches((process,), {target: "gone"})
@@ -25450,11 +25665,15 @@ def test_privileged_process_diagnostics_allow_only_vanished_generations(
     process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
     find_error = b"/usr/bin/find: '/proc/123/fd': No such file or directory\n"
     grep_error = b"/usr/bin/grep: /proc/123/maps: No such file or directory\n"
-    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: None)
+    monkeypatch.setattr(
+        wrkslots, "_process_observation_is_active", lambda _process: False
+    )
     wrkslots._allow_only_vanished_process_diagnostics("find", 1, find_error, {123: process})
     wrkslots._allow_only_vanished_process_diagnostics("grep", 2, grep_error, {123: process})
 
-    monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
+    monkeypatch.setattr(
+        wrkslots, "_process_observation_is_active", lambda _process: True
+    )
     with pytest.raises(wrkslots.Refusal, match="find census produced diagnostics"):
         wrkslots._allow_only_vanished_process_diagnostics("find", 1, find_error, {123: process})
     with pytest.raises(wrkslots.Refusal, match="grep census produced diagnostics"):
