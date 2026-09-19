@@ -14637,6 +14637,178 @@ def test_legacy_projection_noreplace_does_not_enqueue_planted_destination(
 
 
 
+def test_write_handoff_rejects_pre_snapshot_temp_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "external-handoff.md"
+    source.write_text("owner-authored continuation\n", encoding="utf-8")
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    replacement = b"pre-snapshot replacement must survive\n"
+
+    def replace_temp(point: str) -> None:
+        if point != "after-handoff-temp-write-before-snapshot":
+            return
+        temps = list(config.control.glob(f"{sidecar.name}.tmp.*"))
+        assert len(temps) == 1
+        planted = config.control / "pre-snapshot-replacement"
+        planted.write_bytes(replacement)
+        os.replace(planted, temps[0])
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", replace_temp)
+    args = argparse.Namespace(
+        project_root=str(project), machine="testhost", slot="slot01", agent="codex-1",
+        owner_pid=os.getpid(), expected_generation=1, from_file=str(source), wait_lock=0.0,
+    )
+    with pytest.raises(wrkslots.StateError, match="differs from its durable intent"):
+        wrkslots._cmd_write_handoff(args)
+
+    assert not sidecar.exists()
+    temps = list(config.control.glob(f"{sidecar.name}.tmp.*"))
+    assert len(temps) == 1
+    assert temps[0].read_bytes() == replacement
+    publication = wrkslots._handoff_write_publication(
+        wrkslots._load_active(config).slots[0], wrkslots._load_events(config)
+    )
+    assert publication is not None and publication[2] is False
+
+
+def test_write_handoff_post_publish_replacement_stays_untrusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "external-handoff.md"
+    source.write_text("owner-authored continuation\n", encoding="utf-8")
+    config = wrkslots._load_config(str(project), "testhost")
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+
+    def replace_after_helper(point: str) -> None:
+        if point != "after-handoff-sidecar-write":
+            return
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        planted = b"post-publication replacement\n"
+        digest = hashlib.sha256(planted).hexdigest()
+        payload["contents_utf8"] = planted.decode("utf-8")
+        payload["sha256"] = digest
+        payload["source_identity"]["size"] = len(planted)
+        payload["source_identity"]["sha256"] = digest
+        sidecar.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", replace_after_helper)
+    args = argparse.Namespace(
+        project_root=str(project), machine="testhost", slot="slot01", agent="codex-1",
+        owner_pid=os.getpid(), expected_generation=1, from_file=str(source), wait_lock=0.0,
+    )
+    with pytest.raises(wrkslots.StateError, match="differs from the owner's exact"):
+        wrkslots._cmd_write_handoff(args)
+    publication = wrkslots._handoff_write_publication(
+        wrkslots._load_active(config).slots[0], wrkslots._load_events(config)
+    )
+    assert publication is not None and publication[2] is False
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    refused = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    )
+    assert refused.returncode == 3
+    assert "no matching owner-authenticated publication intent" in refused.stderr
+    queued = raw_command(project, "retirement-queue", "--format", "json")
+    assert queued.returncode == 0, queued.stderr
+    assert json.loads(queued.stdout)["pending"] == []
+
+
+def test_recover_refuses_unauthenticated_orphan_handoff_temp(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    source = tmp_path / "orphan-source.md"
+    source.write_text("orphan bytes\n", encoding="utf-8")
+    contents, identity = wrkslots._read_regular_file_identity(
+        source, "orphan source", wrkslots.HANDOFF_BYTES_LIMIT
+    )
+    sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
+    artifact = wrkslots._HandoffArtifact(
+        path=sidecar, machine=record.machine, slot=record.slot, generation=record.generation,
+        contents=contents, sha256=identity.sha256, recorded_at=wrkslots._utc_now(),
+        source="write-handoff", source_path=source.resolve(), source_identity=identity,
+        provenance_complete=True, storage_identity=identity,
+    )
+    temp = sidecar.with_name(f"{sidecar.name}.tmp.orphan")
+    temp.write_text(
+        json.dumps(wrkslots._handoff_artifact_to_obj(artifact), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    refused = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--discard-partial"
+    )
+
+    assert refused.returncode == 3
+    assert "no matching owner-authenticated publication intent" in refused.stderr
+    assert temp.is_file()
+    assert not sidecar.exists()
+
+
+def test_recover_completes_authenticated_write_handoff_publication(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    source = tmp_path / "external-handoff.md"
+    source.write_text("recover authenticated write\n", encoding="utf-8")
+    interrupted = raw_command(
+        project, "write-handoff", "slot01", "--agent", "codex-1", "--owner-pid",
+        str(os.getpid()), "--expected-generation", "1", "--from-file", str(source),
+        env={"WRKSLOTS_TEST_INTERRUPT": "before-handoff-sidecar-publish"},
+    )
+    assert interrupted.returncode == 86
+
+    recovered = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--discard-partial"
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    publication = wrkslots._handoff_write_publication(record, wrkslots._load_events(config))
+    assert publication is not None and publication[2] is True
+    read = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
+    )
+    assert read.returncode == 0, read.stderr
+
+
+def test_recover_completes_provenance_bound_legacy_projection(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    legacy = checkout(project).parent / "HANDOFF.md"
+    legacy.write_text("recover legacy projection\n", encoding="utf-8")
+    interrupted = raw_command(
+        project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid()),
+        env={"WRKSLOTS_TEST_INTERRUPT": "before-handoff-sidecar-publish"},
+    )
+    assert interrupted.returncode == 86
+
+    recovered = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--discard-partial"
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    reads = [event for event in wrkslots._load_events(config) if event["kind"] == "handoff-read"]
+    assert len(reads) == 2
+    assert [wrkslots._as_mapping(event["payload"], "read")["retirement_enqueued"] for event in reads] == [False, True]
+    queued = json.loads(raw_command(project, "retirement-queue", "--format", "json").stdout)
+    assert len(queued["pending"]) == 1
+
+
+
 def test_write_handoff_same_bytes_different_source_provenance_refuses(
     tmp_path: Path,
 ) -> None:

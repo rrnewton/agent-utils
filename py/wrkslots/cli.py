@@ -3235,18 +3235,26 @@ def _atomic_write_handoff_noreplace(path: Path, payload: object) -> None:
             "inspect it and use 'wrkslots recover'"
         )
     temp = path.parent / f"{prefix}{os.getpid()}.{uuid.uuid4().hex}"
+    intended_contents = (
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    ).encode("utf-8")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     try:
         descriptor = os.open(temp, flags, 0o644)
-        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=True)
-            handle.write("\n")
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(intended_contents)
             handle.flush()
             os.fsync(handle.fileno())
         _fsync_directory(path.parent)
+        _interrupt_for_test("after-handoff-temp-write-before-snapshot")
         temp_contents, temp_identity = _read_regular_file_identity(
             temp, "handoff sidecar publication temp", HANDOFF_SIDECAR_BYTES_LIMIT
         )
+        if temp_contents != intended_contents:
+            raise StateError(
+                f"handoff sidecar publication temp differs from its durable intent; "
+                f"preserved it for recovery: {temp}"
+            )
         _interrupt_for_test("before-handoff-sidecar-publish")
         _rename_noreplace(temp, path, "publish handoff sidecar")
         _fsync_directory(path.parent)
@@ -3774,6 +3782,8 @@ def _resolve_handoff_artifact(
             "provenance and is permanently manual-only; preserve it for inspection "
             "rather than replacing or using it as removal authority"
         )
+    if sidecar is not None:
+        _assert_handoff_sidecar_publication(config, record, sidecar)
     if sidecar is not None and legacy is not None:
         if sidecar.contents != legacy.contents or sidecar.sha256 != legacy.sha256:
             raise Refusal(
@@ -5270,6 +5280,166 @@ def _handoff_read_matches_artifact(
         and read.source == artifact.source
         and read.source_path == artifact.source_path
         and read.source_identity == artifact.source_identity
+    )
+
+
+def _handoff_write_publication(
+    record: ActiveRecord,
+    events: Sequence[Mapping[str, object]],
+) -> tuple[int, Mapping[str, object], bool] | None:
+    intents: dict[int, Mapping[str, object]] = {}
+    completed: set[int] = set()
+    for event in events:
+        kind = event.get("kind")
+        payload = _as_mapping(event["payload"], f"{kind} event payload")
+        if kind == "handoff-write-intended":
+            if payload.get("slot") != record.slot or payload.get("generation") != record.generation:
+                continue
+            artifact = _as_mapping(payload.get("artifact"), "handoff write intent artifact")
+            if (
+                artifact.get("schema") != HANDOFF_SIDECAR_SCHEMA
+                or artifact.get("machine") != record.machine
+                or artifact.get("slot") != record.slot
+                or artifact.get("generation") != record.generation
+                or artifact.get("source") != "write-handoff"
+            ):
+                raise StateError("handoff write intent has an invalid artifact identity")
+            if _identity_from_obj(
+                payload.get("writer"), "handoff write intent writer"
+            ) is None:
+                raise StateError("handoff write intent lacks an owner identity")
+            intents[_as_int(event["sequence"], "handoff write intent sequence", minimum=1)] = artifact
+        elif kind == "handoff-write-completed":
+            if payload.get("slot") != record.slot or payload.get("generation") != record.generation:
+                continue
+            sequence = _as_int(
+                payload.get("intent_sequence"),
+                "handoff write completion intent_sequence",
+                minimum=1,
+            )
+            intended_artifact = intents.get(sequence)
+            if intended_artifact is None:
+                raise StateError("handoff write completion references an unknown intent")
+            digest = _as_str(
+                payload.get("artifact_sha256"),
+                "handoff write completion artifact_sha256",
+            )
+            if digest != _event_digest(intended_artifact):
+                raise StateError("handoff write completion digest does not match its intent")
+            completed.add(sequence)
+    if not intents:
+        return None
+    sequence = max(intents)
+    return sequence, intents[sequence], sequence in completed
+
+
+def _legacy_projection_read(
+    record: ActiveRecord,
+    events: Sequence[Mapping[str, object]],
+    artifact: _HandoffArtifact,
+) -> tuple[Mapping[str, object], bool] | None:
+    selected: tuple[Mapping[str, object], bool] | None = None
+    expected_contents = artifact.contents.decode("utf-8")
+    assert artifact.source_path is not None
+    assert artifact.source_identity is not None
+    for event in events:
+        if event.get("kind") != "handoff-read":
+            continue
+        payload = _as_mapping(event["payload"], "handoff-read event payload")
+        if payload.get("slot") != record.slot or payload.get("generation") != record.generation:
+            continue
+        if (
+            payload.get("sha256") == artifact.sha256
+            and payload.get("contents_utf8") == expected_contents
+            and payload.get("source") == "legacy-slot-file"
+            and payload.get("source_path") == str(artifact.source_path)
+            and payload.get("source_identity")
+            == _regular_file_identity_to_obj(artifact.source_identity)
+        ):
+            enqueued = payload.get("retirement_enqueued", False)
+            if not isinstance(enqueued, bool):
+                raise StateError("handoff-read event retirement_enqueued must be boolean")
+            selected = payload, enqueued
+    return selected
+
+
+def _assert_handoff_sidecar_publication(
+    config: Config,
+    record: ActiveRecord,
+    artifact: _HandoffArtifact,
+    *,
+    allow_outstanding_write: bool = False,
+) -> tuple[str, int | None, Mapping[str, object] | None]:
+    if not artifact.provenance_complete:
+        raise Refusal("handoff sidecar lacks complete source provenance")
+    events = _load_events(config, record.machine)
+    artifact_obj = _handoff_artifact_to_obj(artifact)
+    if artifact.source == "write-handoff":
+        publication = _handoff_write_publication(record, events)
+        if publication is None or not _json_equal(publication[1], artifact_obj):
+            raise Refusal(
+                f"slot {record.slot} handoff sidecar has no matching owner-authenticated "
+                "publication intent; preserve it for manual review"
+            )
+        if not publication[2] and not allow_outstanding_write:
+            raise Refusal(
+                f"slot {record.slot} handoff publication is incomplete; preserve the "
+                "sidecar and have its exact owner retry write-handoff"
+            )
+        return "write-handoff", publication[0], None
+    legacy = _legacy_projection_read(record, events, artifact)
+    if legacy is None:
+        raise Refusal(
+            f"slot {record.slot} projected legacy sidecar has no matching "
+            "provenance-bearing read; preserve it for manual review"
+        )
+    return "legacy-slot-file", None, legacy[0]
+
+
+def _complete_handoff_write_publication(
+    config: Config,
+    record: ActiveRecord,
+    intent_sequence: int,
+    artifact: _HandoffArtifact,
+) -> None:
+    publication = _handoff_write_publication(
+        record, _load_events(config, record.machine)
+    )
+    if publication is None or publication[0] != intent_sequence:
+        raise StateError("handoff write intent changed before completion")
+    if not _json_equal(publication[1], _handoff_artifact_to_obj(artifact)):
+        raise StateError("handoff write completion does not match its intent")
+    if publication[2]:
+        return
+    _write_event_file(
+        config,
+        record.machine,
+        "handoff-write-completed",
+        {
+            "slot": record.slot,
+            "generation": record.generation,
+            "intent_sequence": intent_sequence,
+            "artifact_sha256": _event_digest(publication[1]),
+        },
+    )
+
+
+def _complete_legacy_projection(
+    config: Config,
+    record: ActiveRecord,
+    artifact: _HandoffArtifact,
+    read_payload: Mapping[str, object],
+) -> None:
+    latest = _latest_handoff_read(record, _load_events(config, record.machine))
+    if latest is not None and latest.retirement_enqueued and _handoff_read_matches_artifact(
+        latest, artifact
+    ):
+        return
+    _write_event_file(
+        config,
+        record.machine,
+        "handoff-read",
+        {**dict(read_payload), "retirement_enqueued": True},
     )
 
 
@@ -12764,7 +12934,46 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
                 f"slot {record.slot} handoff sidecar schema 1 lacks auditable source "
                 "provenance and is permanently manual-only; preserve it for inspection"
             )
+        _ensure_event_log(config, record.machine, require_repository=False)
+        publication = _handoff_write_publication(
+            record, _load_events(config, record.machine)
+        )
+        intent_sequence: int
+        intended: Mapping[str, object]
         if existing is None:
+            if publication is None:
+                intended = _handoff_artifact_to_obj(artifact)
+                intent = _write_event_file(
+                    config,
+                    record.machine,
+                    "handoff-write-intended",
+                    {
+                        "slot": record.slot,
+                        "generation": record.generation,
+                        "artifact": intended,
+                        "writer": _identity_to_obj(owner),
+                    },
+                )
+                intent_sequence = _as_int(
+                    intent["sequence"], "handoff write intent sequence", minimum=1
+                )
+            else:
+                intent_sequence, intended, completed = publication
+                if completed:
+                    raise Refusal(
+                        f"slot {record.slot} completed handoff sidecar disappeared; "
+                        "preserve the slot and repair its exact artifact"
+                    )
+                recorded_at = _as_str(
+                    intended.get("recorded_at"), "handoff write intent recorded_at"
+                )
+                _parse_timestamp(recorded_at, "handoff write intent recorded_at")
+                artifact = dataclasses.replace(artifact, recorded_at=recorded_at)
+                if not _json_equal(intended, _handoff_artifact_to_obj(artifact)):
+                    raise Refusal(
+                        f"slot {record.slot} has an outstanding handoff intent for "
+                        "different bytes or source provenance; preserve it for recovery"
+                    )
             _atomic_write_handoff_noreplace(
                 sidecar_path, _handoff_artifact_to_obj(artifact)
             )
@@ -12778,20 +12987,34 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
                     "preserve it and the external source for recovery"
                 )
             artifact = written
-        elif (
-            existing.contents != artifact.contents
-            or existing.sha256 != artifact.sha256
-            or existing.source != artifact.source
-            or existing.source_path != artifact.source_path
-            or existing.source_identity != artifact.source_identity
-        ):
-            raise Refusal(
-                f"slot {record.slot} already has an immutable handoff sidecar with "
-                "different contents or source provenance; preserve both versions for "
-                "manual review"
+            _complete_handoff_write_publication(
+                config, record, intent_sequence, artifact
             )
         else:
+            if (
+                existing.contents != artifact.contents
+                or existing.sha256 != artifact.sha256
+                or existing.source != artifact.source
+                or existing.source_path != artifact.source_path
+                or existing.source_identity != artifact.source_identity
+            ):
+                raise Refusal(
+                    f"slot {record.slot} already has an immutable handoff sidecar with "
+                    "different contents or source provenance; preserve both versions for "
+                    "manual review"
+                )
             artifact = existing
+            if publication is None or not _json_equal(
+                publication[1], _handoff_artifact_to_obj(artifact)
+            ):
+                raise Refusal(
+                    f"slot {record.slot} existing handoff sidecar has no matching "
+                    "owner-authenticated publication intent; preserve it for manual review"
+                )
+            intent_sequence = publication[0]
+            _complete_handoff_write_publication(
+                config, record, intent_sequence, artifact
+            )
         if (
             not artifact.provenance_complete
             or artifact.source_path is None
@@ -17187,7 +17410,17 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 state = _load_active(config, machine, require_repository=False)
                 record = _find_record(state, slot)
                 _expected_generation(record, generation)
-                _handoff_artifact_from_obj(config, record, raw, target, identity)
+                artifact = _handoff_artifact_from_obj(
+                    config, record, raw, target, identity
+                )
+                authority_kind, intent_sequence, read_payload = (
+                    _assert_handoff_sidecar_publication(
+                        config,
+                        record,
+                        artifact,
+                        allow_outstanding_write=True,
+                    )
+                )
                 _interrupt_for_test("before-handoff-temp-recovery-publish")
                 _rename_noreplace(
                     leftover, target, "recover handoff sidecar publication"
@@ -17200,6 +17433,16 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                     identity,
                     "recovered handoff sidecar",
                 )
+                if authority_kind == "write-handoff":
+                    assert intent_sequence is not None
+                    _complete_handoff_write_publication(
+                        config, record, intent_sequence, artifact
+                    )
+                else:
+                    assert read_payload is not None
+                    _complete_legacy_projection(
+                        config, record, artifact, read_payload
+                    )
                 print(
                     f"recovered handoff sidecar {target.name} from {leftover.name}"
                 )
@@ -17295,6 +17538,14 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                     f"handoff sidecar temp file disagrees with durable target; "
                     f"preserved both {leftover} and {target}"
                 )
+            authority_kind, intent_sequence, read_payload = (
+                _assert_handoff_sidecar_publication(
+                    config,
+                    record,
+                    target_artifact,
+                    allow_outstanding_write=True,
+                )
+            )
             retired = _retired_handoff_temp_path(target, temp_identity)
             if retired.exists() or retired.is_symlink():
                 raise StateError(
@@ -17339,6 +17590,16 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
                 raise StateError(
                     f"durable handoff sidecar changed during temp recovery; "
                     f"preserved both {target} and {retired}"
+                )
+            if authority_kind == "write-handoff":
+                assert intent_sequence is not None
+                _complete_handoff_write_publication(
+                    config, record, intent_sequence, target_artifact
+                )
+            else:
+                assert read_payload is not None
+                _complete_legacy_projection(
+                    config, record, target_artifact, read_payload
                 )
             print(
                 f"quarantined exact duplicate handoff temp {leftover.name}; "
