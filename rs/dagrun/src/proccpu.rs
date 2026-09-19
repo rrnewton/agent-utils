@@ -7,6 +7,10 @@
 //!
 //! This is not cgroup accounting: escaped groups and activity between samples can be
 //! missed. Ambiguous, missing or resource-limited evidence is unavailable, never zero.
+//! One shared observation retains at most 1024 members across 256 registered groups,
+//! with a one-second scan deadline and 64 descriptors reserved below the soft limit.
+//! Descriptor pressure can lower this ceiling. A shared refusal affects all readers
+//! of that snapshot; it does not permit a partial population to be reported.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -56,14 +60,19 @@ fn check(deadline: Instant) -> Result<(), Unavailable> {
         Ok(())
     }
 }
-fn clk_tck() -> f64 {
+fn checked_clk_tck(value: libc::c_long) -> Result<f64, Unavailable> {
+    if value > 0 {
+        Ok(value as f64)
+    } else {
+        Err(unavailable(&format!(
+            "SC_CLK_TCK unavailable: nonpositive value {value}"
+        )))
+    }
+}
+fn clk_tck() -> Result<f64, Unavailable> {
     // SAFETY: sysconf is a query with no pointer arguments.
     let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if value > 0 {
-        value as f64
-    } else {
-        100.0
-    }
+    checked_clk_tck(value)
 }
 fn gone(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
@@ -174,6 +183,23 @@ fn fd_pid(text: &str) -> Result<i64, Unavailable> {
 struct Proc {
     root: File,
 }
+fn verify_namespace_status(status: &str, pid: u32) -> Result<(), Unavailable> {
+    let namespaces: Vec<_> = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NSpid:"))
+        .map(str::split_whitespace)
+        .map(Iterator::collect::<Vec<_>>)
+        .collect();
+    if namespaces.is_empty() {
+        return Err(unavailable(
+            "procfs namespace metadata unavailable: NSpid missing",
+        ));
+    }
+    if namespaces != vec![vec![pid.to_string().as_str()]] {
+        return Err(unavailable("procfs PID namespace mismatch"));
+    }
+    Ok(())
+}
 impl Proc {
     fn new(path: &Path) -> Result<Self, Unavailable> {
         allow_fds(2)?;
@@ -193,15 +219,7 @@ impl Proc {
         let proc = Self { root };
         let deadline = Instant::now() + SCAN_TIME;
         let status = read_record(&proc.open("self/status", deadline)?, deadline)?;
-        let namespaces: Vec<_> = status
-            .lines()
-            .filter_map(|line| line.strip_prefix("NSpid:"))
-            .map(str::split_whitespace)
-            .map(Iterator::collect::<Vec<_>>)
-            .collect();
-        if namespaces != vec![vec![std::process::id().to_string().as_str()]] {
-            return Err(unavailable("procfs PID namespace mismatch"));
-        }
+        verify_namespace_status(&status, std::process::id())?;
         let own = stat(&read_record(&proc.open("self/stat", deadline)?, deadline)?)?;
         if own.pid != std::process::id() {
             return Err(unavailable("procfs PID namespace mismatch"));
@@ -584,7 +602,7 @@ impl Registry {
             .map_err(Clone::clone)?
             .get(&owner.key)
             .ok_or_else(|| unavailable("no measured members"))?;
-        Ok(*ticks as f64 / clk_tck())
+        Ok(*ticks as f64 / clk_tck()?)
     }
 }
 
@@ -716,7 +734,7 @@ mod tests {
         let got = synthetic_seconds(100, root).unwrap();
         // (10+5+20+5) + (30) = 70 ticks
         assert!(
-            (got - 70.0 / clk_tck()).abs() < 1e-9,
+            (got - 70.0 / clk_tck().unwrap()).abs() < 1e-9,
             "expected the two group members' own+reaped CPU and nothing from the stranger, got {got}"
         );
     }
@@ -791,7 +809,7 @@ mod tests {
         )
         .ok()?
         .get(&pgid)
-        .map(|ticks| *ticks as f64 / clk_tck())
+        .and_then(|ticks| clk_tck().ok().map(|rate| *ticks as f64 / rate))
     }
 
     #[test]
@@ -1022,7 +1040,7 @@ mod tests {
         assert!(pair.original.ticks > 0);
         assert!(pair.valid(Instant::now() + SCAN_TIME).unwrap());
         let before = reader.seconds().unwrap();
-        assert!(before >= pair.original.ticks as f64 / clk_tck());
+        assert!(before >= pair.original.ticks as f64 / clk_tck().unwrap());
         child.send(b'r');
         assert_eq!(child.line(), "reaped");
         assert!(!pair.valid(Instant::now() + SCAN_TIME).unwrap());
@@ -1309,5 +1327,245 @@ mod tests {
         println!("native ptrace reparent pid={} tracee={tracee} zombie_ticks={} ptracer_waited={before_waited} before_cpu={before} after_cpu={after}", child.child.id(), pair.original.ticks);
         child.send(b'x');
         assert!(child.child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn positive_clock_rate_and_namespace_metadata_are_required() {
+        assert_eq!(checked_clk_tck(100).unwrap(), 100.0);
+        assert_eq!(checked_clk_tck(250).unwrap(), 250.0);
+        for value in [0, -1] {
+            assert!(checked_clk_tck(value)
+                .unwrap_err()
+                .to_string()
+                .contains("SC_CLK_TCK unavailable"));
+        }
+        assert!(verify_namespace_status("NSpid:\t100\n", 100).is_ok());
+        assert!(verify_namespace_status("Name:\ttest\n", 100)
+            .unwrap_err()
+            .to_string()
+            .contains("NSpid missing"));
+        for text in ["NSpid: 100 1\n", "NSpid: 101\n", "NSpid: 100\nNSpid: 100\n"] {
+            assert!(verify_namespace_status(text, 100).is_err());
+        }
+    }
+
+    fn run_isolated_native_case(name: &str) -> bool {
+        use std::io::Write;
+
+        const CASE: &str = "AU_PROCCPU_ISOLATED_CASE";
+        match std::env::var(CASE) {
+            Ok(case) => {
+                assert_eq!(case, name, "unexpected isolated test recursion marker");
+                return false;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("invalid isolated test recursion marker: {error}"),
+        }
+        eprintln!(
+            "native isolated case start: {name} parent={} thread={:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CASE, name)
+            .output()
+            .unwrap();
+        std::io::stdout().lock().write_all(&output.stdout).unwrap();
+        std::io::stderr().lock().write_all(&output.stderr).unwrap();
+        eprintln!(
+            "native isolated case finish: {name} status={}",
+            output.status
+        );
+        assert!(output.status.success(), "isolated case failed: {name}");
+        true
+    }
+
+    #[test]
+    fn native_public_compatibility_and_unusual_comm() {
+        if run_isolated_native_case("proccpu::tests::native_public_compatibility_and_unusual_comm")
+        {
+            return;
+        }
+        let mut child = Native::start("comm");
+        let zombie = child.line().parse::<u32>().unwrap();
+        let raw = fs::read(format!("/proc/{zombie}/stat")).unwrap();
+        assert!(raw.windows(6).any(|bytes| bytes == b"p\xff)\n(\x80"));
+        let pid = child.child.id();
+        let first = subtree_cpu_seconds(pid).unwrap();
+        assert!(first > 0.0);
+        let key = registry().lock().unwrap().compatibility[&pid].0.key;
+        assert_eq!(subtree_cpu_seconds(pid), Some(first));
+        assert_eq!(registry().lock().unwrap().compatibility[&pid].0.key, key);
+        assert!(subtree_cpu_seconds_in(pid, Path::new("/proc")).unwrap() >= first);
+        std::thread::sleep(SNAPSHOT_TTL + Duration::from_millis(50));
+        assert!(subtree_cpu_seconds(pid).unwrap() >= first);
+        assert_ne!(registry().lock().unwrap().compatibility[&pid].0.key, key);
+        child.send(b'r');
+        assert_eq!(child.line(), "reaped");
+        child.send(b'x');
+        assert!(child.child.wait().unwrap().success());
+        assert_eq!(subtree_cpu_seconds(pid), None);
+        assert!(!registry().lock().unwrap().compatibility.contains_key(&pid));
+    }
+
+    #[test]
+    fn native_shared_sampling_cost_and_availability() {
+        if run_isolated_native_case("proccpu::tests::native_shared_sampling_cost_and_availability")
+        {
+            return;
+        }
+        fn self_cpu() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // SAFETY: usage is writable storage; this only observes the test process.
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
+            let usage = unsafe { usage.assume_init() };
+            usage.ru_utime.tv_sec as f64
+                + usage.ru_utime.tv_usec as f64 / 1e6
+                + usage.ru_stime.tv_sec as f64
+                + usage.ru_stime.tv_usec as f64 / 1e6
+        }
+        for groups in [1, 4, 16] {
+            let before = fs::read_dir("/proc/self/fd").unwrap().count();
+            let mut children = Vec::new();
+            let mut readers = Vec::new();
+            for _ in 0..groups {
+                let mut child = Native::start("zombie");
+                child.line();
+                readers.push(ProcessGroupCpu::new(child.child.id()).unwrap());
+                children.push(child);
+            }
+            registry().lock().unwrap().snapshot = None;
+            let first_start = Instant::now();
+            let first_cpu = self_cpu();
+            for reader in &readers {
+                assert!(reader.seconds().unwrap() > 0.0);
+            }
+            let first_cpu = self_cpu() - first_cpu;
+            let first_seconds = first_start.elapsed().as_secs_f64();
+            let captured = registry()
+                .lock()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .captured;
+            let cached_start = Instant::now();
+            let cached_cpu = self_cpu();
+            for _ in 0..10 {
+                for reader in &readers {
+                    assert!(reader.seconds().unwrap() > 0.0);
+                }
+            }
+            let cached_cpu = self_cpu() - cached_cpu;
+            let cached_seconds = cached_start.elapsed().as_secs_f64();
+            let one_snapshot = registry()
+                .lock()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .captured
+                == captured;
+            let held = fs::read_dir("/proc/self/fd").unwrap().count();
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            // SAFETY: writable rlimit storage for an observation only; no limits change.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+                0
+            );
+            let limit = unsafe { limit.assume_init() };
+            println!(
+                "PROCCPU_COST {}",
+                serde_json::json!({"edition":"rust","groups":groups,"matching_processes":groups*2,"first_wall_s":first_seconds,"first_self_cpu_s":first_cpu,"cached_wall_s":cached_seconds,"cached_self_cpu_s":cached_cpu,"cached_calls":groups*10,"one_cached_snapshot":one_snapshot,"fd_before":before,"fd_held":held,"rlimit_nofile":[limit.rlim_cur,limit.rlim_max]})
+            );
+            drop(readers);
+            for child in &mut children {
+                child.send(b'r');
+                assert_eq!(child.line(), "reaped");
+                child.send(b'x');
+                assert!(child.child.wait().unwrap().success());
+            }
+            drop(children);
+            assert_eq!(fs::read_dir("/proc/self/fd").unwrap().count(), before);
+        }
+    }
+
+    #[test]
+    fn native_scheduler_retains_constructor_and_sample_failure_reasons() {
+        const CASE: &str = "AU_PROCCPU_REASON_CONTROL";
+        if let Ok(stage) = std::env::var(CASE) {
+            fn pressure() {
+                let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                // SAFETY: only this isolated test subprocess lowers its own soft FD limit.
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+                    0
+                );
+                let mut limit = unsafe { limit.assume_init() };
+                limit.rlim_cur = 64;
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            }
+            let watcher = match stage.as_str() {
+                "registration" => {
+                    pressure();
+                    None
+                }
+                "observation" => Some(std::thread::spawn(|| {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        if registry()
+                            .lock()
+                            .unwrap()
+                            .owners
+                            .values()
+                            .any(|owner| owner.strong_count() > 0)
+                        {
+                            pressure();
+                            return;
+                        }
+                        assert!(Instant::now() < deadline, "registration event deadline");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                })),
+                _ => panic!("unknown isolated reason case"),
+            };
+            let cfg = crate::io::dag_from_json(r#"{"steps":[{"group":"g","job":"quiet","desc":"known refusal","cmd":"sleep 2.5","cpu_timeout":1,"timeout":30}]}"#).unwrap();
+            let result = crate::scheduler::run_dag(&cfg, 1, false, 0);
+            assert!(result.ok);
+            if let Some(watcher) = watcher {
+                watcher.join().unwrap();
+            }
+            return;
+        }
+        for stage in ["registration", "observation"] {
+            let logs = TmpRoot::new("reason-log");
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(logs.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "proccpu::tests::native_scheduler_retains_constructor_and_sample_failure_reasons", "--nocapture"])
+                .env(CASE, stage).env(crate::attribution::LOG_DIR_ENV, logs.path()).output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{stage}: {stderr} {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(stderr.matches("CANNOT be enforced").count(), 1, "{stderr}");
+            assert!(
+                stderr.contains(&format!("{stage} failed: descriptor reserve")),
+                "{stderr}"
+            );
+            if stage == "registration" {
+                assert!(
+                    stderr.contains("not retried after waiting starts"),
+                    "{stderr}"
+                );
+            }
+            println!("native scheduler reason {stage}: {stderr}");
+        }
     }
 }

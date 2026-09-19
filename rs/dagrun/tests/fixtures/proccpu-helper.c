@@ -111,7 +111,8 @@ int main(int argc, char **argv) {
         if (pthread_create(&thread, NULL, worker, NULL)) return 3;
         pthread_exit(NULL);
     }
-    if (strcmp(argv[1], "zombie")) return 4;
+    if (!strcmp(argv[1], "comm") && prctl(PR_SET_NAME, "p\xff)\n(\x80")) return 52;
+    if (strcmp(argv[1], "zombie") && strcmp(argv[1], "comm")) return 4;
     pid_t pid = fork();
     if (pid < 0) return 5;
     if (!pid) { burn(); _exit(0); }

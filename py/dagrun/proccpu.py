@@ -8,6 +8,10 @@ terminal pidfd we therefore reread the *held, paired* stat file and retain only 
 This is not cgroup accounting. Escaped process groups and activity between samples
 can be missed. Missing, ambiguous or resource-limited observations are unavailable,
 never zero. Successful observations are shared for at most half a second.
+One shared observation retains at most 1024 members across 256 registered groups,
+with a one-second scan deadline and 64 descriptors reserved below the soft limit.
+Descriptor pressure can lower this ceiling. A shared refusal affects all readers
+of that snapshot; it does not permit a partial population to be reported.
 """
 
 from __future__ import annotations
@@ -37,11 +41,21 @@ _MAX_INTERRUPTS = 16
 _SCAN_SECONDS = 1.0
 _SNAPSHOT_TTL_S = 0.5
 _U64_MAX = (1 << 64) - 1
-_CLK_TCK = os.sysconf("SC_CLK_TCK")
 
 
 class Unavailable(Exception):
     """No complete, authenticated CPU observation is available."""
+
+
+def _clk_tck() -> float:
+    """A missing unit conversion is unavailable, never an invented rate."""
+    try:
+        value = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError) as exc:
+        raise Unavailable(f"SC_CLK_TCK unavailable: {exc}") from exc
+    if value <= 0:
+        raise Unavailable(f"SC_CLK_TCK unavailable: nonpositive value {value}")
+    return float(value)
 
 
 def _check(deadline: float) -> None:
@@ -192,6 +206,8 @@ class _Proc:
             finally:
                 os.close(statusfd)
             namespaces = [line.split()[1:] for line in status.splitlines() if line.startswith("NSpid:")]
+            if not namespaces:
+                raise Unavailable("procfs namespace metadata unavailable: NSpid missing")
             if namespaces != [[str(os.getpid())]]:
                 raise Unavailable("procfs PID namespace mismatch")
             with os.fdopen(self.open("self/stat"), "rb") as record:
@@ -448,7 +464,7 @@ class ProcessGroupCpu:
                     self._authenticate(deadline)
                     if self.pgid not in totals:
                         raise Unavailable("no measured members")
-                    return totals[self.pgid] / _CLK_TCK
+                    return totals[self.pgid] / _clk_tck()
                 if self.key not in _snapshot_keys or time.monotonic() - _snapshot_at > _SNAPSHOT_TTL_S:
                     owners = list(_owners.values())
                     active: list[ProcessGroupCpu] = []
@@ -484,7 +500,7 @@ class ProcessGroupCpu:
                     raise Unavailable(_snapshot_error)
                 if self.key not in _snapshot:
                     raise Unavailable("no measured members")
-                return _snapshot[self.key] / _CLK_TCK
+                return _snapshot[self.key] / _clk_tck()
         except OSError as exc:
             raise Unavailable(str(exc)) from exc
 

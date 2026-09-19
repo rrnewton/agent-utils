@@ -919,7 +919,10 @@ pub fn uncontained_cpu_budget_warning(cfg: &DagConfig) -> Option<String> {
     Some(format!(
         "UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort \
          procfs process-group CPU floor will police {} step(s) (largest {largest}s), but it can \
-         miss processes that leave the group and activity between observations. `capabilities` cannot \
+         miss processes that leave the group and activity between observations. \
+         A shared snapshot is limited to 1024 process records across 256 groups, a 1s scan, \
+         and available descriptors with a 64-FD reserve; a shared refusal is unavailable \
+         for all its readers and is reported separately. `capabilities` cannot \
          express that quality difference.",
         live.len()
     ))
@@ -3428,10 +3431,19 @@ fn run_step(ctx: StepCtx) {
     };
     let pid = child.id();
     // Bind the invocation before monitor startup; never reauthenticate a recycled PGID.
-    let process_cpu = if !boxed && cpu_budget > 0 {
-        ProcessGroupCpu::new(pid).ok()
+    let (process_cpu, process_cpu_registration_error) = if !boxed && cpu_budget > 0 {
+        match ProcessGroupCpu::new(pid) {
+            Ok(reader) => (Some(reader), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "registration failed: {error}; invocation identity was not retained, \
+                     so registration is not retried after waiting starts"
+                )),
+            ),
+        }
     } else {
-        None
+        (None, None)
     };
     let abort_after_spawn = {
         let mut sh = lock_shared(&shared);
@@ -3684,18 +3696,21 @@ fn run_step(ctx: StepCtx) {
                         continue;
                     }
 
-                    let (measured, source) = if boxed {
+                    let (measured, source, unavailable_reason) = if boxed {
                         (
                             stats.as_ref().and_then(cpu_seconds_from_stats),
                             CPU_SOURCE_CGROUP,
+                            None,
                         )
                     } else {
-                        (
-                            process_cpu
-                                .as_ref()
-                                .and_then(|reader| reader.seconds().ok()),
-                            CPU_SOURCE_PROCFS,
-                        )
+                        let (measured, reason) = match process_cpu.as_ref() {
+                            Some(reader) => match reader.seconds() {
+                                Ok(value) => (Some(value), None),
+                                Err(error) => (None, Some(format!("observation failed: {error}"))),
+                            },
+                            None => (None, process_cpu_registration_error.clone()),
+                        };
+                        (measured, CPU_SOURCE_PROCFS, reason)
                     };
 
                     let Some(cpu_used_s) = measured else {
@@ -3706,10 +3721,13 @@ fn run_step(ctx: StepCtx) {
                             } else {
                                 "procfs process-group CPU accounting"
                             };
+                            let detail = unavailable_reason
+                                .map(|reason| format!(" Reason: {reason}."))
+                                .unwrap_or_default();
                             eprintln!(
                                 "[scheduler] \u{26a0} step {t:?}: {mechanism} is unavailable, \
                                  so the {cpu_timeout}s CPU-time budget CANNOT be enforced for \
-                                 this step; only the wall timeout still applies."
+                                 this step; only the wall timeout still applies.{detail}"
                             );
                         }
                         continue;
