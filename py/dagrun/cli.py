@@ -99,6 +99,7 @@ from dagrun.profile_enrich import container_core_budget
 from dagrun.protocols import CgroupManager, MetricsSink, RunWindow, StepOutcome
 from dagrun.reservation import Reservation
 from dagrun.scheduler import (
+    _checked_jobs_env_export,
     MAX_PROFILE_TIMESERIES_INTERVAL_S,
     MIN_PROFILE_TIMESERIES_INTERVAL_S,
     _self_managed_width_error,
@@ -2393,9 +2394,10 @@ def _profiled_step(base_step: Step, cfg: DagConfig, request: IsolatedTrialReques
         base_step, cfg.default_jobs_flag, request.inner_jobs
     )
     inner_env = dict(request.env)
-    inner_env.update(
-        env_with_inner_jobs(base_step, cfg.default_jobs_env, request.inner_jobs)
-    )
+    jobs_env = env_with_inner_jobs(base_step, cfg.default_jobs_env, request.inner_jobs)
+    for name, value in jobs_env.items():
+        inner_env.pop(name, None)
+        guest_command = _checked_jobs_env_export(name, value) + guest_command
     inner_env.update(cmdtype_env_with_inner_jobs(base_step, request.inner_jobs))
     ready_path = shlex.quote(str(request.guest_launch_ready_path))
     release_path = shlex.quote(str(request.guest_launch_release_path))
@@ -2411,8 +2413,12 @@ def _profiled_step(base_step: Step, cfg: DagConfig, request: IsolatedTrialReques
         f"{guest_command}"
     )
     argv = list(request.argv_prefix)
-    if inner_env:
+    if inner_env or jobs_env:
         argv.append("env")
+        # The profiler wrapper opts out of scheduler injection. Its actual guest Bash must
+        # also start without the channel, including an inherited or request-provided value.
+        for name in jobs_env:
+            argv.extend(("-u", name))
         argv.extend(f"{name}={value}" for name, value in sorted(inner_env.items()))
     argv.extend(("bash", "-c", guest_command))
     # The guest width is already rendered inside the profiler wrapper. Neutralize scheduler-side

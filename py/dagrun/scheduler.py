@@ -176,6 +176,46 @@ def stream_split_notice(limit_bytes: int) -> str:
     )
 
 
+_JOBS_ENV_PROBE_VALUE = "__dagrun_jobs_env_capability_probe__"
+
+
+def _checked_jobs_env_export(name: str, value: str) -> str:
+    """Assign ``name`` only after bash and a child process preserve arbitrary text.
+
+    The configured key is deliberately absent from the outer ``bash`` environment (see the spawn
+    path below), so startup-sensitive variables cannot act before this guard. The non-numeric
+    probe prevents a dynamic numeric parameter from passing by coincidence -- ``LINENO=1`` used
+    to pass when the guard itself happened to be on line one. ``printenv`` is an independent
+    process boundary, proving the exported value is what a real build tool will inherit.
+    """
+    quoted_probe = shlex.quote(_JOBS_ENV_PROBE_VALUE)
+    quoted_value = shlex.quote(value)
+    child_probe = shlex.quote(
+        f'[ "${{{name}-}}" = "$1" ] && '
+        f'[ "$(/usr/bin/printenv {name} 2>/dev/null)" = "$1" ]'
+    )
+    failure = shlex.quote(
+        f"dagrun: ERROR: jobs environment variable {name} did not retain "
+        f"assigned width {value}; refusing guest command"
+    )
+    return (
+        f"if ! export {name}={quoted_probe} || "
+        f"[ \"${{{name}-}}\" != {quoted_probe} ] || "
+        f"[ \"$(/usr/bin/printenv {name} 2>/dev/null)\" != {quoted_probe} ] || "
+        f"! /bin/bash --noprofile --norc -c {child_probe} "
+        f"dagrun-jobs-env-probe {quoted_probe}; then\n"
+        f"  printf '%s\\n' {failure} >&2\n"
+        "  exit 125\n"
+        "fi\n"
+        f"if ! export {name}={quoted_value} || "
+        f"[ \"${{{name}-}}\" != {quoted_value} ] || "
+        f"[ \"$(/usr/bin/printenv {name} 2>/dev/null)\" != {quoted_value} ]; then\n"
+        f"  printf '%s\\n' {failure} >&2\n"
+        "  exit 125\n"
+        "fi\n"
+    )
+
+
 class BudgetUnit(Enum):
     """The quantity a per-step budget bounds, and the ONLY unit a breach may be reported in.
 
@@ -1413,7 +1453,10 @@ class Runner:
         # Deliver the width through this machine's env channel when it has one. Empty overlay
         # when the host configured none, so behaviour is unchanged where nothing is set.
         jobs_env = env_with_inner_jobs(step, self.cfg.default_jobs_env, inner_jobs)
-        env.update(jobs_env)
+        # Do not expose the assigned channel before Bash startup. The final guard below
+        # checks it and injects the admitted integer after the scope wrapper's exports.
+        for name in jobs_env:
+            env.pop(name, None)
         cmdtype_env = cmdtype_env_with_inner_jobs(step, inner_jobs)
         env.pop(DAGRUN_EXTRA_ARGS_ENV, None)
         env.update(cmdtype_env)
@@ -1457,29 +1500,8 @@ class Runner:
         # declares no preferred_inner_jobs.
         base_cmd = command_with_inner_jobs(step, self.cfg.default_jobs_flag, inner_jobs)
         if jobs_env:
-            # The real cgroup wrapper exports its scope/operator CARGO_BUILD_JOBS before running
-            # ``base_cmd``. Put the per-step allocation at the final command boundary as well as
-            # in Popen's environment so a configured CARGO_BUILD_JOBS channel wins there. The
-            # name was validated before any node could spawn and the value is a decimal integer.
             name, env_value = next(iter(jobs_env.items()))
-            quoted_value = shlex.quote(env_value)
-            failure = shlex.quote(
-                f"dagrun: ERROR: jobs environment variable {name} did not retain "
-                f"assigned width {env_value}; refusing guest command"
-            )
-            # Assignment success is not enough for shell-managed names: for example bash reports
-            # BASHOPTS as readonly but continues to the next command with status zero overall.
-            # Test both the export status and an exact readback before the user's command exists
-            # in the control flow. This is fail-closed without maintaining a brittle shell-name
-            # denylist.
-            base_cmd = (
-                f"if ! export {name}={quoted_value} || "
-                f"[ \"${{{name}-}}\" != {quoted_value} ]; then\n"
-                f"  printf '%s\\n' {failure} >&2\n"
-                "  exit 125\n"
-                "fi\n"
-                f"{base_cmd}"
-            )
+            base_cmd = _checked_jobs_env_export(name, env_value) + base_cmd
 
         # When per-step cgroups are enabled, prepare_command wraps the command so the bash
         # leader self-moves into the step's child cgroup BEFORE forking any grandchild (the

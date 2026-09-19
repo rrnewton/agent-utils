@@ -1224,6 +1224,54 @@ def test_single_step_measure_preserves_exact_child_returncode() -> None:
     assert measure.returncode == 37
 
 
+@pytest.mark.parametrize(("channel", "width", "refused", "observe_startup"), (
+    ("CARGO_BUILD_JOBS", 1, False, False),
+    ("CARGO_BUILD_JOBS", 4, False, False),
+    ("LINENO", 1, True, False),
+    ("IFS", 1, True, False),
+    ("WORKER_JOBS", 2, False, True),
+))
+def test_jobs_env_profiled_guest_boundary(
+    tmp_path: Path, channel: str, width: int, refused: bool, observe_startup: bool,
+) -> None:
+    from dagrun.model import ResourceHint
+
+    profiler = tmp_path / "profiler"
+    guest = tmp_path / "guest"
+    startup = tmp_path / "startup"
+    hook = tmp_path / "startup.sh"
+    hook.write_text(f"printf '%s\\n' \"${{{channel}-unset}}\" >> {shlex.quote(str(startup))}\n")
+    step = Step("g", "j", "", f"printf '%s' \"${{{channel}-}}\" > {shlex.quote(str(guest))}",
+                jobs_flag="", hint=ResourceHint(preferred_inner_jobs=width),
+                env={channel: "99"})
+    request = IsolatedTrialRequest(
+        trial_id="jobs-env", step=step.tag, inner_jobs=width, kind=CaptureKind.PERF,
+        output_dir=tmp_path, expected_wall_s=1.0,
+        window=CaptureWindow(0.02, 0.0, 0.02, False),
+        argv_prefix=("/bin/bash", "-c", 'printf started > "$1"; shift; exec "$@"',
+                     "profiler", str(profiler)),
+        env={channel: "88", **({"BASH_ENV": str(hook)} if observe_startup else {})},
+    )
+    # Exercise the real shell handshake, using local regular files rather than a capture
+    # controller. This tests inner command execution, not FIFO/controller timing or real perf.
+    request.guest_launch_release_path.write_text("go\n")
+    cfg = DagConfig(steps=(step,), default_jobs_env=channel)
+    wrapped = cli._profiled_step(step, cfg, request)
+    assert wrapped.jobs_env == "" and wrapped.jobs_flag == ""
+    result = cli._run_single_step(wrapped, cfg, width, None, None, 0)
+    assert profiler.read_text() == "started"
+    assert int(request.guest_launch_ready_path.read_text()) > 0
+    if refused:
+        assert not result.ok
+        assert result.returncode == 125
+        assert not guest.exists(), "profiler startup is not proof that the guest was protected"
+    else:
+        assert result.ok and result.returncode == 0
+        assert guest.read_text() == str(width)
+        if observe_startup:
+            assert startup.read_text().splitlines()[0] == "unset"
+
+
 def test_target_profiler_capture_runs_after_pass_one_and_consumes_target_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -3188,13 +3188,24 @@ fn capture_termination_evidence(
     culprit
 }
 
-fn checked_jobs_env_export(name: &str, value: &str) -> String {
+pub(crate) fn checked_jobs_env_export(name: &str, value: &str) -> String {
+    const PROBE: &str = "__dagrun_jobs_env_capability_probe__";
     let failure = format!(
         "dagrun: ERROR: jobs environment variable {name} did not retain assigned width {value}; \
          refusing guest command"
     );
+    let child_probe = format!(
+        "'[ \"${{{name}-}}\" = \"$1\" ] && \
+         [ \"$(/usr/bin/printenv {name} 2>/dev/null)\" = \"$1\" ]'"
+    );
     format!(
-        "if ! export {name}={value} || [ \"${{{name}-}}\" != {value} ]; then\n  \
+        "if ! export {name}={PROBE} || [ \"${{{name}-}}\" != {PROBE} ] || \
+         [ \"$(/usr/bin/printenv {name} 2>/dev/null)\" != {PROBE} ] || \
+         ! /bin/bash --noprofile --norc -c {child_probe} \
+         dagrun-jobs-env-probe {PROBE}; then\n  \
+         printf '%s\\n' '{failure}' >&2\n  exit 125\nfi\n\
+         if ! export {name}={value} || [ \"${{{name}-}}\" != {value} ] || \
+         [ \"$(/usr/bin/printenv {name} 2>/dev/null)\" != {value} ]; then\n  \
          printf '%s\\n' '{failure}' >&2\n  exit 125\nfi\n"
     )
 }
@@ -3363,9 +3374,10 @@ fn run_step(ctx: StepCtx) {
     // that step's process tree and must not ask for the same capacity again, which would wait on
     // itself forever. Independent top-level runners receive the path from their own launcher.
     cmd.env_remove(crate::resource_caps::PATH_ENV);
-    if let Some((name, value)) = &jobs_env {
-        // Runner authority wins over a DAG-supplied value on the same channel.
-        cmd.env(name, value);
+    if let Some((name, _)) = &jobs_env {
+        // Remove the channel before Bash startup; the final guard installs the admitted
+        // integer after the scope wrapper's exports and checks ordinary child inheritance.
+        cmd.env_remove(name);
     }
     // Runner authority also wins over the configurable jobs-env channel. The tag identifies
     // which outer node launched a nested scheduler; DAGRUN_STEP remains the ownership token.
@@ -8102,6 +8114,60 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             .summary
             .contains("did not retain assigned width 1"));
         assert!(!output.exists(), "the guest command must not run");
+    }
+
+    #[test]
+    fn jobs_env_dynamic_lineno_refuses_before_guest() {
+        let output = jobs_env_output("dynamic_lineno");
+        let cfg = jobs_env_cfg(&output, "LINENO");
+        let result = run_dag_limited(&cfg, 1, 1, false, 0);
+        assert!(!result.ok);
+        assert_eq!(result.outcomes[0].returncode, Some(125));
+        assert!(result.outcomes[0]
+            .summary
+            .contains("did not retain assigned width 1"));
+        assert!(!output.exists(), "the guest command must not run");
+    }
+
+    #[test]
+    fn jobs_env_fresh_bash_ifs_reset_refuses_before_guest() {
+        let output = jobs_env_output("fresh_bash_ifs");
+        let cfg = jobs_env_cfg(&output, "IFS");
+        let result = run_dag_limited(&cfg, 1, 1, false, 0);
+        assert!(!result.ok);
+        assert_eq!(result.outcomes[0].returncode, Some(125));
+        assert!(result.outcomes[0]
+            .summary
+            .contains("did not retain assigned width 1"));
+        assert!(!output.exists(), "the guest command must not run");
+    }
+
+    #[test]
+    fn jobs_env_startup_sees_no_channel_then_guest_sees_admitted_width() {
+        let output = jobs_env_output("startup_guest");
+        let startup = jobs_env_output("startup_observation");
+        let hook = jobs_env_output("startup_hook");
+        std::fs::write(
+            &hook,
+            "printf '%s\\n' \"${CARGO_BUILD_JOBS-unset}\" >> \"$STARTUP_PATH\"\n",
+        )
+        .unwrap();
+        let mut cfg = jobs_env_cfg(&output, "CARGO_BUILD_JOBS");
+        cfg.steps[0]
+            .env
+            .insert("BASH_ENV".to_string(), hook.to_string_lossy().into_owned());
+        cfg.steps[0].env.insert(
+            "STARTUP_PATH".to_string(),
+            startup.to_string_lossy().into_owned(),
+        );
+        let result = run_dag_limited(&cfg, 1, 1, false, 0);
+        assert!(result.ok);
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "1");
+        let observations = std::fs::read_to_string(&startup).unwrap();
+        assert_eq!(observations.lines().next(), Some("unset"));
+        for path in [output, startup, hook] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

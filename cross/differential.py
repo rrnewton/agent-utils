@@ -7107,7 +7107,7 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
         width_leg("unboxed-roomy", 8, "4", boxed=False)
         width_leg("boxed-narrow", 1, "1", boxed=True)
 
-        def readonly_leg(label: str, *, boxed: bool) -> None:
+        def readonly_leg(label: str, channel: str = "BASHOPTS", *, boxed: bool) -> None:
             outcomes: dict[str, Outcome] = {}
             spawned: dict[str, bool] = {}
             for name, command in (("py", py), ("rs", rs)):
@@ -7125,7 +7125,7 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                 if not boxed:
                     args.append("--unsafe-no-cgroups")
                 env = {
-                    "DAGRUN_JOBS_ENV": "BASHOPTS",
+                    "DAGRUN_JOBS_ENV": channel,
                     "OBSERVED_PATH": str(output),
                     "DAGRUN_NO_STEP_LOGS": "1",
                 }
@@ -7152,11 +7152,13 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
             else:
                 rep.bad(
                     check,
-                    "readonly BASHOPTS must fail before the guest command; "
+                    f"shell-managed {channel} must fail before the guest command; "
                     f"outcomes={outcomes} spawned={spawned}",
                 )
 
         readonly_leg("unboxed-readonly", boxed=False)
+        readonly_leg("unboxed-dynamic", "LINENO", boxed=False)
+        readonly_leg("unboxed-fresh-bash", "IFS", boxed=False)
         readonly_leg("boxed-readonly", boxed=True)
 
         for leg, extra, phrase in (
@@ -7165,6 +7167,14 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                 "malformed",
                 {"DAGRUN_JOBS_ENV": "NOT=A=NAME"},
                 "valid environment variable name",
+            ),
+            *(
+                (f"startup-control-{name.lower()}", {"DAGRUN_JOBS_ENV": name},
+                 "shell startup/control variable")
+                for name in (
+                    "BASH_COMPAT", "BASH_ENV", "BASH_XTRACEFD", "CDPATH", "ENV",
+                    "EXECIGNORE", "GLOBIGNORE", "PATH", "POSIXLY_CORRECT",
+                )
             ),
             (
                 "retired-name-ignored",

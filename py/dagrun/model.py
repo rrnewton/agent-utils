@@ -459,6 +459,14 @@ _RUNNER_ENV_NAMES = frozenset(
 )
 
 
+# These assignable names change shell startup/control rather than carrying a worker count.
+# Dynamic/readonly parameters are handled by the final shell capability probe.
+_SHELL_CONTROL_JOBS_ENV_NAMES = frozenset({
+    "BASH_COMPAT", "BASH_ENV", "BASH_XTRACEFD", "CDPATH", "ENV",
+    "EXECIGNORE", "GLOBIGNORE", "PATH", "POSIXLY_CORRECT",
+})
+
+
 def resolve_jobs_env(
     explicit: str | None = None,
     env: Mapping[str, str] | None = None,
@@ -484,6 +492,11 @@ def resolve_jobs_env(
     if raw in _RUNNER_ENV_NAMES:
         raise ValueError(
             f"{JOBS_ENV_ENV}={raw!r} is reserved by dagrun and cannot carry a step's worker count"
+        )
+    if raw in _SHELL_CONTROL_JOBS_ENV_NAMES:
+        raise ValueError(
+            f"{JOBS_ENV_ENV}={raw!r} is a shell startup/control variable, not a safe "
+            "jobs environment channel"
         )
     return raw
 

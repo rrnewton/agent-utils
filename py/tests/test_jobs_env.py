@@ -69,6 +69,74 @@ def test_host_declares_the_channel_and_the_graph_does_not_have_to() -> None:
     assert env_with_inner_jobs(step, "CARGO_BUILD_JOBS", 4) == {"CARGO_BUILD_JOBS": "4"}
 
 
+@pytest.mark.parametrize("name", (
+    "BASH_COMPAT", "BASH_ENV", "BASH_XTRACEFD", "CDPATH", "ENV",
+    "EXECIGNORE", "GLOBIGNORE", "PATH", "POSIXLY_CORRECT",
+))
+def test_jobs_env_shell_controls_refused_at_every_configuration_boundary(name: str) -> None:
+    with pytest.raises(ValueError, match="shell startup/control variable"):
+        resolve_jobs_env(env={JOBS_ENV_ENV: name})
+    with pytest.raises(ValueError, match="shell startup/control variable"):
+        step_width_is_resizable(_step(jobs_env=name, jobs_flag="-j%d"), "-j", "")
+    for doc in (
+        {"default_jobs_env": name, "steps": []},
+        {"steps": [{"group": "g", "job": "j", "cmd": "true", "jobs_env": name}]},
+    ):
+        with pytest.raises(DagJsonError, match="shell startup/control variable"):
+            dag_from_json(json.dumps(doc))
+
+
+@pytest.mark.parametrize("name", ("LINENO", "IFS"))
+def test_jobs_env_dynamic_or_fresh_shell_reset_refuses_guest(tmp_path: Path, name: str) -> None:
+    marker = tmp_path / "guest"
+    step = Step("g", "j", "", f"printf ran > {shlex.quote(str(marker))}",
+                jobs_flag="", hint=ResourceHint(preferred_inner_jobs=1))
+    result = run_dag_limited(DagConfig(steps=(step,), default_jobs_env=name),
+                             max_steps=1, max_cpus=1, cgroups=None, verbosity=0)
+    assert not result.ok
+    assert result.outcomes[0].returncode == 125
+    assert "did not retain assigned width 1" in result.outcomes[0].summary
+    assert not marker.exists(), "the guest command must not run"
+
+
+def test_jobs_env_removed_before_bash_startup_then_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = tmp_path / "startup"
+    guest = tmp_path / "guest"
+    hook = tmp_path / "startup.sh"
+    hook.write_text(f"printf '%s\\n' \"${{WORKER_JOBS-unset}}\" >> {shlex.quote(str(observed))}\n")
+    monkeypatch.setenv("WORKER_JOBS", "77")
+    step = Step("g", "j", "", f"printf '%s' \"$WORKER_JOBS\" > {shlex.quote(str(guest))}",
+                jobs_flag="", hint=ResourceHint(preferred_inner_jobs=2),
+                env={"WORKER_JOBS": "99", "BASH_ENV": str(hook)})
+    result = run_dag_limited(DagConfig(steps=(step,), default_jobs_env="WORKER_JOBS"),
+                             max_steps=1, max_cpus=2, cgroups=None, verbosity=0)
+    assert result.ok
+    assert guest.read_text() == "2"
+    assert observed.read_text().splitlines()[0] == "unset"
+
+
+def test_jobs_env_startup_channel_cannot_execute_before_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    startup = tmp_path / "startup"
+    guest = tmp_path / "guest"
+    (tmp_path / "1").write_text(f"printf started > {shlex.quote(str(startup))}\n")
+    step = Step("g", "j", "", f"printf ran > {shlex.quote(str(guest))}",
+                jobs_flag="", hint=ResourceHint(preferred_inner_jobs=1))
+    error = None
+    try:
+        run_dag_limited(DagConfig(steps=(step,), default_jobs_env="BASH_ENV"),
+                        max_steps=1, max_cpus=1, cgroups=None, verbosity=0)
+    except ValueError as exc:
+        error = str(exc)
+    assert error is not None and "shell startup/control variable" in error
+    assert not startup.exists()
+    assert not guest.exists()
+
+
 def test_no_channel_configured_is_a_no_op() -> None:
     """A host that sets nothing behaves exactly as before this feature existed."""
     assert env_with_inner_jobs(_step(jobs_flag=""), "", 4) == {}

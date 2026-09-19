@@ -2773,7 +2773,15 @@ fn capture_config(args: &SweepArgs, output_dir: &str) -> CaptureConfig {
 /// materialize those channels first or an appended `--jobs` would accidentally target perf.
 fn profiler_wrapped_step(base: &Step, cfg: &DagConfig, request: &IsolatedTrialRequest) -> Step {
     let width = Some(request.inner_jobs);
-    let guest_command = crate::model::command_with_inner_jobs(base, &cfg.default_jobs_flag, width);
+    let mut guest_command =
+        crate::model::command_with_inner_jobs(base, &cfg.default_jobs_flag, width);
+    let jobs_env = crate::model::env_with_inner_jobs(base, &cfg.default_jobs_env, width);
+    if let Some((name, value)) = &jobs_env {
+        guest_command = format!(
+            "{}{guest_command}",
+            crate::scheduler::checked_jobs_env_export(name, value)
+        );
+    }
     let ready_path = box_shell_quote(&request.guest_launch_ready_path().to_string_lossy());
     let release_path = box_shell_quote(&request.guest_launch_release_path().to_string_lossy());
     let guest_command = format!(
@@ -2784,18 +2792,21 @@ fn profiler_wrapped_step(base: &Step, cfg: &DagConfig, request: &IsolatedTrialRe
          {guest_command}"
     );
     let mut injected = request.env.clone();
-    if let Some((name, value)) =
-        crate::model::env_with_inner_jobs(base, &cfg.default_jobs_env, width)
-    {
-        injected.insert(name, value);
+    if let Some((name, _)) = &jobs_env {
+        injected.remove(name);
     }
     if let Some((name, value)) = crate::model::cmdtype_env_with_inner_jobs(base, width) {
         injected.insert(name, value);
     }
 
     let mut argv = request.argv_prefix.clone();
-    if !injected.is_empty() {
+    if !injected.is_empty() || jobs_env.is_some() {
         argv.push("env".to_string());
+        // The outer wrapper opts out. Remove this channel again before its real inner Bash,
+        // then inject it exactly once through the checked final guest guard.
+        if let Some((name, _)) = &jobs_env {
+            argv.extend(["-u".to_string(), name.clone()]);
+        }
         argv.extend(
             injected
                 .into_iter()
@@ -5677,6 +5688,113 @@ mod tests {
         assert_eq!(wrapped.jobs_flag.as_deref(), Some(""));
         assert_eq!(wrapped.jobs_env.as_deref(), Some(""));
         assert_eq!(wrapped.hint.preferred_inner_jobs, Some(8));
+    }
+
+    fn jobs_env_profiled_boundary(channel: &str, width: i64, refused: bool, observe_startup: bool) {
+        let root = std::env::temp_dir().join(format!(
+            "dagrun-profile-jobs-env-{}-{}-{width}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let profiler = root.join("profiler");
+        let guest = root.join("guest");
+        let startup = root.join("startup");
+        let hook = root.join("startup.sh");
+        std::fs::write(
+            &hook,
+            format!(
+                "printf '%s\\n' \"${{{channel}-unset}}\" >> {}\n",
+                box_shell_quote(&startup.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        let mut cfg = tiny();
+        cfg.steps.truncate(1);
+        cfg.default_jobs_env = channel.to_string();
+        cfg.steps[0].cmd = format!(
+            "printf '%s' \"${{{channel}-}}\" > {}",
+            box_shell_quote(&guest.to_string_lossy())
+        );
+        cfg.steps[0].jobs_flag = Some(String::new());
+        cfg.steps[0].hint.preferred_inner_jobs = Some(width);
+        cfg.steps[0]
+            .env
+            .insert(channel.to_string(), "99".to_string());
+        let mut injected = BTreeMap::from([(channel.to_string(), "88".to_string())]);
+        if observe_startup {
+            injected.insert("BASH_ENV".to_string(), hook.to_string_lossy().into_owned());
+        }
+        let request = IsolatedTrialRequest {
+            trial_id: "jobs-env".to_string(),
+            step: cfg.steps[0].tag(),
+            inner_jobs: width,
+            kind: crate::profile_capture::CaptureKind::Perf,
+            output_dir: root.clone(),
+            expected_wall_s: 1.0,
+            window: crate::profile_capture::centered_capture_window(1.0, 0.02).unwrap(),
+            argv_prefix: vec![
+                "/bin/bash".to_string(),
+                "-c".to_string(),
+                "printf started > \"$1\"; shift; exec \"$@\"".to_string(),
+                "profiler".to_string(),
+                profiler.to_string_lossy().into_owned(),
+            ],
+            env: injected,
+            guest_launch: crate::profile_capture::GuestLaunchSignal::default(),
+            include_in_model: false,
+        };
+        // Regular files exercise the real shell handshake without claiming controller/FIFO
+        // timing or real perf coverage. The stand-in execs the actual inner command.
+        std::fs::write(request.guest_launch_release_path(), "go\n").unwrap();
+        let wrapped = profiler_wrapped_step(&cfg.steps[0], &cfg, &request);
+        assert_eq!(wrapped.jobs_env.as_deref(), Some(""));
+        assert_eq!(wrapped.jobs_flag.as_deref(), Some(""));
+        let result =
+            run_profiler_trial(&cfg.steps[0], &cfg, width, &request, &None, "", 0).unwrap();
+        assert_eq!(std::fs::read_to_string(&profiler).unwrap(), "started");
+        assert!(
+            std::fs::read_to_string(request.guest_launch_ready_path())
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+                > 0
+        );
+        if refused {
+            assert!(!result.ok());
+            assert_eq!(result.returncode, 125);
+            assert!(!guest.exists(), "profiler startup is not guest protection");
+        } else {
+            assert!(result.ok());
+            assert_eq!(std::fs::read_to_string(&guest).unwrap(), width.to_string());
+            if observe_startup {
+                let observations = std::fs::read_to_string(&startup).unwrap();
+                assert_eq!(observations.lines().next(), Some("unset"));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jobs_env_profiled_valid_widths() {
+        jobs_env_profiled_boundary("CARGO_BUILD_JOBS", 1, false, false);
+        jobs_env_profiled_boundary("CARGO_BUILD_JOBS", 4, false, false);
+    }
+
+    #[test]
+    fn jobs_env_profiled_lineno_refuses_guest() {
+        jobs_env_profiled_boundary("LINENO", 1, true, false);
+    }
+
+    #[test]
+    fn jobs_env_profiled_ifs_refuses_guest() {
+        jobs_env_profiled_boundary("IFS", 1, true, false);
+    }
+
+    #[test]
+    fn jobs_env_profiled_startup_precedes_injection() {
+        jobs_env_profiled_boundary("WORKER_JOBS", 2, false, true);
     }
 
     #[test]

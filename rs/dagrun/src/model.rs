@@ -646,6 +646,21 @@ fn normalize_jobs_env(raw: &str, source: &str) -> Result<String, String> {
             "{source}={name:?} is reserved by dagrun and cannot carry a step's worker count"
         ));
     }
+    // Assignment alone cannot prove these shell-control names are ordinary width channels.
+    if matches!(
+        name,
+        "BASH_COMPAT"
+            | "BASH_ENV"
+            | "BASH_XTRACEFD"
+            | "CDPATH"
+            | "ENV"
+            | "EXECIGNORE"
+            | "GLOBIGNORE"
+            | "PATH"
+            | "POSIXLY_CORRECT"
+    ) {
+        return Err(format!("{source}={name:?} is a shell startup/control variable, not a safe jobs environment channel"));
+    }
     Ok(name.to_string())
 }
 
@@ -2271,6 +2286,48 @@ mod tests {
         );
         step.jobs_env = Some(String::new());
         assert!(!step_width_is_resizable(&step, "-j", "CARGO_BUILD_JOBS"));
+    }
+
+    #[test]
+    fn jobs_env_shell_control_names_are_refused_without_replacing_runner_authority() {
+        let names = [
+            "BASH_COMPAT",
+            "BASH_ENV",
+            "BASH_XTRACEFD",
+            "CDPATH",
+            "ENV",
+            "EXECIGNORE",
+            "GLOBIGNORE",
+            "PATH",
+            "POSIXLY_CORRECT",
+        ];
+        let accepted: Vec<_> = names
+            .iter()
+            .filter(|name| resolve_jobs_env(Some(name)).is_ok())
+            .collect();
+        assert!(
+            accepted.is_empty(),
+            "accepted shell-control channels: {accepted:?}"
+        );
+        for name in names {
+            assert!(resolve_jobs_env(Some(name))
+                .unwrap_err()
+                .contains("shell startup/control variable"));
+            for doc in [
+                serde_json::json!({"default_jobs_env": name, "steps": []}),
+                serde_json::json!({"steps": [{"group":"g", "job":"j", "cmd":"true", "jobs_flag":"-j", "jobs_env":name}]}),
+            ] {
+                assert!(crate::io::dag_from_json(&doc.to_string())
+                    .unwrap_err()
+                    .0
+                    .contains("shell startup/control variable"));
+            }
+        }
+        for name in ["DAGRUN_EXTRA_ARGS", "DAGRUN_OUTER_RUN", "DAGRUN_STEP"] {
+            assert!(resolve_jobs_env(Some(name))
+                .unwrap_err()
+                .contains("reserved by dagrun"));
+        }
     }
 
     #[test]
