@@ -47,6 +47,14 @@ draft, and posting destination. Reply counts marked approximate come from the pr
 selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately
 for each channel and thread; a failed send preserves the text. This composer scrolls with history.
 
+## Adding a home-screen icon
+
+Open `/voice` in Chrome on Android and choose **Add to Home screen** from the browser menu.
+The shortcut uses vibe-talk's speech-bubble icon. If an existing shortcut still has a blank or
+generic icon after reloading, remove that shortcut and add it again. The manifest supplies the
+app name and regular and maskable PNG icons; browser display mode preserves the existing voice
+permission behavior. The shortcut requires the server to be reachable.
+
 ## Reading messages with a device voice
 
 To use **Read** in the message view without an ElevenLabs account or conversational agent, add

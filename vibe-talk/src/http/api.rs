@@ -1275,7 +1275,7 @@ const VOICE_CSS: &str = include_str!("../../web/voice.css");
 const APP_JS: &str = include_str!("../../web/app.js");
 const STYLE_CSS: &str = include_str!("../../web/style.css");
 
-fn asset(content_type: &'static str, body: &'static str) -> Response {
+fn asset(content_type: &'static str, body: impl IntoResponse) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
@@ -1318,6 +1318,28 @@ pub async fn app_js() -> Response {
 /// `GET /style.css`
 pub async fn style_css() -> Response {
     asset("text/css; charset=utf-8", STYLE_CSS)
+}
+
+/// `GET /manifest.webmanifest` — public home-screen identity, with no credentials.
+pub async fn web_manifest() -> Response {
+    asset(
+        "application/manifest+json; charset=utf-8",
+        include_str!("../../web/manifest.webmanifest"),
+    )
+}
+
+/// `GET /icons/{name}` — embedded artwork, available before the app is authenticated.
+pub async fn app_icon(Path(name): Path<String>) -> Response {
+    let png: &[u8] = match name.as_str() {
+        "icon.svg" => {
+            return asset("image/svg+xml", include_str!("../../web/icons/icon.svg"));
+        }
+        "icon-192.png" => include_bytes!("../../web/icons/icon-192.png"),
+        "icon-512.png" => include_bytes!("../../web/icons/icon-512.png"),
+        "maskable-512.png" => include_bytes!("../../web/icons/maskable-512.png"),
+        _ => return not_found().await.into_response(),
+    };
+    asset("image/png", png)
 }
 
 #[cfg(test)]

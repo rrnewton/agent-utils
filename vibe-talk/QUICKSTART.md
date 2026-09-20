@@ -21,6 +21,9 @@ See [device speech](README.md#reading-messages-with-a-device-voice) for setup,
 offline-voice considerations, and browser limitations. Existing deployments keep ElevenLabs
 read-aloud unless they select this backend.
 
+For a home-screen shortcut, open `/voice` in Chrome and choose **Add to Home screen**. It uses
+the vibe-talk speech-bubble icon. Remove and re-add an older shortcut if its icon stays blank.
+
 Budget about an hour if you do all six, most of it clicking through two dashboards and waiting on
 DNS. Half that if you stop after step 3.
 

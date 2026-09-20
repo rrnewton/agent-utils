@@ -5,14 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark light" />
     <title>vibe-talk — voice</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/icons/icon.svg" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
     <!--
       Deliberately NOT declared here, and this is not an oversight:
 
-        * `apple-mobile-web-app-capable` / a web app manifest. This page has never declared
-          standalone mode and deliberately keeps it that way; standalone mode has long-standing
-          reports of iOS re-prompting for the microphone (WebKit 185448, 215884). The app-like
-          feel below is built entirely from layout and gesture properties, which need no such
-          declaration.
+        * `apple-mobile-web-app-capable`. The manifest supplies a home-screen name and icon but
+          keeps display: browser; standalone mode has long-standing reports of iOS re-prompting
+          for the microphone (WebKit 185448, 215884). The app-like feel below is built entirely
+          from layout and gesture properties, which need no such declaration.
         * Any third-party script, font, or stylesheet. Two local files, no CDN, no build step.
     -->
     <link rel="stylesheet" href="/style.css" />

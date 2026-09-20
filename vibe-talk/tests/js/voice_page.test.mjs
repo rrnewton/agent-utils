@@ -2388,11 +2388,11 @@ test("the controls are built to be tapped, not clicked", () => {
   assert.match(control, /user-select:\s*none/, "a long press would start selecting the label");
 });
 
-test("the page declares no standalone mode and no manifest", () => {
-  // Deliberate, and easy to "helpfully" add back. Keeping the assertion next to the frame tests
-  // so the reason travels with the rule.
+test("home-screen identity keeps browser mode for microphone compatibility", () => {
+  const manifest = JSON.parse(readFileSync(join(WEB, "manifest.webmanifest"), "utf8"));
+  assert.equal(manifest.display, "browser");
+  assert.equal(manifest.display_override, undefined);
   assert.doesNotMatch(HTML_CODE, /apple-mobile-web-app-capable/);
-  assert.doesNotMatch(HTML_CODE, /rel="manifest"/);
   assert.doesNotMatch(HTML_CODE, /mobile-web-app-capable/);
   // The markup does not declare it, and the prose says why — so the comment must survive too.
   assert.match(HTML, /apple-mobile-web-app-capable/, "the reason it is absent must stay recorded");
