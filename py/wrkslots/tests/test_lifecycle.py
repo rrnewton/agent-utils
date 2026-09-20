@@ -25665,6 +25665,212 @@ def test_mount_namespace_reselects_after_representative_generation_changes(
     assert inspected == [123, 124]
 
 
+def process_census_status_samples(
+    monkeypatch: pytest.MonkeyPatch, pid_dir: Path, samples: list[str | BaseException],
+) -> list[Path]:
+    pending = iter(samples)
+    calls: list[Path] = []
+    original_read = Path.read_text
+
+    def read_text(
+        path: Path, encoding: str | None = None, errors: str | None = None,
+    ) -> str:
+        if path != pid_dir / "status":
+            return original_read(path, encoding=encoding, errors=errors)
+        assert encoding == "ascii" and errors is None
+        calls.append(path)
+        sample = next(pending)
+        if isinstance(sample, BaseException):
+            raise sample
+        return sample
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    return calls
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+def test_process_census_reopened_active_state_retains_owned_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,
+) -> None:
+    proc_root = tmp_path / "proc"
+    pid_dir = proc_root / "123"
+    pid_dir.mkdir(parents=True)
+    uid = os.getuid()
+    status = f"State:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+    reads = process_census_status_samples(
+        monkeypatch, pid_dir, [ProcessLookupError(errno.ESRCH, "old inode"), status, status],
+    )
+    monkeypatch.setattr(wrkslots, "_read_process_stat", lambda _path: wrkslots._ProcessStat(17, 0))
+    namespaces: list[Path] = []
+
+    def namespace(path: Path) -> str:
+        namespaces.append(path)
+        return "pid:123"
+
+    monkeypatch.setattr(wrkslots, "_mount_namespace", namespace)
+    monkeypatch.setattr(wrkslots, "_read_process_cgroup", lambda _path: "/fixture")
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024,
+    )
+    observed = (
+        wrkslots._absent_validate_process_snapshot(proc_root)
+        if lane == "privileged" else wrkslots._same_uid_process_observations(budget, proc_root)
+    )
+    assert observed == (
+        wrkslots._AbsentProcessObservation(123, 17, "/fixture" if lane == "privileged" else "", "pid:123"),
+    )
+    assert namespaces == [pid_dir]
+    assert reads == [pid_dir / "status"] * 3  # two state reads, then the real UID reader
+
+
+@pytest.mark.parametrize("state", ("Z", "X"))
+@pytest.mark.parametrize("final_generation", (17, 18))
+def test_process_census_reopened_terminal_state_keeps_final_generation_check(
+    monkeypatch: pytest.MonkeyPatch, state: str, final_generation: int,
+) -> None:
+    pid_dir = Path("/proc/123")
+    reads = process_census_status_samples(
+        monkeypatch, pid_dir,
+        [ProcessLookupError(errno.ESRCH, "old inode"), f"State:\t{state} (terminal)\n"],
+    )
+    remaining = [wrkslots._ProcessStat(17, 0), wrkslots._ProcessStat(final_generation, 0)]
+    stat_reads: list[Path] = []
+
+    def read_stat(path: Path) -> wrkslots._ProcessStat:
+        stat_reads.append(path)
+        return remaining.pop(0)
+
+    monkeypatch.setattr(wrkslots, "_read_process_stat", read_stat)
+    if final_generation == 18:
+        with pytest.raises(wrkslots._ProcessEvidenceChanged, match="generation changed"):
+            wrkslots._process_generation_is_terminal(pid_dir, wrkslots._ProcessStat(17, 0))
+    else:
+        assert wrkslots._process_generation_is_terminal(pid_dir, wrkslots._ProcessStat(17, 0))
+    assert stat_reads == [pid_dir, pid_dir]
+    assert remaining == []
+    assert reads == [pid_dir / "status"] * 2
+
+
+@pytest.mark.parametrize("status", ("", "State:\t?\n", "State:\tZ\nState:\tS\n"))
+@pytest.mark.parametrize("current_generation", (17, 18))
+def test_process_census_reopened_state_distinguishes_replacement_from_unknown(
+    monkeypatch: pytest.MonkeyPatch, status: str, current_generation: int,
+) -> None:
+    pid_dir = Path("/proc/123")
+    reads = process_census_status_samples(
+        monkeypatch, pid_dir, [ProcessLookupError(errno.ESRCH, "old inode"), status],
+    )
+    monkeypatch.setattr(
+        wrkslots, "_read_process_stat", lambda _path: wrkslots._ProcessStat(current_generation, 0),
+    )
+    with pytest.raises(wrkslots.Refusal) as refused:
+        wrkslots._process_generation_is_terminal(pid_dir, wrkslots._ProcessStat(17, 0))
+    assert isinstance(refused.value, wrkslots._ProcessEvidenceChanged) is (current_generation == 18)
+    assert reads == [pid_dir / "status"] * 2
+
+
+@pytest.mark.parametrize("generation_bound", (False, True))
+@pytest.mark.parametrize("after_esrch,error", (
+    (False, "access"), (False, "permission"), (False, "io"), (False, "decode"),
+    (True, "access"), (True, "permission"), (True, "io"), (True, "decode"), (True, "esrch"),
+))
+def test_process_census_reopened_status_keeps_hard_errors_and_read_bound(
+    monkeypatch: pytest.MonkeyPatch, generation_bound: bool, after_esrch: bool, error: str,
+) -> None:
+    pid_dir = Path("/proc/123")
+    failure: BaseException = (
+        UnicodeDecodeError("ascii", b"\xff", 0, 1, "not ASCII")
+        if error == "decode" else OSError(
+            {"access": errno.EACCES, "permission": errno.EPERM, "io": errno.EIO, "esrch": errno.ESRCH}[error],
+            "unreadable fixture evidence",
+        )
+    )
+    samples: list[str | BaseException] = [failure]
+    if after_esrch:
+        samples.insert(0, ProcessLookupError(errno.ESRCH, "old inode"))
+    reads = process_census_status_samples(monkeypatch, pid_dir, samples)
+    monkeypatch.setattr(
+        wrkslots, "_read_process_stat",
+        lambda _path: pytest.fail("a failed status read must not become generation-change evidence"),
+    )
+    with pytest.raises(wrkslots.Refusal, match="process state is indeterminate") as refused:
+        if generation_bound:
+            wrkslots._process_generation_is_terminal(pid_dir, wrkslots._ProcessStat(17, 0))
+        else:
+            wrkslots._process_is_zombie(pid_dir)
+    assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+    assert refused.value.__cause__ is failure
+    assert reads == [pid_dir / "status"] * (2 if after_esrch else 1)
+
+
+@pytest.mark.parametrize("generation_present", (False, True))
+@pytest.mark.parametrize("after_esrch", (False, True))
+def test_process_census_reopened_missing_status_requires_absent_generation(
+    monkeypatch: pytest.MonkeyPatch, generation_present: bool, after_esrch: bool,
+) -> None:
+    pid_dir = Path("/proc/123")
+    samples: list[str | BaseException] = [FileNotFoundError(errno.ENOENT, "fresh path missing")]
+    if after_esrch:
+        samples.insert(0, ProcessLookupError(errno.ESRCH, "old inode"))
+    reads = process_census_status_samples(monkeypatch, pid_dir, samples)
+    monkeypatch.setattr(
+        wrkslots, "_read_process_stat",
+        lambda _path: wrkslots._ProcessStat(17, 0) if generation_present else None,
+    )
+    if generation_present:
+        with pytest.raises(wrkslots.Refusal, match="missing while its generation is still present") as refused:
+            wrkslots._process_is_zombie(pid_dir)
+        assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+    else:
+        assert wrkslots._process_is_zombie(pid_dir)
+    assert reads == [pid_dir / "status"] * (2 if after_esrch else 1)
+
+
+@pytest.mark.parametrize("failure", ("unreadable", "malformed"))
+def test_process_census_reopened_status_needs_readable_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    original_read = Path.read_text
+    (tmp_path / "stat").write_text("not process generation evidence\n")
+
+    def stat_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if path == tmp_path / "stat" and failure == "unreadable":
+            raise PermissionError(errno.EACCES, "generation unreadable")
+        return original_read(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", stat_read)
+    reads = process_census_status_samples(
+        monkeypatch, tmp_path, [ProcessLookupError(errno.ESRCH, "old inode"), "State:\tZ\n"],
+    )
+    with pytest.raises(wrkslots.Refusal, match="process generation") as refused:
+        wrkslots._process_generation_is_terminal(tmp_path, wrkslots._ProcessStat(17, 0))
+    assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+    assert reads == [tmp_path / "status"] * 2
+
+
+@pytest.mark.parametrize("state", ("R", "S", "Z", "X"))
+def test_process_census_reopened_ordinary_state_reader_composes_with_liveness(
+    monkeypatch: pytest.MonkeyPatch, state: str,
+) -> None:
+    pid_dir = Path("/proc/123")
+    reads = process_census_status_samples(
+        monkeypatch, pid_dir, [ProcessLookupError(errno.ESRCH, "old inode"), f"State:\t{state}\n"],
+    )
+    stat_reads: list[Path] = []
+
+    def read_stat(path: Path) -> wrkslots._ProcessStat:
+        stat_reads.append(path)
+        return wrkslots._ProcessStat(17, 0)
+
+    monkeypatch.setattr(wrkslots, "_read_process_stat", read_stat)
+    active = state in {"R", "S"}
+    assert wrkslots._process_observation_is_active(
+        wrkslots._AbsentProcessObservation(123, 17, "", "pid:123"),
+    ) is active
+    assert stat_reads == [pid_dir] * (2 if active else 1)
+    assert reads == [pid_dir / "status"] * 2
+
+
 @pytest.mark.parametrize("state", ("R", "S", "D", "T", "t", "X", "Z", "P", "I", "K", "W", "x"))
 def test_process_census_status_preserves_known_active_and_terminal_states(
     tmp_path: Path, state: str,
