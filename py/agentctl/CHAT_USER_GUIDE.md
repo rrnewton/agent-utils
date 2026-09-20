@@ -78,6 +78,9 @@ state directory. Exiting the coordinator stops the bridge and returns to the
 shell; after killing the launcher externally, check for and stop any surviving
 bridge process before reusing its state.
 
+Without an `event_command`, `launch --interval` accepts the same 0.1–86400-second
+polling range as `run`; the polling and failure-backoff behavior is described below.
+
 The launched coordinator inherits `HERDR_WORKSPACE_ID`. Consequently, its
 ordinary `agentctl start NAME ...` calls create subagent tabs in the same Herdr
 workspace unless it explicitly supplies `--workspace-id`.
@@ -160,11 +163,14 @@ agentctl chat run --state /work/project/.agentctl/.chat
 Initialization sets the message history cutoff to the current time. Messages
 created before that cutoff are excluded from both events and polls. Use an
 explicit RFC3339 `--after` on `init` to replay a chosen interval. Without `event_command`,
-`run` waits three seconds **after each completed polling cycle** before starting
-another; `--interval` accepts 0.1–60 seconds. A cycle includes transport and
+`run` waits one hour **after each completed polling cycle** before starting
+another by default; `--interval` accepts 0.1–86400 seconds (one day). A cycle includes transport and
 delivery work, so this is not a fixed message latency. Choose a longer interval
-when your authenticated client has a shared read quota. Failures double the
-delay up to 60 seconds; successful cycles restore the configured interval.
+when your authenticated client has a shared read quota or a costly polling
+adapter. For configured intervals at or below 60 seconds, failures double the
+delay up to 60 seconds. Longer configured intervals double on failure up to one
+day. Backoff never shortens the configured interval, and a successful cycle
+restores it.
 
 With `event_command`, incoming events wake the bridge immediately. A background
 recovery scan runs on connection and every 300 seconds after a completed scan.

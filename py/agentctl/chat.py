@@ -48,6 +48,12 @@ from agentctl.jsonx import as_mapping, as_sequence, get_str
 from agentctl.subagents import harness_arguments
 
 
+_MIN_POLL_INTERVAL = 0.1
+_MAX_POLL_INTERVAL = 86400.0
+_DEFAULT_POLL_INTERVAL = 3600.0
+_SHORT_FAILURE_BACKOFF_LIMIT = 60.0
+
+
 class Transport(Protocol):
     """Bounded poll/send/react operations; send deduplicates request_id retries.
 
@@ -979,7 +985,15 @@ def _run_polling(bridge: Bridge, interval: float, prog: str) -> None:
                     bridge.tick()
                 except errors as exc:
                     print(f"{prog}: {exc}", file=sys.stderr, flush=True)
-                    poll_delay = min(60.0, poll_delay * 2)
+                    # Fast interactive polls back off to one minute. Conservative long polls keep
+                    # doubling toward one day, so a broken or quota-limited adapter gets quieter
+                    # instead of retrying forever at the ordinary hourly cadence.
+                    failure_limit = (
+                        _SHORT_FAILURE_BACKOFF_LIMIT
+                        if interval <= _SHORT_FAILURE_BACKOFF_LIMIT
+                        else _MAX_POLL_INTERVAL
+                    )
+                    poll_delay = max(interval, min(failure_limit, poll_delay * 2))
                 else:
                     poll_delay = interval
                 next_poll = time.monotonic() + poll_delay
@@ -1270,12 +1284,14 @@ and '{prog} COMMAND --help' for command-specific options.
         help="Chat reply prefix label (default: model, config agent_label, or harness)")
     launch.add_argument("--after", metavar="RFC3339_TIME",
         help="earliest message time, including timezone (default: launch time; no history replay)")
-    launch.add_argument("--interval", type=float, default=3, metavar="SECONDS",
-        help="poll delay in seconds, 0.1–60 (default: 3); ignored by event-command intake")
+    launch.add_argument("--interval", type=float, default=_DEFAULT_POLL_INTERVAL, metavar="SECONDS",
+        help=("poll delay in seconds, 0.1–86400 (default: 3600); failures never shorten it; "
+              "ignored by event-command intake"))
     launch.add_argument("--reconcile-interval", type=float, default=300, metavar="SECONDS",
         help="event-stream recovery scan interval, 10–86400 seconds (default: 300)")
-    subparsers["run"].add_argument("--interval", type=float, default=3, metavar="SECONDS",
-        help="delay after each poll cycle in seconds, 0.1–60 (default: 3); used without event_command; failures back off to 60 seconds")
+    subparsers["run"].add_argument("--interval", type=float, default=_DEFAULT_POLL_INTERVAL, metavar="SECONDS",
+        help=("delay after each poll cycle in seconds, 0.1–86400 (default: 3600); used without "
+              "event_command; failures double toward 60 seconds or one day and never shorten it"))
     subparsers["run"].add_argument("--reconcile-interval", type=float, default=300, metavar="SECONDS",
         help="REST recovery scan interval with event_command, 10–86400 seconds (default: 300); push messages never wait for this scan")
     subparsers["context"].add_argument("--request", required=True, metavar="KEY_OR_PREFIX",
@@ -1344,8 +1360,8 @@ commands. See '{prog} userguide' for exact scopes, lifecycle, and adapter protoc
         return 0
     try:
         if args.command == "launch":
-            if not 0.1 <= args.interval <= 60:
-                raise ValueError("interval must be between 0.1 and 60 seconds")
+            if not _MIN_POLL_INTERVAL <= args.interval <= _MAX_POLL_INTERVAL:
+                raise ValueError("interval must be between 0.1 and 86400 seconds")
             if not 10 <= args.reconcile_interval <= 86400:
                 raise ValueError("reconcile interval must be between 10 and 86400 seconds")
             return _launch_here(args.state, args.config, harness=args.harness, model=args.model,
@@ -1391,8 +1407,8 @@ commands. See '{prog} userguide' for exact scopes, lifecycle, and adapter protoc
                     os.close(descriptor)
                 print(json.dumps(bridge.status(), indent=2))
             else:
-                if not 0.1 <= args.interval <= 60:
-                    raise ValueError("interval must be between 0.1 and 60 seconds")
+                if not _MIN_POLL_INTERVAL <= args.interval <= _MAX_POLL_INTERVAL:
+                    raise ValueError("interval must be between 0.1 and 86400 seconds")
                 if not 10 <= args.reconcile_interval <= 86400:
                     raise ValueError("reconcile interval must be between 10 and 86400 seconds")
                 _run_bridge(bridge, args.interval, prog, reconcile_interval=args.reconcile_interval)

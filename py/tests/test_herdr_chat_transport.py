@@ -466,8 +466,13 @@ def test_run_loop_retries_malformed_transport_output(
     assert "malformed adapter message" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(("interval_arguments", "failures", "expected_delays"), [
+    (("--interval", "10"), 4, [20, 40, 60, 60, 10]),
+    ((), 2, [7200, 14400, 3600]),
+])
 def test_run_loop_backs_off_failures_and_recovers_configured_interval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    interval_arguments: tuple[str, ...], failures: int, expected_delays: list[float],
 ) -> None:
     calls = 0
     now = 0.0
@@ -481,9 +486,9 @@ def test_run_loop_backs_off_failures_and_recovers_configured_interval(
         def tick(self) -> dict[str, object]:
             nonlocal calls
             calls += 1
-            if calls <= 4:
+            if calls <= failures:
                 raise ValueError("temporary quota failure")
-            if calls == 5:
+            if calls == failures + 1:
                 return {}
             raise KeyboardInterrupt
 
@@ -498,5 +503,63 @@ def test_run_loop_backs_off_failures_and_recovers_configured_interval(
     monkeypatch.setattr(chat_module, "Bridge", RecoveringBridge)
     monkeypatch.setattr(time, "sleep", sleep)
     monkeypatch.setattr(time, "monotonic", lambda: now)
-    assert chat_module.run_cli(["run", "--state", str(tmp_path), "--interval", "10"]) == 130
-    assert delays == [20, 40, 60, 60, 10]
+    assert chat_module.run_cli([
+        "run", "--state", str(tmp_path), *interval_arguments,
+    ]) == 130
+    assert delays == expected_delays
+
+
+def test_run_loop_long_interval_failures_back_off_toward_one_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    now = 0.0
+    delays: list[float] = []
+
+    class RecoveringBridge:
+        def __init__(self, state: Path) -> None:
+            self.state = state
+            self.config = Config(_SPACE, ("users/owner",), Target(), "test-agent", reply_mode="file")
+
+        def tick(self) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                raise ValueError("temporary quota failure")
+            if calls == 3:
+                return {}
+            raise KeyboardInterrupt
+
+        def output_requests(self, *, retry_failed: bool = False) -> dict[str, str]:
+            return {}
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        delays.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr(chat_module, "Bridge", RecoveringBridge)
+    monkeypatch.setattr(time, "sleep", sleep)
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    assert chat_module.run_cli([
+        "run", "--state", str(tmp_path), "--interval", "3600",
+    ]) == 130
+    assert delays == [7200, 14400, 3600]
+
+
+def test_run_accepts_one_day_poll_interval_and_rejects_larger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    intervals: list[float] = []
+    monkeypatch.setattr(chat_module, "Bridge", lambda state: object())
+    monkeypatch.setattr(chat_module, "_run_bridge",
+                        lambda bridge, interval, prog, **kwargs: intervals.append(interval))
+
+    assert chat_module.run_cli([
+        "run", "--state", str(tmp_path), "--interval", "86400",
+    ]) == 0
+    assert intervals == [86400]
+    assert chat_module.run_cli([
+        "run", "--state", str(tmp_path), "--interval", "86400.1",
+    ]) == 1
+    assert "between 0.1 and 86400 seconds" in capsys.readouterr().err

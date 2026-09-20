@@ -417,7 +417,9 @@ def test_each_chat_subcommand_has_specific_help(command: str, capsys: pytest.Cap
     text = capsys.readouterr().out
     assert f"agentctl chat {command}" in text
     assert "Example:" in text
-    if command not in ("launch", "run"):
+    if command in ("launch", "run"):
+        assert "0.1–86400" in text
+    else:
         assert "--interval" not in text
     if command != "reply":
         assert "--request" not in text

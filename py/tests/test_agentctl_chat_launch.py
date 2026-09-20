@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -130,7 +131,11 @@ def test_launch_here_owns_bridge_for_coordinator_lifetime(
 
     assert result == 0
     assert initialized == [(tmp_path / "state", config, None)]
-    assert processes[0].command[1:3] == [str(Path(chat_module.__file__).resolve()), "run"]
+    assert processes[0].command == [
+        sys.executable, str(Path(chat_module.__file__).resolve()), "run",
+        "--state", str((tmp_path / "state").absolute()), "--interval", "3",
+        "--reconcile-interval", "300",
+    ]
     assert processes[0].kwargs["start_new_session"] is True
     assert processes[0].terminated
     assert processes[1].command == ["codex", "--no-alt-screen", "--model", "gpt-6-astra",
@@ -144,5 +149,45 @@ def test_launch_help_describes_current_pane_and_every_option(capsys: pytest.Capt
     output = capsys.readouterr().out
     for text in ("this Herdr pane", "--config", "--harness", "--model", "--resume",
                  "--harness-arg", "--agent-label", "--after", "--interval",
-                 "--reconcile-interval", "--state"):
+                 "--reconcile-interval", "--state", "0.1–86400"):
         assert text in output
+
+
+def test_launch_accepts_one_day_poll_interval_and_rejects_larger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    intervals: list[float] = []
+
+    def launch(*args: object, **kwargs: object) -> int:
+        interval = kwargs["interval"]
+        assert isinstance(interval, float)
+        intervals.append(interval)
+        return 0
+
+    monkeypatch.setattr(chat_module, "_launch_here", launch)
+    assert chat_module.run_cli([
+        "launch", "--config", str(tmp_path / "chat.json"), "--interval", "86400",
+    ]) == 0
+    assert intervals == [86400]
+    assert chat_module.run_cli([
+        "launch", "--config", str(tmp_path / "chat.json"), "--interval", "86400.1",
+    ]) == 1
+    assert "between 0.1 and 86400 seconds" in capsys.readouterr().err
+
+
+def test_launch_defaults_to_hourly_polling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    intervals: list[float] = []
+
+    def launch(*args: object, **kwargs: object) -> int:
+        interval = kwargs["interval"]
+        assert isinstance(interval, float)
+        intervals.append(interval)
+        return 0
+
+    monkeypatch.setattr(chat_module, "_launch_here", launch)
+    assert chat_module.run_cli([
+        "launch", "--config", str(tmp_path / "chat.json"),
+    ]) == 0
+    assert intervals == [3600.0]

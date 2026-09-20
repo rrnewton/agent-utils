@@ -281,7 +281,9 @@ recovery scans run independently. A durable cursor and message IDs allow safe
 replay after reconnecting. `run --reconcile-interval` controls background scans
 in streaming mode (default: 300 seconds). Without an event adapter,
 `run --interval` controls the delay after each completed polling cycle
-(default: 3 seconds). The Chat user guide documents the adapter protocol.
+(0.1–86400 seconds; default: 3600 seconds). Failure backoff never polls more often
+than the configured interval and grows toward a one-day ceiling after long-interval
+failures. The Chat user guide documents the adapter protocol.
 
 One `run` or `tick` process owns each Chat state directory. Stop `run` before
 using `tick` for manual recovery. Explicit `chat reply` submissions remain
