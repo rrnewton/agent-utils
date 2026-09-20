@@ -1106,7 +1106,7 @@ pub(crate) fn target_lock_path(pane_id: &str) -> AgentResult<PathBuf> {
     Ok(root.join(format!("{}.lock", pane_lock_digest(pane_id))))
 }
 
-fn lock_resolved_target<A: AgentApi + ?Sized>(
+pub(crate) fn lock_resolved_target<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
 ) -> AgentResult<(File, AgentPaneInfo)> {

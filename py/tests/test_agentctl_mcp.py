@@ -25,7 +25,7 @@ def test_stdio_initialize_list_and_empty_registry(tmp_path: Path) -> None:
     assert [reply["id"] for reply in replies] == [1, 2, 3]
     assert replies[0]["result"]["serverInfo"]["name"] == "agentctl"
     names = {tool["name"] for tool in replies[1]["result"]["tools"]}
-    assert {"agent_start", "agent_send", "agent_goal", "agent_pause", "agent_stop"} <= names
+    assert {"agent_start", "agent_adopt", "agent_send", "agent_goal", "agent_pause", "agent_stop"} <= names
     assert replies[2]["result"]["isError"] is False
     assert json.loads(replies[2]["result"]["content"][0]["text"]) == []
     assert not (tmp_path / "registry").exists()
@@ -44,3 +44,25 @@ def test_every_mcp_operation_describes_and_closes_its_argument_schema() -> None:
         schema = tool["inputSchema"]
         assert isinstance(schema, dict)
         assert schema["additionalProperties"] is False
+
+
+def test_adopt_mcp_routes_session_as_an_assertion_option(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    arguments: list[str] = []
+
+    def invoke(argv: list[str]) -> int:
+        arguments.extend(argv)
+        return 0
+
+    monkeypatch.setattr("agentctl.cli.main", invoke)
+    result = call_tool("agent_adopt", {
+        "name": "reviewer", "pane": "w1:p2", "workspace": "project",
+        "cwd": "/work/project", "harness": "codex", "session": "thread-1",
+    }, str(tmp_path / "registry"), "/opt/herdr")
+    assert result["isError"] is False
+    assert arguments == [
+        "--registry", str(tmp_path / "registry"), "--herdr-bin", "/opt/herdr",
+        "adopt", "reviewer", "--pane=w1:p2", "--workspace=project",
+        "--cwd=/work/project", "--harness=codex", "--session=thread-1",
+    ]

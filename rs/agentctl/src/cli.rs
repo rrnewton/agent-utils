@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
-use crate::subagents::{ManagedAgents, StartOptions};
+use crate::subagents::{AdoptOptions, ManagedAgents, StartOptions};
 
 #[derive(Parser)]
 #[command(
@@ -19,7 +19,7 @@ use crate::subagents::{ManagedAgents, StartOptions};
     version,
     about = "Manage persistent coding agents that you can message and inspect",
     long_about = "Manage named coding-agent sessions with durable prompt delivery and direct human access.\nThe Rust implementation controls interactive Codex/Claude sessions through Herdr.\nUse an installation with the worker extension for headless workers and the Google Chat bridge.",
-    after_help = "Examples:\n  agentctl quickstart\n  agentctl start reviewer --cwd .\n  agentctl send reviewer 'Review the current changes'\n  agentctl pause reviewer\n  agentctl attach reviewer\n  agentctl resume reviewer\n  agentctl stop reviewer"
+    after_help = "Examples:\n  agentctl quickstart\n  agentctl start reviewer --cwd .\n  agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex\n  agentctl send reviewer 'Review the current changes'\n  agentctl pause reviewer\n  agentctl attach reviewer\n  agentctl resume reviewer\n  agentctl stop reviewer"
 )]
 struct Cli {
     /// Registry directory containing agent records and durable queues
@@ -51,7 +51,12 @@ enum Commands {
         after_help = "Example: agentctl start reviewer --cwd . --harness codex --brief 'Review the changes'"
     )]
     Start(Start),
-    /// Close the owned agent pane and archive its record, queue, and output
+    /// Register an existing Herdr agent without taking ownership of its runtime
+    #[command(
+        after_help = "Example: agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"
+    )]
+    Adopt(Adopt),
+    /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(after_help = "Example: agentctl stop reviewer")]
     Stop(Named),
     /// List registered agents with live status or an explicit probe error
@@ -164,6 +169,27 @@ struct Start {
     startup_timeout: f64,
     #[command(flatten)]
     delivery: Delivery,
+}
+
+#[derive(Args)]
+struct Adopt {
+    #[command(flatten)]
+    agent: Named,
+    /// Exact live Herdr pane containing the agent (required)
+    #[arg(long, value_name = "ID")]
+    pane: String,
+    /// Expected live Herdr workspace label; a mismatch is refused (required)
+    #[arg(long, value_name = "LABEL")]
+    workspace: String,
+    /// Expected live agent working directory; compared canonically (required)
+    #[arg(long, value_name = "DIR")]
+    cwd: PathBuf,
+    /// Expected live Herdr harness kind, such as codex or claude (required)
+    #[arg(long, value_name = "KIND")]
+    harness: String,
+    /// Stable native conversation ID already reported by this exact pane
+    #[arg(long, value_name = "ID")]
+    session: Option<String>,
 }
 
 #[derive(Args)]
@@ -402,6 +428,16 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 },
             )?
         }
+        Commands::Adopt(value) => manager.adopt(
+            &value.agent.name,
+            AdoptOptions {
+                pane_id: value.pane,
+                expected_workspace: value.workspace,
+                cwd: value.cwd,
+                harness: value.harness,
+                session: value.session,
+            },
+        )?,
         Commands::Stop(value) => manager.stop(&value.name)?,
         Commands::List => json!(manager.list()?),
         Commands::Status(value) => manager.status(&value.name)?,
@@ -478,27 +514,28 @@ fn add_capabilities(value: &mut serde_json::Value) {
             add_capabilities(value);
         }
     } else if value.get("adapter").is_some() && value.get("name").is_some() {
-        value["capabilities"] = if value["adapter"] == "herdr"
-            && value["mode"] == "interactive"
-            && value["backend"] == "herdr"
-        {
-            json!([
-                "send",
-                "status",
-                "read",
-                "wait",
-                "stop",
-                "attach",
-                "pause",
-                "resume",
-                "terminal-snapshot",
-                "drain",
-                "goal",
-                "bind-session"
-            ])
-        } else {
-            json!(["status"])
-        };
+        value["capabilities"] =
+            if matches!(value["adapter"].as_str(), Some("herdr" | "herdr-foreign"))
+                && value["mode"] == "interactive"
+                && value["backend"] == "herdr"
+            {
+                json!([
+                    "send",
+                    "status",
+                    "read",
+                    "wait",
+                    "stop",
+                    "attach",
+                    "pause",
+                    "resume",
+                    "terminal-snapshot",
+                    "drain",
+                    "goal",
+                    "bind-session"
+                ])
+            } else {
+                json!(["status"])
+            };
     }
 }
 
@@ -525,6 +562,14 @@ mod tests {
         assert!(help.contains("--message-id"));
         assert!(help.contains("Seconds to wait"));
         assert!(!help.contains("--startup-timeout"));
+        let error = Cli::try_parse_from(["agentctl", "adopt", "--help"])
+            .err()
+            .unwrap();
+        let help = error.to_string();
+        for required in ["--pane", "--workspace", "--cwd", "--harness", "--session"] {
+            assert!(help.contains(required));
+        }
+        assert!(help.contains("without taking ownership"));
     }
     #[test]
     fn invalid_timeouts_and_ambiguous_prompts_are_rejected() {
@@ -545,5 +590,33 @@ mod tests {
             "agentctl", "send", "worker", "prompt", "--file", "task.txt"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn adopted_interactive_records_advertise_the_full_named_interface() {
+        let mut record = json!({
+            "name": "foreign",
+            "adapter": "herdr-foreign",
+            "mode": "interactive",
+            "backend": "herdr",
+        });
+        add_capabilities(&mut record);
+        assert_eq!(
+            record["capabilities"],
+            json!([
+                "send",
+                "status",
+                "read",
+                "wait",
+                "stop",
+                "attach",
+                "pause",
+                "resume",
+                "terminal-snapshot",
+                "drain",
+                "goal",
+                "bind-session"
+            ])
+        );
     }
 }

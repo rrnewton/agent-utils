@@ -22,6 +22,9 @@ class Operation:
 OPERATIONS = {
     "start": Operation("Start a persistent agent; interactive Herdr or headless Herdr/tmux.",
         ("name",), ("name", "cwd", "harness", "mode", "backend", "model", "brief", "resume")),
+    "adopt": Operation("Register an existing identity-checked Herdr agent without owning its runtime.",
+        ("name", "pane", "workspace", "cwd", "harness"),
+        ("name", "pane", "workspace", "cwd", "harness", "session")),
     "send": Operation("Submit follow-up text, retaining uncertain delivery for reconciliation.",
         ("name", "text"), ("name", "text", "message_id", "model", "ready_timeout")),
     "list": Operation("List all named sessions and their capabilities.", (), ()),
@@ -29,7 +32,8 @@ OPERATIONS = {
     "read": Operation("Read terminal text or an explicit headless answer boundary.",
         ("name",), ("name", "output", "lines", "since_turn")),
     "wait": Operation("Wait for readiness; this does not prove goal completion.", ("name",), ("name", "timeout")),
-    "stop": Operation("Stop only the owned session and archive its state.", ("name",), ("name",)),
+    "stop": Operation("Stop an owned session, or safely unregister an adopted one, and archive state.",
+        ("name",), ("name",)),
     "pause": Operation("Pause automated input for human interaction.", ("name",), ("name",)),
     "resume": Operation("Resume automated input after human interaction.", ("name",), ("name",)),
     "goal": Operation("Read native goal state when supported, or send a goal instruction.",
@@ -74,9 +78,10 @@ def call_tool(name: str, arguments: dict[str, object], registry: str, herdr_bin:
             value = arguments[key]
             if not isinstance(value, str) or not value or value.startswith("-"):
                 raise ValueError(f"{key} must be a nonempty identifier")
-            argv.append(value)
+            if key == "name" or command == "bind-session":
+                argv.append(value)
     for key, value in arguments.items():
-        if key in ("name", "session", "text"):
+        if key in ("name", "text") or (key == "session" and command == "bind-session"):
             continue
         if key in _INTEGERS:
             valid = isinstance(value, int) and not isinstance(value, bool)

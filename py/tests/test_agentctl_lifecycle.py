@@ -37,6 +37,66 @@ def test_start_holds_its_generation_lock_through_brief_and_returned_status(tmp_p
     assert fake.submitted == ["this generation's task"]
 
 
+def test_start_holds_registry_identity_lock_through_native_session_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    original_start = fake.start_agent
+
+    def start_agent(
+        name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
+    ) -> None:
+        descriptor = os.open(tmp_path / "registry/.identity.lock", os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+        original_start(name, kind, pane_id, arguments, timeout=timeout)
+
+    monkeypatch.setattr(fake, "start_agent", start_agent)
+    assert manager.start("worker", cwd=str(tmp_path))["lifecycle"] == "running"
+
+
+def test_start_session_change_leaves_launch_failed_record_stoppable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    original_info = fake.pane_info
+    record_path = tmp_path / "registry/worker/agent.json"
+
+    def info(pane: str) -> AgentPaneInfo:
+        result = original_info(pane)
+        if record_path.exists() and json.loads(record_path.read_text())["lifecycle"] == "running":
+            return replace(result, session_value="replacement-session")
+        return result
+
+    monkeypatch.setattr(fake, "pane_info", info)
+    with pytest.raises(AgentDeliveryError):
+        manager.start("worker", cwd=str(tmp_path))
+    failed = manager.get("worker")
+    assert failed.lifecycle == "launch_failed"
+    assert failed.session_agent is None and failed.session_value is None
+    assert manager.stop("worker")["pane_closed"] is True
+
+
+def test_start_refuses_unregistered_same_session_in_another_workspace_and_is_stoppable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    fake.presentations.append(Pane("w2:p1", "w2:t1", "w2"))
+    fake.infos["w2:p1"] = AgentPaneInfo(
+        "w2:p1", "w2", str(tmp_path), "codex", "idle", "codex", "session-1",
+    )
+    with pytest.raises(AgentDeliveryError, match="not globally unique"):
+        manager.start("worker", cwd=str(tmp_path))
+    failed = manager.get("worker")
+    assert failed.lifecycle == "launch_failed"
+    assert failed.session_value is None
+    assert manager.stop("worker")["pane_closed"] is True
+    assert fake.presentations == [Pane("w2:p1", "w2:t1", "w2")]
+
+
 def test_allocation_captures_pane_before_later_launch_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     fake.workspace = "w1"

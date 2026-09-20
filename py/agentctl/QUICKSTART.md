@@ -20,6 +20,15 @@ while keeping their terminals available for direct inspection.
    agentctl status reviewer
    ```
 
+   To keep an agent that is already running in Herdr, adopt its exact live
+   identity instead. All four assertions are required; adoption changes neither
+   the pane nor its process:
+
+   ```sh
+   agentctl adopt reviewer --pane w1:p2 --workspace project \
+     --cwd /work/project --harness codex
+   ```
+
 3. Send follow-up work and inspect progress:
 
    ```sh
@@ -41,9 +50,10 @@ while keeping their terminals available for direct inspection.
    agentctl resume reviewer
    ```
 
-5. Finish with `agentctl stop reviewer`. This stops the owned runtime and
-   archives its session state. Exiting the CLI or closing its caller does not
-   stop the worker.
+5. Finish with `agentctl stop reviewer`. This stops a runtime created by
+   `agentctl` and archives its session state. For an adopted agent it only
+   unregisters and archives the control state; the foreign pane and process keep
+   running. Exiting the CLI or closing its caller does not stop the worker.
 
 State defaults to `.agentctl` in the current directory. Use the same
 `--registry /absolute/path` across callers. Workers share the working directory

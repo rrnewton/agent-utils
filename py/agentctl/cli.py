@@ -53,7 +53,10 @@ def parser() -> argparse.ArgumentParser:
     """Build real subcommands with operation-specific options and examples."""
     root = argparse.ArgumentParser(prog="agentctl", allow_abbrev=False,
         description="Start persistent coding agents, delegate follow-up work, and keep their terminals accessible.",
-        epilog="Start here: agentctl quickstart\nExample: agentctl start reviewer --cwd . --brief 'Review the current changes'",
+        epilog=("Start here: agentctl quickstart\n"
+            "Examples:\n"
+            "  agentctl start reviewer --cwd . --brief 'Review the current changes'\n"
+            "  agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     _common(root)
     root.add_argument("--version", action="version", version=f"agentctl {__version__}")
@@ -89,6 +92,20 @@ def parser() -> argparse.ArgumentParser:
         help="interactive startup deadline, greater than 0 and at most 300 (default: 30)")
     _delivery(start)
 
+    adopt = command("adopt", "Register an existing Herdr agent without taking ownership of its runtime.",
+        "agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex",
+        named=True)
+    adopt.add_argument("--pane", required=True, metavar="ID",
+        help="exact live Herdr pane containing the agent (required)")
+    adopt.add_argument("--workspace", required=True, metavar="LABEL",
+        help="expected live Herdr workspace label; a mismatch is refused (required)")
+    adopt.add_argument("--cwd", required=True, metavar="DIR",
+        help="expected live agent working directory; compared canonically (required)")
+    adopt.add_argument("--harness", required=True, metavar="KIND",
+        help="expected live harness kind, for example codex or claude (required)")
+    adopt.add_argument("--session", metavar="ID",
+        help="optional stable native conversation ID already reported by this exact pane")
+
     command("list", "List every registered session, including unavailable and failed launches.", "agentctl list")
     command("capabilities", "Show the adapters and services available in this installation.", "agentctl capabilities")
     command("status", "Inspect saved identity, runtime state, and supported operations.", "agentctl status reviewer", named=True)
@@ -111,7 +128,7 @@ def parser() -> argparse.ArgumentParser:
         "agentctl wait reviewer --timeout 60", named=True)
     wait.add_argument("--timeout", type=_ascii_float, default=900.0, metavar="SECONDS", help="readiness deadline (default: 900 seconds)")
     for name, purpose in (
-        ("stop", "Stop only the owned runtime and archive its state."),
+        ("stop", "Stop an owned runtime, or unregister an adopted runtime without closing it, and archive state."),
         ("attach", "Focus the session's terminal for direct inspection and interaction."),
         ("pause", "Pause automated input while allowing an active turn to finish."),
         ("resume", "Allow automated input after human interaction; clear any unfinished composer draft first."),
@@ -216,6 +233,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 harness_args=args.harness_arg, workspace_id=args.workspace_id,
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
                 working_timeout=args.working_timeout, max_attempts=args.max_attempts)
+        elif args.command == "adopt":
+            result = sessions.adopt(name, pane_id=args.pane,
+                expected_workspace=args.workspace, expected_cwd=args.cwd,
+                harness=args.harness, session=args.session)
         elif args.command == "list":
             result = sessions.list()
         elif args.command == "status":

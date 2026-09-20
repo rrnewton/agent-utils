@@ -54,7 +54,7 @@ class Sessions(ManagedAgents):
             result.extend(("final-answer", "reset", "migrate", "repair"))
         else:
             result.append("terminal-snapshot")
-        if record.adapter == "herdr":
+        if record.adapter in ("herdr", "herdr-foreign"):
             result.extend(("drain", "goal", "bind-session"))
         return result
 
@@ -75,25 +75,45 @@ class Sessions(ManagedAgents):
         if not Path(root).is_dir():
             raise AgentDeliveryError(f"cwd is not a directory: {root}")
         with self._lock(name):
-            directory = self._directory(name)
-            if os.path.lexists(directory):
-                raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
-            directory.mkdir(mode=0o700)
-            record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(), model=model,
-                adapter="turn-runner", mode=mode, backend=backend, runtime_home=str(directory / "runtime"))
-            self._save(record)
-            try:
-                response = self._worker(record, "start", cwd=root, harness=harness,
-                                        model=model, backend=backend, brief=brief)
-                record.lifecycle = "running"
-                self._sync_worker_record(record, response)
-            except (HerdrRunError, OSError, ValueError) as exc:
-                record.lifecycle, record.error = "launch_failed", str(exc)
+            with self._identity_transaction():
+                directory = self._directory(name)
+                if os.path.lexists(directory):
+                    raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
+                directory.mkdir(mode=0o700)
+                record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(), model=model,
+                    adapter="turn-runner", mode=mode, backend=backend, runtime_home=str(directory / "runtime"))
                 self._save(record)
-                raise
+                try:
+                    response = self._worker(record, "start", cwd=root, harness=harness,
+                                            model=model, backend=backend, brief=brief)
+                    self._sync_worker_record(record, response, save=False)
+                    if record.session_value is not None:
+                        owner = self._identity_owner(
+                            record.session_agent or record.harness,
+                            record.session_value, exclude=name,
+                        )
+                        if owner is not None:
+                            try:
+                                self._worker(record, "stop")
+                            except HerdrRunError as stop_error:
+                                detail = f"; could not stop the conflicting new runtime: {stop_error}"
+                            else:
+                                detail = "; stopped the conflicting new runtime"
+                            record.session_agent = record.session_value = None
+                            raise AgentDeliveryError(
+                                f"native session is already registered as {owner.name!r}{detail}"
+                            )
+                    record.lifecycle = "running"
+                    self._save(record)
+                except (HerdrRunError, OSError, ValueError) as exc:
+                    record.lifecycle, record.error = "launch_failed", str(exc)
+                    self._save(record)
+                    raise
             return self.status(name)
 
-    def _sync_worker_record(self, record: AgentRecord, response: dict[str, object]) -> None:
+    def _sync_worker_record(
+        self, record: AgentRecord, response: dict[str, object], *, save: bool = True,
+    ) -> None:
         value = response.get("record")
         if isinstance(value, dict):
             runtime = as_mapping(value, "runtime record")
@@ -103,14 +123,15 @@ class Sessions(ManagedAgents):
             record.session_value = session if isinstance(session, str) else None
             pane = runtime.get("presentation_pane")
             record.pane_id = pane if isinstance(pane, str) else None
-        self._save(record)
+        if save:
+            self._save(record)
 
     def status(self, name: str) -> dict[str, object]:
         """Distinguish saved lifecycle, runtime liveness, and supported operations."""
         return self._status_record(self._load(name))
 
     def _status_record(self, record: AgentRecord) -> dict[str, object]:
-        if record.adapter == "herdr":
+        if record.adapter in ("herdr", "herdr-foreign"):
             result = super()._status_record(record)
         else:
             result = record.to_document()
@@ -135,7 +156,7 @@ class Sessions(ManagedAgents):
                      model: str | None = None, **options: object) -> dict[str, object]:
         """Submit to the selected adapter without reusing another generation's name."""
         record = self._load(name)
-        if record.adapter == "herdr":
+        if record.adapter in ("herdr", "herdr-foreign"):
             if model is not None:
                 raise AgentDeliveryError("per-turn model overrides require a headless session")
             return asdict(super().send(name, text, message_id=message_id, expected_token=record.token, **options))
@@ -157,7 +178,7 @@ class Sessions(ManagedAgents):
             raise AgentDeliveryError("--output since_turn requires since-turn")
         with self._lock(name):
             record = self._load(name)
-            if record.adapter == "herdr":
+            if record.adapter in ("herdr", "herdr-foreign"):
                 if output not in ("tail", "all") or since_turn is not None:
                     raise AgentDeliveryError("interactive terminals expose snapshots, not final-answer boundaries")
                 self._checked(record)
@@ -173,7 +194,7 @@ class Sessions(ManagedAgents):
     def stop(self, name: str, *, expected_token: str | None = None) -> dict[str, object]:
         """Retire a runtime, then archive its canonical identity and artifacts."""
         record = self._load_expected(name, expected_token)
-        if record.adapter == "herdr":
+        if record.adapter in ("herdr", "herdr-foreign"):
             return super().stop(name, expected_token=record.token)
         with self._lock(name):
             current = self._load(name)
@@ -218,7 +239,7 @@ class Sessions(ManagedAgents):
         if not math.isfinite(timeout) or not 0 <= timeout <= 31_536_000:
             raise AgentDeliveryError("wait timeout must be finite and between 0 and 31536000 seconds")
         initial = self._load(name)
-        if initial.adapter == "herdr":
+        if initial.adapter in ("herdr", "herdr-foreign"):
             return super().wait(name, timeout=timeout, expected_token=initial.token, **options)  # type: ignore[arg-type]
         deadline = time.monotonic() + timeout
         while True:
@@ -247,7 +268,7 @@ class Sessions(ManagedAgents):
     def attach(self, name: str, *, expected_token: str | None = None) -> dict[str, object]:
         """Focus a verified Herdr tab or attach the current terminal to an exact tmux window."""
         initial = self._load_expected(name, expected_token)
-        if initial.adapter == "herdr":
+        if initial.adapter in ("herdr", "herdr-foreign"):
             return super().attach(name, expected_token=initial.token)
         attach_command: list[str] | None = None
         with self._lock(name):

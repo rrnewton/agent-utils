@@ -266,7 +266,10 @@ fn interactive_mode() -> String {
 
 impl AgentRecord {
     fn supported(&self) -> Result<()> {
-        if self.adapter != "herdr" || self.mode != "interactive" || self.backend != "herdr" {
+        if !matches!(self.adapter.as_str(), "herdr" | "herdr-foreign")
+            || self.mode != "interactive"
+            || self.backend != "herdr"
+        {
             return Err(fail(format!("agent {:?} uses adapter {:?}, mode {:?}, backend {:?}; use the agentctl with the worker extension implementation for this runtime", self.name, self.adapter, self.mode, self.backend)));
         }
         Ok(())
@@ -323,7 +326,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .collect())
     }
     fn pane_info(&self, pane_id: &str) -> crate::error::Result<AgentPaneInfo> {
-        if Some(self.client.agent_pane(&self.record.name)?) != self.record.pane_id {
+        if self.record.adapter == "herdr"
+            && Some(self.client.agent_pane(&self.record.name)?) != self.record.pane_id
+        {
             return Err(crate::error::AdapterError::unavailable(format!(
                 "agent {:?} no longer owns its recorded pane",
                 self.record.name
@@ -467,6 +472,21 @@ impl Default for StartOptions {
     }
 }
 
+/// Required live-identity assertions for a pre-existing Herdr agent.
+#[derive(Clone, Debug)]
+pub struct AdoptOptions {
+    /// Exact live pane containing the harness.
+    pub pane_id: String,
+    /// Expected live workspace label.
+    pub expected_workspace: String,
+    /// Expected live harness working directory.
+    pub cwd: PathBuf,
+    /// Expected Herdr harness kind.
+    pub harness: String,
+    /// Optional native session ID already reported by the exact pane.
+    pub session: Option<String>,
+}
+
 /// Registry-backed coordinator interface to visible foreign-harness workers.
 pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     client: &'a A,
@@ -497,6 +517,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &self.registry.join(format!(".{agent_name}.lock")),
             "agent lifecycle lock",
         )?;
+        file.lock_exclusive()
+            .map_err(|error| fail(error.to_string()))?;
+        Ok(file)
+    }
+
+    fn identity_lock(&self) -> Result<File> {
+        agent::create_private_directory(&self.registry, "agent registry", true, true)?;
+        let file =
+            agent::open_private_lock(&self.registry.join(".identity.lock"), "agent identity lock")?;
         file.lock_exclusive()
             .map_err(|error| fail(error.to_string()))?;
         Ok(file)
@@ -562,6 +591,33 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(json!(self.load(agent_name)?))
     }
 
+    fn identity_owner(
+        &self,
+        session_agent: &str,
+        session_value: &str,
+        exclude: Option<&str>,
+    ) -> Result<Option<AgentRecord>> {
+        if !self.registry.exists() {
+            return Ok(None);
+        }
+        agent::validate_private_directory(&self.registry, "agent registry", false)?;
+        for entry in fs::read_dir(&self.registry).map_err(|error| fail(error.to_string()))? {
+            let entry = entry.map_err(|error| fail(error.to_string()))?;
+            let existing_name = entry.file_name().to_string_lossy().into_owned();
+            if name(&existing_name).is_err() || Some(existing_name.as_str()) == exclude {
+                continue;
+            }
+            let other = self.load(&existing_name)?;
+            if other.session_agent.as_deref().unwrap_or(&other.harness) == session_agent
+                && (other.session_value.as_deref() == Some(session_value)
+                    || other.goal_session_id.as_deref() == Some(session_value))
+            {
+                return Ok(Some(other));
+            }
+        }
+        Ok(None)
+    }
+
     /// Start one fresh tab and retain failed launch artifacts for diagnosis.
     pub fn start(&self, agent_name: &str, cwd: &Path, options: StartOptions) -> Result<Value> {
         name(agent_name)?;
@@ -583,6 +639,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &options.harness_args,
         )?;
         let _lock = self.lock(agent_name)?;
+        let identity_lock = self.identity_lock()?;
+        if let Some(resume) = options.resume.as_deref() {
+            if let Some(owner) = self.identity_owner(&options.harness, resume, Some(agent_name))? {
+                return Err(fail(format!(
+                    "native session is already registered as {:?}",
+                    owner.name
+                )));
+            }
+        }
         let directory = self.directory(agent_name)?;
         if fs::symlink_metadata(&directory).is_ok() {
             return Err(fail(format!(
@@ -635,12 +700,271 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             self.save(&record)?;
             return Err(fail(format!("launch of {agent_name:?} failed: {error}; record and any created tab retained at {}", directory.display())));
         }
+        drop(identity_lock);
         // Keep this generation's lifecycle lock through startup delivery and returned status.
         // Sending by name after releasing it can redirect the old brief into a replacement.
         if let Some(brief) = options.brief {
             self.send_record(&record, &brief, options.delivery, None)?;
         }
         self.status(agent_name)
+    }
+
+    /// Register an identity-checked live Herdr agent without owning its runtime.
+    pub fn adopt(&self, agent_name: &str, options: AdoptOptions) -> Result<Value> {
+        name(agent_name)?;
+        if options.pane_id.is_empty() || options.pane_id.contains('\0') {
+            return Err(fail("adopt needs a nonempty pane id without NUL"));
+        }
+        if options.expected_workspace.is_empty() || options.expected_workspace.contains('\0') {
+            return Err(fail(
+                "adopt needs a nonempty expected workspace label without NUL",
+            ));
+        }
+        harness_arguments(&options.harness, None, None, &[])?;
+        let cwd = fs::canonicalize(&options.cwd)
+            .map_err(|_| fail(format!("cwd is not a directory: {}", options.cwd.display())))?;
+        if !cwd.is_dir() {
+            return Err(fail(format!("cwd is not a directory: {}", cwd.display())));
+        }
+        if options
+            .session
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value.contains('\0'))
+        {
+            return Err(fail(
+                "native session id must be nonempty and contain no NUL",
+            ));
+        }
+        let target = Target {
+            pane_id: Some(options.pane_id.clone()),
+            session_agent: options.session.as_ref().map(|_| options.harness.clone()),
+            session_value: options.session.clone(),
+            expected_agent: Some(options.harness.clone()),
+            expected_workspace: Some(options.expected_workspace),
+            expected_cwd: Some(cwd.clone()),
+        };
+        let _generation_lock = self.lock(agent_name)?;
+        let directory = self.directory(agent_name)?;
+        if fs::symlink_metadata(&directory).is_ok() {
+            return Err(fail(format!(
+                "agent {agent_name:?} already registered; stop it before reusing the name"
+            )));
+        }
+        // Different names have independent lifecycle locks. Make adoption one
+        // registry-wide identity transaction so simultaneous callers cannot
+        // register two panes that report the same native session.
+        let _identity_lock = self.identity_lock()?;
+        let (_target_lock, info) = agent::lock_resolved_target(self.client, &target)?;
+        match (&info.session_agent, &info.session_value) {
+            (None, None) => {}
+            (Some(kind), Some(value))
+                if !kind.is_empty()
+                    && !value.is_empty()
+                    && !kind.contains('\0')
+                    && !value.contains('\0') =>
+            {
+                if kind != &options.harness {
+                    return Err(fail(format!(
+                        "refusing pane {}: native session agent is {kind:?}, expected {:?}",
+                        options.pane_id, options.harness
+                    )));
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Err(fail(format!(
+                    "refusing pane {}: native session identity is invalid",
+                    options.pane_id
+                )));
+            }
+            _ => {
+                return Err(fail(format!(
+                    "refusing pane {}: native session identity is incomplete",
+                    options.pane_id
+                )));
+            }
+        }
+        if info.session_value.is_some() {
+            // A reported native session becomes the durable queue authority.
+            // Prove now that it resolves uniquely back to this exact pane.
+            agent::resolve_target(
+                self.client,
+                &Target {
+                    pane_id: Some(info.pane_id.clone()),
+                    session_agent: info.session_agent.clone(),
+                    session_value: info.session_value.clone(),
+                    expected_agent: Some(options.harness.clone()),
+                    expected_workspace: None,
+                    expected_cwd: Some(cwd.clone()),
+                },
+            )?;
+        }
+        let presentations: Vec<Pane> = self
+            .client
+            .panes()?
+            .into_iter()
+            .filter(|pane| pane.pane_id == info.pane_id)
+            .collect();
+        if presentations.len() != 1 {
+            return Err(fail(format!(
+                "refusing pane {}: expected one live presentation, found {}",
+                options.pane_id,
+                presentations.len()
+            )));
+        }
+        let presentation = &presentations[0];
+        if presentation.workspace_id != info.workspace_id {
+            return Err(fail(format!(
+                "refusing pane {}: presentation workspace identity changed",
+                options.pane_id
+            )));
+        }
+        for entry in fs::read_dir(&self.registry).map_err(|error| fail(error.to_string()))? {
+            let entry = entry.map_err(|error| fail(error.to_string()))?;
+            let existing_name = entry.file_name().to_string_lossy().into_owned();
+            if name(&existing_name).is_err() {
+                continue;
+            }
+            let other = self.load(&existing_name)?;
+            let same_session = info.session_value.is_some()
+                && other.session_agent.as_deref().unwrap_or(&other.harness)
+                    == info.session_agent.as_deref().unwrap_or("")
+                && (other.session_value == info.session_value
+                    || other.goal_session_id == info.session_value);
+            if other.pane_id.as_ref() == Some(&info.pane_id) || same_session {
+                return Err(fail(format!(
+                    "pane {:?} is already registered as {:?}",
+                    options.pane_id, other.name
+                )));
+            }
+        }
+        let confirmed = agent::resolve_target(
+            self.client,
+            &Target {
+                pane_id: Some(info.pane_id.clone()),
+                session_agent: info.session_agent.clone(),
+                session_value: info.session_value.clone(),
+                expected_agent: Some(options.harness.clone()),
+                expected_workspace: None,
+                expected_cwd: Some(cwd.clone()),
+            },
+        )?;
+        if confirmed.workspace_id != info.workspace_id
+            || confirmed.session_agent != info.session_agent
+            || confirmed.session_value != info.session_value
+        {
+            return Err(fail(format!(
+                "refusing pane {}: live identity changed before adoption",
+                options.pane_id
+            )));
+        }
+        let final_presentations: Vec<Pane> = self
+            .client
+            .panes()?
+            .into_iter()
+            .filter(|pane| pane.pane_id == confirmed.pane_id)
+            .collect();
+        if final_presentations.len() != 1
+            || final_presentations[0].tab_id != presentation.tab_id
+            || final_presentations[0].workspace_id != presentation.workspace_id
+        {
+            return Err(fail(format!(
+                "refusing pane {}: live presentation changed before adoption",
+                options.pane_id
+            )));
+        }
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .map_err(|error| fail(error.to_string()))?;
+        agent::sync_directory(&self.registry)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| fail(error.to_string()))?;
+        let mut record = AgentRecord {
+            adapter: "herdr-foreign".to_owned(),
+            mode: interactive_mode(),
+            backend: herdr_adapter(),
+            paused: false,
+            runtime_home: None,
+            extra: BTreeMap::new(),
+            name: agent_name.to_owned(),
+            token: format!("{}-{}", now.as_nanos(), std::process::id()),
+            harness: options.harness,
+            cwd: cwd.display().to_string(),
+            created_at: now.as_secs_f64(),
+            schema: 1,
+            lifecycle: "running".to_owned(),
+            workspace_id: Some(info.workspace_id),
+            tab_id: Some(presentation.tab_id.clone()),
+            pane_id: Some(info.pane_id),
+            session_agent: info.session_agent,
+            session_value: info.session_value,
+            model: None,
+            resume: None,
+            arguments: Vec::new(),
+            error: None,
+            goal: None,
+            goal_delivery: None,
+            goal_session_id: None,
+            goal_command: None,
+            goal_messages: BTreeMap::new(),
+            goal_message_id: None,
+        };
+        self.save(&record)?;
+        let final_status = self.status_record(&record).and_then(|result| {
+            if !result["probe_error"].is_null() {
+                return Err(fail(format!(
+                    "final live-identity verification failed: {}",
+                    result["probe_error"]
+                )));
+            }
+            let final_info = self.checked(&record)?;
+            if final_info.session_agent != record.session_agent
+                || final_info.session_value != record.session_value
+            {
+                return Err(fail("final live native-session identity changed"));
+            }
+            let live: Vec<Pane> = self
+                .client
+                .panes()?
+                .into_iter()
+                .filter(|pane| Some(&pane.pane_id) == record.pane_id.as_ref())
+                .collect();
+            if live.len() != 1
+                || Some(&live[0].tab_id) != record.tab_id.as_ref()
+                || Some(&live[0].workspace_id) != record.workspace_id.as_ref()
+            {
+                return Err(fail("final live-presentation verification failed"));
+            }
+            Ok(result)
+        });
+        match final_status {
+            Ok(result) => Ok(result),
+            Err(error) => match self.archive_failed_adoption(&mut record, &error.to_string()) {
+                Ok(destination) => Err(fail(format!(
+                    "adoption failed final verification and was not registered; diagnostic record archived at {}: {error}",
+                    destination.display()
+                ))),
+                Err(cleanup) => Err(fail(format!(
+                    "adoption failed final verification ({error}); could not finish failed-record archival from {}: {cleanup}",
+                    directory.display()
+                ))),
+            },
+        }
+    }
+
+    fn archive_failed_adoption(&self, record: &mut AgentRecord, error: &str) -> Result<PathBuf> {
+        let archive = self.registry.join("archive");
+        agent::create_private_directory(&archive, "agent archive", false, false)?;
+        let destination = archive.join(format!("{}-{}-adopt-failed", record.name, record.token));
+        fs::rename(self.directory(&record.name)?, &destination)
+            .map_err(|error| fail(error.to_string()))?;
+        agent::sync_directory(&archive)?;
+        agent::sync_directory(&self.registry)?;
+        record.lifecycle = "adopt_failed".to_owned();
+        record.error = Some(error.to_owned());
+        agent::atomic_json(&destination.join("agent.json"), &json!(record))?;
+        Ok(destination)
     }
 
     fn launch(&self, record: &mut AgentRecord, options: &StartOptions) -> Result<()> {
@@ -665,8 +989,64 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )?;
         record.session_agent = info.session_agent;
         record.session_value = info.session_value;
+        let owner = match (&record.session_agent, &record.session_value) {
+            (Some(session_agent), Some(session_value)) => {
+                self.identity_owner(session_agent, session_value, Some(&record.name))?
+            }
+            _ => None,
+        };
+        if let Some(owner) = owner {
+            let pane = record.pane_id.as_deref().expect("launched pane");
+            match self.client.close_pane(pane) {
+                Ok(()) => {
+                    record.session_agent = None;
+                    record.session_value = None;
+                    return Err(fail(format!(
+                        "native session is already registered as {:?}; closed the conflicting new pane",
+                        owner.name
+                    )));
+                }
+                Err(error) => {
+                    record.session_agent = None;
+                    record.session_value = None;
+                    return Err(fail(format!(
+                        "native session is already registered as {:?}; could not close the conflicting new pane: {error}",
+                        owner.name
+                    )));
+                }
+            }
+        }
+        if record.session_value.is_some() {
+            if let Err(error) = agent::resolve_target(self.client, &record.target()?) {
+                record.session_agent = None;
+                record.session_value = None;
+                return Err(fail(format!(
+                    "started native session is not globally unique; the failed owned pane remains available for stop: {error}"
+                )));
+            }
+        }
         record.lifecycle = "running".to_owned();
-        self.save(record)
+        self.save(record)?;
+        let final_info = match agent::resolve_target(self.client, &record.target()?)
+            .and_then(|_| self.checked(record))
+        {
+            Ok(info) => info,
+            Err(error) => {
+                record.session_agent = None;
+                record.session_value = None;
+                return Err(error);
+            }
+        };
+        if final_info.session_agent != record.session_agent
+            || final_info.session_value != record.session_value
+        {
+            record.session_agent = None;
+            record.session_value = None;
+            return Err(fail(
+                "started agent native session changed during identity commit",
+            ));
+        }
+        Ok(())
     }
 
     fn create_presentation(&self, record: &mut AgentRecord, options: &StartOptions) -> Result<()> {
@@ -945,6 +1325,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return Err(fail("goal command must be a nonempty argument vector"));
         }
         let _lock = self.lock(agent_name)?;
+        let _identity_lock = self.identity_lock()?;
         let mut record = self.load(agent_name)?;
         let info = self.checked(&record)?;
         for existing in [
@@ -958,6 +1339,28 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             if existing != session_id {
                 return Err(fail("refusing to replace an already bound native session"));
             }
+        }
+        if let Some(owner) = self.identity_owner(&record.harness, session_id, Some(agent_name))? {
+            return Err(fail(format!(
+                "native session is already registered as {:?}",
+                owner.name
+            )));
+        }
+        let mut reported = Vec::new();
+        for pane in self.client.panes()? {
+            let live = self.client.pane_info(&pane.pane_id)?;
+            if live.session_agent.as_deref() == Some(&record.harness)
+                && live.session_value.as_deref() == Some(session_id)
+            {
+                reported.push(pane.pane_id);
+            }
+        }
+        if !reported.is_empty()
+            && (reported.len() != 1 || Some(&reported[0]) != record.pane_id.as_ref())
+        {
+            return Err(fail(
+                "native session is reported by another or ambiguous live pane",
+            ));
         }
         // Session metadata is optional in Herdr. This is an explicit caller
         // assertion anchored to the independently verified live name and pane.
@@ -1107,11 +1510,40 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(())
     }
 
-    /// Close exactly the owned pane and archive its metadata, queue, and output.
+    /// Close an owned pane, or only unregister a foreign runtime, then archive state.
     pub fn stop(&self, agent_name: &str) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
         record.supported()?;
+        if record.adapter == "herdr-foreign" {
+            let info = self.checked(&record)?;
+            let mut text = self
+                .client
+                .read(&info.pane_id, "recent-unwrapped", Some(5000))?;
+            if text.is_empty() {
+                text = self.client.read(&info.pane_id, "recent", Some(5000))?;
+            }
+            self.snapshot(&record, &text)?;
+            // Output capture is another control round trip. Refuse archival if
+            // the exact foreign identity changed while it was in progress.
+            self.checked(&record)?;
+            record.lifecycle = "stopped".to_owned();
+            self.save(&record)?;
+            let archive = self.registry.join("archive");
+            agent::create_private_directory(&archive, "agent archive", false, false)?;
+            let destination = archive.join(format!("{agent_name}-{}", record.token));
+            fs::rename(self.directory(agent_name)?, &destination)
+                .map_err(|error| fail(error.to_string()))?;
+            agent::sync_directory(&archive)?;
+            agent::sync_directory(&self.registry)?;
+            return Ok(json!({
+                "name": agent_name,
+                "archive": destination,
+                "pane_closed": false,
+                "tab_closed": false,
+                "runtime_preserved": true,
+            }));
+        }
         let panes = self.client.panes()?;
         if panes.iter().any(|pane| {
             Some(&pane.pane_id) == record.pane_id.as_ref()
@@ -1193,6 +1625,7 @@ mod tests {
     use crate::error::{AdapterError, Result as AdapterResult};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     struct Fixture {
@@ -1219,6 +1652,11 @@ mod tests {
                     add_sibling_on_read: AtomicBool::new(false),
                     require_start_lock: AtomicBool::new(false),
                     started: AtomicBool::new(false),
+                    report_session: AtomicBool::new(true),
+                    duplicate_session: AtomicBool::new(false),
+                    change_session_after_save: AtomicBool::new(false),
+                    change_owned_session_after_save: AtomicBool::new(false),
+                    fail_close: AtomicBool::new(false),
                 },
                 root,
             }
@@ -1239,6 +1677,25 @@ mod tests {
                 )
                 .unwrap()
         }
+        fn prepare_foreign(&self) {
+            self.client.panes.lock().unwrap().push(Fake::pane("owned"));
+            self.client.started.store(true, Ordering::Relaxed);
+        }
+        fn adopt_options(&self) -> AdoptOptions {
+            AdoptOptions {
+                pane_id: "owned".to_owned(),
+                expected_workspace: "subagents".to_owned(),
+                cwd: self.root.clone(),
+                harness: "codex".to_owned(),
+                session: None,
+            }
+        }
+        fn adopt(&self) -> Value {
+            self.prepare_foreign();
+            self.manager()
+                .adopt("foreign", self.adopt_options())
+                .unwrap()
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -1255,6 +1712,11 @@ mod tests {
         add_sibling_on_read: AtomicBool,
         require_start_lock: AtomicBool,
         started: AtomicBool,
+        report_session: AtomicBool,
+        duplicate_session: AtomicBool,
+        change_session_after_save: AtomicBool,
+        change_owned_session_after_save: AtomicBool,
+        fail_close: AtomicBool,
     }
     impl Fake {
         fn pane(id: &str) -> Pane {
@@ -1294,24 +1756,47 @@ mod tests {
             if !self.panes.lock().unwrap().iter().any(|p| p.pane_id == pane) {
                 return Err(AdapterError::unavailable("missing pane"));
             }
+            let changed_after_save = self.change_session_after_save.load(Ordering::Relaxed)
+                && self.root.join("registry/foreign/agent.json").exists();
+            let owned_changed_after_save =
+                self.change_owned_session_after_save.load(Ordering::Relaxed)
+                    && agent::read_private_json(&self.root.join("registry/worker/agent.json"))
+                        .ok()
+                        .and_then(|record| record["lifecycle"].as_str().map(str::to_owned))
+                        .as_deref()
+                        == Some("running");
+            let changed_after_save = changed_after_save || owned_changed_after_save;
+            let report_session = self.report_session.load(Ordering::Relaxed)
+                || changed_after_save
+                || pane == "reported";
+            let kind = if pane == "claude" { "claude" } else { "codex" };
             Ok(AgentPaneInfo {
                 pane_id: pane.to_owned(),
-                workspace_id: "workspace".to_owned(),
+                workspace_id: if pane == "external" {
+                    "other-workspace"
+                } else {
+                    "workspace"
+                }
+                .to_owned(),
                 cwd: self.root.display().to_string(),
                 agent: self
                     .started
                     .load(Ordering::Relaxed)
-                    .then(|| "codex".to_owned()),
+                    .then(|| kind.to_owned()),
                 status: "idle".to_owned(),
-                session_agent: Some("codex".to_owned()),
-                session_value: Some(
-                    if pane == "owned" {
+                session_agent: report_session.then(|| kind.to_owned()),
+                session_value: report_session.then(|| {
+                    if changed_after_save {
+                        "replacement-thread"
+                    } else if matches!(pane, "owned" | "claude" | "reported")
+                        || self.duplicate_session.load(Ordering::Relaxed)
+                    {
                         "thread"
                     } else {
                         "human-thread"
                     }
-                    .to_owned(),
-                ),
+                    .to_owned()
+                }),
             })
         }
         fn workspace_label(&self, _: &str) -> AdapterResult<String> {
@@ -1352,6 +1837,9 @@ mod tests {
             Ok(("tab".to_owned(), "owned".to_owned()))
         }
         fn close_pane(&self, pane: &str) -> AdapterResult<()> {
+            if self.fail_close.load(Ordering::Relaxed) {
+                return Err(AdapterError::unavailable("close failed"));
+            }
             self.closed.lock().unwrap().push(pane.to_owned());
             self.panes.lock().unwrap().retain(|p| p.pane_id != pane);
             Ok(())
@@ -1371,6 +1859,17 @@ mod tests {
             _: &[String],
             _: Duration,
         ) -> AdapterResult<()> {
+            if self.require_start_lock.load(Ordering::Relaxed) {
+                let identity = agent::open_private_lock(
+                    &self.root.join("registry/.identity.lock"),
+                    "test identity lock",
+                )
+                .unwrap();
+                assert!(
+                    FileExt::try_lock_exclusive(&identity).is_err(),
+                    "startup released its identity lock before native session commit"
+                );
+            }
             self.started.store(true, Ordering::Relaxed);
             Ok(())
         }
@@ -1398,6 +1897,474 @@ mod tests {
         let status = fixture.start(Some("initial task".to_owned()));
         assert_eq!(status["lifecycle"], "running");
         assert_eq!(*fixture.client.runs.lock().unwrap(), ["initial task"]);
+    }
+
+    #[test]
+    fn start_session_change_leaves_launch_failed_record_stoppable() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .change_owned_session_after_save
+            .store(true, Ordering::Relaxed);
+        let error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("session"), "{error}");
+        let failed = fixture.manager().load("worker").unwrap();
+        assert_eq!(failed.lifecycle, "launch_failed");
+        assert!(failed.session_agent.is_none() && failed.session_value.is_none());
+        assert_eq!(
+            fixture.manager().stop("worker").unwrap()["pane_closed"],
+            true
+        );
+    }
+
+    #[test]
+    fn adopted_agent_keeps_native_identity_and_uses_the_durable_named_interface() {
+        let fixture = Fixture::new();
+        let adopted = fixture.adopt();
+        let manager = fixture.manager();
+        assert_eq!(adopted["adapter"], "herdr-foreign");
+        assert_eq!(adopted["pane_id"], "owned");
+        assert_eq!(adopted["session_agent"], "codex");
+        assert_eq!(adopted["session_value"], "thread");
+        assert_eq!(manager.list().unwrap().len(), 1);
+        manager
+            .send("foreign", "follow up", DrainOptions::default())
+            .unwrap();
+        assert_eq!(manager.read("foreign", 10).unwrap(), "visible output");
+        assert_eq!(
+            manager.wait("foreign", Duration::from_secs(0)).unwrap()["agent_status"],
+            "idle"
+        );
+        assert_eq!(
+            manager.bind_session("foreign", "thread", None).unwrap()["source"],
+            "explicit"
+        );
+        let command = ["/bin/false".to_owned()];
+        let goal = manager
+            .goal(
+                "foreign",
+                Some("finish adopted work"),
+                DrainOptions::default(),
+                Some(&command),
+            )
+            .unwrap();
+        assert_eq!(goal["delivery"], "delivered");
+        assert_eq!(
+            *fixture.client.runs.lock().unwrap(),
+            ["follow up", "/goal finish adopted work"]
+        );
+        let binding =
+            agent::read_private_json(&fixture.root.join("registry/foreign/queue/target.json"))
+                .unwrap();
+        assert_eq!(binding["kind"], "session");
+        assert_eq!(binding["agent"], "codex");
+        assert_eq!(binding["value"], "thread");
+    }
+
+    #[test]
+    fn stopping_an_adopted_agent_only_unregisters_and_archives_control_state() {
+        let fixture = Fixture::new();
+        let adopted = fixture.adopt();
+        let manager = fixture.manager();
+        manager
+            .send("foreign", "retained request", DrainOptions::default())
+            .unwrap();
+        let presentation = Fake::pane("owned");
+
+        let stopped = manager.stop("foreign").unwrap();
+
+        assert_eq!(stopped["runtime_preserved"], true);
+        assert_eq!(stopped["pane_closed"], false);
+        assert_eq!(stopped["tab_closed"], false);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(*fixture.client.panes.lock().unwrap(), [presentation]);
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        let saved = agent::read_private_json(&archive.join("agent.json")).unwrap();
+        assert_eq!(saved["adapter"], "herdr-foreign");
+        assert_eq!(saved["token"], adopted["token"]);
+        assert!(archive.join("output.json").is_file());
+        assert_eq!(
+            fs::read_dir(archive.join("queue/processed"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn adoption_refuses_identity_mismatches_without_creating_a_record() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .panes
+            .lock()
+            .unwrap()
+            .push(Fake::pane("owned"));
+        let manager = fixture.manager();
+        assert!(manager.adopt("foreign", fixture.adopt_options()).is_err());
+        assert!(!fixture.root.join("registry/foreign").exists());
+
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        let mut options = fixture.adopt_options();
+        options.harness = "claude".to_owned();
+        assert!(fixture.manager().adopt("foreign", options).is_err());
+        assert!(!fixture.root.join("registry/foreign").exists());
+
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        let mut options = fixture.adopt_options();
+        options.expected_workspace = "wrong".to_owned();
+        assert!(fixture.manager().adopt("foreign", options).is_err());
+        assert!(!fixture.root.join("registry/foreign").exists());
+
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        let wrong = fixture.root.join("wrong");
+        fs::create_dir(&wrong).unwrap();
+        let mut options = fixture.adopt_options();
+        options.cwd = wrong;
+        assert!(fixture.manager().adopt("foreign", options).is_err());
+        assert!(!fixture.root.join("registry/foreign").exists());
+
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        let mut options = fixture.adopt_options();
+        options.session = Some("wrong-thread".to_owned());
+        assert!(fixture.manager().adopt("foreign", options).is_err());
+        assert!(!fixture.root.join("registry/foreign").exists());
+    }
+
+    #[test]
+    fn adoption_refuses_a_duplicate_pane_and_preserves_the_first_generation() {
+        let fixture = Fixture::new();
+        let adopted = fixture.adopt();
+        let error = fixture
+            .manager()
+            .adopt("second", fixture.adopt_options())
+            .unwrap_err();
+        assert!(error.to_string().contains("already registered as"));
+        assert_eq!(
+            fixture.manager().get("foreign").unwrap()["token"],
+            adopted["token"]
+        );
+        assert!(!fixture.root.join("registry/second").exists());
+    }
+
+    #[test]
+    fn same_provider_local_session_id_is_allowed_for_different_harnesses() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        let mut pane = Fake::pane("claude");
+        pane.tab_id = "claude-tab".to_owned();
+        fixture.client.panes.lock().unwrap().push(pane);
+        let mut options = fixture.adopt_options();
+        options.pane_id = "claude".to_owned();
+        options.harness = "claude".to_owned();
+        let adopted = fixture.manager().adopt("claude", options).unwrap();
+        assert_eq!(adopted["session_agent"], "claude");
+        assert_eq!(adopted["session_value"], "thread");
+        assert_eq!(fixture.manager().list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn adoption_refuses_same_harness_session_held_by_headless_record() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut document = agent::read_private_json(&path).unwrap();
+        document["adapter"] = json!("turn-runner");
+        document["mode"] = json!("headless");
+        document["backend"] = json!("tmux");
+        document["runtime_home"] = json!(fixture.root.join("runtime"));
+        document["session_agent"] = Value::Null;
+        document["session_value"] = json!("thread");
+        document["pane_id"] = json!("headless-pane");
+        agent::atomic_json(&path, &document).unwrap();
+        *fixture.client.panes.lock().unwrap() = vec![Fake::pane("foreign")];
+        fixture
+            .client
+            .duplicate_session
+            .store(true, Ordering::Relaxed);
+        let mut options = fixture.adopt_options();
+        options.pane_id = "foreign".to_owned();
+        let error = fixture.manager().adopt("foreign", options).unwrap_err();
+        assert!(error.to_string().contains("already registered as"));
+        assert!(!fixture.root.join("registry/foreign").exists());
+    }
+
+    #[test]
+    fn interactive_start_refuses_resume_claimed_by_adopted_agent() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        let presentation = Fake::pane("owned");
+        let error = fixture
+            .manager()
+            .start(
+                "second",
+                &fixture.root,
+                StartOptions {
+                    resume: Some("thread".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("already registered as"));
+        assert!(!fixture.root.join("registry/second").exists());
+        assert_eq!(*fixture.client.panes.lock().unwrap(), [presentation]);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn start_refuses_unregistered_same_session_in_another_workspace_and_is_stoppable() {
+        let fixture = Fixture::new();
+        let mut external = Fake::pane("external");
+        external.tab_id = "external-tab".to_owned();
+        external.workspace_id = "other-workspace".to_owned();
+        fixture.client.panes.lock().unwrap().push(external.clone());
+        fixture
+            .client
+            .duplicate_session
+            .store(true, Ordering::Relaxed);
+        let error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("not globally unique"), "{error}");
+        let failed = fixture.manager().load("worker").unwrap();
+        assert_eq!(failed.lifecycle, "launch_failed");
+        assert!(failed.session_value.is_none());
+        assert_eq!(
+            fixture.manager().stop("worker").unwrap()["pane_closed"],
+            true
+        );
+        assert_eq!(*fixture.client.panes.lock().unwrap(), [external]);
+    }
+
+    #[test]
+    fn conflicting_started_pane_remains_stoppable_if_initial_close_fails() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let holder_path = fixture.root.join("registry/worker/agent.json");
+        let mut holder = agent::read_private_json(&holder_path).unwrap();
+        holder["adapter"] = json!("turn-runner");
+        holder["mode"] = json!("headless");
+        holder["backend"] = json!("tmux");
+        holder["runtime_home"] = json!(fixture.root.join("runtime"));
+        holder["pane_id"] = json!("headless-pane");
+        agent::atomic_json(&holder_path, &holder).unwrap();
+        fixture.client.panes.lock().unwrap().clear();
+        fixture.client.fail_close.store(true, Ordering::Relaxed);
+        let error = fixture
+            .manager()
+            .start(
+                "second",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("could not close"), "{error}");
+        let failed = fixture.manager().load("second").unwrap();
+        assert_eq!(failed.lifecycle, "launch_failed");
+        assert!(failed.session_agent.is_none() && failed.session_value.is_none());
+        fixture.client.fail_close.store(false, Ordering::Relaxed);
+        assert_eq!(
+            fixture.manager().stop("second").unwrap()["pane_closed"],
+            true
+        );
+    }
+
+    #[test]
+    fn adoption_refuses_a_reported_session_visible_in_two_live_panes() {
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        let mut duplicate = Fake::pane("duplicate");
+        duplicate.tab_id = "other-tab".to_owned();
+        fixture.client.panes.lock().unwrap().push(duplicate);
+        fixture
+            .client
+            .duplicate_session
+            .store(true, Ordering::Relaxed);
+        let error = fixture
+            .manager()
+            .adopt("foreign", fixture.adopt_options())
+            .unwrap_err();
+        assert!(error.to_string().contains("exactly one live pane"));
+        assert!(!fixture.root.join("registry/foreign").exists());
+    }
+
+    #[test]
+    fn adoption_archives_failed_generation_if_identity_changes_after_save() {
+        for initially_reported in [true, false] {
+            let fixture = Fixture::new();
+            fixture.prepare_foreign();
+            fixture
+                .client
+                .report_session
+                .store(initially_reported, Ordering::Relaxed);
+            fixture
+                .client
+                .change_session_after_save
+                .store(true, Ordering::Relaxed);
+            let error = fixture
+                .manager()
+                .adopt("foreign", fixture.adopt_options())
+                .unwrap_err();
+            assert!(error.to_string().contains("was not registered"));
+            assert!(!fixture.root.join("registry/foreign").exists());
+            let records: Vec<PathBuf> = fs::read_dir(fixture.root.join("registry/archive"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path().join("agent.json"))
+                .collect();
+            assert_eq!(records.len(), 1);
+            let saved = agent::read_private_json(&records[0]).unwrap();
+            assert_eq!(saved["lifecycle"], "adopt_failed");
+            assert!(saved["error"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()));
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.client.runs.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn sessionless_adoption_stays_pane_bound_after_goal_session_binding() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let adopted = fixture.adopt();
+        let manager = fixture.manager();
+        assert!(adopted["session_value"].is_null());
+        manager
+            .bind_session("foreign", "explicit-thread", None)
+            .unwrap();
+        manager
+            .send("foreign", "still pane bound", DrainOptions::default())
+            .unwrap();
+        let binding =
+            agent::read_private_json(&fixture.root.join("registry/foreign/queue/target.json"))
+                .unwrap();
+        assert_eq!(binding["kind"], "pane");
+        assert_eq!(binding["pane_id"], "owned");
+    }
+
+    #[test]
+    fn bind_session_refuses_an_authoritative_owner_in_another_record() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let mut second = Fake::pane("second");
+        second.tab_id = "second-tab".to_owned();
+        fixture.client.panes.lock().unwrap().push(second);
+        let mut options = fixture.adopt_options();
+        options.pane_id = "second".to_owned();
+        fixture.manager().adopt("second", options).unwrap();
+        let error = fixture
+            .manager()
+            .bind_session("second", "thread", None)
+            .unwrap_err();
+        assert!(error.to_string().contains("already registered as"));
+        assert!(fixture
+            .manager()
+            .load("second")
+            .unwrap()
+            .goal_session_id
+            .is_none());
+    }
+
+    #[test]
+    fn bind_session_refuses_unregistered_live_session_contradiction() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture.adopt();
+        let mut reported = Fake::pane("reported");
+        reported.tab_id = "reported-tab".to_owned();
+        fixture.client.panes.lock().unwrap().push(reported);
+        let error = fixture
+            .manager()
+            .bind_session("foreign", "thread", None)
+            .unwrap_err();
+        assert!(error.to_string().contains("another or ambiguous live pane"));
+        assert!(fixture
+            .manager()
+            .load("foreign")
+            .unwrap()
+            .goal_session_id
+            .is_none());
+    }
+
+    #[test]
+    fn concurrent_bind_session_allows_exactly_one_provider_local_owner() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture.adopt();
+        let mut second = Fake::pane("second");
+        second.tab_id = "second-tab".to_owned();
+        fixture.client.panes.lock().unwrap().push(second);
+        let mut options = fixture.adopt_options();
+        options.pane_id = "second".to_owned();
+        let manager = fixture.manager();
+        manager.adopt("second", options).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            for name in ["foreign", "second"] {
+                let barrier = Arc::clone(&barrier);
+                let outcomes = Arc::clone(&outcomes);
+                let manager = &manager;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let bound = manager.bind_session(name, "shared-thread", None).is_ok();
+                    outcomes.lock().unwrap().push(bound);
+                });
+            }
+            barrier.wait();
+        });
+        let mut outcomes = outcomes.lock().unwrap().clone();
+        outcomes.sort_unstable();
+        assert_eq!(outcomes, [false, true]);
+        let claims = [
+            manager.load("foreign").unwrap().goal_session_id,
+            manager.load("second").unwrap().goal_session_id,
+        ];
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| claim.as_deref() == Some("shared-thread"))
+                .count(),
+            1
+        );
     }
 
     #[test]

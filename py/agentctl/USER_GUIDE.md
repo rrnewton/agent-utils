@@ -71,6 +71,45 @@ agentctl send reviewer 'Focus on cancellation and restart behavior'
 be repeated. `--resume SESSION` resumes an explicitly identified conversation.
 Use `--workspace-id` to choose an exact Herdr workspace.
 
+### Adopt an existing Herdr agent
+
+An agent that is already running in Herdr can join the same named registry
+without being restarted or renamed:
+
+```sh
+herdr pane list
+herdr pane get w1:p2
+herdr workspace get w1
+agentctl adopt reviewer --pane w1:p2 --workspace project \
+  --cwd /work/project --harness codex
+```
+
+Use the pane ID, working directory, harness, workspace ID, and workspace label
+reported by those read-only Herdr commands; do not infer them from a tab title.
+`--pane`, `--workspace`, `--cwd`, and `--harness` are required identity
+assertions. Adoption resolves the workspace label, canonicalizes the directory,
+requires a live matching harness, pins the exact pane and tab, and refuses a
+pane or native session already registered under another name. A pane title or
+tab label is never enough. If Herdr already reports a native conversation ID,
+the record and durable queue retain it automatically. `--session ID` may be
+supplied only to assert an ID already reported by that exact live pane; it is not
+a way to guess or overwrite native identity.
+
+If `pane get` reports no native session, omit `--session`; the adopted queue
+stays bound to the exact pane. A separately recovered ID can later enable native
+goal inspection with `agentctl bind-session NAME ID`. That explicit fallback
+does not rewrite the queue target and is refused if another registered record or
+live pane already reports the same harness-local ID.
+
+The saved adapter is `herdr-foreign`. Named `send`, `read`, `wait`, `goal`,
+`bind-session`, `status`, `list`, pause/resume, attach, and durable drain then use
+the same interface as a started interactive session. The registry owns those
+control artifacts, not the adopted process. Consequently, `agentctl stop NAME`
+revalidates the target, saves a final terminal snapshot, unregisters it, and
+archives its queue without closing the pane, tab, or process. Stop the foreign
+runtime through the authority that created it. If the recorded live identity can
+no longer be verified, `stop` refuses and leaves the registration in place.
+
 `send` accepts literal text or `--file`. In interactive mode, the instruction is
 persisted before submission. The manager waits for native readiness, records an
 in-flight barrier, and asks Herdr to submit the text with paste plus Enter. It
@@ -160,7 +199,11 @@ completed native goal.
 agentctl stop reviewer
 ```
 
-Stopping closes only the runtime owned by the session and archives its state.
+Stopping closes only a runtime created and owned by the session manager, then
+archives its state. For an adopted `herdr-foreign` record, stopping means safe
+unregistration: the manager verifies the recorded identity, saves a terminal
+snapshot, archives its record and queue, and leaves the pane, tab, and process
+running.
 An unavailable terminal server is not proof that an agent died. A lost terminal
 view is not proof that a headless runner stopped. Preserve the registry and
 inspect `status` when ownership checks refuse an operation.
@@ -253,7 +296,9 @@ Chat access and saved bridge state, but no live Herdr pane.
 
 `agentctl mcp --registry /absolute/path` serves session operations over stdio
 when the MCP extension is available. The coordinator can use either CLI or MCP;
-workers do not need individual Chat connections.
+workers do not need individual Chat connections. Its `agent_adopt` tool requires
+the same `name`, `pane`, `workspace`, `cwd`, and `harness` assertions and accepts
+the same optional already-reported `session` assertion as the CLI.
 
 ## Compatibility entry points
 
@@ -279,7 +324,8 @@ uses `HERDR_SUBAGENTS_HOME`, or `$XDG_STATE_HOME/herdr-agent/foreign` (default:
 Use `agentctl --registry .herdr-agents` to continue a managed interactive
 registry. An independent worker-compatibility registry retains its own command
 and environment until those workers are stopped and started through the unified
-interface. Creating a new registry does not adopt an agent by matching its name.
+interface. Creating a new registry does not adopt an agent by matching its name;
+use `agentctl adopt` with the explicit live identity assertions above.
 Low-level compatibility arguments remain discoverable with each entry point's
 `--help`.
 

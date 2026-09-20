@@ -74,11 +74,15 @@ def _start(harness: Harness, report: Report, case: PairCase, label: str,
 def _orientation(harness: Harness, report: Report) -> None:
     case = harness.case("primary-orientation")
     _pair(harness, report, case, "primary/version", ("--version",))
-    for arguments in ((), ("--help",), ("start", "--help"), ("send", "--help"), ("goal", "--help")):
+    for arguments in ((), ("--help",), ("start", "--help"), ("adopt", "--help"),
+                      ("send", "--help"), ("goal", "--help")):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, arguments), strict=True):
             report.require(f"primary/help/{arguments}/{edition}",
                            outcome.returncode == 0 and not outcome.stderr and "--registry" in outcome.stdout
-                           and ("--message-id" in outcome.stdout if arguments == ("send", "--help") else True),
+                           and ("--message-id" in outcome.stdout if arguments == ("send", "--help") else True)
+                           and (all(option in outcome.stdout for option in
+                                    ("--pane", "--workspace", "--cwd", "--harness", "--session"))
+                                if arguments == ("adopt", "--help") else True),
                            f"missing operation help: {outcome!r}")
     for command in ("quickstart", "userguide"):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, (command,)), strict=True):
@@ -260,6 +264,99 @@ def _ownership(harness: Harness, report: Report) -> None:
                                    for root in (case.python_root, case.rust_root)), f"uncertain identity was retired: {outcomes!r}")
 
 
+def _adoption(harness: Harness, report: Report) -> None:
+    case = harness.case("primary-adoption")
+    common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
+    python, _ = _pair(harness, report, case, "primary/adopt/register", (
+        "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+        "--cwd", "<ROOT>", "--harness", "codex", "--session", "session-1", *common,
+    ))
+    adopted = _json(python)
+    report.require("primary/adopt/metadata", isinstance(adopted, dict)
+                   and all(adopted.get(key) == value for key, value in {
+                       "name": "foreign", "adapter": "herdr-foreign", "mode": "interactive",
+                       "backend": "herdr", "pane_id": "w1:p1", "tab_id": "w1:t1",
+                       "workspace_id": "w1", "session_agent": "codex",
+                       "session_value": "session-1", "capabilities": _CAPABILITIES,
+                   }.items()), f"adoption lost exact live identity: {adopted!r}")
+    for command in (("status", "foreign"), ("list",),
+                    ("wait", "foreign", "--timeout", "0")):
+        _pair(harness, report, case, f"primary/adopt/{command[0]}", (*command, *common))
+    _pair(harness, report, case, "primary/adopt/send",
+          ("send", "foreign", "retained request", "--message-id", "adopted-1", *common))
+    _pair(harness, report, case, "primary/adopt/read", ("read", "foreign", *common))
+    _pair(harness, report, case, "primary/adopt/bind",
+          ("bind-session", "foreign", "session-1", *_GOAL_COMMAND, *common))
+    _pair(harness, report, case, "primary/adopt/pause", ("pause", "foreign", *common))
+    _pair(harness, report, case, "primary/adopt/resume", ("resume", "foreign", *common))
+    _pair(harness, report, case, "primary/adopt/attach", ("attach", "foreign", *common))
+    python, _ = _pair(harness, report, case, "primary/adopt/unregister",
+                      ("stop", "foreign", *common))
+    stopped = _json(python)
+    report.require("primary/adopt/runtime-preserved", isinstance(stopped, dict)
+                   and stopped.get("runtime_preserved") is True
+                   and stopped.get("pane_closed") is False
+                   and stopped.get("tab_closed") is False
+                   and all(not _state(root).get("closed")
+                           and not _state(root).get("closed_panes")
+                           and not (root / "registry/foreign").exists()
+                           and len(list((root / "registry/archive").glob("*/agent.json"))) == 1
+                           and len(list((root / "registry/archive").glob(
+                               "*/queue/processed/adopted-1.json"))) == 1
+                           for root in (case.python_root, case.rust_root)),
+                   f"unregister mutated a foreign runtime or lost durable state: {stopped!r}")
+
+    mismatch_cases: tuple[tuple[str, Mapping[str, object], tuple[str, ...]], ...] = (
+        ("non-agent", {"harness": None}, ()),
+        ("harness", {}, ("--harness", "claude")),
+        ("workspace", {}, ("--workspace", "wrong")),
+        ("session", {}, ("--session", "wrong-session")),
+    )
+    for label, state, replacement in mismatch_cases:
+        mismatch = harness.case(f"primary-adoption-{label}", state)
+        arguments = [
+            "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+            "--cwd", "<ROOT>", "--harness", "codex", *common,
+        ]
+        option = replacement[0] if replacement else None
+        if option is not None:
+            index = arguments.index(option) if option in arguments else -1
+            if index >= 0:
+                arguments[index:index + 2] = replacement
+            else:
+                arguments.extend(replacement)
+        outcomes = harness.invoke(mismatch, arguments)
+        report.require(f"primary/adopt/refuse-{label}", all(
+            outcome.returncode == 75 for outcome in outcomes
+        ) and all(not (root / "registry/foreign").exists()
+                  and not _state(root).get("closed")
+                  for root in (mismatch.python_root, mismatch.rust_root)),
+            f"identity mismatch was adopted or mutated: {outcomes!r}")
+
+    for label, producer, consumer in (
+        ("python-rust", harness.python, harness.rust),
+        ("rust-python", harness.rust, harness.python),
+    ):
+        interop = harness.case(f"primary-adoption-interop-{label}")
+        root = interop.python_root
+        adopted = harness._invoke_one(producer, root, (
+            "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+            "--cwd", "<ROOT>", "--harness", "codex", *common,
+        ))
+        status = harness._invoke_one(consumer, root, ("status", "foreign", *common))
+        sent = harness._invoke_one(consumer, root, (
+            "send", "foreign", "cross-engine adopted request", *common,
+        ))
+        stopped = harness._invoke_one(consumer, root, ("stop", "foreign", *common))
+        report.require(f"primary/adopt/interop-{label}", all(
+            outcome.returncode == 0 for outcome in (adopted, status, sent, stopped)
+        ) and _state(root).get("submitted") == ["cross-engine adopted request"]
+            and not _state(root).get("closed") and not _state(root).get("closed_panes")
+            and len(list((root / "registry/archive").glob("*/agent.json"))) == 1,
+            f"adopted record was not safely portable between editions: "
+            f"{(adopted, status, sent, stopped)!r}")
+
+
 def _invalid_cli(harness: Harness, report: Report) -> None:
     case = harness.case("primary-invalid-cli")
     for label, arguments in (
@@ -296,6 +393,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
         _handoff_and_pending(harness, report)
         _registry_and_interop(harness, report)
         _ownership(harness, report)
+        _adoption(harness, report)
         _invalid_cli(harness, report)
     return report
 
