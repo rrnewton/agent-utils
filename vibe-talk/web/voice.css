@@ -127,6 +127,8 @@ body {
      and the transcript cannot scroll underneath it. */
   display: grid;
   grid-template-rows: auto 1fr auto;
+  /* Constrain the shared overlay anchor to the viewport even when a control's text is wider. */
+  grid-template-columns: minmax(0, 1fr);
   /* style.css leaves room at the bottom for a fixed status strip this page does not have. */
   padding-bottom: 0;
 }
@@ -1315,7 +1317,10 @@ body {
   z-index: 2;
   right: calc(0.75rem + env(safe-area-inset-right));
   bottom: 0.5rem;
+  max-width: calc(100% - 1.5rem - env(safe-area-inset-left) - env(safe-area-inset-right));
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 0.4rem;
   pointer-events: none;
 }
@@ -1668,7 +1673,9 @@ body {
   position: absolute;
   z-index: 5;
   inset-inline: 0;
-  bottom: 0.5rem;
+  /* Follow the actual tool height, including wrapped rows and larger phone fonts. Both layers
+     stay outside the scrolling content, so showing a banner never moves the reader's place. */
+  bottom: calc(0.5rem + var(--scroll-tools-clearance, 0px));
   width: max-content;
   max-width: calc(100% - 1.5rem);
   margin-inline: auto;

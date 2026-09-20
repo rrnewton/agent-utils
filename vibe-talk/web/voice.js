@@ -50,6 +50,18 @@ const el = (id) => document.getElementById(id);
 const STATUS_DISMISS_MS = 6000;
 let statusTimer = null;
 
+// The floating chips can wrap or disappear as actions become available. Keep the banner above
+// their measured height instead of giving both overlays the same bottom edge. Observing the tools
+// also handles font/viewport changes and their parent screen being hidden, without moving history.
+if (typeof window.ResizeObserver === "function") {
+  new window.ResizeObserver(([entry]) => {
+    const height = entry.contentRect.height;
+    el("frame-body").style.setProperty(
+      "--scroll-tools-clearance", height > 0 ? `calc(${height}px + 0.5rem)` : "0px"
+    );
+  }).observe(el("scroll-tools"));
+}
+
 const setStatus = (text) => {
   if (statusTimer !== null) {
     clearTimeout(statusTimer);
