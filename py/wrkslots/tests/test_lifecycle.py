@@ -25471,6 +25471,7 @@ def test_absent_validate_process_and_systemd_checks_fail_closed(
     rows = ((record, (target,)),)
     proc_root = tmp_path / "proc"
     (proc_root / "123").mkdir(parents=True)
+    (proc_root / "123" / "status").write_text("State:\tS (sleeping)\n")
     monkeypatch.setattr(
         wrkslots,
         "_read_process_stat",
@@ -25662,6 +25663,418 @@ def test_mount_namespace_reselects_after_representative_generation_changes(
     )
     assert wrkslots._absent_validate_mount_match(processes, {target: "gone"}) is None
     assert inspected == [123, 124]
+
+
+@pytest.mark.parametrize("state", ("R", "S", "D", "T", "t", "X", "Z", "P", "I", "K", "W", "x"))
+def test_process_census_status_preserves_known_active_and_terminal_states(
+    tmp_path: Path, state: str,
+) -> None:
+    (tmp_path / "status").write_text(f"State:\t{state} (fixture state)\n")
+    assert wrkslots._process_is_zombie(tmp_path) is (state in {"Z", "X"})
+
+
+@pytest.mark.parametrize("status", (
+    b"", b"State:\n", b"State:\t? (unknown)\n", b"State:\tZZ (malformed)\n",
+    b"State:\tS (sleeping)\nState:\tZ (zombie)\n", b"State:\t\xff\n",
+    b"State:Z S\n",
+))
+def test_process_census_status_refuses_malformed_or_ambiguous_evidence(
+    tmp_path: Path, status: bytes,
+) -> None:
+    (tmp_path / "status").write_bytes(status)
+    with pytest.raises(wrkslots.Refusal, match="process state") as refused:
+        wrkslots._process_is_zombie(tmp_path)
+    assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+@pytest.mark.parametrize("namespace", ("visible", "protected"))
+def test_process_census_fresh_snapshot_omits_terminal_generations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, namespace: str,
+) -> None:
+    read_fd, release_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(release_fd)
+        try:
+            os.read(read_fd, 1)
+        finally:
+            os._exit(0)
+    os.close(read_fd)
+    try:
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        (proc_root / str(pid)).symlink_to(Path("/proc") / str(pid))
+        os.close(release_fd)
+        release_fd = -1
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        assert wrkslots._process_is_zombie(proc_root / str(pid))
+        namespace_reads: list[Path] = []
+
+        def read_namespace(path: Path) -> str | None:
+            namespace_reads.append(path)
+            return f"pid:{pid}" if namespace == "protected" else None
+
+        monkeypatch.setattr(wrkslots, "_mount_namespace", read_namespace)
+        budget = wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=5, stdout_limit=1024, stderr_limit=1024,
+        )
+        snapshot = (
+            wrkslots._absent_validate_process_snapshot(proc_root)
+            if lane == "privileged"
+            else wrkslots._same_uid_process_observations(budget, proc_root)
+        )
+        assert snapshot == ()
+        assert namespace_reads == []
+    finally:
+        if release_fd >= 0:
+            os.close(release_fd)
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+@pytest.mark.parametrize("new_generation", (None, 17, 18))
+@pytest.mark.parametrize("status_present", (True, False))
+def test_process_census_terminal_snapshot_binds_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,
+    new_generation: int | None, status_present: bool,
+) -> None:
+    proc_root = tmp_path / "proc"
+    pid_dir = proc_root / "123"
+    pid_dir.mkdir(parents=True)
+    if status_present:
+        (pid_dir / "status").write_text("State:\tZ (zombie)\n")
+    stats: list[wrkslots._ProcessStat | None] = [wrkslots._ProcessStat(17, 0)]
+    stats.append(None if new_generation is None else wrkslots._ProcessStat(new_generation, 0))
+    if not status_present and new_generation is None:
+        stats.append(None)
+    reads: list[Path] = []
+
+    def read_stat(path: Path) -> wrkslots._ProcessStat | None:
+        reads.append(path)
+        return stats.pop(0)
+
+    monkeypatch.setattr(wrkslots, "_read_process_stat", read_stat)
+    monkeypatch.setattr(
+        wrkslots, "_mount_namespace",
+        lambda _path: pytest.fail("terminal classification reached a namespace observer"),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024,
+    )
+
+    def snapshot() -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        if lane == "privileged":
+            return wrkslots._absent_validate_process_snapshot(proc_root)
+        return wrkslots._same_uid_process_observations(budget, proc_root)
+
+    if not status_present and new_generation is not None:
+        with pytest.raises(wrkslots.Refusal, match="missing while its generation is still present") as refused:
+            snapshot()
+        assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+    elif new_generation == 18:
+        with pytest.raises(wrkslots._ProcessEvidenceChanged, match="generation changed"):
+            snapshot()
+    else:
+        assert snapshot() == ()
+    assert reads == [pid_dir] * (3 if not status_present and new_generation is None else 2)
+    assert stats == []
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+@pytest.mark.parametrize("stage", ("snapshot", "preflight"))
+@pytest.mark.parametrize("evidence", ("stat-denied", "status-denied", "stat-malformed", "status-malformed", "status-missing"))
+def test_process_census_unknown_identity_refuses_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, stage: str,
+    evidence: str,
+) -> None:
+    pid = os.getpid()
+    pid_dir = Path("/proc") / str(pid)
+    generation = wrkslots._read_process_stat(pid_dir)
+    assert generation is not None
+    process = wrkslots._AbsentProcessObservation(pid, generation.start_ticks, "", f"pid:{pid}")
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    (proc_root / str(pid)).symlink_to(pid_dir)
+    original_read = Path.read_text
+    field, failure = evidence.split("-")
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if path.parent.name == str(pid) and path.name == field:
+            if failure == "denied":
+                raise PermissionError(errno.EACCES, "fixture evidence denied")
+            if failure == "missing":
+                raise FileNotFoundError(errno.ENOENT, "fixture evidence missing")
+            return "unparseable process evidence\n"
+        return original_read(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    snapshots = 0
+
+    def snapshot() -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        nonlocal snapshots
+        snapshots += 1
+        return (process,)
+
+    if stage == "preflight":
+        monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", snapshot)
+        monkeypatch.setattr(wrkslots, "_same_uid_process_observations", lambda _budget: snapshot())
+    monkeypatch.setattr(
+        wrkslots, "_run_root_owned_command",
+        lambda *_args, **_kwargs: pytest.fail("unknown identity reached a trusted reader"),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024,
+    )
+    with pytest.raises(wrkslots.Refusal) as refused:
+        if stage == "snapshot":
+            if lane == "privileged":
+                wrkslots._absent_validate_process_snapshot(proc_root)
+            else:
+                wrkslots._same_uid_process_observations(budget, proc_root)
+        elif lane == "privileged":
+            wrkslots._capture_process_path_census((Path("/fixture/slot"),), budget=budget)
+        else:
+            wrkslots._capture_same_uid_process_path_census((Path("/fixture/slot"),), budget=budget)
+    assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+    assert snapshots == (1 if stage == "preflight" else 0)
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+@pytest.mark.parametrize("scenario", ("once", "persistent", "deadline", "between-pids"))
+def test_process_census_preflight_discards_attempt_with_shared_bounds(
+    monkeypatch: pytest.MonkeyPatch, lane: str, scenario: str,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "pid:123")
+    calls: list[str] = []
+    now = 0.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024,
+    )
+
+    def snapshot() -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        calls.append("snapshot")
+        if scenario == "between-pids":
+            return (process, wrkslots._AbsentProcessObservation(124, 18, "", "pid:124"))
+        return (process,) if scenario != "once" or calls.count("snapshot") == 1 else ()
+
+    def active(observed: wrkslots._AbsentProcessObservation) -> bool:
+        nonlocal now
+        assert observed == process
+        calls.append("identity")
+        if scenario in {"deadline", "between-pids"}:
+            now = 6.0
+        return scenario == "between-pids"
+
+    def observer(name: str) -> Callable[
+        [Sequence[wrkslots._AbsentProcessObservation], object, wrkslots._ReadOnlyCommandBudget],
+        tuple[()],
+    ]:
+        def observe(processes: Sequence[wrkslots._AbsentProcessObservation], _targets: object, actual: wrkslots._ReadOnlyCommandBudget) -> tuple[()]:
+            assert processes == ()
+            assert actual is budget
+            calls.append(name)
+            return ()
+        return observe
+
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", snapshot)
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", lambda _budget: snapshot())
+    monkeypatch.setattr(
+        wrkslots, "_read_process_stat",
+        lambda path: wrkslots._ProcessStat(17 if path.name == "123" else 18, 0),
+    )
+    monkeypatch.setattr(wrkslots, "_process_observation_is_active", active)
+    monkeypatch.setattr(wrkslots, "_absent_validate_find_matches", observer("find"))
+    monkeypatch.setattr(wrkslots, "_absent_validate_maps_matches", observer("maps"))
+    monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", observer("mount"))
+    monkeypatch.setattr(wrkslots, "_same_uid_batched_path_matches", lambda processes, _targets, _budget: ((), ()) if processes == () else pytest.fail("stale identity reached direct path observers"))
+
+    def capture() -> wrkslots._ProcessPathCensus:
+        if lane == "privileged":
+            return wrkslots._capture_process_path_census((Path("/fixture/slot"),), budget=budget)
+        return wrkslots._capture_same_uid_process_path_census((Path("/fixture/slot"),), budget=budget)
+
+    if scenario == "once":
+        census = capture()
+        assert census.processes == ()
+        assert census.matches == ()
+        assert calls == ["snapshot", "identity", "snapshot", "find", "maps", "mount"]
+    else:
+        with pytest.raises(wrkslots.Refusal, match="three liveness attempts" if scenario == "persistent" else "operation-wide time bound"):
+            capture()
+        assert calls == ["snapshot", "identity"] * (3 if scenario == "persistent" else 1)
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+@pytest.mark.parametrize("evidence", ("clear", "live-link", "live-mount", "stale-link", "stale-map", "mixed"))
+def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
+    monkeypatch: pytest.MonkeyPatch, lane: str, evidence: str,
+) -> None:
+    target = Path("/fixture/vanished-slot")
+    processes = (
+        wrkslots._AbsentProcessObservation(123, 17, "", "pid:123"),
+        wrkslots._AbsentProcessObservation(124, 18, "", "pid:124"),
+    )
+    calls: list[str] = []
+    reused = False
+
+    def read_stat(path: Path) -> wrkslots._ProcessStat | None:
+        if path.name == "123":
+            return wrkslots._ProcessStat(19, 0) if reused else None
+        assert path.name == "124"
+        return wrkslots._ProcessStat(18, 0)
+
+    def snapshot() -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        calls.append("snapshot")
+        return processes
+
+    def run(command: Sequence[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
+        nonlocal reused
+        if "/usr/bin/find" in command:
+            calls.append("find")
+            assert "/proc/123/root" in command and "/proc/124/root" in command
+            if evidence == "stale-link":
+                reused = True
+                return (0, os.fsencode(f"/proc/123/cwd\0{target}\0"), b"")
+            output = os.fsencode(f"/proc/124/cwd\0{target}\0") if evidence == "live-link" else b""
+            diagnostic = b"/usr/bin/find: '/proc/123/fd': No such file or directory\n"
+            if evidence == "mixed":
+                diagnostic += b"/usr/bin/find: '/proc/124/root': Permission denied\n"
+            return (1, output, diagnostic)
+        assert "/usr/bin/grep" in command
+        calls.append("maps")
+        assert "/proc/123/maps" in command and "/proc/124/maps" in command
+        if evidence == "stale-map":
+            reused = True
+            return (0, os.fsencode(f"/proc/123/maps:1000-2000 r--p 00000000 00:00 1 {target}\n"), b"")
+        return (2, b"", b"/usr/bin/grep: /proc/123/maps: No such file or directory\n")
+
+    def mountinfo(
+        pid: int, _budget: wrkslots._ReadOnlyCommandBudget,
+        _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
+    ) -> tuple[tuple[Path, str], ...]:
+        calls.append(f"mount:{pid}")
+        if pid == 123:
+            try:
+                raise FileNotFoundError(errno.ENOENT, "fixture generation is gone")
+            except FileNotFoundError as exc:
+                raise wrkslots.Refusal("mount evidence disappeared") from exc
+        assert pid == 124
+        return ((target, str(target)),) if evidence == "live-mount" else ()
+
+    monkeypatch.setattr(wrkslots, "_read_process_stat", read_stat)
+    monkeypatch.setattr(wrkslots, "_process_is_zombie", lambda _path: False)
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", snapshot)
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", lambda _budget: snapshot())
+    monkeypatch.setattr(wrkslots, "_same_uid_direct_path_processes", lambda observed, _budget: ((), observed))
+    monkeypatch.setattr(wrkslots, "_root_owned_executable", lambda path, _label: wrkslots._TrustedExecutablePath(path, ()))
+    monkeypatch.setattr(wrkslots, "_run_bounded_read_only_command", run)
+    monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=4096, stderr_limit=4096,
+    )
+
+    def capture() -> wrkslots._ProcessPathCensus:
+        if lane == "privileged":
+            return wrkslots._capture_process_path_census((target,), budget=budget)
+        return wrkslots._capture_same_uid_process_path_census((target,), budget=budget)
+
+    if evidence.startswith("stale"):
+        with pytest.raises(wrkslots.Refusal, match="three liveness attempts"):
+            capture()
+        first = ["snapshot", "find"] + (["maps"] if evidence == "stale-map" else [])
+        assert calls == [*first, "snapshot", "snapshot"]
+    elif evidence == "mixed":
+        with pytest.raises(wrkslots.Refusal, match="Permission denied") as refused:
+            capture()
+        assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+        assert calls == ["snapshot", "find"]
+    else:
+        census = capture()
+        assert census.processes == processes
+        assert calls == ["snapshot", "find", "maps", "mount:123", "mount:124"]
+        if evidence.startswith("live"):
+            with pytest.raises(wrkslots.Refusal, match="live process 124"):
+                census.assert_slot_unused(target, None, ignore_current_process=False)
+        else:
+            assert census.matches == ()
+            census.assert_slot_unused(target, None, ignore_current_process=False)
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+@pytest.mark.parametrize("result", ("clear", "in-use", "untrusted"))
+def test_process_census_live_protected_identity_reaches_trusted_readers(
+    monkeypatch: pytest.MonkeyPatch, lane: str, result: str,
+) -> None:
+    pid = os.getpid()
+    generation = wrkslots._read_process_stat(Path("/proc") / str(pid))
+    assert generation is not None
+    process = wrkslots._AbsentProcessObservation(pid, generation.start_ticks, "", f"pid:{pid}")
+    target = Path("/fixture/protected-slot")
+    calls: list[str] = []
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", lambda: (process,))
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", lambda _budget: (process,))
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_direct_path_processes",
+        lambda processes, _budget: ((), processes),
+    )
+
+    def trusted(path: Path, _label: str) -> wrkslots._TrustedExecutablePath:
+        calls.append(path.name)
+        if result == "untrusted":
+            raise wrkslots.Refusal("fixture executable authority is unknown")
+        return wrkslots._TrustedExecutablePath(path, ())
+
+    def run(command: Sequence[str], **kwargs: object) -> tuple[int, bytes, bytes]:
+        authorities = kwargs["trusted_executables"]
+        assert isinstance(authorities, tuple)
+        assert tuple(item.path for item in authorities) == (Path("/usr/bin/sudo"), Path(command[5]))
+        assert command[:5] == ["/usr/bin/sudo", "-n", "-u", "root", "--"]
+        if command[5] == "/usr/bin/grep":
+            assert f"/proc/{pid}/maps" in command
+            return (1, b"", b"")
+        assert command[5] == "/usr/bin/find"
+        assert f"/proc/{pid}/root" in command
+        output = os.fsencode(f"/proc/{pid}/cwd\0{target}\0") if result == "in-use" else b""
+        return (0, output, b"")
+
+    def mounts(
+        processes: Sequence[wrkslots._AbsentProcessObservation], _targets: object,
+        _budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[()]:
+        assert processes == (process,)
+        calls.append("mount")
+        return ()
+
+    monkeypatch.setattr(wrkslots, "_root_owned_executable", trusted)
+    monkeypatch.setattr(wrkslots, "_run_bounded_read_only_command", run)
+    monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", mounts)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=4096, stderr_limit=1024,
+    )
+
+    def capture() -> wrkslots._ProcessPathCensus:
+        if lane == "privileged":
+            return wrkslots._capture_process_path_census((target,), budget=budget)
+        return wrkslots._capture_same_uid_process_path_census((target,), budget=budget)
+
+    if result == "untrusted":
+        with pytest.raises(wrkslots.Refusal, match="executable authority is unknown"):
+            capture()
+        assert calls == ["sudo"]
+        return
+    census = capture()
+    assert census.processes == (process,)
+    assert calls == ["sudo", "find", "sudo", "grep", "mount"]
+    if result == "in-use":
+        with pytest.raises(wrkslots.Refusal, match=f"live process {pid}"):
+            census.assert_slot_unused(target, None, ignore_current_process=False)
+    else:
+        census.assert_slot_unused(target, None, ignore_current_process=False)
 
 
 def test_process_census_retries_when_mountinfo_owner_becomes_a_zombie(
@@ -25907,6 +26320,9 @@ def test_process_path_census_collects_every_target_once(
     monkeypatch.setattr(
         wrkslots, "_absent_validate_process_snapshot", lambda: (process,)
     )
+    monkeypatch.setattr(
+        wrkslots, "_process_observation_is_active", lambda observed: observed == process
+    )
 
     def mount_matches(
         _processes: object, targets: object, _budget: object
@@ -26039,6 +26455,7 @@ def missing_path_census_control(
         wrkslots, "_same_uid_direct_path_processes", lambda processes, _budget: (processes, ())
     )
     monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", mounts)
+    monkeypatch.setattr(wrkslots, "_read_process_stat", lambda _path: wrkslots._ProcessStat(17, 0))
     monkeypatch.setattr(wrkslots, "_process_observation_is_active", lambda _process: True)
     monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _process: True)
     monkeypatch.setattr(
@@ -26492,6 +26909,7 @@ def test_same_uid_snapshot_selects_filesystem_uid(
     proc_root = tmp_path / "proc"
     pid_dir = proc_root / "123"
     pid_dir.mkdir(parents=True)
+    (pid_dir / "status").write_text("State:\tS (sleeping)\n")
     filesystem_uid = os.getuid() + 1
     monkeypatch.setattr(
         wrkslots,
@@ -26561,6 +26979,9 @@ def test_same_uid_census_resolves_protected_process_only_with_fresh_privilege(
     target = Path("/absent/validate/gone")
     monkeypatch.setattr(
         wrkslots, "_same_uid_process_observations", lambda _budget: (process,)
+    )
+    monkeypatch.setattr(
+        wrkslots, "_process_observation_is_active", lambda observed: observed == process
     )
     monkeypatch.setattr(
         wrkslots,

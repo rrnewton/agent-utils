@@ -24005,19 +24005,39 @@ def _process_start_ticks(pid_dir: Path) -> int | None:
 def _process_is_zombie(pid_dir: Path) -> bool:
     try:
         status = (pid_dir / "status").read_text(encoding="ascii")
-    except FileNotFoundError:
-        return True
+    except FileNotFoundError as exc:
+        if _read_process_stat(pid_dir) is None:
+            return True
+        raise Refusal(
+            f"process state is indeterminate because {pid_dir / 'status'} "
+            "is missing while its generation is still present"
+        ) from exc
     except (OSError, UnicodeError) as exc:
         raise Refusal(
             f"process state is indeterminate because {pid_dir / 'status'} is unreadable: {exc}"
         ) from exc
-    state = next(
-        (line.split(maxsplit=1)[1] for line in status.splitlines() if line.startswith("State:")),
-        None,
-    )
-    if state is None:
+    states = [line.split() for line in status.splitlines() if line.startswith("State:")]
+    if not states:
         raise Refusal(f"process state is missing for PID {pid_dir.name}")
-    return state.startswith(("Z", "X"))
+    # Include state tokens exposed by current and older supported Linux kernels.
+    # Unknown or ambiguous evidence must never be interpreted as terminal.
+    if (
+        len(states) != 1 or len(states[0]) < 2 or states[0][0] != "State:"
+        or states[0][1] not in {"R", "S", "D", "T", "t", "X", "Z", "P", "I", "K", "W", "x"}
+    ):
+        raise Refusal(f"process state is invalid for PID {pid_dir.name}")
+    return states[0][1] in {"Z", "X"}
+
+
+def _process_generation_is_terminal(pid_dir: Path, generation: _ProcessStat) -> bool:
+    if not _process_is_zombie(pid_dir):
+        return False
+    current = _read_process_stat(pid_dir)
+    if current is not None and current.start_ticks != generation.start_ticks:
+        raise _ProcessEvidenceChanged(
+            f"PID {pid_dir.name} generation changed during terminal-state observation"
+        )
+    return True
 
 
 def _absent_validate_process_snapshot(
@@ -24036,6 +24056,8 @@ def _absent_validate_process_snapshot(
     for pid_dir in pid_dirs:
         generation = _read_process_stat(pid_dir)
         if generation is None:
+            continue
+        if _process_generation_is_terminal(pid_dir, generation):
             continue
         try:
             if _process_uid(pid_dir) is None:
@@ -24614,6 +24636,24 @@ def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
     return after is not None and after.start_ticks == process.start_ticks
 
 
+def _assert_process_observations_active(
+    processes: Sequence[_AbsentProcessObservation],
+    budget: _ReadOnlyCommandBudget,
+) -> None:
+    for process in processes:
+        budget.remaining_seconds()
+        # Retain vanished identities in the original tuple: every downstream
+        # observer must still establish absence or reject stale/reused evidence.
+        if _read_process_stat(Path("/proc") / str(process.pid)) is None:
+            continue
+        # A present but obsolete identity invalidates this whole attempt. Fresh
+        # selection omits proven terminal generations, including protected links.
+        if not _process_observation_is_active(process):
+            raise _ProcessEvidenceChanged(
+                f"PID {process.pid} exited or changed before process path census"
+            )
+
+
 def _allow_only_vanished_process_diagnostics(
     program: str,
     returncode: int,
@@ -24903,6 +24943,8 @@ def _same_uid_process_observations(
         generation = _read_process_stat(pid_dir)
         if generation is None:
             continue
+        if _process_generation_is_terminal(pid_dir, generation):
+            continue
         filesystem_uid = _process_filesystem_uid(pid_dir)
         if filesystem_uid is None or filesystem_uid != os.getuid():
             continue
@@ -25095,6 +25137,7 @@ def _capture_same_uid_process_path_census(
         budget.remaining_seconds()
         try:
             processes = _same_uid_process_observations(budget)
+            _assert_process_observations_active(processes, budget)
             direct_matches, indeterminate = _same_uid_batched_path_matches(
                 processes, targets, budget
             )
@@ -25826,6 +25869,7 @@ def _capture_process_path_census(
                     include_owner_cgroups=False
                 )
             )
+            _assert_process_observations_active(processes, selected_budget)
             path_matches = (
                 *_absent_validate_find_matches(processes, targets, selected_budget),
                 *_absent_validate_maps_matches(processes, targets, selected_budget),
