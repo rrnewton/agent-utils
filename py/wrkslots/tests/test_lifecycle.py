@@ -25856,7 +25856,7 @@ def test_process_path_census_collects_every_target_once(
 
     census = wrkslots._capture_process_path_census((first, second))
 
-    assert calls == ["mount", "find", "maps"]
+    assert calls == ["find", "maps", "mount"]
     assert census.processes == (process,)
     assert census.matches == (
         (123, str(first), "mount", str(first)),
@@ -25897,6 +25897,152 @@ def test_privileged_process_diagnostics_allow_only_vanished_generations(
         wrkslots._allow_only_vanished_process_diagnostics("find", 1, find_error, {123: process})
     with pytest.raises(wrkslots.Refusal, match="grep census produced diagnostics"):
         wrkslots._allow_only_vanished_process_diagnostics("grep", 2, grep_error, {123: process})
+
+
+def missing_path_census_control(
+    monkeypatch: pytest.MonkeyPatch, lane: str, scenario: str,
+) -> tuple[Callable[[], wrkslots._ProcessPathCensus], list[str]]:
+    """Exercise the real census, command budgets, parsers and diagnostic policy."""
+    target = Path("/absent/validate/census-control")
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    calls: list[str] = []
+    now = 0.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=4096, stderr_limit=4096,
+        input_limit=(2 * (len(os.fsencode(target)) + 1) - 1) if scenario == "input" else 4096,
+    )
+
+    def snapshot() -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        calls.append("snapshot")
+        return (process,)
+
+    def mounts(
+        _processes: object, _targets: object, actual: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[tuple[int, str, str, str], ...]:
+        assert actual is budget
+        calls.append("mount")
+        return (
+            ((123, str(target), "mount", "discarded-first-attempt"),)
+            if calls.count("snapshot") == 1 else ()
+        )
+
+    def run(command: Sequence[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
+        nonlocal now
+        program = "find" if "/usr/bin/find" in command else "grep"
+        calls.append(program)
+        if scenario == "input":
+            if program == "find":
+                return (0, b"", b"")
+            return (2, b"", b"/usr/bin/grep: /proc/123/maps: No such file or directory\n")
+        if program == "grep":
+            return (1, b"", b"")
+        if scenario == "once" and calls.count("snapshot") > 1:
+            return (0, b"", b"")
+        diagnostic = b"/usr/bin/find: '/proc/123/fd/399': No such file or directory\n"
+        if scenario == "unknown":
+            diagnostic = diagnostic.replace(b"/123/", b"/124/")
+        elif scenario == "malformed":
+            diagnostic = b"find failed without a recognized path\n"
+        elif scenario == "permission":
+            diagnostic = diagnostic.replace(b"No such file or directory", b"Permission denied")
+        elif scenario == "mixed":
+            diagnostic += b"/usr/bin/find: '/proc/124/fd/399': No such file or directory\n"
+        elif scenario == "framing":
+            return (0, b"/proc/123/fd/7\0", b"")
+        elif scenario == "time":
+            now = 6.0
+        # Partial find output cannot survive into the accepted attempt.
+        partial = b"/proc/123/fd/7\0" + os.fsencode(target / "partial") + b"\0"
+        return (1, partial, diagnostic)
+
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", snapshot)
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", lambda _budget: snapshot())
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_direct_path_processes", lambda processes, _budget: (processes, ())
+    )
+    monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", mounts)
+    monkeypatch.setattr(wrkslots, "_process_observation_is_active", lambda _process: True)
+    monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _process: True)
+    monkeypatch.setattr(
+        wrkslots, "_root_owned_executable",
+        lambda path, _label: wrkslots._TrustedExecutablePath(path, ()),
+    )
+    monkeypatch.setattr(wrkslots, "_run_bounded_read_only_command", run)
+    if lane == "privileged":
+        return lambda: wrkslots._capture_process_path_census((target,), budget=budget), calls
+    assert lane == "same-uid"
+    return lambda: wrkslots._capture_same_uid_process_path_census((target,), budget=budget), calls
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+def test_missing_path_census_discards_attempt_before_complete_reobservation(
+    monkeypatch: pytest.MonkeyPatch, lane: str,
+) -> None:
+    capture, calls = missing_path_census_control(monkeypatch, lane, "once")
+    census = capture()
+    assert calls == ["snapshot", "find", "snapshot", "find", "grep", "mount"]
+    assert len(census.processes) == 1
+    assert census.matches == ()
+    assert census.owner_cgroup_complete is (lane == "privileged")
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+def test_missing_path_census_refuses_after_three_complete_attempts(
+    monkeypatch: pytest.MonkeyPatch, lane: str,
+) -> None:
+    capture, calls = missing_path_census_control(monkeypatch, lane, "persistent")
+    with pytest.raises(wrkslots.Refusal, match="three liveness attempts") as refused:
+        capture()
+    assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+    assert calls == ["snapshot", "find"] * 3
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+@pytest.mark.parametrize("bound", ("time", "input"))
+def test_missing_path_census_preserves_shared_attempt_budgets(
+    monkeypatch: pytest.MonkeyPatch, lane: str, bound: str,
+) -> None:
+    capture, calls = missing_path_census_control(monkeypatch, lane, bound)
+    with pytest.raises(wrkslots.Refusal, match=f"operation-wide {bound} bound") as refused:
+        capture()
+    assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+    if bound == "time":
+        assert calls == ["snapshot", "find"]
+    else:
+        # The second real command wrapper exhausts the shared grep pattern input.
+        assert calls == ["snapshot", "find", "grep", "snapshot", "find"]
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+@pytest.mark.parametrize("failure", ("unknown", "malformed", "permission", "mixed", "framing"))
+def test_missing_path_census_keeps_hard_refusals(
+    monkeypatch: pytest.MonkeyPatch, lane: str, failure: str,
+) -> None:
+    capture, calls = missing_path_census_control(monkeypatch, lane, failure)
+    with pytest.raises(wrkslots.Refusal) as refused:
+        capture()
+    assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+    assert calls.count("snapshot") == 1
+    assert calls.count("find") == (2 if failure == "permission" and lane == "same-uid" else 1)
+
+
+@pytest.mark.parametrize("program", ("find", "grep"))
+def test_missing_path_diagnostics_preserve_zombie_behavior(
+    monkeypatch: pytest.MonkeyPatch, program: str,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
+    monkeypatch.setattr(
+        wrkslots, "_read_process_stat", lambda _path: wrkslots._ProcessStat(17, 0)
+    )
+    monkeypatch.setattr(wrkslots, "_process_is_zombie", lambda _path: True)
+    diagnostic = (
+        b"/usr/bin/find: '/proc/123/fd/399': No such file or directory\n"
+        if program == "find" else b"/usr/bin/grep: /proc/123/maps: No such file or directory\n"
+    )
+    code = 1 if program == "find" else 2
+    wrkslots._allow_only_vanished_process_diagnostics(program, code, diagnostic, {123: process})
+    assert wrkslots._same_uid_indeterminate_processes(program, code, diagnostic, {123: process}) == ()
 
 
 def test_kernel_thread_process_scan_omits_only_exe() -> None:

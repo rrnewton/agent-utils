@@ -24637,11 +24637,21 @@ def _allow_only_vanished_process_diagnostics(
     except UnicodeError as exc:
         raise Refusal(f"privileged {program} census diagnostics are undecodable") from exc
     pattern = _FIND_MISSING_RE if program == "find" else _GREP_MISSING_RE
+    changed_diagnostic: str | None = None
     for line in lines:
         match = pattern.fullmatch(line)
         process = processes.get(int(match.group("pid"))) if match else None
-        if process is None or _process_observation_is_active(process):
+        if process is None:
             raise Refusal(f"privileged {program} census produced diagnostics: {line}")
+        if _process_observation_is_active(process):
+            changed_diagnostic = line
+    # Validate every diagnostic before classifying motion: an earlier vanished
+    # FD must not hide a later permission, malformed, or unknown-path refusal.
+    # The enclosing bounded retry discards this entire incomplete census.
+    if changed_diagnostic is not None:
+        raise _ProcessEvidenceChanged(
+            f"privileged {program} census produced diagnostics: {changed_diagnostic}"
+        )
 
 
 def _same_uid_indeterminate_processes(
@@ -24672,14 +24682,17 @@ def _same_uid_indeterminate_processes(
         _FIND_PERMISSION_RE if program == "find" else _GREP_PERMISSION_RE
     )
     indeterminate: dict[int, _AbsentProcessObservation] = {}
+    changed_diagnostic: str | None = None
     for line in lines:
         missing = missing_pattern.fullmatch(line)
         if missing is not None:
             process = processes.get(int(missing.group("pid")))
-            if process is None or _process_observation_is_active(process):
+            if process is None:
                 raise Refusal(
                     f"same-UID {program} census produced diagnostics: {line}"
                 )
+            if _process_observation_is_active(process):
+                changed_diagnostic = line
             continue
         denied = permission_pattern.fullmatch(line)
         process = (
@@ -24690,6 +24703,10 @@ def _same_uid_indeterminate_processes(
         if not _process_observation_is_active(process):
             continue
         indeterminate[process.pid] = process
+    if changed_diagnostic is not None:
+        raise _ProcessEvidenceChanged(
+            f"same-UID {program} census produced diagnostics: {changed_diagnostic}"
+        )
     return tuple(indeterminate.values())
 
 
@@ -25081,11 +25098,16 @@ def _capture_same_uid_process_path_census(
             direct_matches, indeterminate = _same_uid_batched_path_matches(
                 processes, targets, budget
             )
+            privileged_matches = (
+                *_absent_validate_find_matches(indeterminate, targets, budget),
+                *_absent_validate_maps_matches(indeterminate, targets, budget),
+            )
+            # Reject volatile path motion before spending the shared mountinfo
+            # input budget. An accepted attempt still completes every observer.
             matches = (
                 *_absent_validate_mount_matches(processes, targets, budget),
                 *direct_matches,
-                *_absent_validate_find_matches(indeterminate, targets, budget),
-                *_absent_validate_maps_matches(indeterminate, targets, budget),
+                *privileged_matches,
             )
         except _ProcessEvidenceChanged:
             if attempt < 2:
@@ -25804,12 +25826,14 @@ def _capture_process_path_census(
                     include_owner_cgroups=False
                 )
             )
-            mount_matches = _absent_validate_mount_matches(
-                processes, targets, selected_budget
-            )
             path_matches = (
                 *_absent_validate_find_matches(processes, targets, selected_budget),
                 *_absent_validate_maps_matches(processes, targets, selected_budget),
+            )
+            # A failed path observation discards the whole attempt without
+            # first rereading every mount table. Budgets never reset on retry.
+            mount_matches = _absent_validate_mount_matches(
+                processes, targets, selected_budget
             )
         except _ProcessEvidenceChanged:
             if attempt < 2:
