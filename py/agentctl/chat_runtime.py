@@ -119,7 +119,7 @@ class _OutputPump:
                     self.stream = None
                     subscribed = desired
                     delay = 1.0
-                if not desired[0]:
+                if self.bridge.config.reply_mode != "tagged" and not desired[0]:
                     self.changed.wait(30)
                     continue
                 try:
@@ -128,8 +128,20 @@ class _OutputPump:
                         _post(self.events, _Notice("output_connected"), self.stop)
                     if self.stop.is_set() or self.changed.is_set():
                         continue
-                    for event in self.stream.wait(30):
-                        _post(self.events, _Notice("output", event), self.stop)
+                    # The server emits only a false-to-true regex edge. A
+                    # retained close marker stays true while later replies
+                    # arrive, so re-arm at a bounded cadence. Read the whole
+                    # interval: an initial status event must not hide the
+                    # output event waiting behind it on the same socket.
+                    deadline = time.monotonic() + 1
+                    while not self.stop.is_set() and not self.changed.is_set():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        for event in self.stream.wait(remaining):
+                            _post(self.events, _Notice("output", event), self.stop)
+                    self.stream.close()
+                    self.stream = None
                     delay = 1.0
                 except Exception as exc:
                     _post(self.events, _Notice("output_error", str(exc)), self.stop)
@@ -172,6 +184,7 @@ class _Runtime:
         self.reconcile_requested = True
         self.output_pending: dict[str, PaneOutputSnapshot | PaneAgentStatus] = {}
         self.output_inflight: dict[str, PaneOutputSnapshot | PaneAgentStatus] = {}
+        self.send_inflight: dict[str, str] = {}
         self.input_path = bridge.state / "input.json"
         self.input_state: dict[str, object] = _read(self.input_path) if self.input_path.exists() else {"cursor": None}
         self.deferred = bridge.state / "deferred"
@@ -209,8 +222,8 @@ class _Runtime:
         records = [(p, _read(p)) for p in (self.bridge.state / "requests").glob("*.json")]
         return sorted(records, key=lambda item: get_str(item[1], "received_at", "request"))
 
-    def _outbound_text(self, key: str) -> str:
-        text = get_str(_read(self.bridge.state / "replies" / f"{key}.json"), "text", "reply")
+    def _outbound_text(self, reply: dict[str, object]) -> str:
+        text = get_str(reply, "text", "reply")
         prefix = f"[{self.bridge.config.agent_label}]"
         return text if text.startswith(prefix) else f"{prefix} {text}"
 
@@ -218,10 +231,8 @@ class _Runtime:
         if message.get("sender") not in self.bridge.config.allowed_senders:
             return False
         for _, record in self._records():
-            if record.get("phase") == "reply_pending":
-                key = get_str(record, "key", "request")
-                if message.get("text") == self._outbound_text(key):
-                    return True
+            if message.get("text") in self.bridge._pending_outbound_texts(record):
+                return True
         return False
 
     def _accept_message(self, message: dict[str, object]) -> Path | None:
@@ -298,6 +309,7 @@ class _Runtime:
                 changed = True
             else:
                 pending = True
+        self.bridge._reconcile_reply_state(path, record)
         if "ack" not in record:
             source = as_mapping(record["message"], "source")
             record["ack"] = self.bridge._ack_record(get_str(source, "id", "source"),
@@ -311,13 +323,15 @@ class _Runtime:
         if (ack["state"] == "pending" and due and ("ack", key) not in self.jobs
                 and sum(lane == "ack" for lane, _ in self.jobs) < 4):
             self._ack_start(path, record)
-        if (record["phase"] in ("awaiting_reply", "delivery_uncertain", "reply_pending")
-                and (self.bridge.state / "replies" / f"{key}.json").exists()
+        if (record["phase"] in ("awaiting_reply", "delivery_uncertain", "reply_pending", "replied")
                 and ("send", key) not in self.jobs
                 and now >= self.retry.get(("send", key), (0, 1))[0]
                 and sum(lane == "send" for lane, _ in self.jobs) < 2):
             # Reload after the ACK attempt's record update.
-            self._send_start(path, _read(path))
+            record = _read(path)
+            reply = self.bridge._next_reply(record)
+            if reply is not None:
+                self._send_start(path, record, reply)
         return pending, prompt
 
     def _start_delivery(self, pending: bool, to_enqueue: list[tuple[str, str]], now: float) -> None:
@@ -342,6 +356,9 @@ class _Runtime:
             pending = pending or waiting
             if prompt is not None:
                 to_enqueue.append(prompt)
+        feedback_pending, feedback_prompts = self.bridge._feedback_delivery()
+        pending = pending or feedback_pending
+        to_enqueue.extend(feedback_prompts)
         self._start_delivery(pending, to_enqueue, now)
         if ((self.reconcile_requested or now >= self.next_poll) and ("poll", "page") not in self.jobs
                 and now >= self.retry.get(("poll", "page"), (0, 1))[0]):
@@ -358,10 +375,6 @@ class _Runtime:
                 def inspect(event: PaneOutputSnapshot | PaneAgentStatus = event) -> object:
                     return self._inspect_output(event)
                 self._start("output", key, inspect)
-        if not desired[0]:
-            path = self.bridge.state / "output.json"
-            if not path.exists() or _read(path).get("state") != "idle":
-                _write(path, {"state": "idle", "error": None, "updated_at": _utc()})
         for path in sorted(self.deferred.glob("*.json")):
             message = _read(path)
             if not self._possible_echo(message):
@@ -400,15 +413,13 @@ class _Runtime:
             "space": self.bridge.config.space, "message": source["id"], "emoji": ack["emoji"],
             "request_id": ack["request_id"], "attempt": attempts})
 
-    def _send_start(self, path: Path, record: dict[str, object]) -> None:
-        if record["phase"] == "delivery_uncertain":
-            record["delivery_confirmed_by"] = "reply_artifact"
-        record["phase"] = "reply_pending"
-        _write(path, record)
+    def _send_start(self, path: Path, record: dict[str, object], reply: dict[str, object]) -> None:
+        self.bridge._reply_started(path, record, reply)
         source = as_mapping(record["message"], "source")
         key = get_str(record, "key", "request")
+        self.send_inflight[key] = get_str(reply, "reply_key", "reply")
         self._transport("send", key, {"action": "send", "space": self.bridge.config.space,
-            "thread": source["thread"], "request_id": record["request_id"], "text": self._outbound_text(key)})
+            "thread": source["thread"], "request_id": reply["request_id"], "text": self._outbound_text(reply)})
 
     def _complete(self, item: _Completion) -> None:
         job = (item.lane, item.key)
@@ -435,14 +446,14 @@ class _Runtime:
                 else:
                     ack["error"] = str(error)[:2000]
                 record["ack"] = ack
-            elif error is None:
-                record.update(phase="replied", reply_id=identifier, replied_at=item.finished_at)
-                record.pop("reply_error", None)
+                _write(path, record)
             else:
-                record["reply_error"] = str(error)[:2000]
-            _write(path, record)
+                reply_key = self.send_inflight.pop(item.key)
+                self.bridge._reply_complete(path, record, reply_key, identifier,
+                                            item.finished_at, None if error is None else str(error)[:2000])
         elif item.lane == "output":
             event = self.output_inflight.pop(item.key)
+            self.next_drain = 0.0
             if error is None:
                 if item.result is not None:
                     if not isinstance(item.result, PaneOutputSnapshot):
@@ -450,8 +461,6 @@ class _Runtime:
                     result = self.bridge._capture_output(item.result, deliver=False, verify_target=False)
                     if result["errors"]:
                         self._log(f"output capture: {result['errors']}")
-                if isinstance(event, PaneAgentStatus):
-                    self.next_drain = 0.0
             else:
                 self.output_pending.setdefault(item.key, event)
         elif item.lane == "poll" and error is None:

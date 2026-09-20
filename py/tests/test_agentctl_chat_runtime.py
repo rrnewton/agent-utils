@@ -17,11 +17,11 @@ import agentctl.chat_runtime as runtime_module
 from agentctl.agent import Target, enqueue
 from agentctl.chat import Bridge, Config, _read, _write, submit_reply
 from agentctl.chat_input import InputStreamError
-from agentctl.chat_output import PaneOutputSnapshot
+from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutputStream
 from agentctl.chat_runtime import _Notice, _Runtime
 from agentctl.client import AgentPaneInfo
 from agentctl.errors import AgentDeliveryError
-from agentctl.jsonx import as_mapping
+from agentctl.jsonx import as_mapping, as_sequence
 from tests.test_herdr_chat import Harness
 
 
@@ -618,6 +618,225 @@ def test_source_supplied_nonce_and_unknown_output_cannot_authorize_a_reply(rig: 
     assert list((rig.state / "replies").glob("*.json")) == []
     assert rig.transport.calls("send") == []
     assert rig.phase() == "awaiting_reply"
+
+
+def _reply_snapshot(rig: Rig, bodies: Sequence[str], *, nonce: str | None = None,
+                    legacy: bool = False) -> PaneOutputSnapshot:
+    selected = nonce if nonce is not None else str(rig.record()["reply_nonce"])
+    marker = "GCHAT_REPLY" if legacy else "CHAT_REPLY"
+    target = rig.bridge.config.target.pane_id
+    assert target is not None
+    text = "\n".join(f"<{marker}_{selected}>\n{body}\n</{marker}_{selected}>" for body in bodies)
+    return PaneOutputSnapshot(target, text, False)
+
+
+def _queue_snapshot(rig: Rig, snapshot: PaneOutputSnapshot) -> None:
+    rig.runtime._handle(_Notice("output", snapshot))
+    rig.runtime._stage()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_multiple_replies_keep_order_while_more_output_arrives_and_after_restart(
+    rig: Rig, legacy: bool,
+) -> None:
+    rig.accept()
+    rig.runtime._stage()
+    rig.until(lambda: rig.phase() == "awaiting_reply" and rig.ack() == "acked")
+    send = rig.transport.gate("send")
+    _queue_snapshot(rig, _reply_snapshot(rig, ["First milestone", "Second milestone"], legacy=legacy))
+    rig.until(lambda: ("send", _key()) in rig.runtime.jobs)
+    assert send.entered.wait(5)
+    assert [call["text"] for call in rig.transport.calls("send")] == ["[fixture-agent] First milestone"]
+    full = _reply_snapshot(rig, ["First milestone", "Second milestone", "Completed"], legacy=legacy)
+    _queue_snapshot(rig, full)
+    rig.until(lambda: not rig.runtime.output_pending and not rig.runtime.output_inflight)
+    assert len(rig.transport.calls("send")) == 1
+    send.release.set()
+    rig.until(lambda: rig.phase() == "replied" and len(rig.transport.calls("send")) == 3)
+    sent = rig.transport.calls("send")
+    assert [call["text"] for call in sent] == [
+        "[fixture-agent] First milestone", "[fixture-agent] Second milestone", "[fixture-agent] Completed",
+    ]
+    assert len({str(call["request_id"]) for call in sent}) == 3
+    assert all(call["thread"] == _THREAD for call in sent)
+    assert sent[0]["request_id"] == rig.record()["request_id"]
+    rig.restart()
+    _queue_snapshot(rig, full)
+    rig.until(lambda: not rig.runtime.jobs and not rig.runtime.output_pending)
+    assert len(rig.transport.calls("send")) == 3
+    assert len(rig.harness.prompts) == 1
+
+
+def test_later_reply_retry_preserves_identity_and_suppresses_all_reply_echoes(rig: Rig) -> None:
+    rig.accept()
+    rig.runtime._stage()
+    rig.until(lambda: rig.phase() == "awaiting_reply" and rig.ack() == "acked")
+    _queue_snapshot(rig, _reply_snapshot(rig, ["First milestone"]))
+    rig.until(lambda: rig.phase() == "replied")
+    first_id = str(rig.transport.calls("send")[0]["request_id"])
+    send = rig.transport.gate("send")
+    rig.transport.lose_send_once = True
+    _queue_snapshot(rig, _reply_snapshot(rig, ["First milestone", "Second milestone", "Completed"]))
+    rig.until(lambda: ("send", _key()) in rig.runtime.jobs)
+    assert send.entered.wait(5)
+    second_id = str(rig.transport.calls("send")[1]["request_id"])
+    assert second_id != first_id
+    with rig.transport.lock:
+        echo_id = rig.transport.sent[second_id]
+    echo = _message("echo", id=echo_id, text="[fixture-agent] Second milestone")
+    rig.runtime._input_event({"type": "message", "message": echo, "cursor": "second-reply-echo"})
+    assert len(list(rig.runtime.deferred.glob("*.json"))) == 1
+    send.release.set()
+    rig.until(lambda: "reply_error" in rig.record())
+    assert len(rig.transport.calls("send")) == 2
+    rig.restart()
+    rig.runtime._stage()
+    rig.until(lambda: rig.phase() == "replied" and len(rig.transport.calls("send")) == 4)
+    sent = rig.transport.calls("send")
+    assert [call["text"] for call in sent] == [
+        "[fixture-agent] First milestone", "[fixture-agent] Second milestone",
+        "[fixture-agent] Second milestone", "[fixture-agent] Completed",
+    ]
+    assert sent[1]["request_id"] == sent[2]["request_id"] == second_id
+    assert len(rig.transport.sent) == 3
+    assert list(rig.runtime.deferred.glob("*.json")) == []
+    for request_id, body in ((first_id, "First milestone"), (second_id, "Second milestone")):
+        with rig.transport.lock:
+            identifier = rig.transport.sent[request_id]
+        rig.runtime._input_event({"type": "message", "message": _message(
+            "echo", id=identifier, text="[fixture-agent] " + body), "cursor": "known-reply-echo"})
+    rig.runtime._stage()
+    assert len(list((rig.state / "requests").glob("*.json"))) == 1
+    assert len(rig.harness.prompts) == 1
+
+
+def test_restart_recovers_outbox_confirmation_before_request_metadata_commit(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig.accept()
+    rig.runtime._stage()
+    rig.until(lambda: rig.phase() == "awaiting_reply" and rig.ack() == "acked")
+    submit_reply(rig.state, _key(), "Completed")
+
+    def crash_aggregate(path: Path, document: dict[str, object]) -> None:
+        if path.parent == rig.state / "requests" and document.get("phase") == "replied":
+            outbox = _read(rig.state / "replies" / f"{_key()}.json")
+            assert all(as_mapping(item, "reply item").get("reply_id")
+                       for item in as_sequence(outbox["items"], "reply items"))
+            raise OSError("crash before aggregate reply confirmation")
+        _write(path, document)
+
+    monkeypatch.setattr(chat_module, "_write", crash_aggregate)
+    rig.runtime._stage()
+    with pytest.raises(OSError, match="before aggregate reply confirmation"):
+        rig.until(lambda: rig.phase() == "replied")
+    assert rig.phase() == "reply_pending"
+    assert len(rig.transport.calls("send")) == 1
+    monkeypatch.setattr(chat_module, "_write", _write)
+    rig.restart()
+    rig.runtime._stage()
+    assert rig.phase() == "replied"
+    assert rig.record()["reply_id"] == next(iter(rig.transport.sent.values()))
+    assert rig.record()["replied_at"]
+    assert len(rig.transport.calls("send")) == 1
+    assert len(rig.harness.prompts) == 1
+
+
+def test_unknown_reply_feedback_is_durable_and_uses_the_harness_lane(rig: Rig) -> None:
+    rig.accept()
+    rig.runtime._stage()
+    rig.until(lambda: rig.phase() == "awaiting_reply" and rig.ack() == "acked")
+    unknown = "X" * 22
+    rig.harness.state = "working"
+    bad = _reply_snapshot(rig, ["Wrong destination"], nonce=unknown)
+    _queue_snapshot(rig, bad)
+    rig.until(lambda: not rig.runtime.jobs and not rig.runtime.output_pending)
+    assert len(rig.harness.prompts) == 1
+    assert rig.transport.calls("send") == []
+    rig.restart()
+    rig.harness.state = "idle"
+    rig.runtime.next_drain = 0
+    rig.runtime._stage()
+    rig.until(lambda: len(rig.harness.prompts) == 2 and not rig.runtime.jobs)
+    feedback = rig.harness.prompts[-1]
+    assert unknown in feedback
+    assert str(rig.record()["reply_nonce"]) in feedback
+    assert "unavailable" in feedback.lower() or "not available" in feedback.lower()
+    assert "CHAT_REPLY" in feedback
+    _queue_snapshot(rig, bad)
+    rig.until(lambda: not rig.runtime.jobs and not rig.runtime.output_pending)
+    assert len(rig.harness.prompts) == 2
+    assert rig.transport.calls("send") == []
+    assert len(list((rig.state / "requests").glob("*.json"))) == 1
+
+
+def test_explicit_identical_blocks_are_separate_messages_but_snapshot_replay_is_not(rig: Rig) -> None:
+    rig.accept()
+    rig.runtime._stage()
+    rig.until(lambda: rig.phase() == "awaiting_reply" and rig.ack() == "acked")
+    repeated = _reply_snapshot(rig, ["Still working", "Still working"])
+    _queue_snapshot(rig, repeated)
+    rig.until(lambda: rig.phase() == "replied" and len(rig.transport.calls("send")) == 2)
+    sent = rig.transport.calls("send")
+    assert sent[0]["text"] == sent[1]["text"] == "[fixture-agent] Still working"
+    assert sent[0]["request_id"] != sent[1]["request_id"]
+    _queue_snapshot(rig, repeated)
+    rig.until(lambda: not rig.runtime.jobs and not rig.runtime.output_pending)
+    assert len(rig.transport.calls("send")) == 2
+
+
+def test_unknown_reply_without_any_request_still_delivers_protocol_feedback(rig: Rig) -> None:
+    unknown = "Y" * 22
+    _queue_snapshot(rig, _reply_snapshot(rig, ["No destination"], nonce=unknown))
+    rig.until(lambda: len(rig.harness.prompts) == 1 and not rig.runtime.jobs)
+    assert unknown in rig.harness.prompts[0]
+    assert "none" in rig.harness.prompts[0].lower()
+    assert rig.transport.calls("send") == []
+    assert list((rig.state / "requests").glob("*.json")) == []
+
+
+def test_output_pump_rearms_retained_matches_even_without_outstanding_requests(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subscriptions: list[tuple[str, ...]] = []
+    target = rig.bridge.config.target.pane_id
+    assert target is not None
+    pane_id = target
+    wake = threading.Event()
+
+    class Stream(PaneOutputStream):
+        def __init__(self, nonces: Sequence[str]) -> None:
+            self.number = len(subscriptions)
+            self.reads = 0
+            subscriptions.append(tuple(nonces))
+
+        def wait(self, timeout: float) -> tuple[PaneOutputSnapshot | PaneAgentStatus, ...]:
+            self.reads += 1
+            if self.reads == 1:
+                return (PaneAgentStatus(pane_id, "idle"),)
+            if self.reads == 2:
+                return (PaneOutputSnapshot(pane_id, "retained-output-" + str(self.number), False),)
+            wake.wait(timeout)
+            return ()
+
+        def wake(self) -> None:
+            wake.set()
+
+        def close(self) -> None:
+            pass
+
+    def open_output(nonces: Sequence[str]) -> PaneOutputStream:
+        return Stream(nonces)
+
+    monkeypatch.setattr(rig.bridge, "open_output", open_output)
+    rig.runtime.output.thread.start()
+    captured: list[str] = []
+    while len(captured) < 2:
+        notice = rig.runtime.events.get(timeout=5)
+        if isinstance(notice.value, PaneOutputSnapshot):
+            captured.append(notice.value.text)
+    assert subscriptions[:2] == [(), ()]
+    assert captured == ["retained-output-0", "retained-output-1"]
 
 
 def test_output_identity_lookup_cannot_delay_next_message_intake_or_ack(rig: Rig) -> None:

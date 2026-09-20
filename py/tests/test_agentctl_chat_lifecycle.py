@@ -180,7 +180,7 @@ def test_sigterm_stops_real_event_adapter_and_descendant_and_releases_owner(tmp_
     )
     process = subprocess.Popen([sys.executable, "-c", program, str(tmp_path / "state"),
                                 child_program, str(pidfile)], stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE)
+                               stderr=subprocess.PIPE, cwd=Path(__file__).resolve().parents[1])
     pids: list[int] = []
     try:
         deadline = time.monotonic() + 5

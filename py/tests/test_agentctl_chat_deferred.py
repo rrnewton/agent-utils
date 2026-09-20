@@ -44,7 +44,9 @@ def _pending_reply(state: Path) -> Iterator[tuple[_Runtime, dict[str, object]]]:
     runtime = _Runtime(bridge, 300, "test-chat", threading.Event())
     runtime._input_event({"type": "checkpoint", "cursor": "last-valid"})
     try:
-        yield runtime, _message(_SPACE + "/messages/echo", text=runtime._outbound_text(key))
+        reply = bridge._next_reply(record)
+        assert reply is not None
+        yield runtime, _message(_SPACE + "/messages/echo", text=runtime._outbound_text(reply))
     finally:
         runtime.stop.set()
         for pool in runtime.pools.values():

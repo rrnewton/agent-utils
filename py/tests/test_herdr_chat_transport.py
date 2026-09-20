@@ -442,7 +442,7 @@ def test_run_loop_retries_malformed_transport_output(
     class RetryBridge:
         def __init__(self, state: Path) -> None:
             self.state = state
-            self.config = Config(_SPACE, ("users/owner",), Target(), "test-agent")
+            self.config = Config(_SPACE, ("users/owner",), Target(), "test-agent", reply_mode="file")
 
         def tick(self) -> dict[str, object]:
             nonlocal calls
@@ -476,7 +476,7 @@ def test_run_loop_backs_off_failures_and_recovers_configured_interval(
     class RecoveringBridge:
         def __init__(self, state: Path) -> None:
             self.state = state
-            self.config = Config(_SPACE, ("users/owner",), Target(), "test-agent")
+            self.config = Config(_SPACE, ("users/owner",), Target(), "test-agent", reply_mode="file")
 
         def tick(self) -> dict[str, object]:
             nonlocal calls

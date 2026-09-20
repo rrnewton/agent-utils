@@ -2,7 +2,7 @@
 
 `agentctl chat` lets you message an existing Codex or Claude agent **running in a
 Herdr terminal** from one Google Chat space. Use it to send work or ask for
-progress while away from that terminal, and receive the agent's final answer in
+progress while away from that terminal, and receive the agent's replies in
 the originating Chat thread. The agent keeps its native tools, instructions,
 conversation, and terminal interface.
 
@@ -21,10 +21,11 @@ paste and Enter sequence.** Input does not arrive through a native harness
 channel or protocol connection. Herdr must report the subsequent working state
 to confirm submission.
 
-For the response, the agent brackets its final answer with the unique reply tags
-supplied in the prompt. The bridge watches for the closing tag, captures the
-complete block, and posts the answer in the original thread. The agent needs no
-file write or reply-command invocation for this normal path.
+For each response, the agent uses the provider-independent reply tags supplied
+in the prompt. The bridge captures each complete block and posts it as a separate
+message in the original thread. The same request can receive progress updates
+followed by a final answer. The agent needs no file write or reply-command
+invocation for this normal path.
 
 `agentctl chat run` is a separate, long-running process. The Herdr server owns the
 agent's terminal and harness process. The bridge does not launch or restart the
@@ -56,7 +57,7 @@ pane and identity assertions, and omit `agent_name` unless it has a registered
 Herdr agent name. No `agentctl` manager process needs to remain running.
 Herdr must observe working transitions to confirm prompt delivery. Some Claude
 integrations expose session identity but leave the reported state idle during a
-turn. In that case the bridge records `delivery_uncertain`; a final reply artifact
+turn. In that case the bridge records `delivery_uncertain`; a reply artifact
 still proves execution and permits the threaded response without reinjection.
 
 ```json
@@ -119,7 +120,7 @@ With `event_command`, incoming events wake the bridge immediately. A background
 recovery scan runs on connection and every 300 seconds after a completed scan.
 `--reconcile-interval` accepts 10–86400 seconds; `--interval` does not apply in
 this mode. A reported event gap also requests a recovery scan. ACK requests,
-Herdr prompt delivery, final replies, and recovery scans run independently:
+Herdr prompt delivery, replies, and recovery scans run independently:
 a busy coordinator does not delay an intake ACK, and a slow ACK does not delay
 prompt delivery. Provider and harness latency still determine when those
 operations finish. See the event adapter contract below to enable this mode.
@@ -140,25 +141,51 @@ names. The bridge does not authorize messages from everyone in a space.
 ## Reply capture
 
 `reply_mode` defaults to `"tagged"` for newly ingested requests. Each prompt
-supplies a unique pair of tags. The agent places each tag on its own line, with
-only its final user-facing answer between them:
+supplies a unique pair of provider-independent tags. The agent may reply once or
+multiple times, including progress updates when requested. Each block becomes a
+separate chat message. Put each tag on its own line, without an enclosing code
+fence, and reuse the request's ID for every reply to that request:
 
 ```text
-<GCHAT_REPLY_NONCE>
+<CHAT_REPLY_NONCE>
+The implementation is ready. I am running the checks.
+</CHAT_REPLY_NONCE>
+
+<CHAT_REPLY_NONCE>
 The checks passed. The change is ready.
-</GCHAT_REPLY_NONCE>
+</CHAT_REPLY_NONCE>
 ```
 
 `NONCE` stands for the unique value in that request's actual tags; do not reuse
-this example literally. The daemon subscribes to that closing tag using Herdr's
-`events.subscribe` API and blocks locally until it is observed. The supported
-Herdr implementation checks text subscriptions internally every 100 milliseconds;
-this is separate from the Google Chat polling interval.
+this example literally. New requests remain available for further replies after
+earlier replies are sent; a closing tag ends one message, not the request. A later
+user request does not invalidate those earlier reply IDs. `GCHAT_REPLY` tags
+remain accepted for prompts already in flight, while new prompts use
+`CHAT_REPLY`. Completed requests saved under the single-reply protocol are not
+reopened.
 
-The bridge captures only a complete tagged block, saves a durable reply artifact,
-and sends it with the request's stable reply ID. It prefixes the posted answer
-with `agent_label`. Final replies may contain up to 30,000 UTF-8 bytes. Unbracketed
-terminal output is not a final Chat answer.
+The daemon subscribes to reply tags through Herdr's `events.subscribe` API,
+including unavailable IDs. It rearms its output observation every second so later milestones can be captured
+while the agent is still working. Herdr checks text subscriptions internally
+every 100 milliseconds; this is separate from the chat provider's polling
+interval. Retained terminal history is bounded, so capture is not a lossless
+stream of agent messages.
+
+The bridge saves each complete tagged block durably before sending it with its
+own stable reply ID. It prefixes each posted message with `agent_label`. Each
+reply may contain up to 30,000 UTF-8 bytes. Text outside the tags is not sent.
+Two complete identical blocks in retained output are two messages; rereading
+the same snapshot does not send them again. If the original identical block has
+already disappeared from retained history, a new identical block cannot reliably
+be distinguished from a redraw and is conservatively treated as a replay. Use
+distinct milestone text when sending repeated updates.
+
+If the agent uses an unavailable reply ID, the bridge queues a protocol error
+directly to that agent. The error identifies the unavailable ID and lists the
+available request IDs and request-key prefixes so the agent can correct its
+routing. The error is not posted to chat. Repeated observations of the same bad
+ID and available destinations produce only one error, including after a bridge
+restart. Prompt echoes and quoted code examples do not trigger these errors.
 
 Set `reply_mode` to `"file"` to retain explicit file submission. Requests saved
 before tagged capture was enabled retain their original file-reply instructions.
@@ -172,6 +199,9 @@ agentctl chat reply --state /work/project/.agentctl/.chat \
 You may run `reply` while the daemon is running. The streaming runner checks for
 saved file replies at least once per second; the polling runner picks them up
 on its next cycle. This pickup interval does not include the provider's send time.
+File submission remains a recovery path for one immutable first reply: retrying
+the same text is idempotent, and replacing it with different text is refused.
+Use tagged output for subsequent replies.
 
 ## Thread context
 
@@ -206,7 +236,7 @@ prompt submissions run independently; neither waits for the other to finish.
 Each request saves `ack.state` (`pending`, `acked`, or `disabled`), the configured
 emoji, a stable request UUID, attempts, last attempt time, next retry time,
 error, and confirmed reaction resource. Reaction failures do not abort prompt
-or final-reply processing. They remain visible in `status` and retry after
+or reply processing. They remain visible in `status` and retry after
 3, 6, 12, 24, 48, then 60 seconds while the bridge is running. Restarting preserves
 that state and retry identity. Unfinished requests from state created without
 ACK support acquire ACK state; completed requests are not decorated retrospectively.
@@ -226,7 +256,8 @@ somebody else's emoji as its own ACK. Keep the OAuth actor stable across retries
 
 State directories are private to the current account. `requests/` holds source
 messages and delivery phases, `queue/` is the existing durable Herdr inbox, and
-`replies/` holds final answers. Immutable message resource names deduplicate both
+`replies/` holds durable reply artifacts. `feedback/` records deduplicated
+protocol errors queued to the coordinator. Immutable message resource names deduplicate both
 events and polls; replaying an event does not create a second prompt.
 `input.json` records the stream's durable cursor and connection/recovery state.
 The cursor advances only after its message has been saved or excluded by the
@@ -238,7 +269,7 @@ a new bridge state directory after checking what was already delivered.
 
 Busy coordinators keep messages queued while intake continues. A crash or lost
 working-state acknowledgement after terminal injection marks `delivery_uncertain`;
-the bridge does not automatically send that prompt again. A keyed final reply
+the bridge does not automatically send that prompt again. A keyed reply
 from the coordinator proves execution and allows reply delivery while preserving
 the failed queue artifact. Otherwise inspect the pane and
 queue artifact before deciding whether a new request is needed. Provider failures
@@ -252,17 +283,17 @@ clipped or malformed block leaves a `capture_error` instead of posting a guessed
 answer. If all tags have been evicted, the request remains awaiting a reply. Inspect
 the pane and `agentctl chat status`. An idle/done event triggers one fresh read
 to recover an early closing tag inside a quoted example; readiness itself is
-never treated as an answer. These subscriptions stay active after capture errors,
-without repeatedly polling the pane. After stopping `run`, an explicit
+never treated as an answer. Output observation stays active after capture errors
+and rearms every second to detect further replies. After stopping `run`, an explicit
 `agentctl chat tick` also retries capture once after inspection. Captures request
 up to 4,000 retained logical lines
 and are bounded to 2 MiB. If the answer cannot be recovered from retained
 history, submit the verified answer with `agentctl chat reply`.
 
-An identical `reply` retry succeeds even after its final answer was posted;
-a different answer for the same request is refused. Replies use a stable UUID
-request ID. If the upstream acknowledgement is lost,
-retries reuse that ID. A command adapter **must** honor idempotent sends. Google
+Each captured reply uses its own stable UUID request ID. If the upstream
+acknowledgement is lost, retries reuse that ID before later replies for the same
+request are sent. An identical explicit `reply` retry succeeds even after its
+answer was posted. A command adapter **must** honor idempotent sends. Google
 Chat's own request-ID retention is finite; inspect very old uncertain replies
 before restarting after a long outage. Poll cursors, allowlisted senders, target
 assertions, and reply identity are bound to the initialized state; use a new state
@@ -278,7 +309,7 @@ messages from an operator-supplied event adapter:
 ```
 
 This is a separate input connection. Keep either the built-in REST transport,
-`transport_command`, or `transport_socket` for reactions, final replies, history,
+`transport_command`, or `transport_socket` for reactions, replies, history,
 and recovery scans.
 The package does not supply a Google Workspace Events subscription or manage its
 credentials. One public implementation can use
@@ -366,7 +397,7 @@ newline, and reads one JSON response followed by a newline. Successful payloads
 are identical to the command transport below; a response containing `error` is
 a failed, unconfirmed operation. Socket operations have a 60-second I/O timeout,
 with requests bounded to 1 MiB and responses to 8 MiB. Serve connections
-concurrently to let ACKs, final replies, and scans proceed independently.
+concurrently to let ACKs, replies, and scans proceed independently.
 Herdr prompt delivery uses its separate connection. This avoids launching a
 client process for each request; the adapter can retain its own authenticated
 connections.
@@ -421,7 +452,7 @@ Reaction request and response:
 
 The adapter must ensure its reaction is present and return that reaction's full
 resource name. Repeating the request must not toggle the reaction off. The stable
-UUID is separate from the final reply UUID and lets an adapter reconcile its own
+UUID is separate from every reply UUID and lets an adapter reconcile its own
 lost responses. Report failures, including missing reaction permissions, instead
 of acknowledging an operation that was not confirmed. Set `ack_reaction` to null
 for a transport that does not implement reactions.
@@ -444,7 +475,7 @@ in this package. The public REST adapter uses `https://chat.googleapis.com/v1/`.
 ## Scope
 
 Each bridge connects one configured space to one coordinator. It handles text
-messages and explicit final replies. It does not discover trigger keywords in
+messages and explicit replies, including progress updates. It does not discover trigger keywords in
 other spaces, forward attachments, or supervise the coordinator's lifetime.
 Keep the input composer empty between automated
 deliveries; direct human input and bridge input need coordination.

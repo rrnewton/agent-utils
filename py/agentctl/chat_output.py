@@ -3,7 +3,8 @@
 The bridge blocks on a Unix socket instead of periodically reading a pane. Herdr
 0.8 internally polls subscription predicates every 100 milliseconds. Its output
 predicate matches individual rendered lines and emits on a false-to-true edge;
-subscribe to a request-specific closing marker, not an opening marker. Events
+the bridge watches reply markers and re-arms the subscription once per second
+so an earlier retained closing tag cannot hide later progress replies. Events
 contain a retained snapshot, not a lossless terminal stream or assistant message.
 
 There is no replay cursor. Reconnecting evaluates the current snapshot again.

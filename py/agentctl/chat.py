@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -40,7 +41,7 @@ from agentctl.agent import (
 )
 from agentctl.client import AgentPaneInfo, HerdrClient, Pane
 from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutputStream
-from agentctl.chat_replies import extract_replies
+from agentctl.chat_replies import extract_replies, unknown_reply_ids
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 from agentctl.jsonx import as_mapping, as_sequence, get_str
 
@@ -99,14 +100,18 @@ def _reaction_emoji(value: object) -> str | None:
 def _reply_instruction(nonce: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_-]{22}", nonce) is None:
         raise ValueError("invalid saved chat reply nonce")
-    return (f"Put your final reply between <GCHAT_REPLY_{nonce}> and </GCHAT_REPLY_{nonce}>, "
-            "each on its own line, without a code fence.")
+    return (f"You may send one or multiple replies to this request, including progress updates. "
+            f"Put each reply between <CHAT_REPLY_{nonce}> and </CHAT_REPLY_{nonce}>, "
+            "each on its own line, without a code fence. Each complete block is sent as a separate "
+            "chat message. Reuse this request's ID for later updates.")
 
 
 def _closing_pattern(nonces: Sequence[str]) -> str:
     for nonce in nonces:
         _reply_instruction(nonce)
-    return r"^\s*(?:[•⏺]\s+)?</GCHAT_REPLY_(?:" + "|".join(map(re.escape, nonces)) + r")>\s*$"
+    # Watch unknown and malformed IDs too: restricting this subscription to the current allowlist
+    # would make the routing errors we need to explain invisible to the coordinator.
+    return r"^\s*(?:[•⏺]\s+)?</?(?:GCHAT|CHAT)_REPLY_[^<>\s]*>\s*$"
 
 
 def _request_path(state: Path, key: str) -> Path:
@@ -402,7 +407,7 @@ class Bridge:
             if self.config.transport_socket else CommandTransport(self.config.transport_command)
             if self.config.transport_command else GoogleChatTransport(
                 self.config.token_env, self.config.token_command, self.config.reaction_user))
-        for name in ("requests", "replies", "queue"):
+        for name in ("requests", "replies", "queue", "feedback"):
             _private(self.state / name)
 
     @classmethod
@@ -446,8 +451,14 @@ class Bridge:
             raise ValueError("chat message exceeds 32000 bytes")
 
     def _ingest_result(self, result: dict[str, object], checkpoint: dict[str, object] | None = None) -> None:
-        own_replies = {_read(path).get("reply_id")
-                       for path in (self.state / "requests").glob("*.json")}
+        own_replies: set[object] = set()
+        for saved_path in (self.state / "requests").glob("*.json"):
+            saved_record = _read(saved_path)
+            own_replies.add(saved_record.get("reply_id"))
+            # The outbox is committed before aggregate request metadata. Reading it also covers
+            # a crash between those writes, including earlier replies to the same request.
+            for item in self._reply_items(saved_record):
+                own_replies.add(item.get("reply_id"))
         saved = checkpoint if checkpoint is not None else _read(self.state / "bridge.json")
         high = _timestamp(get_str(saved, "high_water", "checkpoint"))
         start = _timestamp(get_str(saved, "started_at", "checkpoint"))
@@ -474,6 +485,7 @@ class Bridge:
                     # Persist an unpredictable marker before the prompt can reach the TUI.
                     # Source text cannot know it; retained output from another request cannot match it.
                     record["reply_nonce"] = secrets.token_urlsafe(16)
+                    record["reply_protocol"] = 2
                 _write(path, record)
         if checkpoint is None:
             return
@@ -549,7 +561,7 @@ class Bridge:
                        f"{command}\n")
         nonce = record.get("reply_nonce")
         if isinstance(nonce, str):
-            return ("The user's request arrived through the Google Chat bridge.\n"
+            return ("The user's request arrived through the chat bridge.\n"
                     f"Source: {message['id']}\n"
                     f"{_reply_instruction(nonce)}\n"
                     f"{context}\n{message['text']}")
@@ -564,6 +576,178 @@ class Bridge:
                 "UTF-8 file and run this command, replacing PATH_TO_YOUR_REPLY with that file:\n"
                 f"{reply}\nDo not send a separate chat message; the bridge delivers this reply durably.")
 
+    def _reply_items(self, record: dict[str, object]) -> list[dict[str, object]]:
+        """Read the ordered outbox, interpreting a legacy single artifact without resending it."""
+        key = get_str(record, "key", "request")
+        path = self.state / "replies" / f"{key}.json"
+        if not path.exists():
+            return []
+        document = _read(path)
+        if "items" in document:
+            return [as_mapping(item, "reply item") for item in as_sequence(document["items"], "reply items")]
+        item: dict[str, object] = {
+            "reply_key": "0", "request_id": get_str(record, "request_id", "request"),
+            "text": get_str(document, "text", "reply"),
+        }
+        if record.get("phase") == "replied":
+            item["reply_id"] = get_str(record, "reply_id", "request")
+        return [item]
+
+    def _reconcile_reply_state(self, path: Path, record: dict[str, object]) -> None:
+        """Recover a confirmed outbox write whose aggregate request update was interrupted."""
+        if record.get("phase") not in ("awaiting_reply", "reply_pending", "delivery_uncertain"):
+            return
+        items = self._reply_items(record)
+        if items and all(item.get("reply_id") for item in items):
+            last = items[-1]
+            record.update(phase="replied", reply_id=last["reply_id"])
+            if last.get("replied_at"):
+                record["replied_at"] = last["replied_at"]
+            record.pop("reply_error", None)
+            _write(path, record)
+
+    def _next_reply(self, record: dict[str, object]) -> dict[str, object] | None:
+        return next((item for item in self._reply_items(record) if not item.get("reply_id")), None)
+
+    def _outbound_text(self, text: str) -> str:
+        prefix = f"[{self.config.agent_label}]"
+        return text if text.startswith(prefix) else f"{prefix} {text}"
+
+    def _pending_outbound_texts(self, record: dict[str, object]) -> list[str]:
+        return [self._outbound_text(get_str(item, "text", "reply item"))
+                for item in self._reply_items(record) if not item.get("reply_id")]
+
+    def _append_replies(self, record: dict[str, object], answers: list[str]) -> bool:
+        """Commit newly observed occurrences atomically before any provider send."""
+        key = get_str(record, "key", "request")
+        path = self.state / "replies" / f"{key}.json"
+        existed = path.exists()
+        items = self._reply_items(record)
+        previous = Counter(hashlib.sha256(get_str(item, "text", "reply item").encode()).hexdigest()
+                           for item in items)
+        observed: Counter[str] = Counter()
+        added = False
+        for answer in answers:
+            digest = hashlib.sha256(answer.encode()).hexdigest()
+            observed[digest] += 1
+            if observed[digest] <= previous[digest]:
+                continue
+            index = len(items)
+            identity = get_str(record, "request_id", "request")
+            if index:
+                identity = str(uuid.uuid5(uuid.UUID(identity), f"reply:{index}"))
+            items.append({"reply_key": str(index), "request_id": identity, "text": answer})
+            added = True
+        if added:
+            document = {"text": items[0]["text"], "items": items}
+            if existed:
+                _write(path, document)
+            else:
+                from agentctl.agent import _atomic_json_create
+                try:
+                    _atomic_json_create(str(path), document)
+                except FileExistsError:
+                    # A concurrent recovery-file submission may establish the first reply.
+                    # Reload it before appending captured output; its accepted text and stable
+                    # first-send identity must survive even while the daemon is running.
+                    return self._append_replies(record, answers)
+        return added
+
+    def _reply_started(self, path: Path, record: dict[str, object], reply: dict[str, object]) -> None:
+        if record["phase"] == "delivery_uncertain":
+            record["delivery_confirmed_by"] = "reply_artifact"
+        record["phase"] = "reply_pending"
+        _write(path, record)
+
+    def _reply_complete(self, path: Path, record: dict[str, object], reply_key: str,
+                        identifier: str | None, finished_at: str, error: str | None) -> None:
+        items = self._reply_items(record)
+        if error is not None:
+            record.update(phase="reply_pending", reply_error=error[:2000])
+        else:
+            if identifier is None:
+                raise ValueError("successful chat reply has no provider message id")
+            item = next(item for item in items if item.get("reply_key") == reply_key)
+            item.update(reply_id=identifier, replied_at=finished_at)
+            key = get_str(record, "key", "request")
+            _write(self.state / "replies" / f"{key}.json", {"text": items[0]["text"], "items": items})
+            record.update(phase="reply_pending" if any(not item.get("reply_id") for item in items) else "replied",
+                          reply_id=identifier, replied_at=finished_at)
+            record.pop("reply_error", None)
+        _write(path, record)
+
+    def _feedback_delivery(self) -> tuple[bool, list[tuple[str, str]]]:
+        """Return unsubmitted feedback and whether its durable harness queue still needs draining."""
+        pending = False
+        prompts: list[tuple[str, str]] = []
+        for path in sorted((self.state / "feedback").glob("*.json")):
+            feedback = _read(path)
+            identifier = get_str(feedback, "queue_id", "reply feedback")
+            phases = [phase for phase in ("inbox", "inflight", "processed", "failed")
+                      if (self.state / "queue" / phase / f"{identifier}.json").exists()]
+            if not phases:
+                prompts.append((identifier, get_str(feedback, "text", "reply feedback")))
+                pending = True
+            elif any(phase in ("inbox", "inflight") for phase in phases):
+                pending = True
+        return pending, prompts
+
+    def _without_prompt_echoes(self, text: str, *, trim_history: bool = False) -> str:
+        """Remove full saved user envelopes, including source text with copied fence examples."""
+        matches: list[tuple[int, str]] = []
+        for phase in ("processed", "inflight", "inbox", "failed"):
+            for path in (self.state / "queue" / phase).glob("*.json"):
+                prompt = get_str(_read(path), "text", "queued prompt")
+                start = text.find(prompt)
+                if start >= 0:
+                    matches.append((start, prompt))
+        # A retained envelope proves earlier scrollback predates the visible request set.
+        if matches and trim_history:
+            text = text[min(start for start, _ in matches):]
+        for _, prompt in matches:
+            text = text.replace(prompt, "")
+        return text
+
+    def _unknown_reply_feedback(self, text: str, available: dict[str, str]) -> None:
+        known = set(available)
+        # Already completed legacy fences in retained history are not new routing mistakes.
+        for path in (self.state / "requests").glob("*.json"):
+            record = _read(path)
+            if (record.get("phase") == "replied" and record.get("reply_protocol") != 2
+                    and isinstance(record.get("reply_nonce"), str)):
+                nonce = str(record["reply_nonce"])
+                if nonce not in text:
+                    known.add(nonce)
+                    continue
+                historical = {get_str(item, "text", "reply item") for item in self._reply_items(record)}
+                try:
+                    visible = extract_replies(text, (nonce,)).get(nonce, [])
+                except ValueError:
+                    visible = []
+                # Suppress old delivered text (including clipped history), but diagnose an
+                # actual new response directed to a closed legacy request.
+                if not historical or not visible or all(body in historical for body in visible):
+                    known.add(nonce)
+        invalid = unknown_reply_ids(text, known)
+        if not invalid:
+            return
+        listing = "\n".join(f"- {nonce} (request {key[:12]})" for nonce, key in available.items())
+        if not listing:
+            listing = "(none)"
+        for nonce in invalid:
+            identity = hashlib.sha256(json.dumps([nonce, sorted(available)], ensure_ascii=True).encode()).hexdigest()
+            path = self.state / "feedback" / f"{identity}.json"
+            if path.exists():
+                continue
+            detail = (f"Chat reply routing error: you referenced ID {json.dumps(nonce[:256])}, "
+                      "which is not available. No message was sent for that ID.\n"
+                      f"The outstanding user request IDs available in this session are:\n{listing}\n"
+                      "Please direct your response to the appropriate request using its exact ID. "
+                      "Use CHAT_REPLY opening and closing tags on their own lines. "
+                      "Each complete block is a separate message; an earlier reply does not close "
+                      "a request that supports multiple replies. This is bridge feedback, not a new user request.")
+            _write(path, {"queue_id": f"feedback-{identity}", "text": detail, "created_at": _utc()})
+
     def _deliver(self) -> None:
         queue = self.state / "queue"
         paths = sorted((self.state / "requests").glob("*.json"),
@@ -577,7 +761,10 @@ class Bridge:
                     enqueue(str(queue), self._prompt(record), message_id=queue_id)
                 record["phase"] = "queued"
                 _write(path, record)
-        if any(record.get("phase") == "queued" for record in map(_read, paths)):
+        feedback_pending, feedback_prompts = self._feedback_delivery()
+        for identifier, prompt in feedback_prompts:
+            enqueue(str(queue), prompt, message_id=identifier)
+        if feedback_pending or any(record.get("phase") == "queued" for record in map(_read, paths)):
             # Zero readiness wait keeps chat polling responsive while the lead is busy.
             drain(self.client, self.config.target, str(queue), ready_timeout=0)
         for path in paths:
@@ -590,23 +777,24 @@ class Bridge:
                 elif (queue / "failed" / f"{queue_id}.json").exists():
                     record["phase"] = "delivery_uncertain"
                 _write(path, record)
-            reply_path = self.state / "replies" / f"{key}.json"
-            if record["phase"] in ("awaiting_reply", "reply_pending", "delivery_uncertain") and reply_path.exists():
-                if record["phase"] == "delivery_uncertain":
-                    record["delivery_confirmed_by"] = "reply_artifact"
-                reply = get_str(_read(reply_path), "text", "reply")
-                record["phase"] = "reply_pending"
-                _write(path, record)
-                source = as_mapping(record["message"], "source message")
-                prefix = f"[{self.config.agent_label}]"
-                result = self.transport({"action": "send", "space": self.config.space,
-                    "thread": source["thread"], "request_id": record["request_id"],
-                    "text": reply if reply.startswith(prefix) else f"{prefix} {reply}"})
-                reply_id = get_str(result, "id", "sent reply")
-                if not reply_id.startswith(self.config.space + "/messages/"):
-                    raise ValueError("transport returned a reply outside the configured space")
-                record.update(phase="replied", reply_id=reply_id)
-                _write(path, record)
+            self._reconcile_reply_state(path, record)
+            if record["phase"] in ("awaiting_reply", "reply_pending", "delivery_uncertain", "replied"):
+                while (item := self._next_reply(record)) is not None:
+                    self._reply_started(path, record, item)
+                    source = as_mapping(record["message"], "source message")
+                    try:
+                        result = self.transport({"action": "send", "space": self.config.space,
+                            "thread": source["thread"], "request_id": item["request_id"],
+                            "text": self._outbound_text(get_str(item, "text", "reply item"))})
+                        reply_id = get_str(result, "id", "sent reply")
+                        if re.fullmatch(re.escape(self.config.space) + r"/messages/[A-Za-z0-9_.-]+", reply_id) is None:
+                            raise ValueError("transport returned a reply outside the configured space")
+                    except (OSError, ValueError, TypeError, HerdrRunError, subprocess.SubprocessError) as exc:
+                        self._reply_complete(path, record, get_str(item, "reply_key", "reply item"),
+                                             None, _utc(), str(exc))
+                        raise
+                    self._reply_complete(path, record, get_str(item, "reply_key", "reply item"),
+                                         reply_id, _utc(), None)
 
     def tick(self) -> dict[str, object]:
         """Reconcile replies, poll a page, and attempt ready deliveries once."""
@@ -627,19 +815,19 @@ class Bridge:
             os.close(descriptor)
 
     def output_requests(self, *, retry_failed: bool = False) -> dict[str, str]:
-        """Return unfinished tagged requests; a completed artifact needs no more TUI reads."""
+        """Return addressable tagged requests; protocol v2 stays open after each reply."""
         result: dict[str, str] = {}
         for path in sorted((self.state / "requests").glob("*.json")):
             record = _read(path)
             nonce = record.get("reply_nonce")
             if not isinstance(nonce, str) or record.get("phase") not in (
-                "queued", "awaiting_reply", "delivery_uncertain"
+                "queued", "awaiting_reply", "delivery_uncertain", "reply_pending", "replied"
             ):
+                continue
+            if record.get("reply_protocol") != 2 and record.get("phase") in ("reply_pending", "replied"):
                 continue
             _reply_instruction(nonce)
             key = get_str(record, "key", "chat request")
-            if (self.state / "replies" / f"{key}.json").exists():
-                continue
             if record.get("capture_error") and not retry_failed:
                 continue
             if nonce in result:
@@ -651,7 +839,7 @@ class Bridge:
         """Subscribe to unique closing markers after checking the pinned coordinator."""
         info = resolve_target(self.client, self.config.target)
         return PaneOutputStream(self.client.event_socket(), info.pane_id,
-                               _closing_pattern(nonces) if nonces else "", watch_settled=True)
+                               _closing_pattern(nonces), watch_settled=True)
 
     def capture_event(self, event: PaneOutputSnapshot | PaneAgentStatus, *, deliver: bool = True) -> dict[str, object]:
         """Treat settled-state events as a hint to recheck incomplete replies."""
@@ -683,23 +871,24 @@ class Bridge:
                     raise HerdrUnavailable("chat reply output belongs to a different coordinator pane")
             captured: list[str] = []
             errors: list[dict[str, str]] = []
-            for nonce, key in self.output_requests(retry_failed=True).items():
-                if re.search(_closing_pattern([nonce]), snapshot.text, flags=re.MULTILINE) is None:
+            text = self._without_prompt_echoes(snapshot.text)
+            available = self.output_requests(retry_failed=True)
+            self._unknown_reply_feedback(self._without_prompt_echoes(snapshot.text, trim_history=True), available)
+            for nonce, key in available.items():
+                closing = r"^\s*(?:[•⏺]\s+)?</(?:GCHAT|CHAT)_REPLY_" + re.escape(nonce) + r">\s*$"
+                if re.search(closing, text, flags=re.MULTILINE) is None:
                     continue
                 path = self.state / "requests" / f"{key}.json"
                 record = _read(path)
-                # Remove unrelated older scrollback when the echoed instruction is
-                # still retained. Its inline markers cannot constitute a reply.
-                text = snapshot.text
-                instruction = _reply_instruction(nonce)
-                start = text.find(instruction)
-                if start >= 0:
-                    text = text[start + len(instruction):]
                 try:
                     answers = extract_replies(text, (nonce,))
                     if nonce not in answers:
                         raise ValueError("closing marker is visible but no complete reply block is retained; inspect the pane and retry chat tick or submit a reply file")
-                    submit_reply(self.state, key, answers[nonce])
+                    # Upgrade an already-delivered legacy prompt while keeping its old marker
+                    # valid; historical completed legacy requests remain closed during migration.
+                    record["reply_protocol"] = 2
+                    _write(path, record)
+                    added = self._append_replies(record, answers[nonce])
                 except ValueError as exc:
                     error = str(exc)[:2000]
                     record.update(capture_error=error, capture_failed_at=_utc())
@@ -707,9 +896,10 @@ class Bridge:
                 else:
                     record.pop("capture_error", None)
                     record.pop("capture_failed_at", None)
-                    record["reply_capture"] = {"source": "herdr_output", "pane_id": snapshot.pane_id,
-                                               "captured_at": _utc(), "snapshot_truncated": snapshot.truncated}
-                    captured.append(key)
+                    if added:
+                        record["reply_capture"] = {"source": "herdr_output", "pane_id": snapshot.pane_id,
+                                                   "captured_at": _utc(), "snapshot_truncated": snapshot.truncated}
+                        captured.append(key)
                 _write(path, record)
             # Existing send request IDs retain their idempotency semantics. A
             # provider failure here leaves the captured artifact ready for retry.
@@ -722,7 +912,7 @@ class Bridge:
     def capture_once(self) -> dict[str, object]:
         """Inspect retained matching output once, including explicitly retried failures."""
         nonces = tuple(self.output_requests(retry_failed=True))
-        if not nonces:
+        if not nonces and self.config.reply_mode != "tagged":
             return {"captured": [], "errors": []}
         stream = self.open_output(nonces)
         try:
@@ -773,6 +963,7 @@ def _run_polling(bridge: Bridge, interval: float, prog: str) -> None:
     poll_delay = interval
     reconnect_at = 0.0
     reconnect_delay = 1.0
+    rearm_at = 0.0
     errors = (OSError, ValueError, TypeError, HerdrRunError, subprocess.SubprocessError)
     try:
         while True:
@@ -787,6 +978,10 @@ def _run_polling(bridge: Bridge, interval: float, prog: str) -> None:
                 next_poll = time.monotonic() + poll_delay
             unfinished = tuple(bridge.output_requests(retry_failed=True))
             nonces = tuple(bridge.output_requests())
+            watching = bridge.config.reply_mode == "tagged" or bool(unfinished)
+            if stream is not None and time.monotonic() >= rearm_at:
+                stream.close()
+                stream = None
             signature = (unfinished, nonces)
             if signature != subscribed:
                 if stream is not None:
@@ -795,10 +990,10 @@ def _run_polling(bridge: Bridge, interval: float, prog: str) -> None:
                 subscribed = signature
                 reconnect_at = 0.0
                 reconnect_delay = 1.0
-                if not unfinished:
+                if not watching:
                     _write(bridge.state / "output.json", {"state": "idle", "error": None,
                                                          "updated_at": _utc()})
-            if unfinished and stream is None and time.monotonic() >= reconnect_at:
+            if watching and stream is None and time.monotonic() >= reconnect_at:
                 try:
                     stream = bridge.open_output(nonces)
                 except errors as exc:
@@ -811,8 +1006,9 @@ def _run_polling(bridge: Bridge, interval: float, prog: str) -> None:
                     _write(bridge.state / "output.json", {"state": "connected", "error": None,
                                                          "updated_at": _utc()})
                     reconnect_delay = 1.0
-            deadline = next_poll
-            if unfinished and stream is None:
+                    rearm_at = time.monotonic() + 1.0
+            deadline = min(next_poll, rearm_at) if stream is not None else next_poll
+            if watching and stream is None:
                 deadline = min(deadline, reconnect_at)
             timeout = max(0.0, deadline - time.monotonic())
             if stream is None:

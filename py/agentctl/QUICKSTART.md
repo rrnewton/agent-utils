@@ -56,8 +56,9 @@ before using their commands.
 
 To message one of these agents remotely, run `agentctl chat quickstart`.
 The Chat bridge accepts messages from configured senders, acknowledges intake
-with 🤖, and sends the agent's tagged final answer back to its Google Chat
-thread. The agent normally needs no reply-file write or reply command. Thread
+with 🤖, and sends the agent's tagged replies back to their originating chat
+thread. One request can receive multiple replies, including progress updates.
+The agent normally needs no reply-file write or reply command. Thread
 replies also include a command hint for reading the nearest ten prior messages.
 The built-in transport polls the public Google Chat API. For prompt intake from
 a persistent event stream, configure an `event_command` adapter as described in

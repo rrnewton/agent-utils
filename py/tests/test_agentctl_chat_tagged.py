@@ -24,7 +24,7 @@ def _records(state: Path) -> dict[str, dict[str, object]]:
 
 def _block(record: dict[str, object], text: str = "Finished") -> str:
     nonce = record["reply_nonce"]
-    return f"<GCHAT_REPLY_{nonce}>\n{text}\n</GCHAT_REPLY_{nonce}>"
+    return f"<CHAT_REPLY_{nonce}>\n{text}\n</CHAT_REPLY_{nonce}>"
 
 
 def _snapshot(text: str, *, pane: str = "w1:p1", truncated: bool = False) -> PaneOutputSnapshot:
@@ -39,7 +39,9 @@ def test_default_nonce_prompt_is_short_durable_and_not_itself_a_reply(tmp_path: 
     nonce = str(record["reply_nonce"])
     assert re.fullmatch(r"[A-Za-z0-9_-]{22}", nonce)
     prompt = harness.prompts[0]
-    assert f"<GCHAT_REPLY_{nonce}>" in prompt and f"</GCHAT_REPLY_{nonce}>" in prompt
+    assert f"<CHAT_REPLY_{nonce}>" in prompt and f"</CHAT_REPLY_{nonce}>" in prompt
+    assert "one or multiple replies" in prompt and "separate chat message" in prompt
+    assert "Google Chat" not in prompt and "GCHAT_REPLY" not in prompt
     assert "PATH_TO_YOUR_REPLY" not in prompt and " --file " not in prompt
     assert "Source: spaces/test/messages/one" in prompt
     assert len(prompt) < 700
@@ -72,16 +74,20 @@ def test_capture_is_durable_threaded_and_deduplicated_after_restart(tmp_path: Pa
     restarted.tick()
     assert len(harness.prompts) == 1
     assert len([call for call in chat.calls if call["action"] == "send"]) == 1
-    assert restarted.output_requests() == {}
+    assert restarted.output_requests() == {str(record["reply_nonce"]): str(record["key"])}
 
 
-def test_redrawn_identical_blocks_create_one_reply(tmp_path: Path) -> None:
+def test_two_identical_blocks_send_two_replies_and_repeated_snapshot_sends_none(tmp_path: Path) -> None:
     bridge, _, chat = setup(tmp_path)
     chat.message()
     bridge.tick()
     block = _block(_records(tmp_path)["one"])
-    assert not bridge.capture_output(_snapshot(block + "\n" + block))["errors"]
-    assert len(chat.sent) == 1
+    snapshot = _snapshot(block + "\n" + block)
+    assert not bridge.capture_output(snapshot)["errors"]
+    assert len(chat.sent) == 2
+    assert bridge.capture_output(snapshot) == {"captured": [], "errors": []}
+    assert len(chat.sent) == 2
+    assert len([call for call in chat.calls if call["action"] == "send"]) == 2
 
 
 def test_snapshot_from_wrong_pane_is_refused_before_transport(tmp_path: Path) -> None:
@@ -114,7 +120,7 @@ def test_lost_transport_ack_retries_artifact_without_reprompt_or_recapture(tmp_p
     with pytest.raises(OSError, match="acknowledgement lost"):
         bridge.capture_output(_snapshot(_block(record)))
     assert _records(tmp_path)["one"]["phase"] == "reply_pending"
-    assert bridge.output_requests() == {}
+    assert bridge.output_requests() == {str(record["reply_nonce"]): str(record["key"])}
     restarted = Bridge(tmp_path, harness, chat)
     restarted.tick()
     sends = [call for call in chat.calls if call["action"] == "send"]
@@ -144,7 +150,7 @@ def test_crash_after_reply_artifact_before_capture_metadata_recovers(
     assert not chat.sent
     assert _read(tmp_path / "replies" / f"{record['key']}.json")["text"] == "Finished"
     restarted = Bridge(tmp_path, harness, chat)
-    assert restarted.output_requests() == {}
+    assert restarted.output_requests() == {str(record["reply_nonce"]): str(record["key"])}
     restarted.tick()
     assert len(chat.sent) == 1 and len(harness.prompts) == 1
 
@@ -163,7 +169,7 @@ def test_tagged_capture_confirms_uncertain_prompt_delivery(tmp_path: Path) -> No
     assert len(harness.prompts) == 1
 
 
-@pytest.mark.parametrize("kind", ["clipped", "fenced", "conflicting", "empty", "mismatched", "oversize"])
+@pytest.mark.parametrize("kind", ["clipped", "fenced", "empty", "mismatched", "oversize"])
 def test_bad_capture_is_visible_and_does_not_starve_another_request(tmp_path: Path, kind: str) -> None:
     bridge, _, chat = setup(tmp_path)
     chat.message("broken")
@@ -175,7 +181,6 @@ def test_bad_capture_is_visible_and_does_not_starve_another_request(tmp_path: Pa
     variants = {
         "clipped": f"Reply beginning disappeared\n</GCHAT_REPLY_{nonce}>",
         "fenced": "```text\n" + _block(broken) + "\n```",
-        "conflicting": _block(broken, "First") + "\n" + _block(broken, "Second"),
         "empty": _block(broken, "  "),
         "mismatched": f"<GCHAT_REPLY_{nonce}>\nWrong close\n</GCHAT_REPLY_XXXXXXXXXXXXXXXXXXXXXX>\n</GCHAT_REPLY_{nonce}>",
         "oversize": _block(broken, "x" * 30001),
@@ -298,7 +303,7 @@ def _instrument(bridge: Bridge, harness: Harness, clock: _Clock,
     return ticks, reads
 
 
-def test_daemon_idle_waits_follow_chat_deadline_without_pane_poll_or_reconnect(
+def test_daemon_rearms_output_without_polling_chat_or_reading_panes_each_second(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bridge, harness, chat = setup(tmp_path)
@@ -325,10 +330,10 @@ def test_daemon_idle_waits_follow_chat_deadline_without_pane_poll_or_reconnect(
     monkeypatch.setattr(bridge, "open_output", open_output)
     with pytest.raises(_StopLoop):
         chat_module._run_bridge(bridge, 60, "test-chat")
-    assert ticks == [0, 60, 120]
-    assert opens == [0] and stream.waits == [60, 60, 60]
+    assert ticks == [0]
+    assert opens == [0, 1, 2] and stream.waits == [1, 1, 1]
     assert not reads and len(harness.prompts) == 1
-    assert stream.closes == 1
+    assert stream.closes == 3
 
 
 def test_daemon_sends_output_before_long_provider_poll_deadline(
@@ -338,9 +343,15 @@ def test_daemon_sends_output_before_long_provider_poll_deadline(
     chat.message()
     clock = _Clock()
     ticks, reads = _instrument(bridge, harness, clock, monkeypatch)
+    waits = 0
 
     def wait(timeout: float) -> tuple[PaneOutputSnapshot, ...]:
-        assert timeout == 60
+        nonlocal waits
+        waits += 1
+        if waits == 2:
+            assert timeout == 0.75
+            raise _StopLoop()
+        assert timeout == 1
         clock.now += 0.25
         return (_snapshot(_block(_records(tmp_path)["one"])),)
 
@@ -351,8 +362,58 @@ def test_daemon_sends_output_before_long_provider_poll_deadline(
     assert ticks == [0] and clock.now == 0.25
     assert len(chat.sent) == 1 and not reads
     assert stream.closes == 1
-    assert clock.sleeps == [59.75]
-    assert _read(tmp_path / "output.json")["state"] == "idle"
+    assert not clock.sleeps
+    assert _read(tmp_path / "output.json")["state"] == "connected"
+    assert bridge.output_requests()
+
+
+def test_daemon_delivers_later_blocks_for_same_id_before_next_provider_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, harness, chat = setup(tmp_path)
+    chat.message()
+    clock = _Clock()
+    ticks, reads = _instrument(bridge, harness, clock, monkeypatch)
+    opens: list[float] = []
+    snapshots_at: list[float] = []
+    streams: list[_FakeStream] = []
+    bodies = ["Started", "Milestone reached", "Finished"]
+
+    def open_output(nonces: Sequence[str]) -> PaneOutputStream:
+        record = _records(tmp_path)["one"]
+        assert tuple(nonces) == (record["reply_nonce"],)
+        opens.append(clock.now)
+        retained = "\n".join(_block(record, body) for body in bodies[:len(opens)])
+        delivered = False
+
+        def wait(timeout: float) -> tuple[PaneOutputSnapshot, ...]:
+            nonlocal delivered
+            if len(chat.sent) == len(bodies):
+                raise _StopLoop()
+            if not delivered:
+                delivered = True
+                clock.now += 0.1
+                snapshots_at.append(clock.now)
+                return (_snapshot(retained),)
+            # A retained closing line can keep the output predicate true. The
+            # next subscription must capture the expanded output despite that.
+            clock.now += timeout
+            return ()
+
+        stream = _FakeStream(wait)
+        streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(bridge, "open_output", open_output)
+    with pytest.raises(_StopLoop):
+        chat_module._run_bridge(bridge, 60, "test-chat")
+    assert ticks == [0] and opens == [0, 1, 2]
+    assert snapshots_at == pytest.approx([0.1, 1.1, 2.1])
+    assert [call["text"] for call in chat.calls if call["action"] == "send"] == [
+        "[test-agent] " + body for body in bodies
+    ]
+    assert len(chat.sent) == 3 and len(harness.prompts) == 1 and not reads
+    assert [stream.closes for stream in streams] == [1, 1, 1]
 
 
 def test_daemon_eof_backs_off_then_reconnects_without_reprompt(
@@ -363,12 +424,17 @@ def test_daemon_eof_backs_off_then_reconnects_without_reprompt(
     clock = _Clock(allowed_sleeps=1)
     ticks, reads = _instrument(bridge, harness, clock, monkeypatch)
     opens: list[float] = []
+    recovered_waits = 0
 
     def disconnected(timeout: float) -> tuple[PaneOutputSnapshot, ...]:
         clock.now += 0.25
         raise OutputStreamError("stream_eof", "server restarted")
 
     def recovered(timeout: float) -> tuple[PaneOutputSnapshot, ...]:
+        nonlocal recovered_waits
+        recovered_waits += 1
+        if recovered_waits == 2:
+            raise _StopLoop()
         clock.now += 0.25
         return (_snapshot(_block(_records(tmp_path)["one"])),)
 
@@ -382,7 +448,7 @@ def test_daemon_eof_backs_off_then_reconnects_without_reprompt(
     with pytest.raises(_StopLoop):
         chat_module._run_bridge(bridge, 60, "test-chat")
     assert opens == [0, 1.25] and ticks == [0]
-    assert clock.now == 1.5 and clock.sleeps == [1, 58.5]
+    assert clock.now == 1.5 and clock.sleeps == [1]
     assert [stream.closes for stream in streams] == [1, 1]
     assert not reads and len(harness.prompts) == 1 and len(chat.sent) == 1
 
@@ -423,6 +489,7 @@ def test_daemon_rebuilds_subscription_after_bad_capture_to_avoid_starving_pendin
     clock = _Clock()
     ticks, reads = _instrument(bridge, harness, clock, monkeypatch)
     subscriptions: list[tuple[str, ...]] = []
+    complete_waits = 0
 
     def clipped(timeout: float) -> tuple[PaneOutputSnapshot, ...]:
         clock.now += 0.1
@@ -430,6 +497,11 @@ def test_daemon_rebuilds_subscription_after_bad_capture_to_avoid_starving_pendin
         return (_snapshot(f"Only the end remains\n</GCHAT_REPLY_{nonce}>", truncated=True),)
 
     def complete(timeout: float) -> tuple[PaneOutputSnapshot, ...]:
+        nonlocal complete_waits
+        complete_waits += 1
+        if complete_waits > 1:
+            clock.now += timeout
+            return ()
         clock.now += 0.1
         return (_snapshot(_block(_records(tmp_path)["valid"])),)
 
@@ -448,14 +520,14 @@ def test_daemon_rebuilds_subscription_after_bad_capture_to_avoid_starving_pendin
     records = _records(tmp_path)
     assert set(subscriptions[0]) == {records["broken"]["reply_nonce"], records["valid"]["reply_nonce"]}
     assert subscriptions[1] == (records["valid"]["reply_nonce"],)
-    assert subscriptions[2] == ()
+    assert subscriptions[2] == subscriptions[1]
     assert [stream.closes for stream in streams] == [1, 1, 1]
     assert records["broken"]["capture_error"] and records["valid"]["phase"] == "replied"
     assert ticks == [0] and not reads
     assert len(chat.sent) == 1 and len(harness.prompts) == 2
 
 
-def test_early_fenced_close_recovers_on_idle_without_periodic_reads_or_reconnect_loop(
+def test_early_fenced_close_recovers_on_idle_and_continues_watching_later_replies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bridge, harness, chat = setup(tmp_path)
@@ -486,7 +558,10 @@ def test_early_fenced_close_recovers_on_idle_without_periodic_reads_or_reconnect
         record = _records(tmp_path)["one"]
         return "```text\n" + _block(record, "Example only") + "\n```\n" + _block(record, "Actual final answer")
 
-    streams = [_FakeStream(quoted_example), _FakeStream(settled)]
+    def stopped(timeout: float) -> tuple[PaneOutputSnapshot | PaneAgentStatus, ...]:
+        raise _StopLoop()
+
+    streams = [_FakeStream(quoted_example), _FakeStream(settled), _FakeStream(stopped)]
 
     def open_output(nonces: Sequence[str]) -> PaneOutputStream:
         subscriptions.append(tuple(nonces))
@@ -497,7 +572,8 @@ def test_early_fenced_close_recovers_on_idle_without_periodic_reads_or_reconnect
     with pytest.raises(_StopLoop):
         chat_module._run_bridge(bridge, 60, "test-chat")
     assert len(subscriptions[0]) == 1 and subscriptions[1] == ()
-    assert len(subscriptions) == 2 and [stream.closes for stream in streams] == [1, 1]
+    assert subscriptions[2] == subscriptions[0]
+    assert [stream.closes for stream in streams] == [1, 1, 1]
     assert len(reads) == 1 and reads[0] == pytest.approx(0.3)
     assert ticks == [0] and len(harness.prompts) == 1
     assert next(iter(chat.sent.values()))["text"] == "[test-agent] Actual final answer"
@@ -506,7 +582,7 @@ def test_early_fenced_close_recovers_on_idle_without_periodic_reads_or_reconnect
     assert as_mapping(saved["reply_capture"], "capture")["snapshot_truncated"] is None
 
 
-def test_already_idle_bad_capture_keeps_status_watch_without_reread_or_reopen_loop(
+def test_already_idle_bad_capture_rearms_watch_without_automatic_pane_rereads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bridge, harness, chat = setup(tmp_path)
@@ -537,7 +613,10 @@ def test_already_idle_bad_capture_keeps_status_watch_without_reread_or_reopen_lo
         reads.append(clock.now)
         return clipped_text()
 
-    streams = [_FakeStream(clipped), _FakeStream(idle_then_wait)]
+    def stopped(timeout: float) -> tuple[PaneOutputSnapshot | PaneAgentStatus, ...]:
+        raise _StopLoop()
+
+    streams = [_FakeStream(clipped), _FakeStream(idle_then_wait), _FakeStream(stopped)]
 
     def open_output(nonces: Sequence[str]) -> PaneOutputStream:
         subscriptions.append(tuple(nonces))
@@ -547,9 +626,9 @@ def test_already_idle_bad_capture_keeps_status_watch_without_reread_or_reopen_lo
     monkeypatch.setattr(harness, "read", read)
     with pytest.raises(_StopLoop):
         chat_module._run_bridge(bridge, 60, "test-chat")
-    assert len(subscriptions) == 2 and subscriptions[1] == ()
-    assert reads == [0] and ticks == [0, 60]
-    assert [stream.closes for stream in streams] == [1, 1]
+    assert len(subscriptions) == 3 and subscriptions[1:] == [(), ()]
+    assert reads == [0] and ticks == [0]
+    assert [stream.closes for stream in streams] == [1, 1, 1]
     assert len(harness.prompts) == 1 and not chat.sent
     assert _records(tmp_path)["one"]["capture_error"]
 
