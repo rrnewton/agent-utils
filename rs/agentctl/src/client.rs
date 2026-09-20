@@ -161,19 +161,18 @@ impl HerdrClient {
         unique_label_id(&workspaces, "workspace_id", label, "workspace")
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
-    pub fn create_workspace(&self, label: &str, cwd: &str) -> Result<(String, String, String)> {
-        let result = self.call(
-            &strings(&[
-                "workspace",
-                "create",
-                "--label",
-                label,
-                "--cwd",
-                cwd,
-                "--no-focus",
-            ]),
-            &format!("workspace create {label:?}"),
-        )?;
+    pub fn create_workspace(
+        &self,
+        label: &str,
+        cwd: &str,
+        environment: &[String],
+    ) -> Result<(String, String, String)> {
+        let mut arguments = strings(&["workspace", "create", "--label", label, "--cwd", cwd]);
+        for entry in environment {
+            arguments.extend(["--env".to_owned(), entry.clone()]);
+        }
+        arguments.push("--no-focus".to_owned());
+        let result = self.call(&arguments, &format!("workspace create {label:?}"))?;
         let workspace = required_object(&result, "workspace", "workspace create")?;
         let tab = required_object(&result, "tab", "workspace create")?;
         let pane = required_object(&result, "root_pane", "workspace create")?;
@@ -184,21 +183,28 @@ impl HerdrClient {
         ))
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
-    pub fn create_tab(&self, workspace_id: &str, label: &str, cwd: &str) -> Result<String> {
-        let result = self.call(
-            &strings(&[
-                "tab",
-                "create",
-                "--workspace",
-                workspace_id,
-                "--label",
-                label,
-                "--cwd",
-                cwd,
-                "--no-focus",
-            ]),
-            &format!("tab create {label:?}"),
-        )?;
+    pub fn create_tab(
+        &self,
+        workspace_id: &str,
+        label: &str,
+        cwd: &str,
+        environment: &[String],
+    ) -> Result<String> {
+        let mut arguments = strings(&[
+            "tab",
+            "create",
+            "--workspace",
+            workspace_id,
+            "--label",
+            label,
+            "--cwd",
+            cwd,
+        ]);
+        for entry in environment {
+            arguments.extend(["--env".to_owned(), entry.clone()]);
+        }
+        arguments.push("--no-focus".to_owned());
+        let result = self.call(&arguments, &format!("tab create {label:?}"))?;
         let tab = match result.get("tab") {
             Some(value) => value
                 .as_object()
@@ -497,21 +503,23 @@ impl HerdrClient {
         workspace: &str,
         label: &str,
         cwd: &str,
+        environment: &[String],
     ) -> Result<(String, String)> {
-        let result = self.call(
-            &strings(&[
-                "tab",
-                "create",
-                "--workspace",
-                workspace,
-                "--label",
-                label,
-                "--cwd",
-                cwd,
-                "--no-focus",
-            ]),
-            "tab create",
-        )?;
+        let mut arguments = strings(&[
+            "tab",
+            "create",
+            "--workspace",
+            workspace,
+            "--label",
+            label,
+            "--cwd",
+            cwd,
+        ]);
+        for entry in environment {
+            arguments.extend(["--env".to_owned(), entry.clone()]);
+        }
+        arguments.push("--no-focus".to_owned());
+        let result = self.call(&arguments, "tab create")?;
         let tab = required_object(&result, "tab", "tab create")?;
         let pane = required_object(&result, "root_pane", "tab create")?;
         let tab_id = required_string(tab, "tab_id", "tab create")?;
@@ -707,7 +715,15 @@ mod tests {
         assert_eq!(
             executable
                 .client()
-                .create_tab_with_pane("workspace", "worker", "/tmp")
+                .create_tab_with_pane(
+                    "workspace",
+                    "worker",
+                    "/tmp",
+                    &[
+                        "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai".to_owned(),
+                        "LITERAL=a b=$(unexpanded)=tail".to_owned(),
+                    ],
+                )
                 .unwrap(),
             ("tab".to_owned(), "pane".to_owned())
         );
@@ -722,6 +738,47 @@ mod tests {
                 "worker",
                 "--cwd",
                 "/tmp",
+                "--env",
+                "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai",
+                "--env",
+                "LITERAL=a b=$(unexpanded)=tail",
+                "--no-focus"
+            ])
+        );
+    }
+
+    #[test]
+    fn workspace_allocation_passes_literal_environment() {
+        let executable = FakeExecutable::new(
+            r#"{"result":{"workspace":{"workspace_id":"workspace"},"tab":{"tab_id":"tab"},"root_pane":{"pane_id":"pane"}}}"#,
+        );
+        assert_eq!(
+            executable
+                .client()
+                .create_workspace(
+                    "subagents",
+                    "/tmp",
+                    &[
+                        "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai".to_owned(),
+                        "LITERAL=a b=$(unexpanded)=tail".to_owned(),
+                    ],
+                )
+                .unwrap(),
+            ("workspace".to_owned(), "tab".to_owned(), "pane".to_owned())
+        );
+        assert_eq!(
+            executable.arguments(),
+            serde_json::json!([
+                "workspace",
+                "create",
+                "--label",
+                "subagents",
+                "--cwd",
+                "/tmp",
+                "--env",
+                "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai",
+                "--env",
+                "LITERAL=a b=$(unexpanded)=tail",
                 "--no-focus"
             ])
         );

@@ -61,6 +61,9 @@ agentctl start reviewer --harness codex --cwd /work/project \
   --brief 'Review the current changes and report actionable findings'
 agentctl start implementer --harness claude --cwd /work/project \
   --file /tmp/implementation-task.txt
+agentctl start gateway-worker --harness codex --cwd /work/project \
+  --env META_CODEX_AI_GATEWAY=azure-codex-cyber:openai \
+  --brief 'Use the configured gateway for this task'
 agentctl list
 agentctl status reviewer
 agentctl send reviewer 'Focus on cancellation and restart behavior'
@@ -70,6 +73,21 @@ agentctl send reviewer 'Focus on cancellation and restart behavior'
 `--harness-arg=ARG` passes a literal argument to an interactive harness and may
 be repeated. `--resume SESSION` resumes an explicitly identified conversation.
 Use `--workspace-id` to choose an exact Herdr workspace.
+
+Interactive Herdr starts also accept repeatable `--env KEY=VALUE`. Each entry is
+passed as one literal argument to Herdr when it creates the tab, before the
+harness starts; spaces, shell characters, additional `=` characters, Unicode,
+and an empty value are not expanded or rewritten. Names must match
+`[A-Za-z_][A-Za-z0-9_]*`, and neither names nor values may contain NUL. This
+option does not apply to headless workers.
+
+Environment values are launch-only input. `agentctl` does not write them to the
+session registry or return them from `status` or `list`. They still become part
+of the launched process environment and are not a credential vault; use the
+host's ordinary credential facilities for secrets. If a launch using `--env`
+fails, its retained status record uses a generic diagnostic so terminal-control
+errors cannot copy a value into later status output; the immediate command still
+reports the launch failure to its caller.
 
 ### Adopt an existing Herdr agent
 

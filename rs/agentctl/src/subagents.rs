@@ -106,6 +106,33 @@ pub fn harness_arguments(
     Ok(arguments)
 }
 
+/// Validate literal `KEY=VALUE` entries for a newly created terminal.
+pub fn environment_entries(values: &[String]) -> Result<Vec<String>> {
+    let mut entries = Vec::with_capacity(values.len());
+    for entry in values {
+        let Some((name, value)) = entry.split_once('=') else {
+            return Err(fail("environment entry must use KEY=VALUE"));
+        };
+        let valid_name = name
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if name.contains('\0') || !valid_name {
+            return Err(fail(
+                "environment variable name must match [A-Za-z_][A-Za-z0-9_]*",
+            ));
+        }
+        if value.contains('\0') {
+            return Err(fail("environment variable value must contain no NUL"));
+        }
+        entries.push(entry.clone());
+    }
+    Ok(entries)
+}
+
 /// Lifecycle operations in addition to the existing interactive messaging API.
 pub trait ManagedApi: AgentApi {
     /// Resolve a unique workspace label.
@@ -115,15 +142,23 @@ pub trait ManagedApi: AgentApi {
         &self,
         label: &str,
         cwd: &str,
+        environment: &[String],
     ) -> crate::error::Result<(String, String, String)>;
     /// Create a fresh labelled tab without stealing focus.
-    fn create_tab(&self, workspace: &str, label: &str, cwd: &str) -> crate::error::Result<String>;
+    fn create_tab(
+        &self,
+        workspace: &str,
+        label: &str,
+        cwd: &str,
+        environment: &[String],
+    ) -> crate::error::Result<String>;
     /// Capture both ownership IDs in the same tab-allocation response.
     fn create_tab_with_pane(
         &self,
         workspace: &str,
         label: &str,
         cwd: &str,
+        environment: &[String],
     ) -> crate::error::Result<(String, String)>;
     /// Close exactly one owned pane, preserving any concurrently added siblings.
     fn close_pane(&self, pane: &str) -> crate::error::Result<()>;
@@ -180,19 +215,27 @@ impl ManagedApi for HerdrClient {
         &self,
         label: &str,
         cwd: &str,
+        environment: &[String],
     ) -> crate::error::Result<(String, String, String)> {
-        HerdrClient::create_workspace(self, label, cwd)
+        HerdrClient::create_workspace(self, label, cwd, environment)
     }
-    fn create_tab(&self, workspace: &str, label: &str, cwd: &str) -> crate::error::Result<String> {
-        HerdrClient::create_tab(self, workspace, label, cwd)
+    fn create_tab(
+        &self,
+        workspace: &str,
+        label: &str,
+        cwd: &str,
+        environment: &[String],
+    ) -> crate::error::Result<String> {
+        HerdrClient::create_tab(self, workspace, label, cwd, environment)
     }
     fn create_tab_with_pane(
         &self,
         workspace: &str,
         label: &str,
         cwd: &str,
+        environment: &[String],
     ) -> crate::error::Result<(String, String)> {
-        HerdrClient::create_tab_with_pane(self, workspace, label, cwd)
+        HerdrClient::create_tab_with_pane(self, workspace, label, cwd, environment)
     }
     fn close_pane(&self, pane: &str) -> crate::error::Result<()> {
         HerdrClient::close_pane(self, pane)
@@ -449,6 +492,8 @@ pub struct StartOptions {
     pub resume: Option<String>,
     /// Additional literal harness arguments.
     pub harness_args: Vec<String>,
+    /// Literal environment entries for the new Herdr tab.
+    pub environment: Vec<String>,
     /// Initial task to submit after the harness is ready.
     pub brief: Option<String>,
     /// Herdr's bounded startup-readiness deadline.
@@ -465,6 +510,7 @@ impl Default for StartOptions {
             model: None,
             resume: None,
             harness_args: Vec::new(),
+            environment: Vec::new(),
             brief: None,
             startup_timeout: Duration::from_secs(30),
             delivery: DrainOptions::default(),
@@ -619,7 +665,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     /// Start one fresh tab and retain failed launch artifacts for diagnosis.
-    pub fn start(&self, agent_name: &str, cwd: &Path, options: StartOptions) -> Result<Value> {
+    pub fn start(&self, agent_name: &str, cwd: &Path, mut options: StartOptions) -> Result<Value> {
         name(agent_name)?;
         let cwd = fs::canonicalize(cwd)
             .map_err(|_| fail(format!("cwd is not a directory: {}", cwd.display())))?;
@@ -638,6 +684,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             options.resume.as_deref(),
             &options.harness_args,
         )?;
+        options.environment = environment_entries(&options.environment)?;
         let _lock = self.lock(agent_name)?;
         let identity_lock = self.identity_lock()?;
         if let Some(resume) = options.resume.as_deref() {
@@ -696,7 +743,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let launched = self.launch(&mut record, &options);
         if let Err(error) = launched {
             record.lifecycle = "launch_failed".to_owned();
-            record.error = Some(error.to_string());
+            record.error = Some(if options.environment.is_empty() {
+                error.to_string()
+            } else {
+                "launch failed with caller-supplied environment; details omitted from status"
+                    .to_owned()
+            });
             self.save(&record)?;
             return Err(fail(format!("launch of {agent_name:?} failed: {error}; record and any created tab retained at {}", directory.display())));
         }
@@ -1074,16 +1126,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         match selected {
             Some(workspace) => {
                 record.workspace_id = Some(workspace.clone());
-                let (tab, pane) =
-                    self.client
-                        .create_tab_with_pane(&workspace, &record.name, &record.cwd)?;
+                let (tab, pane) = self.client.create_tab_with_pane(
+                    &workspace,
+                    &record.name,
+                    &record.cwd,
+                    &options.environment,
+                )?;
                 record.tab_id = Some(tab);
                 record.pane_id = Some(pane);
                 self.save(record)?;
             }
             None => {
                 let (workspace, tab, pane) =
-                    self.client.create_workspace("subagents", &record.cwd)?;
+                    self.client
+                        .create_workspace("subagents", &record.cwd, &options.environment)?;
                 record.workspace_id = Some(workspace);
                 record.tab_id = Some(tab.clone());
                 record.pane_id = Some(pane);
@@ -1646,6 +1702,7 @@ mod tests {
                     root: root.clone(),
                     panes: Mutex::new(Vec::new()),
                     runs: Mutex::new(Vec::new()),
+                    environments: Mutex::new(Vec::new()),
                     closed: Mutex::new(Vec::new()),
                     focused: Mutex::new(Vec::new()),
                     fail_panes: AtomicBool::new(false),
@@ -1706,6 +1763,7 @@ mod tests {
         root: PathBuf,
         panes: Mutex<Vec<Pane>>,
         runs: Mutex<Vec<String>>,
+        environments: Mutex<Vec<Vec<String>>>,
         closed: Mutex<Vec<String>>,
         focused: Mutex<Vec<String>>,
         fail_panes: AtomicBool,
@@ -1820,11 +1878,22 @@ mod tests {
         fn workspace_id_for_label(&self, _: &str) -> AdapterResult<Option<String>> {
             Ok(Some("workspace".to_owned()))
         }
-        fn create_workspace(&self, _: &str, _: &str) -> AdapterResult<(String, String, String)> {
+        fn create_workspace(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+        ) -> AdapterResult<(String, String, String)> {
             unreachable!()
         }
-        fn create_tab(&self, workspace: &str, label: &str, cwd: &str) -> AdapterResult<String> {
-            self.create_tab_with_pane(workspace, label, cwd)
+        fn create_tab(
+            &self,
+            workspace: &str,
+            label: &str,
+            cwd: &str,
+            environment: &[String],
+        ) -> AdapterResult<String> {
+            self.create_tab_with_pane(workspace, label, cwd, environment)
                 .map(|value| value.0)
         }
         fn create_tab_with_pane(
@@ -1832,7 +1901,9 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
+            environment: &[String],
         ) -> AdapterResult<(String, String)> {
+            self.environments.lock().unwrap().push(environment.to_vec());
             self.panes.lock().unwrap().push(Self::pane("owned"));
             Ok(("tab".to_owned(), "owned".to_owned()))
         }
@@ -1897,6 +1968,103 @@ mod tests {
         let status = fixture.start(Some("initial task".to_owned()));
         assert_eq!(status["lifecycle"], "running");
         assert_eq!(*fixture.client.runs.lock().unwrap(), ["initial task"]);
+    }
+
+    #[test]
+    fn environment_entries_preserve_literals_and_reject_invalid_input() {
+        let entries = vec![
+            "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai".to_owned(),
+            "LITERAL= spaces $(unexpanded) = remain ".to_owned(),
+            "UNICODE=snowman-☃\nnext-line".to_owned(),
+            "EMPTY=".to_owned(),
+        ];
+        assert_eq!(environment_entries(&entries).unwrap(), entries);
+        for invalid in [
+            "MISSING_EQUALS",
+            "=value",
+            "9START=value",
+            "BAD-NAME=value",
+            "BAD\0NAME=value",
+            "GOOD=bad\0value",
+        ] {
+            assert!(
+                environment_entries(&[invalid.to_owned()]).is_err(),
+                "accepted invalid environment entry {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_sets_environment_only_on_the_created_tab() {
+        let fixture = Fixture::new();
+        let entries = vec![
+            "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai".to_owned(),
+            "LITERAL=a b=$(unexpanded)=tail".to_owned(),
+        ];
+        let status = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    environment: entries.clone(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let observed = fixture.client.environments.lock().unwrap();
+        assert_eq!(observed.as_slice(), std::slice::from_ref(&entries));
+        drop(observed);
+        assert!(status.get("environment").is_none());
+        for entry in entries {
+            assert!(!status.to_string().contains(&entry));
+        }
+    }
+
+    #[test]
+    fn invalid_environment_is_refused_before_registry_or_tab_creation() {
+        let fixture = Fixture::new();
+        let error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    environment: vec!["BAD-NAME=value".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("environment variable name"));
+        assert!(!fixture.root.join("registry").exists());
+        assert!(fixture.client.environments.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_launch_status_does_not_retain_environment_values() {
+        let fixture = Fixture::new();
+        let secret = "ACCESS_TOKEN=literal-sensitive-value";
+        fixture.client.fail_panes.store(true, Ordering::Relaxed);
+        let error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    environment: vec![secret.to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("pane query failed"));
+        let record = fixture.manager().load("worker").unwrap();
+        assert_eq!(record.lifecycle, "launch_failed");
+        assert_eq!(
+            record.error.as_deref(),
+            Some("launch failed with caller-supplied environment; details omitted from status")
+        );
+        assert!(!serde_json::to_string(&record).unwrap().contains(secret));
     }
 
     #[test]

@@ -132,6 +132,22 @@ def test_native_goal_and_transcript_boundaries_are_honest(tmp_path: Path, monkey
         sessions.read_session("worker", output="last")
 
 
+def test_headless_start_rejects_interactive_tab_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, calls = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="headless start does not accept.*environment"):
+        sessions.start_session(
+            "worker",
+            cwd=str(tmp_path),
+            mode="headless",
+            environment=("META_CODEX_AI_GATEWAY=azure-codex-cyber:openai",),
+        )
+    assert fake.environments == []
+    assert calls == []
+    assert not (tmp_path / "registry").exists()
+
+
 def test_mcp_routes_into_the_cli_registry_and_honors_its_pause(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions, fake, _ = setup(tmp_path, monkeypatch)
     sessions.start_session("worker", cwd=str(tmp_path))

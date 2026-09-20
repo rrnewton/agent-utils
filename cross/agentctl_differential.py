@@ -80,6 +80,7 @@ def _orientation(harness: Harness, report: Report) -> None:
             report.require(f"primary/help/{arguments}/{edition}",
                            outcome.returncode == 0 and not outcome.stderr and "--registry" in outcome.stdout
                            and ("--message-id" in outcome.stdout if arguments == ("send", "--help") else True)
+                           and ("--env" in outcome.stdout if arguments == ("start", "--help") else True)
                            and (all(option in outcome.stdout for option in
                                     ("--pane", "--workspace", "--cwd", "--harness", "--session"))
                                 if arguments == ("adopt", "--help") else True),
@@ -105,7 +106,9 @@ def _lifecycle(harness: Harness, report: Report) -> None:
     for kind in ("codex", "claude"):
         case = harness.case(f"primary-{kind}")
         if not _start(harness, report, case, f"primary/{kind}/start", "--harness", kind,
-                      "--model", "chosen-model", "--resume", "session-1", "--harness-arg=--extra"):
+                      "--model", "chosen-model", "--resume", "session-1", "--harness-arg=--extra",
+                      "--env", "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai",
+                      "--env", "LITERAL= spaces $(unexpanded) = remain "):
             continue
         for command in (("status", "worker"), ("list",), ("wait", "worker", "--timeout", "0")):
             _pair(harness, report, case, f"primary/{kind}/{command[0]}", (*command, *_COMMON))
@@ -114,6 +117,14 @@ def _lifecycle(harness: Harness, report: Report) -> None:
         report.require(f"primary/{kind}/native-launch-presets",
                        all(_state(root).get("launch_arguments") == expected_args
                            for root in (case.python_root, case.rust_root)), "native launch argv was changed or split")
+        expected_environment = [
+            "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai",
+            "LITERAL= spaces $(unexpanded) = remain ",
+        ]
+        report.require(f"primary/{kind}/literal-tab-environment",
+                       all(_state(root).get("tab_environment") == expected_environment
+                           for root in (case.python_root, case.rust_root)),
+                       "tab environment was changed, split, or reordered")
         python, _ = _pair(harness, report, case, f"primary/{kind}/metadata", ("status", "worker", *_COMMON))
         status = _json(python)
         report.require(f"primary/{kind}/metadata-contract", isinstance(status, dict)
@@ -122,6 +133,10 @@ def _lifecycle(harness: Harness, report: Report) -> None:
                            "paused": False, "runtime_home": None, "capabilities": _CAPABILITIES,
                            "pane_id": "w1:p1", "session_value": "session-1", "lifecycle": "running",
                        }.items()), f"missing canonical identity: {status!r}")
+        report.require(f"primary/{kind}/environment-not-in-status",
+                       isinstance(status, dict)
+                       and all(entry not in json.dumps(status) for entry in expected_environment),
+                       f"status exposed launch environment values: {status!r}")
         _pair(harness, report, case, f"primary/{kind}/bind", ("bind-session", "worker", "session-1", *_GOAL_COMMAND, *_COMMON))
         _pair(harness, report, case, f"primary/{kind}/goal-absent", ("goal", "worker", *_COMMON))
         python, _ = _pair(harness, report, case, f"primary/{kind}/set-goal", ("goal", "worker", "finish review", *_COMMON))
@@ -367,6 +382,9 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
         ("nonfinite", ("send", "worker", "text", "--ready-timeout", "nan")),
         ("zero-working", ("send", "worker", "text", "--working-timeout", "0")),
         ("zero-startup", ("start", "worker", "--startup-timeout", "0")),
+        ("environment-missing-equals", ("start", "worker", "--env", "MISSING_EQUALS")),
+        ("environment-empty-name", ("start", "worker", "--env", "=value")),
+        ("environment-invalid-name", ("start", "worker", "--env", "BAD-NAME=value")),
         ("zero-lines", ("read", "worker", "--lines", "0")),
         ("underscore-count", ("read", "worker", "--lines", "1_0")),
         ("unicode-time", ("wait", "worker", "--timeout", "١.0")),

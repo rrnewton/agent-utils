@@ -69,8 +69,10 @@ class Sessions(ManagedAgents):
             return super().start(name, cwd=cwd, harness=harness, model=model, brief=brief, **options)  # type: ignore[arg-type]
         if mode != "headless" or backend not in ("herdr", "tmux") or harness not in ("codex", "agy"):
             raise AgentDeliveryError("headless sessions support codex/agy with herdr/tmux")
-        if any(options.get(key) for key in ("resume", "harness_args", "workspace_id")):
-            raise AgentDeliveryError("headless start does not accept resume, harness arguments, or workspace-id")
+        if any(options.get(key) for key in ("resume", "harness_args", "workspace_id", "environment")):
+            raise AgentDeliveryError(
+                "headless start does not accept resume, harness arguments, workspace-id, or environment"
+            )
         root = str(Path(cwd).expanduser().resolve())
         if not Path(root).is_dir():
             raise AgentDeliveryError(f"cwd is not a directory: {root}")

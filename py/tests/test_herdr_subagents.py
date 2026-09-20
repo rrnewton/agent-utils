@@ -10,7 +10,7 @@ import pytest
 
 from agentctl.client import AgentPaneInfo, HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError, AgentPending, HerdrUnavailable
-from agentctl.subagents import ManagedAgents, harness_arguments
+from agentctl.subagents import ManagedAgents, environment_entries, harness_arguments
 import agentctl.legacy_cli as cli
 import agentctl.codex_goal as native_goal
 
@@ -21,6 +21,7 @@ class FakeManagedClient:
         self.infos: dict[str, AgentPaneInfo] = {}
         self.presentations: list[Pane] = []
         self.launched: list[tuple[str, str, str, tuple[str, ...]]] = []
+        self.environments: list[tuple[str, ...]] = []
         self.closed: list[str] = []
         self.submitted: list[str] = []
         self.serial = 0
@@ -35,13 +36,21 @@ class FakeManagedClient:
         assert workspace_id == "w1"
         return "subagents"
 
-    def create_workspace(self, *, label: str, cwd: str) -> tuple[str, str, str]:
+    def create_workspace(
+        self, *, label: str, cwd: str, environment: tuple[str, ...] = (),
+    ) -> tuple[str, str, str]:
         self.workspace = "w1"
-        tab = self.create_tab(workspace_id="w1", label=label, cwd=cwd)
+        tab = self.create_tab(
+            workspace_id="w1", label=label, cwd=cwd, environment=environment
+        )
         return "w1", tab, self.presentations[-1].pane_id
 
-    def create_tab(self, *, workspace_id: str, label: str, cwd: str) -> str:
+    def create_tab(
+        self, *, workspace_id: str, label: str, cwd: str,
+        environment: tuple[str, ...] = (),
+    ) -> str:
         del label
+        self.environments.append(tuple(environment))
         self.serial += 1
         tab, pane = f"w1:t{self.serial}", f"w1:p{self.serial}"
         self.presentations.append(Pane(pane, tab, workspace_id))
@@ -51,8 +60,14 @@ class FakeManagedClient:
     def rename_tab(self, tab_id: str, label: str) -> None:
         del tab_id, label
 
-    def create_tab_with_pane(self, *, workspace_id: str, label: str, cwd: str) -> tuple[str, str]:
-        tab = self.create_tab(workspace_id=workspace_id, label=label, cwd=cwd)
+    def create_tab_with_pane(
+        self, *, workspace_id: str, label: str, cwd: str,
+        environment: tuple[str, ...] = (),
+    ) -> tuple[str, str]:
+        tab = self.create_tab(
+            workspace_id=workspace_id, label=label, cwd=cwd,
+            environment=environment,
+        )
         return tab, self.presentations[-1].pane_id
 
     def start_agent(self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float) -> None:
@@ -142,6 +157,75 @@ def test_harness_arguments_preserve_literals_without_implicit_permission_changes
     assert harness_arguments("gemini", extra=("--model=chosen",)) == ("--model=chosen",)
     with pytest.raises(AgentDeliveryError, match="presets"):
         harness_arguments("gemini", model="chosen")
+
+
+def test_environment_entries_preserve_literal_values() -> None:
+    entries = (
+        "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai",
+        'LITERAL= spaces $(unexpanded) "quotes" = remain ',
+        "UNICODE=snowman-☃\nnext-line",
+        "EMPTY=",
+    )
+    assert environment_entries(entries) == entries
+
+
+@pytest.mark.parametrize(
+    "entry",
+    (
+        "MISSING_EQUALS",
+        "=value",
+        "9START=value",
+        "BAD-NAME=value",
+        "BAD\0NAME=value",
+        "GOOD=bad\0value",
+    ),
+)
+def test_environment_entries_reject_invalid_or_nul_names_and_values(entry: str) -> None:
+    with pytest.raises(AgentDeliveryError, match="environment"):
+        environment_entries((entry,))
+
+
+def test_start_sets_environment_only_on_the_created_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    entries = (
+        "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai",
+        "LITERAL=a b=$(unexpanded)=tail",
+    )
+    status = manager.start("worker", cwd=str(tmp_path), environment=entries)
+    assert fake.environments == [entries]
+    assert "environment" not in status
+    assert all(value not in json.dumps(status) for value in entries)
+    saved = json.loads((tmp_path / "registry/worker/agent.json").read_text())
+    assert "environment" not in saved
+    assert all(value not in json.dumps(saved) for value in entries)
+
+
+def test_invalid_environment_is_refused_before_registry_or_tab_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="environment variable name"):
+        manager.start("worker", cwd=str(tmp_path), environment=("BAD-NAME=value",))
+    assert not (tmp_path / "registry").exists()
+    assert fake.environments == []
+
+
+def test_failed_launch_status_does_not_retain_environment_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    secret = "ACCESS_TOKEN=literal-sensitive-value"
+    fake.fail_start = True
+    with pytest.raises(AgentDeliveryError, match="trust prompt"):
+        manager.start("worker", cwd=str(tmp_path), environment=(secret,))
+    record = manager.get("worker")
+    assert record.lifecycle == "launch_failed"
+    assert record.error == (
+        "launch failed with caller-supplied environment; details omitted from status"
+    )
+    assert secret not in json.dumps(manager.status("worker"))
 
 
 def test_failed_launch_is_inspectable_and_can_be_archived(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

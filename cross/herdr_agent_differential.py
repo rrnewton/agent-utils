@@ -124,6 +124,10 @@ elif args[:2] == ["pane", "get"]:
     }})
 elif args[:2] == ["tab", "create"]:
     state["closed"] = False
+    state["tab_environment"] = [
+        args[index + 1] for index, argument in enumerate(args[:-1])
+        if argument == "--env"
+    ]
     envelope({"tab": {"tab_id": "w1:t1"}, "root_pane": {
         "pane_id":"w1:p1", "tab_id":"w1:t1", "workspace_id":"w1",
     }})

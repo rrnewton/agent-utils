@@ -25,6 +25,7 @@ from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 _KIND = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
+_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def _name(value: str) -> str:
@@ -59,6 +60,23 @@ def harness_arguments(
     if any("\0" in value for value in args):
         raise AgentDeliveryError("harness arguments must contain no NUL")
     return tuple((*args, *extra))
+
+
+def environment_entries(values: Sequence[str]) -> tuple[str, ...]:
+    """Validate literal ``KEY=VALUE`` entries for a newly created terminal."""
+    entries: list[str] = []
+    for entry in values:
+        name, separator, value = entry.partition("=")
+        if not separator:
+            raise AgentDeliveryError("environment entry must use KEY=VALUE")
+        if "\0" in name or _ENVIRONMENT_NAME.fullmatch(name) is None:
+            raise AgentDeliveryError(
+                "environment variable name must match [A-Za-z_][A-Za-z0-9_]*"
+            )
+        if "\0" in value:
+            raise AgentDeliveryError("environment variable value must contain no NUL")
+        entries.append(entry)
+    return tuple(entries)
 
 
 @dataclass
@@ -325,7 +343,8 @@ class ManagedAgents:
     def start(
         self, name: str, *, cwd: str, workspace_id: str | None = None,
         harness: str = "codex", model: str | None = None, resume: str | None = None,
-        harness_args: Sequence[str] = (), brief: str | None = None,
+        harness_args: Sequence[str] = (), environment: Sequence[str] = (),
+        brief: str | None = None,
         startup_timeout: float = 30.0, ready_timeout: float = 900.0,
         working_timeout: float = 30.0, max_attempts: int = 3,
     ) -> dict[str, object]:
@@ -341,6 +360,7 @@ class ManagedAgents:
         if not math.isfinite(startup_timeout) or not 0 < startup_timeout <= 300:
             raise AgentDeliveryError("startup timeout must be between 0 and 300 seconds")
         arguments = harness_arguments(harness, model=model, resume=resume, extra=harness_args)
+        environment = environment_entries(environment)
         if brief is not None and not brief:
             raise AgentDeliveryError("brief must not be empty")
         with self._lock(name):
@@ -360,7 +380,7 @@ class ManagedAgents:
                                      model=model, resume=resume, arguments=list(arguments))
                 self._save(record)
                 try:
-                    self._create_presentation(record, workspace_id)
+                    self._create_presentation(record, workspace_id, environment)
                     assert record.pane_id is not None
                     self.client.start_agent(name, harness, record.pane_id, arguments, timeout=startup_timeout)
                     info = self._checked(record, ready=True)
@@ -409,7 +429,12 @@ class ManagedAgents:
                             "started agent native session changed during identity commit"
                         )
                 except (HerdrRunError, ValueError, OSError) as exc:
-                    record.lifecycle, record.error = "launch_failed", str(exc)
+                    record.lifecycle = "launch_failed"
+                    record.error = (
+                        "launch failed with caller-supplied environment; "
+                        "details omitted from status"
+                        if environment else str(exc)
+                    )
                     self._save(record)
                     raise AgentDeliveryError(
                         f"launch of {name!r} failed: {exc}; record and any created "
@@ -605,7 +630,10 @@ class ManagedAgents:
         agent._atomic_json(str(destination / "agent.json"), record.to_document())
         return destination
 
-    def _create_presentation(self, record: AgentRecord, workspace_id: str | None) -> None:
+    def _create_presentation(
+        self, record: AgentRecord, workspace_id: str | None,
+        environment: Sequence[str],
+    ) -> None:
         # Independent registries can share the default workspace. Serialize label
         # resolution and creation host-wide, releasing before any harness startup.
         lock = agent._open_private_lock(agent._target_lock_path("managed-workspace:subagents"), "workspace allocation lock")
@@ -617,14 +645,18 @@ class ManagedAgents:
             else:
                 selected = self.client.workspace_id_for_label("subagents")
             if selected is None:
-                selected, tab, pane = self.client.create_workspace(label="subagents", cwd=record.cwd)
+                selected, tab, pane = self.client.create_workspace(
+                    label="subagents", cwd=record.cwd, environment=environment
+                )
                 record.workspace_id, record.tab_id, record.pane_id = selected, tab, pane
                 self._save(record)
                 self.client.rename_tab(tab, record.name)
             else:
                 record.workspace_id = selected
                 record.tab_id, record.pane_id = self.client.create_tab_with_pane(
-                    workspace_id=selected, label=record.name, cwd=record.cwd)
+                    workspace_id=selected, label=record.name, cwd=record.cwd,
+                    environment=environment,
+                )
                 self._save(record)
         finally:
             os.close(lock)

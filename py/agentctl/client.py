@@ -326,14 +326,20 @@ class HerdrClient:
             )
         return matches[0] if matches else None
 
-    def create_workspace(self, *, label: str, cwd: str) -> tuple[str, str, str]:
+    def create_workspace(
+        self, *, label: str, cwd: str, environment: Sequence[str] = (),
+    ) -> tuple[str, str, str]:
         """Create a workspace. Returns ``(workspace_id, root_tab_id, root_pane_id)``.
 
         Herdr gives a new workspace one default tab (labelled ``"1"``); the caller renames it rather
         than creating a second tab, so a freshly created workspace has exactly one tab.
         """
+        arguments = ["workspace", "create", "--label", label, "--cwd", cwd]
+        for entry in environment:
+            arguments.extend(("--env", entry))
+        arguments.append("--no-focus")
         result = self._call(
-            ["workspace", "create", "--label", label, "--cwd", cwd, "--no-focus"],
+            arguments,
             f"workspace create {label!r}",
         )
         try:
@@ -396,10 +402,17 @@ class HerdrClient:
         """Relabel an existing tab."""
         self._call(["tab", "rename", tab_id, label], f"tab rename {tab_id}")
 
-    def create_tab_with_pane(self, *, workspace_id: str, label: str, cwd: str) -> tuple[str, str]:
+    def create_tab_with_pane(
+        self, *, workspace_id: str, label: str, cwd: str,
+        environment: Sequence[str] = (),
+    ) -> tuple[str, str]:
         """Return the tab and original pane from the same allocation response."""
-        result = self._call(["tab", "create", "--workspace", workspace_id,
-            "--label", label, "--cwd", cwd, "--no-focus"], f"tab create {label!r}")
+        arguments = ["tab", "create", "--workspace", workspace_id,
+            "--label", label, "--cwd", cwd]
+        for entry in environment:
+            arguments.extend(("--env", entry))
+        arguments.append("--no-focus")
+        result = self._call(arguments, f"tab create {label!r}")
         try:
             tab = as_mapping(result.get("tab"), "created tab")
             pane = as_mapping(result.get("root_pane"), "created root pane")

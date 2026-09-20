@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
-use crate::subagents::{AdoptOptions, ManagedAgents, StartOptions};
+use crate::subagents::{environment_entries, AdoptOptions, ManagedAgents, StartOptions};
 
 #[derive(Parser)]
 #[command(
@@ -155,6 +155,9 @@ struct Start {
     /// Extra literal harness argument; repeat or use --harness-arg=--flag
     #[arg(long = "harness-arg", value_name = "ARG")]
     harness_args: Vec<String>,
+    /// Set a literal KEY=VALUE variable in the created interactive Herdr tab; repeatable and omitted from status
+    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = environment_value)]
+    environment: Vec<String>,
     /// Initial prompt to deliver after startup; conflicts with --file
     #[arg(long, conflicts_with = "file", value_name = "TEXT")]
     brief: Option<String>,
@@ -306,6 +309,11 @@ fn startup_seconds(value: &str) -> Result<f64, String> {
     }
     Ok(value)
 }
+fn environment_value(value: &str) -> Result<String, String> {
+    environment_entries(&[value.to_owned()])
+        .map(|entries| entries.into_iter().next().expect("one validated entry"))
+        .map_err(|error| error.to_string())
+}
 #[derive(Clone, Debug)]
 struct GoalCommand(Vec<String>);
 fn command_json(value: &str) -> Result<GoalCommand, String> {
@@ -422,6 +430,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
                     model: value.model,
                     resume: value.resume,
                     harness_args: value.harness_args,
+                    environment: value.environment,
                     brief,
                     startup_timeout: Duration::from_secs_f64(value.startup_timeout),
                     delivery: value.delivery.options(),

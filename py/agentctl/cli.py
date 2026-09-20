@@ -18,6 +18,7 @@ from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
 from agentctl.sessions import Sessions
+from agentctl.subagents import environment_entries
 
 
 def guide(document: str) -> int:
@@ -47,6 +48,13 @@ def _delivery(parser: argparse.ArgumentParser) -> None:
         help="interactive only: wait for evidence that input was accepted (default: 30 seconds)")
     parser.add_argument("--max-attempts", type=_bounded_uint, default=3, metavar="COUNT",
         help="interactive only: delivery attempt limit; uncertain input is never replayed automatically (default: 3)")
+
+
+def _environment_entry(value: str) -> str:
+    try:
+        return environment_entries((value,))[0]
+    except HerdrRunError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parser() -> argparse.ArgumentParser:
@@ -84,6 +92,9 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--resume", metavar="SESSION", help="resume an explicit native conversation (interactive only)")
     start.add_argument("--harness-arg", action="append", default=[], metavar="ARG",
         help="literal interactive harness argument; repeat and use = for flags")
+    start.add_argument("--env", action="append", default=[], type=_environment_entry,
+        metavar="KEY=VALUE",
+        help="interactive Herdr only: set a literal variable in the created tab; repeat; values are not shown by status")
     start.add_argument("--workspace-id", metavar="ID", help="interactive only: exact Herdr workspace; default: current workspace or a shared subagents workspace")
     first = start.add_mutually_exclusive_group()
     first.add_argument("--brief", metavar="TEXT", help="initial task, submitted after launch")
@@ -230,7 +241,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             brief = Path(args.file).read_text(encoding="utf-8") if args.file else args.brief
             result = sessions.start_session(name, cwd=args.cwd, mode=args.mode, backend=args.backend,
                 harness=args.harness, model=args.model, brief=brief, resume=args.resume,
-                harness_args=args.harness_arg, workspace_id=args.workspace_id,
+                harness_args=args.harness_arg, environment=args.env,
+                workspace_id=args.workspace_id,
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
                 working_timeout=args.working_timeout, max_attempts=args.max_attempts)
         elif args.command == "adopt":
