@@ -340,7 +340,13 @@ _MOUNTINFO_FILE_BYTES_LIMIT = 4 * 1024 * 1024
 _FILE_HANDLE_BYTES_LIMIT = 128
 _AT_FDCWD = -100
 _AT_SYMLINK_FOLLOW = 0x400
-_MOUNTINFO_CENSUS_BYTES_LIMIT = 64 * 1024 * 1024
+# This is an operation-wide limit, not a per-file limit.  Hosts where procfs
+# hides mount-namespace identities must conservatively read one mountinfo file
+# per process.  A 2026-09-20 production census had 3,459 readable files totaling
+# 92,473,348 bytes, so the former 64 MiB ceiling made every otherwise healthy
+# ownerless-validation cleanup fail closed.  Keep a finite ceiling with useful
+# headroom while retaining the independent 4 MiB per-file and 60 second bounds.
+_MOUNTINFO_CENSUS_BYTES_LIMIT = 128 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
 _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # Keep this provider command inside the intended 30-second integration envelope:

@@ -26456,6 +26456,33 @@ def test_mountinfo_census_enforces_file_aggregate_and_deadline_bounds(
         wrkslots._mountinfo_path_references(3, expired)
 
 
+def test_mountinfo_census_accepts_observed_fleet_scale_above_sixty_four_mib(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    one_mib = b"x" * (1024 * 1024)
+    monkeypatch.setattr(
+        wrkslots, "_read_bounded_regular_file", lambda *_args: one_mib
+    )
+    monkeypatch.setattr(
+        wrkslots, "_parse_mountinfo_paths", lambda _text, _label, _cache=None: ()
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1,
+        stderr_limit=1,
+        input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
+    )
+
+    # A real fleet census reached 92,473,348 bytes before parsing its final
+    # process.  Exercise 96 MiB so the regression covers that observation with
+    # headroom; the old 64 MiB aggregate ceiling would refuse this sequence.
+    for pid in range(96):
+        assert wrkslots._mountinfo_path_references(pid + 1, budget) == ()
+    assert budget.input_remaining == (
+        wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT - 96 * 1024 * 1024
+    )
+
+
 @pytest.mark.parametrize(
     ("evidence_path", "observed"),
     (
