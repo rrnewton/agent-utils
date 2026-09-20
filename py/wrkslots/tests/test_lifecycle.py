@@ -17504,6 +17504,83 @@ def test_host_context_runner_must_be_in_invoking_ancestry(
         terminate_process(sibling)
 
 
+def test_host_context_cli_recovers_create_and_rejects_nonancestor_runner(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project)
+    before = journal.read_bytes()
+    coordinator, proof_fd = start_host_context_coordinator()
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        base_environment = {
+            "WRKSLOTS_REMOVE_COORDINATOR_START_TICKS": str(identity.start_ticks),
+            "WRKSLOTS_REMOVE_PROOF_FD": str(proof_fd),
+        }
+        argv = [
+            sys.executable,
+            str(WRKSLOTS),
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(coordinator.pid),
+            "--slot",
+            "slot01",
+        ]
+
+        refused = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=source_environment(
+                base_environment
+                | {"WRKSLOTS_REMOVE_RUNNER_PID": str(coordinator.pid)}
+            ),
+            pass_fds=(proof_fd,),
+        )
+
+        assert refused.returncode == 3
+        assert "removal runner PID" in refused.stderr
+        assert "not in the invoking process ancestry" in refused.stderr
+        assert journal.read_bytes() == before
+        assert active_slots(project) == []
+
+        recovered = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=source_environment(
+                base_environment | {"WRKSLOTS_REMOVE_RUNNER_PID": str(os.getpid())}
+            ),
+            pass_fds=(proof_fd,),
+        )
+
+        assert recovered.returncode == 0, recovered.stderr
+        assert "recovered create: registered slot=slot01 checkouts=1" in recovered.stdout
+        assert not journal.exists()
+        rows = active_slots(project)
+        assert len(rows) == 1
+        row = wrkslots._as_mapping(rows[0], "recovered active slot")
+        assert row["slot"] == "slot01"
+        events = wrkslots._load_events(
+            wrkslots._load_config(str(project), "testhost")
+        )
+        started = [event for event in events if event["kind"] == "recovery-started"]
+        assert len(started) == 1
+        payload = wrkslots._as_mapping(started[0]["payload"], "test payload")
+        assert payload["actor"] == wrkslots._identity_to_obj(identity)
+    finally:
+        terminate_process(coordinator)
+        os.close(proof_fd)
+
+
 def test_host_context_runner_validate_batch_preserves_actor_and_runner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

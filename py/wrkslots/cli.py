@@ -27586,7 +27586,7 @@ def _cmd_recover(
             config, require_repository=kind != "finish"
         )
         if kind == "create":
-            _assert_caller_process(coordinator, "coordinator")
+            _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
             _recover_create(
                 config,
                 path,
