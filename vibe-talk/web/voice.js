@@ -341,10 +341,18 @@ let timelineThreads = [];
 const channelContexts = new Map();
 const threadColors = new Map();
 const channelDrafts = new Map();
-const channelSendStates = new Map();
-const channelSends = new Set();
 let activeComposerKey = "";
 const CHANNEL_DRAFTS_KEY = "vibe-talk.channel-drafts";
+
+// Local send records never enter the provider message list or its read/archive/reply machinery.
+const OUTGOING_KEY = "vibe-talk.outgoing-messages";
+const OUTGOING_TIMEOUT_MS = 60000;
+const outgoingMessages = new Map();
+const outgoingObservations = new Map();
+const outgoingDestinations = new Map();
+const outgoingJobs = new Map();
+let outgoingSequence = 0;
+let outgoingStorageOkay = true;
 
 /** Whether the last `showView` put the reader back rather than taking them to the newest. */
 let viewRestored = false;
@@ -1885,6 +1893,7 @@ function renderCannedPrompts() {
 async function api(path, options) {
   const headers = { Authorization: `Bearer ${token()}` };
   const init = { method: (options && options.method) || "GET", headers };
+  if (options && options.signal) init.signal = options.signal;
   // Only when there IS one. A GET with a Content-Type and no body is a request that says it is
   // carrying JSON and is not, which some proxies treat as a malformed request rather than as a
   // harmless extra header.
@@ -3442,6 +3451,7 @@ function renderChannelNavigation() {
   el("discord-log").hidden = channelView === "threads";
   el("channel-compose-label").textContent = selectedThreadId ? "Reply in this thread" : "Message the main channel";
   el("channel-compose-text").placeholder = selectedThreadId ? "Write a thread reply…" : "Write a message…";
+  renderOutgoingMessages();
 }
 
 function saveChannelDrafts() {
@@ -3471,9 +3481,9 @@ function restoreChannelComposer() {
   el("channel-compose-text").value = channelDrafts.get(activeComposerKey) || "";
   el("channel-compose-state").textContent = readOnly
     ? "This channel is read-only."
-    : channelSendStates.get(activeComposerKey) || "";
-  el("channel-compose-text").disabled = channelSends.has(activeComposerKey);
-  el("channel-send").disabled = !channel || readOnly || channelSends.has(activeComposerKey);
+    : "";
+  el("channel-compose-text").disabled = false;
+  el("channel-send").disabled = !channel || readOnly;
   renderChannelNavigation();
 }
 
@@ -3602,6 +3612,7 @@ function mergeTimelineItems(previous, arriving, older, hasMore, timeField) {
 }
 
 function applyTimelinePage(payload, older = false) {
+  observeOutgoingMessages(payload.messages || []);
   const previousCount = channelView === "threads" ? timelineThreads.length : timelineMessages.length;
   const incoming = channelView === "threads" ? payload.threads || [] : payload.messages || [];
   const merged = mergeTimelineItems(
@@ -3716,49 +3727,348 @@ async function loadOlderTimeline() {
   }
 }
 
+/** Save before clearing an editor; storage refusal never prevents an intentional send. */
+function persistOutgoingMessages() {
+  try {
+    const encoded = JSON.stringify([...outgoingMessages.values()]);
+    localStorage.setItem(OUTGOING_KEY, encoded);
+    outgoingStorageOkay = localStorage.getItem(OUTGOING_KEY) === encoded;
+  } catch (_error) {
+    outgoingStorageOkay = false;
+  }
+  return outgoingStorageOkay;
+}
+
+function loadOutgoingMessages() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(OUTGOING_KEY) || "[]");
+    if (!Array.isArray(saved)) return;
+    for (const held of saved) {
+      if (!held || typeof held.id !== "string" || typeof held.channel !== "string" ||
+          !held.channel || typeof held.text !== "string" ||
+          !["sending", "sent", "failed", "unconfirmed"].includes(held.state)) continue;
+      const interrupted = held.state === "sending";
+      const entry = {
+        id: held.id, channel: held.channel,
+        threadId: typeof held.threadId === "string" ? held.threadId : null,
+        replyTo: typeof held.replyTo === "string" ? held.replyTo : null,
+        originView: ["main", "threads", "thread", "flat"].includes(held.originView) ? held.originView : "main",
+        text: held.text,
+        remaining: typeof held.remaining === "string" ? held.remaining : held.text.trim(),
+        state: interrupted ? "unconfirmed" : held.state,
+        phase: "", createdAt: Number(held.createdAt) || Date.now(),
+        postedCount: Math.max(0, Number(held.postedCount) || 0),
+        parts: Array.isArray(held.parts) ? held.parts.filter((part) =>
+          part && typeof part.id === "string" && typeof part.content === "string") : [],
+        observedParts: Array.isArray(held.observedParts)
+          ? held.observedParts.filter((id) => typeof id === "string") : [],
+        detail: interrupted ? "This page closed before delivery was confirmed." : String(held.detail || ""),
+      };
+      outgoingMessages.set(entry.id, entry);
+    }
+    // In particular, never replay a POST merely because Android reopened this page.
+    if (outgoingMessages.size) persistOutgoingMessages();
+  } catch (_error) {
+    outgoingStorageOkay = false;
+  }
+}
+
+function outgoingInView(entry) {
+  if (entry.channel !== el("discord-channel").value) return false;
+  if (channelView === "thread") return entry.threadId === selectedThreadId;
+  if (channelView === "flat") return true;
+  // A reply opened from a root in the main view needs a visible receipt when Reply closes.
+  return !entry.threadId || entry.originView === "main";
+}
+
+function outgoingStatus(entry) {
+  if (entry.state === "sending") return entry.phase === "queued" ? "Waiting to send…" : "Sending…";
+  if (entry.state === "sent") return "Sent.";
+  const prefix = entry.postedCount > 0
+    ? `${entry.postedCount} part${entry.postedCount === 1 ? "" : "s"} confirmed. ` : "";
+  if (entry.state === "unconfirmed") {
+    return `${prefix}Delivery unconfirmed. Check history before retrying to avoid a duplicate. ${entry.detail}`;
+  }
+  return `${prefix}Not sent. ${entry.detail}`;
+}
+
+/** Only provider history/stream observations retire receipts; appending an ACK is not a read. */
+function observeOutgoingMessages(messages) {
+  let changed = false;
+  for (const entry of outgoingMessages.values()) {
+    if (entry.state !== "sending" && entry.state !== "sent") continue;
+    if (entry.state === "sending" && entry.phase !== "posting") continue;
+    const seen = outgoingObservations.get(entry.id) || new Set(entry.observedParts);
+    const partIds = new Set(entry.parts.map((part) => part.id));
+    for (const message of messages) {
+      const id = String(message.id);
+      if (String(message.channel_id) === entry.channel &&
+          (entry.state === "sending" || partIds.has(id))) seen.add(id);
+    }
+    outgoingObservations.set(entry.id, seen);
+    const observed = entry.parts.filter((part) => seen.has(part.id)).map((part) => part.id);
+    if (observed.length !== entry.observedParts.length) {
+      entry.observedParts = observed;
+      changed = true;
+    }
+  }
+  if (changed) persistOutgoingMessages();
+}
+
+function renderOutgoingMessages() {
+  const host = el("outgoing-log");
+  const channel = el("discord-channel").value;
+  const visibleIds = new Set([...el("discord-log").children].flatMap(rowMessages)
+    .filter((message) => String(message.channel_id) === channel).map((message) => String(message.id)));
+  let retired = false;
+  const rows = [];
+  for (const entry of outgoingMessages.values()) {
+    // An ACK can render as an ordinary, actionable provider row immediately. Keep its receipt
+    // until history/stream has independently caught up, so a stale read cannot erase the send.
+    const unseen = entry.channel === channel
+      ? entry.parts.filter((part) => !visibleIds.has(part.id)) : entry.parts;
+    if (entry.state === "sent" && entry.parts.length &&
+        entry.parts.every((part) => entry.observedParts.includes(part.id))) {
+      outgoingMessages.delete(entry.id);
+      outgoingObservations.delete(entry.id);
+      retired = true;
+      continue;
+    }
+    if (!outgoingInView(entry)) continue;
+    if (entry.state === "sent" && entry.parts.length && !unseen.length) continue;
+    const row = document.createElement("li");
+    row.className = "outgoing-message";
+    row.setAttribute("data-outgoing-id", entry.id);
+    row.setAttribute("data-send-state", entry.state);
+    row.setAttribute("data-who", "me");
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = entry.replyTo ? "You · Reply" : "You";
+    if (entry.threadId && channelView !== "thread") {
+      const thread = document.createElement("button");
+      thread.className = "thread-badge";
+      thread.setAttribute("type", "button");
+      thread.style.setProperty("--thread-hue", threadHue(entry.threadId));
+      thread.textContent = "Thread";
+      thread.addEventListener("click", guardQuietly(() => openThread(entry.threadId)));
+      meta.append(thread);
+    }
+    const body = document.createElement("div");
+    body.className = "msg-text";
+    const text = entry.state === "sent" && unseen.length
+      ? unseen.map((part) => part.content).join("\n\n")
+      : entry.postedCount ? entry.remaining : entry.text;
+    renderMarkdownInto(body, text);
+    const status = document.createElement("div");
+    status.className = "outgoing-status";
+    status.setAttribute("role", "status");
+    if (entry.state === "sending") {
+      const spinner = document.createElement("span");
+      spinner.className = "outgoing-spinner";
+      spinner.setAttribute("aria-hidden", "true");
+      status.append(spinner);
+    }
+    const label = document.createElement("span");
+    label.textContent = outgoingStatus(entry) + (outgoingStorageOkay ? "" :
+      " This browser could not save this message. Keep this page open; reloading may lose its text or delivery status.");
+    status.append(label);
+    row.append(meta, body, status);
+    if (entry.state === "failed" || entry.state === "unconfirmed") {
+      const actions = document.createElement("div");
+      actions.className = "outgoing-actions";
+      const retry = document.createElement("button");
+      retry.className = "outgoing-retry";
+      retry.setAttribute("type", "button");
+      retry.textContent = entry.postedCount ? "Retry unsent text" : "Retry";
+      retry.disabled = !entry.remaining || knownChannel(entry.channel)?.writable === false;
+      retry.addEventListener("click", guardQuietly(() => retryOutgoingMessage(entry.id)));
+      const dismiss = document.createElement("button");
+      dismiss.className = "outgoing-dismiss";
+      dismiss.setAttribute("type", "button");
+      dismiss.textContent = "Dismiss";
+      dismiss.setAttribute("title", "Discard this local send record. This does not delete a message from the chat service.");
+      dismiss.addEventListener("click", () => {
+        outgoingMessages.delete(entry.id);
+        outgoingObservations.delete(entry.id);
+        persistOutgoingMessages();
+        renderOutgoingMessages();
+      });
+      actions.append(retry, dismiss);
+      row.append(actions);
+    }
+    rows.push(row);
+  }
+  if (retired) persistOutgoingMessages();
+  host.replaceChildren(...rows);
+  host.hidden = rows.length === 0;
+}
+
+function queueOutgoingMessage(request) {
+  let id;
+  do {
+    id = `outgoing-${Date.now().toString(36)}-${++outgoingSequence}-${Math.random().toString(36).slice(2, 9)}`;
+  } while (outgoingMessages.has(id));
+  const entry = {
+    id, ...request, originView: channelView, createdAt: Date.now(),
+    remaining: request.text.trim(), state: "sending", phase: "queued",
+    parts: [], observedParts: [], postedCount: 0, detail: "",
+  };
+  outgoingMessages.set(id, entry);
+  return scheduleOutgoingMessage(entry);
+}
+
+function retryOutgoingMessage(id) {
+  const entry = outgoingMessages.get(id);
+  if (!entry || entry.state === "sending" || entry.state === "sent" || !entry.remaining) return;
+  if (knownChannel(entry.channel)?.writable === false) {
+    entry.detail = "This channel is read-only.";
+    persistOutgoingMessages();
+    renderOutgoingMessages();
+    return;
+  }
+  entry.state = "sending";
+  entry.phase = "queued";
+  entry.detail = "";
+  outgoingObservations.delete(entry.id);
+  return scheduleOutgoingMessage(entry);
+}
+
+/** Serialize a burst to one destination without making the composer wait for that destination. */
+function scheduleOutgoingMessage(entry) {
+  const destination = JSON.stringify([entry.channel, entry.threadId]);
+  let credential = "";
+  try { credential = token(); } catch (_error) { /* Dispatch reports the missing credential. */ }
+  const job = { credential, stopped: false, cancel: null };
+  outgoingJobs.set(entry.id, job);
+  persistOutgoingMessages();
+  renderOutgoingMessages();
+  const previous = outgoingDestinations.get(destination) || Promise.resolve();
+  const completion = previous.catch(() => {}).then(() => dispatchOutgoingMessage(entry, job));
+  outgoingDestinations.set(destination, completion);
+  return completion.finally(() => {
+    if (outgoingJobs.get(entry.id) === job) outgoingJobs.delete(entry.id);
+    if (outgoingDestinations.get(destination) === completion) outgoingDestinations.delete(destination);
+  });
+}
+
+async function dispatchOutgoingMessage(entry, job) {
+  if (job.stopped) return;
+  let timer = null;
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  try {
+    if (!job.credential || token() !== job.credential) {
+      entry.state = "failed";
+      entry.detail = "Sign-in changed before this message was sent. Sign in and retry when ready.";
+      return;
+    }
+    if (knownChannel(entry.channel)?.writable === false) {
+      entry.state = "failed";
+      entry.detail = "This channel is read-only.";
+      return;
+    }
+    entry.phase = "posting";
+    persistOutgoingMessages();
+    renderOutgoingMessages();
+    const body = { text: entry.remaining };
+    if (entry.replyTo) body.reply_to = entry.replyTo;
+    if (entry.threadId) body.thread_id = entry.threadId;
+    const interruption = new Promise((_resolve, reject) => {
+      job.cancel = () => {
+        if (controller) controller.abort();
+        reject(new Error("The send was interrupted before delivery was confirmed."));
+      };
+      timer = setTimeout(() => {
+        if (controller) controller.abort();
+        reject(new Error("The send timed out before delivery was confirmed."));
+      }, OUTGOING_TIMEOUT_MS);
+    });
+    const payload = await Promise.race([
+      api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply`, {
+        method: "POST", body, ...(controller ? { signal: controller.signal } : {}),
+      }),
+      interruption,
+    ]);
+    if (job.stopped) return;
+    if (payload && payload.error === "partially_posted") {
+      entry.postedCount += Math.max(0, Number(payload.posted) || 0);
+      // An adapter can lose an acknowledgement after delivery. Even a 207 is not proof that the
+      // last attempted part failed to arrive; its unsent suffix is the ONLY safe retry candidate.
+      entry.remaining = typeof payload.unsent === "string" ? payload.unsent : "";
+      entry.state = "unconfirmed";
+      outgoingObservations.delete(entry.id);
+      entry.detail = redact(payload.detail || "The remaining delivery could not be confirmed.");
+      return;
+    }
+    const parts = payload && Array.isArray(payload.parts) && payload.parts.length
+      ? payload.parts : payload && payload.posted ? [payload.posted] : [];
+    if (!parts.length || parts.some((part) => !part || !part.id ||
+        (part.channel_id && String(part.channel_id) !== entry.channel))) {
+      throw new Error("The server did not confirm which message was sent.");
+    }
+    entry.parts = parts.map((part) => ({
+      ...part, id: String(part.id), channel_id: entry.channel, content: String(part.content || ""),
+    }));
+    const observed = outgoingObservations.get(entry.id) || new Set();
+    entry.observedParts = entry.parts.filter((part) => observed.has(part.id)).map((part) => part.id);
+    outgoingObservations.set(entry.id, new Set(entry.observedParts));
+    entry.state = "sent";
+    entry.detail = "";
+    noteSelfAuthor(parts[0].author_id);
+    if (entry.channel === el("discord-channel").value) {
+      const pinned = currentView === "discord" && atBottom(el("scroll-area"));
+      for (const part of entry.parts) appendChannelRow(part);
+      if (pinned) scrollToNewest();
+    }
+  } catch (error) {
+    if (job.stopped) return;
+    entry.state = error.status >= 400 && error.status < 500 && error.status !== 408
+      ? "failed" : "unconfirmed";
+    outgoingObservations.delete(entry.id);
+    entry.detail = redact(error.message);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    job.cancel = null;
+    entry.phase = "";
+    persistOutgoingMessages();
+    renderChannelRows();
+  }
+}
+
+function stopOutgoingSends() {
+  for (const [id, job] of outgoingJobs) {
+    const entry = outgoingMessages.get(id);
+    if (!entry || entry.state !== "sending") continue;
+    job.stopped = true;
+    const attempted = entry.phase === "posting";
+    entry.state = attempted ? "unconfirmed" : "failed";
+    outgoingObservations.delete(entry.id);
+    entry.detail = attempted ? "Sign-in changed before delivery was confirmed."
+      : "Sign-in changed before this message was sent.";
+    if (job.cancel) job.cancel();
+    entry.phase = "";
+  }
+  persistOutgoingMessages();
+  renderOutgoingMessages();
+}
+
 async function sendChannelMessage() {
   const key = activeComposerKey;
   const channel = el("discord-channel").value;
-  const threadId = selectedThreadId;
-  const context = channelContextKey();
-  const text = el("channel-compose-text").value.trim();
+  const text = el("channel-compose-text").value;
   if (knownChannel(channel)?.writable === false) {
     el("channel-compose-state").textContent = "This channel is read-only.";
     return;
   }
-  if (!text || !channel || channelSends.has(key)) return;
+  if (!text.trim() || !channel) return;
   rememberChannelDraft();
-  channelSends.add(key);
-  channelSendStates.set(key, "Sending…");
-  restoreChannelComposer();
-  try {
-    const body = { text };
-    if (threadId) body.thread_id = threadId;
-    const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/reply`, { method: "POST", body });
-    if (payload && payload.error === "partially_posted") {
-      channelDrafts.set(key, payload.unsent || "");
-      channelSendStates.set(key, `${Number(payload.posted) || 0} parts sent. ${redact(payload.detail || "The rest failed")}. The unsent text is kept here.`);
-    } else {
-      channelDrafts.delete(key);
-      channelSendStates.set(key, "Sent.");
-    }
-    saveChannelDrafts();
-    if (context === channelContextKey()) {
-      if (payload && payload.posted && typeof payload.posted === "object") {
-        noteSelfAuthor(payload.posted.author_id);
-        for (const part of payload.parts || [payload.posted]) appendChannelRow(part);
-      }
-      if (threadingSupported) {
-        try { await loadDiscord({ keepPosition: true }); }
-        catch (error) { setStatus(`The send result is saved, but history could not refresh: ${redact(error.message)}`); }
-      } else scrollToNewest();
-    }
-  } catch (error) {
-    channelSendStates.set(key, `Not sent: ${redact(error.message)}`);
-  } finally {
-    channelSends.delete(key);
-    if (activeComposerKey === key) restoreChannelComposer();
-  }
+  const completion = queueOutgoingMessage({ channel, threadId: selectedThreadId, replyTo: null, text });
+  channelDrafts.delete(key);
+  // A failed outbox write leaves the previous durable draft available as a last resort.
+  if (outgoingStorageOkay) saveChannelDrafts();
+  el("channel-compose-text").value = "";
+  el("channel-compose-state").textContent = "";
+  scrollToNewest();
+  await completion;
 }
 
 // --- raw Discord, rendered ------------------------------------------------------------------
@@ -4244,6 +4554,12 @@ function renderChannelRows() {
   const rows = [...list.children];
   // Every message some LOADED message answers.
   const answered = new Set();
+  // A positive acknowledgement is already evidence of a reply, even while a slower history read
+  // has not returned its provider ID. Pending or wholly unconfirmed sends are not that evidence.
+  for (const entry of outgoingMessages.values()) {
+    if (entry.channel === el("discord-channel").value && entry.replyTo &&
+        (entry.state === "sent" || entry.postedCount > 0)) answered.add(entry.replyTo);
+  }
   // The author census FIRST and in full, because `bucketFor` asks how many other bots there are —
   // a question no single row can answer, and one whose answer must not change halfway through the
   // loop that is applying it.
@@ -4360,6 +4676,7 @@ function renderChannelRows() {
       );
     }
   }
+  renderOutgoingMessages();
 }
 
 /**
@@ -5828,6 +6145,7 @@ function renderOlderControl() {
 function applyNewestPage(payload) {
   const list = el("discord-log");
   const messages = payload.messages || [];
+  observeOutgoingMessages(messages);
   const oldest = messages.length ? messages[0].id : null;
   // Compared on the row's NEWEST constituent, so a combined row is kept only when the whole of it
   // is older than this page — otherwise a message would be on screen twice, once in each row.
@@ -5880,6 +6198,7 @@ async function loadOlder() {
         `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}`
     );
     if (generation !== discordLoadGeneration || channel !== el("discord-channel").value) return;
+    observeOutgoingMessages(payload.messages || []);
     const list = el("discord-log");
     const arriving = glom(payload.messages || []).map(discordNode);
     // The step is OVER before the anchored mutation, so that every consequence of it — the rows,
@@ -6426,11 +6745,13 @@ async function loadTodo(options) {
     // backlog number that includes rows nobody can see is the kind of number a reader stops
     // believing.
     const served = payload.messages || [];
+    observeOutgoingMessages(served);
     const messages = markOwnRead
       ? served.filter((m) => bucketFor(m.author_id, m.author_is_bot) !== "me")
       : served;
     const list = el("discord-log");
     list.replaceChildren(...glom(messages).map(discordNode));
+    renderChannelRows();
     // The walk back belongs to the UNFILTERED channel. Leaving a cursor armed here would let a
     // scroll to the top prepend unfiltered rows into a filtered list.
     discordMoreAbove = false;
@@ -6511,6 +6832,7 @@ function todoSummary() {
  * Outside the mode this is an ordinary append, because nothing on screen is claiming a count.
  */
 function appendChannelRow(message) {
+  if ([...el("discord-log").children].some((row) => idsOf(row).includes(String(message.id)))) return;
   if (threadingSupported) {
     const id = threadOf(message);
     if (channelView === "threads" ||
@@ -6719,22 +7041,9 @@ function setTodoMode(on) {
 
 // --- replying to a channel message -------------------------------------------------------------
 //
-// `#51 reply-view`. The server half already existed and had no caller:
-// `POST /api/v1/channels/{id}/reply` takes `{text, reply_to}` and sets Discord's
-// `message_reference.message_id`, which is what makes the answer a REPLY in the channel rather
-// than a loose message that happens to follow. Until now the only way to reach it was the voice
-// agent, so a reply typed by hand did not exist and `#50` could not tell an answered message from
-// an unanswered one — Discord records a reference only for replies made through the affordance.
-//
-// Two decisions the issue leaves open, made here rather than left to the reader of a diff:
-//
-//   * THE POSTED REPLY IS APPENDED, not re-fetched. A refetch replaces every child of the log,
-//     which destroys the anchor the reader's position is measured against — so "your reply
-//     appeared" would cost "and you lost your place". The server hands back the Message it
-//     actually posted, which is better evidence than a refetch anyway: it is what Discord
-//     accepted, not what a later read happened to return.
-//   * DRAFTS ARE PER MESSAGE. One global draft would silently hand what you wrote about one
-//     message to a reply to a different one, which is the kind of mistake that gets posted.
+// Drafts are per target message. Once Send is pressed the captured reply target, destination and
+// text move into the outgoing queue, freeing this screen for the next reply immediately. Only
+// provider message IDs reconcile a successful send with history; local IDs cannot be replied to.
 
 const DRAFTS_KEY = "vibe-talk.voice.drafts";
 
@@ -6838,75 +7147,37 @@ function closeReply() {
   replyTarget = null;
 }
 
-/**
- * Post it, as a real Discord reply.
- *
- * Failures are handled HERE rather than by `guard`, and that is the point: a reply that did not
- * post must leave the text exactly where the reader typed it, on the screen they typed it on, and
- * must not touch a live call. Losing what somebody wrote because the network blinked is the one
- * outcome this must not have.
- */
+/** Hand the captured target and text to the same durable outbox as the normal composer. */
 async function sendReply() {
-  if (!replyTarget) {
-    return;
-  }
-  const text = el("reply-text").value.trim();
-  if (!text) {
+  if (!replyTarget) return;
+  const text = el("reply-text").value;
+  if (!text.trim()) {
     el("reply-state").textContent = "Nothing to send yet — write something first.";
     return;
   }
   const channel = replyChannelId;
   const target = replyTarget;
-  const context = channelContextKey();
-  el("reply-state").textContent = "Posting…";
-  el("reply-send").disabled = true;
-  try {
-    const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/reply`, {
-      method: "POST",
-      body: { text, reply_to: target.id, ...(replyThreadId ? { thread_id: replyThreadId } : {}) },
-    });
-    // A LONG REPLY IS SPLIT, and it can get halfway. The server answers 207 for that, which
-    // `fetch` reports as `ok` — so this has to be checked BEFORE anything is cleared. Treating it
-    // as success would clear a draft whose remainder is the only copy of that text in existence,
-    // and re-sending the whole thing would post the first half twice.
-    if (payload && payload.error === "partially_posted") {
-      // The draft becomes exactly what did NOT arrive, written down before the box is touched.
-      drafts.set(target.id, payload.unsent || "");
-      persistDrafts();
-      el("reply-text").value = payload.unsent || "";
-      const landed = Number(payload.posted) || 0;
-      el("reply-state").textContent =
-        `Only ${landed} part${landed === 1 ? "" : "s"} went through: ` +
-        `${redact(String(payload.detail || "the rest failed"))}. ` +
-        "What is left is still in the box — send it again to post the remainder.";
-      return;
-    }
-    if (payload && payload.posted) {
-      // The account Discord recorded this reply under is THIS BRIDGE'S OWN, and it is the one
-      // account whose messages are the owner's words. Learned here, for free, from a reply he was
-      // sending anyway — no `/users/@me` call and no name matching. `#85 voice-desktop-review`.
-      noteSelfAuthor(payload.posted.author_id);
-      // EVERY part, through the same appender as a live arrival: the reply is in the window from
-      // now on, so the next `/todo` read will count it, and a list that counted it one read later
-      // would disagree with itself in between. `appendChannelRow` also re-derives the row states,
-      // which is what dims the message just answered on the spot rather than at the next poll.
-      if (context === channelContextKey()) {
-        for (const part of payload.parts || [payload.posted]) appendChannelRow(part);
-      }
-    }
-    // Cleared LAST, and only here: every path that did not fully succeed returns above with the
-    // text still written down.
-    drafts.delete(target.id);
-    persistDrafts();
-    el("reply-text").value = "";
-    el("reply-state").textContent = "";
-    closeReply();
-  } catch (error) {
-    // Stay put. The text is still in the box, and the reason is beside it.
-    el("reply-state").textContent = `Not posted: ${redact(error.message)}`;
-  } finally {
-    el("reply-send").disabled = false;
+  if (knownChannel(channel)?.writable === false) {
+    el("reply-state").textContent = "This channel is read-only.";
+    return;
   }
+  rememberDraft();
+  const completion = queueOutgoingMessage({
+    channel, threadId: replyThreadId, replyTo: String(target.id), text,
+  });
+  drafts.delete(target.id);
+  if (outgoingStorageOkay) persistDrafts();
+  el("reply-text").value = "";
+  el("reply-state").textContent = "";
+  // Do not call closeReply: its draft save would overwrite the fallback retained after a storage
+  // failure. The captured request owns its text now; a newer reply draft must never be touched by
+  // its eventual completion.
+  replyTarget = null;
+  replyScrollMark = null;
+  showScreen("main");
+  showView("discord");
+  scrollToNewest();
+  await completion;
 }
 
 // --- keeping the channel view fresh -----------------------------------------------------------
@@ -7491,6 +7762,7 @@ function refreshAfterLiveMutation() {
  * arrive twice.
  */
 function receiveLiveMessage(message, selfPosted, replayed) {
+  observeOutgoingMessages([message]);
   // The other free way to learn which account is ours: the server marks what IT posted, so the
   // author of a self-posted message is this bridge by construction. Done before the channel guard
   // below, because the fact is true regardless of which channel the reader happens to be looking
@@ -7499,9 +7771,19 @@ function receiveLiveMessage(message, selfPosted, replayed) {
     noteSelfAuthor(message.author_id);
   }
   if (String(message.channel_id) !== String(el("discord-channel").value)) {
+    renderOutgoingMessages();
     return;
   }
+  if (!threadingSupported && discordFetchInFlight) {
+    // This event is newer evidence than a read already on the wire. Invalidate that snapshot
+    // even when the event's ID is already visible from a POST acknowledgement; otherwise it
+    // could erase the row after this event retired its durable send receipt.
+    ++discordLoadGeneration;
+    if (!discordQueuedLoad) queueDiscordLoad({ keepPosition: true });
+  }
   if (threadingSupported) {
+    appendChannelRow(message);
+    renderOutgoingMessages();
     relayToAgent(message, selfPosted, replayed);
     // The server owns thread membership, counts and activity ordering. Re-read the active
     // context instead of dropping a reply from another thread into the visible conversation.
@@ -7514,6 +7796,7 @@ function receiveLiveMessage(message, selfPosted, replayed) {
   // that only looked at row identities would add a second copy of it.
   const already = [...list.children].some((li) => idsOf(li).includes(id));
   if (already) {
+    renderOutgoingMessages();
     return;
   }
   // The SAME constructor the fetched rows go through, so the untrusted-content boundary is
@@ -8030,6 +8313,7 @@ async function saveToken() {
     setStatus("nothing to save");
     return;
   }
+  if (value !== token()) stopOutgoingSends();
   localStorage.setItem(TOKEN_KEY, value);
   // Read it back rather than assuming: private browsing and a full quota both make setItem throw
   // or silently do nothing, and "saved" would then be a lie the owner only discovers later.
@@ -8056,6 +8340,7 @@ function forgetToken() {
   // Before the token goes, not after: the stream holds a bearer credential open, and a signed-out
   // page that is still receiving one channel's messages is the leak this control exists to close.
   stopChannelStream();
+  stopOutgoingSends();
   localStorage.removeItem(TOKEN_KEY);
   el("api-token").value = "";
   markSave(SAVE_LABEL, "", false);
@@ -8265,6 +8550,7 @@ for (const topic of HELP_TOPICS) {
 // `#51 reply-view`. Both ways out of the reply screen go through `closeReply`, so neither can be
 // the one that forgets to put the reader back where they were reading.
 loadDrafts();
+loadOutgoingMessages();
 try {
   const saved = JSON.parse(localStorage.getItem(CHANNEL_DRAFTS_KEY) || "{}");
   for (const [key, value] of Object.entries(saved || {})) {

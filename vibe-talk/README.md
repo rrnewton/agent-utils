@@ -48,7 +48,14 @@ draft, and posting destination. Reply counts marked approximate come from the pr
 
 **A normal text box at the bottom.** Scroll below the newest message to write to the channel or
 selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately
-for each channel and thread; a failed send preserves the text. This composer scrolls with history.
+for each channel and thread. This composer scrolls with history.
+
+**Sending responds immediately.** Normal messages and replies appear locally with a sending
+indicator, leaving the composer ready for the next message. Confirmation replaces that indicator
+with the delivered message. A failed or interrupted send keeps its text and offers a manual retry;
+partially sent messages retain the remaining text. When delivery is unconfirmed, check the history
+before retrying because the chat service may have received the message. Reopening the app restores
+unfinished sends without sending them again automatically.
 
 ## Adding a home-screen icon
 

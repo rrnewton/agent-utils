@@ -302,6 +302,7 @@ const FIXTURE_TREE = {
     "timeline-notice",
     "thread-list",
     "discord-log",
+    "outgoing-log",
     "channel-composer",
   ],
   "channel-composer": ["channel-compose-label", "channel-compose-text", "channel-send", "channel-compose-state"],
@@ -1830,6 +1831,8 @@ const TUNING_BANDS = {
     "a device engine needs time to initialize but must not strand a tapped row indefinitely"],
   BROWSER_SPEECH_FINISH_MS: [30000, 120000,
     "short chunks at half speed may take many seconds; a hung engine must eventually release the row"],
+  OUTGOING_TIMEOUT_MS: [15000, 180000,
+    "slow mobile sends need time to complete, but a lost response must not spin forever or block queued messages"],
   STATUS_DISMISS_MS: [2000, 20000,
     "below a couple of seconds the message goes before it can be read; above twenty it is a " +
     "fixture covering a line of the conversation, the thing #63 status-line-placement took away"],
@@ -6623,17 +6626,25 @@ test("A REPLY THAT ONLY HALF POSTED KEEPS THE REST OF YOUR TEXT", async () => {
   await page.el("reply-send").click();
   await page.settle();
 
-  // The remainder is in the box AND written down, and the finished half is not repeated in either.
-  assert.equal(page.el("reply-text").value, "second half.", "the unsent text was thrown away");
-  const kept = JSON.parse(page.storage.get("vibe-talk.voice.drafts") || "{}");
-  assert.equal(
-    kept["1000000000000000001"],
-    "second half.",
-    "the draft was cleared, so a reload would lose what never posted"
-  );
-  // Still on the reply screen, with the reason.
-  assert.match(page.el("reply-state").text(), /1 part/i);
-  assert.match(page.el("reply-state").text(), /still in the box/i);
+  // Submission returns to history immediately. The remainder belongs to its outgoing message,
+  // leaving the editor free for another draft without losing what the server did not accept.
+  assert.equal(page.screen(), "main");
+  assert.equal(page.el("reply-text").value, "");
+  const held = outgoingRows(page)[0];
+  assert.match(held.text(), /second half\./);
+  assert.doesNotMatch(held.text(), /first half\./);
+  assert.match(held.text(), /1 part/i);
+  assert.equal(savedOutgoing(page)[0].remaining, "second half.");
+  assert.equal(savedOutgoing(page)[0].replyTo, "1000000000000000001");
+
+  page.replyResponse = async () => json(200, {
+    posted: message({ id: "9000000000000000002", content: "second half." }),
+  });
+  await outgoingRetry(held).click();
+  await page.settle();
+  assert.deepEqual(page.repliesPosted[1].body, {
+    text: "second half.", reply_to: "1000000000000000001",
+  }, "retry repeated the already accepted prefix");
 });
 
 test("...and a reply that fully posted clears the draft and shows every part", async () => {
@@ -10019,7 +10030,7 @@ test("a browser that refuses to store a DRAFT says so, rather than promising a r
   assert.equal(kept.el("reply-state").textContent, "", "a stored draft was reported as lost");
 });
 
-test("a failed Google Chat send names the backend and loses nothing the reader typed", async () => {
+test("a failed Google Chat send names the backend and retains the message outside the editor", async () => {
   const page = newPage();
   page.chatProviderName = "Google Chat";
   await signIn(page);
@@ -10031,18 +10042,16 @@ test("a failed Google Chat send names the backend and loses nothing the reader t
   await page.el("reply-send").click();
   await page.settle();
 
-  assert.equal(page.screen(), "reply", "a failed send threw the reader off the screen");
-  assert.equal(
-    page.el("reply-text").value,
-    "this took a while to write",
-    "a failed send erased what was typed"
-  );
-  assert.match(page.el("reply-state").textContent, /Not posted/);
-  assert.match(page.el("reply-state").textContent, /502/, "it does not say what went wrong");
-  assert.match(page.el("reply-state").textContent, /Google Chat returned HTTP 502/);
-  assert.doesNotMatch(page.el("reply-state").textContent, /discord/i);
-  assert.equal(page.el("reply-send").disabled, false, "Send is stuck disabled after a failure");
-  // Nothing was appended: the channel must not show a message the provider never accepted.
+  assert.equal(page.screen(), "main");
+  assert.equal(page.el("reply-text").value, "");
+  const held = outgoingRows(page)[0];
+  assert.match(held.text(), /this took a while to write/);
+  assert.match(held.text(), /Google Chat returned HTTP 502/);
+  assert.doesNotMatch(held.text(), /discord/i);
+  assert.ok(outgoingRetry(held), "the failed message offers no way to retry");
+  assert.equal(savedOutgoing(page)[0].remaining, "this took a while to write",
+    "a reload would lose the failed message");
+  // A failed local message is distinct from history confirmed by the provider.
   assert.equal(page.el("discord-log").children.length, 1);
 });
 
@@ -14129,6 +14138,23 @@ async function threadPage() {
 const threadButton = (row) => row.descendants().find((node) => node.className === "thread-replies");
 const threadBadge = (row) => row.descendants().find((node) => node.className === "thread-badge");
 
+// Outgoing rows are deliberately separate from provider-confirmed history. These helpers only
+// inspect the rendered controls and durable browser state; none calls the implementation directly.
+const outgoingRows = (page) => page.el("outgoing-log").children;
+const outgoingRetry = (row) => row.descendants().find((node) => node.hasClass("outgoing-retry"));
+const outgoingDismiss = (row) => row.descendants().find((node) => node.hasClass("outgoing-dismiss"));
+const savedOutgoing = (page) => JSON.parse(page.storage.get("vibe-talk.outgoing-messages") || "[]");
+const outgoingSpinner = (row) => row.descendants().find((node) => node.hasClass("outgoing-spinner"));
+
+function delayedReply(page) {
+  let finish;
+  page.replyResponse = () => new Promise((resolve) => { finish = resolve; });
+  return (response) => {
+    assert.ok(finish, "the page never started the held POST");
+    finish(response);
+  };
+}
+
 test("thread views show roots in Main and expose the selector only when threads exist", async () => {
   const page = await threadPage();
   assert.equal(page.el("channel-view-tabs").hidden, false);
@@ -14235,6 +14261,8 @@ test("read-only channels keep drafts but disable main and thread sends, includin
   await signIn(page);
   await showDiscord(page, data.messages);
   assert.equal(page.el("channel-send").disabled, true);
+  assert.equal(page.el("channel-compose-text").disabled, false,
+    "read-only permission prevents posting, not composing a local draft");
   assert.match(page.el("channel-compose-state").textContent, /This channel is read-only/);
   page.el("channel-compose-text").value = "keep this main draft";
   await page.el("channel-compose-text").dispatch("input");
@@ -14243,6 +14271,8 @@ test("read-only channels keep drafts but disable main and thread sends, includin
   assert.equal(page.repliesPosted.length, 0);
   await threadButton(page.el("discord-log").children[1]).click();
   assert.equal(page.el("channel-send").disabled, true);
+  assert.equal(page.el("channel-compose-text").disabled, false,
+    "the thread draft editor was disabled with its Send button");
   assert.match(page.el("channel-compose-state").textContent, /This channel is read-only/);
   page.el("channel-compose-text").value = "keep this thread draft";
   await page.el("channel-compose-text").dispatch("input");
@@ -14284,7 +14314,7 @@ test("removing the selected channel cannot carry its thread or composer draft in
   assert.equal(page.el("channel-send").disabled, true);
 });
 
-test("main and thread composer drafts survive navigation, partial sends and reload", async () => {
+test("main drafts and a thread's unsent remainder survive navigation and reload independently", async () => {
   const page = await threadPage();
   page.el("channel-compose-text").value = "main draft";
   await page.el("channel-compose-text").dispatch("input");
@@ -14295,8 +14325,10 @@ test("main and thread composer drafts survive navigation, partial sends and relo
   page.replyResponse = async () => json(207, { error: "partially_posted", posted: 1, unsent: "unsent tail", detail: "Google Chat returned HTTP 502" });
   await page.el("channel-send").click();
   assert.deepEqual(page.repliesPosted[0].body, { text: "thread draft", thread_id: page.threads[0].id });
-  assert.equal(page.el("channel-compose-text").value, "unsent tail");
-  assert.match(page.el("channel-compose-state").textContent, /Google Chat returned HTTP 502/);
+  assert.equal(page.el("channel-compose-text").value, "");
+  assert.match(outgoingRows(page)[0].text(), /unsent tail/);
+  assert.match(outgoingRows(page)[0].text(), /Google Chat returned HTTP 502/);
+  assert.equal(savedOutgoing(page)[0].remaining, "unsent tail");
   await page.el("thread-back").click();
   assert.equal(page.el("channel-compose-text").value, "main draft");
   const again = newPage(page.storage);
@@ -14306,7 +14338,9 @@ test("main and thread composer drafts survive navigation, partial sends and relo
   await showDiscord(again, page.messages);
   assert.equal(again.el("channel-compose-text").value, "main draft");
   await threadButton(again.el("discord-log").children[1]).click();
-  assert.equal(again.el("channel-compose-text").value, "unsent tail");
+  assert.equal(again.el("channel-compose-text").value, "");
+  assert.match(outgoingRows(again)[0].text(), /unsent tail/);
+  assert.equal(again.repliesPosted.length, 0, "opening a saved remainder posted it without consent");
 });
 
 test("a send completing after leaving a thread cannot clear or paint the main context", async () => {
@@ -14437,15 +14471,18 @@ test("thread-aware speech batches never mix threads and summaries and read marks
   assert.deepEqual(page.upstreamReadCalls.at(-1), { message_id: "202", thread_id: data.threads[0].id });
 });
 
-test("a failed standalone send keeps its draft and send controls usable", async () => {
+test("a failed standalone send keeps its text in a retryable row and its composer usable", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, []);
   page.replyResponse = errorResponse(502, "chat_error", "Google Chat returned HTTP 502");
   page.el("channel-compose-text").value = "do not lose this";
   await page.el("channel-send").click();
-  assert.equal(page.el("channel-compose-text").value, "do not lose this");
-  assert.match(page.el("channel-compose-state").textContent, /Google Chat returned HTTP 502/);
+  assert.equal(page.el("channel-compose-text").value, "");
+  assert.match(outgoingRows(page)[0].text(), /do not lose this/);
+  assert.match(outgoingRows(page)[0].text(), /Google Chat returned HTTP 502/);
+  assert.equal(savedOutgoing(page)[0].remaining, "do not lose this");
+  assert.ok(outgoingRetry(outgoingRows(page)[0]));
   assert.equal(page.el("channel-send").disabled, false);
   assert.equal(page.el("channel-compose-text").disabled, false);
 });
@@ -14517,4 +14554,402 @@ test("a failed fetch from a context already left cannot raise an error over the 
   assert.equal(page.el("channel-view-flat").getAttribute("aria-pressed"), "true");
   assert.equal(page.el("discord-log").children.length, 5);
   assert.equal(page.el("error").hidden, true);
+});
+
+test("Send shows a local message and clears the composer before the network answers", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  assertMarkupContains("pane-discord", "outgoing-log");
+  assert.ok(markupPlace("outgoing-log").at > markupPlace("discord-log").at);
+  assert.ok(markupPlace("outgoing-log").at < markupPlace("channel-composer").at);
+  const finish = delayedReply(page);
+  await page.el("channel-compose-text").setValue("the first message");
+  const submitted = page.el("channel-send").click();
+  // No yielding or network completion: this is the responsiveness the user actually experiences.
+  assert.equal(page.el("channel-compose-text").value, "");
+  assert.equal(outgoingRows(page).length, 1);
+  assert.match(outgoingRows(page)[0].text(), /the first message/);
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "sending");
+  assert.ok(outgoingSpinner(outgoingRows(page)[0]), "an in-flight message has no progress indicator");
+  assert.equal(page.el("channel-send").disabled, false);
+  assert.equal(page.el("channel-compose-text").disabled, false);
+  await page.el("channel-compose-text").setValue("a newer draft");
+  finish(json(200, { posted: message({ id: "9101", content: "the first message" }) }));
+  await submitted;
+  await page.settle();
+  assert.equal(page.el("channel-compose-text").value, "a newer draft",
+    "the first response erased text typed while it was on the network");
+  assert.equal(outgoingRows(page).length, 0, "the confirmed message still has a second local bubble");
+  assert.equal(shownIds(page).filter((id) => id === "9101").length, 1);
+});
+
+test("Send on an explicit reply closes its editor immediately and never clears a later reply draft", async () => {
+  const page = newPage();
+  await signIn(page);
+  const messages = [message({ id: "9110", content: "question" })];
+  await openReplyOn(page, messages);
+  const finish = delayedReply(page);
+  await page.el("reply-text").setValue("my answer");
+  const submitted = page.el("reply-send").click();
+  assert.equal(page.screen(), "main", "reply stayed open waiting for the provider");
+  assert.equal(page.el("reply-text").value, "");
+  assert.match(outgoingRows(page)[0].text(), /my answer/);
+  assert.equal(savedOutgoing(page)[0].replyTo, "9110");
+  await openReplyOn(page, messages);
+  await page.el("reply-text").setValue("another thought on the same question");
+  finish(json(200, { posted: message({ id: "9111", content: "my answer", reply_to: "9110" }) }));
+  await submitted;
+  await page.settle();
+  assert.equal(page.screen(), "reply", "a completed earlier send closed the newer editor");
+  assert.equal(page.el("reply-text").value, "another thought on the same question");
+  assert.equal(JSON.parse(page.storage.get("vibe-talk.voice.drafts"))["9110"],
+    "another thought on the same question");
+});
+
+test("a rejected send stops spinning, keeps its text, and allows an explicit retry", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  page.replyResponse = errorResponse(403, "refused", "You cannot post to this channel.");
+  await page.el("channel-compose-text").setValue("retained after refusal");
+  await page.el("channel-send").click();
+  await page.settle();
+  const failed = outgoingRows(page)[0];
+  assert.equal(failed.getAttribute("data-send-state"), "failed");
+  assert.equal(outgoingSpinner(failed), undefined);
+  assert.match(failed.text(), /You cannot post to this channel/);
+  assert.equal(savedOutgoing(page)[0].remaining, "retained after refusal");
+  assert.equal(page.el("channel-compose-text").value, "");
+  assert.ok(outgoingRetry(failed));
+  page.replyResponse = async () => json(200, {
+    posted: message({ id: "9121", content: "retained after refusal" }),
+  });
+  await outgoingRetry(failed).click();
+  await page.settle();
+  assert.deepEqual(page.repliesPosted.map((call) => call.body), [
+    { text: "retained after refusal" }, { text: "retained after refusal" },
+  ]);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("transport failure says delivery is unconfirmed and never automatically retries", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  page.replyResponse = async () => { throw new TypeError("Failed to fetch"); };
+  await page.el("channel-compose-text").setValue("possibly received upstream");
+  await page.el("channel-send").click();
+  await page.settle();
+  const pending = outgoingRows(page)[0];
+  assert.equal(pending.getAttribute("data-send-state"), "unconfirmed");
+  assert.equal(outgoingSpinner(pending), undefined);
+  assert.match(pending.text(), /check.*history|history.*check/i);
+  assert.match(pending.text(), /possibly received upstream/);
+  assert.ok(outgoingRetry(pending));
+  await reReadChannel(page);
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1, "a poll retried an ambiguous delivery");
+  assert.equal(outgoingRows(page).length, 1, "a poll lost the only local record of the send");
+});
+
+test("partial delivery with zero confirmed parts still requires a deliberate retry", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 0, unsent: "maybe already posted",
+    detail: "Google Chat returned HTTP 502",
+  });
+  await page.el("channel-compose-text").setValue("maybe already posted");
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "unconfirmed");
+  assert.match(outgoingRows(page)[0].text(), /check.*history|history.*check/i);
+  assert.equal(savedOutgoing(page)[0].remaining, "maybe already posted");
+  assert.equal(page.repliesPosted.length, 1);
+});
+
+test("a pending send survives channel refresh, navigation and reload without replay", async () => {
+  const page = newPage();
+  const other = { id: "2220000000000000002", label: "other", writable: true };
+  page.channels.push(other);
+  await signIn(page);
+  await showDiscord(page, []);
+  const finish = delayedReply(page);
+  await page.el("channel-compose-text").setValue("still waiting for confirmation");
+  const submitted = page.el("channel-send").click();
+  await page.settle();
+  const localId = outgoingRows(page)[0].getAttribute("data-outgoing-id");
+  await reReadChannel(page);
+  assert.equal(outgoingRows(page)[0].getAttribute("data-outgoing-id"), localId);
+  page.el("discord-channel").value = other.id;
+  await page.el("discord-channel").dispatch("change");
+  assert.equal(outgoingRows(page).length, 0, "channel A's local message leaked into channel B");
+  page.el("discord-channel").value = CHANNEL.id;
+  await page.el("discord-channel").dispatch("change");
+  assert.equal(outgoingRows(page)[0].getAttribute("data-outgoing-id"), localId);
+  // A reload loses the browser's knowledge of the in-flight request. It must not pretend it
+  // knows whether the provider accepted it, and must not create a second POST on its own.
+  const again = newPage(new Map(page.storage));
+  again.channels.push(other);
+  await signIn(again);
+  await showDiscord(again, []);
+  assert.equal(again.repliesPosted.length, 0);
+  assert.equal(outgoingRows(again)[0].getAttribute("data-outgoing-id"), localId);
+  assert.equal(outgoingRows(again)[0].getAttribute("data-send-state"), "unconfirmed");
+  assert.match(outgoingRows(again)[0].text(), /still waiting for confirmation/);
+  finish(json(200, { posted: message({ id: "9141", content: "still waiting for confirmation" }) }));
+  await submitted;
+});
+
+test("retry retains its original channel, thread and reply target after navigation and reload", async () => {
+  const page = await threadPage();
+  await threadButton(page.el("discord-log").children[1]).click();
+  await replyButton(page.el("discord-log").children[1]).click();
+  page.replyResponse = errorResponse(403, "refused", "permission changed");
+  await page.el("reply-text").setValue("answer only inside this thread");
+  await page.el("reply-send").click();
+  await page.settle();
+  const original = page.repliesPosted[0];
+  await page.el("thread-back").click();
+  assert.equal(outgoingRows(page).length, 0);
+  const again = newPage(new Map(page.storage));
+  again.threadingSupported = true;
+  again.threads = page.threads;
+  await signIn(again);
+  await showDiscord(again, page.messages);
+  await threadButton(again.el("discord-log").children[1]).click();
+  await outgoingRetry(outgoingRows(again)[0]).click();
+  await again.settle();
+  assert.equal(again.repliesPosted[0].path, original.path);
+  assert.deepEqual(again.repliesPosted[0].body, {
+    text: "answer only inside this thread", thread_id: page.threads[0].id, reply_to: "202",
+  });
+});
+
+test("a live message arriving before its send acknowledgement appears only once", async () => {
+  const page = newPage();
+  const stream = await withLiveChannel(page, []);
+  const finish = delayedReply(page);
+  await page.el("channel-compose-text").setValue("the live echo wins the race");
+  const submitted = page.el("channel-send").click();
+  await page.settle();
+  const posted = message({ id: "9161", content: "the live echo wins the race" });
+  await deliver(page, stream, sseMessage(posted));
+  assert.equal(shownIds(page).filter((id) => id === "9161").length, 1);
+  assert.equal(outgoingRows(page).length, 1,
+    "matching text was mistaken for proof that this particular POST succeeded");
+  finish(json(200, { posted }));
+  await submitted;
+  await page.settle();
+  assert.equal(shownIds(page).filter((id) => id === "9161").length, 1,
+    "the acknowledgement appended a second copy of the live message");
+  assert.equal(outgoingRows(page).length, 0);
+  await deliver(page, stream, sseMessage(posted));
+  assert.equal(shownIds(page).filter((id) => id === "9161").length, 1,
+    "a replayed live event added the sent message again");
+});
+
+test("two independent identical sends keep separate bubbles and POSTs, in submission order", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  const responses = [];
+  page.replyResponse = () => new Promise((resolve) => responses.push(resolve));
+  await page.el("channel-compose-text").setValue("same words");
+  const first = page.el("channel-send").click();
+  await page.settle();
+  await page.el("channel-compose-text").setValue("same words");
+  const second = page.el("channel-send").click();
+  await page.settle();
+  assert.equal(outgoingRows(page).length, 2, "text matching collapsed two intentional sends");
+  assert.notEqual(outgoingRows(page)[0].getAttribute("data-outgoing-id"),
+    outgoingRows(page)[1].getAttribute("data-outgoing-id"));
+  assert.equal(page.repliesPosted.length, 1, "one destination's messages can race out of order");
+  responses[0](json(200, { posted: message({ id: "9171", content: "same words" }) }));
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 2);
+  responses[1](json(200, { posted: message({ id: "9172", content: "same words" }) }));
+  await Promise.all([first, second]);
+  await page.settle();
+  assert.deepEqual(page.repliesPosted.map((call) => call.body), [
+    { text: "same words" }, { text: "same words" },
+  ]);
+  assert.equal(shownIds(page).filter((id) => id === "9171").length, 1);
+  assert.equal(shownIds(page).filter((id) => id === "9172").length, 1);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("confirmed messages survive an older history snapshot and reconcile by provider id after reload", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  const posted = message({ id: "9181", content: "confirmed before history caught up" });
+  page.replyResponse = async () => json(200, { posted });
+  await page.el("channel-compose-text").setValue(posted.content);
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.equal(shownIds(page).filter((id) => id === posted.id).length, 1);
+  // The read side can lag the successful write. A refresh answering an older snapshot must not
+  // erase the user's message or relabel its known success as an unconfirmed send.
+  await reReadChannel(page);
+  assert.match(page.el("pane-discord").text(), /confirmed before history caught up/);
+  const again = newPage(new Map(page.storage));
+  await signIn(again);
+  await showDiscord(again, []);
+  assert.equal(again.repliesPosted.length, 0);
+  assert.match(again.el("pane-discord").text(), /confirmed before history caught up/);
+  assert.equal(outgoingRows(again)[0].getAttribute("data-send-state"), "sent");
+  assert.equal(outgoingSpinner(outgoingRows(again)[0]), undefined);
+  again.messages = [posted];
+  await reReadChannel(again);
+  assert.equal(shownIds(again).filter((id) => id === posted.id).length, 1);
+  assert.equal(outgoingRows(again).length, 0, "provider history and the local confirmation both remain visible");
+});
+
+test("a later permission change disables retry without losing the saved message", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  page.replyResponse = errorResponse(403, "refused", "read-only now");
+  await page.el("channel-compose-text").setValue("keep until I can send");
+  await page.el("channel-send").click();
+  await page.settle();
+  const again = newPage(new Map(page.storage));
+  again.channels = [{ ...CHANNEL, writable: false }];
+  await signIn(again);
+  await showDiscord(again, []);
+  const retry = outgoingRetry(outgoingRows(again)[0]);
+  assert.equal(retry.disabled, true, "a read-only destination still offers to post the old message");
+  // The fixture intentionally permits dispatch on a disabled button, proving the handler also
+  // checks permission instead of relying on a visual attribute for its safety boundary.
+  await retry.click();
+  await again.settle();
+  assert.equal(again.repliesPosted.length, 0);
+  assert.equal(savedOutgoing(again)[0].remaining, "keep until I can send");
+});
+
+test("dismissing an unconfirmed local message removes it durably without posting", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  page.replyResponse = errorResponse(502, "chat_error", "Google Chat returned HTTP 502");
+  await page.el("channel-compose-text").setValue("I verified this in the chat client");
+  await page.el("channel-send").click();
+  await page.settle();
+  await outgoingDismiss(outgoingRows(page)[0]).click();
+  assert.equal(outgoingRows(page).length, 0);
+  assert.equal(savedOutgoing(page).length, 0);
+  assert.equal(page.repliesPosted.length, 1);
+  const again = newPage(new Map(page.storage));
+  await signIn(again);
+  await showDiscord(again, []);
+  assert.equal(outgoingRows(again).length, 0);
+  assert.equal(again.repliesPosted.length, 0);
+});
+
+test("a send timeout stops spinning and a late acknowledgement cannot silently retry or rewrite it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  const finish = delayedReply(page);
+  await page.el("channel-compose-text").setValue("mobile connection stalled");
+  const submitted = page.el("channel-send").click();
+  await page.settle();
+  assert.equal(page.expireTimers(sourceConstant("OUTGOING_TIMEOUT_MS")), 1);
+  await submitted;
+  await page.settle();
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "unconfirmed");
+  assert.equal(outgoingSpinner(outgoingRows(page)[0]), undefined);
+  assert.match(outgoingRows(page)[0].text(), /timed out/i);
+  finish(json(200, { posted: message({ id: "9201", content: "mobile connection stalled" }) }));
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1);
+  assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "unconfirmed");
+  assert.equal(savedOutgoing(page)[0].remaining, "mobile connection stalled");
+});
+
+test("signing out interrupts a pending send and prevents its queued successor from posting", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  const finish = delayedReply(page);
+  await page.el("channel-compose-text").setValue("already on the wire");
+  const first = page.el("channel-send").click();
+  await page.settle();
+  await page.el("channel-compose-text").setValue("still waiting locally");
+  const second = page.el("channel-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1);
+  assert.equal(outgoingRows(page).length, 2);
+  await page.el("forget-token").click();
+  await Promise.all([first, second]);
+  await page.settle();
+  assert.equal(page.screen(), "signin");
+  assert.deepEqual(savedOutgoing(page).map((entry) => [entry.remaining, entry.state]), [
+    ["already on the wire", "unconfirmed"], ["still waiting locally", "failed"],
+  ]);
+  finish(json(200, { posted: message({ id: "9211", content: "already on the wire" }) }));
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1, "the queued message used a signed-out credential");
+  assert.deepEqual(savedOutgoing(page).map((entry) => entry.state), ["unconfirmed", "failed"]);
+  await signIn(page);
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1, "signing back in replayed a saved send automatically");
+});
+
+test("a sent receipt retires when provider history arrives even if To do hides that own message", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(2));
+  const posted = message({ id: "9221", content: "already handled by me", author_id: "own-account" });
+  page.replyResponse = async () => json(200, { posted });
+  await page.el("channel-compose-text").setValue(posted.content);
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.equal(savedOutgoing(page).length, 1, "acknowledgement erased the durable fallback before a history read");
+  page.messages.push(posted);
+  assert.equal(page.el("mark-own-read").checked, true);
+  await turnTodoOn(page);
+  await page.settle();
+  assert.equal(shownIds(page).includes(posted.id), false, "the premise requires the own message to be filtered");
+  assert.equal(outgoingRows(page).length, 0, "a hidden provider message left a local receipt stuck on screen");
+  assert.equal(savedOutgoing(page).length, 0, "filtered history never acknowledged the durable send record");
+});
+
+test("an older in-flight poll cannot erase a sent message after its live confirmation retires the receipt", async () => {
+  const page = newPage();
+  const stream = await withLiveChannel(page, []);
+  const finishPost = delayedReply(page);
+  await page.el("channel-compose-text").setValue("confirmed while the old read waited");
+  const submitted = page.el("channel-send").click();
+  await page.settle();
+  const standardPage = page.channelPage;
+  let finishOldPage;
+  let holdFirst = true;
+  page.channelPage = (path, options) => {
+    if (holdFirst) {
+      holdFirst = false;
+      return new Promise((resolve) => { finishOldPage = resolve; });
+    }
+    return standardPage(path, options);
+  };
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  assert.ok(finishOldPage, "the old history read must already be in flight");
+  const posted = message({ id: "9231", content: "confirmed while the old read waited" });
+  finishPost(json(200, { posted }));
+  await submitted;
+  page.messages = [posted];
+  await deliver(page, stream, sseMessage(posted));
+  assert.match(page.el("pane-discord").text(), /confirmed while the old read waited/);
+  assert.equal(savedOutgoing(page).length, 0, "the live confirmation did not retire the receipt");
+  // This response describes the instant before the send. Its late arrival must not erase both
+  // the acknowledged row and the durable fallback that the newer live observation just retired.
+  finishOldPage(json(200, { channel: CHANNEL, messages: [], has_more: false, complete: true }));
+  await page.settle();
+  assert.match(page.el("pane-discord").text(), /confirmed while the old read waited/,
+    "an older in-flight page erased the message after its live confirmation");
+  assert.equal(shownIds(page).filter((id) => id === posted.id).length, 1);
 });

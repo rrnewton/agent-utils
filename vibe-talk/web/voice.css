@@ -524,6 +524,64 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* Local sends live beside the confirmed history until their provider IDs arrive. They look like
+   the reader's own messages, but carry delivery state instead of actions on a server message. */
+#outgoing-log .outgoing-message {
+  background: var(--mine);
+  border-color: var(--mine-edge);
+  margin-left: var(--speaker-inset);
+  border-bottom-right-radius: 0.15rem;
+  overflow-wrap: anywhere;
+}
+
+#outgoing-log .msg-text {
+  white-space: pre-wrap;
+  font-size: calc(0.88rem * var(--msg-scale));
+}
+
+.outgoing-status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.outgoing-spinner {
+  flex: 0 0 auto;
+  width: 0.85rem;
+  height: 0.85rem;
+  border: 2px solid var(--mine-edge);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: outgoing-spin 0.8s linear infinite;
+}
+
+.outgoing-message[data-send-state="failed"] .outgoing-status,
+.outgoing-message[data-send-state="unconfirmed"] .outgoing-status {
+  color: var(--warn);
+}
+
+.outgoing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+
+.outgoing-actions button {
+  min-height: 2.5rem;
+}
+
+@keyframes outgoing-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .outgoing-spinner { animation: none; }
+}
+
 #channel-composer {
   display: grid;
   gap: 0.5rem;
