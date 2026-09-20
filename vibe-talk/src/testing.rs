@@ -223,13 +223,22 @@ fn state_pieces_with(
     let elevenlabs = Arc::new(FakeElevenLabs::new());
     let config = Config::from_toml_and_env(text, &BTreeMap::new()).expect("test config is valid");
     let config_for_version = config.summaries.clone();
+    let speech: Arc<dyn crate::speech::SpeechProvider> = match config.read_aloud.backend {
+        crate::config::ReadAloudBackend::Browser => Arc::new(crate::speech::BrowserSpeech),
+        crate::config::ReadAloudBackend::ElevenLabs => {
+            Arc::new(crate::elevenlabs::speech::ElevenLabsSpeech::new(
+                elevenlabs.clone(),
+                config.elevenlabs.clone(),
+            ))
+        }
+    };
     let state = AppState {
         config: Arc::new(config),
         chat: fake.clone(),
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs: elevenlabs.clone(),
-        speech: elevenlabs.clone(),
+        speech,
         store: Arc::clone(&store),
         // A real hub, never a stub: a test drives `live::poll_once` or `AppState::live.publish`
         // directly and then reads the SSE route, which is the whole ingestion path minus the

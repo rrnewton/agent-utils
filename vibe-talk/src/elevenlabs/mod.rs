@@ -23,6 +23,13 @@ pub mod fake;
 pub mod http;
 pub mod mock;
 pub mod socket;
+pub mod speech;
+
+// Keep the audio client API usable while shared handlers use `crate::speech::SpeechProvider`.
+pub use crate::speech::{clamp_speed, Speech, MAX_SPEECH_SPEED, MIN_SPEECH_SPEED};
+
+/// Audio stream carrying an ElevenLabs client error until the provider adapter handles it.
+pub type SpeechStream = crate::speech::SpeechStream<SpeechError>;
 
 use std::time::Duration;
 
@@ -261,37 +268,7 @@ pub struct VoiceStyle {
     pub similarity_boost: Option<f64>,
 }
 
-/// Audio for one message, as the vendor returned it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Speech {
-    /// The encoded audio. Handed to the caller verbatim; this server does not transcode.
-    pub audio: Vec<u8>,
-    /// What the audio IS, so the browser is told rather than left to sniff.
-    pub content_type: String,
-}
-
-/// Audio arriving as it is generated, rather than all at once when it is finished.
-///
-/// The difference this makes is the whole of read-aloud's latency: on the non-streaming endpoint
-/// the vendor generates the entire file before sending a byte, so the reader waits for the last
-/// word to be synthesised before hearing the first. Here the first frames are forwarded to the
-/// browser as they arrive and playback starts against a file that is still being written.
-pub struct SpeechStream {
-    /// What the audio IS, so the browser is told rather than left to sniff.
-    pub content_type: String,
-    /// The audio itself, in whatever chunks the vendor happens to send.
-    pub chunks: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, SpeechError>>,
-}
-
-impl std::fmt::Debug for SpeechStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpeechStream")
-            .field("content_type", &self.content_type)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Turning a message's text into audio.
+/// ElevenLabs audio transport. Application code uses [`crate::speech::SpeechProvider`].
 #[async_trait]
 pub trait SpeechProvider: Send + Sync {
     /// Read `text` aloud in the configured voice.
@@ -336,26 +313,6 @@ pub trait SpeechProvider: Send + Sync {
             })),
         })
     }
-}
-
-/// The speeds this server will ask a vendor for.
-///
-/// Bounded because the reader drives it from a slider and the vendor charges per request: below a
-/// half the words stop being words, and above double the audio is faster than it can be followed,
-/// so both ends are a request nobody wanted to pay for.
-pub const MIN_SPEECH_SPEED: f64 = 0.5;
-/// See [`MIN_SPEECH_SPEED`].
-pub const MAX_SPEECH_SPEED: f64 = 2.0;
-
-/// Clamp a requested speed into the range this server will ask for, or drop it if it is not a
-/// number at all.
-#[must_use]
-pub fn clamp_speed(speed: Option<f64>) -> Option<f64> {
-    let value = speed?;
-    if !value.is_finite() {
-        return None;
-    }
-    Some(value.clamp(MIN_SPEECH_SPEED, MAX_SPEECH_SPEED))
 }
 
 /// A minted, short-lived conversation URL.

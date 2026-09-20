@@ -292,6 +292,8 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
     checks.push(discord_token(state, &deadline).await);
     checks.extend(discord_channels(state, &deadline).await);
 
+    checks.push(read_aloud_selection(state));
+
     checks.push(elevenlabs_key(state, &deadline).await);
     // One vendor call answers both of these, and the voice check reads the agent's verdict as
     // well as its profile — so the voice row is BUILT first and PUSHED second, which is the
@@ -322,6 +324,29 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
         budget_seconds: TOTAL_BUDGET.as_secs(),
         took_ms: deadline.elapsed_ms(),
     }
+}
+
+/// Identify the selected playback path without claiming that audio played on the device.
+fn read_aloud_selection(state: &AppState) -> Check {
+    let provider = state.speech.describe();
+    let playback = match provider.playback {
+        crate::speech::Playback::Browser => {
+            "the browser uses the device's speech engine and selects a voice it reports as local; \
+             no ElevenLabs credentials are needed for this read-aloud mode. The server cannot \
+             verify browser voice availability or audible playback: open the message view, \
+             enable Read, and tap a message on the device"
+        }
+        crate::speech::Playback::Audio => {
+            "the server generates audio through this provider; this check confirms the selected \
+             backend only and does not synthesize or play audio"
+        }
+    };
+    Check::new(
+        "read_aloud",
+        "Read-aloud backend selection",
+        Diagnosis::Confirmed(format!("{} selected: {playback}", provider.label)),
+    )
+    .about(provider.backend)
 }
 
 /// Did Discord accept the bot token at all, and whose token is it?
@@ -444,10 +469,10 @@ fn elevenlabs_voice(state: &AppState, profile: Option<&AgentProfile>, agent: &Di
         // An explicitly named voice needs no agent at all, so it resolves even when the agent
         // check went red. That is not optimism: read-aloud really does work in this state.
         (Some(named), _) => Diagnosis::Confirmed(format!(
-            "elevenlabs.voice_id names {named} explicitly, so that is the voice read-aloud uses"
+            "elevenlabs.voice_id names {named} explicitly, so ElevenLabs synthesis uses that voice"
         )),
         (None, Some(borrowed)) => Diagnosis::Confirmed(format!(
-            "elevenlabs.voice_id is unset, so read-aloud borrows the agent's own voice, \
+            "elevenlabs.voice_id is unset, so ElevenLabs synthesis borrows the agent's own voice, \
              {borrowed} — which is the intended default and needs no setting"
         )),
         // Nothing configured, and nothing to borrow. Either the agent genuinely has no voice —
@@ -455,7 +480,7 @@ fn elevenlabs_voice(state: &AppState, profile: Option<&AgentProfile>, agent: &Di
         // could not be read at all, in which case THAT is the fault and this row must say so.
         (None, None) => agent.clone(),
     };
-    Check::new("elevenlabs.voice", "Read-aloud voice", diagnosis)
+    Check::new("elevenlabs.voice", "ElevenLabs voice", diagnosis)
 }
 
 /// Can this deployment summarise anything at all?
@@ -585,8 +610,8 @@ mod tests {
         let report = run(&state).await;
         assert!(report.ok, "{:#?}", report.checks);
         assert_eq!(report.failed, 0);
-        // One token check, two channels, key, agent, voice, summaries, storage.
-        assert_eq!(report.checks.len(), 8, "{:#?}", report.checks);
+        // One token check, two channels, read-aloud selection, key, agent, voice, summaries, storage.
+        assert_eq!(report.checks.len(), 9, "{:#?}", report.checks);
     }
 
     #[tokio::test]

@@ -5,6 +5,35 @@ source code, vendor documentation, and package metadata. Where a claim rests on 
 file is cited; where it rests on vendor documentation, the doc page is linked; claims that could not
 be confirmed are marked **unverified** and are never used to carry a conclusion.
 
+## Device speech for individual messages (2026-09-19)
+
+Reading a selected message does not require a conversational agent. Chromium's implementation of
+the Web Speech API calls Android's installed `TextToSpeech` service, so a browser can offer
+tap-to-read without shipping a speech model, obtaining an API key, or routing synthesis through
+the application server. This is a smaller dependency than a hosted voice conversation when the
+desired interaction is choosing and listening to an existing message.
+
+[MDN's voice discovery reference](https://developer.mozilla.org/en-US/docs/Web/API/SpeechSynthesis/getVoices)
+describes `getVoices()` and the asynchronous `voiceschanged` event. Its
+[compatibility data](https://github.com/mdn/browser-compat-data/blob/main/api/SpeechSynthesis.json)
+lists Chrome Android support, but no Android WebView support. Chromium's
+[Android implementation](https://chromium.googlesource.com/chromium/src/+/main/content/browser/speech/tts_android.cc)
+also explains why a web client should use cancellation and fresh utterances: Android pause stops
+speech, while resume has no implementation.
+
+The [localService property](https://developer.mozilla.org/en-US/docs/Web/API/SpeechSynthesisVoice/localService)
+allows a client to select browser-reported local voices. That is not an independent audit of the
+phone's speech engine: Chromium's
+[Android service integration](https://chromium.googlesource.com/chromium/src/+/main/content/public/android/java/src/org/chromium/content/browser/TtsPlatformImpl.java)
+uses the configured engine and exposes language entries rather than checking every native voice's
+network requirement. Downloaded voices and an offline device check are appropriate when offline
+processing is required. Background playback and physical-phone audio remain unverified by desktop
+browser automation.
+
+The device backend covers selected-message reading. The existing ElevenLabs integration still
+supplies its own server-generated audio and conversational voice features; device speech does not
+provide speech recognition, model responses, or summarisation.
+
 ## The problem being solved
 
 The proposal is a Rust server, run as a Podman container, that receives Discord webhook pushes,

@@ -14,6 +14,7 @@ const state = {
   channels: [],
   digest: [],
   agentId: null,
+  readAloud: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -144,6 +145,11 @@ async function loadConfig() {
   const config = await api("/api/v1/client-config");
   state.channels = config.channels;
   state.agentId = config.elevenlabs_agent_id;
+  state.readAloud = config.read_aloud || null;
+  if (state.readAloud && state.readAloud.playback === "browser") {
+    // Voice discovery may be asynchronous; begin before the reader presses Read.
+    window.speechSynthesis?.getVoices?.();
+  }
   fillChannelSelects();
   const providerName =
     typeof config.chat_provider_name === "string" ? config.chat_provider_name.trim() : "";
@@ -278,15 +284,30 @@ async function loadScrollback() {
   list.lastElementChild?.scrollIntoView({ block: "end" });
 }
 
-// Local speech: no vendor, no key, no cost. It is the fallback while the hosted agent is unwired,
-// and it is also the fastest way to sanity-check that a digest is actually speakable.
+// The browser's speech service reads the digest. A configured device backend selects only a
+// voice reported as local; the phone's speech-engine settings determine how audio is generated.
 function speak(text) {
-  if (!("speechSynthesis" in window)) {
-    setStatus("this browser has no speech engine");
+  if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance !== "function") {
+    setStatus("This browser has no speech engine. Open this page in Chrome on Android.");
     return;
   }
+  const utterance = new SpeechSynthesisUtterance(text);
+  if (state.readAloud && state.readAloud.playback === "browser") {
+    const voices = (window.speechSynthesis.getVoices?.() || [])
+      .filter((voice) => voice.localService === true);
+    const language = String(navigator.language || "en").toLowerCase();
+    const voice = voices.find((entry) => String(entry.lang).toLowerCase() === language) ||
+      voices.find((entry) => entry.default) || voices[0];
+    if (!voice) {
+      setStatus("No device voice is ready. Download a voice in Android Text-to-speech settings, then tap Read again.");
+      return;
+    }
+    utterance.voice = voice;
+    utterance.lang = voice.lang;
+    utterance.onerror = () => setStatus("Device speech could not play. Check your media volume and installed voices, then tap Read again.");
+  }
   window.speechSynthesis.cancel();
-  window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+  window.speechSynthesis.speak(utterance);
 }
 
 function speakDigest() {

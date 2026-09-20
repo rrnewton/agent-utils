@@ -5,10 +5,11 @@ use std::sync::Arc;
 use crate::agent_backend::AgentBackend;
 use crate::chat::ChatClient;
 use crate::config::Config;
-use crate::elevenlabs::{SignedUrlProvider, SpeechProvider};
+use crate::elevenlabs::SignedUrlProvider;
 use crate::live::LiveHub;
 use crate::model::{ChannelId, ChannelInfo};
 use crate::retrieval::Ranker;
+use crate::speech::SpeechProvider;
 use crate::store::{AddedChannel, StateStore};
 use crate::summarize::Summarizer;
 
@@ -23,11 +24,10 @@ pub struct AppState {
     pub ranker: Arc<dyn Ranker>,
     /// Mints short-lived signed conversation URLs for the configured ElevenLabs agent.
     pub elevenlabs: Arc<dyn SignedUrlProvider>,
-    /// Reads one message aloud in the configured ElevenLabs voice.
+    /// Reads messages using the configured speech backend and advertises its playback interface.
     ///
-    /// A SEPARATE capability from minting a conversation URL, held separately, because the two
-    /// use different settings and fail for different reasons: a deployment can read aloud without
-    /// having a conversational agent at all.
+    /// Separate from minting a conversation URL: device speech needs no account, and a server
+    /// audio provider can read aloud without having a conversational agent.
     pub speech: Arc<dyn SpeechProvider>,
     /// Slow-path backend (absent in v0).
     pub agent: Arc<dyn AgentBackend>,
@@ -59,11 +59,11 @@ pub struct AppState {
     /// allowlist is the kind of ambiguity this server spends effort avoiding. With ingestion off
     /// nobody publishes, so a subscriber simply waits — and the startup banner says which it is.
     pub live: Arc<LiveHub>,
-    /// Messages resolved for read-aloud BEFORE the reader taps one.
+    /// Messages resolved for server audio BEFORE the reader taps one.
     ///
-    /// Turning read-aloud on prepares everything on screen; a tap then plays a ticket, which is a
-    /// map lookup and nothing else. See [`crate::speech_tickets`] for why this is a ticket rather
-    /// than the page simply sending the text it already has.
+    /// With server audio, turning read-aloud on prepares everything on screen and a tap then plays
+    /// a ticket. Device speech reads the text already in the browser and uses no tickets.
+    /// See [`crate::speech_tickets`] for why server audio uses this authority boundary.
     pub speech_tickets: Arc<crate::speech_tickets::SpeechTickets>,
     /// Channels the owner added from inside the app, joined onto the configured allowlist.
     ///

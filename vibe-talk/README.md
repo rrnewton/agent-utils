@@ -2,7 +2,8 @@
 
 A small Rust web server for reading, discussing, and replying to your coding agents' chat messages
 from a phone. It supports Discord directly and other services, including Google Chat, through a
-compatible HTTP bridge. Voice conversations use an optional ElevenLabs agent.
+compatible HTTP bridge. Messages can be read with the phone's speech engine or ElevenLabs;
+voice conversations use an optional ElevenLabs agent.
 
 It is a **bridge, not an agent host**. It holds the chat backend's credential, answers questions about
 channels over an authenticated HTTP API, and serves a phone web app. It is deliberately **not**
@@ -46,6 +47,40 @@ draft, and posting destination. Reply counts marked approximate come from the pr
 selected thread. **Send** posts without requiring a message to reply to. Drafts are kept separately
 for each channel and thread; a failed send preserves the text. This composer scrolls with history.
 
+## Reading messages with a device voice
+
+To use **Read** in the message view without an ElevenLabs account or conversational agent, add
+this to the server configuration and restart it:
+
+```toml
+[read_aloud]
+backend = "browser"
+```
+
+Reload the phone page, open the message view, press **Read**, and tap a message. Tap that message
+again to stop it, or tap another to switch. **Stop** leaves reading mode; **Pace** changes the
+speed. A combined row is read in order, and messages are marked read only after playback finishes.
+This works independently of the conversational voice mode and per-message summarisation.
+
+Chrome on Android exposes the installed Android text-to-speech service through the Web Speech
+API. The page selects a voice the browser reports as local, loads voices as they become available,
+and starts playback from a tap. If no voice is available, install or download a voice in Android's
+text-to-speech settings and try again. Embedded Android WebViews do not support this API; open
+the page in Chrome instead. Keep the page visible while listening: background and locked-screen
+playback depend on the browser and are not guaranteed.
+
+The app makes no ElevenLabs speech request in browser mode. The phone's configured speech engine
+controls its own processing: Chromium's `localService` flag does not prove that every Android
+engine stays offline. Choose a downloaded offline voice and check it in airplane mode when that
+distinction matters. Browser automation verifies the interaction with a simulated speech engine;
+audible output on a physical phone remains a device check.
+
+Omitting `[read_aloud]`, or setting `backend = "elevenlabs"`, preserves server-generated ElevenLabs
+audio and its existing voice configuration. `GET /api/v1/client-config` reports the selected
+backend and playback mode. Rust handlers depend on `speech::SpeechProvider`; vendor credentials
+and API details stay in its adapter. Additional private providers can implement that interface
+outside this repository.
+
 ## Setting it up
 
 **If you are setting this up for the first time, use [`QUICKSTART.md`](QUICKSTART.md).** It runs
@@ -76,6 +111,7 @@ Two things are worth knowing before you begin, because they shape everything els
 | Per-message summaries, from the ElevenLabs agent | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS — and it is now the only summariser there is.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. The extractive truncating summariser that used to be the default has been **deleted**, so there is nothing to fall back to: a deployment without ElevenLabs credentials still starts, and shows every long message as a **failed** summary — a red row — instead of handing you its opening lines and calling that a summary. |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Web app: text tab, digest, find-a-message, local speech | **works** |
+| Device speech for the message view's Read control | **prototype.** Uses browser-reported local voices without ElevenLabs credentials. Playback, cancellation, and failures have automated browser coverage; physical-phone audio and background playback remain device checks. |
 | Main, Threads, All, selected-thread history, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
 | **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, seven tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
 | ElevenLabs voice agent | **reachable, and currently NOT invoking tools.** A real agent has now been driven headlessly (`scripts/run.sh --smoke-agent`): the signed URL mints, the conversation opens, the agent answers — and it calls no tool, saying its tools "appear to be out of date". In the same conversation ElevenLabs reports our MCP server connected with all five tools visible, so the fault is in the agent's own configuration rather than in this server. |
@@ -187,12 +223,12 @@ hosted LLM). Open it, and the id is in the dashboard URL — it starts `agent_`.
 `elevenlabs.voice_id` is **optional and normally left unset**, and the reason is worth knowing
 rather than guessing at. An agent and a voice are different objects in ElevenLabs' model: an agent
 is a prompt, a model, tools *and* a voice, while the text-to-speech API takes a voice and knows
-nothing about agents. With `voice_id` unset, read-aloud **borrows the configured agent's own
+nothing about agents. With the ElevenLabs read-aloud backend and `voice_id` unset, read-aloud **borrows the configured agent's own
 voice** — and the agent's delivery with it, its speed and stability — so a channel message is read
 out by the same voice that talks to you, from the one thing you already configured.
 
 Set it only when those two should deliberately **differ**. With neither a voice id nor an agent id
-configured, read-aloud refuses and names both, rather than falling back to whichever voice the
+configured, the ElevenLabs backend refuses and names both, rather than falling back to whichever voice the
 account happens to list first.
 
 Copy `vibe-talk.example.toml` to `vibe-talk.toml` (gitignored) and fill it in, or pass everything
@@ -595,7 +631,8 @@ code path the startup probe uses, which is itself in the same position — see *
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
 | Channels | `[[channels]]` | `VIBE_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated |
 | ElevenLabs agent id | `elevenlabs.agent_id` | `VIBE_TALK_ELEVENLABS_AGENT_ID` | public |
-| ElevenLabs API key | `elevenlabs.api_key` | `VIBE_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and to read messages aloud |
+| Read-aloud backend | `read_aloud.backend` | `VIBE_TALK_READ_ALOUD_BACKEND` | `elevenlabs` (default) or `browser` for the device speech engine; independent of conversational voice mode |
+| ElevenLabs API key | `elevenlabs.api_key` | `VIBE_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and for the ElevenLabs read-aloud backend |
 | Your own Discord user id | `discord.owner_user_id` | `VIBE_TALK_DISCORD_OWNER_USER_ID` | public; **cannot be derived** — see below. Without it, messages you type into Discord yourself are drawn as a third party |
 | ElevenLabs voice id | `elevenlabs.voice_id` | `VIBE_TALK_ELEVENLABS_VOICE_ID` | public; **optional** — read-aloud borrows the configured agent's own voice when this is unset |
 | ElevenLabs API base | `elevenlabs.api_base` | `VIBE_TALK_ELEVENLABS_API_BASE` | `https://api.elevenlabs.io/v1` |

@@ -212,6 +212,7 @@ function showScreen(name) {
   // own body. `#63 status-line-placement`.
   el("control-pane").hidden = !main;
   if (!main) {
+    if (readAloudPlayback === "browser") stopReading();
     disarmClear();
     // The composer lives in the control bar now, and leaving the call screen leaves text entry:
     // coming back should show the bar as it rests, not with a field standing open from a visit to
@@ -4521,8 +4522,8 @@ function toggleMessageDetails(li, messages) {
 // --- reading a message aloud ----------------------------------------------------------------
 //
 // The owner's ask: in the channel view, the Talk control becomes READ. Turn it on and a tap on any
-// message sends that message's full text to ElevenLabs and plays it; when the audio finishes, the
-// message archives itself. Not hands-free — a tap per message — but it turns a backlog of long
+// message reads its full text through the configured speech provider; when the audio finishes,
+// the message archives itself. Not hands-free — a tap per message — but it turns a backlog of long
 // bot messages into something that can be worked through with a thumb and an ear, with the greyed
 // rows showing exactly how far you have got.
 //
@@ -4561,7 +4562,14 @@ function applyReadSpeed(value) {
   const shown = readSpeed === null ? 100 : readSpeed;
   el("read-speed-range").value = String(shown);
   el("speed-value").textContent =
-    readSpeed === null ? "Pace: as the agent speaks" : `Pace: ${readSpeed}%`;
+    readSpeed === null
+      ? readAloudPlayback === "browser" ? "Pace: device default" : "Pace: as the agent speaks"
+      : `Pace: ${readSpeed}%`;
+  el("read-pace-help").textContent = readAloudPlayback === "browser"
+    ? "Unset, a message uses the device voice's normal pace. Changes apply to the next spoken part."
+    : "Unset, a message is read at whatever pace the voice agent is configured with.";
+  el("read-speed-range").setAttribute("aria-label", readAloudPlayback === "browser"
+    ? "reading pace, percent of the device voice's normal pace" : "reading pace, percent of the agent's own");
   el("read-speed-label").textContent = readSpeed === null ? "Pace" : `${readSpeed}%`;
   try {
     if (readSpeed === null) {
@@ -4625,6 +4633,182 @@ function readAlready(id, who) {
 /** Is a tap on a message a request to hear it? Session-only, and only in the channel view. */
 let readingMode = false;
 
+// Playback is a capability declared by the backend. Older servers use the audio route. A device
+// voice is explicitly selected; it never falls back to a remote speech service.
+let readAloudPlayback = "audio";
+let readAloudLabel = "ElevenLabs";
+let browserVoicesListening = false;
+let waitingForBrowserVoice = false;
+let browserVoiceProblem = "";
+
+function browserSpeechEngine() {
+  const engine = window.speechSynthesis;
+  return engine && typeof engine.getVoices === "function" &&
+    typeof engine.speak === "function" && typeof engine.cancel === "function" &&
+    typeof window.SpeechSynthesisUtterance === "function" ? engine : null;
+}
+
+function browserSpeechVoice() {
+  const engine = browserSpeechEngine();
+  if (!engine) return null;
+  // Some browser voices send text to a service. Only voices explicitly reported as local qualify;
+  // the phone's configured speech engine still determines how it generates audio. An empty list
+  // must never select the browser's implicit default.
+  const voices = engine.getVoices().filter((voice) => voice.localService === true);
+  const language = String(navigator.language || "en").toLowerCase();
+  return voices.find((voice) => String(voice.lang).toLowerCase() === language) ||
+    voices.find((voice) => String(voice.lang).toLowerCase().split("-")[0] === language.split("-")[0]) ||
+    voices.find((voice) => voice.default) || voices[0] || null;
+}
+
+function prepareBrowserSpeech() {
+  const engine = browserSpeechEngine();
+  if (!engine) return;
+  // Chrome may expose an empty list at first. Populate it ahead of the tap; do not defer speak()
+  // until this event, because a later callback may no longer have the user's audio permission.
+  if (!browserVoicesListening && typeof engine.addEventListener === "function") {
+    engine.addEventListener("voiceschanged", () => {
+      if (readAloudPlayback === "browser" && waitingForBrowserVoice && browserSpeechVoice()) {
+        waitingForBrowserVoice = false;
+        if (readingMode) {
+          if (el("error").textContent === browserVoiceProblem) clearError();
+          setReadState("ready");
+          setStatus("Device voice is ready. Tap a message to hear it.");
+        }
+      }
+    });
+    browserVoicesListening = true;
+  }
+  browserSpeechVoice();
+}
+
+function browserSpeechProblem() {
+  if (!browserSpeechEngine()) {
+    return "This browser does not expose device speech. Open this page in Chrome on Android.";
+  }
+  if (!browserSpeechVoice()) {
+    waitingForBrowserVoice = true;
+    browserVoiceProblem = "No installed device voice is available yet. In Android Settings, open Text-to-speech " +
+      "output and download a voice for your language, then return here and tap the message again.";
+    return browserVoiceProblem;
+  }
+  return "";
+}
+
+// Short utterances avoid mobile engines' long-text limits while keeping every part of the row.
+const BROWSER_SPEECH_CHUNK_CHARS = 180;
+const BROWSER_SPEECH_START_MS = 10000;
+const BROWSER_SPEECH_FINISH_MS = 60000;
+
+function browserSpeechChunks(text) {
+  let remaining = Array.from(String(text).replace(/\s+/gu, " ").trim());
+  const chunks = [];
+  while (remaining.length > 0) {
+    let end = Math.min(BROWSER_SPEECH_CHUNK_CHARS, remaining.length);
+    if (end < remaining.length) {
+      const prefix = remaining.slice(0, end).join("");
+      const sentences = [...prefix.matchAll(/[.!?;:]\s+/gu)];
+      const last = sentences[sentences.length - 1];
+      const sentenceEnd = last ? Array.from(prefix.slice(0, last.index + last[0].length)).length : 0;
+      const space = remaining.slice(0, end).lastIndexOf(" ");
+      if (sentenceEnd >= end / 2) end = sentenceEnd;
+      else if (space > 0) end = space + 1;
+    }
+    const chunk = remaining.slice(0, end).join("").trim();
+    if (chunk) chunks.push(chunk);
+    remaining = remaining.slice(end);
+  }
+  return chunks;
+}
+
+function browserSpeechFailure(error) {
+  if (error === "start-timeout" || error === "speech-timeout") {
+    return "The device voice stopped responding. Tap the message again to restart it.";
+  }
+  if (error === "not-allowed") {
+    return "Device speech was blocked. Tap the message again to allow playback.";
+  }
+  if (error === "voice-unavailable" || error === "language-unavailable") {
+    return "The device voice is unavailable. Download a voice in Android Text-to-speech settings, then tap again.";
+  }
+  return "The device voice could not read that message. Check your media volume and installed voices, then tap again.";
+}
+
+/** Speak the cached raw row on the tap's own call stack, without a network request or await. */
+function readWithBrowserSpeech(parts, id, ticket) {
+  const problem = browserSpeechProblem();
+  if (problem) throw new Error(problem);
+  if (session.socket && !session.chat) {
+    throw new Error("Hang up the voice call before reading messages with the device voice.");
+  }
+  const messages = [...el("discord-log").children].flatMap(rowMessages);
+  const text = parts.map((part) => {
+    const message = messages.find((entry) => String(entry.id) === part);
+    if (!message) throw new Error("That message is no longer loaded. Refresh the channel and tap it again.");
+    return String(message.content || "");
+  }).join("\n\n");
+  const chunks = browserSpeechChunks(text);
+  if (chunks.length === 0) throw new Error("This message has no text to read.");
+  const engine = browserSpeechEngine();
+  const voice = browserSpeechVoice();
+  waitingForBrowserVoice = false;
+  clearError();
+  // Retain the current utterance as well as its listeners. Some engines otherwise lose events
+  // after garbage collection, which would strand the row and its remaining chunks.
+  nowPlaying = { id, playback: "browser", audio: { pause: () => engine.cancel() }, urls: [],
+    utterance: null, speechTimer: null };
+  const current = () => ticket === readingTicket && nowPlaying !== null && nowPlaying.id === id;
+  const fail = (error) => {
+    if (!current()) return;
+    stopReading();
+    setReadState("failed");
+    const detail = browserSpeechFailure(error);
+    setStatus(detail);
+    showError(detail);
+  };
+  const speakPart = (index) => {
+    if (!current()) return;
+    const utterance = new window.SpeechSynthesisUtterance(chunks[index]);
+    utterance.voice = voice;
+    utterance.lang = voice.lang;
+    utterance.rate = readSpeed === null ? 1 : readSpeed / 100;
+    const isCurrentPart = () => current() && nowPlaying.utterance === utterance;
+    const watch = (delay, error) => {
+      if (nowPlaying.speechTimer !== null) clearTimeout(nowPlaying.speechTimer);
+      nowPlaying.speechTimer = setTimeout(() => {
+        if (isCurrentPart()) fail(error);
+      }, delay);
+    };
+    utterance.onstart = () => {
+      if (!isCurrentPart()) return;
+      watch(BROWSER_SPEECH_FINISH_MS, "speech-timeout");
+      if (pendingRead === id) setStatus(`Reading with ${readAloudLabel}.`);
+      pendingRead = null;
+      setReadState("ready");
+      renderChannelRows();
+    };
+    utterance.onerror = (event) => { if (isCurrentPart()) fail(event.error); };
+    utterance.onend = () => {
+      if (!isCurrentPart()) return;
+      if (index + 1 < chunks.length) {
+        speakPart(index + 1);
+      } else {
+        stopReading();
+        setReadState("ready");
+        guardQuietly(() => dismissMessages({ messages: parts }))();
+      }
+    };
+    nowPlaying.utterance = utterance;
+    watch(BROWSER_SPEECH_START_MS, "start-timeout");
+    try {
+      engine.speak(utterance);
+    } catch (_error) {
+      fail("synthesis-failed");
+    }
+  };
+  speakPart(0);
+}
+
 /**
  * Where each visible message can be PLAYED from, resolved before the reader taps anything.
  *
@@ -4655,6 +4839,11 @@ async function prepareSpeech() {
   if (!readingMode || currentView !== "discord") {
     return;
   }
+  if (readAloudPlayback === "browser") {
+    prepareBrowserSpeech();
+    return;
+  }
+  if (readAloudPlayback !== "audio") return;
   const channel = el("discord-channel").value;
   if (!channel) {
     return;
@@ -4774,8 +4963,9 @@ function stopReading() {
     }
     return;
   }
-  const { audio, urls } = nowPlaying;
+  const { audio, urls, speechTimer } = nowPlaying;
   nowPlaying = null;
+  if (speechTimer !== null && speechTimer !== undefined) clearTimeout(speechTimer);
   try {
     audio.pause();
   } catch (_error) {
@@ -4789,6 +4979,7 @@ function stopReading() {
       URL.revokeObjectURL(url);
     }
   }
+  if (wasPending && readingMode) setReadState("ready");
   renderChannelRows();
 }
 
@@ -4857,6 +5048,20 @@ async function readAloud(ids) {
   pendingRead = id;
   setReadState("working");
   renderChannelRows();
+  if (readAloudPlayback !== "audio") {
+    try {
+      if (readAloudPlayback !== "browser") throw new Error("This speech playback method is not supported by this page.");
+      readWithBrowserSpeech(parts, id, ticket);
+    } catch (error) {
+      if (ticket === readingTicket) {
+        stopReading();
+        setReadState("failed");
+        setStatus(error.message);
+      }
+      throw error;
+    }
+    return;
+  }
   // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
   // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
   // starts playing against a response the server is still writing.
@@ -7651,6 +7856,11 @@ function setTokenState(text) {
 const NO_TOKEN_YET = "no token saved in this browser — paste your write-scope token above.";
 
 function applyClientConfig(config) {
+  const speech = config.read_aloud;
+  readAloudPlayback = speech ? String(speech.playback || "unsupported") : "audio";
+  readAloudLabel = speech && speech.label ? String(speech.label) : "ElevenLabs";
+  if (readAloudPlayback === "browser") prepareBrowserSpeech();
+  applyReadSpeed(readSpeed);
   threadingSupported = config.threading_supported === true;
   // The selected backend owns its display name. An older server leaves it unspecified, so the
   // page stays neutral instead of guessing a platform from channel IDs or deployment details.
@@ -7955,7 +8165,9 @@ el("read-aloud").addEventListener("click", () => {
   }
   setStatus(
     readingMode
-      ? "reading mode: tap a message to hear it, and it archives when it finishes."
+      ? readAloudPlayback === "browser"
+        ? browserSpeechProblem() || `${readAloudLabel}: tap a message to hear it, and it archives when it finishes.`
+        : "reading mode: tap a message to hear it, and it archives when it finishes."
       : "reading mode off."
   );
   renderControls();

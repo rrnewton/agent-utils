@@ -29,6 +29,8 @@ pub const ENV_READ_TOKEN: &str = "VIBE_TALK_READ_TOKEN";
 pub const ENV_WRITE_TOKEN: &str = "VIBE_TALK_WRITE_TOKEN";
 /// Environment variable carrying the dedicated live-event ingestion token.
 pub const ENV_INGEST_TOKEN: &str = "VIBE_TALK_INGEST_TOKEN";
+/// Environment variable selecting read-aloud: `elevenlabs` (default) or `browser`.
+pub const ENV_READ_ALOUD_BACKEND: &str = "VIBE_TALK_READ_ALOUD_BACKEND";
 /// Environment variable carrying the ElevenLabs API key.
 pub const ENV_ELEVENLABS_API_KEY: &str = "VIBE_TALK_ELEVENLABS_API_KEY";
 /// Environment variable carrying the ElevenLabs agent id.
@@ -141,6 +143,8 @@ pub struct Config {
     pub ingest: IngestConfig,
     /// Channels this server will read.
     pub channels: Vec<ChannelInfo>,
+    /// Read-aloud backend, independent of conversational voice mode.
+    pub read_aloud: ReadAloudConfig,
     /// ElevenLabs wiring, when configured.
     pub elevenlabs: ElevenLabsConfig,
     /// Durable state: where it lives, and how much of it is kept.
@@ -148,6 +152,26 @@ pub struct Config {
     /// Summarisation policy. Every field is part of the cache key; see
     /// [`crate::summarize::policy_version`].
     pub summaries: SummariesConfig,
+}
+
+/// How message read-aloud is synthesized; separate from conversational voice mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReadAloudBackend {
+    /// Server audio from ElevenLabs, preserving the default for existing deployments.
+    #[default]
+    ElevenLabs,
+    /// Browser Web Speech using a voice advertised as local by the browser.
+    Browser,
+}
+
+/// Backend selection for tapping messages to read them aloud.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadAloudConfig {
+    /// Speech backend; defaults to ElevenLabs when omitted.
+    #[serde(default)]
+    pub backend: ReadAloudBackend,
 }
 
 /// What a summary is, in numbers.
@@ -345,7 +369,7 @@ impl IngestConfig {
 /// specific refusal naming the absent setting, never a silent fallback. See
 /// [`crate::elevenlabs::credentials`].
 // Clone because the agent summariser has to HOLD this: `Summarizer::summarize` takes no
-// configuration, unlike the signed-URL and speech paths, so a backend that talks to ElevenLabs
+// configuration, unlike the signed-URL client, so a backend that talks to ElevenLabs
 // cannot be handed the settings at call time and must be built with them.
 #[derive(Clone, Debug)]
 pub struct ElevenLabsConfig {
@@ -418,6 +442,8 @@ struct FileConfig {
     channels: Vec<FileChannel>,
     #[serde(default)]
     elevenlabs: FileElevenLabs,
+    #[serde(default)]
+    read_aloud: ReadAloudConfig,
     #[serde(default)]
     storage: FileStorage,
     #[serde(default)]
@@ -798,6 +824,21 @@ impl Config {
                 token: ingest_token,
             },
             channels,
+            read_aloud: ReadAloudConfig {
+                backend: match get(ENV_READ_ALOUD_BACKEND) {
+                    None => file.read_aloud.backend,
+                    Some("browser") => ReadAloudBackend::Browser,
+                    Some("elevenlabs") => ReadAloudBackend::ElevenLabs,
+                    Some(other) => {
+                        return Err(ConfigError::Invalid {
+                            field: "read_aloud.backend".to_owned(),
+                            detail: format!(
+                                "unknown backend {other:?}; choose browser or elevenlabs"
+                            ),
+                        })
+                    }
+                },
+            },
             elevenlabs: ElevenLabsConfig {
                 agent_id: get(ENV_ELEVENLABS_AGENT_ID)
                     .map(str::to_owned)

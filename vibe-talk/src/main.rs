@@ -6,13 +6,14 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use vibe_talk::agent_backend::NoAgentBackend;
 use vibe_talk::chat::ChatClient;
-use vibe_talk::config::{Config, ENV_CONFIG_PATH};
+use vibe_talk::config::{Config, ReadAloudBackend, ENV_CONFIG_PATH};
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::discord::http::HttpDiscordClient;
 use vibe_talk::elevenlabs::http::HttpElevenLabsClient;
-use vibe_talk::elevenlabs::{SignedUrlProvider, SpeechProvider};
+use vibe_talk::elevenlabs::SignedUrlProvider;
 use vibe_talk::probe::{self, ENV_SKIP_STARTUP_PROBE};
 use vibe_talk::retrieval::LexicalRanker;
+use vibe_talk::speech::SpeechProvider;
 use vibe_talk::state::AppState;
 use vibe_talk::store::disabled::DisabledStore;
 use vibe_talk::store::sqlite::SqliteStore;
@@ -449,7 +450,22 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let bind = config.bind;
-    let speech: Arc<dyn SpeechProvider> = Arc::clone(&elevenlabs_client) as Arc<dyn SpeechProvider>;
+    let speech: Arc<dyn SpeechProvider> = match config.read_aloud.backend {
+        ReadAloudBackend::Browser => Arc::new(vibe_talk::speech::BrowserSpeech),
+        ReadAloudBackend::ElevenLabs => {
+            Arc::new(vibe_talk::elevenlabs::speech::ElevenLabsSpeech::new(
+                elevenlabs_client.clone(),
+                config.elevenlabs.clone(),
+            ))
+        }
+    };
+    let read_aloud = speech.describe();
+    tracing::info!(
+        backend = read_aloud.backend,
+        label = read_aloud.label,
+        playback = ?read_aloud.playback,
+        "message read-aloud configured independently of conversational voice mode"
+    );
     let elevenlabs: Arc<dyn SignedUrlProvider> = elevenlabs_client;
     let live_limit = config.discord.default_fetch_limit;
     let state = AppState {

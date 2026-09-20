@@ -6,7 +6,20 @@ value. `README.md` is the reference; this is the path through it.
 **It assumes you have nothing.** No cloud account, no domain, no reverse proxy, no orchestrator —
 one machine that can run a process and reach `discord.com` outbound is the whole requirement.
 **Step 4, putting it on the internet, is OPTIONAL**: a deployment reached only over your LAN or
-over `localhost` is a complete one, and steps 5 and 6 are only for the voice half.
+over `localhost` is a complete one, and steps 5 and 6 are only for conversational voice.
+
+For message read-aloud without a hosted agent, add this to the server's TOML configuration:
+
+```toml
+[read_aloud]
+backend = "browser"
+```
+
+Restart and reload the page in Chrome on Android. Open the message view, press **Read**, and tap
+a message. This uses the phone's configured speech engine and needs an installed voice.
+See [device speech](README.md#reading-messages-with-a-device-voice) for setup,
+offline-voice considerations, and browser limitations. Existing deployments keep ElevenLabs
+read-aloud unless they select this backend.
 
 Budget about an hour if you do all six, most of it clicking through two dashboards and waiting on
 DNS. Half that if you stop after step 3.

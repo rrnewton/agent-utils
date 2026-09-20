@@ -135,8 +135,8 @@ async fn a_correctly_wired_deployment_reports_every_check_green() {
     let body = report(state).await;
     assert_eq!(body["ok"], true, "{body:#}");
     assert_eq!(body["failed"], 0, "{body:#}");
-    // Token, two channels, key, agent, voice, summaries, storage.
-    assert_eq!(body["checks"].as_array().expect("checks").len(), 8);
+    // Token, two channels, read-aloud selection, key, agent, voice, summaries, storage.
+    assert_eq!(body["checks"].as_array().expect("checks").len(), 9);
     for check in body["checks"].as_array().expect("checks") {
         assert_eq!(check["status"], "pass", "{check:#}");
         // A check that passed must say WHAT it established, or it cannot be told from one that
@@ -633,6 +633,46 @@ async fn an_explicitly_configured_voice_is_reported_as_the_one_that_wins() {
         text(voice, "detail").contains("voice_chosen_by_hand"),
         "{voice:#}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Device speech is separate from ElevenLabs configuration.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn browser_read_aloud_is_identified_without_claiming_device_playback_was_verified() {
+    let config = format!(
+        "{}\n[read_aloud]\nbackend = 'browser'\n",
+        vibe_talk::testing::config_toml_without_elevenlabs()
+    );
+    let (state, _chat, elevenlabs) = vibe_talk::testing::state_from_toml(&config);
+    let body = report(state).await;
+    let selected = check(&body, "read_aloud");
+    assert_eq!(selected["title"], "Read-aloud backend selection");
+    assert_eq!(selected["subject"], "browser");
+    assert_eq!(selected["status"], "pass");
+    assert_eq!(selected["unconfigured"], false);
+    let detail = text(selected, "detail");
+    assert!(detail.contains("Device voice selected"), "{selected:#}");
+    assert!(
+        detail.contains("no ElevenLabs credentials are needed"),
+        "{selected:#}"
+    );
+    assert!(
+        detail.contains("cannot verify browser voice availability or audible playback"),
+        "{selected:#}"
+    );
+    assert!(
+        detail.contains("tap a message on the device"),
+        "{selected:#}"
+    );
+
+    let voice = check(&body, "elevenlabs.voice");
+    assert_eq!(voice["title"], "ElevenLabs voice");
+    assert_eq!(voice["unconfigured"], true);
+    assert_ne!(voice["title"], selected["title"]);
+    assert!(elevenlabs.requested().is_empty());
+    assert!(elevenlabs.spoken().is_empty());
 }
 
 // ---------------------------------------------------------------------------------------------

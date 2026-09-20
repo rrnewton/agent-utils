@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, Scope};
 use crate::chat::ChatError;
-use crate::elevenlabs::{SignedUrl, SignedUrlError, SpeechError};
+use crate::elevenlabs::{SignedUrl, SignedUrlError};
 use crate::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
 use crate::ops::{self, OpError};
 use crate::retrieval::Resolution;
+use crate::speech::SpeechError;
 use crate::state::AppState;
 use crate::store::{ConversationId, ConversationSummary, ReadMark, Speaker, StoreError, Turn};
 use crate::summary::DigestEntry;
@@ -121,17 +122,16 @@ impl From<SpeechError> for ApiError {
     fn from(value: SpeechError) -> Self {
         let code = value.code();
         let status = match value {
-            // The operator has to set `elevenlabs.voice_id` and restart. Retrying will not help,
-            // and this is distinguishable from ElevenLabs having refused us.
-            SpeechError::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // A missing provider setting requires operator action rather than a retry.
+            SpeechError::NotConfigured { .. } => StatusCode::SERVICE_UNAVAILABLE,
             // The CALLER asked for something impossible, and no vendor call was made. 422 rather
             // than 502: nothing upstream went wrong, and a reader must not be told the voice
             // service is broken because they tapped a message with no words in it.
             SpeechError::Empty => StatusCode::UNPROCESSABLE_ENTITY,
-            SpeechError::Transport(_) | SpeechError::Status { .. } => StatusCode::BAD_GATEWAY,
+            SpeechError::Backend { .. } => StatusCode::BAD_GATEWAY,
+            SpeechError::BrowserPlaybackRequired => StatusCode::CONFLICT,
         };
-        // `Display` for every variant is already redacted at construction; see
-        // `SpeechError::from_response`.
+        // Provider adapters redact their errors before crossing the shared speech boundary.
         Self::new(status, code, value.to_string())
     }
 }
@@ -496,6 +496,8 @@ pub struct ClientConfigResponse {
     /// ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public
     /// widget. The API key never leaves the server.
     pub elevenlabs_agent_id: Option<String>,
+    /// Selected read-aloud backend and the playback interface the browser should use.
+    pub read_aloud: crate::speech::Description,
     /// Server version, so a stale cached page is visible.
     pub version: &'static str,
     /// Whether the operator has allowed an earlier transcript to be replayed into a new call.
@@ -548,6 +550,7 @@ pub async fn client_config(
         chat_provider_name: state.chat.provider_name().to_owned(),
         channels: ops::channels(&state).await,
         elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
+        read_aloud: state.speech.describe(),
         version: env!("CARGO_PKG_VERSION"),
         live_poll_seconds: state.config.discord.live_poll_seconds,
         live_delivery: if state.config.ingest.enabled() {
@@ -673,10 +676,7 @@ pub async fn speak(
     );
     let characters = said.chars().count();
     let asked = std::time::Instant::now();
-    let spoken = state
-        .speech
-        .speak(&state.config.elevenlabs, &said, query.speed)
-        .await?;
+    let spoken = state.speech.speak(&said, query.speed).await?;
     let generated_ms = asked.elapsed().as_millis();
     let bytes = spoken.audio.len();
     // At the vendor's default mp3 bitrate this is roughly sixteen kilobytes per second of speech,
@@ -723,7 +723,7 @@ pub struct SpeakQuery {
     ///
     /// Clamped rather than validated: a slider is a blunt instrument and a request refused for
     /// being slightly out of range would be a tap that did nothing. See
-    /// [`crate::elevenlabs::clamp_speed`].
+    /// [`crate::speech::clamp_speed`].
     pub speed: Option<f64>,
 }
 
@@ -1583,7 +1583,7 @@ mod tests {
              inside channelName"
         );
         assert_eq!(
-            VOICE_JS.matches(".label").count(),
+            channel_label_reads_in_voice_page(VOICE_JS),
             3,
             "web/voice.js reads a channel's configured label somewhere other than the fallback \
              inside channelName and the two sentences the alias editor shows"
@@ -1596,6 +1596,30 @@ mod tests {
             "the alias editor on /voice must be where the other two readings of the configured \
              label are; if they moved, this count is guarding the wrong thing"
         );
+    }
+
+    fn channel_label_reads_in_voice_page(source: &str) -> usize {
+        // Read-aloud metadata also has a label. Exempt only its accesses in the function that
+        // binds `speech` to `config.read_aloud`; channel.label in that same function still counts.
+        let config = function_body(source, "function applyClientConfig(");
+        assert!(config.contains("const speech = config.read_aloud;"));
+        let without_speech_label = config.replace("speech.label", "speech_provider_name");
+        source
+            .replacen(config, &without_speech_label, 1)
+            .matches(".label")
+            .count()
+    }
+
+    #[test]
+    fn speech_metadata_exemption_does_not_hide_direct_channel_labels() {
+        let changed = VOICE_JS.replacen(
+            "function applyClientConfig(config) {",
+            "function applyClientConfig(config) {\n  heading = channel.label;",
+            1,
+        );
+        assert_eq!(channel_label_reads_in_voice_page(&changed), 4);
+        let changed = format!("{VOICE_JS}\nheading = speech.label;\n");
+        assert_eq!(channel_label_reads_in_voice_page(&changed), 4);
     }
 }
 
@@ -2202,6 +2226,9 @@ pub async fn prepare_speech(
     Json(request): Json<PrepareSpeechRequest>,
 ) -> Result<Json<PrepareSpeechResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
+    if state.speech.describe().playback == crate::speech::Playback::Browser {
+        return Err(SpeechError::BrowserPlaybackRequired.into());
+    }
     let window = if let Some(thread_id) = request.thread_id.as_deref() {
         if request.ids.len() > usize::from(ops::MAX_PAGE) {
             return Err(ApiError::bad_request(
@@ -2241,16 +2268,16 @@ pub async fn prepare_speech(
             channel: window.channel.id.0.clone(),
             message: message.id.0.clone(),
             said,
-            speed: crate::elevenlabs::clamp_speed(request.speed),
+            speed: crate::speech::clamp_speed(request.speed),
         });
         prepared.push(PreparedSpeech {
             message_id: message.id.0.clone(),
             url: format!("/api/v1/speech/{ticket}"),
         });
     }
-    // Best effort and deliberately not awaited for correctness: warming the voice makes the first
-    // tap fast, and failing to warm it makes the first tap ordinary rather than broken.
-    let _ = state.speech.speak(&state.config.elevenlabs, "", None).await;
+    // Best effort: warming reusable provider resources makes the first tap fast; a warm-up
+    // failure leaves the actual playback request to report the provider's actionable error.
+    let _ = state.speech.warm_up().await;
     Ok(Json(PrepareSpeechResponse {
         prepared,
         expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
@@ -2284,7 +2311,7 @@ pub async fn play_speech(
     let began = std::time::Instant::now();
     let stream = state
         .speech
-        .speak_stream(&state.config.elevenlabs, &prepared.said, prepared.speed)
+        .speak_stream(&prepared.said, prepared.speed)
         .await?;
     // TIME TO FIRST BYTE, which is now the number that matters. The old measurement timed the whole
     // generation because the reader waited for the whole generation; they no longer do.

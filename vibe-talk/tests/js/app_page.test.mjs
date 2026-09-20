@@ -195,7 +195,8 @@ class FakeElement {
 function newPage(
   channels = [{ ...CHANNEL }],
   store = new Map([["vibe-talk.token", "read-token-aaaaaaaaaaaaaaaa"]]),
-  chatProviderName = undefined
+  chatProviderName = undefined,
+  readAloud = undefined
 ) {
   const elements = new Map();
   for (const [id, markup] of PAGE_ELEMENTS) {
@@ -250,6 +251,8 @@ function newPage(
     createdTags: [],
     /** Everything the page has asked this browser to say out loud. */
     spoken: [],
+    utterances: [],
+    deviceVoices: [],
   };
 
   /** The channel the fake server answers WITH: the same overlay `ops::allowed` applies. */
@@ -286,11 +289,13 @@ function newPage(
     document,
     localStorage,
     console,
+    navigator: { language: "en-US" },
     setTimeout,
     window: {
       speechSynthesis: {
         cancel: () => {},
-        speak: (utterance) => page.spoken.push(utterance.text),
+        getVoices: () => page.deviceVoices,
+        speak: (utterance) => { page.spoken.push(utterance.text); page.utterances.push(utterance); },
       },
     },
     SpeechSynthesisUtterance: class {
@@ -306,6 +311,7 @@ function newPage(
           chat_provider_name: chatProviderName,
           channels: page.channels,
           elevenlabs_agent_id: null,
+          read_aloud: readAloud,
           live_poll_seconds: 30,
         });
       }
@@ -529,4 +535,32 @@ test("an alias is text the page renders as CHARACTERS, never as markup", async (
     ["div", "li", "option", "p", "span"],
     "the page created an element it does not create for an ordinary channel name"
   );
+});
+
+
+test("the digest page selects a local device voice only when that backend is configured", async () => {
+  const remote = { name: "Remote", lang: "en-US", localService: false, default: true };
+  const local = { name: "Installed", lang: "en-US", localService: true };
+  const page = newPage(undefined, undefined, undefined, { playback: "browser", local_only: true });
+  page.deviceVoices = [remote];
+  await page.settle();
+  await page.el("refresh-digest").click();
+  await page.el("speak-digest").click();
+  assert.equal(page.spoken.length, 0);
+  assert.match(page.el("status").textContent, /Text-to-speech settings/);
+  page.deviceVoices = [remote, local];
+  await page.el("speak-digest").click();
+  assert.equal(page.utterances.length, 1);
+  assert.equal(page.utterances[0].voice, local);
+  assert.equal(page.utterances[0].lang, "en-US");
+  page.utterances[0].onerror();
+  assert.match(page.el("status").textContent, /could not play/);
+});
+
+test("the digest page preserves browser-default playback for an older server", async () => {
+  const page = await loaded();
+  await page.el("refresh-digest").click();
+  await page.el("speak-digest").click();
+  assert.equal(page.spoken.length, 1);
+  assert.equal(page.utterances[0].voice, undefined);
 });

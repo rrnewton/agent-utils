@@ -943,6 +943,7 @@ function newPage(store = new Map(), script = SCRIPT) {
         chat_provider_name: page.chatProviderName,
         channels: page.channels,
         elevenlabs_agent_id: "agent_test",
+        read_aloud: page.readAloud,
         live_poll_seconds: page.livePollSeconds,
         live_delivery: page.liveDelivery,
         channel_registration_supported: page.channelRegistrationSupported,
@@ -1251,6 +1252,7 @@ function newPage(store = new Map(), script = SCRIPT) {
   FakeWebSocket.OPEN = 1;
 
   const navigator = {
+    language: "en-US",
     mediaDevices: {
       getUserMedia: async (constraints) => {
         // Rebuilt in THIS realm, key for key. The page's object is made inside the vm context, so
@@ -1670,6 +1672,38 @@ function newPage(store = new Map(), script = SCRIPT) {
       throw new Error(`the page fetched ${path}, which this fixture does not serve`);
     },
   };
+  page.enableDeviceSpeech = (voices = [{ name: "Device English", lang: "en-US", localService: true, default: true }]) => {
+    const listeners = new Map();
+    const engine = {
+      voices,
+      utterances: [],
+      cancellations: 0,
+      autoStart: true,
+      throwOnSpeak: false,
+      getVoices() { return this.voices; },
+      addEventListener(type, fn) { listeners.set(type, fn); },
+      setVoices(next) {
+        this.voices = next;
+        const changed = listeners.get("voiceschanged");
+        if (changed) changed();
+      },
+      cancel() { this.cancellations += 1; },
+      speak(utterance) {
+        if (this.throwOnSpeak) throw new Error("speech engine failure");
+        this.utterances.push(utterance);
+        if (this.autoStart) utterance.start();
+      },
+    };
+    context.window.speechSynthesis = engine;
+    context.window.SpeechSynthesisUtterance = class {
+      constructor(text) { this.text = text; }
+      start() { if (this.onstart) this.onstart(); }
+      end() { if (this.onend) this.onend(); }
+      fail(error = "synthesis-failed") { if (this.onerror) this.onerror({ error }); }
+    };
+    page.deviceSpeech = engine;
+    return engine;
+  };
   vm.createContext(context);
   vm.runInContext(script, context, { filename: "voice.js" });
   return page;
@@ -1790,6 +1824,12 @@ const CLEAR_ARMED_MS = sourceConstant("CLEAR_ARMED_MS");
 // The bands are deliberately WIDE. They are not a second opinion about the tuning; they are the
 // boundary between a judgement and a different behaviour wearing the same name.
 const TUNING_BANDS = {
+  BROWSER_SPEECH_CHUNK_CHARS: [60, 300,
+    "device voices need short utterances to avoid mobile synthesis stalls without pausing every word"],
+  BROWSER_SPEECH_START_MS: [5000, 20000,
+    "a device engine needs time to initialize but must not strand a tapped row indefinitely"],
+  BROWSER_SPEECH_FINISH_MS: [30000, 120000,
+    "short chunks at half speed may take many seconds; a hung engine must eventually release the row"],
   STATUS_DISMISS_MS: [2000, 20000,
     "below a couple of seconds the message goes before it can be read; above twenty it is a " +
     "fixture covering a line of the conversation, the thing #63 status-line-placement took away"],
@@ -3354,8 +3394,13 @@ test("the desktop layout is chosen by CAPABILITY, and no user-agent string decid
     ["web/voice.html", HTML_CODE],
   ]) {
     assert.doesNotMatch(text, /userAgent|userAgentData/, `${name} sniffs the user agent`);
+    // User-facing device-speech setup instructions may name Android. Quoted copy is not a
+    // layout decision; a navigator.userAgent read remains forbidden by the assertion above.
+    const layoutCode = name.endsWith(".js")
+      ? text.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, "")
+      : text;
     assert.doesNotMatch(
-      text,
+      layoutCode,
       /\b(iPhone|iPad|Android|Macintosh|Windows NT)\b/,
       `${name} names a device or an operating system to decide a layout`
     );
@@ -5108,6 +5153,280 @@ async function inReadingMode(page, messages) {
   await page.settle();
   return rows;
 }
+
+
+// Device speech is selected by the backend; cloud audio remains covered by the existing tests.
+const DEVICE_SPEECH = { backend: "browser", label: "Device voice", playback: "browser", local_only: true };
+
+function devicePage(voices) {
+  const page = newPage();
+  page.readAloud = DEVICE_SPEECH;
+  page.enableDeviceSpeech(voices);
+  return page;
+}
+
+test("device speech reads the full raw combined row synchronously without a speech HTTP request", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const text = "The complete message. " + "Another sentence with enough detail to span several utterances. ".repeat(12);
+  const messages = [
+    message({ id: "1000000000000000001", content: text, timestamp: "2026-08-19T14:00:00Z" }),
+    message({ id: "1000000000000000002", content: "The final part of the same row.", timestamp: "2026-08-19T14:00:01Z" }),
+  ];
+  const rows = await inReadingMode(page, messages);
+  assert.equal(rows.length, 1, "fixture did not produce the combined row");
+  const tapped = rows[0].dispatch("click", {});
+  assert.equal(page.deviceSpeech.utterances.length, 1, "speak was deferred beyond the tap's call stack");
+  await tapped;
+  assert.equal(rowState(page, 0).reading, "true");
+  assert.deepEqual(page.dismissCalls, []);
+  const spoken = [];
+  for (let at = 0; at < page.deviceSpeech.utterances.length; at += 1) {
+    const utterance = page.deviceSpeech.utterances[at];
+    spoken.push(utterance.text);
+    assert.ok(Array.from(utterance.text).length <= 180, "an utterance exceeds mobile-safe chunk size");
+    assert.equal(utterance.voice.localService, true);
+    assert.equal(utterance.lang, "en-US");
+    if (at + 1 < 3) assert.deepEqual(page.dismissCalls, [], "archived before all chunks finished");
+    utterance.end();
+  }
+  await page.settle();
+  assert.equal(spoken.join(" "), messages.map((m) => m.content).join(" ").replace(/\s+/g, " ").trim());
+  assert.deepEqual(page.dismissCalls, [{ messages: messages.map((m) => m.id) }]);
+  assert.deepEqual(page.prepareCalls, []);
+  assert.deepEqual(page.speakCalls, []);
+  assert.equal(page.players.length, 0);
+});
+
+test("device speech ignores remote voices and waits for a fresh tap when installed voices appear", async () => {
+  const remote = { name: "Cloud voice", lang: "en-US", localService: false, default: true };
+  const page = devicePage([remote]);
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ content: "Hello from the phone" })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, 0);
+  assert.match(page.el("error").textContent, /Text-to-speech.*download a voice/);
+  assert.equal(readButton(page).getAttribute("data-read-state"), "failed");
+  const local = { name: "Downloaded English", lang: "en-US", localService: true, default: false };
+  page.deviceSpeech.setVoices([remote, local]);
+  assert.equal(page.deviceSpeech.utterances.length, 0, "voiceschanged tried to speak without a new user gesture");
+  assert.equal(readButton(page).getAttribute("data-read-state"), "ready");
+  assert.match(page.el("status").textContent, /Tap a message/);
+  await rows[0].dispatch("click", {});
+  assert.equal(page.deviceSpeech.utterances[0].voice, local);
+  assert.deepEqual(page.prepareCalls, []);
+  assert.deepEqual(page.speakCalls, []);
+});
+
+test("device speech gives useful unsupported-browser guidance without falling back to cloud audio", async () => {
+  const page = newPage();
+  page.readAloud = DEVICE_SPEECH;
+  await signIn(page);
+  const rows = await inReadingMode(page, [message()]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.match(page.el("error").textContent, /Chrome on Android/);
+  assert.equal(readButton(page).getAttribute("data-read-state"), "failed");
+  assert.deepEqual(page.prepareCalls, []);
+  assert.deepEqual(page.speakCalls, []);
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("device speech picks the device language and applies pace to every subsequent chunk", async () => {
+  const french = { name: "French", lang: "fr-FR", localService: true, default: true };
+  const english = { name: "English", lang: "en-US", localService: true, default: false };
+  const page = devicePage([french, english]);
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ content: "A sentence long enough to make multiple parts. ".repeat(12) })]);
+  assert.match(page.el("speed-value").textContent, /device default/);
+  page.el("read-speed-range").value = "145";
+  await page.el("read-speed-range").dispatch("input");
+  await rows[0].dispatch("click", {});
+  assert.equal(page.deviceSpeech.utterances[0].voice, english);
+  assert.equal(page.deviceSpeech.utterances[0].rate, 1.45);
+  page.el("read-speed-range").value = "180";
+  await page.el("read-speed-range").dispatch("input");
+  page.deviceSpeech.utterances[0].end();
+  assert.equal(page.deviceSpeech.utterances[1].rate, 1.8);
+  assert.deepEqual(page.prepareCalls, []);
+});
+
+test("device speech ignores late callbacks from a chunk that has already finished", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ content: "A sentence with several more parts to follow. ".repeat(10) })]);
+  await rows[0].dispatch("click", {});
+  const first = page.deviceSpeech.utterances[0];
+  first.end();
+  assert.equal(page.deviceSpeech.utterances.length, 2);
+  first.end();
+  first.fail();
+  assert.equal(page.deviceSpeech.utterances.length, 2, "a completed chunk queued its successor twice");
+  assert.equal(page.deviceSpeech.cancellations, 0, "an old chunk canceled the next chunk");
+  assert.equal(rowState(page, 0).reading, "true");
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("device speech keeps Unicode intact across a long unbroken message", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const content = "🎵".repeat(410);
+  const rows = await inReadingMode(page, [message({ content })]);
+  await rows[0].dispatch("click", {});
+  for (let at = 0; at < page.deviceSpeech.utterances.length; at += 1) {
+    assert.doesNotMatch(page.deviceSpeech.utterances[at].text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+    page.deviceSpeech.utterances[at].end();
+  }
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.map((part) => part.text).join(""), content);
+  assert.equal(page.dismissCalls.length, 1);
+});
+
+for (const content of ["", "   "]) {
+  test(`device speech does not archive a message with ${JSON.stringify(content)} text`, async () => {
+    const page = devicePage();
+    await signIn(page);
+    const rows = await inReadingMode(page, [message({ content })]);
+    await rows[0].dispatch("click", {});
+    await page.settle();
+    assert.match(page.el("error").textContent, /no text to read/);
+    assert.equal(page.deviceSpeech.utterances.length, 0);
+    assert.deepEqual(page.dismissCalls, []);
+  });
+}
+
+test("device speech cancellation, replacement, and stale events cannot archive an unread row", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", content: "first" }),
+    message({ id: "1000000000000000002", content: "second" }),
+  ]);
+  await rows[0].dispatch("click", {});
+  const first = page.deviceSpeech.utterances[0];
+  await rows[1].dispatch("click", {});
+  assert.equal(page.deviceSpeech.cancellations, 1);
+  first.end();
+  first.fail();
+  assert.equal(rowState(page, 1).reading, "true");
+  assert.deepEqual(page.dismissCalls, []);
+  await rows[1].dispatch("click", {});
+  page.deviceSpeech.utterances[1].end();
+  assert.equal(page.deviceSpeech.cancellations, 2);
+  assert.equal(page.deviceSpeech.utterances.length, 2, "second tap restarted rather than stopped");
+  assert.deepEqual(page.dismissCalls, []);
+  assert.equal(rowState(page, 1).reading, "false");
+});
+
+test("device speech is interruptible while the engine has not started speaking", async () => {
+  const page = devicePage();
+  page.deviceSpeech.autoStart = false;
+  await signIn(page);
+  const rows = await inReadingMode(page, [message()]);
+  await rows[0].dispatch("click", {});
+  assert.equal(readButton(page).getAttribute("data-read-state"), "working");
+  await rows[0].dispatch("click", {});
+  page.deviceSpeech.utterances[0].start();
+  page.deviceSpeech.utterances[0].end();
+  assert.equal(page.deviceSpeech.cancellations, 1);
+  assert.deepEqual(page.dismissCalls, []);
+  assert.equal(rowState(page, 0).reading, "false");
+  assert.equal(readButton(page).getAttribute("data-read-state"), "ready");
+});
+
+for (const action of ["stop", "view", "settings"]) {
+  test(`device speech cancels when leaving playback by ${action}`, async () => {
+    const page = devicePage();
+    await signIn(page);
+    const rows = await inReadingMode(page, [message()]);
+    await rows[0].dispatch("click", {});
+    if (action === "stop") await readButton(page).click();
+    if (action === "view") await page.el("view-switch").click();
+    if (action === "settings") await page.el("open-settings").click();
+    page.deviceSpeech.utterances[0].end();
+    assert.equal(page.deviceSpeech.cancellations, 1);
+    assert.deepEqual(page.dismissCalls, []);
+    assert.equal(rowState(page, 0).reading, "false");
+  });
+}
+
+for (const error of ["not-allowed", "voice-unavailable", "audio-hardware", "network"]) {
+  test(`device speech surfaces ${error} without archiving or starting a cloud request`, async () => {
+    const page = devicePage();
+    await signIn(page);
+    const rows = await inReadingMode(page, [message()]);
+    await rows[0].dispatch("click", {});
+    page.deviceSpeech.utterances[0].fail(error);
+    await page.settle();
+    assert.equal(page.el("error").hidden, false);
+    assert.equal(readButton(page).getAttribute("data-read-state"), "failed");
+    assert.deepEqual(page.dismissCalls, []);
+    assert.deepEqual(page.speakCalls, []);
+    assert.equal(rowState(page, 0).reading, "false");
+  });
+}
+
+for (const started of [false, true]) {
+  test(`device speech watchdog cancels an engine that never ${started ? "finishes" : "starts"}`, async () => {
+    const page = devicePage();
+    page.deviceSpeech.autoStart = started;
+    await signIn(page);
+    const rows = await inReadingMode(page, [message()]);
+    await rows[0].dispatch("click", {});
+    const timerDelay = sourceConstant(started ? "BROWSER_SPEECH_FINISH_MS" : "BROWSER_SPEECH_START_MS");
+    assert.ok(page.expireTimers(timerDelay) >= 1);
+    assert.match(page.el("error").textContent, /stopped responding/);
+    assert.equal(readButton(page).getAttribute("data-read-state"), "failed");
+    assert.equal(page.deviceSpeech.cancellations, 1);
+    page.deviceSpeech.utterances[0].start();
+    page.deviceSpeech.utterances[0].end();
+    assert.deepEqual(page.dismissCalls, []);
+    assert.equal(rowState(page, 0).reading, "false");
+  });
+}
+
+test("device speech clears watchdogs on stop and replaces the failed status on a successful retry", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message()]);
+  await rows[0].dispatch("click", {});
+  page.deviceSpeech.utterances[0].fail("not-allowed");
+  assert.match(page.el("status").textContent, /was blocked/);
+  await rows[0].dispatch("click", {});
+  assert.equal(page.el("error").hidden, true);
+  assert.match(page.el("status").textContent, /Reading with Device voice/);
+  await readButton(page).click();
+  assert.equal(page.expireTimers(sourceConstant("BROWSER_SPEECH_START_MS")), 0);
+  assert.equal(page.expireTimers(sourceConstant("BROWSER_SPEECH_FINISH_MS")), 0);
+  assert.equal(page.el("error").hidden, true);
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("device speech cannot overlap a live voice call or be recorded by its microphone", async () => {
+  const page = devicePage();
+  await startTalking(page);
+  const rows = await inReadingMode(page, [message()]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.match(page.el("error").textContent, /Hang up the voice call/);
+  assert.equal(page.deviceSpeech.utterances.length, 0);
+  assert.equal(page.sockets[0].readyState, 1, "reading closed the live call");
+  assert.ok(page.tracks.every((track) => track.stops === 0), "reading stopped microphone capture");
+  assert.deepEqual(page.speakCalls, []);
+});
+
+test("a configured audio speech backend keeps using server audio even when device voices exist", async () => {
+  const page = devicePage();
+  page.readAloud = { backend: "elevenlabs", label: "ElevenLabs", playback: "audio", local_only: false };
+  await signIn(page);
+  const rows = await inReadingMode(page, [message()]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.ok(page.prepareCalls.length > 0);
+  assert.equal(page.players.length, 1);
+  assert.equal(page.deviceSpeech.utterances.length, 0);
+});
 
 test("READ REPLACES TALK IN THE CHANNEL VIEW, and Talk comes back in the transcript", async () => {
   const page = newPage();
