@@ -9134,6 +9134,48 @@ def _assert_remove_processes(
         _assert_process_descends_from(writer, coordinator, "removal proof writer")
 
 
+@dataclasses.dataclass(frozen=True)
+class _RecoveryProcesses:
+    """Original recovery actor plus the authenticated invoking handoff."""
+
+    coordinator: ProcessIdentity
+    runner: ProcessIdentity
+    writer: ProcessIdentity | None
+    proof_fd: int | None
+
+    @classmethod
+    def capture(cls, coordinator_pid: int) -> _RecoveryProcesses:
+        return cls(*_capture_remove_processes(coordinator_pid))
+
+    def assert_current(self, coordinator: ProcessIdentity) -> None:
+        if coordinator != self.coordinator:
+            raise Refusal("recovery coordinator differs from captured process authority")
+        if (
+            (self.writer is None) != (self.proof_fd is None)
+            or (self.writer is None and self.runner != self.coordinator)
+            or (
+                self.proof_fd is not None
+                and (type(self.proof_fd) is not int or self.proof_fd < 0)
+            )
+        ):
+            raise Refusal("recovery process authority has inconsistent handoff evidence")
+        _assert_remove_processes(
+            self.coordinator, self.runner, self.writer, self.proof_fd
+        )
+
+
+def _assert_recovery_processes(
+    coordinator: ProcessIdentity,
+    processes: _RecoveryProcesses | None,
+    label: str = "coordinator",
+) -> None:
+    if processes is None:
+        # Standalone callers retain their ordinary direct-ancestry contract.
+        _assert_caller_process(coordinator, label)
+    else:
+        processes.assert_current(coordinator)
+
+
 def _capture_registration_owner(pid: int) -> ProcessIdentity:
     """Capture an owner now; registration verifies its authority before publication."""
     return _read_process_identity(pid)
@@ -18319,6 +18361,8 @@ def _recover_finish(
     raw: Mapping[str, object],
     state: ActiveState,
     coordinator: ProcessIdentity,
+    *,
+    processes: _RecoveryProcesses | None = None,
 ) -> None:
     _exact_keys(
         raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
@@ -18443,7 +18487,7 @@ def _recover_finish(
         raise StateError("finish journal has neither its active record nor a durable archive entry")
     if _record_to_obj(current) != _record_to_obj(record):
         raise StateError("finish journal record does not exactly match ACTIVE")
-    _assert_caller_process(coordinator, "coordinator")
+    _assert_recovery_processes(coordinator, processes)
     _assert_not_held(config, current)
     age, expired = _heartbeat_diagnosis(current)
     owner_state, detail = _process_state(current.owner)
@@ -18453,7 +18497,7 @@ def _recover_finish(
         and current.owner == coordinator
     )
     if live_validate_owner:
-        _assert_caller_process(coordinator, "validate owner")
+        _assert_recovery_processes(coordinator, processes, "validate owner")
     else:
         _assert_registered_liveness(config, current)
     if not expired and not validate_complete:
@@ -24593,11 +24637,21 @@ def _allow_only_vanished_process_diagnostics(
     except UnicodeError as exc:
         raise Refusal(f"privileged {program} census diagnostics are undecodable") from exc
     pattern = _FIND_MISSING_RE if program == "find" else _GREP_MISSING_RE
+    changed_diagnostic: str | None = None
     for line in lines:
         match = pattern.fullmatch(line)
         process = processes.get(int(match.group("pid"))) if match else None
-        if process is None or _process_observation_is_active(process):
+        if process is None:
             raise Refusal(f"privileged {program} census produced diagnostics: {line}")
+        if _process_observation_is_active(process):
+            changed_diagnostic = line
+    # Validate every diagnostic before classifying motion: an earlier vanished
+    # FD must not hide a later permission, malformed, or unknown-path refusal.
+    # The enclosing bounded retry discards this entire incomplete census.
+    if changed_diagnostic is not None:
+        raise _ProcessEvidenceChanged(
+            f"privileged {program} census produced diagnostics: {changed_diagnostic}"
+        )
 
 
 def _same_uid_indeterminate_processes(
@@ -24628,14 +24682,17 @@ def _same_uid_indeterminate_processes(
         _FIND_PERMISSION_RE if program == "find" else _GREP_PERMISSION_RE
     )
     indeterminate: dict[int, _AbsentProcessObservation] = {}
+    changed_diagnostic: str | None = None
     for line in lines:
         missing = missing_pattern.fullmatch(line)
         if missing is not None:
             process = processes.get(int(missing.group("pid")))
-            if process is None or _process_observation_is_active(process):
+            if process is None:
                 raise Refusal(
                     f"same-UID {program} census produced diagnostics: {line}"
                 )
+            if _process_observation_is_active(process):
+                changed_diagnostic = line
             continue
         denied = permission_pattern.fullmatch(line)
         process = (
@@ -24646,6 +24703,10 @@ def _same_uid_indeterminate_processes(
         if not _process_observation_is_active(process):
             continue
         indeterminate[process.pid] = process
+    if changed_diagnostic is not None:
+        raise _ProcessEvidenceChanged(
+            f"same-UID {program} census produced diagnostics: {changed_diagnostic}"
+        )
     return tuple(indeterminate.values())
 
 
@@ -25037,11 +25098,16 @@ def _capture_same_uid_process_path_census(
             direct_matches, indeterminate = _same_uid_batched_path_matches(
                 processes, targets, budget
             )
+            privileged_matches = (
+                *_absent_validate_find_matches(indeterminate, targets, budget),
+                *_absent_validate_maps_matches(indeterminate, targets, budget),
+            )
+            # Reject volatile path motion before spending the shared mountinfo
+            # input budget. An accepted attempt still completes every observer.
             matches = (
                 *_absent_validate_mount_matches(processes, targets, budget),
                 *direct_matches,
-                *_absent_validate_find_matches(indeterminate, targets, budget),
-                *_absent_validate_maps_matches(indeterminate, targets, budget),
+                *privileged_matches,
             )
         except _ProcessEvidenceChanged:
             if attempt < 2:
@@ -25760,12 +25826,14 @@ def _capture_process_path_census(
                     include_owner_cgroups=False
                 )
             )
-            mount_matches = _absent_validate_mount_matches(
-                processes, targets, selected_budget
-            )
             path_matches = (
                 *_absent_validate_find_matches(processes, targets, selected_budget),
                 *_absent_validate_maps_matches(processes, targets, selected_budget),
+            )
+            # A failed path observation discards the whole attempt without
+            # first rereading every mount table. Budgets never reset on retry.
+            mount_matches = _absent_validate_mount_matches(
+                processes, targets, selected_budget
             )
         except _ProcessEvidenceChanged:
             if attempt < 2:
@@ -27357,6 +27425,7 @@ def _cmd_recover(
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
+    processes = _RecoveryProcesses(coordinator, runner, handoff_writer, proof_fd)
     with _mutation_locks(config, args.wait_lock):
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         recovered_partial = _recover_partial_updates(config, args.discard_partial)
@@ -27523,6 +27592,7 @@ def _cmd_recover(
                 recovery_record,
                 excluded_paths=excluded,
             )
+        _assert_recovery_processes(coordinator, processes)
         _ensure_event_log(config)
         _write_event_file(
             config,
@@ -27532,6 +27602,12 @@ def _cmd_recover(
                 "slot": raw.get("slot"),
                 "operation": raw.get("kind"),
                 "actor": _identity_to_obj(coordinator),
+                "runner": _identity_to_obj(runner),
+                "handoff_writer": (
+                    _identity_to_obj(handoff_writer)
+                    if handoff_writer is not None
+                    else None
+                ),
                 "coordinator_authorized": bool(args.coordinator_authorized),
             },
         )
@@ -27608,7 +27684,9 @@ def _cmd_recover(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
             try:
-                _recover_finish(config, path, raw, state, coordinator)
+                _recover_finish(
+                    config, path, raw, state, coordinator, processes=processes
+                )
             except Refusal as exc:
                 _restore_interrupted_private_finish_after_refusal(
                     config, raw, exc
