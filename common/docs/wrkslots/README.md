@@ -50,6 +50,11 @@ An assigned agent can run `create` with its own live `--owner-pid` and the live
 records and rechecks both exact process identities. Only an invoking coordinator can create an
 unbound slot or assign another owner, which must be its descendant.
 
+The owner PID must represent that one agent's lifetime. Do not bind several logical agents to a
+shared multiplexing supervisor, coordinator, or application-server PID: process ancestry cannot
+distinguish those agents, and the shared live generation prevents per-agent liveness and reclaim.
+Separate coordinator and owner processes must also be visible in the same Linux PID namespace.
+
 `create` uses an existing source repository and its configured `origin` remote by default. Use
 `--remote NAME=REMOTE` when a checkout should use a different configured remote. Add
 `--remote-url NAME=URL` when the caller must verify that remote's exact fetch URL; otherwise

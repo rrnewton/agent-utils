@@ -58,6 +58,13 @@ Its live `--coordinator-pid` may run separately, including in another terminal p
 ancestry is not evidence of that assignment. The explicit flag records the assignment, while
 the owner ancestry check prevents the agent from binding an unrelated process as owner.
 
+Choose an owner process whose lifetime represents that one assigned agent. A shared multiplexing
+supervisor, coordinator, or application server may be an ancestor of every worker command, but it
+cannot identify which logical agent is alive; binding several agent names to that PID leaves every
+row live until the shared process exits and defeats per-agent liveness and reclaim. Separate
+coordinator and owner processes must be visible in the same Linux PID namespace so their `/proc`
+identities can be read and rechecked.
+
 The coordinator can instead invoke `create` to bind another live child owner. That path requires
 the coordinator to be in the command's ancestry and the owner to descend from the coordinator.
 Omitting `--owner-pid` also requires an invoking coordinator; the owner then immediately runs

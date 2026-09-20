@@ -28391,9 +28391,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
         type=int,
         metavar="PID",
         help=(
-            "live owner PID to bind; the owner may be in this command's ancestry "
-            "even when its assigned coordinator runs separately, or another child "
-            "of the invoking coordinator; omit only when the coordinator creates "
+            "live owner PID whose lifetime represents this one agent; do not use a "
+            "shared multiplexing supervisor. The owner may be in this command's "
+            "ancestry even when its assigned coordinator runs separately, or another "
+            "child of the invoking coordinator; omit only when the coordinator creates "
             "the slot and the owner will immediately adopt"
         ),
     )
