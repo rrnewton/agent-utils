@@ -134,6 +134,30 @@ def test_subscription_request_and_retained_snapshot(tmp_path: Path) -> None:
         assert stream.wait(0) == ()
 
 
+def test_each_exact_next_marker_is_an_independent_line_subscription(tmp_path: Path) -> None:
+    patterns = (
+        r"^</CHAT_REPLY_AAAAAAAAAAAAAAAAAAAAAA_1>$",
+        r"^</CHAT_REPLY_BBBBBBBBBBBBBBBBBBBBBB_7>$",
+    )
+    with _server(tmp_path) as server:
+        stream = PaneOutputStream(server.path, _PANE, patterns, watch_settled=True)
+        try:
+            _, request = server.connection()
+            params = as_mapping(request["params"], "params")
+            subscriptions = params["subscriptions"]
+            assert isinstance(subscriptions, list)
+            output = subscriptions[:2]
+            assert [as_mapping(as_mapping(item, "subscription")["match"], "match")["value"]
+                    for item in output] == list(patterns)
+            assert all(as_mapping(item, "subscription")["type"] == "pane.output_matched"
+                       for item in output)
+            assert [as_mapping(item, "subscription")["type"] for item in subscriptions[2:]] == [
+                "pane.agent_status_changed", "pane.agent_status_changed",
+            ]
+        finally:
+            stream.close()
+
+
 def test_ack_and_snapshot_in_same_socket_write(tmp_path: Path) -> None:
     def handler(connection: socket.socket, request: dict[str, object]) -> None:
         connection.sendall(_wire({"id": request["id"], "result": {"type": "subscription_started"}}) + _wire(_event()))
@@ -151,6 +175,27 @@ def test_partial_utf8_frame_survives_timeout(tmp_path: Path) -> None:
         assert stream.wait(0.01) == ()
         connection.sendall(payload[split:])
         assert "🤖" in _next_snapshot(stream).text
+
+
+def test_nonblocking_socket_readiness_race_retries_within_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _server(tmp_path) as server, _stream(server) as stream:
+        connection, _ = server.connection()
+        original_recv = socket.socket.recv
+        blocked = False
+
+        def recv(current: socket.socket, size: int, flags: int = 0) -> bytes:
+            nonlocal blocked
+            if not blocked and not current.getblocking():
+                blocked = True
+                raise BlockingIOError
+            return original_recv(current, size, flags)
+
+        monkeypatch.setattr(socket.socket, "recv", recv)
+        connection.sendall(_wire(_event()))
+        assert "ready" in _next_snapshot(stream).text
+        assert blocked
 
 
 def test_multiple_frames_are_preserved_in_order(tmp_path: Path) -> None:

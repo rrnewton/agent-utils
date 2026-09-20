@@ -13,6 +13,17 @@ ENTRY_POINT = re.compile(
     re.MULTILINE,
 )
 
+# These helpers are exec targets for trusted parent processes and require
+# inherited private descriptors. Publishing them as user-facing console scripts
+# would expose a nonsensical and unsafe interface, but their exact callable
+# surface remains declared here so a new CLI-shaped module cannot evade review.
+PRIVATE_ENTRY_POINTS = frozenset({
+    ("agentctl._command_anchor", "main"),
+    ("agentctl._command_supervisor", "main"),
+    ("agentctl._event_command_supervisor", "main"),
+    ("agentctl._launch_gate", "main"),
+})
+
 
 def test_public_main_functions_are_declared_entry_points() -> None:
     """Reject CLI-shaped modules that package installers cannot discover."""
@@ -33,4 +44,7 @@ def test_public_main_functions_are_declared_entry_points() -> None:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main":
                     discovered.add((module, node.name))
 
-    assert discovered == declared
+    assert declared.isdisjoint(PRIVATE_ENTRY_POINTS)
+    assert all(module.rsplit(".", 1)[-1].startswith("_")
+               for module, _ in PRIVATE_ENTRY_POINTS)
+    assert discovered == declared | PRIVATE_ENTRY_POINTS

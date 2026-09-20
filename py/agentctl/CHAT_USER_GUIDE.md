@@ -74,7 +74,9 @@ agentctl chat launch --config chat.json --state .agentctl/chat-coordinator \
 target in the reusable configuration, initializes new bridge state, starts the
 bridge, and runs the native coordinator in that same pane. The bridge lives for
 the coordinator's normal lifetime. Its diagnostics go to `bridge.log` under the
-state directory. Exiting the coordinator stops the bridge and returns to the
+state directory. Launch retains only `bridge.log` and `bridge.log.1`, each at
+most 1 MiB; an exit diagnostic reads only the final 2,000 bytes of those files.
+Exiting the coordinator stops the bridge and returns to the
 shell; after killing the launcher externally, check for and stop any surviving
 bridge process before reusing its state.
 
@@ -98,11 +100,32 @@ REST configuration is:
 }
 ```
 
+The configuration must be a private regular file owned by the current account
+(normally mode `0600`) and is limited to 512 KiB. The bridge rejects symlinks,
+hard links, duplicate keys, nonfinite numbers, excessive JSON nesting, and a
+file that changes while its single opened descriptor is read. The same strict
+read rules apply to saved bridge artifacts. `allowed_senders` permits at most
+256 unique canonical IDs of at most 256 UTF-8 bytes each. Each configured
+transport, token, or event command permits at most 128 arguments, 8 KiB per
+argument, and 128 KiB in aggregate. Target identity fields are limited to
+512 bytes, except `expected_cwd` and socket paths, which permit 4 KiB.
+
 Transport settings such as `token_command`, `transport_socket`, and
 `event_command` belong in the same file. `--model` becomes the reply label by
 default; use `--agent-label` when the visible label should differ. `--resume`
 resumes a native conversation, and repeated `--harness-arg` values pass literal
 extra arguments to the harness.
+
+For an inbound-only coordinator, add `"outbound_mode": "disabled"`. The bridge
+still polls or subscribes, durably saves authorized messages, supplies thread
+context on request, and delivers prompts to the pinned Herdr pane. It never
+creates reactions or Chat messages, never opens a reply-capture subscription,
+and refuses `agentctl chat reply` artifacts. The prompt states that outbound
+Chat is disabled and that no Chat reply will be published. This mode overrides
+`ack_reaction` and `reply_mode` defensively, including for pending-looking state
+left in the state directory. `"enabled"` is the default and the only other
+accepted value. A REST deployment using disabled mode needs message-read scope,
+not message-create or reaction-create scope.
 
 Run `launch` only from an idle Herdr shell pane. It refuses a non-Herdr terminal,
 a mismatched workspace environment, a pane already hosting an agent, a missing
@@ -153,7 +176,9 @@ must print only the current token to stdout. `token_env` selects another
 environment variable when needed. Renewing an environment-only token
 requires restarting the bridge with the new environment. Alternatively,
 configure a command or socket transport below to use an existing authenticated
-client.
+client. Tokens are limited to 16 KiB; a token helper's stdout is bounded at that
+credential-sized limit plus its optional line ending rather than the general
+adapter-output limit.
 
 ```sh
 agentctl chat init --config chat.json --state /work/project/.agentctl/.chat
@@ -172,10 +197,12 @@ delay up to 60 seconds. Longer configured intervals double on failure up to one
 day. Backoff never shortens the configured interval, and a successful cycle
 restores it.
 
-With `event_command`, incoming events wake the bridge immediately. A background
-recovery scan runs on connection and every 300 seconds after a completed scan.
-`--reconcile-interval` accepts 10–86400 seconds; `--interval` does not apply in
-this mode. A reported event gap also requests a recovery scan. ACK requests,
+With `event_command`, incoming events wake the bridge immediately. REST
+reconciliation runs on connection, after a reported event gap, and at
+`--reconcile-interval` (10–86400 seconds, default 300); `--interval` does not
+apply in this mode. Independently, a local durable-state recovery pass runs at
+startup and every 300 seconds even when REST reconciliation is configured less
+often. ACK requests,
 Herdr prompt delivery, replies, and recovery scans run independently:
 a busy coordinator does not delay an intake ACK, and a slow ACK does not delay
 prompt delivery. Provider and harness latency still determine when those
@@ -183,9 +210,21 @@ operations finish. See the event adapter contract below to enable this mode.
 
 Reply capture waits on Herdr subscriptions in both modes. A service manager can
 restart the process using the same state directory. `status` displays requests,
-delivery phases, ACK retry state, capture errors, and observer state. Only one
+delivery phases, ACK retry state, capture errors, and observer state. The first
+observed state is durable immediately. Later connection/error flaps are
+coalesced, and the latest state is saved after at most 60 seconds by default.
+`--observer-write-interval` accepts 60–3600 seconds for both `run` and `launch`.
+It is a hard minimum between advisory state writes, not a heartbeat: unchanged
+input and output state causes no write. Input cursor advances remain immediately
+durable regardless of this interval. Use the service supervisor for process
+liveness; `updated_at` records the latest persisted state transition. Older
+releases could save longer observer errors. A compatible file within the 8 KiB
+cap is shortened once to the current 2,000-character bound; a file beyond the
+encoded cap is refused instead of being read and rewritten. Only one
 `run` or `tick` process may own a state directory: `.run.lock` enforces this.
 Stop `run` before using `tick` for one polling, capture, and delivery cycle.
+SIGTERM performs owned stream/process cleanup and exits successfully for service
+managers; interactive SIGINT/Ctrl-C remains exit status 130.
 
 Messages are accepted only from the configured sender resource IDs. A distinct
 bot identity for replies makes authorship clearer. Durable reply IDs suppress the
@@ -196,45 +235,308 @@ names. The bridge does not authorize messages from everyone in a space.
 
 ## Reply capture
 
-`reply_mode` defaults to `"tagged"` for newly ingested requests. Each prompt
-supplies a unique pair of provider-independent tags. The agent may reply once or
-multiple times, including progress updates when requested. Each block becomes a
-separate chat message. Put each tag on its own line, without an enclosing code
-fence, and reuse the request's ID for every reply to that request:
+`reply_mode` defaults to `"tagged"` for newly ingested requests. New requests use
+reply protocol v3. Each prompt supplies an unpredictable 22-character request
+nonce and the exact first reply ID, whose numeric ordinal starts at 1. The agent
+may reply once or multiple times, including progress updates when requested.
+Each block becomes a separate chat message. Put each tag on its own line,
+without an enclosing code fence, and increment the ordinal for every later reply:
 
 ```text
-<CHAT_REPLY_NONCE>
+<CHAT_REPLY_NONCE_1>
 The implementation is ready. I am running the checks.
-</CHAT_REPLY_NONCE>
+</CHAT_REPLY_NONCE_1>
 
-<CHAT_REPLY_NONCE>
+<CHAT_REPLY_NONCE_2>
 The checks passed. The change is ready.
-</CHAT_REPLY_NONCE>
+</CHAT_REPLY_NONCE_2>
 ```
 
 `NONCE` stands for the unique value in that request's actual tags; do not reuse
 this example literally. New requests remain available for further replies after
-earlier replies are sent; a closing tag ends one message, not the request. A later
-user request does not invalidate those earlier reply IDs. `GCHAT_REPLY` tags
-remain accepted for prompts already in flight, while new prompts use
-`CHAT_REPLY`. Completed requests saved under the single-reply protocol are not
-reopened.
+earlier replies are sent; a closing tag ends one message, not the request. A
+later user request does not invalidate the earlier request nonce. Ordinals must
+be consecutive and may not be skipped, duplicated, or reused with different
+text. Capture closes automatically after bounded ordinal 999999. `GCHAT_REPLY`
+spelling remains accepted, while new prompts use `CHAT_REPLY`.
 
-The daemon subscribes to reply tags through Herdr's `events.subscribe` API,
-including unavailable IDs. It rearms its output observation every second so later milestones can be captured
-while the agent is still working. Herdr checks text subscriptions internally
-every 100 milliseconds; this is separate from the chat provider's polling
-interval. Retained terminal history is bounded, so capture is not a lossless
-stream of agent messages.
+The daemon keeps one Herdr `events.subscribe` connection with one line-local
+predicate for each active request's exact next closing marker (at most 128 active
+requests). After a real retained-output snapshot is captured durably, it
+immediately rebuilds the subscription for that request's next ordinal. A single
+snapshot may capture several consecutive ordinals. There is no periodic output
+reconnect. Idle/done status events perform a fresh retained-output read, which
+also recovers final output after scrollback retention changes. Herdr checks text
+subscriptions internally every 100 milliseconds; this is separate from the
+chat provider's polling interval. Retained terminal history is bounded, so
+capture is not a lossless stream of agent messages.
+
+Exact-next predicates guarantee timely valid progress without a 1 Hz scan, but
+an unavailable or malformed marker does not itself wake an exact active-request
+predicate. It is diagnosed when it appears in a snapshot triggered by a valid
+marker or an idle/done read. With no active request, a generic diagnostic
+predicate remains installed. A malformed block whose exact closing marker is
+visible still records `capture_error` immediately.
+
+Protocol v3 is a deliberate state migration. `run` refuses before provider or
+Herdr access when a still-addressable unsequenced v2 (or older pre-versioned)
+request exists. Stop the runner, recover retained unsequenced work with one-shot
+`agentctl chat tick` or a v2-capable bridge, then close each v2
+subscription without deleting history:
+
+```sh
+agentctl chat close --state /work/project/.agentctl/.chat \
+  --request REQUEST_KEY_OR_UNIQUE_HEX_PREFIX
+```
+
+The same `close` command closes a v3 request explicitly. `status` keeps the
+record, reply history, `reply_closed_at`, and closure reason; its
+`reply_subscriptions` object reports the current active count and limit. Closing
+requests frees the 128-request subscription capacity. If v2 recovery is not needed,
+initialize a fresh state directory and retain the old directory for inspection;
+do not erase it to bypass migration.
+
+### Resource and complexity model
+
+Let **R** be retained request records, **Q** retained harness-queue artifacts,
+**F** retained routing-feedback records, **D** deferred possible-echo records,
+**S** unadopted local file submissions, **P** mutable pending-reply journals,
+**M** lifetime reply-history artifacts, **B** their retained body bytes, and
+**L** the retained pane text (hard-capped at 2 MiB). In push mode, unchanged
+provider heartbeats are discarded before the owner mailbox. Between real events
+and recovery deadlines there is no 1 Hz filesystem scan, subscription rebuild,
+or durable observer heartbeat. The owner may wake after at most 30 seconds to
+observe an externally set stop flag; that deadline check performs O(R) in-memory
+work and no filesystem scan. Cursor-changing events write their checkpoint
+immediately. Pending harness delivery keeps an idle/done status subscription
+even with outbound Chat disabled; its output-pattern list is empty, so this
+does not capture terminal text or publish replies. A settled event wakes a
+readiness-checked drain immediately. A missed event is covered by a slow
+300-second delivery fallback, not a 30-second busy retry. Repeated unchanged
+busy errors preserve their existing artifact and timestamp without another
+atomic write or fsync.
+
+The retained intake population is capped at 2,048 request records, 64 MiB
+of complete normalized source-message JSON, and 128 MiB of encoded request
+files, with each normalized message capped at 64 KiB (including resource IDs,
+timestamps, optional fields, and text). Request records use an exact
+version-aware field schema, so unknown padding cannot bypass these budgets.
+Startup and recovery stream this population and refuse before constructing an
+over-limit in-memory list. They also cap F at 1,024 records/16 MiB, D at 1,024
+records/64 MiB, and Q at the derived R+F count with at most 512 KiB per artifact
+and a 512 MiB reservation budget. Reservations include escaped JSON prompt
+bytes, bounded delivery metadata, error sidecars, and temporary atomic replacement
+files. Delivery errors are capped at 2,000 UTF-8 bytes before persistence. Intake
+reserves a complete request batch before writing any new request or advancing its
+cursor; retries reuse the same per-ID reservation. Recovery counts retained metadata
+and sidecars before retaining the queue, and refuses any prompt whose encoded
+artifact plus update allowance cannot fit. Thus inbound-only mode has the same bounds.
+Recovery also counts crash-left `.message.*` files in every queue directory;
+their population is limited to the request/feedback ceilings plus 16, and their
+bytes consume the same budget. A fixed allowance covers target binding,
+its atomic replacement, and lock files. Refusal preserves these artifacts for
+operator inspection; it does not remove potentially active temporary files.
+All new Chat JSON writes, including submissions and queue metadata, share one
+private `.atomic/staged.json` slot under `.atomic.lock`. The lock spans bounded
+serialization, write/fsync, destination replacement or create-only link, and
+directory fsync. This adds at most one 512 KiB payload plus one 8 KiB recovery
+intent per state; internal publication links share the same payload inode,
+rather than one crash-left file per write or destination. Generic queue callers
+retain their existing behavior unless they explicitly select this policy. A
+selected policy also bounds queue reads, writes, and diagnostics when no separate
+artifact limit is supplied; an explicit limit cannot enlarge the policy bound.
+`send` applies the same policy to binding, enqueue, and drain. The staging
+directory and lock pathname cannot be write destinations; only the fixed audit
+marker is allowed inside the staging directory.
+Before publication, the writer durably records the confined destination and
+payload identity. It retains the staging link until the destination directory
+has been fsynced. Recovery retries that fsync before adoption, delivery, or a
+checkpoint may proceed. Before removing any internal payload link, cleanup
+appends a typed, content-free PREPARE phase to the intent and fsyncs both the intent and
+staging directory. The phase shares the existing 8 KiB metadata bound; a failed
+preparation preserves the original intent bytes and all payload links. Cleanup
+then removes internal links, fsyncs, and revalidates every held inode and the
+final name while the phase is still durable. Only after those post-unlink checks
+and cleanup fsync succeed does it append and fsync COMMIT. Unlinking the intent is the
+commit point and final namespace operation; only a directory fsync follows it.
+The next writer may reclaim only those fixed, owned, mode-0600 regular entries;
+an unsafe or oversized slot is refused and preserved. If a create-only write
+crashed after linking its final name, reclaiming the slot preserves the final
+artifact. Corrupt post-publication intent is refused without discarding evidence.
+A malformed partial intent can be reclaimed only while its owned payload has
+exactly one link and no publication link exists. It uses the same durable cleanup
+phase before removing the payload. PREPARE recovery resumes only when a trusted
+payload, publication link, or matching final remains. Between last-anchor unlink
+and durable COMMIT, a crash can leave no trusted anchor; that irreducibly ambiguous
+state requires offline inspection. A complete COMMIT certifies the post-unlink
+checks and permits remaining intent cleanup. A partial COMMIT is only PREPARE,
+not a certificate. Detected interference remains refused across restart. Errors
+report bounded diagnostics and digests, not payload text. These are
+interference checks, not exclusion of arbitrary same-UID writers: a transient
+alias hidden by our own unlink's ctime update, or changes after the final check,
+cannot be atomically ruled out on Linux. No later semantic validation relies on
+reconstructing recovery evidence after the commit point.
+
+At first owner startup, a bounded migration audit holds the runner, submission,
+queue-binding, queue-delivery, and atomic locks in that order. Normal queue
+operations release binding before taking delivery, so the audit adds no reverse
+lock dependency. It reports scattered `.message.*`
+files with paths and byte counts for offline cleanup; it never glob-deletes
+them. The audit refuses unsafe entries, more than 128 scattered temporaries,
+or more than 64 MiB. A durable `.atomic/audited-v1.json` marker avoids later
+history-directory walks. Submission commands audit their own directory under
+the submission lock until the owner has completed that migration. Ordinary
+event-driven writes check only the fixed slot and do not scan staging directories.
+`request-limit.json` and `population-limit.json` retain coalesced refusal
+diagnostics. At exhaustion, already accepted work remains durable, while the
+new message is refused without advancing its event or REST checkpoint. Drain
+the old state and rotate to a fresh state directory; raising a service memory
+limit does not repair an over-limit state.
+
+Every durable JSON body also has an individual encoded-file cap: 512 KiB for
+`bridge.json`, request, feedback, deferred, and current delivery-queue records;
+32 KiB for `input.json`; 8 KiB for `output.json` and reply receipts; and 256 KiB
+for pending/history reply items and local submissions. Coalesced refusal
+diagnostics are limited to 64 KiB. Each older embedded reply outbox that
+otherwise validates may be migrated up to 256 MiB, and all such encoded
+monoliths together may consume at most the 1 GiB state-wide reply budget. The
+bridge removes each monolith durably after its sharded summary verifies; a
+failed cleanup is retried from that current summary without remigrating. Any
+larger older-format outbox or saved artifact is refused. Writes are finite JSON
+and are size-checked before a
+temporary is created. Reads use one no-follow, nonblocking descriptor, require a
+private current-user regular file with one link, read at most cap plus one byte,
+and reject duplicate keys, nonfinite numbers, excessive nesting, and an unstable
+opened file. REST and command-adapter JSON responses are limited to 8 MiB, and
+poll, stream, and context cursors to 8 KiB.
+
+Regardless of `--reconcile-interval`, an unconditional local durable-state
+recovery pass every 300 seconds rereads and sorts request records, costing
+O(R log R), and inspects O(Q + F + D + P) queue/feedback/deferred/pending
+artifacts plus O(P x 30 KiB) pending body bytes needed for recovery. Runtime
+recovery decodes each R/Q/F/D artifact once; the queue's delivery lock keeps
+phase names stable while the same auxiliary pass builds prompt, feedback, and
+deferred indexes. Queue bodies are discarded after their small prompt index
+entries are derived.
+Cold validation and status do not build these runtime caches: they retain only
+the current auxiliary body and scalar identity/reservation indexes. Usage and
+reservations become admission authority only after a complete validated scan;
+any read failure or refusal invalidates the cached authority. Reply-text
+index rebuilds touch each pending key once, not the accumulated index once per
+request. Both sharded and embedded reply summaries must pass per-request
+and state-wide count/byte caps before any pending bodies are materialized. It does
+not enumerate immutable sent history, so its cost is independent of M and B. This is
+distinct from configurable provider reconciliation. Each completed REST
+reconciliation also refreshes these local indexes at the same asymptotic cost,
+so choosing an interval below 300 seconds deliberately increases scan cadence.
+Fully idle push operation is therefore not scan-free.
+
+Continuous owners keep a small `(literal line, digest)` index for Q prompts,
+not a second in-memory copy of every prompt body. A valid output event builds
+the visible-line set in O(L), checks Q small anchors, and exact-reads only the
+V queue artifacts whose anchors are actually visible; it never scans a queue,
+feedback, deferred, or reply-history directory. Exact full-prompt matching and
+removal cost O(V x L), so ordinary output CPU is O(Q + V x L + R + L), with
+V <= Q. One-shot `tick`/capture, which has no long-lived owner cache, may read
+all Q queue artifacts once. Feedback and deferred possible echoes are indexed
+at startup/recovery and updated by exact event IDs; their lifetime directories
+are not rescanned after each output event. Output capture writes one pending
+artifact and a constant-size request summary per new block. Send
+completion updates that pending journal, creates one immutable history artifact
+and exact provider-ID receipt, updates the request summary, then removes the
+pending journal. These durability operations are O(1) artifacts and O(body)
+bytes per reply rather than rewriting prior bodies.
+The streaming owner reuses its request cache and rereads only records changed by
+capture. Marker advances pass an immutable owner-authorized snapshot to the
+subscription worker, which rechecks target identity without request-directory
+scans or reads. Public one-shot opens still validate durable state. Polling
+shares one validated request snapshot between marker selection, capture, and
+subscription open/reopen; unchanged waits do not reload it. Each snapshot
+streams and checks count/byte caps before retaining each record. A released
+batch of D deferred messages uses one request-population preflight, O(R + D),
+and leaves all deferred sources intact if admission fails. Replaying an
+unchanged retained snapshot does not rewrite request metadata. A
+malformed multi-request snapshot can invoke conservative per-request parser
+isolation, with an adversarial O(R x L) fallback; an unavailable-ID diagnostic
+also sorts at most R destinations once, at O(R log R). Request/deadline staging
+retains an O(R) CPU pass per real event or deadline. Command transports are
+bounded to 60 seconds, 8 MiB stdout, and 64 KiB stderr; crossing a bound terminates the
+helper process group, including descendants left behind by a successful leader.
+On Linux, bounded command helpers require `pidfd_open` and process-descriptor
+signals. Unavailable descriptors or descriptor exhaustion refuse execution
+before the adapter receives permission to start. A trusted supervisor publishes
+a separate process-group anchor; the caller validates both identities before
+acknowledging execution. The supervisor kills and reaps the original group and
+returns the adapter's exact exit or signal status over a private bounded channel.
+Before spawning it, the caller reads the exact Linux `sigaction` and refuses
+unless `SIGCHLD` is `SIG_DFL` with `SA_NOCLDWAIT` clear; otherwise a direct child
+could be auto-reaped and its numeric PID reused during a descriptor-failure race.
+Missing or malformed status is a failure. Cancellation first asks the supervisor
+to clean up. Emergency cleanup freezes and checks the exact identities, takes a
+stable stopped group census,
+and requires all recorded processes to disappear. Caller death also wakes a
+stopped supervisor so it can clean up. Descendants deliberately escaping into
+another session or process group are outside this containment contract.
+`chat launch` likewise blocks on pidfds for the bridge and coordinator instead
+of polling either process. A bridge-only exit gets one event-driven 200 ms
+coalescing wait for coordinator completion, matching the former observation
+window without waking while both processes remain alive. Each launch child first
+runs an inert parent-death gate. The bridge or coordinator command cannot execute
+until the launcher validates the gate's identity, owns its pidfd, and receives the
+gate's bounded readiness byte proving its double-checked parent-death lifeline is
+armed. SIGTERM during either `Popen` window is recorded through a self-pipe and
+acted on only after the new child is tracked. Pidfds remain open through exact
+status collection and reaping. If both post-spawn pidfd attempts fail, cleanup
+first revalidates the still-unreaped direct child's PID, start time, and PPID before
+waking, killing, reaping, and proving it disappeared. Bridge process-group signals
+additionally require its still-live or unreaped leader identity to match the
+recorded PID, start time, session, and PGID.
+Launch applies the same pre-spawn `SIGCHLD` requirement, because automatic
+reaping could destroy that zombie pin and its authoritative wait status.
+
+Persistent event commands run behind a trusted supervisor and live process-group
+anchor. The provider does not exist until the bridge has acquired and validated
+pidfds for both helpers and acknowledged their identities; only then can it
+receive the subscription request. The supervisor reports the provider's exact
+final status on a separate bounded channel. Inherited automatic child reaping is
+rejected before the supervisor or provider exists. If descriptor acquisition or
+registration is unavailable, the attempt fails closed and the input runner
+applies its bounded reconnect backoff; there is no periodic `waitid` fallback.
+One-shot and persistent supervisors capture their direct-child identity before
+pidfd acquisition. If both post-spawn attempts fail, cleanup first closes ACK
+and lifeline authority, then revalidates PID, start time, PPID, process group,
+and session before each numeric wake or kill. It reaps and proves the supervisor
+disappeared before preserving the original descriptor error, while the closed
+ACK and lifeline plus supervisor death remove any pre-ACK anchor.
+
+Reply bodies are limited to 30,000 UTF-8 bytes. Operational caps are 4,096
+replies or 64 MiB per request, 65,536 replies or 1 GiB per state, and 1,024
+pending replies or 32 MiB per state. Reaching a cap closes further tagged
+capture with `reply_close_reason: "storage_limit"` while retaining history and
+continuing delivery of already-pending replies. The protocol ordinal ceiling
+999999 is not the operational storage budget. The create-only local submission
+staging area is independently bounded to 1,024 files and 32 MiB while a runner
+is stopped; `chat reply` checks that bounded S population under its own local
+lock at O(S) files and O(S x 30 KiB) decoded body bytes. This is an explicit
+local CLI operation, not a service-loop scan. Owner adoption applies the
+reply/pending caps above. A submission that no
+longer fits is recorded by digest/byte count and rejection reason in its request,
+then unlinked last so a crash cannot retry or leak the unaccounted body. Default
+`status` is O(R) and reports request, auxiliary, and reply counts, bytes, caps,
+phase, last reply ID, refusal diagnostics, and closure fields;
+it never reads reply bodies. An explicit deep audit reads them at O(M + B):
+
+```sh
+agentctl chat history --state /work/project/.agentctl/.chat \
+  --request REQUEST_KEY_OR_UNIQUE_HEX_PREFIX
+```
 
 The bridge saves each complete tagged block durably before sending it with its
 own stable reply ID. It prefixes each posted message with `agent_label`. Each
 reply may contain up to 30,000 UTF-8 bytes. Text outside the tags is not sent.
-Two complete identical blocks in retained output are two messages; rereading
-the same snapshot does not send them again. If the original identical block has
-already disappeared from retained history, a new identical block cannot reliably
-be distinguished from a redraw and is conservatively treated as a replay. Use
-distinct milestone text when sending repeated updates.
+Two complete identical bodies with consecutive ordinals are two messages;
+rereading the same ordinal and body does not send it again. A reused ordinal with
+different text is refused rather than guessed.
 
 If the agent uses an unavailable reply ID, the bridge queues a protocol error
 directly to that agent. The error identifies the unavailable ID and lists the
@@ -252,9 +554,18 @@ agentctl chat reply --state /work/project/.agentctl/.chat \
   --request REQUEST_KEY --file answer.txt
 ```
 
-You may run `reply` while the daemon is running. The streaming runner checks for
-saved file replies at least once per second; the polling runner picks them up
-on its next cycle. This pickup interval does not include the provider's send time.
+The reply file must be a current-user, single-link regular file containing at
+most 30,000 valid UTF-8 bytes. Ordinary user-owned input permissions such as
+`0644` are accepted; this explicit operator input is not durable bridge
+authority. The command opens it once without following symlinks and refuses
+group/world-writable files, hard links, FIFOs, devices, files that grow while
+being read, and invalid UTF-8.
+
+You may run `reply` while the daemon is running. After the artifact is durable,
+the streaming runner receives a nonblocking private local notification and wakes
+immediately. A five-minute recovery scan covers a missed notification or a
+restart. The polling runner picks replies up on its next provider cycle. This
+pickup interval does not include the provider's send time.
 File submission remains a recovery path for one immutable first reply: retrying
 the same text is idempotent, and replacing it with different text is refused.
 Use tagged output for subsequent replies.
@@ -311,9 +622,23 @@ somebody else's emoji as its own ACK. Keep the OAuth actor stable across retries
 ## Durable state and recovery
 
 State directories are private to the current account. `requests/` holds source
-messages and delivery phases, `queue/` is the existing durable Herdr inbox, and
-`replies/` holds durable reply artifacts. `feedback/` records deduplicated
-protocol errors queued to the coordinator. Immutable message resource names deduplicate both
+messages and constant-size reply summaries, `queue/` is the existing durable
+Herdr inbox, and `submissions/` holds at most one create-only local recovery
+submission per request until the bridge owner adopts it; its state-wide backlog
+is capped at 1,024 files/32 MiB. Sharded
+`replies/items/PREFIX/PREFIX/REQUEST/pending/` journals only unsent work;
+`replies/items/PREFIX/PREFIX/REQUEST/history/` holds immutable sent artifacts. Each
+sequence directory has at most 1,000 leaves. `reply-receipts/`
+provides exact provider-ID lookup without loading history. Older embedded
+`replies/REQUEST.json` outboxes are expanded once under the owner lock; the
+request storage-version marker is committed last and the older source remains
+read-only. A one-time expansion reads that older monolith at O(M + B), but a
+normal restart and fixed five-minute recovery inspect only request summaries
+and pending journals. Immutable history bodies are read only by explicit
+`history`/deep-audit work.
+`feedback/` records bounded, deduplicated protocol errors queued to the
+coordinator, and `deferred/` holds bounded possible provider echoes until their
+send identities reconcile. Immutable message resource names deduplicate both
 events and polls; replaying an event does not create a second prompt.
 `input.json` records the stream's durable cursor and connection/recovery state.
 The cursor advances only after its message has been saved or excluded by the
@@ -340,8 +665,9 @@ answer. If all tags have been evicted, the request remains awaiting a reply. Ins
 the pane and `agentctl chat status`. An idle/done event triggers one fresh read
 to recover an early closing tag inside a quoted example; readiness itself is
 never treated as an answer. Output observation stays active after capture errors
-and rearms every second to detect further replies. After stopping `run`, an explicit
-`agentctl chat tick` also retries capture once after inspection. Captures request
+without periodic reconnects; later output is recovered on another match or the
+next idle/done transition. After stopping `run`, an explicit `agentctl chat tick`
+also retries capture once after inspection. Captures request
 up to 4,000 retained logical lines
 and are bounded to 2 MiB. If the answer cannot be recovered from retained
 history, submit the verified answer with `agentctl chat reply`.
@@ -401,11 +727,24 @@ Write one UTF-8 JSON object per line to stdout and flush each event promptly:
 `message` has the same normalized fields and identity requirements as a poll
 result below. Preserve the authenticated sender ID and exact configured space;
 the bridge applies the same sender allowlist to both paths. `thread_reply` must
-come from provider metadata. An optional `cursor` on any event must be a nonempty
-string of at most 8192 characters. A `checkpoint` advances past upstream events
-that do not produce a message. A `heartbeat` reports a live connection; it does
-not prove that no messages were missed. A `gap` requests a background recovery
-scan. Preserve event order and emit preceding inputs before advancing a checkpoint.
+come from provider metadata. Event objects are exact: `message` requires only
+`type`, `message`, and an optional `cursor`; `heartbeat` permits only `type` and
+an optional `cursor`; `checkpoint` requires exactly `type` and `cursor`; `gap`
+permits `type`, optional `cursor`, and an optional nonempty UTF-8 `reason` of at
+most 2,000 bytes. Unknown or cross-type fields are refused before any durable
+mutation. An optional cursor must contain 1–8,192 UTF-8 bytes. A `checkpoint`
+advances past upstream events that do not produce a message. A `heartbeat`
+reports a live connection; it does not prove that no messages were missed. A
+`gap` requests a background recovery scan. Preserve event order and emit
+preceding inputs before advancing a checkpoint.
+
+Every normalized message has exactly `id`, `text`, `sender`, `thread`, and
+`created_at`, with optional boolean `thread_reply`; extra keys are rejected
+before echo detection, sender filtering, or cursor advancement. Text is limited
+to 32,000 UTF-8 bytes, sender IDs to 256 bytes, message/thread resources to
+2 KiB each, and timestamps to 128 bytes. Saved request and deferred messages
+must obey the same exact schema; adapter-specific keys make the state invalid
+and require operator correction or rotation.
 
 Each line is limited to 1 MiB. Invalid UTF-8, duplicate JSON keys, nonfinite
 numbers, or incomplete frames are errors. Stdout must contain only protocol
@@ -417,6 +756,15 @@ subscription using the saved cursor, with retry delays increasing up to
 60 seconds. Ordinary idle waits do not reconnect. Provider retention and REST
 history availability still bound recovery; a durable cursor is not an unlimited
 upstream event log.
+The event-command runner requires Linux `pidfd_open` and `pidfd_send_signal`.
+It verifies descriptor support before creating its trusted helpers, validates
+the supervisor and anchor through `/proc` plus mandatory pidfds, and refuses to
+start the provider until that containment handshake is acknowledged. Graceful
+shutdown signals the provider through its exact handle; the live anchor pins
+the original process group through bounded descendant teardown. A missing or
+exhausted descriptor, selector-registration failure, or malformed handshake
+refuses that attempt. The normal reconnect backoff retries without entering a
+process-status polling loop.
 
 ## Existing-client transports
 
@@ -432,8 +780,10 @@ Set `transport_command` to an argument array in `chat.json`, for example:
 
 The bridge launches the command with literal arguments, sends one JSON object on
 stdin, and expects one JSON object on stdout. It never invokes a shell. Each call
-must finish within 60 seconds; diagnostics belong on stderr. The adapter owns its
-credentials and stays separate from the reusable library.
+must finish within 60 seconds. Stdout is limited to 8 MiB and stderr to 64 KiB;
+crossing either bound terminates the adapter process group. Diagnostics belong on
+stderr. The adapter owns its credentials and stays separate from the reusable
+library.
 
 For an already-running local adapter, set `transport_socket` instead of
 `transport_command`:

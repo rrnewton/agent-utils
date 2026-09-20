@@ -6,6 +6,7 @@ import re
 from collections.abc import Collection
 
 _NONCE = re.compile(r"[A-Za-z0-9_-]{22}\Z")
+_SEQUENCED = re.compile(r"(?P<nonce>[A-Za-z0-9_-]{22})_(?P<ordinal>[1-9][0-9]{0,5})\Z")
 _MARKER = re.compile(r"<(?P<close>/?)(?P<protocol>G?CHAT)_REPLY_(?P<nonce>[^<>\s]*)>")
 _FENCE = re.compile(r"(?P<fence>`{3,}|~{3,})(?P<suffix>.*)")
 _MAX_REPLY_BYTES = 30_000
@@ -43,10 +44,15 @@ def _body(lines: list[str], opening_margin: str, closing_margin: str) -> str:
     return result
 
 
-def _scan(text: str, nonces: Collection[str], *, extract: bool) -> tuple[dict[str, list[str]], list[str]]:
+def _scan(
+    text: str, nonces: Collection[str], *, extract: bool, sequenced: bool = False,
+) -> tuple[dict[str, list[str]], list[str], list[str], list[str]]:
     expected = set(nonces)
-    if any(_NONCE.fullmatch(nonce) is None for nonce in expected):
-        raise ValueError("chat reply nonce must contain 22 base64url characters")
+    expected_pattern = _SEQUENCED if sequenced else _NONCE
+    if any(expected_pattern.fullmatch(nonce) is None for nonce in expected):
+        description = ("22 base64url characters plus an underscore and ordinal"
+                       if sequenced else "22 base64url characters")
+        raise ValueError(f"chat reply nonce must contain {description}")
     text = text.replace("\r\n", "\n")
     if any((ord(char) < 32 and char not in "\t\n") or 127 <= ord(char) <= 159 for char in text):
         raise ValueError("chat reply capture must contain rendered text without ANSI or control sequences")
@@ -57,6 +63,8 @@ def _scan(text: str, nonces: Collection[str], *, extract: bool) -> tuple[dict[st
 
     replies: dict[str, list[str]] = {}
     unknown: dict[str, None] = {}
+    closing_unknown: dict[str, None] = {}
+    raw_closing: dict[str, None] = {}
     active: tuple[str, str] | None = None
     opening_margin = ""
     body: list[str] = []
@@ -64,6 +72,9 @@ def _scan(text: str, nonces: Collection[str], *, extract: bool) -> tuple[dict[st
     prompt_margin: int | None = None
     for line in text.split("\n"):
         normalized, margin = _undecorate(line)
+        raw_marker = _MARKER.fullmatch(normalized)
+        if raw_marker is not None and raw_marker["close"]:
+            raw_closing[raw_marker["nonce"]] = None
         stripped = line.lstrip(" \t")
         decorated = stripped.startswith(("• ", "⏺ "))
         if active is None:
@@ -107,6 +118,8 @@ def _scan(text: str, nonces: Collection[str], *, extract: bool) -> tuple[dict[st
         nonce = marker["nonce"]
         if nonce not in expected:
             unknown[nonce] = None
+            if marker["close"]:
+                closing_unknown[nonce] = None
         identity = marker["protocol"], nonce
         if active is None:
             if nonce in expected and not marker["close"]:
@@ -123,7 +136,7 @@ def _scan(text: str, nonces: Collection[str], *, extract: bool) -> tuple[dict[st
         if extract:
             replies.setdefault(nonce, []).append(_body(body, opening_margin, margin))
         active, body = None, []
-    return replies, list(unknown)
+    return replies, list(unknown), list(closing_unknown), list(raw_closing)
 
 
 def extract_replies(text: str, nonces: Collection[str]) -> dict[str, list[str]]:
@@ -162,3 +175,46 @@ def unknown_reply_ids(text: str, nonces: Collection[str]) -> list[str]:
     unavailable ID. Expected IDs still must contain 22 base64url characters.
     """
     return _scan(text, nonces, extract=False)[1]
+
+
+def reply_marker_ids(text: str) -> list[str]:
+    """Return first-seen standalone marker IDs after rendered-text filtering."""
+    return _scan(text, (), extract=False)[1]
+
+
+def reply_marker_sets(text: str) -> tuple[list[str], list[str]]:
+    """Return filtered marker IDs and raw standalone closing IDs in one scan."""
+    _, identifiers, _, raw_closing = _scan(text, (), extract=False)
+    return identifiers, raw_closing
+
+
+def sequenced_reply_id(nonce: str, ordinal: int) -> str:
+    """Build one bounded protocol-v3 marker ID."""
+    if _NONCE.fullmatch(nonce) is None:
+        raise ValueError("chat reply nonce must contain 22 base64url characters")
+    if type(ordinal) is not int or not 1 <= ordinal <= 999_999:
+        raise ValueError("chat reply ordinal must be an integer between 1 and 999999")
+    return f"{nonce}_{ordinal}"
+
+
+def extract_sequenced_replies(
+    text: str, nonces: Collection[str], *, marker_ids: Collection[str] | None = None,
+) -> dict[str, list[tuple[int, str]]]:
+    """Extract protocol-v3 replies, preserving occurrence order and ordinals."""
+    expected_nonces = set(nonces)
+    if any(_NONCE.fullmatch(nonce) is None for nonce in expected_nonces):
+        raise ValueError("chat reply nonce must contain 22 base64url characters")
+    visible = reply_marker_ids(text) if marker_ids is None else list(marker_ids)
+    expected_ids: set[str] = set()
+    for identifier in visible:
+        match = _SEQUENCED.fullmatch(identifier)
+        if match is not None and match["nonce"] in expected_nonces:
+            expected_ids.add(identifier)
+    raw, _, _, _ = _scan(text, expected_ids, extract=True, sequenced=True)
+    result: dict[str, list[tuple[int, str]]] = {}
+    for identifier, bodies in raw.items():
+        match = _SEQUENCED.fullmatch(identifier)
+        assert match is not None
+        nonce, ordinal = match["nonce"], int(match["ordinal"])
+        result.setdefault(nonce, []).extend((ordinal, body) for body in bodies)
+    return result

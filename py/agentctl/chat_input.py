@@ -5,20 +5,61 @@ from __future__ import annotations
 import json
 import math
 import os
-import select
+import selectors
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Sequence
-from typing import IO
+from pathlib import Path
+from typing import IO, cast
 
+from agentctl.chat import (
+    _CommandAnchorIdentity,
+    _cleanup_unpinned_direct_child,
+    _command_identities_gone,
+    _command_process_identity,
+    _read_command_publication,
+    _read_command_result,
+    _require_waitable_sigchld_children,
+    _same_command_process,
+    _validated_supervisor_identity,
+    _write_command_control,
+)
 from agentctl.errors import HerdrUnavailable
 from agentctl.jsonx import as_mapping
 
 
 _CLOSE_GRACE_SECONDS = 2.0
+_CONTROL_TIMEOUT_SECONDS = 5.0
+
+
+def _wait_fds(
+    readers: Sequence[int], writers: Sequence[int], timeout: float | None,
+) -> tuple[list[int], list[int]]:
+    """Wait on arbitrary descriptor values without the select(2) FD ceiling."""
+    selector = selectors.DefaultSelector()
+    masks: dict[int, int] = {}
+    for descriptor in readers:
+        masks[descriptor] = masks.get(descriptor, 0) | selectors.EVENT_READ
+    for descriptor in writers:
+        masks[descriptor] = masks.get(descriptor, 0) | selectors.EVENT_WRITE
+    try:
+        for descriptor, mask in masks.items():
+            selector.register(descriptor, mask)
+        events = selector.select(timeout)
+        readable = [key.fd for key, mask in events if mask & selectors.EVENT_READ]
+        writable = [key.fd for key, mask in events if mask & selectors.EVENT_WRITE]
+        return readable, writable
+    finally:
+        selector.close()
+
+
+def _descriptor_ready(descriptor: int, timeout: float) -> bool:
+    readable, _ = _wait_fds((descriptor,), (), timeout)
+    return descriptor in readable
 
 
 class InputStreamError(HerdrUnavailable):
@@ -86,6 +127,26 @@ class EventCommandStream:
             raise ValueError("subscription request must be a valid JSON object") from exc
         if len(payload) - 1 > max_frame_bytes:
             raise ValueError("subscription request exceeds the event frame byte limit")
+        if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+            raise InputStreamError(
+                "process_descriptor_unavailable",
+                "event command supervision requires Linux process descriptors",
+            )
+        try:
+            _require_waitable_sigchld_children("event command containment")
+        except (OSError, ValueError) as exc:
+            raise InputStreamError(
+                "process_status_unavailable",
+                "event command supervision requires SIGCHLD=SIG_DFL with SA_NOCLDWAIT clear",
+            ) from exc
+        try:
+            probe_pidfd = os.pidfd_open(os.getpid())
+        except OSError as exc:
+            raise InputStreamError(
+                "process_descriptor_unavailable",
+                "event command supervision requires Linux process descriptors",
+            ) from exc
+        os.close(probe_pidfd)
         self._max_frame = max_frame_bytes
         self._buffer = bytearray()
         self._process: subprocess.Popen[bytes] | None = None
@@ -93,6 +154,16 @@ class EventCommandStream:
         self._stdout: IO[bytes] | None = None
         self._stderr: IO[bytes] | None = None
         self._pidfd: int | None = None
+        self._anchor_pidfd: int | None = None
+        self._anchor: _CommandAnchorIdentity | None = None
+        self._supervisor_identity: _CommandAnchorIdentity | None = None
+        self._identity_read: int | None = None
+        self._acknowledge_write: int | None = None
+        self._lifeline_write: int | None = None
+        self._result_read: int | None = None
+        self._provider_ready_read: int | None = None
+        self._returncode: int | None = None
+        self._authority_granted = False
         self._exited = False
         self._closed = threading.Event()
         self._released = False
@@ -101,28 +172,193 @@ class EventCommandStream:
         self._wake_read.setblocking(False)
         self._wake_write.setblocking(False)
         try:
-            self._process = subprocess.Popen(
-                list(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, start_new_session=True, bufsize=0,
+            deadline = time.monotonic() + start_timeout
+            self._start_supervisor(command, deadline)
+            pipes = (
+                cast(IO[bytes], self._stdin),
+                cast(IO[bytes], self._stdout),
+                cast(IO[bytes], self._stderr),
             )
-            self._stdin, self._stdout, self._stderr = (
-                self._process.stdin, self._process.stdout, self._process.stderr,
-            )
-            try:
-                self._pidfd = os.pidfd_open(self._process.pid)
-            except (AttributeError, OSError):
-                # Platforms without process descriptors use bounded checks
-                # which retain the child identity until group cleanup.
-                pass
-            assert self._stdin is not None and self._stdout is not None and self._stderr is not None
-            for pipe in (self._stdin, self._stdout, self._stderr):
+            for pipe in pipes:
                 os.set_blocking(pipe.fileno(), False)
-            self._send(payload, time.monotonic() + start_timeout)
+            self._send(payload, deadline)
         except BaseException as exc:
-            self.close()
+            try:
+                self.close()
+            except BaseException as cleanup_exc:
+                raise cleanup_exc from exc
             if isinstance(exc, OSError):
                 raise InputStreamError("command_failed", "could not start or subscribe to the event command") from exc
             raise
+
+    def _start_supervisor(self, command: Sequence[str], deadline: float) -> None:
+        controls: list[int] = []
+
+        def control_pipe() -> tuple[int, int]:
+            pair = os.pipe2(os.O_CLOEXEC)
+            controls.extend(pair)
+            return pair
+
+        supervisor = Path(__file__).with_name("_event_command_supervisor.py")
+        try:
+            identity_read, identity_write = control_pipe()
+            acknowledge_read, acknowledge_write = control_pipe()
+            lifeline_read, lifeline_write = control_pipe()
+            result_read, result_write = control_pipe()
+            provider_ready_read, provider_ready_write = control_pipe()
+            process = subprocess.Popen(
+                (
+                    sys.executable,
+                    str(supervisor),
+                    str(os.getpid()),
+                    str(identity_write),
+                    str(acknowledge_read),
+                    str(lifeline_read),
+                    str(result_write),
+                    str(provider_ready_write),
+                    *command,
+                ),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                bufsize=0,
+                pass_fds=(
+                    identity_write,
+                    acknowledge_read,
+                    lifeline_read,
+                    result_write,
+                    provider_ready_write,
+                ),
+            )
+        except BaseException:
+            for descriptor in controls:
+                os.close(descriptor)
+            raise
+
+        self._process = process
+        self._stdin, self._stdout, self._stderr = process.stdin, process.stdout, process.stderr
+        for descriptor in (
+            identity_write, acknowledge_read, lifeline_read, result_write, provider_ready_write,
+        ):
+            os.close(descriptor)
+            controls.remove(descriptor)
+        self._identity_read = identity_read
+        self._acknowledge_write = acknowledge_write
+        self._lifeline_write = lifeline_write
+        self._result_read = result_read
+        self._provider_ready_read = provider_ready_read
+        try:
+            try:
+                expected_supervisor = _validated_supervisor_identity(
+                    process, "event command supervisor",
+                )
+            except ValueError as exc:
+                raise InputStreamError(
+                    "containment_failed",
+                    "event command supervisor vanished before descriptor acquisition",
+                ) from exc
+            self._supervisor_identity = expected_supervisor
+            try:
+                self._pidfd = os.pidfd_open(process.pid)
+            except OSError as original_pidfd_error:
+                os.close(identity_read)
+                self._identity_read = None
+                try:
+                    self._pidfd = os.pidfd_open(process.pid)
+                except OSError:
+                    self._pidfd = None
+                raise InputStreamError(
+                    "process_descriptor_unavailable",
+                    "event command supervision could not pin the trusted supervisor",
+                ) from original_pidfd_error
+            observed = _command_process_identity(process.pid)
+            if (
+                not _same_command_process(expected_supervisor, observed)
+                or observed is None
+                or observed.ppid != os.getpid()
+                or observed.pgrp != process.pid
+                or observed.session != process.pid
+                or observed.state in ("X", "Z")
+            ):
+                os.close(self._pidfd)
+                self._pidfd = None
+                raise InputStreamError(
+                    "containment_failed",
+                    "event command supervisor identity changed before activation",
+                )
+            self._supervisor_identity = observed
+            self._anchor = _read_command_publication(identity_read, process.pid, deadline)
+            try:
+                self._anchor_pidfd = os.pidfd_open(self._anchor.pid)
+            except OSError as exc:
+                raise InputStreamError(
+                    "process_descriptor_unavailable",
+                    "event command supervision could not pin the trusted anchor",
+                ) from exc
+            current_anchor = _command_process_identity(self._anchor.pid)
+            if (
+                not _same_command_process(self._anchor, current_anchor)
+                or current_anchor is None
+                or current_anchor.ppid != process.pid
+                or current_anchor.pgrp != self._anchor.pid
+                or current_anchor.session != process.pid
+                or current_anchor.state in ("X", "Z")
+            ):
+                os.close(self._anchor_pidfd)
+                self._anchor_pidfd = None
+                raise InputStreamError(
+                    "containment_failed",
+                    "event command anchor identity changed before activation",
+                )
+
+            # Registration is part of the pre-authority proof. A descriptor
+            # backend failure must not start the operator-selected provider.
+            probe = selectors.DefaultSelector()
+            try:
+                probe.register(self._pidfd, selectors.EVENT_READ)
+                probe.register(self._anchor_pidfd, selectors.EVENT_READ)
+                assert self._stdin is not None and self._stdout is not None and self._stderr is not None
+                probe.register(self._stdin, selectors.EVENT_WRITE)
+                probe.register(self._stdout, selectors.EVENT_READ)
+                probe.register(self._stderr, selectors.EVENT_READ)
+                probe.register(self._wake_read, selectors.EVENT_READ)
+            finally:
+                probe.close()
+            _write_command_control(acknowledge_write, b"1", deadline)
+            self._authority_granted = True
+            os.close(acknowledge_write)
+            self._acknowledge_write = None
+            os.close(identity_read)
+            self._identity_read = None
+            self._wait_provider_ready(deadline)
+        except BaseException:
+            raise
+
+    def _wait_provider_ready(self, deadline: float) -> None:
+        descriptor = self._provider_ready_read
+        assert descriptor is not None
+        os.set_blocking(descriptor, False)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InputStreamError(
+                    "command_failed", "event command did not start before its deadline",
+                )
+            readable, _ = _wait_fds((descriptor,), (), remaining)
+            if descriptor not in readable:
+                continue
+            try:
+                value = os.read(descriptor, 2)
+            except BlockingIOError:
+                continue
+            if value == b"1":
+                os.close(descriptor)
+                self._provider_ready_read = None
+                return
+            raise InputStreamError(
+                "command_failed", "could not start the configured event command",
+            )
 
     def _drain_wake(self) -> None:
         try:
@@ -183,9 +419,6 @@ class EventCommandStream:
         return True
 
     def _child_exited(self) -> bool:
-        if self._pidfd is None and self._process is not None:
-            result = os.waitid(os.P_PID, self._process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-            self._exited = result is not None
         return self._exited
 
     def _send(self, payload: bytes, deadline: float) -> None:
@@ -198,7 +431,7 @@ class EventCommandStream:
                 raise InputStreamError("subscription_timeout", "event command did not accept its subscription request")
             readers = self._readers(include_stdout=b"\n" not in self._buffer)
             try:
-                readable, writable, _ = select.select(readers, [pipe.fileno()], [], remaining)
+                readable, writable = _wait_fds(readers, (pipe.fileno(),), remaining)
             except InterruptedError:
                 continue
             if not self._read_ready(readable):
@@ -229,7 +462,7 @@ class EventCommandStream:
                 # do not mistake a descendant holding its pipe open for a live
                 # subscription after the owning command has exited.
                 assert self._stdout is not None
-                readable, _, _ = select.select([self._stdout.fileno()], [], [], 0)
+                readable, _ = _wait_fds((self._stdout.fileno(),), (), 0)
                 if readable:
                     self._read_stdout()
                     continue
@@ -241,15 +474,11 @@ class EventCommandStream:
             if polled and remaining == 0:
                 return None
             try:
-                readable, _, _ = select.select(
-                    self._readers(), [], [], remaining if self._pidfd is not None else min(remaining, 0.1),
-                )
+                readable, _ = _wait_fds(self._readers(), (), remaining)
             except InterruptedError:
                 continue
             polled = True
             if not readable:
-                if self._pidfd is None and time.monotonic() < deadline:
-                    continue
                 return None
             if not self._read_ready(readable):
                 return None
@@ -285,10 +514,9 @@ class EventCommandStream:
                 return [] if frame is None else [self._decode(frame)]
             except InputStreamError as exc:
                 self.close()
-                if (exc.code == "stream_eof" and self._process is not None
-                        and self._process.returncode is not None and self._process.returncode >= 0):
+                if exc.code == "stream_eof" and self._returncode is not None:
                     raise InputStreamError("stream_eof",
-                                           f"{exc.detail}; exit status {self._process.returncode}") from exc
+                                           f"{exc.detail}; exit status {self._returncode}") from exc
                 raise
             except OSError as exc:
                 self.close()
@@ -301,30 +529,28 @@ class EventCommandStream:
         except (BlockingIOError, OSError):
             pass
 
-    def _terminate_leader(self, process: subprocess.Popen[bytes]) -> None:
-        # Popen.terminate/send_signal poll the child first, which can reap it
-        # and release its PID before we have killed the remaining group.
-        try:
-            os.kill(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
+    @staticmethod
+    def _signal_exact(descriptor: int | None, signum: int) -> None:
+        if descriptor is None:
             return
-        deadline = time.monotonic() + _CLOSE_GRACE_SECONDS
-        while not self._child_exited():
+        try:
+            signal.pidfd_send_signal(descriptor, signum)
+        except ProcessLookupError:
+            pass
+
+    def _wait_supervisor(self, deadline: float) -> bool:
+        if self._pidfd is None:
+            return False
+        while not self._exited:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return
+                return False
             readers = [pipe.fileno() for pipe in (self._stdout, self._stderr) if pipe is not None]
-            if self._pidfd is not None:
-                readers.append(self._pidfd)
+            readers.append(self._pidfd)
             try:
-                readable, _, _ = select.select(
-                    readers, [], [], remaining if self._pidfd is not None else min(remaining, 0.1),
-                )
+                readable, _ = _wait_fds(readers, (), remaining)
             except InterruptedError:
                 continue
-            # Cleanup may flush output before unsubscribing. Discard bounded
-            # chunks without decoding or buffering shutdown frames, so a full
-            # pipe cannot prevent the command from completing its cleanup.
             for attribute in ("_stdout", "_stderr"):
                 pipe = self._stdout if attribute == "_stdout" else self._stderr
                 if pipe is not None and pipe.fileno() in readable:
@@ -338,8 +564,133 @@ class EventCommandStream:
                             self._stdout = None
                         else:
                             self._stderr = None
-            if self._pidfd is not None and self._pidfd in readable:
+            if self._pidfd in readable:
                 self._exited = True
+        return True
+
+    def _finish_supervisor(self) -> None:
+        process = self._process
+        cleanup_fault: BaseException | None = None
+        result_confirmed = False
+        try:
+            if process is not None:
+                if self._pidfd is not None:
+                    if not self._exited:
+                        self._signal_exact(self._pidfd, signal.SIGTERM)
+                        self._signal_exact(self._pidfd, signal.SIGCONT)
+                    if not self._wait_supervisor(time.monotonic() + _CLOSE_GRACE_SECONDS + 1):
+                        self._signal_exact(self._pidfd, signal.SIGKILL)
+                        self._wait_supervisor(time.monotonic() + _CLOSE_GRACE_SECONDS)
+                else:
+                    # No provider can exist before the mandatory pidfd proof
+                    # and ACK. Close authority and lifeline channels before
+                    # validated numeric cleanup of the still-unreaped direct
+                    # supervisor; a stopped helper cannot consume EOF alone.
+                    if self._acknowledge_write is not None:
+                        os.close(self._acknowledge_write)
+                        self._acknowledge_write = None
+                    if self._lifeline_write is not None:
+                        os.close(self._lifeline_write)
+                        self._lifeline_write = None
+                    if self._supervisor_identity is None:
+                        try:
+                            process.wait(timeout=_CONTROL_TIMEOUT_SECONDS)
+                        except subprocess.TimeoutExpired as exc:
+                            raise InputStreamError(
+                                "cleanup_timeout",
+                                "pre-authority event supervisor lacked a cleanup identity",
+                            ) from exc
+                        if _command_process_identity(process.pid) is not None:
+                            raise InputStreamError(
+                                "containment_failed",
+                                "pre-authority event supervisor remained after reap",
+                            )
+                    else:
+                        _cleanup_unpinned_direct_child(
+                            process,
+                            self._supervisor_identity,
+                            "event command supervisor",
+                            timeout=_CONTROL_TIMEOUT_SECONDS,
+                        )
+                    self._exited = True
+
+                if self._lifeline_write is not None:
+                    os.close(self._lifeline_write)
+                    self._lifeline_write = None
+
+                if self._anchor_pidfd is not None and not _descriptor_ready(
+                    self._anchor_pidfd, _CLOSE_GRACE_SECONDS,
+                ):
+                    # The exact live anchor handles SIGTERM by killing its own
+                    # still-pinned group; SIGCONT wakes a stopped anchor.
+                    self._signal_exact(self._anchor_pidfd, signal.SIGTERM)
+                    self._signal_exact(self._anchor_pidfd, signal.SIGCONT)
+                    if not _descriptor_ready(self._anchor_pidfd, _CLOSE_GRACE_SECONDS):
+                        raise InputStreamError(
+                            "cleanup_timeout",
+                            "event command anchor did not terminate its process group",
+                        )
+
+                if self._pidfd is not None and not self._exited:
+                    raise InputStreamError(
+                        "cleanup_timeout",
+                        "event command supervisor did not exit after termination",
+                    )
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired as exc:
+                    raise InputStreamError(
+                        "cleanup_timeout", "event command supervisor was not reapable",
+                    ) from exc
+
+                if self._result_read is not None and self._exited:
+                    try:
+                        self._returncode = _read_command_result(self._result_read)
+                    except (OSError, TypeError, ValueError) as exc:
+                        if self._authority_granted:
+                            raise InputStreamError(
+                                "containment_failed",
+                                "event command supervisor did not publish an exact final status",
+                            ) from exc
+                    else:
+                        result_confirmed = True
+
+                identities = tuple(
+                    identity
+                    for identity in (self._supervisor_identity, self._anchor)
+                    if identity is not None
+                )
+                if identities and not _command_identities_gone(identities, 1):
+                    raise InputStreamError(
+                        "containment_failed",
+                        "event command containment identities survived cleanup",
+                    )
+                if self._authority_granted and not result_confirmed:
+                    raise InputStreamError(
+                        "containment_failed",
+                        "event command cleanup completed without an exact final status",
+                    )
+        except BaseException as exc:
+            cleanup_fault = exc
+        finally:
+            for attribute in (
+                "_identity_read", "_acknowledge_write", "_lifeline_write", "_result_read",
+                "_provider_ready_read",
+            ):
+                descriptor = getattr(self, attribute)
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                    setattr(self, attribute, None)
+            for attribute in ("_pidfd", "_anchor_pidfd"):
+                descriptor = getattr(self, attribute)
+                if descriptor is not None:
+                    os.close(descriptor)
+                    setattr(self, attribute, None)
+        if cleanup_fault is not None:
+            raise cleanup_fault
 
     def close(self) -> None:
         """Allow bounded command cleanup, then kill its remaining group and reap."""
@@ -349,30 +700,13 @@ class EventCommandStream:
             if self._released:
                 return
             self._released = True
-            process = self._process
             try:
-                if process is not None:
-                    # Keep the child unreaped until its entire group is killed:
-                    # its PID cannot be reused for an unrelated process group.
-                    try:
-                        self._terminate_leader(process)
-                    finally:
-                        try:
-                            os.killpg(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            process.wait(timeout=2)
-                        except subprocess.TimeoutExpired as exc:
-                            raise InputStreamError("cleanup_timeout", "event command did not exit after termination") from exc
+                self._finish_supervisor()
             finally:
                 for pipe in (self._stdin, self._stdout, self._stderr):
                     if pipe is not None:
                         pipe.close()
                 self._stdin = self._stdout = self._stderr = None
                 self._buffer.clear()
-                if self._pidfd is not None:
-                    os.close(self._pidfd)
-                    self._pidfd = None
                 self._wake_read.close()
                 self._wake_write.close()

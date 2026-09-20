@@ -48,14 +48,17 @@ class Chat:
             return {"messages": self.messages, "cursor": None}
         if request["action"] == "react":
             return {"id": str(request["message"]) + "/reactions/robot"}
-        self.sent[str(request["request_id"])] = request
-        if self.echo_as_owner and not any(message["id"] == "spaces/test/messages/bot-reply"
+        request_id = str(request["request_id"])
+        self.sent[request_id] = request
+        reply_name = "reply-" + request_id
+        reply_id = "spaces/test/messages/" + reply_name
+        if self.echo_as_owner and not any(message["id"] == reply_id
                                           for message in self.messages):
-            self.message("bot-reply", timestamp="2026-01-02T00:00:05Z")
+            self.message(reply_name, timestamp="2026-01-02T00:00:05Z")
         if self.lose_ack:
             self.lose_ack = False
             raise OSError("reply accepted but acknowledgement lost")
-        return {"id": "spaces/test/messages/bot-reply"}
+        return {"id": reply_id}
 
     def message(self, identifier: str = "one", sender: str = "users/owner",
                 timestamp: str = "2026-01-02T00:00:00Z") -> None:

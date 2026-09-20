@@ -6,11 +6,16 @@ import hashlib
 import io
 import json
 import os
+import selectors
+import signal
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Sequence
 from email.message import Message
 from pathlib import Path
+from typing import IO, cast
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request
@@ -231,6 +236,687 @@ def test_command_adapter_failures_are_not_empty_successes(
         CommandTransport((sys.executable, "-c", script))(_poll())
 
 
+def _assert_command_child_gone(pid: int, outcome: str) -> None:
+    deadline = time.monotonic() + 2
+    state = "unknown"
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+            state = Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2][:1]
+        except (ProcessLookupError, FileNotFoundError):
+            return
+        time.sleep(0.01)
+    pytest.fail(f"{outcome} adapter child {pid} remains in /proc with state {state}")
+
+
+def test_command_supervisor_reaps_nested_descendants_before_return(tmp_path: Path) -> None:
+    """An outer subreaper exposes zombies which would otherwise be hidden by PID 1."""
+    pids = tmp_path / "descendants"
+    package_parent = Path(chat_module.__file__).resolve().parent.parent
+    probe = r'''
+import ctypes
+import os
+import pathlib
+import sys
+import time
+
+sys.path.insert(0, sys.argv[2])
+from agentctl.chat import _run_command
+
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
+pids = pathlib.Path(sys.argv[1])
+grandchild = "import time; time.sleep(60)"
+child = (
+    "import os,pathlib,subprocess,sys,time; "
+    "nested=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
+    "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {nested.pid}'); "
+    "time.sleep(60)"
+)
+leader = (
+    "import pathlib,subprocess,sys,time\n"
+    "path=pathlib.Path(sys.argv[1])\n"
+    "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1],sys.argv[3]])\n"
+    "deadline=time.monotonic()+2\n"
+    "while not path.exists() and time.monotonic()<deadline:\n"
+    "    time.sleep(0.01)\n"
+    "if not path.exists():\n"
+    "    raise RuntimeError('descendant did not start')\n"
+)
+result = _run_command(
+    (sys.executable, "-c", leader, str(pids), child, grandchild), timeout=5,
+)
+if result.returncode != 0:
+    raise SystemExit(f"leader returned {result.returncode}: {result.stderr}")
+descendants = [int(value) for value in pids.read_text().split()]
+remaining = [
+    (pid, pathlib.Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2][:1])
+    for pid in descendants
+    if pathlib.Path(f"/proc/{pid}").exists()
+]
+while True:
+    try:
+        pid, _ = os.waitpid(-1, os.WNOHANG)
+    except ChildProcessError:
+        break
+    if pid == 0:
+        break
+if remaining:
+    raise SystemExit(f"unreaped descendants: {remaining}")
+'''
+    completed = subprocess.run(
+        (sys.executable, "-c", probe, str(pids), str(package_parent)),
+        text=True, capture_output=True, timeout=10, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("stopped", ["none", "supervisor", "anchor", "both"])
+def test_command_parent_death_reaps_supervisor_and_adapter_group(
+    tmp_path: Path, stopped: str,
+) -> None:
+    """Only the isolated probe becomes a subreaper; the bridge parent never does."""
+    pids = tmp_path / "parent-death-descendants"
+    package_parent = Path(chat_module.__file__).resolve().parent.parent
+    probe = r'''
+import ctypes
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
+pids = pathlib.Path(sys.argv[1])
+package_parent = sys.argv[2]
+caller_program = r"""
+import pathlib
+import sys
+sys.path.insert(0, sys.argv[2])
+from agentctl.chat import _run_command
+pids = pathlib.Path(sys.argv[1])
+child = "import os,time; os.close(0); os.close(1); os.close(2); time.sleep(60)"
+adapter = (
+    "import os,pathlib,subprocess,sys,time; "
+    "nested=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
+    "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {nested.pid}'); "
+    "time.sleep(60)"
+)
+_run_command((sys.executable, "-c", adapter, str(pids), child), timeout=60)
+"""
+caller = subprocess.Popen(
+    (sys.executable, "-c", caller_program, str(pids), package_parent),
+)
+deadline = time.monotonic() + 5
+supervisors = []
+while time.monotonic() < deadline:
+    if pids.exists():
+        try:
+            adapter_pid = int(pids.read_text().split()[0])
+            status = pathlib.Path(f"/proc/{adapter_pid}/status").read_text()
+            supervisors = [int(next(
+                line.split()[1] for line in status.splitlines() if line.startswith("PPid:")
+            ))]
+        except FileNotFoundError:
+            supervisors = []
+        if len(supervisors) == 1 and supervisors[0] != 0:
+            break
+    time.sleep(0.01)
+if not pids.exists() or len(supervisors) != 1 or supervisors[0] == 0:
+    outcome = caller.poll()
+    caller.kill()
+    caller.wait(timeout=2)
+    raise SystemExit(
+        f"caller did not expose one live supervisor and adapter group: "
+        f"pids={pids.exists()} supervisors={supervisors} caller={outcome}"
+    )
+supervisor = supervisors[0]
+adapter_pids = [int(value) for value in pids.read_text().split()]
+anchor = os.getpgid(adapter_pids[0])
+caller_pid = caller.pid
+supervisor_status = pathlib.Path(f"/proc/{supervisor}/status").read_text()
+if supervisor_status.split("PPid:\t", 1)[1].splitlines()[0] != str(caller_pid):
+    raise SystemExit("adapter supervisor was not parented by the _run_command caller")
+stopped = sys.argv[3]
+frozen = ([supervisor] if stopped == "supervisor" else [anchor]
+          if stopped == "anchor" else [supervisor, anchor] if stopped == "both" else [])
+for pid in frozen:
+    os.kill(pid, signal.SIGSTOP)
+for pid in frozen:
+    deadline = time.monotonic() + 2
+    while pathlib.Path(f"/proc/{pid}/stat").read_bytes().rpartition(b") ")[2][:1] != b"T":
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"could not freeze {pid}")
+        time.sleep(0.005)
+os.kill(caller_pid, signal.SIGKILL)
+caller.wait(timeout=2)
+
+status = None
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    try:
+        reaped, candidate = os.waitpid(supervisor, os.WNOHANG)
+    except ChildProcessError:
+        time.sleep(0.01)
+        continue
+    if reaped == supervisor:
+        status = candidate
+        break
+    time.sleep(0.01)
+if status is None:
+    for pid in [supervisor, *adapter_pids]:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    raise SystemExit("parent death did not terminate and reap the supervisor")
+if os.waitstatus_to_exitcode(status) != 128 + signal.SIGTERM:
+    raise SystemExit(f"supervisor parent-death status was {os.waitstatus_to_exitcode(status)}")
+remaining = [
+    pid for pid in [caller_pid, supervisor, anchor, *adapter_pids]
+    if pathlib.Path(f"/proc/{pid}").exists()
+]
+if remaining:
+    raise SystemExit(f"parent-death cleanup left /proc entries: {remaining}")
+'''
+    completed = subprocess.run(
+        (sys.executable, "-c", probe, str(pids), str(package_parent), stopped),
+        text=True, capture_output=True, timeout=12, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("close_stdio", [False, True])
+def test_command_success_preserves_leader_response_and_terminates_descendants(
+    tmp_path: Path, close_stdio: bool,
+) -> None:
+    pid_path = tmp_path / "child.pid"
+    child_script = (
+        "import os,time; os.close(0); os.close(1); os.close(2); time.sleep(60)"
+        if close_stdio else "import time; time.sleep(60)"
+    )
+    script = (
+        "import pathlib,subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "print('leader response',flush=True)"
+    )
+    started = time.monotonic()
+    result = _run_command(
+        (sys.executable, "-c", script, str(pid_path), child_script), timeout=5,
+    )
+    assert time.monotonic() - started < 3
+    assert result.returncode == 0
+    assert result.stdout == "leader response\n"
+    assert result.stderr == ""
+    _assert_command_child_gone(int(pid_path.read_text()), "successful")
+
+
+@pytest.mark.parametrize("disposition", ["ignored", "no-cldwait"])
+def test_command_refuses_autoreap_before_stopped_double_pidfd_race(
+    tmp_path: Path, disposition: str,
+) -> None:
+    """Unsafe inherited SIGCHLD state must grant no supervisor or adapter authority."""
+    python_path = str(Path(__file__).resolve().parents[1])
+    setup = (
+        "signal.signal(signal.SIGCHLD,signal.SIG_IGN)"
+        if disposition == "ignored"
+        else """
+class SigSet(ctypes.Structure):
+    _fields_=[('values',ctypes.c_ulong*16)]
+class SigAction(ctypes.Structure):
+    _fields_=[('handler',ctypes.c_void_p),('mask',SigSet),('flags',ctypes.c_int),('restorer',ctypes.c_void_p)]
+action=SigAction()
+action.handler=ctypes.c_void_p(0)
+libc=ctypes.CDLL(None,use_errno=True)
+assert libc.sigemptyset(ctypes.byref(action.mask)) == 0
+action.flags=2
+assert libc.sigaction(signal.SIGCHLD,ctypes.byref(action),None) == 0
+"""
+    )
+    marker = tmp_path / f"command-autoreap-{disposition}"
+    script = f"""
+import ctypes,os,pathlib,signal,subprocess,sys,time
+{setup}
+import agentctl.chat as chat
+original_open=os.pidfd_open
+original_popen=subprocess.Popen
+spawned=[]
+handles=[]
+nonself_opens=[]
+def stopped_popen(*args,**kwargs):
+    process=original_popen(*args,**kwargs)
+    descriptor=original_open(process.pid)
+    spawned.append(process)
+    handles.append(descriptor)
+    signal.pidfd_send_signal(descriptor,signal.SIGSTOP)
+    deadline=time.monotonic()+2
+    while pathlib.Path(f'/proc/{{process.pid}}/stat').read_text().rpartition(') ')[2][:1] not in ('T','t'):
+        if time.monotonic() >= deadline:
+            raise AssertionError('supervisor did not stop')
+        time.sleep(.005)
+    return process
+def exhaust_after_spawn(pid,flags=0):
+    if pid == os.getpid():
+        return original_open(pid,flags)
+    nonself_opens.append(pid)
+    raise OSError(24,'combined stopped-supervisor descriptor exhaustion')
+chat.subprocess.Popen=stopped_popen
+chat.os.pidfd_open=exhaust_after_spawn
+marker=pathlib.Path({str(marker)!r})
+try:
+    try:
+        chat._run_command((sys.executable,'-c',"import pathlib,sys;pathlib.Path(sys.argv[1]).touch()",str(marker)),timeout=5)
+    except ValueError as exc:
+        assert 'SIGCHLD=SIG_DFL' in str(exc),str(exc)
+    else:
+        raise AssertionError('unsafe SIGCHLD state was accepted')
+    assert not spawned,spawned
+    assert not nonself_opens,nonself_opens
+    assert not marker.exists()
+finally:
+    chat.os.pidfd_open=original_open
+    chat.subprocess.Popen=original_popen
+    for process,descriptor in zip(spawned,handles):
+        try:
+            signal.pidfd_send_signal(descriptor,signal.SIGCONT)
+            signal.pidfd_send_signal(descriptor,signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except (ChildProcessError,subprocess.TimeoutExpired):
+            pass
+        os.close(descriptor)
+print('pre-spawn-refusal-ok')
+"""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = python_path + os.pathsep + environment.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True,
+        env=environment, timeout=15, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "pre-spawn-refusal-ok"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("returncode", [0, 7, -signal.SIGKILL])
+def test_command_supervisor_preserves_status_and_teardown_signals_with_default_sigchld(
+    tmp_path: Path, returncode: int,
+) -> None:
+    chat_module._require_waitable_sigchld_children("command status regression")
+    pid_path = tmp_path / "default-signal-child"
+    script = (
+        "import os,pathlib,signal,subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "print('signal-safe',flush=True); "
+        "print('signal-stderr',file=sys.stderr,flush=True); "
+        "code=int(sys.argv[2]); "
+        "os.kill(os.getpid(),-code) if code < 0 else sys.exit(code)"
+    )
+    result = _run_command(
+        (sys.executable, "-c", script, str(pid_path), str(returncode)), timeout=5,
+    )
+    assert result.returncode == returncode
+    assert result.stdout == "signal-safe\n" and result.stderr == "signal-stderr\n"
+    _assert_command_child_gone(int(pid_path.read_text()), "default-signal")
+
+
+@pytest.mark.parametrize("error_number", [38, 24])  # ENOSYS and EMFILE
+def test_command_without_pidfd_fails_before_spawning(
+    monkeypatch: pytest.MonkeyPatch, error_number: int,
+) -> None:
+    def unavailable(pid: int, flags: int = 0) -> int:
+        raise OSError(error_number, os.strerror(error_number))
+
+    def forbidden_spawn(*args: object, **kwargs: object) -> None:
+        pytest.fail("no process may start when containment descriptors are unavailable")
+
+    monkeypatch.setattr(os, "pidfd_open", unavailable)
+    monkeypatch.setattr(subprocess, "Popen", forbidden_spawn)
+    with pytest.raises(RuntimeError, match="process descriptor unavailable"):
+        _run_command((sys.executable, "-c", "raise SystemExit(0)"), timeout=5)
+
+
+def test_command_supervisor_pidfd_failure_retries_only_for_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_open = os.pidfd_open
+    calls: list[int] = []
+
+    def exhaust_once(pid: int, flags: int = 0) -> int:
+        calls.append(pid)
+        if len(calls) == 2:
+            raise OSError(24, "injected process descriptor exhaustion")
+        return original_open(pid, flags)
+
+    marker = tmp_path / "must-not-start"
+    monkeypatch.setattr(os, "pidfd_open", exhaust_once)
+    with pytest.raises(OSError, match="descriptor exhaustion"):
+        _run_command((sys.executable, "-c",
+                      "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker)),
+                     timeout=5)
+    assert calls[0] == os.getpid() and calls[1] == calls[2]
+    assert not marker.exists()
+    _assert_command_child_gone(calls[1], "preauthority descriptor exhaustion")
+
+
+def test_command_repeated_double_pidfd_exhaustion_reaps_stopped_supervisors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_module._require_waitable_sigchld_children("command cleanup regression")
+    original_open = os.pidfd_open
+    original_pipe = os.pipe2
+    original_popen = subprocess.Popen
+    original_kill = os.kill
+    before_fds = len(list(Path("/proc/self/fd").iterdir()))
+    before_tasks = len(list(Path("/proc/self/task").iterdir()))
+    marker = tmp_path / "must-not-start"
+    processes: list[subprocess.Popen[bytes]] = []
+    anchors: list[int] = []
+    pipe_reads: dict[int, int] = {}
+    pidfd_calls: list[int] = []
+    signals: list[tuple[int, int]] = []
+
+    def record_pipe(flags: int) -> tuple[int, int]:
+        read_descriptor, write_descriptor = original_pipe(flags)
+        pipe_reads[write_descriptor] = read_descriptor
+        return read_descriptor, write_descriptor
+
+    def exhaust_twice(pid: int, flags: int = 0) -> int:
+        if pid == os.getpid():
+            return original_open(pid, flags)
+        pidfd_calls.append(pid)
+        message = (
+            "original command pidfd exhaustion"
+            if len(pidfd_calls) % 2 else "cleanup retry pidfd exhaustion"
+        )
+        raise OSError(24, message)
+
+    def record_signal(pid: int, signum: int) -> None:
+        signals.append((pid, signum))
+        original_kill(pid, signum)
+
+    def stopped_popen(
+        args: Sequence[str], *, stdin: int | IO[bytes] | None = None,
+        stdout: int | IO[bytes] | None = None,
+        stderr: int | IO[bytes] | None = None,
+        start_new_session: bool = False, bufsize: int = -1,
+        pass_fds: Sequence[int] = (),
+    ) -> subprocess.Popen[bytes]:
+        process = original_popen(
+            args, stdin=stdin, stdout=stdout, stderr=stderr,
+            start_new_session=start_new_session, bufsize=bufsize, pass_fds=pass_fds,
+        )
+        processes.append(process)
+        identity_read = pipe_reads[int(args[3])]
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(identity_read, selectors.EVENT_READ)
+            if not selector.select(2):
+                pytest.fail("command supervisor did not publish its pre-ACK anchor")
+            publication = json.loads(os.read(identity_read, 4096).splitlines()[0])
+        finally:
+            selector.close()
+        assert isinstance(publication, dict) and isinstance(publication.get("pid"), int)
+        anchors.append(int(publication["pid"]))
+        os.kill(process.pid, signal.SIGSTOP)
+        deadline = time.monotonic() + 2
+        while True:
+            state = Path(f"/proc/{process.pid}/stat").read_text().rpartition(") ")[2][:1]
+            if state in ("T", "t"):
+                return process
+            if time.monotonic() >= deadline:
+                pytest.fail("command supervisor did not stop before pidfd exhaustion")
+            time.sleep(0.005)
+
+    monkeypatch.setattr(os, "pidfd_open", exhaust_twice)
+    monkeypatch.setattr(os, "pipe2", record_pipe)
+    monkeypatch.setattr(os, "kill", record_signal)
+    monkeypatch.setattr(subprocess, "Popen", stopped_popen)
+    for _ in range(10):
+        with pytest.raises(OSError, match="original command pidfd exhaustion"):
+            _run_command(
+                (
+                    sys.executable, "-c",
+                    "import pathlib,sys;pathlib.Path(sys.argv[1]).touch()", str(marker),
+                ),
+                timeout=5,
+            )
+    assert pidfd_calls == [pid for process in processes for pid in (process.pid, process.pid)]
+    assert signals == [
+        item for process in processes for item in (
+            (process.pid, signal.SIGSTOP),
+            (process.pid, signal.SIGCONT),
+            (process.pid, signal.SIGKILL),
+        )
+    ]
+    assert all(process.returncode == -signal.SIGKILL for process in processes)
+    assert all(not Path(f"/proc/{process.pid}").exists() for process in processes)
+    assert len(anchors) == len(processes)
+    deadline = time.monotonic() + 2
+    while any(Path(f"/proc/{pid}").exists() for pid in anchors) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert all(not Path(f"/proc/{pid}").exists() for pid in anchors)
+    assert not marker.exists()
+    assert len(list(Path("/proc/self/fd").iterdir())) == before_fds
+    assert len(list(Path("/proc/self/task").iterdir())) == before_tasks
+
+
+def test_command_preauthority_cleanup_fault_is_not_excused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_open = os.pidfd_open
+    original_cleanup = chat_module._cleanup_unpinned_direct_child
+
+    def exhaust(pid: int, flags: int = 0) -> int:
+        if pid == os.getpid():
+            return original_open(pid, flags)
+        raise OSError(24, "original command pidfd exhaustion")
+
+    def cleanup_then_fail(
+        process: subprocess.Popen[bytes], expected: chat_module._CommandAnchorIdentity,
+        context: str, *, timeout: float = 5.0,
+    ) -> None:
+        original_cleanup(process, expected, context, timeout=timeout)
+        raise RuntimeError("synthetic preauthority cleanup proof failure")
+
+    monkeypatch.setattr(os, "pidfd_open", exhaust)
+    monkeypatch.setattr(chat_module, "_cleanup_unpinned_direct_child", cleanup_then_fail)
+    with pytest.raises(RuntimeError, match="cleanup proof failure") as caught:
+        _run_command((sys.executable, "-c", "raise SystemExit(0)"), timeout=5)
+    assert isinstance(caught.value.__context__, OSError)
+
+
+def test_command_anchor_pidfd_failure_refuses_authority_and_reaps_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_open = os.pidfd_open
+    calls: list[int] = []
+
+    def exhaust_anchor(pid: int, flags: int = 0) -> int:
+        calls.append(pid)
+        if len(calls) == 3:
+            raise OSError(24, "injected anchor descriptor exhaustion")
+        return original_open(pid, flags)
+
+    marker = tmp_path / "must-not-start"
+    monkeypatch.setattr(os, "pidfd_open", exhaust_anchor)
+    with pytest.raises(OSError, match="anchor descriptor exhaustion"):
+        _run_command((sys.executable, "-c",
+                      "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker)),
+                     timeout=5)
+    assert len(calls) == 3 and not marker.exists()
+    for pid in calls[1:]:
+        _assert_command_child_gone(pid, "preauthority anchor descriptor exhaustion")
+
+
+def test_command_missing_final_result_never_uses_popen_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_read_result = chat_module._read_command_result
+    consumed = False
+
+    def lost_result(descriptor: int) -> int:
+        nonlocal consumed
+        if not consumed:
+            # Consume the real successful status, then expose EOF to simulate
+            # a missing private result. Popen itself still observes exit zero.
+            assert original_read_result(descriptor) == 0
+            consumed = True
+        return original_read_result(descriptor)
+
+    monkeypatch.setattr(chat_module, "_read_command_result", lost_result)
+    with pytest.raises(RuntimeError, match="containment could not prove"):
+        _run_command((sys.executable, "-c", "print('must not report success')"), timeout=5)
+    assert consumed
+
+
+@pytest.mark.parametrize("failure_at", [1, 2, 3, 4])
+def test_command_control_pipe_failure_releases_prior_descriptors(
+    monkeypatch: pytest.MonkeyPatch, failure_at: int,
+) -> None:
+    original_pipe = os.pipe2
+    calls = 0
+    descriptors_before = set(Path("/proc/self/fd").iterdir())
+
+    def exhausted(flags: int) -> tuple[int, int]:
+        nonlocal calls
+        calls += 1
+        if calls == failure_at:
+            raise OSError(24, "injected pipe descriptor exhaustion")
+        return original_pipe(flags)
+
+    monkeypatch.setattr(os, "pipe2", exhausted)
+    with pytest.raises(OSError, match="pipe descriptor exhaustion"):
+        _run_command((sys.executable, "-c", "raise SystemExit(0)"), timeout=5)
+    assert set(Path("/proc/self/fd").iterdir()) == descriptors_before
+
+
+@pytest.mark.parametrize("wire", [
+    b"", b"{}\n", b'{"version":1,"returncode":7}',
+    b'{"version":1,"returncode":7}\nextra',
+    b'{"version":1,"returncode":7}\n{}\n',
+    b'{"version":1,"returncode":7,"returncode":0}\n',
+    b'{"version":1,"returncode":true}\n',
+    b'{"version":1,"returncode":256}\n',
+    b'{"version":1,"returncode":-65}\n',
+    b'{"version":true,"returncode":0}\n',
+    b'{"version":1,"returncode":0,"extra":0}\n',
+    b"x" * 257,
+])
+def test_command_final_result_requires_one_exact_bounded_record(wire: bytes) -> None:
+    reader, writer = os.pipe()
+    try:
+        os.write(writer, wire)
+        os.close(writer)
+        writer = -1
+        with pytest.raises((ValueError, TypeError)):
+            chat_module._read_command_result(reader)
+    finally:
+        os.close(reader)
+        if writer >= 0:
+            os.close(writer)
+
+
+@pytest.mark.parametrize("wire", [b"{bad-json}\n", b'{"version":1', b"x" * 4097])
+def test_command_malformed_publication_never_grants_adapter_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wire: bytes,
+) -> None:
+    original_publication = chat_module._read_command_publication
+    identities: list[chat_module._CommandAnchorIdentity] = []
+    supervisor_ids: list[int] = []
+
+    def corrupt_publication(
+        descriptor: int, supervisor_pid: int, deadline: float,
+    ) -> chat_module._CommandAnchorIdentity:
+        identity = original_publication(descriptor, supervisor_pid, deadline)
+        identities.append(identity)
+        supervisor_ids.append(supervisor_pid)
+        reader, writer = os.pipe()
+        os.write(writer, wire)
+        os.close(writer)
+        try:
+            # Feed actual malformed/partial framing through the real parser.
+            return original_publication(reader, supervisor_pid, deadline)
+        finally:
+            os.close(reader)
+
+    marker = tmp_path / "must-not-start"
+    monkeypatch.setattr(chat_module, "_read_command_publication", corrupt_publication)
+    with pytest.raises(ValueError):
+        _run_command((sys.executable, "-c",
+                      "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker)),
+                     timeout=5)
+    assert not marker.exists()
+    for pid in [*supervisor_ids, *(item.pid for item in identities)]:
+        _assert_command_child_gone(pid, "malformed handshake")
+
+
+def test_command_emergency_census_ignores_non_utf8_unrelated_comm(tmp_path: Path) -> None:
+    ready = tmp_path / "non-utf8-ready"
+    script = r'''
+import ctypes
+import pathlib
+import sys
+import time
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(15, ctypes.c_char_p(b"bad\xffname"), 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_NAME")
+pathlib.Path(sys.argv[1]).write_text("ready")
+time.sleep(60)
+'''
+    unrelated = subprocess.Popen((sys.executable, "-c", script, str(ready)))
+    try:
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert ready.exists()
+        nonexistent = chat_module._CommandAnchorIdentity(
+            pid=1 << 30, starttime=1, ppid=1, pgrp=1 << 30,
+            session=1 << 30, state="T",
+        )
+        assert chat_module._command_group_members(nonexistent) == ()
+    finally:
+        unrelated.kill()
+        unrelated.wait(timeout=2)
+
+
+def test_command_failure_preserves_leader_result_and_terminates_descendant(tmp_path: Path) -> None:
+    pid_path = tmp_path / "child.pid"
+    script = (
+        "import pathlib,subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "print('failure detail',file=sys.stderr,flush=True); sys.exit(7)"
+    )
+    started = time.monotonic()
+    result = _run_command((sys.executable, "-c", script, str(pid_path)), timeout=5)
+    assert time.monotonic() - started < 3
+    assert result.returncode == 7
+    assert result.stdout == ""
+    assert result.stderr == "failure detail\n"
+    _assert_command_child_gone(int(pid_path.read_text()), "failed")
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGKILL])
+def test_command_preserves_signal_returncode(signum: signal.Signals) -> None:
+    result = _run_command(
+        (sys.executable, "-c", "import os,sys; os.kill(os.getpid(),int(sys.argv[1]))",
+         str(signum.value)),
+        timeout=5,
+    )
+    assert result.returncode == -signum
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
 def test_command_timeout_terminates_descendants_holding_output_pipes(tmp_path: Path) -> None:
     pid_path = tmp_path / "child.pid"
     script = (
@@ -242,18 +928,355 @@ def test_command_timeout_terminates_descendants_holding_output_pipes(tmp_path: P
     with pytest.raises(subprocess.TimeoutExpired):
         _run_command((sys.executable, "-c", script, str(pid_path)), timeout=0.5)
     assert time.monotonic() - started < 5
-    pid = int(pid_path.read_text())
+    _assert_command_child_gone(int(pid_path.read_text()), "timed-out")
+
+
+@pytest.mark.parametrize("cleanup", ["cooperative", "emergency", "census-error"])
+def test_command_timeout_contains_group_when_supervisor_is_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup: str,
+) -> None:
+    """The old fallback killed only S's PGID, leaving its separately-sessioned C alive."""
+    pid_path = tmp_path / "stopped-supervisor-pids"
+    child_script = "import os,time; os.close(0); os.close(1); os.close(2); time.sleep(60)"
+    adapter = (
+        "import os,pathlib,subprocess,sys,time; "
+        "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
+        "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {child.pid}'); "
+        "time.sleep(60)"
+    )
+    outcomes: list[BaseException] = []
+    censuses: list[tuple[chat_module._CommandAnchorIdentity, ...]] = []
+    if cleanup != "cooperative":
+        original_signal = signal.pidfd_send_signal
+        original_census = chat_module._command_group_members
+        dropped: set[int] = set()
+
+        def unresponsive(descriptor: int, signum: int) -> None:
+            if signum in (signal.SIGTERM, signal.SIGCONT) and signum not in dropped:
+                dropped.add(signum)
+                return
+            original_signal(descriptor, signum)
+
+        def observe_census(
+            anchor: chat_module._CommandAnchorIdentity,
+        ) -> tuple[chat_module._CommandAnchorIdentity, ...]:
+            members = original_census(anchor)
+            censuses.append(members)
+            if cleanup == "census-error":
+                raise OSError(5, "injected emergency census failure")
+            return members
+
+        monkeypatch.setattr(signal, "pidfd_send_signal", unresponsive)
+        monkeypatch.setattr(chat_module, "_command_group_members", observe_census)
+
+    def invoke() -> None:
+        try:
+            _run_command(
+                (sys.executable, "-c", adapter, str(pid_path), child_script), timeout=0.5)
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    deadline = time.monotonic() + 2
+    while not pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert pid_path.exists(), "adapter did not publish its process identities"
+    adapter_pid, child_pid = (int(value) for value in pid_path.read_text().split())
+    supervisor_pid = int(next(
+        line.split()[1]
+        for line in Path(f"/proc/{adapter_pid}/status").read_text().splitlines()
+        if line.startswith("PPid:")
+    ))
+    os.kill(supervisor_pid, signal.SIGSTOP)
+    worker.join(timeout=6)
+    if worker.is_alive():
+        os.kill(supervisor_pid, signal.SIGCONT)
+        worker.join(timeout=2)
+    assert not worker.is_alive(), "stopped supervisor left command cleanup blocked"
+    assert len(outcomes) == 1 and isinstance(outcomes[0], subprocess.TimeoutExpired)
+    if cleanup == "emergency":
+        assert len(censuses) >= 2
+        assert all(member.state in ("T", "t", "Z") for member in censuses[-1])
+        assert {adapter_pid, child_pid}.issubset({member.pid for member in censuses[-1]})
+    elif cleanup == "census-error":
+        assert len(censuses) == 1
+    for pid, role in ((supervisor_pid, "supervisor"),
+                      (adapter_pid, "adapter"), (child_pid, "descendant")):
+        _assert_command_child_gone(pid, f"stopped-supervisor {role}")
+
+
+@pytest.mark.parametrize(("descriptor", "name"), [(1, "stdout"), (2, "stderr")])
+def test_command_output_is_bounded_before_json_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, descriptor: int, name: str,
+) -> None:
+    monkeypatch.setattr(chat_module, "_MAX_COMMAND_STDOUT", 1024)
+    monkeypatch.setattr(chat_module, "_MAX_COMMAND_STDERR", 1024)
+    pid_path = tmp_path / "child.pid"
+    script = (
+        "import os,pathlib,subprocess,sys,time; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        f"os.write({descriptor}, b'x' * 1025); time.sleep(60)"
+    )
+    with pytest.raises(ValueError, match=rf"{name} exceeds its byte limit"):
+        _run_command((sys.executable, "-c", script, str(pid_path)), timeout=5)
+    _assert_command_child_gone(int(pid_path.read_text()), "overflowed")
+
+
+def test_command_output_read_failure_cleans_the_complete_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_path = tmp_path / "read-failure-pids"
+    script = (
+        "import os,pathlib,subprocess,sys,time; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {child.pid}'); "
+        "print('ready',flush=True); time.sleep(60)"
+    )
+    original_read = os.read
+    failed = False
+
+    def fail_output(descriptor: int, length: int) -> bytes:
+        nonlocal failed
+        if length == 65536 and not failed and pid_path.exists():
+            failed = True
+            raise OSError(5, "injected output read failure")
+        return original_read(descriptor, length)
+
+    monkeypatch.setattr(os, "read", fail_output)
+    with pytest.raises(OSError, match="injected output read failure"):
+        _run_command((sys.executable, "-c", script, str(pid_path)), timeout=5)
+    assert failed
+    for value in pid_path.read_text().split():
+        _assert_command_child_gone(int(value), "output read failure")
+
+
+def test_command_final_wait_failure_always_wakes_anchor_then_reaps_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_wait = subprocess.Popen.wait
+    original_signal = signal.pidfd_send_signal
+    original_open = os.pidfd_open
+    handles: list[tuple[int, int]] = []
+    killed = False
+    failed = False
+    woke_after_failure = False
+
+    def remember_open(pid: int, flags: int = 0) -> int:
+        descriptor = original_open(pid, flags)
+        handles.append((pid, descriptor))
+        return descriptor
+
+    def record_signal(descriptor: int, signum: int) -> None:
+        nonlocal killed, woke_after_failure
+        if len(handles) >= 3 and descriptor == handles[1][1] and signum == signal.SIGKILL:
+            killed = True
+        if (len(handles) >= 3 and descriptor == handles[2][1]
+                and signum == signal.SIGCONT and failed):
+            woke_after_failure = True
+        original_signal(descriptor, signum)
+
+    def wait_failure(process: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+        nonlocal failed
+        if killed and not failed:
+            failed = True
+            assert timeout is not None
+            raise subprocess.TimeoutExpired("injected final supervisor wait", timeout)
+        return original_wait(process, timeout)
+
+    monkeypatch.setattr(os, "pidfd_open", remember_open)
+    monkeypatch.setattr(signal, "pidfd_send_signal", record_signal)
+    monkeypatch.setattr(subprocess.Popen, "wait", wait_failure)
+    pid_path = tmp_path / "wait-failure-adapter"
+    command = (sys.executable, "-c", "import os,pathlib,sys,time; "
+               "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)",
+               str(pid_path))
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_command(command, timeout=0.5)
+    assert failed and woke_after_failure
+    for pid in [*(pid for pid, _ in handles[1:]), int(pid_path.read_text())]:
+        _assert_command_child_gone(pid, "final wait failure")
+
+
+@pytest.mark.parametrize("failure", ["lifeline-read", "supervisor-signal"])
+def test_active_command_anchor_fault_always_kills_its_group(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from agentctl import _command_anchor as anchor_module
+
+    class GroupKilled(BaseException):
+        pass
+
+    activation_read, activation_write = os.pipe()
+    ready_read, ready_write = os.pipe()
+    lifeline_read, lifeline_write = os.pipe()
+    original_read = os.read
+    killed: list[int] = []
+
+    def fail_signal(descriptor: int, signum: int) -> None:
+        raise OSError(9, "injected active supervisor descriptor failure")
+
+    def fail_read(descriptor: int, length: int) -> bytes:
+        if descriptor == lifeline_read:
+            # Readiness proves this is the phase in which C may already run.
+            assert original_read(ready_read, 1) == b"1"
+            if failure == "lifeline-read":
+                raise OSError(5, "injected active lifeline read failure")
+            return b""
+        return original_read(descriptor, length)
+
+    def kill_group() -> None:
+        killed.append(os.getpgrp())
+        raise GroupKilled
+
+    monkeypatch.setattr(anchor_module, "_prctl", lambda option, argument: None)
+    monkeypatch.setattr(anchor_module, "_read_byte", lambda descriptor, expected_parent: b"1")
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: signal.SIG_DFL)
+    monkeypatch.setattr(signal, "pidfd_send_signal", fail_signal)
+    monkeypatch.setattr(os, "read", fail_read)
+    monkeypatch.setattr(anchor_module, "_kill_anchored_group", kill_group)
+    try:
+        with pytest.raises(GroupKilled):
+            anchor_module.run(os.getppid(), activation_read, ready_write, lifeline_read, -1)
+        assert killed
+    finally:
+        for descriptor in (activation_read, activation_write, ready_read, ready_write,
+                           lifeline_read, lifeline_write):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def test_command_supervisor_crash_after_adapter_start_uses_frozen_census(tmp_path: Path) -> None:
+    """A separate reaper models init; the bridge must prove its orphan group vanished."""
+    pids = tmp_path / "crashed-supervisor-pids"
+    package_parent = Path(chat_module.__file__).resolve().parent.parent
+    probe = r'''
+import ctypes
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
+caller_program = r"""
+import pathlib
+import sys
+sys.path.insert(0, sys.argv[2])
+from agentctl import chat
+adapter = (
+    "import os,pathlib,subprocess,sys,time; "
+    "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+    "pathlib.Path(sys.argv[1]).write_text(f'{os.getppid()} {os.getpgrp()} {os.getpid()} {child.pid}'); "
+    "time.sleep(60)"
+)
+censuses = []
+original_census = chat._command_group_members
+def census(anchor):
+    result = original_census(anchor)
+    censuses.append(result)
+    return result
+chat._command_group_members = census
+try:
+    chat._run_command((sys.executable, "-c", adapter, sys.argv[1]), timeout=10)
+except ValueError as exc:
+    if "final result" not in str(exc):
+        raise
+else:
+    raise SystemExit("supervisor crash was incorrectly reported as adapter success")
+if len(censuses) < 2:
+    raise SystemExit("supervisor crash did not take a stable emergency census")
+if not all(item.state in ("T", "t", "Z") for item in censuses[-1]):
+    raise SystemExit("emergency census included a running group member")
+"""
+path = pathlib.Path(sys.argv[1])
+caller = subprocess.Popen((sys.executable, "-c", caller_program, str(path), sys.argv[2]))
+identities = []
+try:
+    deadline = time.monotonic() + 5
+    while not path.exists() and time.monotonic() < deadline:
+        if caller.poll() is not None:
+            raise SystemExit("caller failed before adapter started")
+        time.sleep(0.005)
+    identities = [int(value) for value in path.read_text().split()]
+    supervisor, anchor, adapter, descendant = identities
+    os.kill(supervisor, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while caller.poll() is None and time.monotonic() < deadline:
+        # Only the outer test reaper owns these orphaned processes. Reap each
+        # after it exits, without stealing the caller or its direct child S.
+        for pid in (anchor, adapter, descendant):
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+        time.sleep(0.005)
+    if caller.wait(timeout=1) != 0:
+        raise SystemExit("caller did not report a proved containment failure")
+    remaining = [pid for pid in identities if pathlib.Path(f"/proc/{pid}").exists()]
+    if remaining:
+        raise SystemExit(f"supervisor crash left identities: {remaining}")
+finally:
+    if caller.poll() is None:
+        caller.kill()
+        caller.wait(timeout=2)
+    for pid in identities:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
         try:
-            os.kill(pid, 0)
-            state = Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2][:1]
-        except (ProcessLookupError, FileNotFoundError):
-            return
-        if state == "Z":
-            return
-        time.sleep(0.01)
-    pytest.fail(f"timed-out adapter child {pid} remains running")
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if not pid:
+            time.sleep(0.005)
+'''
+    completed = subprocess.run(
+        (sys.executable, "-c", probe, str(pids), str(package_parent)),
+        text=True, capture_output=True, timeout=18, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_command_transport_retries_nonblocking_readiness_race(
+    monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    blocked = False
+    if operation == "read":
+        original_read = os.read
+
+        def flaky_read(fd: int, length: int) -> bytes:
+            nonlocal blocked
+            if not blocked and not os.get_blocking(fd):
+                blocked = True
+                raise BlockingIOError
+            return original_read(fd, length)
+
+        monkeypatch.setattr(os, "read", flaky_read)
+    else:
+        original_write = os.write
+
+        def flaky_write(fd: int, data: object) -> int:
+            nonlocal blocked
+            if not blocked:
+                blocked = True
+                raise BlockingIOError
+            return original_write(fd, cast(bytes, data))
+
+        monkeypatch.setattr(os, "write", flaky_write)
+    script = "import sys; data = sys.stdin.buffer.read(); sys.stdout.buffer.write(data)"
+    result = _run_command((sys.executable, "-c", script), timeout=5, input_text="ready")
+    assert blocked and result.returncode == 0 and result.stdout == "ready" and result.stderr == ""
 
 
 class Pages:
@@ -316,6 +1339,7 @@ def test_wrong_reply_resource_remains_pending_and_keeps_retry_id(tmp_path: Path)
     path = tmp_path / "requests" / f"{key}.json"
     _write(path, {"key": key, "queue_id": "source-one", "phase": "awaiting_reply",
                   "message": message, "request_id": _REQUEST_ID, "received_at": _START})
+    bridge.migrate_reply_outboxes()
     submit_reply(tmp_path, key, "Done")
     with pytest.raises(ValueError, match="outside"):
         bridge._deliver()
@@ -439,7 +1463,7 @@ def test_run_loop_retries_malformed_transport_output(
     calls = 0
     now = 0.0
 
-    class RetryBridge:
+    class RetryBridge(Bridge):
         def __init__(self, state: Path) -> None:
             self.state = state
             self.config = Config(_SPACE, ("users/owner",), Target(), "test-agent", reply_mode="file")
@@ -453,6 +1477,18 @@ def test_run_loop_retries_malformed_transport_output(
 
         def output_requests(self, *, retry_failed: bool = False) -> dict[str, str]:
             return {}
+
+        def output_markers(self, *, retry_failed: bool = False) -> tuple[str, ...]:
+            return ()
+
+        def _prime_prompt_cache(self) -> None:
+            return None
+
+        def migrate_reply_outboxes(self) -> None:
+            pass
+
+        def validate_continuous_output(self) -> None:
+            pass
 
     def skip_sleep(seconds: float) -> None:
         nonlocal now
@@ -477,14 +1513,16 @@ def test_run_loop_backs_off_failures_and_recovers_configured_interval(
     calls = 0
     now = 0.0
     delays: list[float] = []
+    tick_times: list[float] = []
 
-    class RecoveringBridge:
+    class RecoveringBridge(Bridge):
         def __init__(self, state: Path) -> None:
             self.state = state
             self.config = Config(_SPACE, ("users/owner",), Target(), "test-agent", reply_mode="file")
 
         def tick(self) -> dict[str, object]:
             nonlocal calls
+            tick_times.append(now)
             calls += 1
             if calls <= failures:
                 raise ValueError("temporary quota failure")
@@ -494,6 +1532,18 @@ def test_run_loop_backs_off_failures_and_recovers_configured_interval(
 
         def output_requests(self, *, retry_failed: bool = False) -> dict[str, str]:
             return {}
+
+        def output_markers(self, *, retry_failed: bool = False) -> tuple[str, ...]:
+            return ()
+
+        def _prime_prompt_cache(self) -> None:
+            return None
+
+        def migrate_reply_outboxes(self) -> None:
+            pass
+
+        def validate_continuous_output(self) -> None:
+            pass
 
     def sleep(seconds: float) -> None:
         nonlocal now
@@ -506,6 +1556,10 @@ def test_run_loop_backs_off_failures_and_recovers_configured_interval(
     assert chat_module.run_cli([
         "run", "--state", str(tmp_path), *interval_arguments,
     ]) == 130
+    expected_ticks = [0.0]
+    for delay in expected_delays:
+        expected_ticks.append(expected_ticks[-1] + delay)
+    assert tick_times == expected_ticks
     assert delays == expected_delays
 
 
@@ -515,14 +1569,16 @@ def test_run_loop_long_interval_failures_back_off_toward_one_day(
     calls = 0
     now = 0.0
     delays: list[float] = []
+    tick_times: list[float] = []
 
-    class RecoveringBridge:
+    class RecoveringBridge(Bridge):
         def __init__(self, state: Path) -> None:
             self.state = state
             self.config = Config(_SPACE, ("users/owner",), Target(), "test-agent", reply_mode="file")
 
         def tick(self) -> dict[str, object]:
             nonlocal calls
+            tick_times.append(now)
             calls += 1
             if calls <= 2:
                 raise ValueError("temporary quota failure")
@@ -532,6 +1588,18 @@ def test_run_loop_long_interval_failures_back_off_toward_one_day(
 
         def output_requests(self, *, retry_failed: bool = False) -> dict[str, str]:
             return {}
+
+        def output_markers(self, *, retry_failed: bool = False) -> tuple[str, ...]:
+            return ()
+
+        def _prime_prompt_cache(self) -> None:
+            return None
+
+        def migrate_reply_outboxes(self) -> None:
+            pass
+
+        def validate_continuous_output(self) -> None:
+            pass
 
     def sleep(seconds: float) -> None:
         nonlocal now
@@ -544,6 +1612,7 @@ def test_run_loop_long_interval_failures_back_off_toward_one_day(
     assert chat_module.run_cli([
         "run", "--state", str(tmp_path), "--interval", "3600",
     ]) == 130
+    assert tick_times == [0, 7200, 21600, 25200]
     assert delays == [7200, 14400, 3600]
 
 
@@ -563,3 +1632,38 @@ def test_run_accepts_one_day_poll_interval_and_rejects_larger(
         "run", "--state", str(tmp_path), "--interval", "86400.1",
     ]) == 1
     assert "between 0.1 and 86400 seconds" in capsys.readouterr().err
+
+
+def test_run_cli_reports_sigterm_as_clean_service_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(chat_module, "Bridge", lambda state: object())
+
+    def terminated(*args: object, **kwargs: object) -> None:
+        raise chat_module._ServiceTerminated
+
+    monkeypatch.setattr(chat_module, "_run_bridge", terminated)
+    assert chat_module.run_cli(["run", "--state", str(tmp_path)]) == 0
+
+
+def test_run_validates_observer_write_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    intervals: list[float] = []
+    monkeypatch.setattr(chat_module, "Bridge", lambda state: object())
+    monkeypatch.setattr(chat_module, "_run_bridge",
+        lambda bridge, interval, prog, **kwargs: intervals.append(
+            float(kwargs["observer_write_interval"])))
+
+    for value in (60.0, 3600.0):
+        assert chat_module.run_cli([
+            "run", "--state", str(tmp_path),
+            "--observer-write-interval", str(value),
+        ]) == 0
+    assert intervals == [60, 3600]
+    for invalid_value in (59.9, 3600.1):
+        assert chat_module.run_cli([
+            "run", "--state", str(tmp_path),
+            "--observer-write-interval", str(invalid_value),
+        ]) == 1
+    assert capsys.readouterr().err.count("between 60 and 3600 seconds") == 2

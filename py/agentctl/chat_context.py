@@ -15,6 +15,7 @@ _STAMP = re.compile(
 )
 _SPACE = re.compile(r"spaces/[A-Za-z0-9_-]+")
 _MAX_MESSAGES = 200
+_MAX_CURSOR_BYTES = 8 * 1024
 
 
 def _instant(value: str) -> tuple[int, int]:
@@ -42,6 +43,8 @@ def _limit(value: object) -> int:
 def _cursor(value: object) -> str | None:
     if value is not None and (not isinstance(value, str) or not value):
         raise ValueError("context cursor must be a nonempty string or null")
+    if isinstance(value, str) and len(value.encode("utf-8")) > _MAX_CURSOR_BYTES:
+        raise ValueError(f"context cursor must not exceed {_MAX_CURSOR_BYTES} UTF-8 bytes")
     return value
 
 

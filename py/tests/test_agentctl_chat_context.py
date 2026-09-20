@@ -123,7 +123,7 @@ def test_equal_or_later_message_is_never_returned(stamp: str) -> None:
     ("before", "2026-01-02T00:00:26+01:99"), ("before", "2026-02-30T00:00:00Z"),
     ("before", '2026-01-02T00:00:26Z" AND thread.name = other'),
     ("limit", True), ("limit", 0), ("limit", 201), ("limit", 10.0),
-    ("cursor", ""), ("cursor", 3), ("action", "poll"),
+    ("cursor", ""), ("cursor", 3), ("cursor", "x" * 8193), ("action", "poll"),
 ])
 def test_rest_context_query_rejects_invalid_fields(key: str, value: object) -> None:
     with pytest.raises((ValueError, TypeError)):
@@ -180,6 +180,7 @@ def test_invalid_order_duplicates_or_oversized_page_are_refused(rows: list[dict[
 @pytest.mark.parametrize("response", [
     {"messages": {}, "cursor": None}, {"messages": ["not-an-object"]},
     {"messages": [], "cursor": 3}, {"messages": [], "cursor": ""},
+    {"messages": [], "cursor": "x" * 8193},
     {"messages": [], "cursor": "same"},
 ])
 def test_malformed_or_nonprogressing_pages_are_refused(response: dict[str, object]) -> None:

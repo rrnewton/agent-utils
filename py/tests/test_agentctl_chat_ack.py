@@ -155,7 +155,63 @@ def test_legacy_configuration_defaults_to_robot() -> None:
     document = as_mapping(json.loads(json.dumps(asdict(_config()))), "config")
     del document["ack_reaction"]
     del document["reaction_user"]
-    assert Config.parse(document).ack_reaction == "🤖"
+    del document["outbound_mode"]
+    parsed = Config.parse(document)
+    assert parsed.ack_reaction == "🤖" and parsed.outbound_mode == "enabled"
+
+
+@pytest.mark.parametrize("value", [None, "", "read-only", False, 1])
+def test_invalid_outbound_mode_is_refused(value: object) -> None:
+    with pytest.raises(ValueError, match="outbound_mode"):
+        _config(outbound_mode=value)
+
+
+def test_outbound_disabled_persists_input_but_refuses_every_chat_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, harness, chat = _setup(tmp_path, outbound_mode="disabled")
+    status = bridge.tick()
+    record = _record(tmp_path)
+    key = str(record["key"])
+
+    assert [call["action"] for call in chat.calls] == ["poll"]
+    assert record["phase"] == "awaiting_reply"
+    assert "reply_nonce" not in record
+    assert as_mapping(record["ack"], "ack")["state"] == "disabled"
+    assert as_mapping(record["ack"], "ack")["emoji"] is None
+    assert status["outbound_mode"] == "disabled" and status["ack_reaction"] is None
+    assert len(harness.prompts) == 1
+    assert "Outbound Chat is disabled" in harness.prompts[0]
+    assert "no Chat reply will be published" in harness.prompts[0]
+    assert "<CHAT_REPLY_" not in harness.prompts[0] and " --file " not in harness.prompts[0]
+    with pytest.raises(ValueError, match="reply artifacts are refused"):
+        submit_reply(tmp_path, key, "must not be saved")
+    assert list((tmp_path / "replies").glob("*.json")) == []
+    assert list((tmp_path / "replies" / "items").rglob("*.json")) == []
+    assert list((tmp_path / "submissions").glob("*.json")) == []
+
+    # Corrupt or legacy pending-looking state must not bypass the mode.
+    ack = as_mapping(record["ack"], "ack")
+    ack.update(state="pending", emoji="🤖", error="retry", next_retry_at=None)
+    record.update(phase="reply_pending", ack=ack, reply_nonce="A" * 22, reply_protocol=2)
+    _write(tmp_path / "requests" / f"{key}.json", record)
+    _write(tmp_path / "replies" / f"{key}.json", {
+        "text": "preexisting", "items": [{
+            "reply_key": "0", "request_id": record["request_id"], "text": "preexisting",
+        }],
+    })
+    bridge.tick()
+    assert set(call["action"] for call in chat.calls) == {"poll"}
+    assert as_mapping(_record(tmp_path)["ack"], "ack")["state"] == "disabled"
+    assert bridge.output_requests(retry_failed=True) == {}
+    monkeypatch.setattr(bridge, "open_output",
+                        lambda nonces: (_ for _ in ()).throw(AssertionError("capture subscribed")))
+    assert bridge.capture_once() == {"captured": [], "errors": []}
+    for action in ("react", "send"):
+        before = len(chat.calls)
+        with pytest.raises(ValueError, match="outbound Chat is disabled"):
+            bridge._transport_request({"action": action})
+        assert len(chat.calls) == before
 
 
 def test_ack_only_for_authorized_new_nonempty_messages(tmp_path: Path) -> None:
@@ -409,7 +465,7 @@ def test_command_adapter_react_contract() -> None:
     assert CommandTransport((sys.executable, "-c", script))(_react()) == {"id": _REACTION, "request": _react()}
 
 
-@pytest.mark.parametrize("command", ["launch", "init", "tick", "run", "status", "reply", "quickstart", "userguide"])
+@pytest.mark.parametrize("command", ["launch", "init", "tick", "run", "status", "reply", "close", "quickstart", "userguide"])
 def test_each_chat_subcommand_has_specific_help(command: str, capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as result:
         chat_module.run_cli([command, "--help"])
@@ -421,7 +477,7 @@ def test_each_chat_subcommand_has_specific_help(command: str, capsys: pytest.Cap
         assert "0.1–86400" in text
     else:
         assert "--interval" not in text
-    if command != "reply":
+    if command not in ("reply", "close"):
         assert "--request" not in text
 
 
@@ -437,6 +493,7 @@ def test_quickstart_explains_ack_configuration(capsys: pytest.CaptureFixture[str
     text = capsys.readouterr().out
     assert "ack_reaction" in text and "🤖" in text
     assert "reaction_user" in text
+    assert "outbound_mode" in text and "disabled" in text
     assert "Herdr" in text
 
 

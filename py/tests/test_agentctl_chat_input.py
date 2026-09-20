@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import signal
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import IO, cast
 
 import pytest
 
+from agentctl.chat import (
+    _CommandAnchorIdentity, _cleanup_unpinned_direct_child,
+    _require_waitable_sigchld_children,
+)
 from agentctl.chat_input import EventCommandStream, InputStreamError
 
 
@@ -265,15 +272,9 @@ def test_close_from_another_thread_interrupts_wait_and_is_idempotent() -> None:
     stream.wake()
 
 
-@pytest.mark.parametrize("without_pidfd", [False, True])
 def test_close_allows_durable_unsubscribe_and_drains_shutdown_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, without_pidfd: bool,
+    tmp_path: Path,
 ) -> None:
-    if without_pidfd:
-        def unavailable(pid: int, flags: int = 0) -> int:
-            raise OSError("unsupported")
-
-        monkeypatch.setattr(os, "pidfd_open", unavailable)
     marker = tmp_path / "unsubscribed"
     program = (
         "import signal\n"
@@ -294,13 +295,13 @@ def test_close_allows_durable_unsubscribe_and_drains_shutdown_output(
         pid = int(str(stream.wait(5)[0]["pid"]))
         stream.close()
         assert marker.read_text() == "unsubscribed"
-        assert stream._process is not None and stream._process.returncode == 0
+        assert stream._returncode == 0
         assert _gone(pid)
     finally:
         stream.close()
 
 
-def test_close_bounds_uncooperative_group_without_reaping_owner_before_kill(
+def test_close_bounds_uncooperative_anchored_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     program = (
@@ -315,36 +316,27 @@ def test_close_bounds_uncooperative_group_without_reaping_owner_before_kill(
         identifiers = stream.wait(5)[0]
         parent, child = int(str(identifiers["parent"])), int(str(identifiers["child"]))
         assert stream._process is not None
-        process = stream._process
-        group_signals: list[tuple[int, int]] = []
-        original_killpg, original_wait = os.killpg, process.wait
-
-        def killpg(pid: int, signum: int) -> None:
-            assert process.returncode is None
-            group_signals.append((pid, signum))
-            original_killpg(pid, signum)
-
-        def wait(timeout: float | None = None) -> int:
-            assert group_signals == [(parent, signal.SIGKILL)]
-            return original_wait(timeout)
-
-        def poll() -> int | None:
-            pytest.fail("cleanup must retain the owner's PID until group termination")
-
-        monkeypatch.setattr(os, "killpg", killpg)
-        monkeypatch.setattr(process, "wait", wait)
-        monkeypatch.setattr(process, "poll", poll)
+        monkeypatch.setattr(
+            os, "killpg",
+            lambda pid, signum: pytest.fail(
+                "outer bridge must not signal a numeric process group",
+            ),
+        )
+        monkeypatch.setattr(
+            stream._process, "poll",
+            lambda: pytest.fail(
+                "outer bridge cleanup must use exact readiness, not Popen.poll",
+            ),
+        )
         started = time.monotonic()
         stream.close()
         assert time.monotonic() - started < 3
-        assert group_signals == [(parent, signal.SIGKILL)]
-        assert process.returncode == -signal.SIGKILL
+        assert stream._returncode == -signal.SIGKILL
         deadline = time.monotonic() + 1
         while not _gone(child) and time.monotonic() < deadline:
             time.sleep(0.005)
         assert _gone(parent) and _gone(child)
         stream.close()
-        assert len(group_signals) == 1
     finally:
         stream.close()
 
@@ -366,6 +358,7 @@ def test_cleanup_kills_descendants_even_if_parent_exits_with_output_pipe_open(pa
             with pytest.raises(InputStreamError) as caught:
                 stream.wait(5)
             assert caught.value.code == "stream_eof"
+            assert "exit status 7" in str(caught.value)
             assert time.monotonic() - started < 2
         else:
             stream.close()
@@ -443,16 +436,420 @@ def test_nonfinite_or_oversized_subscription_is_rejected_before_spawn() -> None:
         EventCommandStream(["must-not-run"], {"value": "x" * 200}, max_frame_bytes=128)
 
 
-def test_process_exit_detection_without_process_descriptors(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_process_descriptors_refuse_before_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def unavailable(pid: int, flags: int = 0) -> int:
         raise OSError("unsupported")
 
+    def spawn(*args: object, **kwargs: object) -> None:
+        pytest.fail("pidfd preflight must precede event command spawn")
+
     monkeypatch.setattr(os, "pidfd_open", unavailable)
-    stream = _stream("print('{\"type\":\"heartbeat\"}')\nsys.exit(7)\n")
-    try:
-        assert stream.wait(5) == [{"type": "heartbeat"}]
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    with pytest.raises(InputStreamError) as caught:
+        _stream("time.sleep(60)\n")
+    assert caught.value.code == "process_descriptor_unavailable"
+
+
+def test_process_descriptor_race_after_spawn_kills_and_reaps_without_waitid_polling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    original_open = os.pidfd_open
+    original_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[bytes]] = []
+
+    def open_descriptor(pid: int, flags: int = 0) -> int:
+        if pid == os.getpid():
+            return original_open(pid, flags)
+        raise OSError("descriptor exhausted after spawn")
+
+    def popen(
+        args: Sequence[str], *, stdin: int, stdout: int, stderr: int,
+        start_new_session: bool, bufsize: int, pass_fds: Sequence[int],
+    ) -> subprocess.Popen[bytes]:
+        process = original_popen(
+            args, stdin=stdin, stdout=stdout, stderr=stderr,
+            start_new_session=start_new_session, bufsize=bufsize, pass_fds=pass_fds,
+        )
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(os, "pidfd_open", open_descriptor)
+    monkeypatch.setattr(os, "waitid", lambda *args, **kwargs: pytest.fail("waitid polling fallback"))
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    with pytest.raises(InputStreamError) as caught:
+        _stream(f"open({str(tmp_path / 'provider-started')!r},'w').close()\ntime.sleep(60)\n")
+    assert caught.value.code == "process_descriptor_unavailable"
+    assert len(spawned) == 1 and spawned[0].returncode is not None
+    assert not (tmp_path / "provider-started").exists()
+
+
+def test_repeated_double_pidfd_exhaustion_reaps_stopped_event_supervisors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _require_waitable_sigchld_children("event cleanup regression")
+    original_open = os.pidfd_open
+    original_pipe = os.pipe2
+    original_popen = subprocess.Popen
+    original_kill = os.kill
+    before_fds = len(list(Path("/proc/self/fd").iterdir()))
+    before_tasks = len(list(Path("/proc/self/task").iterdir()))
+    marker = tmp_path / "provider-must-not-start"
+    processes: list[subprocess.Popen[bytes]] = []
+    anchors: list[int] = []
+    pipe_reads: dict[int, int] = {}
+    pidfd_calls: list[int] = []
+    signals: list[tuple[int, int]] = []
+
+    def record_pipe(flags: int) -> tuple[int, int]:
+        read_descriptor, write_descriptor = original_pipe(flags)
+        pipe_reads[write_descriptor] = read_descriptor
+        return read_descriptor, write_descriptor
+
+    def exhaust_twice(pid: int, flags: int = 0) -> int:
+        if pid == os.getpid():
+            return original_open(pid, flags)
+        pidfd_calls.append(pid)
+        message = (
+            "original event pidfd exhaustion"
+            if len(pidfd_calls) % 2 else "cleanup retry event pidfd exhaustion"
+        )
+        raise OSError(24, message)
+
+    def record_signal(pid: int, signum: int) -> None:
+        signals.append((pid, signum))
+        original_kill(pid, signum)
+
+    def stopped_popen(
+        args: Sequence[str], *, stdin: int | IO[bytes] | None = None,
+        stdout: int | IO[bytes] | None = None,
+        stderr: int | IO[bytes] | None = None,
+        start_new_session: bool = False, bufsize: int = -1,
+        pass_fds: Sequence[int] = (),
+    ) -> subprocess.Popen[bytes]:
+        process = original_popen(
+            args, stdin=stdin, stdout=stdout, stderr=stderr,
+            start_new_session=start_new_session, bufsize=bufsize, pass_fds=pass_fds,
+        )
+        processes.append(process)
+        identity_read = pipe_reads[int(args[3])]
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(identity_read, selectors.EVENT_READ)
+            if not selector.select(2):
+                pytest.fail("event supervisor did not publish its pre-ACK anchor")
+            publication = json.loads(os.read(identity_read, 4096).splitlines()[0])
+        finally:
+            selector.close()
+        assert isinstance(publication, dict) and isinstance(publication.get("pid"), int)
+        anchors.append(int(publication["pid"]))
+        os.kill(process.pid, signal.SIGSTOP)
+        deadline = time.monotonic() + 2
+        while True:
+            state = Path(f"/proc/{process.pid}/stat").read_text().rpartition(") ")[2][:1]
+            if state in ("T", "t"):
+                return process
+            if time.monotonic() >= deadline:
+                pytest.fail("event supervisor did not stop before pidfd exhaustion")
+            time.sleep(0.005)
+
+    monkeypatch.setattr(os, "pidfd_open", exhaust_twice)
+    monkeypatch.setattr(os, "pipe2", record_pipe)
+    monkeypatch.setattr(os, "kill", record_signal)
+    monkeypatch.setattr(subprocess, "Popen", stopped_popen)
+    for _ in range(10):
         with pytest.raises(InputStreamError) as caught:
-            stream.wait(5)
-        assert caught.value.code == "stream_eof"
+            _stream(
+                f"open({str(marker)!r},'w').close()\ntime.sleep(60)\n",
+            )
+        assert caught.value.code == "process_descriptor_unavailable"
+        assert isinstance(caught.value.__cause__, OSError)
+        assert "original event pidfd exhaustion" in str(caught.value.__cause__)
+    assert pidfd_calls == [pid for process in processes for pid in (process.pid, process.pid)]
+    assert signals == [
+        item for process in processes for item in (
+            (process.pid, signal.SIGSTOP),
+            (process.pid, signal.SIGCONT),
+            (process.pid, signal.SIGKILL),
+        )
+    ]
+    assert all(process.returncode == -signal.SIGKILL for process in processes)
+    assert all(not Path(f"/proc/{process.pid}").exists() for process in processes)
+    assert len(anchors) == len(processes)
+    deadline = time.monotonic() + 2
+    while any(Path(f"/proc/{pid}").exists() for pid in anchors) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert all(not Path(f"/proc/{pid}").exists() for pid in anchors)
+    assert not marker.exists()
+    assert len(list(Path("/proc/self/fd").iterdir())) == before_fds
+    assert len(list(Path("/proc/self/task").iterdir())) == before_tasks
+
+
+def test_event_preauthority_cleanup_fault_is_not_excused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_open = os.pidfd_open
+    original_cleanup = _cleanup_unpinned_direct_child
+
+    def exhaust(pid: int, flags: int = 0) -> int:
+        if pid == os.getpid():
+            return original_open(pid, flags)
+        raise OSError(24, "original event pidfd exhaustion")
+
+    def cleanup_then_fail(
+        process: subprocess.Popen[bytes], expected: _CommandAnchorIdentity,
+        context: str, *, timeout: float = 5.0,
+    ) -> None:
+        original_cleanup(process, expected, context, timeout=timeout)
+        raise RuntimeError("synthetic preauthority cleanup proof failure")
+
+    monkeypatch.setattr(os, "pidfd_open", exhaust)
+    monkeypatch.setattr("agentctl.chat_input._cleanup_unpinned_direct_child", cleanup_then_fail)
+    with pytest.raises(RuntimeError, match="cleanup proof failure") as caught:
+        _stream("time.sleep(60)\n")
+    assert isinstance(caught.value.__cause__, InputStreamError)
+
+
+@pytest.mark.parametrize("failure", ["supervisor_pidfd", "anchor_pidfd", "registration"])
+def test_pre_ack_failure_never_starts_provider_or_leaks(
+    failure: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    marker = tmp_path / "provider-started"
+    original_open = os.pidfd_open
+    original_popen = subprocess.Popen
+    original_selector = selectors.DefaultSelector
+    nonself_opens = 0
+    spawned: list[subprocess.Popen[bytes]] = []
+    before_fds = len(list(Path("/proc/self/fd").iterdir()))
+
+    def open_descriptor(pid: int, flags: int = 0) -> int:
+        nonlocal nonself_opens
+        if pid == os.getpid():
+            return original_open(pid, flags)
+        nonself_opens += 1
+        if (failure == "supervisor_pidfd" and nonself_opens == 1) or (
+            failure == "anchor_pidfd" and nonself_opens == 2
+        ):
+            raise OSError("synthetic pidfd exhaustion")
+        return original_open(pid, flags)
+
+    def popen(
+        args: Sequence[str], *, stdin: int, stdout: int, stderr: int,
+        start_new_session: bool, bufsize: int, pass_fds: Sequence[int],
+    ) -> subprocess.Popen[bytes]:
+        process = original_popen(
+            args, stdin=stdin, stdout=stdout, stderr=stderr,
+            start_new_session=start_new_session, bufsize=bufsize, pass_fds=pass_fds,
+        )
+        spawned.append(process)
+        return process
+
+    selector_instances = 0
+
+    class RegistrationFailure:
+        def __init__(self) -> None:
+            nonlocal selector_instances
+            selector_instances += 1
+            self.number = selector_instances
+            self.inner = cast(selectors.BaseSelector, original_selector())
+
+        def register(
+            self, fileobj: int, events: int, data: object = None,
+        ) -> object:
+            if self.number == 2:
+                self.number = -1
+                raise OSError("synthetic selector registration failure")
+            return self.inner.register(fileobj, events, data)
+
+        def select(
+            self, timeout: float | None = None,
+        ) -> list[tuple[object, int]]:
+            return cast(list[tuple[object, int]], self.inner.select(timeout))
+
+        def close(self) -> None:
+            self.inner.close()
+
+    monkeypatch.setattr(os, "pidfd_open", open_descriptor)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    if failure == "registration":
+        monkeypatch.setattr(selectors, "DefaultSelector", RegistrationFailure)
+    with pytest.raises(InputStreamError) as caught:
+        _stream(f"open({str(marker)!r},'w').close()\ntime.sleep(60)\n")
+    assert caught.value.code == (
+        "command_failed" if failure == "registration" else "process_descriptor_unavailable"
+    )
+    assert len(spawned) == 1 and spawned[0].returncode is not None
+    assert not marker.exists()
+    assert len(list(Path("/proc/self/fd").iterdir())) == before_fds
+
+
+@pytest.mark.parametrize("disposition", ["ignored", "no-cldwait"])
+def test_event_refuses_autoreap_before_stopped_double_pidfd_race(
+    tmp_path: Path, disposition: str,
+) -> None:
+    python_path = str(Path(__file__).resolve().parents[1])
+    setup = (
+        "signal.signal(signal.SIGCHLD,signal.SIG_IGN)"
+        if disposition == "ignored"
+        else """
+class SigSet(ctypes.Structure):
+    _fields_=[('values',ctypes.c_ulong*16)]
+class SigAction(ctypes.Structure):
+    _fields_=[('handler',ctypes.c_void_p),('mask',SigSet),('flags',ctypes.c_int),('restorer',ctypes.c_void_p)]
+action=SigAction()
+action.handler=ctypes.c_void_p(0)
+libc=ctypes.CDLL(None,use_errno=True)
+assert libc.sigemptyset(ctypes.byref(action.mask)) == 0
+action.flags=2
+assert libc.sigaction(signal.SIGCHLD,ctypes.byref(action),None) == 0
+"""
+    )
+    marker = tmp_path / f"event-autoreap-{disposition}"
+    script = f"""
+import ctypes,os,pathlib,signal,subprocess,sys,time
+{setup}
+import agentctl.chat_input as chat_input
+original_open=os.pidfd_open
+original_popen=subprocess.Popen
+spawned=[]
+handles=[]
+nonself_opens=[]
+def stopped_popen(*args,**kwargs):
+    process=original_popen(*args,**kwargs)
+    descriptor=original_open(process.pid)
+    spawned.append(process)
+    handles.append(descriptor)
+    signal.pidfd_send_signal(descriptor,signal.SIGSTOP)
+    deadline=time.monotonic()+2
+    while pathlib.Path(f'/proc/{{process.pid}}/stat').read_text().rpartition(') ')[2][:1] not in ('T','t'):
+        if time.monotonic() >= deadline:
+            raise AssertionError('supervisor did not stop')
+        time.sleep(.005)
+    return process
+def exhaust_after_spawn(pid,flags=0):
+    if pid == os.getpid():
+        return original_open(pid,flags)
+    nonself_opens.append(pid)
+    raise OSError(24,'combined stopped-supervisor descriptor exhaustion')
+chat_input.subprocess.Popen=stopped_popen
+chat_input.os.pidfd_open=exhaust_after_spawn
+marker=pathlib.Path({str(marker)!r})
+provider="import json,pathlib,sys,time;json.load(sys.stdin);pathlib.Path(sys.argv[1]).touch();time.sleep(60)"
+try:
+    try:
+        chat_input.EventCommandStream(
+            [sys.executable,'-u','-c',provider,str(marker)],{{'action':'subscribe'}},
+        )
+    except chat_input.InputStreamError as exc:
+        assert exc.code=='process_status_unavailable',exc.code
+        assert 'SIGCHLD=SIG_DFL' in str(exc),str(exc)
+    else:
+        raise AssertionError('unsafe SIGCHLD state was accepted')
+    assert not spawned,spawned
+    assert not nonself_opens,nonself_opens
+    assert not marker.exists()
+finally:
+    chat_input.os.pidfd_open=original_open
+    chat_input.subprocess.Popen=original_popen
+    for process,descriptor in zip(spawned,handles):
+        try:
+            signal.pidfd_send_signal(descriptor,signal.SIGCONT)
+            signal.pidfd_send_signal(descriptor,signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except (ChildProcessError,subprocess.TimeoutExpired):
+            pass
+        os.close(descriptor)
+print('pre-spawn-refusal-ok')
+"""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = python_path + os.pathsep + environment.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True,
+        env=environment, timeout=15, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "pre-spawn-refusal-ok"
+    assert not marker.exists()
+
+
+def test_stopped_supervisor_and_anchor_are_woken_for_exact_cleanup() -> None:
+    stream = _stream(
+        "child=os.fork()\n"
+        "if child: print(json.dumps({'parent':os.getpid(),'child':child}))\n"
+        "while True: time.sleep(60)\n",
+    )
+    try:
+        identities = stream.wait(5)[0]
+        provider = int(str(identities["parent"]))
+        child = int(str(identities["child"]))
+        assert stream._process is not None and stream._anchor is not None
+        supervisor = stream._process.pid
+        anchor = stream._anchor.pid
+        os.kill(supervisor, signal.SIGSTOP)
+        os.kill(anchor, signal.SIGSTOP)
+        stream.close()
+        assert stream._returncode in (-signal.SIGTERM, -signal.SIGKILL)
+        assert all(_gone(pid) for pid in (provider, child, supervisor, anchor))
     finally:
         stream.close()
+
+
+def test_owner_sigkill_closes_lifeline_and_removes_provider_group() -> None:
+    python_path = str(Path(__file__).resolve().parents[1])
+    provider = (
+        "import json,os,sys,time;json.load(sys.stdin);child=os.fork();"
+        "print(json.dumps({'type':'heartbeat','provider':os.getpid(),'child':child}),flush=True) "
+        "if child else None;time.sleep(60)"
+    )
+    owner = f"""
+import json,os,sys,time
+from agentctl.chat_input import EventCommandStream
+stream=EventCommandStream([sys.executable,'-u','-c',{provider!r}],{{'action':'subscribe'}})
+event=stream.wait(5)[0]
+print(json.dumps({{'owner':os.getpid(),'supervisor':stream._process.pid,'anchor':stream._anchor.pid,
+                  'provider':event['provider'],'child':event['child']}}),flush=True)
+time.sleep(60)
+"""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = python_path + os.pathsep + environment.get("PYTHONPATH", "")
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-c", owner], stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=environment,
+    )
+    try:
+        assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            assert selector.select(10), "event stream owner did not publish its identities"
+        finally:
+            selector.close()
+        identities = json.loads(process.stdout.readline())
+        os.kill(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        watched = tuple(int(identities[key]) for key in ("supervisor", "anchor", "provider", "child"))
+        while not all(_gone(pid) for pid in watched) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert all(_gone(pid) for pid in watched)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_repeated_supervised_streams_leave_no_descriptors_or_processes() -> None:
+    before = len(list(Path("/proc/self/fd").iterdir()))
+    identifiers: list[int] = []
+    for _ in range(10):
+        stream = _stream(
+            "print(json.dumps({'type':'heartbeat','pid':os.getpid()}))\ntime.sleep(60)\n",
+        )
+        identifiers.append(int(str(stream.wait(5)[0]["pid"])))
+        stream.close()
+    assert all(_gone(pid) for pid in identifiers)
+    assert len(list(Path("/proc/self/fd").iterdir())) == before

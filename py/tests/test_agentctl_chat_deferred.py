@@ -44,7 +44,7 @@ def _pending_reply(state: Path) -> Iterator[tuple[_Runtime, dict[str, object]]]:
     runtime = _Runtime(bridge, 300, "test-chat", threading.Event())
     runtime._input_event({"type": "checkpoint", "cursor": "last-valid"})
     try:
-        reply = bridge._next_reply(record)
+        reply = bridge._next_reply(runtime.reply_items_by_key[key])
         assert reply is not None
         yield runtime, _message(_SPACE + "/messages/echo", text=runtime._outbound_text(reply))
     finally:
@@ -93,7 +93,11 @@ def test_reconciliation_does_not_checkpoint_or_defer_invalid_echo(
         assert _read(tmp_path / "bridge.json") == before
         observer = _read(tmp_path / "input.json")
         assert observer["cursor"] == "last-valid"
-        assert observer["reconcile_error"]
+        assert "reconcile_error" not in observer
+        assert runtime.input_state["reconcile_error"]
+        runtime.input_observer._next_write = 0
+        assert runtime.input_observer.flush()
+        assert _read(tmp_path / "input.json")["reconcile_error"]
         assert runtime.reconcile_requested
         assert list(runtime.deferred.glob("*.json")) == []
 
@@ -128,7 +132,8 @@ def test_echo_survives_crash_before_cursor_commit_and_replays_once(
     {"created_at": "2025-01-01T00:00:00Z", "text": 123, "thread_reply": "invalid"},
     {"text": "", "thread_reply": "invalid"},
 ])
-def test_ordinary_ingestion_retains_filter_order(tmp_path: Path, fields: dict[str, object]) -> None:
+def test_ordinary_ingestion_validates_before_filtering(tmp_path: Path, fields: dict[str, object]) -> None:
     bridge, _, _ = setup(tmp_path)
-    bridge._ingest_result({"messages": [_message(_SOURCE, **fields)]})
+    with pytest.raises((TypeError, ValueError)):
+        bridge._ingest_result({"messages": [_message(_SOURCE, **fields)]})
     assert list((tmp_path / "requests").glob("*.json")) == []

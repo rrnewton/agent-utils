@@ -1,11 +1,11 @@
 """Bounded, blocking subscriptions to retained Herdr terminal output.
 
 The bridge blocks on a Unix socket instead of periodically reading a pane. Herdr
-0.8 internally polls subscription predicates every 100 milliseconds. Its output
-predicate matches individual rendered lines and emits on a false-to-true edge;
-the bridge watches reply markers and re-arms the subscription once per second
-so an earlier retained closing tag cannot hide later progress replies. Events
-contain a retained snapshot, not a lossless terminal stream or assistant message.
+0.8 internally polls subscription predicates every 100 milliseconds. Each output
+predicate matches one individual rendered line and emits on a false-to-true edge.
+The bridge therefore subscribes to each request's exact next protocol-v3 closing
+marker and rebuilds only after that ordinal is durably captured. Events contain a
+retained snapshot, not a lossless terminal stream or assistant message.
 
 There is no replay cursor. Reconnecting evaluates the current snapshot again.
 Callers must deduplicate replies durably and reject incomplete bracketed replies;
@@ -20,6 +20,7 @@ import select
 import socket
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from agentctl.errors import HerdrUnavailable
@@ -76,20 +77,23 @@ class PaneOutputStream:
         self,
         socket_path: str,
         pane_id: str,
-        pattern: str,
+        pattern: str | Sequence[str],
         *,
         lines: int = 4000,
         connect_timeout: float = 5.0,
         max_frame_bytes: int = 2 * 1024 * 1024,
         watch_settled: bool = False,
     ) -> None:
-        if not socket_path or not pane_id or (not pattern and not watch_settled):
+        patterns = (pattern,) if isinstance(pattern, str) and pattern else tuple(pattern)
+        if any(not isinstance(item, str) or not item for item in patterns):
+            raise ValueError("output patterns must be nonempty strings")
+        if not socket_path or not pane_id or (not patterns and not watch_settled):
             raise ValueError("socket path and pane id must be nonempty; an empty pattern requires settled-state watching")
         if not math.isfinite(connect_timeout) or connect_timeout <= 0:
             raise ValueError("connection timeout must be finite and positive")
         if lines <= 0 or max_frame_bytes <= 0:
             raise ValueError("snapshot lines and frame byte limit must be positive")
-        self._path, self._pane, self._pattern = socket_path, pane_id, pattern
+        self._path, self._pane, self._patterns = socket_path, pane_id, patterns
         self._watch_settled = watch_settled
         self._lines, self._connect_timeout = lines, connect_timeout
         self._max_frame = max_frame_bytes
@@ -128,14 +132,14 @@ class PaneOutputStream:
         self._socket = connection
         self._request_id = f"agentctl:chat-output:{uuid.uuid4().hex}"
         subscriptions: list[dict[str, object]] = []
-        if self._pattern:
+        for pattern in self._patterns:
             subscriptions.append({
                 "type": "pane.output_matched",
                 "pane_id": self._pane,
                 "source": "recent_unwrapped",
                 "lines": self._lines,
                 "strip_ansi": True,
-                "match": {"type": "regex", "value": self._pattern},
+                "match": {"type": "regex", "value": pattern},
             })
         if self._watch_settled:
             subscriptions.extend({"type": "pane.agent_status_changed", "pane_id": self._pane,
@@ -190,7 +194,12 @@ class PaneOutputStream:
                 except BlockingIOError:
                     pass
                 return None
-            chunk = connection.recv(min(65536, self._max_frame + 1 - len(self._buffer)))
+            try:
+                chunk = connection.recv(min(65536, self._max_frame + 1 - len(self._buffer)))
+            except BlockingIOError:
+                # Readiness can be stale by the time a nonblocking socket is
+                # consumed; remain inside the original bounded deadline.
+                continue
             if not chunk:
                 reason = "Herdr closed the output subscription"
                 if self._buffer:
@@ -226,7 +235,7 @@ class PaneOutputStream:
                 if not isinstance(status, str) or status not in ("idle", "done"):
                     raise ValueError("agent status is not a requested settled state")
                 return PaneAgentStatus(self._pane, status)
-            if not self._pattern or document.get("event") != "pane.output_matched":
+            if not self._patterns or document.get("event") != "pane.output_matched":
                 raise ValueError("unexpected subscription event")
             data = as_mapping(document.get("data"), "Herdr output event")
             read = as_mapping(data.get("read"), "Herdr output snapshot")

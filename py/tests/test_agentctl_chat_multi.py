@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import agentctl.agent as agent_module
+import agentctl.chat as chat_module
 from agentctl.agent import Target
 from agentctl.chat import Bridge, Config, _read, _write, submit_reply
 from agentctl.chat_output import PaneOutputSnapshot
@@ -51,9 +52,14 @@ def _record(state: Path, identifier: str = "one") -> dict[str, object]:
     raise AssertionError(f"missing request {identifier}")
 
 
-def _block(record: dict[str, object], text: str, *, legacy: bool = False) -> str:
+def _block(
+    record: dict[str, object], text: str, *, ordinal: int | None = None, legacy: bool = False,
+) -> str:
     prefix = "GCHAT_REPLY" if legacy else "CHAT_REPLY"
     nonce = record["reply_nonce"]
+    if record.get("reply_protocol") == 3:
+        selected = record.get("reply_next_ordinal", 1) if ordinal is None else ordinal
+        nonce = f"{nonce}_{selected}"
     return f"<{prefix}_{nonce}>\n{text}\n</{prefix}_{nonce}>"
 
 
@@ -70,8 +76,8 @@ def test_multiple_blocks_become_separate_messages_and_restart_does_not_repost(tm
     chat.message()
     bridge.tick()
     record = _record(tmp_path)
-    snapshot = _snapshot(harness.prompts[0] + "\n" + _block(record, "First milestone")
-                         + "\n" + _block(record, "Second milestone"))
+    snapshot = _snapshot(harness.prompts[0] + "\n" + _block(record, "First milestone", ordinal=1)
+                         + "\n" + _block(record, "Second milestone", ordinal=2))
     assert not bridge.capture_output(snapshot)["errors"]
     assert _sent_texts(chat) == ["[test-agent] First milestone", "[test-agent] Second milestone"]
     assert {request["thread"] for request in chat.sent.values()} == {"spaces/test/threads/one"}
@@ -86,9 +92,11 @@ def test_identical_blocks_are_distinct_occurrences_but_replayed_snapshot_is_not(
     bridge, harness, chat = _setup(tmp_path)
     chat.message()
     bridge.tick()
-    block = _block(_record(tmp_path), "Still working")
+    record = _record(tmp_path)
+    block = _block(record, "Still working", ordinal=1)
     bridge.capture_output(_snapshot(harness.prompts[0] + "\n" + block))
-    two = _snapshot(harness.prompts[0] + "\n" + block + "\n" + block)
+    two = _snapshot(harness.prompts[0] + "\n" + block + "\n"
+                    + _block(record, "Still working", ordinal=2))
     bridge.capture_output(two)
     Bridge(tmp_path, harness, chat).capture_output(two)
     assert _sent_texts(chat) == ["[test-agent] Still working", "[test-agent] Still working"]
@@ -104,7 +112,7 @@ def test_later_update_remains_routable_after_first_reply_and_new_request(tmp_pat
     chat.message("two", timestamp="2026-01-02T00:01:00Z")
     bridge.tick()
     restarted = Bridge(tmp_path, harness, chat)
-    restarted.capture_output(_snapshot(_block(first, "Finished original work")))
+    restarted.capture_output(_snapshot(_block(first, "Finished original work", ordinal=2)))
     restarted.capture_output(_snapshot(_block(_record(tmp_path, "two"), "Handled follow-up")))
     assert _sent_texts(chat) == ["[test-agent] Started", "[test-agent] Finished original work",
                                "[test-agent] Handled follow-up"]
@@ -112,6 +120,26 @@ def test_later_update_remains_routable_after_first_reply_and_new_request(tmp_pat
         "spaces/test/threads/one", "spaces/test/threads/one", "spaces/test/threads/two",
     ]
     assert len(harness.prompts) == 2
+
+
+def test_original_prompt_echo_remains_filterable_after_ordinal_advance_and_restart(
+    tmp_path: Path,
+) -> None:
+    bridge, harness, chat = _setup(tmp_path)
+    chat.message()
+    bridge.tick()
+    record = _record(tmp_path)
+    bridge._prime_prompt_cache()
+    first = harness.prompts[0] + "\n" + _block(record, "First", ordinal=1)
+    assert bridge.capture_output(_snapshot(first), deliver=False)["errors"] == []
+
+    restarted = Bridge(tmp_path, harness, chat)
+    restarted._prime_prompt_cache()
+    second = first + "\n" + _block(record, "Second", ordinal=2)
+    outcome = restarted.capture_output(_snapshot(second), deliver=False)
+    assert outcome["errors"] == [] and outcome["captured"] == [record["key"]]
+    restarted._deliver()
+    assert _sent_texts(chat) == ["[test-agent] First", "[test-agent] Second"]
 
 
 @pytest.mark.parametrize("first_prompt_retained", [True, False])
@@ -139,7 +167,10 @@ def test_uncertain_send_retries_its_identity_before_later_messages(tmp_path: Pat
     bridge.tick()
     record = _record(tmp_path)
     chat.lose_ack_for = "[test-agent] Second"
-    snapshot = _snapshot("\n".join(_block(record, text) for text in ("First", "Second", "Third")))
+    snapshot = _snapshot("\n".join(
+        _block(record, text, ordinal=ordinal)
+        for ordinal, text in enumerate(("First", "Second", "Third"), start=1)
+    ))
     with pytest.raises(OSError, match="acknowledgement lost"):
         bridge.capture_output(snapshot)
     assert _sent_texts(chat) == ["[test-agent] First", "[test-agent] Second"]
@@ -165,12 +196,14 @@ def test_concurrent_manual_recovery_cannot_be_overwritten_by_first_capture(
     create = agent_module._atomic_json_create
     raced = False
 
-    def create_with_recovery(path: str, document: dict[str, object]) -> None:
+    def create_with_recovery(
+        path: str, document: dict[str, object], *, max_artifact_bytes: int | None = None,
+    ) -> None:
         nonlocal raced
         if not raced:
             raced = True
             submit_reply(tmp_path, key, manual_text)
-        create(path, document)
+        create(path, document, max_artifact_bytes=max_artifact_bytes)
 
     monkeypatch.setattr(agent_module, "_atomic_json_create", create_with_recovery)
     snapshot = _snapshot(_block(record, "Automatic reply"))
@@ -181,7 +214,7 @@ def test_concurrent_manual_recovery_cannot_be_overwritten_by_first_capture(
         expected.append("[test-agent] Automatic reply")
     assert _sent_texts(chat) == expected
     assert next(iter(chat.sent)) == record["request_id"]
-    assert _read(tmp_path / "replies" / f"{key}.json")["text"] == manual_text
+    assert _read(chat_module._reply_item_path(tmp_path, key, 0, sent=True))["text"] == manual_text
     restarted = Bridge(tmp_path, harness, chat)
     restarted.capture_output(snapshot)
     restarted.tick()
@@ -189,12 +222,207 @@ def test_concurrent_manual_recovery_cannot_be_overwritten_by_first_capture(
     assert len([call for call in chat.calls if call["action"] == "send"]) == len(expected)
 
 
+def test_crash_during_manual_first_shift_recovers_both_replies_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, harness, chat = _setup(tmp_path)
+    chat.message()
+    bridge.tick()
+    record = _record(tmp_path)
+    key = str(record["key"])
+    create = agent_module._atomic_json_create
+    raced = False
+
+    def create_with_submission(
+        path: str, document: dict[str, object], *, max_artifact_bytes: int | None = None,
+    ) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            submit_reply(tmp_path, key, "Manual recovery")
+        create(path, document, max_artifact_bytes=max_artifact_bytes)
+
+    monkeypatch.setattr(agent_module, "_atomic_json_create", create_with_submission)
+    bridge.capture_output(_snapshot(_block(record, "Automatic reply")), deliver=False)
+    assert raced
+    original_summary = Bridge._write_reply_summary
+
+    def crash_before_shift_summary(
+        self: Bridge, path: Path, saved: dict[str, object], *, count: int, sent: int,
+        total_bytes: int, pending_bytes: int, next_ordinal: int | None = None,
+        offset: int | None = None,
+    ) -> None:
+        if count == 2 and offset == 1:
+            raise OSError("crash before shift summary")
+        original_summary(
+            self, path, saved, count=count, sent=sent, total_bytes=total_bytes,
+            pending_bytes=pending_bytes, next_ordinal=next_ordinal, offset=offset)
+
+    monkeypatch.setattr(Bridge, "_write_reply_summary", crash_before_shift_summary)
+    with pytest.raises(OSError, match="before shift summary"):
+        bridge._deliver()
+    monkeypatch.setattr(Bridge, "_write_reply_summary", original_summary)
+    crashed = _read(tmp_path / "requests" / f"{key}.json")
+    assert crashed["reply_item_count"] == 1 and crashed["reply_ordinal_offset"] == 0
+    assert _read(chat_module._reply_item_path(tmp_path, key, 0, sent=False))["text"] == "Manual recovery"
+    assert _read(chat_module._reply_item_path(
+        tmp_path, key, 1, sent=False))["reply_shift_from"] == 0
+
+    restarted = Bridge(tmp_path, harness, chat)
+    restarted.tick()
+    assert [call["text"] for call in chat.calls if call["action"] == "send"] == [
+        "[test-agent] Manual recovery", "[test-agent] Automatic reply"]
+    recovered = _read(tmp_path / "requests" / f"{key}.json")
+    assert (recovered["reply_item_count"], recovered["reply_sent_count"],
+            recovered["reply_ordinal_offset"], recovered["reply_next_ordinal"]) == (2, 2, 1, 2)
+
+
+def test_crash_after_shift_journal_create_recovers_before_index_zero_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, harness, chat = _setup(tmp_path)
+    chat.message()
+    bridge.tick()
+    record = _record(tmp_path)
+    key = str(record["key"])
+    create = agent_module._atomic_json_create
+    raced = False
+
+    def create_with_submission(
+        path: str, document: dict[str, object], *, max_artifact_bytes: int | None = None,
+    ) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            submit_reply(tmp_path, key, "Manual recovery")
+        create(path, document, max_artifact_bytes=max_artifact_bytes)
+
+    monkeypatch.setattr(agent_module, "_atomic_json_create", create_with_submission)
+    bridge.capture_output(_snapshot(_block(record, "Automatic reply")), deliver=False)
+    monkeypatch.setattr(agent_module, "_atomic_json_create", create)
+    assert raced
+    original_write = Bridge._write_pending_reply
+
+    def crash_before_manual_overwrite(
+        self: Bridge, saved: dict[str, object], item: dict[str, object],
+    ) -> None:
+        if item.get("reply_key") == "0" and item.get("reply_source") == "file":
+            raise OSError("crash after shift journal create")
+        original_write(self, saved, item)
+
+    monkeypatch.setattr(Bridge, "_write_pending_reply", crash_before_manual_overwrite)
+    with pytest.raises(OSError, match="after shift journal create"):
+        bridge._deliver()
+    monkeypatch.setattr(Bridge, "_write_pending_reply", original_write)
+    crashed = _read(tmp_path / "requests" / f"{key}.json")
+    assert crashed["reply_item_count"] == 1 and crashed["reply_ordinal_offset"] == 0
+    assert _read(chat_module._reply_item_path(
+        tmp_path, key, 0, sent=False))["text"] == "Automatic reply"
+    assert _read(chat_module._reply_item_path(
+        tmp_path, key, 1, sent=False))["reply_shift_from"] == 0
+
+    Bridge(tmp_path, harness, chat).tick()
+    assert [call["text"] for call in chat.calls if call["action"] == "send"] == [
+        "[test-agent] Manual recovery", "[test-agent] Automatic reply"]
+
+
+def test_crash_after_shift_summary_cleans_journal_without_losing_either_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, harness, chat = _setup(tmp_path)
+    chat.message()
+    bridge.tick()
+    record = _record(tmp_path)
+    key = str(record["key"])
+    create = agent_module._atomic_json_create
+    raced = False
+
+    def create_with_submission(
+        path: str, document: dict[str, object], *, max_artifact_bytes: int | None = None,
+    ) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            submit_reply(tmp_path, key, "Manual recovery")
+        create(path, document, max_artifact_bytes=max_artifact_bytes)
+
+    monkeypatch.setattr(agent_module, "_atomic_json_create", create_with_submission)
+    bridge.capture_output(_snapshot(_block(record, "Automatic reply")), deliver=False)
+    monkeypatch.setattr(agent_module, "_atomic_json_create", create)
+    assert raced
+    original_write = Bridge._write_pending_reply
+
+    def crash_before_shift_cleanup(
+        self: Bridge, saved: dict[str, object], item: dict[str, object],
+    ) -> None:
+        if (item.get("reply_key") == "1" and item.get("reply_source") == "capture"
+                and item.get("reply_shift_from") is None):
+            raise OSError("crash after shift summary")
+        original_write(self, saved, item)
+
+    monkeypatch.setattr(Bridge, "_write_pending_reply", crash_before_shift_cleanup)
+    with pytest.raises(OSError, match="after shift summary"):
+        bridge._deliver()
+    monkeypatch.setattr(Bridge, "_write_pending_reply", original_write)
+    crashed = _read(tmp_path / "requests" / f"{key}.json")
+    assert (crashed["reply_item_count"], crashed["reply_ordinal_offset"],
+            crashed["reply_next_ordinal"]) == (2, 1, 2)
+    assert _read(chat_module._reply_item_path(
+        tmp_path, key, 1, sent=False))["reply_shift_from"] == 0
+
+    Bridge(tmp_path, harness, chat).tick()
+    assert [call["text"] for call in chat.calls if call["action"] == "send"] == [
+        "[test-agent] Manual recovery", "[test-agent] Automatic reply"]
+    assert "reply_shift_from" not in _read(chat_module._reply_item_path(
+        tmp_path, key, 1, sent=True))
+
+
+def test_crash_during_identical_file_binding_rebases_next_ordinal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, harness, chat = _setup(tmp_path)
+    chat.message()
+    bridge.tick()
+    record = _record(tmp_path)
+    key = str(record["key"])
+    submit_reply(tmp_path, key, "Same reply")
+    original_summary = Bridge._write_reply_summary
+
+    def crash_before_bind_summary(
+        self: Bridge, path: Path, saved: dict[str, object], *, count: int, sent: int,
+        total_bytes: int, pending_bytes: int, next_ordinal: int | None = None,
+        offset: int | None = None,
+    ) -> None:
+        if offset == 0 and next_ordinal == 2:
+            raise OSError("crash before bind summary")
+        original_summary(
+            self, path, saved, count=count, sent=sent, total_bytes=total_bytes,
+            pending_bytes=pending_bytes, next_ordinal=next_ordinal, offset=offset)
+
+    monkeypatch.setattr(Bridge, "_write_reply_summary", crash_before_bind_summary)
+    with pytest.raises(OSError, match="before bind summary"):
+        bridge.capture_output(_snapshot(_block(record, "Same reply")), deliver=False)
+    monkeypatch.setattr(Bridge, "_write_reply_summary", original_summary)
+    crashed = _read(tmp_path / "requests" / f"{key}.json")
+    assert (crashed["reply_ordinal_offset"], crashed["reply_next_ordinal"]) == (1, 1)
+    assert _read(chat_module._reply_item_path(
+        tmp_path, key, 0, sent=False))["reply_ordinal"] == 1
+
+    restarted = Bridge(tmp_path, harness, chat)
+    restarted.tick()
+    recovered = _read(tmp_path / "requests" / f"{key}.json")
+    assert (recovered["reply_ordinal_offset"], recovered["reply_next_ordinal"]) == (0, 2)
+    assert [call["text"] for call in chat.calls if call["action"] == "send"] == [
+        "[test-agent] Same reply"]
+
+
 def test_all_provider_reply_ids_suppress_self_echo_after_restart(tmp_path: Path) -> None:
     bridge, harness, chat = _setup(tmp_path)
     chat.message()
     bridge.tick()
     record = _record(tmp_path)
-    bridge.capture_output(_snapshot(_block(record, "One") + "\n" + _block(record, "Two")))
+    bridge.capture_output(_snapshot(_block(record, "One", ordinal=1) + "\n"
+                                    + _block(record, "Two", ordinal=2)))
     assert len(chat.sent) == 2
     for index, (request_id, sent) in enumerate(chat.sent.items()):
         chat.messages.append({
@@ -212,7 +440,9 @@ def test_new_prompt_is_generic_and_explicitly_allows_progress_replies(tmp_path: 
     chat.message()
     bridge.tick()
     prompt = harness.prompts[0]
-    assert "<CHAT_REPLY_" in prompt and "</CHAT_REPLY_" in prompt
+    identifier = f"{_record(tmp_path)['reply_nonce']}_1"
+    assert f"`{identifier}`" in prompt
+    assert f"<CHAT_REPLY_{identifier}>" not in prompt
     assert "GCHAT" not in prompt and "Google Chat" not in prompt and "Discord" not in prompt
     assert "multiple" in prompt.lower()
     assert "progress" in prompt.lower()
@@ -364,6 +594,8 @@ def test_completed_legacy_record_is_not_reopened_or_reported_as_unknown(tmp_path
     bridge.tick()
     record = _record(tmp_path)
     record.pop("reply_protocol", None)
+    record.update(reply_storage=2, reply_item_count=0, reply_sent_count=0,
+                  reply_ordinal_offset=0, reply_total_bytes=0, reply_pending_bytes=0)
     record.update(phase="replied", reply_id="spaces/test/messages/legacy-reply")
     _write(tmp_path / "requests" / f"{record['key']}.json", record)
     historical = _snapshot(_block(record, "Historical reply", legacy=True))
@@ -380,10 +612,14 @@ def test_new_response_to_a_closed_legacy_id_gets_feedback_but_history_does_not(t
     bridge.tick()
     record = _record(tmp_path)
     record.pop("reply_protocol", None)
+    for field in ("reply_storage", "reply_item_count", "reply_sent_count",
+                  "reply_ordinal_offset", "reply_total_bytes", "reply_pending_bytes"):
+        record.pop(field, None)
     record.update(phase="replied", reply_id="spaces/test/messages/legacy-reply")
     _write(tmp_path / "requests" / f"{record['key']}.json", record)
     _write(tmp_path / "replies" / f"{record['key']}.json", {"text": "Old answer"})
     restarted = Bridge(tmp_path, harness, chat)
+    restarted.migrate_reply_outboxes()
     restarted.capture_output(_snapshot(_block(record, "Old answer", legacy=True)))
     assert len(harness.prompts) == 1
     restarted.capture_output(_snapshot(_block(record, "A new misdirected answer", legacy=True)))

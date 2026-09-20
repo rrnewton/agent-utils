@@ -296,8 +296,9 @@ The built-in Chat transport polls the public REST API. An optional
 `event_command` connects an operator-supplied event stream; messages then wake
 the bridge immediately, while ACKs, Herdr prompt delivery, final replies, and
 recovery scans run independently. A durable cursor and message IDs allow safe
-replay after reconnecting. `run --reconcile-interval` controls background scans
-in streaming mode (default: 300 seconds). Without an event adapter,
+replay after reconnecting. `run --reconcile-interval` controls REST
+reconciliation in streaming mode (default: 300 seconds); the local durable-state
+recovery pass remains fixed at five minutes. Without an event adapter,
 `run --interval` controls the delay after each completed polling cycle
 (0.1–86400 seconds; default: 3600 seconds). Failure backoff never polls more often
 than the configured interval and grows toward a one-day ceiling after long-interval
@@ -305,8 +306,9 @@ failures. The Chat user guide documents the adapter protocol.
 
 One `run` or `tick` process owns each Chat state directory. Stop `run` before
 using `tick` for manual recovery. Explicit `chat reply` submissions remain
-available while it runs; the streaming runner picks up saved replies within
-one second, before provider send time.
+available while it runs; a private local notification wakes the streaming
+runner immediately after the submission is durable, and the unconditional
+five-minute recovery pass covers a missed notification or restart.
 
 Thread replies include a command hint for the nearest ten prior messages:
 `agentctl chat context --state DIR --request KEY_OR_UNIQUE_HEX_PREFIX --limit 10`.

@@ -73,8 +73,18 @@ def _saved(tmp_path: Path, *, reply_mode: str = "tagged") -> tuple[Path, Path]:
                     expected_cwd="/not-a-live-workspace", expected_workspace="missing-workspace")
     config = Config(_SPACE, ("users/owner",), target, "fixture-agent",
                     transport_command=(sys.executable, str(adapter), str(transcript)), reply_mode=reply_mode)
-    _write(state / "bridge.json", {"config": asdict(config)})
-    record: dict[str, object] = {"key": _KEY, "message": _source(), "phase": "awaiting_reply"}
+    _write(state / "bridge.json", {
+        "version": 1, "config": asdict(config),
+        "after": "2026-01-01T00:00:00Z", "cursor": None,
+        "high_water": "2026-01-01T00:00:00Z",
+        "started_at": "2026-01-01T00:00:00Z",
+    })
+    record: dict[str, object] = {
+        "key": _KEY, "message": _source(), "phase": "awaiting_reply",
+        "queue_id": "00000000000000000000-" + _KEY,
+        "request_id": "00000000-0000-0000-0000-000000000001",
+        "received_at": _TIME,
+    }
     if reply_mode == "tagged":
         record["reply_nonce"] = "a" * 22
     _write(state / "requests" / (_KEY + ".json"), record)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -159,6 +160,331 @@ def target(**changes: str) -> Target:
     return Target(**values)
 
 
+def test_enqueue_artifact_limit_counts_serialized_bytes_before_temporary_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agentctl.agent.time.time", lambda: 123.0)
+    text = "\x00😀\"\\" * 100
+    expected = (json.dumps({
+        "id": "bounded", "text": text, "queued_at": 123.0, "delivery_attempts": 0,
+    }, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+    def unexpected_temporary(*args: object, **kwargs: object) -> None:
+        raise AssertionError("oversized JSON must be rejected before any temporary file is opened")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr("agentctl.agent.tempfile.NamedTemporaryFile", unexpected_temporary)
+        with pytest.raises(AgentDeliveryError, match="exceeding max_artifact_bytes"):
+            enqueue(str(tmp_path), text, message_id="bounded", max_artifact_bytes=len(expected) - 1)
+    assert list((tmp_path / "inbox").iterdir()) == []
+    assert enqueue(str(tmp_path), text, message_id="bounded", max_artifact_bytes=len(expected)) == "bounded"
+    assert (tmp_path / "inbox/bounded.json").read_bytes() == expected
+
+
+def test_bounded_drain_refuses_open_artifact_growth_before_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeAgentHerdr()
+    limit = 4096
+    enqueue(str(tmp_path), "bounded prompt", message_id="growing",
+            max_artifact_bytes=limit)
+    artifact = tmp_path / "inbox" / "growing.json"
+    original_read = os.read
+    grew = False
+
+    def grow_after_first_read(descriptor: int, count: int) -> bytes:
+        nonlocal grew
+        block = original_read(descriptor, count)
+        try:
+            opened = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            opened = ""
+        if not grew and opened == str(artifact):
+            grew = True
+            append = os.open(artifact, os.O_WRONLY | os.O_APPEND)
+            try:
+                os.write(append, b"x" * (limit + 1))
+            finally:
+                os.close(append)
+        return block
+
+    monkeypatch.setattr(os, "read", grow_after_first_read)
+    with pytest.raises(AgentDeliveryError, match="exceeds max_artifact_bytes"):
+        drain(client(fake), target(), str(tmp_path), ready_timeout=0,
+              max_artifact_bytes=limit)
+    assert grew and fake.runs == []
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_queue_rejects_invalid_artifact_limits_without_creating_queue(tmp_path: Path, limit: object) -> None:
+    root = tmp_path / "queue"
+    with pytest.raises(AgentDeliveryError, match="positive integer"):
+        enqueue(str(root), "prompt", max_artifact_bytes=cast(int, limit))
+    with pytest.raises(AgentDeliveryError, match="positive integer"):
+        drain(client(FakeAgentHerdr()), target(), str(root), max_artifact_bytes=cast(int, limit))
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("error_text", ["\x00" * 9000, "é" * 9000, "😀" * 9000])
+def test_bounded_pending_diagnostics_fit_update_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_text: str,
+) -> None:
+    fake = FakeAgentHerdr()
+
+    def unavailable(_pane_id: str) -> AgentPaneInfo:
+        raise HerdrUnavailable(error_text)
+
+    monkeypatch.setattr(fake, "pane_info", unavailable)
+    text = "multiline\n\x00😀"
+    limit = agent_api.queue_artifact_reservation_bytes(text, message_id="bounded")
+    enqueue(str(tmp_path), text, message_id="bounded", max_artifact_bytes=limit)
+    original_size = (tmp_path / "inbox/bounded.json").stat().st_size
+    result = drain(client(fake), target(), str(tmp_path), max_artifact_bytes=limit)
+    assert result.outcome == "pending"
+    assert result.blocked == error_text.encode("utf-8")[:agent_api.QUEUE_ERROR_MAX_BYTES].decode("utf-8")
+    assert len(result.blocked.encode("utf-8")) == agent_api.QUEUE_ERROR_MAX_BYTES
+    artifact = tmp_path / "inbox/bounded.json"
+    document = json.loads(artifact.read_text())
+    assert document["delivery_error"] == result.blocked
+    assert len(document["delivery_error"].encode("utf-8")) <= agent_api.QUEUE_ERROR_MAX_BYTES
+    assert document["text"] == text
+    assert document["delivery_attempts"] == 0
+    assert artifact.stat().st_size <= limit
+    assert artifact.stat().st_size <= original_size + agent_api.QUEUE_UPDATE_MAX_BYTES
+    assert fake.runs == []
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_failed_diagnostics_and_sidecar_are_capped_only_for_bounded_callers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bounded: bool,
+) -> None:
+    fake = FakeAgentHerdr()
+    error_text = "\x00" * 9000
+
+    def unavailable(_pane_id: str, _state: str, _timeout: int) -> None:
+        raise HerdrUnavailable(error_text)
+
+    monkeypatch.setattr(fake, "wait_agent_status", unavailable)
+    text = "at most once"
+    limit = agent_api.queue_artifact_reservation_bytes(text, message_id="bounded") if bounded else None
+    with pytest.raises(AgentPossiblySubmitted) as failure:
+        send(client(fake), target(), str(tmp_path), text, message_id="bounded", max_artifact_bytes=limit)
+    artifact = tmp_path / "failed/bounded.json"
+    sidecar = tmp_path / "failed/bounded.json.error"
+    document = json.loads(artifact.read_text())
+    metadata = json.loads(sidecar.read_text())
+    if bounded:
+        assert limit is not None
+        assert len(str(failure.value).encode("utf-8")) == agent_api.QUEUE_ERROR_MAX_BYTES
+        assert len(document["delivery_error"].encode("utf-8")) <= agent_api.QUEUE_ERROR_MAX_BYTES
+        assert len(metadata["error"].encode("utf-8")) <= agent_api.QUEUE_ERROR_MAX_BYTES
+        assert artifact.stat().st_size <= limit
+        assert sidecar.stat().st_size <= min(limit, agent_api.QUEUE_ERROR_SIDECAR_MAX_BYTES)
+    else:
+        assert error_text in str(failure.value)
+        assert document["delivery_error"].endswith(error_text)
+        assert metadata["error"].endswith(error_text)
+    assert fake.runs == [text]
+    restarted = FakeAgentHerdr()
+    drain(client(restarted), target(), str(tmp_path), max_artifact_bytes=limit)
+    assert restarted.runs == []
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_pending_send_caps_entire_exception_only_for_bounded_callers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bounded: bool,
+) -> None:
+    fake = FakeAgentHerdr()
+    error_text = "x" * 9000
+
+    def unavailable(_pane_id: str) -> AgentPaneInfo:
+        raise HerdrUnavailable(error_text)
+
+    monkeypatch.setattr(fake, "pane_info", unavailable)
+    text = "pending prompt"
+    limit = agent_api.queue_artifact_reservation_bytes(text, message_id="bounded") if bounded else None
+    with pytest.raises(AgentPending) as failure:
+        send(client(fake), target(), str(tmp_path), text, message_id="bounded", max_artifact_bytes=limit)
+    assert type(failure.value) is AgentPending
+    if bounded:
+        assert len(str(failure.value).encode("utf-8")) == agent_api.QUEUE_ERROR_MAX_BYTES
+    else:
+        assert str(failure.value).endswith(error_text)
+    assert fake.runs == []
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_exhausted_head_caps_returned_diagnostic_only_for_bounded_callers(tmp_path: Path, bounded: bool) -> None:
+    enqueue(str(tmp_path), "prompt", message_id="exhausted")
+    artifact = tmp_path / "inbox/exhausted.json"
+    document = json.loads(artifact.read_text())
+    document.update({"id": "x" * 9000, "delivery_attempts": 1})
+    artifact.write_text(json.dumps(document), encoding="utf-8")
+    limit = 100000 if bounded else None
+    result = drain(client(FakeAgentHerdr()), target(), str(tmp_path), max_attempts=1, max_artifact_bytes=limit)
+    assert result.outcome == "pending"
+    assert result.blocked is not None
+    assert json.loads(artifact.read_text())["delivery_error"] == result.blocked
+    if bounded:
+        assert len(result.blocked.encode("utf-8")) == agent_api.QUEUE_ERROR_MAX_BYTES
+    else:
+        assert "x" * 9000 in result.blocked
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_binding_mismatch_caps_exception_only_for_bounded_callers(tmp_path: Path, bounded: bool) -> None:
+    drain(client(FakeAgentHerdr()), target(), str(tmp_path))
+    expected_workspace = "x" * 9000
+    with pytest.raises(AgentDeliveryError) as failure:
+        drain(
+            client(FakeAgentHerdr()), target(expected_workspace=expected_workspace), str(tmp_path),
+            max_artifact_bytes=100000 if bounded else None,
+        )
+    if bounded:
+        assert len(str(failure.value).encode("utf-8")) == agent_api.QUEUE_ERROR_MAX_BYTES
+    else:
+        assert expected_workspace in str(failure.value)
+
+
+def test_oversized_inflight_update_preserves_pending_artifact_before_submission(tmp_path: Path) -> None:
+    text = "x" * 1000
+    enqueue(str(tmp_path), text, message_id="bounded")
+    artifact = tmp_path / "inbox/bounded.json"
+    original = artifact.read_bytes()
+    fake = FakeAgentHerdr()
+    with pytest.raises(AgentDeliveryError, match="exceeding max_artifact_bytes"):
+        drain(client(fake), target(), str(tmp_path), max_artifact_bytes=len(original))
+    assert artifact.read_bytes() == original
+    assert list((tmp_path / "inbox").iterdir()) == [artifact]
+    assert list((tmp_path / "inflight").iterdir()) == []
+    assert fake.runs == []
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_oversized_post_submission_update_retains_inflight_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confirmed: bool,
+) -> None:
+    monkeypatch.setattr("agentctl.agent.time.time", lambda: 123.0)
+    text = "x" * 1000
+    enqueue(str(tmp_path), text, message_id="bounded")
+    document = json.loads((tmp_path / "inbox/bounded.json").read_text())
+    document.update({"possibly_submitted": True, "delivery_state": "inflight", "inflight_at": 123.0})
+    inflight_bytes = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    fake = FakeAgentHerdr()
+
+    def unavailable(_pane_id: str, _state: str, _timeout: int) -> None:
+        raise HerdrUnavailable("confirmation unavailable")
+
+    if not confirmed:
+        monkeypatch.setattr(fake, "wait_agent_status", unavailable)
+    with pytest.raises(AgentPossiblySubmitted, match="exceeding max_artifact_bytes") as failure:
+        drain(client(fake), target(), str(tmp_path), max_artifact_bytes=len(inflight_bytes))
+    artifact = tmp_path / "inflight/bounded.json"
+    assert type(failure.value) is AgentPossiblySubmitted
+    assert failure.value.outcome == "possibly_submitted"
+    assert failure.value.message_id == "bounded"
+    assert failure.value.artifact == str(artifact)
+    assert artifact.read_bytes() == inflight_bytes
+    assert list((tmp_path / "inflight").iterdir()) == [artifact]
+    assert fake.runs == [text]
+    restarted = FakeAgentHerdr()
+    result = drain(client(restarted), target(), str(tmp_path), max_artifact_bytes=len(inflight_bytes))
+    assert result.outcome == "possibly_submitted"
+    assert (tmp_path / "failed/bounded.json").read_bytes() == inflight_bytes
+    assert restarted.runs == []
+
+
+def test_oversized_failure_sidecar_preserves_original_raw_artifact(tmp_path: Path) -> None:
+    inbox, _inflight, _processed, failed = agent_api._prepare(str(tmp_path))
+    source = Path(inbox) / "invalid.json"
+    source.write_bytes(b"invalid")
+    with pytest.raises(AgentDeliveryError, match="exceeding max_artifact_bytes"):
+        agent_api._quarantine_raw(
+            str(source), failed, outcome="invalid_message", error="\x00" * 9000, max_artifact_bytes=100,
+        )
+    assert source.read_bytes() == b"invalid"
+    assert list(Path(inbox).iterdir()) == [source]
+    assert list(Path(failed).iterdir()) == []
+    limit = agent_api.QUEUE_ERROR_SIDECAR_MAX_BYTES
+    assert agent_api._quarantine_raw(
+        str(source), failed, outcome="invalid_message", error="\x00" * 9000, max_artifact_bytes=limit,
+    ) == "invalid"
+    assert list(Path(inbox).iterdir()) == []
+    assert (Path(failed) / source.name).read_bytes() == b"invalid"
+    sidecar = Path(failed) / f"{source.name}.error"
+    assert sidecar.stat().st_size <= limit
+    assert json.loads(sidecar.read_text())["outcome"] == "invalid_message"
+
+
+def test_sidecar_disk_full_after_quarantine_keeps_raw_bytes_and_never_resubmits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inbox, _inflight, _processed, failed = agent_api._prepare(str(tmp_path))
+    source = Path(inbox) / "invalid.json"
+    source.write_bytes(b"invalid")
+
+    def disk_full(
+        path: str, document: dict[str, object], *, max_artifact_bytes: int | None = None,
+    ) -> None:
+        raise OSError(errno.ENOSPC, "injected full disk", path)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(agent_api, "_atomic_json", disk_full)
+        with pytest.raises(OSError) as failure:
+            agent_api._quarantine_raw(
+                str(source), failed, outcome="invalid_message", error="invalid JSON",
+                max_artifact_bytes=agent_api.QUEUE_ERROR_SIDECAR_MAX_BYTES,
+            )
+    assert failure.value.errno == errno.ENOSPC
+    destination = Path(failed) / source.name
+    assert destination.read_bytes() == b"invalid"
+    assert not Path(f"{destination}.error").exists()
+    assert list(Path(inbox).iterdir()) == []
+    restarted = FakeAgentHerdr()
+    drain(client(restarted), target(), str(tmp_path), max_artifact_bytes=agent_api.QUEUE_ERROR_SIDECAR_MAX_BYTES)
+    assert destination.read_bytes() == b"invalid"
+    assert restarted.runs == []
+
+
+def test_bounded_target_binding_rejects_oversized_record_before_write(tmp_path: Path) -> None:
+    fake = FakeAgentHerdr()
+    with pytest.raises(AgentDeliveryError, match="exceeding max_artifact_bytes"):
+        drain(client(fake), target(), str(tmp_path), max_artifact_bytes=10)
+    assert not (tmp_path / "target.json").exists()
+    assert list(tmp_path.glob(".message.*")) == []
+    assert fake.runs == []
+
+
+def test_oversized_atomic_replacement_preserves_existing_bytes_without_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "message.json"
+    original = b'{"original":"untouched"}\n'
+    artifact.write_bytes(original)
+
+    def unexpected_temporary(*args: object, **kwargs: object) -> None:
+        raise AssertionError("oversized replacement must be rejected before a temporary file is opened")
+
+    monkeypatch.setattr("agentctl.agent.tempfile.NamedTemporaryFile", unexpected_temporary)
+    with pytest.raises(AgentDeliveryError, match="exceeding max_artifact_bytes"):
+        agent_api._atomic_json(str(artifact), {"text": "\x00" * 1000}, max_artifact_bytes=1000)
+    assert artifact.read_bytes() == original
+    assert list(tmp_path.glob(".message.*")) == []
+
+
+def test_bounded_drain_preserves_oversized_existing_artifact_without_injection(tmp_path: Path) -> None:
+    enqueue(str(tmp_path), "x" * 1000, message_id="bounded")
+    artifact = tmp_path / "inbox/bounded.json"
+    original = artifact.read_bytes()
+    fake = FakeAgentHerdr()
+    with pytest.raises(AgentDeliveryError, match="exceeds max_artifact_bytes"):
+        drain(client(fake), target(), str(tmp_path), max_artifact_bytes=len(original) - 1)
+    assert artifact.read_bytes() == original
+    assert list((tmp_path / "inflight").iterdir()) == []
+    assert list((tmp_path / "failed").iterdir()) == []
+    assert fake.runs == []
+
+
 def test_multiline_busy_then_idle_is_atomic_and_confirmed(tmp_path: object) -> None:
     fake = FakeAgentHerdr(["working", "working", "idle"])
     text = "first line\nsecond line\nthird line"
@@ -309,10 +635,12 @@ def test_send_inspects_terminal_artifact_when_another_drain_consumed_its_id(
         *,
         message_id: str | None,
         serialize: bool,
+        max_artifact_bytes: int | None = None,
     ) -> str:
         del message_id, serialize
         identifier = original_enqueue(
-            root, text, message_id="cross-drained", serialize=True
+            root, text, message_id="cross-drained", serialize=True,
+            max_artifact_bytes=max_artifact_bytes,
         )
         source = tmp_path / "inbox/cross-drained.json"
         document = json.loads(source.read_text())
@@ -662,10 +990,12 @@ def test_crash_after_inflight_rename_before_metadata_or_run_is_never_resubmitted
     fake = FakeAgentHerdr(["idle"])
     original = agent_api._atomic_json
 
-    def crash_on_inflight(path: str, document: dict[str, object]) -> None:
+    def crash_on_inflight(
+        path: str, document: dict[str, object], *, max_artifact_bytes: int | None = None,
+    ) -> None:
         if Path(path).parent.name == "inflight":
             raise KeyboardInterrupt("simulated death immediately after durable rename")
-        original(path, document)
+        original(path, document, max_artifact_bytes=max_artifact_bytes)
 
     monkeypatch.setattr(agent_api, "_atomic_json", crash_on_inflight)
     with pytest.raises(KeyboardInterrupt):

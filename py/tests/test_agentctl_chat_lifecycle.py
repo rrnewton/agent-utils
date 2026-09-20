@@ -12,12 +12,14 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import agentctl.chat as chat_module
-from agentctl.chat import Bridge, _run_bridge
+import agentctl.chat_runtime as runtime_module
+from agentctl.chat import Bridge, _OutputSubscription, _run_bridge
 from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutputStream
 from agentctl.chat_runtime import _Notice, _OutputPump
 from tests.test_herdr_chat import setup
@@ -56,10 +58,11 @@ def test_output_stop_during_subscription_open_closes_without_waiting(
         assert release.wait(5)
         return stream
 
-    monkeypatch.setattr(bridge, "open_output", open_output)
+    monkeypatch.setattr(bridge, "_open_cached_output",
+                        lambda subscription: open_output(subscription.markers))
     stop = threading.Event()
     pump = _OutputPump(bridge, queue.Queue[_Notice](), stop)
-    pump.update((("first",), ("first",)))
+    pump.update(_OutputSubscription(bridge, ("first",), ("first",), True))
     pump.thread.start()
     try:
         assert opening.wait(2)
@@ -93,14 +96,15 @@ def test_nonce_change_during_open_replaces_stale_subscription_before_waiting(
         replacement.set()
         return streams[1]
 
-    monkeypatch.setattr(bridge, "open_output", open_output)
+    monkeypatch.setattr(bridge, "_open_cached_output",
+                        lambda subscription: open_output(subscription.markers))
     stop = threading.Event()
     pump = _OutputPump(bridge, queue.Queue[_Notice](), stop)
-    pump.update((("first",), ("first",)))
+    pump.update(_OutputSubscription(bridge, ("first",), ("first",), True))
     pump.thread.start()
     try:
         assert opening.wait(2)
-        pump.update((("first", "second"), ("first", "second")))
+        pump.update(_OutputSubscription(bridge, ("first", "second"), ("first", "second"), True))
         release.set()
         assert replacement.wait(1)
         assert subscriptions == [("first",), ("first", "second")]
@@ -123,9 +127,11 @@ def test_sigterm_runs_cleanup_and_restores_previous_handler(
     prior = signal.getsignal(signal.SIGTERM)
     cleaned = False
 
-    def polling(current: Bridge, interval: float, prog: str) -> None:
+    def polling(current: Bridge, interval: float, prog: str, *,
+                observer_write_interval: float) -> None:
         nonlocal cleaned
         assert current is bridge
+        assert observer_write_interval == 60
         assert signal.getsignal(signal.SIGTERM) is not prior
         try:
             os.kill(os.getpid(), signal.SIGTERM)
@@ -134,12 +140,30 @@ def test_sigterm_runs_cleanup_and_restores_previous_handler(
             cleaned = True
 
     monkeypatch.setattr(chat_module, "_run_polling", polling)
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(chat_module._ServiceTerminated):
         _run_bridge(bridge, 3, "test-chat")
     assert cleaned
     assert signal.getsignal(signal.SIGTERM) is prior
     with (tmp_path / ".run.lock").open("rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_event_bridge_propagates_nondefault_observer_write_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, _, _ = setup(tmp_path)
+    bridge.config = replace(bridge.config, event_command=("fixture-events",))
+    calls: list[tuple[float, str, float]] = []
+
+    def streaming(current: Bridge, *, reconcile_interval: float, prog: str,
+                  observer_write_interval: float) -> None:
+        assert current is bridge
+        calls.append((reconcile_interval, prog, observer_write_interval))
+
+    monkeypatch.setattr(runtime_module, "run_streaming", streaming)
+    _run_bridge(bridge, 3600, "test-chat", reconcile_interval=123,
+                observer_write_interval=777)
+    assert calls == [(123, "test-chat", 777)]
 
 
 def _gone(pid: int) -> bool:
@@ -167,16 +191,16 @@ def test_sigterm_stops_real_event_adapter_and_descendant_and_releases_owner(tmp_
         "import signal,sys\n"
         "from dataclasses import replace\n"
         "from pathlib import Path\n"
-        "from agentctl.chat import _run_bridge\n"
+        "from agentctl.chat import _ServiceTerminated,_run_bridge\n"
         "from tests.test_herdr_chat import setup\n"
         "bridge,_,_=setup(Path(sys.argv[1]))\n"
         "bridge.config=replace(bridge.config,event_command=(sys.executable,'-u','-c',sys.argv[2],sys.argv[3]))\n"
         "previous=signal.getsignal(signal.SIGTERM)\n"
         "try:\n"
         "    _run_bridge(bridge,3,'test-chat')\n"
-        "except KeyboardInterrupt:\n"
+        "except _ServiceTerminated:\n"
         "    assert signal.getsignal(signal.SIGTERM) is previous\n"
-        "    sys.exit(130)\n"
+        "    sys.exit(0)\n"
     )
     process = subprocess.Popen([sys.executable, "-c", program, str(tmp_path / "state"),
                                 child_program, str(pidfile)], stdout=subprocess.PIPE,
@@ -195,7 +219,7 @@ def test_sigterm_stops_real_event_adapter_and_descendant_and_releases_owner(tmp_
         assert all(not _gone(pid) for pid in pids)
         process.terminate()
         stdout, stderr = process.communicate(timeout=5)
-        assert process.returncode == 130, (stdout, stderr)
+        assert process.returncode == 0, (stdout, stderr)
         deadline = time.monotonic() + 2
         while not all(_gone(pid) for pid in pids) and time.monotonic() < deadline:
             time.sleep(0.01)
