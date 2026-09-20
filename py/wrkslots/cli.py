@@ -9509,17 +9509,29 @@ def _mount_namespace(pid_dir: Path) -> str | None:
         ) from exc
 
 
+def _read_process_status(
+    pid_dir: Path, *, generation: _ProcessStat | None = None,
+) -> str:
+    try:
+        return (pid_dir / "status").read_text(encoding="ascii")
+    except OSError as exc:
+        if exc.errno != errno.ESRCH:
+            raise
+    # A held proc inode can become unreadable after reap. Reopen its pathname
+    # once; another error remains an error, never proof of terminal state.
+    status = (pid_dir / "status").read_text(encoding="ascii")
+    if generation is not None:
+        current = _read_process_stat(pid_dir)
+        if current is not None and current.start_ticks != generation.start_ticks:
+            raise _ProcessEvidenceChanged(
+                f"process generation changed while reopening status for PID {pid_dir.name}"
+            )
+    return status
+
+
 def _process_uids(pid_dir: Path) -> tuple[int, int, int, int] | None:
     try:
-        try:
-            status = (pid_dir / "status").read_text(encoding="ascii")
-        except OSError as exc:
-            if exc.errno != errno.ESRCH:
-                raise
-            # A proc inode opened before reap can return ESRCH on read. Sample
-            # the pathname once more: a reused PID must expose its current UIDs,
-            # not be declared absent because the earlier generation exited.
-            status = (pid_dir / "status").read_text(encoding="ascii")
+        status = _read_process_status(pid_dir)
     except FileNotFoundError:
         return None
     except (OSError, UnicodeError) as exc:
@@ -24002,9 +24014,11 @@ def _process_start_ticks(pid_dir: Path) -> int | None:
     return None if process_stat is None else process_stat.start_ticks
 
 
-def _process_is_zombie(pid_dir: Path) -> bool:
+def _process_is_zombie(
+    pid_dir: Path, *, generation: _ProcessStat | None = None,
+) -> bool:
     try:
-        status = (pid_dir / "status").read_text(encoding="ascii")
+        status = _read_process_status(pid_dir, generation=generation)
     except FileNotFoundError as exc:
         if _read_process_stat(pid_dir) is None:
             return True
@@ -24030,7 +24044,7 @@ def _process_is_zombie(pid_dir: Path) -> bool:
 
 
 def _process_generation_is_terminal(pid_dir: Path, generation: _ProcessStat) -> bool:
-    if not _process_is_zombie(pid_dir):
+    if not _process_is_zombie(pid_dir, generation=generation):
         return False
     current = _read_process_stat(pid_dir)
     if current is not None and current.start_ticks != generation.start_ticks:
