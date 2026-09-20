@@ -39,6 +39,9 @@ three controls appear above the history:
 * **All** interleaves channel and thread messages chronologically. Colored **Thread** badges
   distinguish conversations; tapping a badge opens that thread.
 
+The selected channel or space is remembered on this device when you reopen the app. If it is no
+longer configured, the app selects the first available channel.
+
 Tap a root's reply count or a thread-list entry to open its history. **Back**, or a swipe right,
 returns to the view and scroll position you came from. The selected thread has its own history,
 draft, and posting destination. Reply counts marked approximate come from the provider's estimate.

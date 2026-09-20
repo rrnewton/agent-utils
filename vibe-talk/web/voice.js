@@ -31,6 +31,7 @@ const READ_SPEED_KEY = "vibe-talk.voice.read-speed";
 const MARK_OWN_KEY = "vibe-talk.voice.mark-own-read";
 const MARKER_KEY = "vibe-talk.voice.place-marker";
 const COMBINE_KEY = "vibe-talk.voice.combine";
+const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
 const el = (id) => document.getElementById(id);
 
@@ -7629,6 +7630,24 @@ function knownChannel(id) {
   return knownChannels.find((channel) => String(channel.id) === String(id)) || null;
 }
 
+function storedActiveChannel() {
+  try {
+    return localStorage.getItem(ACTIVE_CHANNEL_KEY) || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function rememberActiveChannel() {
+  try {
+    const id = el("discord-channel").value;
+    if (id) localStorage.setItem(ACTIVE_CHANNEL_KEY, id);
+    else localStorage.removeItem(ACTIVE_CHANNEL_KEY);
+  } catch (_error) {
+    // Switching spaces still works when this browser cannot retain the preference.
+  }
+}
+
 /**
  * Redraw one channel picker from `knownChannels`, keeping it on the channel it was showing.
  *
@@ -7638,7 +7657,9 @@ function knownChannel(id) {
  */
 function fillChannelSelect(id) {
   const select = el(id);
-  const chosen = select.value;
+  // Restore only an ID still present in the server's current channel list. Settings has its own
+  // picker and must not change the remembered reading destination merely by editing a channel.
+  const chosen = select.value || (id === "discord-channel" ? storedActiveChannel() : "");
   select.replaceChildren();
   for (const channel of knownChannels) {
     const option = document.createElement("option");
@@ -7653,6 +7674,7 @@ function fillChannelSelect(id) {
   } else {
     select.value = "";
   }
+  if (id === "discord-channel") rememberActiveChannel();
 }
 
 /**
@@ -7918,9 +7940,6 @@ function applyClientConfig(config) {
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
   renderAliasEditor();
-  if (knownChannels.length > 0) {
-    select.value = knownChannels[0].id;
-  }
   restoreChannelComposer();
   // `#44 live-push`. The server says whether it is watching the channel at all, and how often.
   // Without it the page would have to infer "live" from a stream that is attached and silent —
@@ -8331,6 +8350,7 @@ el("view-switch").addEventListener("click", () => {
 // The walk back resets with it: a cursor from one channel means nothing in another, and carrying
 // one across would ask the server to step back from a message that is not there.
 function changeSelectedChannel() {
+  rememberActiveChannel();
   rememberChannelDraft();
   channelView = "main";
   selectedThreadId = null;
