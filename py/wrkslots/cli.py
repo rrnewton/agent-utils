@@ -9134,6 +9134,48 @@ def _assert_remove_processes(
         _assert_process_descends_from(writer, coordinator, "removal proof writer")
 
 
+@dataclasses.dataclass(frozen=True)
+class _RecoveryProcesses:
+    """Original recovery actor plus the authenticated invoking handoff."""
+
+    coordinator: ProcessIdentity
+    runner: ProcessIdentity
+    writer: ProcessIdentity | None
+    proof_fd: int | None
+
+    @classmethod
+    def capture(cls, coordinator_pid: int) -> _RecoveryProcesses:
+        return cls(*_capture_remove_processes(coordinator_pid))
+
+    def assert_current(self, coordinator: ProcessIdentity) -> None:
+        if coordinator != self.coordinator:
+            raise Refusal("recovery coordinator differs from captured process authority")
+        if (
+            (self.writer is None) != (self.proof_fd is None)
+            or (self.writer is None and self.runner != self.coordinator)
+            or (
+                self.proof_fd is not None
+                and (type(self.proof_fd) is not int or self.proof_fd < 0)
+            )
+        ):
+            raise Refusal("recovery process authority has inconsistent handoff evidence")
+        _assert_remove_processes(
+            self.coordinator, self.runner, self.writer, self.proof_fd
+        )
+
+
+def _assert_recovery_processes(
+    coordinator: ProcessIdentity,
+    processes: _RecoveryProcesses | None,
+    label: str = "coordinator",
+) -> None:
+    if processes is None:
+        # Standalone callers retain their ordinary direct-ancestry contract.
+        _assert_caller_process(coordinator, label)
+    else:
+        processes.assert_current(coordinator)
+
+
 def _capture_registration_owner(pid: int) -> ProcessIdentity:
     """Capture an owner now; registration verifies its authority before publication."""
     return _read_process_identity(pid)
@@ -18319,6 +18361,8 @@ def _recover_finish(
     raw: Mapping[str, object],
     state: ActiveState,
     coordinator: ProcessIdentity,
+    *,
+    processes: _RecoveryProcesses | None = None,
 ) -> None:
     _exact_keys(
         raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
@@ -18443,7 +18487,7 @@ def _recover_finish(
         raise StateError("finish journal has neither its active record nor a durable archive entry")
     if _record_to_obj(current) != _record_to_obj(record):
         raise StateError("finish journal record does not exactly match ACTIVE")
-    _assert_caller_process(coordinator, "coordinator")
+    _assert_recovery_processes(coordinator, processes)
     _assert_not_held(config, current)
     age, expired = _heartbeat_diagnosis(current)
     owner_state, detail = _process_state(current.owner)
@@ -18453,7 +18497,7 @@ def _recover_finish(
         and current.owner == coordinator
     )
     if live_validate_owner:
-        _assert_caller_process(coordinator, "validate owner")
+        _assert_recovery_processes(coordinator, processes, "validate owner")
     else:
         _assert_registered_liveness(config, current)
     if not expired and not validate_complete:
@@ -27357,6 +27401,7 @@ def _cmd_recover(
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
+    processes = _RecoveryProcesses(coordinator, runner, handoff_writer, proof_fd)
     with _mutation_locks(config, args.wait_lock):
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         recovered_partial = _recover_partial_updates(config, args.discard_partial)
@@ -27523,6 +27568,7 @@ def _cmd_recover(
                 recovery_record,
                 excluded_paths=excluded,
             )
+        _assert_recovery_processes(coordinator, processes)
         _ensure_event_log(config)
         _write_event_file(
             config,
@@ -27532,6 +27578,12 @@ def _cmd_recover(
                 "slot": raw.get("slot"),
                 "operation": raw.get("kind"),
                 "actor": _identity_to_obj(coordinator),
+                "runner": _identity_to_obj(runner),
+                "handoff_writer": (
+                    _identity_to_obj(handoff_writer)
+                    if handoff_writer is not None
+                    else None
+                ),
                 "coordinator_authorized": bool(args.coordinator_authorized),
             },
         )
@@ -27608,7 +27660,9 @@ def _cmd_recover(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
             try:
-                _recover_finish(config, path, raw, state, coordinator)
+                _recover_finish(
+                    config, path, raw, state, coordinator, processes=processes
+                )
             except Refusal as exc:
                 _restore_interrupted_private_finish_after_refusal(
                     config, raw, exc

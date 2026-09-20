@@ -8,6 +8,7 @@ import fnmatch
 import hashlib
 import datetime as dt
 import errno
+import fcntl
 import io
 import itertools
 import json
@@ -17319,6 +17320,224 @@ def set_host_context_handoff(
         "WRKSLOTS_REMOVE_COORDINATOR_START_TICKS", str(coordinator.start_ticks)
     )
     monkeypatch.setenv("WRKSLOTS_REMOVE_PROOF_FD", str(proof_fd))
+
+
+def prepare_host_context_recover_finish(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, dict[str, Path]]:
+    """Real exited owner, actual census and proof-bearing interrupted finish."""
+    project, repository, _remote = make_project(tmp_path)
+    commit_validation_removal_schema(repository, schema_version=2)
+    owner_script = """
+import os, sys
+from wrkslots import cli
+pid = str(os.getpid())
+raise SystemExit(cli.main([
+    '--project-root', sys.argv[1], 'create', 'slot01', '--slot-type', 'validate',
+    '--coordinator-authorized', '--agent', 'recovery-owner', '--task', 'recovery-test',
+    '--purpose', 'real exited owner for recovery', '--owner-pid', pid,
+    '--coordinator-pid', pid, '--repo', 'product=repo',
+]))
+"""
+    made = subprocess.run(
+        [sys.executable, "-c", owner_script, str(project)],
+        env=source_environment(), text=True, capture_output=True, check=False,
+    )
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    registered = wrkslots._load_active(config).slots[0]
+    assert registered.owner is not None
+    assert wrkslots._process_state(registered.owner)[0] == "dead"
+    set_liveness(project, "dead")
+    manifest, artifacts = prepare_validation_removal_proof(project, "slot01")
+    for role in ("run-record", "service-result"):
+        path = artifacts[role]
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value.update(final_validate_status="FAILED", exit_code=1)
+        path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        rebind_validation_removal_artifact(project, manifest, role, path)
+    interrupted = raw_command(
+        project, "remove", "slot01", "--validate-complete",
+        "--coordinator-pid", str(os.getpid()), "--expected-generation", str(registered.generation),
+        "--validation-proof-manifest", manifest.relative_to(project).as_posix(),
+        "--completed-record", artifacts["run-record"].relative_to(project).as_posix(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-finish-journal"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    assert json.loads(journal.read_text(encoding="utf-8"))["kind"] == "finish"
+    assert checkout(project, slot_type="validate").is_dir()
+    return project, journal, manifest, artifacts
+
+
+def recovery_file_snapshot(paths: Sequence[Path]) -> dict[Path, tuple[int, int, bytes]]:
+    return {
+        path: (path.stat().st_dev, path.stat().st_ino, path.read_bytes())
+        for path in paths
+    }
+
+
+@pytest.mark.ordinary_environment
+def test_host_context_recover_finish_preserves_actor_and_issued_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_runner = wrkslots._identity_to_obj(wrkslots._read_process_identity(os.getpid()))
+    project, journal, manifest, artifacts = prepare_host_context_recover_finish(tmp_path)
+    retained = [manifest, artifacts["run-record"], artifacts["service-result"], artifacts["scorecard-handoff"]]
+    before = recovery_file_snapshot(retained)
+    coordinator, proof_fd = start_host_context_coordinator()
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        with pytest.raises(wrkslots.Refusal, match="not in the invoking process ancestry"):
+            wrkslots._assert_caller_process(identity, "coordinator")
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+        result = wrkslots.main([
+            "--project-root", str(project), "recover", "--coordinator-pid",
+            str(coordinator.pid), "--slot", "slot01",
+        ])
+        assert result == 0
+        assert not checkout(project, slot_type="validate").exists()
+        assert not journal.exists() and active_slots(project) == []
+        assert recovery_file_snapshot(retained) == before
+        record = json.loads(artifacts["run-record"].read_text(encoding="utf-8"))
+        assert record["state"] == record["result"] == "unknown"
+        assert record["final_validate_status"] == "FAILED" and record["exit_code"] == 1
+        assert record["passed_tests"] is None
+        events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+        started = [event for event in events if event["kind"] == "recovery-started"]
+        assert len(started) == 1
+        payload = wrkslots._as_mapping(started[0]["payload"], "recovery event payload")
+        assert payload["actor"] == wrkslots._identity_to_obj(identity)
+        assert payload["runner"] == expected_runner
+        assert payload["handoff_writer"] == wrkslots._identity_to_obj(identity)
+        assert os.getpid() != identity.pid
+    finally:
+        terminate_process(coordinator)
+        os.close(proof_fd)
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing-runner", "missing-generation", "wrong-generation", "missing-fd",
+     "closed-fd", "regular-fd", "unrelated-runner", "unrelated-writer"),
+)
+def test_host_context_recover_rejects_invalid_handoff_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    project, journal, manifest, artifacts = prepare_host_context_recover_finish(tmp_path)
+    watched = [journal, manifest, *artifacts.values(), control_directory(project) / "ACTIVE.testhost.json"]
+    before = recovery_file_snapshot(watched)
+    events_before = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"))
+    coordinator, proof_fd = start_host_context_coordinator()
+    other: subprocess.Popen[str] | None = None
+    extra_fd: int | None = None
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+        if mutation == "missing-runner":
+            monkeypatch.delenv("WRKSLOTS_REMOVE_RUNNER_PID")
+        elif mutation == "missing-generation":
+            monkeypatch.delenv("WRKSLOTS_REMOVE_COORDINATOR_START_TICKS")
+        elif mutation == "wrong-generation":
+            monkeypatch.setenv("WRKSLOTS_REMOVE_COORDINATOR_START_TICKS", str(identity.start_ticks + 1))
+        elif mutation == "missing-fd":
+            monkeypatch.delenv("WRKSLOTS_REMOVE_PROOF_FD")
+        elif mutation == "closed-fd":
+            extra_fd = fcntl.fcntl(proof_fd, fcntl.F_DUPFD_CLOEXEC, 512)
+            os.close(extra_fd)
+            monkeypatch.setenv("WRKSLOTS_REMOVE_PROOF_FD", str(extra_fd))
+            extra_fd = None
+        elif mutation == "regular-fd":
+            extra_fd = os.open(manifest, os.O_RDONLY)
+            monkeypatch.setenv("WRKSLOTS_REMOVE_PROOF_FD", str(extra_fd))
+        elif mutation == "unrelated-runner":
+            monkeypatch.setenv("WRKSLOTS_REMOVE_RUNNER_PID", str(coordinator.pid))
+        elif mutation == "unrelated-writer":
+            other = subprocess.Popen(["sleep", "60"], text=True)
+            identity = wrkslots._read_process_identity(other.pid)
+            set_host_context_handoff(monkeypatch, identity, proof_fd)
+        else:
+            raise AssertionError(mutation)
+        result = wrkslots.main([
+            "--project-root", str(project), "recover", "--coordinator-pid",
+            str(identity.pid), "--slot", "slot01",
+        ])
+        assert result == 3
+        assert recovery_file_snapshot(watched) == before
+        assert checkout(project, slot_type="validate").is_dir()
+        assert wrkslots._load_events(wrkslots._load_config(str(project), "testhost")) == events_before
+    finally:
+        terminate_process(coordinator)
+        if other is not None:
+            terminate_process(other)
+        os.close(proof_fd)
+        if extra_fd is not None:
+            os.close(extra_fd)
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("lost", ("coordinator", "writer"))
+def test_host_context_recover_rechecks_authority_before_locked_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lost: str,
+) -> None:
+    project, journal, manifest, artifacts = prepare_host_context_recover_finish(tmp_path)
+    watched = [journal, manifest, *artifacts.values(), control_directory(project) / "ACTIVE.testhost.json"]
+    before = recovery_file_snapshot(watched)
+    config = wrkslots._load_config(str(project), "testhost")
+    events_before = wrkslots._load_events(config)
+    writer, proof_fd = start_host_context_coordinator()
+    identity = wrkslots._read_process_identity(writer.pid if lost == "coordinator" else os.getpid())
+    set_host_context_handoff(monkeypatch, identity, proof_fd)
+    real_locks = wrkslots._mutation_locks
+
+    @contextlib.contextmanager
+    def lose_at_lock(locked_config: wrkslots.Config, wait: float) -> Iterator[None]:
+        with real_locks(locked_config, wait):
+            terminate_process(writer)
+            yield
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", lose_at_lock)
+    try:
+        result = wrkslots.main([
+            "--project-root", str(project), "recover", "--coordinator-pid",
+            str(identity.pid), "--slot", "slot01",
+        ])
+        assert result == 3
+        assert recovery_file_snapshot(watched) == before
+        assert wrkslots._load_events(config) == events_before
+        assert checkout(project, slot_type="validate").is_dir()
+    finally:
+        terminate_process(writer)
+        os.close(proof_fd)
+
+
+@pytest.mark.parametrize("mutation", ("drop-writer", "drop-fd", "negative-fd", "boolean-fd", "wrong-actor"))
+def test_host_context_recover_rejects_inconsistent_internal_carrier(
+    monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    coordinator, proof_fd = start_host_context_coordinator()
+    try:
+        identity = wrkslots._read_process_identity(coordinator.pid)
+        set_host_context_handoff(monkeypatch, identity, proof_fd)
+        authority = wrkslots._RecoveryProcesses.capture(coordinator.pid)
+        if mutation == "drop-writer":
+            authority = replace(authority, writer=None, proof_fd=None)
+        elif mutation == "drop-fd":
+            authority = replace(authority, proof_fd=None)
+        elif mutation == "negative-fd":
+            authority = replace(authority, proof_fd=-1)
+        elif mutation == "boolean-fd":
+            authority = replace(authority, proof_fd=True)
+        elif mutation == "wrong-actor":
+            identity = replace(identity, start_ticks=identity.start_ticks + 1)
+        else:
+            raise AssertionError(mutation)
+        with pytest.raises(wrkslots.Refusal, match="recovery.*(inconsistent|differs)"):
+            authority.assert_current(identity)
+    finally:
+        terminate_process(coordinator)
+        os.close(proof_fd)
 
 
 def test_host_context_runner_preserves_coordinator_identity(
