@@ -8272,6 +8272,7 @@ class _GitVcs:
             checkout,
             [
                 "fetch",
+                "--no-auto-maintenance",
                 "--prune",
                 "--no-tags",
                 "--no-recurse-submodules",
@@ -9590,6 +9591,149 @@ def _unrelated_lsof_warnings(stderr: str, slot_path: Path) -> bool:
     return True
 
 
+_LSOF_DIAGNOSTIC_VALUE_LIMIT = 160
+_LSOF_DIAGNOSTIC_TRUNCATION = "...<truncated>"
+
+
+@dataclasses.dataclass(frozen=True)
+class _LsofUseDiagnostic:
+    pid: int
+    command_excerpt: str | None
+    descriptor_excerpt: str | None
+    name_excerpt: str | None
+
+
+def _lsof_diagnostic_excerpt(value: str) -> str:
+    """Render one lsof field as bounded, terminal-safe JSON string text."""
+
+    pieces: list[str] = []
+    rendered_size = 2  # Opening and closing quotes.
+    for character in value:
+        escaped = json.dumps(character, ensure_ascii=True)[1:-1]
+        if rendered_size + len(escaped) > _LSOF_DIAGNOSTIC_VALUE_LIMIT:
+            while (
+                pieces
+                and rendered_size + len(_LSOF_DIAGNOSTIC_TRUNCATION)
+                > _LSOF_DIAGNOSTIC_VALUE_LIMIT
+            ):
+                removed = pieces.pop()
+                rendered_size -= len(removed)
+            return (
+                '"'
+                + "".join(pieces)
+                + _LSOF_DIAGNOSTIC_TRUNCATION
+                + '"'
+            )
+        pieces.append(escaped)
+        rendered_size += len(escaped)
+    return '"' + "".join(pieces) + '"'
+
+
+def _parse_lsof_use_diagnostic(
+    output: str,
+) -> tuple[_LsofUseDiagnostic | None, bool]:
+    """Return the lowest reported PID's first file record and parse health.
+
+    ``lsof -Fpcfn`` is a stateful stream: ``c`` belongs to the preceding
+    process, while ``n`` belongs to the preceding file descriptor.  Keeping
+    that association here avoids presenting a command from one process beside
+    a path from another.  Only bounded, escaped excerpts survive this parser.
+    Malformed records never become evidence of absence.
+    """
+
+    selected_pid: int | None = None
+    selected_command: str | None = None
+    selected_descriptor: str | None = None
+    selected_name: str | None = None
+    current_pid: int | None = None
+    current_descriptor: str | None = None
+    current_is_selected_record = False
+    malformed = False
+
+    for line in output.splitlines():
+        if not line:
+            malformed = True
+            current_descriptor = None
+            current_is_selected_record = False
+            continue
+        field, value = line[0], line[1:]
+        if field == "p":
+            current_descriptor = None
+            current_is_selected_record = False
+            if not re.fullmatch(r"[0-9]{1,20}", value):
+                malformed = True
+                current_pid = None
+                continue
+            try:
+                pid = int(value)
+            except ValueError:
+                malformed = True
+                current_pid = None
+                continue
+            current_pid = pid
+            if selected_pid is None or pid < selected_pid:
+                selected_pid = pid
+                selected_command = None
+                selected_descriptor = None
+                selected_name = None
+            continue
+        if field == "c":
+            if current_pid is None or not value:
+                malformed = True
+                continue
+            if current_pid == selected_pid and selected_command is None:
+                selected_command = _lsof_diagnostic_excerpt(value)
+            continue
+        if field == "f":
+            current_is_selected_record = False
+            if current_pid is None or not value:
+                malformed = True
+                current_descriptor = None
+                continue
+            current_descriptor = value
+            if current_pid == selected_pid and selected_descriptor is None:
+                selected_descriptor = _lsof_diagnostic_excerpt(value)
+                current_is_selected_record = True
+            continue
+        if field == "n":
+            if current_pid is None or current_descriptor is None or not value:
+                malformed = True
+                continue
+            if current_is_selected_record and selected_name is None:
+                selected_name = _lsof_diagnostic_excerpt(value)
+            continue
+        malformed = True
+        current_descriptor = None
+        current_is_selected_record = False
+
+    if selected_pid is None:
+        return None, malformed
+    return (
+        _LsofUseDiagnostic(
+            selected_pid,
+            selected_command,
+            selected_descriptor,
+            selected_name,
+        ),
+        malformed,
+    )
+
+
+def _format_lsof_use_diagnostic(
+    evidence: _LsofUseDiagnostic, *, malformed: bool
+) -> str:
+    details: list[str] = []
+    if evidence.command_excerpt is not None:
+        details.append(f"command={evidence.command_excerpt}")
+    if evidence.descriptor_excerpt is not None:
+        details.append(f"fd={evidence.descriptor_excerpt}")
+    if evidence.name_excerpt is not None:
+        details.append(f"file={evidence.name_excerpt}")
+    if malformed:
+        details.append("malformed lsof fields omitted")
+    return f"; lsof {', '.join(details)}" if details else ""
+
+
 def _assert_slot_unused(
     slot_path: Path,
     record: ActiveRecord | None = None,
@@ -9643,16 +9787,16 @@ def _assert_slot_unused(
                 "process use is indeterminate because lsof reported: "
                 f"{completed.stderr.strip().splitlines()[0]}"
             )
-        pids = sorted(
-            {
-                int(line[1:])
-                for line in completed.stdout.splitlines()
-                if line.startswith("p") and line[1:].isdigit()
-            }
-        )
-        if pids:
+        evidence, malformed_lsof = _parse_lsof_use_diagnostic(completed.stdout)
+        if evidence is not None:
             raise Refusal(
-                f"live process {pids[0]} uses slot {slot_path}; stop it and retry"
+                f"live process {evidence.pid} uses slot {slot_path}"
+                f"{_format_lsof_use_diagnostic(evidence, malformed=malformed_lsof)}; "
+                "stop it and retry"
+            )
+        if malformed_lsof:
+            raise Refusal(
+                "process use is indeterminate because lsof returned malformed field output"
             )
         if completed.returncode not in (0, 1):
             raise Refusal(

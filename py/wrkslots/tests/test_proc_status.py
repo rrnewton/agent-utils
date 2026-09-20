@@ -43,12 +43,13 @@ def scripted_status(
 
 
 @contextlib.contextmanager
-def waiting_child() -> Iterator[subprocess.Popen[bytes]]:
+def waiting_child(cwd: Path | None = None) -> Iterator[subprocess.Popen[bytes]]:
     child = subprocess.Popen(
         [sys.executable, "-B", "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=cwd,
     )
     pidfd: int | None = None
     try:
@@ -220,6 +221,91 @@ def test_direct_census_refuses_a_live_holder_after_fresh_status(
     with pytest.raises(cli.Refusal, match="live process .* uses slot"):
         cli._assert_slot_unused(slot, use_lsof=False, proc_root=proc_root)
     assert len(calls) == 2
+
+
+def test_lsof_guard_refuses_a_real_live_user_with_attributed_evidence(
+    tmp_path: Path,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    empty_proc = tmp_path / "empty-proc"
+    empty_proc.mkdir()
+    assert Path("/usr/bin/lsof").is_file(), "the slot guard requires the installed lsof"
+
+    with waiting_child(cwd=slot) as child:
+        with pytest.raises(cli.Refusal) as refused:
+            cli._assert_slot_unused(slot, proc_root=empty_proc)
+
+    rendered = str(refused.value)
+    assert f"live process {child.pid} uses slot {slot}" in rendered
+    assert "command=" in rendered
+    assert 'fd="cwd"' in rendered
+    assert f'file="{slot}"' in rendered
+    assert len(rendered) < 1024
+
+
+def test_lsof_diagnostic_associates_process_command_and_first_file_record() -> None:
+    evidence, malformed = cli._parse_lsof_use_diagnostic(
+        "\n".join(
+            (
+                "p900",
+                "cother",
+                "f9",
+                "n/other/file",
+                "p123",
+                "cgit maintenance",
+                "fcwd",
+                "n/selected/slot",
+                "f7",
+                "n/selected/slot/later",
+                "p456",
+                "clater",
+                "fcwd",
+                "n/later/slot",
+            )
+        )
+        + "\n"
+    )
+
+    assert malformed is False
+    assert evidence == cli._LsofUseDiagnostic(
+        pid=123,
+        command_excerpt='"git maintenance"',
+        descriptor_excerpt='"cwd"',
+        name_excerpt='"/selected/slot"',
+    )
+    assert cli._parse_lsof_use_diagnostic("") == (None, False)
+
+
+def test_lsof_diagnostic_is_bounded_terminal_safe_and_malformed_safe() -> None:
+    long_command = "x" * 10_000 + "\x1b[31m"
+    long_descriptor = "9" * 10_000
+    long_name = "/slot/" + "y" * 10_000 + "\nforged refusal"
+    evidence, malformed = cli._parse_lsof_use_diagnostic(
+        f"p123\nc{long_command}\nf{long_descriptor}\nn{long_name}\n"
+    )
+    assert evidence is not None
+    assert malformed is False
+    rendered = cli._format_lsof_use_diagnostic(evidence, malformed=malformed)
+    assert len(rendered) < 600
+    assert rendered.count(cli._LSOF_DIAGNOSTIC_TRUNCATION) == 3
+    assert "\x1b" not in rendered
+    assert "\n" not in rendered
+
+    for broken in (
+        "corphan\nfcwd\nn/slot\n",
+        f"p{'9' * 10_000}\ncbogus\nfcwd\nn/slot\n",
+        "p123\ncright\nn/orphan\nf1\nn/slot/file\n",
+        "p123\ncright\nxunknown\nn/slot/file\n",
+    ):
+        parsed, parse_malformed = cli._parse_lsof_use_diagnostic(broken)
+        assert parse_malformed is True
+        if parsed is not None:
+            diagnostic = cli._format_lsof_use_diagnostic(
+                parsed, malformed=parse_malformed
+            )
+            assert "malformed lsof fields omitted" in diagnostic
+            assert len(diagnostic) < 600
 
 
 def test_the_machines_init_is_refused_as_a_process_identity() -> None:

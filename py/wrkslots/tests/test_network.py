@@ -125,6 +125,10 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
         == ["-c", "credential.helper=", "-c", expected_helper]
         for command in commands
     )
+    fetch = commands[0]
+    operation = fetch.index("-C") + 2
+    assert fetch[operation:operation + 2] == ["fetch", "--no-auto-maintenance"]
+    assert all("--no-auto-maintenance" not in command for command in commands[1:])
 
 
 def test_github_credential_helper_works_with_global_git_config_disabled(
