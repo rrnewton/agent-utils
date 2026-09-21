@@ -349,6 +349,82 @@ def test_input_heartbeats_do_not_write_and_cursor_advances_remain_immediate(
     assert len(writes) == 2 and writes[-1]["error"] == "permission denied"
 
 
+def test_completed_reconciliations_persist_latest_timestamp_without_heartbeat_writes(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[dict[str, object]] = []
+    original = _write
+
+    def write(path: Path, document: dict[str, object]) -> None:
+        if path == rig.state / "input.json":
+            writes.append(dict(document))
+        original(path, document)
+
+    monkeypatch.setattr(runtime_module, "_write", write)
+    rig.runtime._handle(_Notice("input_connected"))
+    assert len(writes) == 1
+
+    first = "2026-01-02T00:05:00Z"
+    second = "2026-01-02T00:10:00Z"
+    for expected in (first, second):
+        # Reconciliation normally runs after the 60-second observer deadline.
+        # Open that deadline explicitly so the test need not wait in real time.
+        rig.runtime.input_observer._next_write = 0
+        rig.runtime._complete(_Completion(
+            "poll", "page", {"messages": [], "cursor": None}, None, expected))
+        assert _read(rig.state / "input.json")["reconciled_at"] == expected
+
+    assert len(writes) == 3, "each completed reconciliation writes at most once"
+    latest = "2026-01-02T00:10:01Z"
+    rig.runtime._complete(_Completion(
+        "poll", "page", {"messages": [], "cursor": None}, None, latest))
+    assert len(writes) == 3, "a reconciliation inside the write interval is coalesced"
+    assert rig.runtime.input_state["reconciled_at"] == latest
+    assert _read(rig.state / "input.json")["reconciled_at"] == second
+    rig.runtime.input_observer._next_write = 0
+    assert rig.runtime.input_observer.flush()
+    assert len(writes) == 4
+    assert _read(rig.state / "input.json")["reconciled_at"] == latest
+
+    restarted = rig.restart()
+    assert restarted.input_state["reconciled_at"] == latest
+
+    restarted._handle(_Notice("input_connected"))
+    for _ in range(100):
+        assert restarted._input_event({"type": "heartbeat"}) == ("heartbeat", None)
+    assert len(writes) == 4, "unchanged status and heartbeats must not write"
+
+
+def test_reconcile_error_then_success_clears_error_and_persists_completion(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[dict[str, object]] = []
+    original = _write
+
+    def write(path: Path, document: dict[str, object]) -> None:
+        if path == rig.state / "input.json":
+            writes.append(dict(document))
+        original(path, document)
+
+    monkeypatch.setattr(runtime_module, "_write", write)
+    rig.runtime._complete(_Completion(
+        "poll", "page", None, OSError("provider unavailable"), "2026-01-02T00:04:00Z"))
+    assert _read(rig.state / "input.json")["reconcile_error"] == "provider unavailable"
+
+    completed = "2026-01-02T00:05:00Z"
+    rig.runtime._complete(_Completion(
+        "poll", "page", {"messages": [], "cursor": None}, None, completed))
+    assert len(writes) == 1, "success inside the write interval is coalesced"
+    assert rig.runtime.input_state["reconcile_error"] is None
+    assert rig.runtime.input_state["reconciled_at"] == completed
+    rig.runtime.input_observer._next_write = 0
+    assert rig.runtime.input_observer.flush()
+    saved = _read(rig.state / "input.json")
+    assert saved["reconcile_error"] is None
+    assert saved["reconciled_at"] == completed
+    assert len(writes) == 2, "error and successful completion each write at most once"
+
+
 def test_input_pump_filters_unchanged_heartbeats_before_owner_mailbox(
     rig: Rig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

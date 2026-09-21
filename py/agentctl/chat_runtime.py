@@ -70,9 +70,9 @@ class _InputObserver:
             self._next_write = time.monotonic() + max(0.0, write_interval - max(0.0, age))
 
     @staticmethod
-    def _logical(document: dict[str, object]) -> tuple[object, object, object]:
+    def _logical(document: dict[str, object]) -> tuple[object, object, object, object]:
         return (document.get("state"), document.get("error"),
-                document.get("reconcile_error"))
+                document.get("reconcile_error"), document.get("reconciled_at"))
 
     @property
     def next_write(self) -> float | None:

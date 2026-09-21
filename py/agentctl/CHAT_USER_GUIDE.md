@@ -215,7 +215,10 @@ observed state is durable immediately. Later connection/error flaps are
 coalesced, and the latest state is saved after at most 60 seconds by default.
 `--observer-write-interval` accepts 60–3600 seconds for both `run` and `launch`.
 It is a hard minimum between advisory state writes, not a heartbeat: unchanged
-input and output state causes no write. Input cursor advances remain immediately
+input and output state causes no write. Each completed REST reconciliation advances
+`reconciled_at` through this coalescing observer. Completions outside the write
+interval are durable immediately; completions inside it retain the latest timestamp
+for the next deadline. Input cursor advances remain immediately
 durable regardless of this interval. Use the service supervisor for process
 liveness; `updated_at` records the latest persisted state transition. Older
 releases could save longer observer errors. A compatible file within the 8 KiB
