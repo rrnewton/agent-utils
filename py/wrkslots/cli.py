@@ -8284,6 +8284,7 @@ class _GitVcs:
 
     def fetch_remote(self, checkout: Path, remote: str, landed_ref: str) -> None:
         _validate_remote(remote)
+        self._remote_url_with_push_authority(checkout, remote)
         _validate_full_ref(landed_ref, "landed ref")
         prefix = f"refs/remotes/{remote}/"
         if not landed_ref.startswith(prefix):
@@ -8301,21 +8302,51 @@ class _GitVcs:
             ],
         )
 
-    def remote_url_sha256(self, checkout: Path, remote: str) -> str:
+    def _assert_no_push_urls(self, checkout: Path, remote: str) -> None:
         _validate_remote(remote)
+        result = self._run(
+            checkout,
+            ["config", "--null", "--get-all", f"remote.{remote}.pushurl"],
+            check=False,
+        )
+        if result.returncode not in (0, 1):
+            raise Refusal(f"cannot determine whether remote {remote!r} has a push URL")
+        values = result.stdout.split("\0")
+        if values and values[-1] == "":
+            values.pop()
+        if any(value for value in values):
+            raise Refusal(
+                f"remote {remote!r} has a configured push URL; remove every non-empty "
+                f"remote.{remote}.pushurl before remote operations"
+            )
+
+    def _remote_url_with_push_authority(self, checkout: Path, remote: str) -> str:
+        _validate_remote(remote)
+        self._assert_no_push_urls(checkout, remote)
         result = self._run(checkout, ["remote", "get-url", "--all", remote])
         urls = result.stdout.splitlines()
         if len(urls) != 1 or not urls[0]:
             raise Refusal(
                 f"remote {remote!r} must have exactly one non-empty fetch URL"
             )
-        return hashlib.sha256(urls[0].encode("utf-8")).hexdigest()
+        push_result = self._run(
+            checkout, ["remote", "get-url", "--push", "--all", remote]
+        )
+        push_urls = push_result.stdout.splitlines()
+        if push_urls != urls:
+            raise Refusal(
+                f"remote {remote!r} effective push URL differs from its single fetch URL; "
+                "remove pushInsteadOf or other push-only redirection"
+            )
+        return urls[0]
+
+    def remote_url_sha256(self, checkout: Path, remote: str) -> str:
+        url = self._remote_url_with_push_authority(checkout, remote)
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
     def assert_remote_url(self, checkout: Path, remote: str, authorized_url: str) -> str:
-        _validate_remote(remote)
-        result = self._run(checkout, ["remote", "get-url", "--all", remote])
-        urls = result.stdout.splitlines()
-        if urls != [authorized_url]:
+        observed_url = self._remote_url_with_push_authority(checkout, remote)
+        if observed_url != authorized_url:
             raise Refusal(
                 f"remote {remote!r} URL differs from trusted provisioning input"
             )
@@ -8418,6 +8449,7 @@ class _GitVcs:
 
     def remote_ref_sha(self, checkout: Path, remote: str, ref: str) -> str | None:
         _validate_remote(remote)
+        self._remote_url_with_push_authority(checkout, remote)
         _validate_full_ref(ref, "remote salvage ref")
         result = self._run(
             checkout, ["ls-remote", "--refs", remote, ref], check=False
@@ -8441,6 +8473,7 @@ class _GitVcs:
     def push_salvage(
         self, checkout: Path, remote: str, commit: str, ref: str
     ) -> None:
+        self._remote_url_with_push_authority(checkout, remote)
         existing = self.remote_ref_sha(checkout, remote, ref)
         if existing is not None:
             if existing != commit:
@@ -10398,21 +10431,28 @@ def _salvage_one_checkout(
 def _salvage_agent_slot(
     config: Config, record: ActiveRecord, vcs: _GitVcs
 ) -> tuple[dict[str, object], ...]:
-    receipts: list[dict[str, object]] = []
+    candidates: list[tuple[Checkout, Path, bool]] = []
     for checkout in record.checkouts:
-        receipts.append(_salvage_one_checkout(config, record, checkout, vcs))
-        for submodule, path in _submodule_salvage_checkouts(config, checkout, vcs):
-            receipts.append(
-                _salvage_one_checkout(
-                    config,
-                    record,
-                    submodule,
-                    vcs,
-                    path_override=path,
-                    allow_detached=True,
-                )
+        path = _stored_path(config, checkout.path, "checkout path")
+        if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+            raise Refusal(
+                f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
+                "recorded remote before reclaim so salvage cannot be sent elsewhere"
             )
-    return tuple(receipts)
+        candidates.append((checkout, path, False))
+        for submodule, path in _submodule_salvage_checkouts(config, checkout, vcs):
+            candidates.append((submodule, path, True))
+    return tuple(
+        _salvage_one_checkout(
+            config,
+            record,
+            checkout,
+            vcs,
+            path_override=path,
+            allow_detached=detached,
+        )
+        for checkout, path, detached in candidates
+    )
 
 
 def _salvage_ownerless_checkout(
@@ -10479,31 +10519,27 @@ def _salvage_ownerless_worktree(
     path_override: Path | None = None,
 ) -> tuple[dict[str, object], ...]:
     path = path_override or _stored_path(config, checkout.path, "ownerless checkout path")
-    receipts = [
+    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+        raise Refusal(
+            f"checkout {checkout.name} remote {checkout.remote} changed during salvage"
+        )
+    candidates: list[tuple[Checkout, Path, bool]] = [(checkout, path, False)]
+    for submodule, submodule_path in _submodule_salvage_checkouts(
+        config, checkout, vcs, path_override=path
+    ):
+        candidates.append((submodule, submodule_path, True))
+    return tuple(
         _salvage_ownerless_checkout(
             config,
             Path(authorization.path).name,
             authorization.recorded_at,
-            checkout,
+            candidate,
             vcs,
-            path_override=path,
+            path_override=candidate_path,
+            allow_detached=detached,
         )
-    ]
-    for submodule, submodule_path in _submodule_salvage_checkouts(
-        config, checkout, vcs, path_override=path
-    ):
-        receipts.append(
-            _salvage_ownerless_checkout(
-                config,
-                Path(authorization.path).name,
-                authorization.recorded_at,
-                submodule,
-                vcs,
-                path_override=submodule_path,
-                allow_detached=True,
-            )
-        )
-    return tuple(receipts)
+        for candidate, candidate_path, detached in candidates
+    )
 
 
 def _assert_salvage_still_matches(
@@ -10527,6 +10563,11 @@ def _assert_salvage_still_matches(
             if paths is None
             else paths[checkout.name]
         )
+        if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+            raise Refusal(
+                f"checkout {checkout.name} remote {checkout.remote} URL changed after "
+                "salvage; preserve it and rerun remove"
+            )
         targets.append((checkout, path, False))
         targets.extend(
             (submodule, submodule_path, True)
@@ -22941,6 +22982,8 @@ def _assert_ownerless_salvage_still_matches(
     vcs: _GitVcs,
     path: Path,
 ) -> None:
+    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+        raise Refusal("ownerless worktree remote changed after salvage; preserve it")
     candidates = [(checkout, path, False)]
     candidates.extend(
         (submodule, submodule_path, True)

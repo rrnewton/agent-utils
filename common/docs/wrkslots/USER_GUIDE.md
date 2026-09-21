@@ -184,6 +184,13 @@ For each `--repo NAME=PATH`, `create` uses the configured `origin` by default. S
 caller must verify its exact fetch URL. Wrkslots records a SHA-256 identity and refuses if the URL
 changes.
 
+Wrkslots also requires Git's single effective push URL to be byte-for-byte identical to that fetch
+URL. Any non-empty `remote.<name>.pushurl`, multiple URL, or push-only rewrite such as
+`url.<base>.pushInsteadOf` that changes the effective destination is refused; SSH and HTTPS
+spellings are not normalized into equivalence. Before agent salvage performs its first fetch, ref
+readback, or push, this authority check covers every parent checkout and initialized nested
+repository in the salvage set.
+
 When `with-proxy` is installed on `PATH`, Wrkslots uses it for Git fetches, pushes, remote ref
 readback, and post-provision hooks. The hook's children, including recursive submodule commands,
 inherit the wrapper's environment. A wrapper failure stops the operation; Wrkslots does not retry

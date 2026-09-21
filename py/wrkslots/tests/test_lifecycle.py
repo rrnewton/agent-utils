@@ -11204,6 +11204,51 @@ def test_create_can_verify_the_selected_configured_remote_url(tmp_path: Path) ->
     assert not checkout(project, "slot02").exists()
 
 
+@pytest.mark.parametrize("authority", ("digest", "exact"))
+@pytest.mark.parametrize("redirect", ("pushurl", "pushInsteadOf"))
+def test_remote_authority_accepts_no_pushurl_and_refuses_override(
+    tmp_path: Path,
+    authority: str,
+    redirect: str,
+) -> None:
+    _project, repository, _remote = make_project(tmp_path)
+    vcs = wrkslots._GitVcs()
+    authorized_url = git(repository, "remote", "get-url", "origin").stdout.strip()
+    expected_digest = hashlib.sha256(authorized_url.encode("utf-8")).hexdigest()
+    assert (
+        git(
+            repository,
+            "config",
+            "--get-all",
+            "remote.origin.pushurl",
+            check=False,
+        ).returncode
+        == 1
+    )
+
+    if authority == "digest":
+        assert vcs.remote_url_sha256(repository, "origin") == expected_digest
+    else:
+        assert vcs.assert_remote_url(repository, "origin", authorized_url) == expected_digest
+
+    redirected = str(tmp_path / "redirect.git")
+    if redirect == "pushurl":
+        git(repository, "config", "remote.origin.pushurl", redirected)
+        expected = "remote 'origin' has a configured push URL"
+    else:
+        git(repository, "config", f"url.{redirected}.pushInsteadOf", authorized_url)
+        expected = "effective push URL differs from its single fetch URL"
+    assert (
+        git(repository, "remote", "get-url", "--push", "--all", "origin").stdout.strip()
+        == redirected
+    )
+    with pytest.raises(wrkslots.Refusal, match=expected):
+        if authority == "digest":
+            vcs.remote_url_sha256(repository, "origin")
+        else:
+            vcs.assert_remote_url(repository, "origin", authorized_url)
+
+
 def test_ignored_file_is_preserved_by_finish_refusal(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     (repository / ".gitignore").write_text("ignored.bin\n", encoding="utf-8")
@@ -11553,6 +11598,16 @@ def test_agent_reclaim_salvages_uncommitted_submodule_files_before_removal(
     tree = checkout(project)
     nested = tree / "component"
     assert nested.is_dir()
+    assert (
+        git(
+            nested,
+            "config",
+            "--get-all",
+            "remote.origin.pushurl",
+            check=False,
+        ).returncode
+        == 1
+    )
     (nested / "uncommitted.txt").write_text("must survive\n", encoding="utf-8")
     mark_owner_dead(project)
     set_liveness(project, "dead")
@@ -11586,6 +11641,129 @@ def test_agent_reclaim_salvages_uncommitted_submodule_files_before_removal(
             f"{nested_receipt['salvage_commit']}:uncommitted.txt",
         ).stdout
         == "must survive\n"
+    )
+
+
+@pytest.mark.parametrize("redirect", ("pushurl", "pushInsteadOf"))
+def test_agent_reclaim_refuses_nested_push_redirect_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    redirect: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    submodule_remote = tmp_path / "submodule.git"
+    submodule_source = tmp_path / "submodule-source"
+    redirected_remote = tmp_path / "redirected.git"
+    for bare in (submodule_remote, redirected_remote):
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(bare)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    subprocess.run(
+        ["git", "clone", str(submodule_remote), str(submodule_source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(submodule_source, "config", "user.name", "Wrkslots Test")
+    git(submodule_source, "config", "user.email", "wrkslots@example.invalid")
+    (submodule_source / "base.txt").write_text("base\n", encoding="utf-8")
+    git(submodule_source, "add", "base.txt")
+    git(submodule_source, "commit", "-m", "submodule base")
+    git(submodule_source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(submodule_remote),
+        "component",
+    )
+    git(repository, "commit", "-am", "add component")
+    git(repository, "push", "origin", "main")
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init --recursive"
+        ],
+    )
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    nested = tree / "component"
+    (nested / "uncommitted.txt").write_text("must survive\n", encoding="utf-8")
+    nested_fetch_url = git(nested, "remote", "get-url", "origin").stdout.strip()
+    if redirect == "pushurl":
+        git(nested, "config", "remote.origin.pushurl", str(redirected_remote))
+        expected = "remote 'origin' has a configured push URL"
+    else:
+        git(
+            nested,
+            "config",
+            f"url.{redirected_remote}.pushInsteadOf",
+            nested_fetch_url,
+        )
+        expected = "effective push URL differs from its single fetch URL"
+    assert (
+        git(nested, "remote", "get-url", "--push", "--all", "origin").stdout.strip()
+        == str(redirected_remote)
+    )
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    original_run = wrkslots._GitVcs._run
+    network_calls: list[tuple[str, ...]] = []
+
+    def forbid_network(
+        repository_path: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if args and args[0] in {"fetch", "push", "ls-remote"}:
+            network_calls.append(tuple(args))
+            raise AssertionError(f"network operation preceded pushurl refusal: {args[0]}")
+        return original_run(
+            repository_path,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(forbid_network))
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert rc == 3
+    assert expected in capsys.readouterr().err
+    assert network_calls == []
+    assert (nested / "uncommitted.txt").read_text(encoding="utf-8") == "must survive\n"
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert (
+        git(
+            redirected_remote,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/salvage",
+        ).stdout
+        == ""
     )
 
 
