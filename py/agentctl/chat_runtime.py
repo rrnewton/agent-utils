@@ -36,6 +36,13 @@ from agentctl.errors import HerdrUnavailable
 from agentctl.jsonx import as_mapping, as_sequence, get_str
 
 
+_MAX_RECONCILE_PAGES = 64
+_MAX_RECONCILE_SECONDS = 60.0
+_SENDABLE_REPLY_PHASES = frozenset({
+    "awaiting_reply", "delivery_uncertain", "reply_pending", "replied",
+})
+
+
 @dataclass(frozen=True)
 class _Notice:
     kind: str
@@ -49,6 +56,13 @@ class _Completion:
     result: object
     error: Exception | None
     finished_at: str
+
+
+@dataclass
+class _ReconcileWindow:
+    started_at: float
+    pages: int
+    cursors: set[str]
 
 
 class _InputObserver:
@@ -363,6 +377,7 @@ class _Runtime:
         self.delivery_prompts: dict[str, str] = {}
         self.delivery_inflight: dict[str, str] = {}
         self.poll_checkpoint: dict[str, object] | None = None
+        self.reconcile_window: _ReconcileWindow | None = None
         self.reconcile_requested = True
         self.output_pending: dict[str, PaneOutputSnapshot | PaneAgentStatus] = {}
         self.output_inflight: dict[str, PaneOutputSnapshot | PaneAgentStatus] = {}
@@ -419,6 +434,22 @@ class _Runtime:
     def _records(self) -> list[tuple[Path, dict[str, object]]]:
         return [self.records[key] for key in self.record_order]
 
+    def _send_candidate(self, key: str) -> bool:
+        cached = self.records.get(key)
+        return bool(
+            self.bridge.config.outbound_mode == "enabled"
+            and cached is not None
+            and cached[1].get("phase") in _SENDABLE_REPLY_PHASES
+            and self.pending_by_key.get(key)
+            and ("send", key) not in self.jobs
+        )
+
+    def _send_ready(self, key: str, now: float) -> bool:
+        if not self._send_candidate(key):
+            return False
+        retry = self.retry.get(("send", key))
+        return retry is None or now >= retry[0]
+
     def _ordered_record_keys(self, now: float, keys: set[str] | None = None) -> list[str]:
         """Prefer fresh durable sends, round-robin after the last started key."""
         order = self.record_order
@@ -428,8 +459,7 @@ class _Runtime:
         selected = order if keys is None else [key for key in order if key in keys]
 
         def send_rank(key: str) -> int:
-            if (("send", key) in self.jobs or not self.pending_by_key.get(key)
-                    or self.bridge.config.outbound_mode == "disabled"):
+            if not self._send_candidate(key):
                 return 2
             retry = self.retry.get(("send", key))
             if retry is None:
@@ -482,6 +512,69 @@ class _Runtime:
         self.feedback_dirty = bool(self.feedback_pending)
         self.deferred_messages = dict(snapshot.deferred_messages)
         self.deferred_dirty = bool(self.deferred_messages)
+
+    def _admit_reconciled_records(
+        self, admitted: list[tuple[Path, dict[str, object]]],
+    ) -> set[str]:
+        """Recover and cache only records durably admitted by one poll page."""
+        if not admitted:
+            return set()
+        descriptor = _open_private_lock(
+            str(self.bridge.state / ".bridge.lock"), "chat bridge lock")
+        selected: set[str] = set()
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            for path, expected in admitted:
+                record, _ = self.bridge._read_bounded_record(path)
+                self.bridge._validate_request_record_schema(record)
+                if (get_str(record, "key", "request") != get_str(expected, "key", "request")
+                        or as_mapping(record.get("message"), "saved source message")
+                        != as_mapping(expected.get("message"), "admitted source message")):
+                    raise ValueError("admitted request identity changed before cache admission")
+                items = self.bridge._recover_reply_state(path, record)
+                self.bridge._adopt_submission(path, record, items)
+                key = get_str(record, "key", "request")
+                self._cache_record(path, record)
+                self._refresh_reply_index(key, items)
+                selected.add(key)
+        finally:
+            os.close(descriptor)
+        return selected
+
+    def _defer_reconciliation(self, reason: str, now: float) -> None:
+        """End one bounded page window and retry it with ordinary backoff."""
+        job = ("poll", "page")
+        delay = min(60, self.retry.get(job, (0, 0.5))[1] * 2)
+        self.retry[job] = (now + delay, delay)
+        self.reconcile_window = None
+        self.poll_checkpoint = None
+        self.reconcile_requested = True
+        self._input_status(reconcile_error=reason[:2000])
+        self._log(f"poll: {reason}")
+
+    def _start_reconciliation_page(self) -> None:
+        now = time.monotonic()
+        window = self.reconcile_window
+        if window is not None:
+            if window.pages >= _MAX_RECONCILE_PAGES:
+                self._defer_reconciliation(
+                    f"reconciliation page budget {_MAX_RECONCILE_PAGES} exhausted", now)
+                return
+            if now - window.started_at >= _MAX_RECONCILE_SECONDS:
+                self._defer_reconciliation(
+                    f"reconciliation time budget {_MAX_RECONCILE_SECONDS:g}s exhausted", now)
+                return
+        checkpoint = _read(self.bridge.state / "bridge.json")
+        if window is None:
+            initial = _cursor(checkpoint.get("cursor"), "saved poll cursor")
+            window = _ReconcileWindow(
+                started_at=now, pages=0,
+                cursors=set() if initial is None else {initial},
+            )
+            self.reconcile_window = window
+        self.poll_checkpoint = checkpoint
+        self.reconcile_requested = False
+        self._transport("poll", "page", self.bridge._poll_request(checkpoint))
 
     def _cache_record(self, path: Path, record: dict[str, object]) -> None:
         key = get_str(record, "key", "request")
@@ -683,10 +776,7 @@ class _Runtime:
                 and ack["state"] == "pending" and due and ("ack", key) not in self.jobs
                 and sum(lane == "ack" for lane, _ in self.jobs) < 4):
             self._ack_start(path, record)
-        if (self.bridge.config.outbound_mode == "enabled"
-                and record["phase"] in ("awaiting_reply", "delivery_uncertain", "reply_pending", "replied")
-                and ("send", key) not in self.jobs
-                and now >= self.retry.get(("send", key), (0, 1))[0]
+        if (self._send_ready(key, now)
                 and sum(lane == "send" for lane, _ in self.jobs) < 2):
             items = self.reply_items_by_key.get(key, [])
             reply = items[0] if items else None
@@ -778,10 +868,7 @@ class _Runtime:
         self._start_delivery(pending, to_enqueue, now)
         if ((self.reconcile_requested or now >= self.next_poll) and ("poll", "page") not in self.jobs
                 and now >= self.retry.get(("poll", "page"), (0, 1))[0]):
-            self.poll_checkpoint = _read(self.bridge.state / "bridge.json")
-            self.reconcile_requested = False
-            self._transport(
-                "poll", "page", self.bridge._poll_request(self.poll_checkpoint))
+            self._start_reconciliation_page()
         loaded = [record for _, record in self._records()]
         desired = self.bridge._output_subscription(
             loaded, watch_delivery=self.delivery_pending or ("drain", "queue") in self.jobs)
@@ -846,6 +933,7 @@ class _Runtime:
         self.jobs.discard(job)
         error = item.error
         selected: set[str] | None = {item.key}
+        poll_terminal = False
         if item.lane in ("ack", "send"):
             path = self.bridge.state / "requests" / f"{item.key}.json"
             cached = self.records.get(item.key)
@@ -927,13 +1015,28 @@ class _Runtime:
             else:
                 self.output_pending.setdefault(item.key, event)
         elif item.lane == "poll":
-            selected = None
+            selected = set()
             if error is None:
+                recover_durable_intake = False
                 try:
                     result = as_mapping(item.result, "poll result")
                     messages = result.get("messages")
                     if not isinstance(messages, list):
                         raise ValueError("poll result messages must be a list")
+                    checkpoint = self.poll_checkpoint
+                    if checkpoint is None:
+                        checkpoint = _read(self.bridge.state / "bridge.json")
+                    window = self.reconcile_window
+                    if window is None:
+                        initial = _cursor(checkpoint.get("cursor"), "saved poll cursor")
+                        window = _ReconcileWindow(
+                            started_at=time.monotonic(), pages=0,
+                            cursors=set() if initial is None else {initial},
+                        )
+                        self.reconcile_window = window
+                    next_cursor = _cursor(result.get("cursor"), "poll result cursor")
+                    if next_cursor is not None and next_cursor in window.cursors:
+                        raise ValueError("poll adapter repeated a reconciliation cursor")
                     accepted: list[object] = []
                     for raw in messages:
                         message = as_mapping(raw, "polled message")
@@ -943,23 +1046,57 @@ class _Runtime:
                         else:
                             accepted.append(raw)
                     result["messages"] = accepted
-                    self.bridge._ingest_result(result, self.poll_checkpoint,
-                                               records=[record for _, record in self._records()])
-                    self.next_poll = time.monotonic() + (0 if result.get("cursor") else self.reconcile_interval)
+                    # Atomic request/checkpoint writes may reach durable storage
+                    # before their fsync reports failure. From this point on,
+                    # an exception requires one authoritative recovery pass.
+                    recover_durable_intake = True
+                    admitted = self.bridge._ingest_result(
+                        result, checkpoint,
+                        records=[record for _, record in self._records()])
+                    selected.update(self._admit_reconciled_records(admitted))
+                    window.pages += 1
+                    now = time.monotonic()
+                    if next_cursor is None:
+                        poll_terminal = True
+                        self.reconcile_window = None
+                        self.next_poll = now + self.reconcile_interval
+                    else:
+                        window.cursors.add(next_cursor)
+                        self.next_poll = now
+                        if window.pages >= _MAX_RECONCILE_PAGES:
+                            error = ValueError(
+                                f"reconciliation page budget {_MAX_RECONCILE_PAGES} exhausted")
+                        elif now - window.started_at >= _MAX_RECONCILE_SECONDS:
+                            error = ValueError(
+                                f"reconciliation time budget {_MAX_RECONCILE_SECONDS:g}s exhausted")
+                    self.poll_checkpoint = None
                     self.next_drain = 0.0
                 except Exception as exc:
                     error = exc
+                    if recover_durable_intake:
+                        # The happy path admits only this page's new records.
+                        # Exceptional write ambiguity or a partial incremental
+                        # admission must recover all durable authority now, not
+                        # wait for the unrelated five-minute maintenance pass.
+                        selected = None
+                        # If authoritative recovery itself fails, propagate it
+                        # and let the service restart. Continuing could consume
+                        # an already-advanced cursor with a stale request cache.
+                        self._reload_records()
         if error is not None:
             self._log(f"{item.lane}: {error}")
             if item.lane not in ("ack", "drain"):
                 delay = min(60, self.retry.get(job, (0, 0.5))[1] * 2)
                 self.retry[job] = (time.monotonic() + delay, delay)
             if item.lane == "poll":
+                self.reconcile_window = None
+                self.poll_checkpoint = None
                 self.reconcile_requested = True
                 self._input_status(reconcile_error=str(error)[:2000])
         else:
-            self.retry.pop(job, None)
-            if item.lane == "poll":
+            if item.lane != "poll" or poll_terminal:
+                self.retry.pop(job, None)
+            if item.lane == "poll" and poll_terminal:
                 self._input_status(reconcile_error=None, reconciled_at=item.finished_at)
         if item.lane == "drain":
             for identifier in self.delivery_tentative:
@@ -1024,8 +1161,6 @@ class _Runtime:
             selected = self._complete(notice.value)
             if notice.value.lane in ("ack", "send"):
                 return True, {notice.value.key}
-            if notice.value.lane == "poll":
-                self._reload_records()
             return True, selected
         elif notice.kind == "local_reply":
             if not isinstance(notice.value, str) or re.fullmatch(r"[0-9a-f]{64}", notice.value) is None:
@@ -1053,7 +1188,7 @@ class _Runtime:
             for key, (_, record) in self.records.items():
                 ack = as_mapping(record.get("ack", {}), "ack")
                 retry = ack.get("next_retry_at")
-                if ack.get("state") == "pending" and (
+                if ack.get("state") == "pending" and ("ack", key) not in self.jobs and (
                     not isinstance(retry, str) or _timestamp(retry) <= wall
                 ):
                     due.add(key)
@@ -1063,12 +1198,7 @@ class _Runtime:
             for key in self._ordered_record_keys(now):
                 if capacity <= 0:
                     break
-                record = self.records[key][1]
-                retry = self.retry.get(("send", key))
-                if (self.pending_by_key.get(key) and ("send", key) not in self.jobs
-                        and record.get("phase") in (
-                            "awaiting_reply", "delivery_uncertain", "reply_pending", "replied")
-                        and (retry is None or now >= retry[0])):
+                if self._send_ready(key, now):
                     due.add(key)
                     capacity -= 1
         return due
@@ -1096,12 +1226,14 @@ class _Runtime:
                       or sum(lane == "send" for lane, _ in self.jobs) >= 2)
         if not sends_full:
             for key in self._ordered_record_keys(now):
-                if self.pending_by_key.get(key) and ("send", key) not in self.jobs:
+                if self._send_candidate(key):
                     deadline = self.retry.get(("send", key), (now, 1))[0]
                     candidates.append(max(now, deadline))
-                    break
         for job, (deadline, _) in self.retry.items():
-            if job not in self.jobs and not (job[0] == "send" and sends_full):
+            # Send retries are covered above only while their durable request is
+            # actually sendable. A stale retry must not turn a queued request
+            # into a zero-timeout service loop.
+            if job[0] != "send" and job not in self.jobs:
                 candidates.append(max(now, deadline))
         for observer in (self.input_observer, self.output_observer):
             if observer.next_write is not None:
@@ -1152,7 +1284,7 @@ class _Runtime:
                 if due:
                     needs_stage = True
                     keys.update(due)
-                if any(now >= deadline and job not in self.jobs
+                if any(job[0] != "send" and now >= deadline and job not in self.jobs
                        for job, (deadline, _) in self.retry.items()):
                     needs_stage = True
                 if (self.reconcile_requested or now >= self.next_poll or

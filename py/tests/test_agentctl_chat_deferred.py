@@ -49,6 +49,7 @@ def _pending_reply(state: Path) -> Iterator[tuple[_Runtime, dict[str, object]]]:
         yield runtime, _message(_SPACE + "/messages/echo", text=runtime._outbound_text(reply))
     finally:
         runtime.stop.set()
+        runtime.local.close()
         for pool in runtime.pools.values():
             pool.shutdown(wait=True, cancel_futures=True)
 

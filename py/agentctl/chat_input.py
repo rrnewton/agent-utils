@@ -149,6 +149,7 @@ class EventCommandStream:
         os.close(probe_pidfd)
         self._max_frame = max_frame_bytes
         self._buffer = bytearray()
+        self._buffer_start = 0
         self._process: subprocess.Popen[bytes] | None = None
         self._stdin: IO[bytes] | None = None
         self._stdout: IO[bytes] | None = None
@@ -382,6 +383,13 @@ class EventCommandStream:
         pipe = self._stdout
         if pipe is None:
             raise InputStreamError("stream_closed", "the event command output is closed")
+        # Consumed frames retain a head offset so a burst of tiny frames does
+        # not shift the remaining bytearray once per wait call. Compact once
+        # before the next read, when those bytes would otherwise consume the
+        # per-frame capacity.
+        if self._buffer_start:
+            del self._buffer[:self._buffer_start]
+            self._buffer_start = 0
         capacity = self._max_frame + 1 - len(self._buffer)
         if capacity <= 0:
             raise InputStreamError("frame_limit_exceeded", "event frame exceeds the byte limit")
@@ -391,7 +399,7 @@ class EventCommandStream:
             return
         if not chunk:
             detail = "the event command closed its output"
-            if self._buffer:
+            if len(self._buffer) > self._buffer_start:
                 detail += " in the middle of a frame"
             raise InputStreamError("stream_eof", detail)
         self._buffer.extend(chunk)
@@ -429,7 +437,8 @@ class EventCommandStream:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise InputStreamError("subscription_timeout", "event command did not accept its subscription request")
-            readers = self._readers(include_stdout=b"\n" not in self._buffer)
+            readers = self._readers(
+                include_stdout=self._buffer.find(b"\n", self._buffer_start) < 0)
             try:
                 readable, writable = _wait_fds(readers, (pipe.fileno(),), remaining)
             except InterruptedError:
@@ -448,14 +457,23 @@ class EventCommandStream:
     def _next_frame(self, deadline: float) -> bytes | None:
         polled = False
         while True:
-            newline = self._buffer.find(b"\n")
+            newline = self._buffer.find(b"\n", self._buffer_start)
             if newline >= 0:
-                if newline > self._max_frame:
+                if newline - self._buffer_start > self._max_frame:
                     raise InputStreamError("frame_limit_exceeded", "event frame exceeds the byte limit")
-                frame = bytes(self._buffer[:newline])
-                del self._buffer[:newline + 1]
+                frame = bytes(self._buffer[self._buffer_start:newline])
+                self._buffer_start = newline + 1
+                if self._buffer_start == len(self._buffer):
+                    self._buffer.clear()
+                    self._buffer_start = 0
+                elif (self._buffer_start >= 65536
+                      and self._buffer_start * 2 >= len(self._buffer)):
+                    # Geometric compaction makes total copied bytes linear in
+                    # the input size even for one-byte frames.
+                    del self._buffer[:self._buffer_start]
+                    self._buffer_start = 0
                 return frame
-            if len(self._buffer) > self._max_frame:
+            if len(self._buffer) - self._buffer_start > self._max_frame:
                 raise InputStreamError("frame_limit_exceeded", "event frame exceeds the byte limit")
             if self._child_exited():
                 # Deliver complete output already written by the command, but
@@ -467,7 +485,7 @@ class EventCommandStream:
                     self._read_stdout()
                     continue
                 detail = "the event command exited"
-                if self._buffer:
+                if len(self._buffer) > self._buffer_start:
                     detail += " in the middle of a frame"
                 raise InputStreamError("stream_eof", detail)
             remaining = max(0.0, deadline - time.monotonic())
@@ -708,5 +726,6 @@ class EventCommandStream:
                         pipe.close()
                 self._stdin = self._stdout = self._stderr = None
                 self._buffer.clear()
+                self._buffer_start = 0
                 self._wake_read.close()
                 self._wake_write.close()

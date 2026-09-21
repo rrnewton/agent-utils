@@ -115,6 +115,10 @@ _MAX_TARGET_FIELD_BYTES = 512
 _MAX_PATH_BYTES = 4096
 _MAX_LAUNCH_LOG_SEGMENT_BYTES = 1 << 20
 _MAX_LEGACY_REPLY_BYTES = _MAX_STATE_REPLY_BYTES
+_RFC3339_TIMESTAMP = re.compile(
+    r"(?P<day>\d{4}-\d{2}-\d{2})[Tt](?P<clock>\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?(?P<zone>[Zz]|[+-]\d{2}:\d{2})\Z"
+)
 
 _REQUEST_REQUIRED_FIELDS = frozenset({
     "key", "message", "phase", "queue_id", "request_id", "received_at",
@@ -201,10 +205,20 @@ def _utc() -> str:
 def _timestamp(value: str) -> datetime:
     if len(value.encode("utf-8")) > _MAX_TIMESTAMP_BYTES:
         raise ValueError(f"chat timestamps must not exceed {_MAX_TIMESTAMP_BYTES} UTF-8 bytes")
-    result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if result.tzinfo is None:
-        raise ValueError("chat timestamps must include a timezone")
-    return result
+    match = _RFC3339_TIMESTAMP.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            "chat timestamps must be RFC3339 with a timezone and at most nine fractional digits"
+        )
+    zone = match["zone"]
+    if zone.lower() == "z":
+        zone = "+00:00"
+    fraction = match["fraction"]
+    # datetime stores microseconds. Truncate the provider's optional nanoseconds
+    # explicitly so Python 3.10 and newer runtimes accept and compare them alike.
+    microsecond = int((fraction or "").ljust(6, "0")[:6])
+    result = datetime.fromisoformat(f"{match['day']}T{match['clock']}{zone}")
+    return result.replace(microsecond=microsecond)
 
 
 def _private(directory: Path) -> None:
@@ -2266,7 +2280,7 @@ class Bridge:
         self, result: dict[str, object], checkpoint: dict[str, object] | None = None,
         records: Sequence[dict[str, object]] | None = None,
         own_replies: set[object] | None = None,
-    ) -> None:
+    ) -> list[tuple[Path, dict[str, object]]]:
         known_replies = set() if own_replies is None else own_replies
         # Recompute from the caller's already-loaded snapshot, or from one
         # bounded disk pass for polling callers. Request records can grow as
@@ -2282,6 +2296,9 @@ class Bridge:
         known_keys = ({get_str(record, "key", "request") for record in records}
                       if records is not None else {
                           path.stem for path in (self.state / "requests").glob("*.json")})
+        caller_known_keys = set(known_keys)
+        admitted: list[tuple[Path, dict[str, object]]] = []
+        admitted_keys: set[str] = set()
         planned_keys: dict[str, str] = {}
         planned: list[tuple[Path, dict[str, object], int, int]] = []
         saved = checkpoint if checkpoint is not None else _read(self.state / "bridge.json")
@@ -2327,6 +2344,9 @@ class Bridge:
                         "encoded_bytes": durable_usage["encoded_bytes"]
                         + sum(item_bytes for _, _, _, item_bytes in planned),
                     }
+                if key not in caller_known_keys and key not in admitted_keys:
+                    admitted.append((path, existing))
+                    admitted_keys.add(key)
                 continue
             record: dict[str, object] = {"key": key, "message": message, "phase": "received",
                                         "queue_id": f"{int(created.timestamp() * 1_000_000):020d}-{key}",
@@ -2384,8 +2404,9 @@ class Bridge:
             self._request_usage = None
             self._request_encoded_sizes = None
             raise
+        admitted.extend((path, record) for path, record, _, _ in planned)
         if checkpoint is None:
-            return
+            return admitted
         original_checkpoint = dict(checkpoint)
         checkpoint.update(cursor=cursor or None, high_water=high.isoformat().replace("+00:00", "Z"))
         if not cursor:
@@ -2394,6 +2415,7 @@ class Bridge:
             checkpoint["after"] = (high - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
         if checkpoint != original_checkpoint:
             _write(self.state / "bridge.json", checkpoint)
+        return admitted
 
     def _ack_record(self, message: str, *, completed_legacy: bool = False) -> dict[str, object]:
         disabled = (self.config.outbound_mode == "disabled"

@@ -19,7 +19,7 @@ import pytest
 
 import agentctl.chat as chat_module
 from agentctl.agent import Target
-from agentctl.chat import Bridge, Config, GoogleChatTransport, _read, _write, run_cli
+from agentctl.chat import Bridge, Config, GoogleChatTransport, _read, _timestamp, _write, run_cli
 from agentctl.jsonx import as_mapping, as_sequence
 
 
@@ -260,6 +260,24 @@ class Http:
         assert timeout == 45
         self.requests.append(request)
         return io.BytesIO(json.dumps(self.document).encode())
+
+
+@pytest.mark.parametrize(("stamp", "microsecond"), [
+    ("2026-01-02T00:00:00.1Z", 100_000),
+    ("2026-01-02T00:00:00.123456Z", 123_456),
+    ("2026-01-02T01:00:00.123456789+01:00", 123_456),
+])
+def test_chat_timestamp_accepts_rfc3339_fraction_precision_on_minimum_python(
+    stamp: str, microsecond: int,
+) -> None:
+    parsed = _timestamp(stamp)
+    assert parsed.microsecond == microsecond
+    assert parsed.tzinfo is not None
+
+
+def test_chat_timestamp_refuses_more_than_rfc3339_nanosecond_precision() -> None:
+    with pytest.raises(ValueError, match="at most nine fractional digits"):
+        _timestamp("2026-01-02T00:00:00.1234567890Z")
 
 
 @pytest.mark.parametrize("action", ["poll", "context"])

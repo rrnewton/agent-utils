@@ -440,9 +440,9 @@ def test_command_success_preserves_leader_response_and_terminates_descendants(
         if close_stdio else "import time; time.sleep(60)"
     )
     script = (
-        "import pathlib,subprocess,sys; "
-        "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "import os,pathlib,sys; "
+        "child=os.posix_spawn(sys.executable,[sys.executable,'-c',sys.argv[2]],os.environ); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child)); "
         "print('leader response',flush=True)"
     )
     started = time.monotonic()
@@ -552,9 +552,9 @@ def test_command_supervisor_preserves_status_and_teardown_signals_with_default_s
     chat_module._require_waitable_sigchld_children("command status regression")
     pid_path = tmp_path / "default-signal-child"
     script = (
-        "import os,pathlib,signal,subprocess,sys; "
-        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "import os,pathlib,signal,sys; "
+        "child=os.posix_spawn(sys.executable,[sys.executable,'-c','import time; time.sleep(60)'],os.environ); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child)); "
         "print('signal-safe',flush=True); "
         "print('signal-stderr',file=sys.stderr,flush=True); "
         "code=int(sys.argv[2]); "
@@ -891,9 +891,9 @@ time.sleep(60)
 def test_command_failure_preserves_leader_result_and_terminates_descendant(tmp_path: Path) -> None:
     pid_path = tmp_path / "child.pid"
     script = (
-        "import pathlib,subprocess,sys; "
-        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "import os,pathlib,sys; "
+        "child=os.posix_spawn(sys.executable,[sys.executable,'-c','import time; time.sleep(60)'],os.environ); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child)); "
         "print('failure detail',file=sys.stderr,flush=True); sys.exit(7)"
     )
     started = time.monotonic()

@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import IO, cast
+from typing import IO, SupportsIndex, cast
 
 import pytest
 
@@ -90,6 +90,34 @@ def test_timeout_preserves_a_split_frame_and_zero_timeout_reads_buffered_frames(
         release.touch()
         assert stream.wait(5) == [{"type": "message", "message": {"text": "complete"}}]
         assert stream.wait(0) == [{"type": "checkpoint", "cursor": "done"}]
+    finally:
+        stream.close()
+
+
+def test_many_tiny_buffered_frames_advance_a_head_without_front_deletion() -> None:
+    count = 2048
+    stream = _stream(f"os.write(1,b'{{}}\\n'*{count})\ntime.sleep(60)\n")
+
+    class CountedBuffer(bytearray):
+        deletions = 0
+
+        def __delitem__(
+            self,
+            key: SupportsIndex | slice[
+                SupportsIndex | None, SupportsIndex | None, SupportsIndex | None],
+        ) -> None:
+            self.deletions += 1
+            super().__delitem__(key)
+
+    try:
+        assert stream.wait(5) == [{}]
+        assert len(stream._buffer) - stream._buffer_start >= (count - 1) * 3
+        tracked = CountedBuffer(stream._buffer)
+        stream._buffer = tracked
+        for _ in range(count - 1):
+            assert stream.wait(0) == [{}]
+        assert tracked.deletions == 0, "tiny frames must not shift the remaining buffer"
+        assert stream._buffer_start == 0 and not stream._buffer
     finally:
         stream.close()
 
@@ -840,6 +868,9 @@ time.sleep(60)
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+        assert process.stdout is not None and process.stderr is not None
+        process.stdout.close()
+        process.stderr.close()
 
 
 def test_repeated_supervised_streams_leave_no_descriptors_or_processes() -> None:

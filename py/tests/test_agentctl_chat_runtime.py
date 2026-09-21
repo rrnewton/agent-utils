@@ -26,7 +26,7 @@ from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutput
 from agentctl.chat_runtime import _Completion, _Notice, _Runtime
 from agentctl.client import AgentPaneInfo
 from agentctl.errors import AgentDeliveryError
-from agentctl.jsonx import as_mapping, as_sequence
+from agentctl.jsonx import as_mapping, as_sequence, get_str
 from tests.test_herdr_chat import Harness
 
 
@@ -423,6 +423,223 @@ def test_reconcile_error_then_success_clears_error_and_persists_completion(
     assert saved["reconcile_error"] is None
     assert saved["reconciled_at"] == completed
     assert len(writes) == 2, "error and successful completion each write at most once"
+
+
+def test_nonterminal_reconcile_page_is_not_reported_complete(rig: Rig) -> None:
+    first = "2026-01-02T00:05:00Z"
+    needed, selected = rig.runtime._handle(_Notice("complete", _Completion(
+        "poll", "page", {"messages": [_message()], "cursor": "page-two"}, None, first)))
+    assert needed and selected == {_key()}
+    assert rig.runtime.input_state.get("reconciled_at") is None
+    assert rig.runtime.input_state.get("reconcile_error") is None
+    assert _read(rig.state / "bridge.json")["cursor"] == "page-two"
+    assert _key() in rig.runtime.records
+
+    completed = "2026-01-02T00:06:00Z"
+    needed, selected = rig.runtime._handle(_Notice("complete", _Completion(
+        "poll", "page", {"messages": [], "cursor": None}, None, completed)))
+    assert needed and selected == set()
+    assert rig.runtime.input_state["reconciled_at"] == completed
+    assert rig.runtime.input_state["reconcile_error"] is None
+
+
+def test_repeated_poll_cursor_refuses_page_before_intake_and_backs_off(rig: Rig) -> None:
+    rig.runtime._handle(_Notice("complete", _Completion(
+        "poll", "page", {"messages": [_message("one")], "cursor": "loop"}, None,
+        "2026-01-02T00:05:00Z")))
+    checkpoint = (rig.state / "bridge.json").read_bytes()
+    needed, selected = rig.runtime._handle(_Notice("complete", _Completion(
+        "poll", "page", {"messages": [_message("two")], "cursor": "loop"}, None,
+        "2026-01-02T00:05:01Z")))
+    assert needed and selected == set()
+    assert (rig.state / "bridge.json").read_bytes() == checkpoint
+    assert not (rig.state / "requests" / f"{_key('two')}.json").exists()
+    assert rig.runtime.reconcile_window is None and rig.runtime.reconcile_requested
+    retry_at, delay = rig.runtime.retry[("poll", "page")]
+    assert retry_at > time.monotonic() and delay == 1
+    assert "repeated a reconciliation cursor" in str(
+        rig.runtime.input_state["reconcile_error"])
+    assert rig.runtime.input_state.get("reconciled_at") is None
+
+
+@pytest.mark.parametrize("budget", ["pages", "time"])
+def test_nonterminal_reconcile_page_stops_at_page_or_time_budget(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, budget: str,
+) -> None:
+    if budget == "pages":
+        monkeypatch.setattr(runtime_module, "_MAX_RECONCILE_PAGES", 1)
+    else:
+        rig.runtime.reconcile_window = runtime_module._ReconcileWindow(
+            started_at=time.monotonic() - runtime_module._MAX_RECONCILE_SECONDS - 1,
+            pages=0, cursors=set())
+    needed, selected = rig.runtime._handle(_Notice("complete", _Completion(
+        "poll", "page", {"messages": [_message()], "cursor": "more"}, None,
+        "2026-01-02T00:05:00Z")))
+    assert needed and selected == {_key()}
+    assert _read(rig.state / "bridge.json")["cursor"] == "more"
+    assert _key() in rig.runtime.records
+    assert rig.runtime.reconcile_window is None and rig.runtime.reconcile_requested
+    assert ("poll", "page") in rig.runtime.retry
+    assert f"reconciliation {budget[:-1] if budget == 'pages' else budget} budget" in str(
+        rig.runtime.input_state["reconcile_error"])
+    assert rig.runtime.input_state.get("reconciled_at") is None
+
+
+def test_poll_pages_admit_only_new_records_without_full_recovery_io(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = 64
+    rig.bridge._ingest_result({
+        "messages": [_message(f"old-{index}") for index in range(baseline)]})
+    rig.runtime._reload_records()
+    reads: list[Path] = []
+    original_read = rig.bridge._read_bounded_record
+
+    def read(path: Path) -> tuple[dict[str, object], int]:
+        reads.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(rig.bridge, "_read_bounded_record", read)
+    monkeypatch.setattr(rig.runtime, "_reload_records", lambda: (_ for _ in ()).throw(
+        AssertionError("a poll page performed full request recovery")))
+    for index in range(5):
+        cursor = None if index == 4 else f"page-{index + 1}"
+        needed, selected = rig.runtime._handle(_Notice("complete", _Completion(
+            "poll", "page", {
+                "messages": [_message(f"new-{index}")], "cursor": cursor,
+            }, None, f"2026-01-02T00:05:0{index}Z")))
+        assert needed and selected == {_key(f"new-{index}")}
+    assert len(rig.runtime.records) == baseline + 5
+    assert reads == [
+        rig.state / "requests" / f"{_key(f'new-{index}')}.json"
+        for index in range(5)
+    ]
+    staged: list[str] = []
+
+    def stage_one(
+        path: Path, record: dict[str, object], now: float,
+    ) -> tuple[bool, tuple[str, str] | None]:
+        staged.append(get_str(record, "key", "request"))
+        return False, None
+
+    monkeypatch.setattr(rig.runtime, "_stage_request", stage_one)
+    rig.runtime._stage(selected)
+    assert staged == [_key("new-4")]
+
+
+def test_incrementally_admitted_poll_request_still_delivers_and_acks(rig: Rig) -> None:
+    _, selected = rig.runtime._handle(_Notice("complete", _Completion(
+        "poll", "page", {"messages": [_message()], "cursor": None}, None,
+        "2026-01-02T00:05:00Z")))
+    assert selected == {_key()}
+    rig.runtime._stage(selected)
+    rig.until(lambda: rig.phase() == "awaiting_reply"
+              and rig.ack() == "acked" and not rig.runtime.jobs)
+    assert len(rig.harness.prompts) == 1
+
+
+@pytest.mark.parametrize("ambiguous_write", ["request", "checkpoint"])
+def test_poll_write_then_error_immediately_recovers_durable_intake(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, ambiguous_write: str,
+) -> None:
+    original_write = chat_module._write
+    injected = False
+
+    def write(path: Path, document: dict[str, object]) -> None:
+        nonlocal injected
+        original_write(path, document)
+        target = (path.parent == rig.state / "requests" if ambiguous_write == "request"
+                  else path == rig.state / "bridge.json")
+        if target and not injected:
+            injected = True
+            raise OSError(f"ambiguous {ambiguous_write} fsync")
+
+    monkeypatch.setattr(chat_module, "_write", write)
+    needed, selected = rig.runtime._handle(_Notice("complete", _Completion(
+        "poll", "page", {"messages": [_message()], "cursor": "next"}, None,
+        "2026-01-02T00:05:00Z")))
+    assert injected and needed and selected is None
+    assert _key() in rig.runtime.records
+    assert (rig.state / "requests" / f"{_key()}.json").exists()
+    assert _read(rig.state / "bridge.json")["cursor"] == (
+        "next" if ambiguous_write == "checkpoint" else None)
+
+    _, delay = rig.runtime.retry[("poll", "page")]
+    rig.runtime.retry[("poll", "page")] = (float("inf"), delay)
+    rig.runtime._stage(selected)
+    rig.until(lambda: rig.phase() == "awaiting_reply"
+              and rig.ack() == "acked" and not rig.runtime.jobs)
+    assert len(rig.harness.prompts) == 1
+
+
+def test_later_incremental_admission_error_recovers_and_stages_entire_page(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_read = rig.bridge._read_bounded_record
+    reads = 0
+
+    def read(path: Path) -> tuple[dict[str, object], int]:
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise OSError("second incremental admission failed")
+        return original_read(path)
+
+    monkeypatch.setattr(rig.bridge, "_read_bounded_record", read)
+    needed, selected = rig.runtime._handle(_Notice("complete", _Completion(
+        "poll", "page", {
+            "messages": [_message("one"), _message("two")], "cursor": None,
+        }, None, "2026-01-02T00:05:00Z")))
+    assert needed and selected is None and reads >= 4
+    assert set(rig.runtime.records) == {_key("one"), _key("two")}
+    _, delay = rig.runtime.retry[("poll", "page")]
+    rig.runtime.retry[("poll", "page")] = (float("inf"), delay)
+    rig.runtime._stage(selected)
+    rig.until(lambda: all(rig.phase(name) == "awaiting_reply" for name in ("one", "two"))
+              and all(rig.ack(name) == "acked" for name in ("one", "two"))
+              and not rig.runtime.jobs)
+    assert len(rig.harness.prompts) == 2
+
+
+def test_failed_authoritative_poll_recovery_propagates_before_cursor_can_continue(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_write = chat_module._write
+    checkpoint_failed = False
+
+    def write(path: Path, document: dict[str, object]) -> None:
+        nonlocal checkpoint_failed
+        original_write(path, document)
+        if path == rig.state / "bridge.json" and not checkpoint_failed:
+            checkpoint_failed = True
+            raise OSError("ambiguous checkpoint fsync")
+
+    original_read = rig.bridge._read_bounded_record
+    recovery_failed = False
+
+    def read(path: Path) -> tuple[dict[str, object], int]:
+        nonlocal recovery_failed
+        if not recovery_failed:
+            recovery_failed = True
+            raise OSError("authoritative recovery failed")
+        return original_read(path)
+
+    monkeypatch.setattr(chat_module, "_write", write)
+    monkeypatch.setattr(rig.bridge, "_read_bounded_record", read)
+    with pytest.raises(OSError, match="authoritative recovery failed"):
+        rig.runtime._handle(_Notice("complete", _Completion(
+            "poll", "page", {"messages": [_message()], "cursor": "next"}, None,
+            "2026-01-02T00:05:00Z")))
+    assert checkpoint_failed and recovery_failed
+    assert _read(rig.state / "bridge.json")["cursor"] == "next"
+    assert (rig.state / "requests" / f"{_key()}.json").exists()
+    assert _key() not in rig.runtime.records
+    assert rig.runtime.input_state.get("reconciled_at") is None
+
+    # A restarted owner performs the same startup authority scan before it can
+    # consume another cursor or publish healthy reconciliation state.
+    rig.runtime._reload_records()
+    assert _key() in rig.runtime.records
 
 
 def test_input_pump_filters_unchanged_heartbeats_before_owner_mailbox(
@@ -1438,6 +1655,93 @@ def test_full_worker_lanes_do_not_create_zero_timeout_retry_spin(rig: Rig) -> No
     now = time.monotonic()
     assert rig.runtime._due_keys(now) == set()
     assert rig.runtime._next_deadline() > now + 250
+
+
+def test_reply_captured_before_prompt_delivery_does_not_create_zero_timeout_spin(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig.bridge._ingest_result({"messages": [_message()]})
+    path = rig.state / "requests" / f"{_key()}.json"
+    record = _read(path)
+    record["phase"] = "queued"
+    ack = as_mapping(record["ack"], "ack")
+    ack.update(state="acked", reaction_id=_SPACE + "/messages/one/reactions/robot",
+               acked_at="2026-01-02T00:00:01Z", error=None, next_retry_at=None)
+    record["ack"] = ack
+    text = "Captured while the coordinator pane is still busy"
+    reply = {
+        "reply_key": "0",
+        "request_id": rig.bridge._reply_identity(record, 0),
+        "reply_source": "capture", "reply_ordinal": 1, "text": text,
+    }
+    durable, created = rig.bridge._create_reply_item(record, 0, reply)
+    assert created and durable == reply
+    size = len(text.encode())
+    record.update(reply_item_count=1, reply_sent_count=0,
+                  reply_total_bytes=size, reply_pending_bytes=size,
+                  reply_next_ordinal=2)
+    _write(path, record)
+    rig.runtime._reload_records()
+    rig.runtime.reconcile_requested = False
+    rig.runtime.next_poll = float("inf")
+    rig.runtime.next_recovery = time.monotonic() + 300
+    rig.runtime.retry[("send", _key())] = (0, 1)
+    started: list[str] = []
+    monkeypatch.setattr(
+        rig.runtime, "_send_start",
+        lambda _path, saved, _reply: started.append(str(saved["key"])),
+    )
+
+    now = time.monotonic()
+    assert rig.runtime._due_keys(now) == set()
+    rig.runtime._stage({_key()})
+    assert started == []
+    assert rig.runtime._next_deadline() > now + 250
+
+    rig.runtime.records[_key()][1]["phase"] = "awaiting_reply"
+    ready = time.monotonic()
+    assert rig.runtime._due_keys(ready) == {_key()}
+    assert rig.runtime._next_deadline() - ready < 0.1
+    rig.runtime._stage({_key()})
+    assert started == [_key()]
+
+
+def test_send_deadline_uses_earliest_eligible_retry_not_record_order(rig: Rig) -> None:
+    for name in ("one", "two"):
+        rig.bridge._ingest_result({"messages": [_message(name)]})
+        path = rig.state / "requests" / f"{_key(name)}.json"
+        record = _read(path)
+        record["phase"] = "awaiting_reply"
+        ack = as_mapping(record["ack"], "ack")
+        ack.update(state="acked", reaction_id=None, acked_at="2026-01-02T00:00:01Z",
+                   error=None, next_retry_at=None)
+        record["ack"] = ack
+        text = f"pending {name}"
+        reply = {
+            "reply_key": "0",
+            "request_id": rig.bridge._reply_identity(record, 0),
+            "reply_source": "capture", "reply_ordinal": 1, "text": text,
+        }
+        durable, created = rig.bridge._create_reply_item(record, 0, reply)
+        assert created and durable == reply
+        size = len(text.encode())
+        record.update(reply_item_count=1, reply_sent_count=0,
+                      reply_total_bytes=size, reply_pending_bytes=size,
+                      reply_next_ordinal=2)
+        _write(path, record)
+    rig.runtime._reload_records()
+    rig.runtime.reconcile_requested = False
+    rig.runtime.next_poll = float("inf")
+    rig.runtime.next_recovery = time.monotonic() + 300
+
+    now = time.monotonic()
+    later = now + 60
+    earlier = now + 1
+    assert set(rig.runtime.record_order) == {_key("one"), _key("two")}
+    late_key, early_key = rig.runtime.record_order
+    rig.runtime.retry[("send", late_key)] = (later, 60)
+    rig.runtime.retry[("send", early_key)] = (earlier, 1)
+    assert rig.runtime._next_deadline() == earlier
 
 
 @pytest.mark.parametrize("completed_index", [0, 1], ids=("first-slot", "second-slot"))
