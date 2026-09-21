@@ -214,11 +214,16 @@ delivery phases, ACK retry state, capture errors, and observer state. The first
 observed state is durable immediately. Later connection/error flaps are
 coalesced, and the latest state is saved after at most 60 seconds by default.
 `--observer-write-interval` accepts 60–3600 seconds for both `run` and `launch`.
-It is a hard minimum between advisory state writes, not a heartbeat: unchanged
-input and output state causes no write. Each completed REST reconciliation advances
-`reconciled_at` through this coalescing observer. Completions outside the write
-interval are durable immediately; completions inside it retain the latest timestamp
-for the next deadline. Input cursor advances remain immediately
+It is a hard minimum between advisory state writes, not a poll-frequency
+heartbeat: unchanged input and output state causes no write. Each completed REST
+reconciliation advances the in-memory `reconciled_at` diagnostic. The first
+success and then at most one quiet success per monotonic hour run the
+staged+intent publisher; after a restart, the durable `updated_at` anchors the
+remaining delay, and a future anchor caused by a backward clock step waits a
+full monotonic hour. The next necessary state or cursor write also folds in the
+latest completion. Reconciliation error flaps are coalesced like other advisory state,
+so disk records the latest net state after the write deadline rather than every
+transient edge. Input cursor advances remain immediately
 durable regardless of this interval. Use the service supervisor for process
 liveness; `updated_at` records the latest persisted state transition. Older
 releases could save longer observer errors. A compatible file within the 8 KiB

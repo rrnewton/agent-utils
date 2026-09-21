@@ -38,6 +38,7 @@ from agentctl.jsonx import as_mapping, as_sequence, get_str
 
 _MAX_RECONCILE_PAGES = 64
 _MAX_RECONCILE_SECONDS = 60.0
+_RECONCILE_HEALTH_WRITE_INTERVAL = 3600.0
 _SENDABLE_REPLY_PHASES = frozenset({
     "awaiting_reply", "delivery_uncertain", "reply_pending", "replied",
 })
@@ -72,9 +73,12 @@ class _InputObserver:
         self.path = path
         self.document = document
         self.write_interval = write_interval
+        self.reconcile_health_write_interval = _RECONCILE_HEALTH_WRITE_INTERVAL
         self._persisted = self._logical(document)
+        self._persisted_reconciled_at = document.get("reconciled_at")
         self._pending = False
         self._next_write: float | None = None
+        self._next_health_write: float | None = None
         updated_at = document.get("updated_at")
         if path.exists() and isinstance(updated_at, str):
             try:
@@ -82,11 +86,28 @@ class _InputObserver:
             except (TypeError, ValueError):
                 age = write_interval
             self._next_write = time.monotonic() + max(0.0, write_interval - max(0.0, age))
+            if self._valid_reconciled_at(self._persisted_reconciled_at):
+                # A future durable anchor means the wall clock moved backward.
+                # Wait a full monotonic interval rather than allowing clock
+                # oscillation to turn each reconciliation into a disk write.
+                health_age = max(0.0, age)
+                self._next_health_write = time.monotonic() + max(
+                    0.0, self.reconcile_health_write_interval - health_age)
 
     @staticmethod
-    def _logical(document: dict[str, object]) -> tuple[object, object, object, object]:
+    def _valid_reconciled_at(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        try:
+            _timestamp(value)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _logical(document: dict[str, object]) -> tuple[object, object, object]:
         return (document.get("state"), document.get("error"),
-                document.get("reconcile_error"), document.get("reconciled_at"))
+                document.get("reconcile_error"))
 
     @property
     def next_write(self) -> float | None:
@@ -98,19 +119,39 @@ class _InputObserver:
         self.document.clear()
         self.document.update(saved)
         self._persisted = self._logical(self.document)
+        self._persisted_reconciled_at = self.document.get("reconciled_at")
         self._pending = False
         self._next_write = now + self.write_interval
+        self._next_health_write = (
+            now + self.reconcile_health_write_interval
+            if self._valid_reconciled_at(self._persisted_reconciled_at)
+            else None)
 
     def status(self, **fields: object) -> bool:
         candidate = dict(self.document)
         candidate.update(fields)
         logical = self._logical(candidate)
+        now = time.monotonic()
+        if not self.path.exists():
+            self._persist(candidate, now)
+            return True
+        reconciled_at = candidate.get("reconciled_at")
+        health_changed = reconciled_at != self._persisted_reconciled_at
+        if (health_changed and self._valid_reconciled_at(reconciled_at)
+                and (self._next_health_write is None or now >= self._next_health_write)):
+            # First successful health must survive a crash even when it also
+            # clears a recently persisted reconciliation error. Later due
+            # health writes likewise fold any pending advisory state.
+            self._persist(candidate, now)
+            return True
         if logical == self._persisted:
+            if health_changed and not self._valid_reconciled_at(reconciled_at):
+                self._persist(candidate, now)
+                return True
             self.document.update(fields)
             self._pending = False
             return False
-        now = time.monotonic()
-        if not self.path.exists() or self._next_write is None or now >= self._next_write:
+        if self._next_write is None or now >= self._next_write:
             self._persist(candidate, now)
             return True
         self.document.update(fields)

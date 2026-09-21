@@ -349,7 +349,135 @@ def test_input_heartbeats_do_not_write_and_cursor_advances_remain_immediate(
     assert len(writes) == 2 and writes[-1]["error"] == "permission denied"
 
 
-def test_completed_reconciliations_persist_latest_timestamp_without_heartbeat_writes(
+def test_quiet_reconciliation_has_monotonic_hourly_not_poll_frequency_writes(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[dict[str, object]] = []
+    original = _write
+
+    def write(path: Path, document: dict[str, object]) -> None:
+        if path == rig.state / "input.json":
+            writes.append(dict(document))
+        original(path, document)
+
+    monkeypatch.setattr(runtime_module, "_write", write)
+    monotonic = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: monotonic[0])
+    rig.runtime._handle(_Notice("input_connected"))
+    assert len(writes) == 1
+    first = "2026-01-02T00:05:00Z"
+    rig.runtime.input_observer._next_write = 0
+    rig.runtime._complete(_Completion(
+        "poll", "page", {"messages": [], "cursor": None}, None, first))
+    assert len(writes) == 2
+    assert _read(rig.state / "input.json")["reconciled_at"] == first
+
+    latest = first
+    # Event timestamps deliberately cross the wall-clock boundary backward and
+    # forward. They must not control the monotonic disk-write cadence.
+    for offset, latest in enumerate((
+        "2026-01-02T01:05:00Z",
+        "2026-01-02T00:10:00Z",
+        "2026-01-02T01:10:00Z",
+        "2026-01-02T00:15:00Z",
+    ), start=1):
+        monotonic[0] = 100.0 + offset * 300.0
+        # Make every completion eligible under the ordinary observer interval.
+        # The separate monotonic health deadline must still suppress it.
+        rig.runtime.input_observer._next_write = 0
+        rig.runtime._complete(_Completion(
+            "poll", "page", {"messages": [], "cursor": None}, None, latest))
+    assert len(writes) == 2
+    assert rig.runtime.input_state["reconciled_at"] == latest
+    assert _read(rig.state / "input.json")["reconciled_at"] == first
+
+    monotonic[0] = 3699.999
+    rig.runtime._complete(_Completion(
+        "poll", "page", {"messages": [], "cursor": None}, None,
+        "2026-01-01T23:59:00Z"))
+    assert len(writes) == 2
+
+    next_hour = "2026-01-02T00:20:00Z"
+    monotonic[0] = 3700.0
+    rig.runtime._complete(_Completion(
+        "poll", "page", {"messages": [], "cursor": None}, None, next_hour))
+    assert len(writes) == 3
+    assert _read(rig.state / "input.json")["reconciled_at"] == next_hour
+
+    folded = "2026-01-02T01:05:00Z"
+    rig.runtime._complete(_Completion(
+        "poll", "page", {"messages": [], "cursor": None}, None, folded))
+    rig.runtime.input_observer._next_write = 0
+    rig.runtime._handle(_Notice("input_error", "socket unavailable"))
+    assert len(writes) == 4
+    state_saved = _read(rig.state / "input.json")
+    assert state_saved["error"] == "socket unavailable"
+    assert state_saved["reconciled_at"] == folded
+
+    rig.runtime._input_event({"type": "checkpoint", "cursor": "durable-one"})
+    assert len(writes) == 5
+    saved = _read(rig.state / "input.json")
+    assert saved["cursor"] == "durable-one"
+    assert saved["reconciled_at"] == folded
+
+
+def test_missing_input_state_is_repaired_by_unchanged_status(rig: Rig) -> None:
+    rig.runtime._handle(_Notice("input_connected"))
+    completed = "2026-01-02T00:05:00Z"
+    rig.runtime._complete(_Completion(
+        "poll", "page", {"messages": [], "cursor": None}, None, completed))
+    rig.runtime._input_event({"type": "checkpoint", "cursor": "durable-one"})
+    rig.runtime.input_observer._next_write = 0
+    rig.runtime._handle(_Notice("input_error", "socket unavailable"))
+    (rig.state / "input.json").unlink()
+    assert rig.runtime.input_observer.status(state="retrying", error="socket unavailable")
+    repaired = _read(rig.state / "input.json")
+    assert repaired["state"] == "retrying"
+    assert repaired["error"] == "socket unavailable"
+    assert repaired["cursor"] == "durable-one"
+    assert repaired["reconciled_at"] == completed
+
+
+@pytest.mark.parametrize(("updated_at", "delay"), [
+    ("2026-01-02T00:30:00Z", 1800.0),
+    ("2026-01-02T02:00:00Z", 3600.0),
+    ("2026-01-01T23:00:00Z", 0.0),
+])
+def test_reconciliation_health_restart_anchor_is_bounded_and_clock_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, updated_at: str, delay: float,
+) -> None:
+    path = tmp_path / "input.json"
+    document: dict[str, object] = {
+        "state": "connected",
+        "error": None,
+        "reconcile_error": None,
+        "reconciled_at": "2026-01-02T00:25:00Z",
+        "updated_at": updated_at,
+    }
+    _write(path, document)
+    monotonic = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: monotonic[0])
+    monkeypatch.setattr(runtime_module, "_utc", lambda: "2026-01-02T01:00:00Z")
+    writes: list[dict[str, object]] = []
+    original = _write
+
+    def write(target: Path, value: dict[str, object]) -> None:
+        writes.append(dict(value))
+        original(target, value)
+
+    monkeypatch.setattr(runtime_module, "_write", write)
+    observer = runtime_module._InputObserver(path, dict(document), 60.0)
+    assert observer._next_health_write == 100.0 + delay
+    if delay:
+        monotonic[0] = 100.0 + delay - 0.001
+        assert not observer.status(reconciled_at="2026-01-02T01:05:00Z")
+        assert writes == []
+    monotonic[0] = 100.0 + delay
+    assert observer.status(reconciled_at="2026-01-02T01:10:00Z")
+    assert len(writes) == 1
+
+
+def test_reconciliation_health_and_net_error_state_are_durable(
     rig: Rig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     writes: list[dict[str, object]] = []
@@ -364,31 +492,34 @@ def test_completed_reconciliations_persist_latest_timestamp_without_heartbeat_wr
     rig.runtime._handle(_Notice("input_connected"))
     assert len(writes) == 1
 
-    first = "2026-01-02T00:05:00Z"
-    second = "2026-01-02T00:10:00Z"
-    for expected in (first, second):
-        # Reconciliation normally runs after the 60-second observer deadline.
-        # Open that deadline explicitly so the test need not wait in real time.
-        rig.runtime.input_observer._next_write = 0
-        rig.runtime._complete(_Completion(
-            "poll", "page", {"messages": [], "cursor": None}, None, expected))
-        assert _read(rig.state / "input.json")["reconciled_at"] == expected
-
-    assert len(writes) == 3, "each completed reconciliation writes at most once"
-    latest = "2026-01-02T00:10:01Z"
+    latest = "2026-01-02T00:10:00Z"
+    rig.runtime.input_observer._next_write = 0
     rig.runtime._complete(_Completion(
         "poll", "page", {"messages": [], "cursor": None}, None, latest))
-    assert len(writes) == 3, "a reconciliation inside the write interval is coalesced"
+    assert len(writes) == 2, "the first successful reconciliation is durable health"
     assert rig.runtime.input_state["reconciled_at"] == latest
-    assert _read(rig.state / "input.json")["reconciled_at"] == second
-    rig.runtime.input_observer._next_write = 0
-    assert rig.runtime.input_observer.flush()
-    assert len(writes) == 4
     assert _read(rig.state / "input.json")["reconciled_at"] == latest
 
-    restarted = rig.restart()
-    assert restarted.input_state["reconciled_at"] == latest
+    rig.runtime.input_observer._next_write = 0
+    rig.runtime._complete(_Completion(
+        "poll", "page", None, OSError("provider unavailable"),
+        "2026-01-02T00:11:00Z"))
+    assert len(writes) == 3
+    failed = _read(rig.state / "input.json")
+    assert failed["reconcile_error"] == "provider unavailable"
+    assert failed["reconciled_at"] == latest
 
+    recovered = "2026-01-02T00:12:00Z"
+    rig.runtime.input_observer._next_write = 0
+    rig.runtime._complete(_Completion(
+        "poll", "page", {"messages": [], "cursor": None}, None, recovered))
+    assert len(writes) == 4
+    saved = _read(rig.state / "input.json")
+    assert saved["reconcile_error"] is None
+    assert saved["reconciled_at"] == recovered
+
+    restarted = rig.restart()
+    assert restarted.input_state["reconciled_at"] == recovered
     restarted._handle(_Notice("input_connected"))
     for _ in range(100):
         assert restarted._input_event({"type": "heartbeat"}) == ("heartbeat", None)
@@ -414,15 +545,13 @@ def test_reconcile_error_then_success_clears_error_and_persists_completion(
     completed = "2026-01-02T00:05:00Z"
     rig.runtime._complete(_Completion(
         "poll", "page", {"messages": [], "cursor": None}, None, completed))
-    assert len(writes) == 1, "success inside the write interval is coalesced"
+    assert len(writes) == 2, "the first successful reconciliation is immediately durable"
     assert rig.runtime.input_state["reconcile_error"] is None
     assert rig.runtime.input_state["reconciled_at"] == completed
-    rig.runtime.input_observer._next_write = 0
-    assert rig.runtime.input_observer.flush()
     saved = _read(rig.state / "input.json")
     assert saved["reconcile_error"] is None
     assert saved["reconciled_at"] == completed
-    assert len(writes) == 2, "error and successful completion each write at most once"
+    assert len(writes) == 2, "error and first successful completion each write once"
 
 
 def test_nonterminal_reconcile_page_is_not_reported_complete(rig: Rig) -> None:
