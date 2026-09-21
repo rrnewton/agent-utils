@@ -11305,10 +11305,14 @@ def test_salvage_push_ignores_pushurl_installed_at_network_boundary(
         .returncode
         == 1
     )
-    assert any(
-        args[0] == "fetch-pack" and str(authorized_remote) in args
-        for args in network_calls
-    )
+    assert [args[0] for args in network_calls] == [
+        "ls-remote",
+        "send-pack",
+        "ls-remote",
+    ]
+    assert all(str(authorized_remote) in args for args in network_calls)
+    assert all("origin" not in args for args in network_calls)
+    assert all(args[0] != "fetch-pack" for args in network_calls)
 
 
 def test_salvage_push_refuses_redirect_in_isolated_config_at_network_boundary(
