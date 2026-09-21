@@ -29,6 +29,17 @@ The durable archive and a website export are distinct concepts:
 - Rebuilding an export never invokes a model. Missing summaries degrade to normalized transcript
   and statistics rather than causing unrelated cached summaries to be discarded.
 
+A `claude-history` team is the one provider whose normalized data is prompts and nothing else.
+It is built from `~/.claude/history.jsonl`, which Claude Code keeps after it has deleted the
+transcript, so its records are the archive's only copy of those prompts. Every event is a
+`user_prompt` with `ingress_kind` `claude_history` and `author_kind` `owner_human`; each session
+is a depth-0 coordinator agent spanning its prompts; turns are one-second placeholders. The team
+is selected by an explicit working-directory pattern recorded in its source manifest, and
+sessions the operator declared covered by a full-transcript `claude` team are excluded. The ingest
+receipt records both exclusions (`history_unmatched_prompts`, `history_covered_prompts`,
+`history_covered_sessions`), which are zero for every other provider. No summary prompt input
+changes: a history phase summarizes exactly as a Claude phase with no responses would.
+
 That degradation is presentation-only. Missing phase, agent-lifetime, project-overview, or calendar
 summary data receives an in-memory fallback labeled `Summary unavailable`, with an explicit false
 availability flag in the website projection. Phase detail JSON still contains normalized transcript

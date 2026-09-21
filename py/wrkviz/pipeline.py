@@ -64,6 +64,12 @@ from wrkviz.claude import (
     load_claude_team,
     snapshot_claude_lineage,
 )
+from wrkviz.claude_history import (
+    PROVIDER as CLAUDE_HISTORY_PROVIDER,
+    ClaudeHistoryParseError,
+    load_claude_history_team,
+    snapshot_claude_history,
+)
 from wrkviz.model import (
     Agent,
     Event,
@@ -392,6 +398,14 @@ class IngestReport:
     snapshot_root: str = ""
     snapshot_root_layout: str = ""
     snapshot_root_established: bool = False
+    # What a prompt-history ingest read and deliberately left out: prompts typed in a working
+    # directory the team's pattern does not select, and prompts belonging to sessions the operator
+    # declared *covered* by a full-transcript team. Zero for every other provider. They are in the
+    # receipt because an exclusion the operator asked for is still an exclusion, and "the history
+    # has 4,226 prompts but the team shows 1,900" needs to be answerable from the archive alone.
+    history_unmatched_prompts: int = 0
+    history_covered_prompts: int = 0
+    history_covered_sessions: int = 0
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the ingest report as a JSON-serializable object."""
@@ -427,6 +441,9 @@ class IngestReport:
             "snapshot_root": self.snapshot_root,
             "snapshot_root_layout": self.snapshot_root_layout,
             "snapshot_root_established": self.snapshot_root_established,
+            "history_unmatched_prompts": self.history_unmatched_prompts,
+            "history_covered_prompts": self.history_covered_prompts,
+            "history_covered_sessions": self.history_covered_sessions,
         }
 
 
@@ -1611,6 +1628,119 @@ def ingest_claude(
             session_file,
             team_slug,
             display_timezone,
+            date_window,
+            identity_overrides,
+            snapshot_root,
+        )
+
+
+def _load_claude_history_source_manifest(
+    archive: Path, team_slug: str, project_pattern: str
+) -> ClaudeSourceCopy | None:
+    path = _source_manifest_path(archive, team_slug)
+    if not path.is_file():
+        return None
+    obj = as_object(read_json(path), str(path))
+    if obj.get("schema_version") != 1 or obj.get("provider") != CLAUDE_HISTORY_PROVIDER:
+        raise ClaudeHistoryParseError(f"invalid Claude history source manifest at {path}")
+    recorded_pattern = as_string(obj.get("project_pattern"), f"{path}: project_pattern")
+    if recorded_pattern != project_pattern:
+        # The pattern is the team's identity: it decides which prompts the team *is*. A team
+        # re-ingested under a different one would keep its slug and silently become a different
+        # selection, and the projection's monotonic union would then carry both. Another pattern
+        # is another team.
+        raise ClaudeHistoryParseError(
+            f"team {team_slug!r} was ingested with project pattern {recorded_pattern!r}, "
+            f"not {project_pattern!r}; register a different team slug for a different selection"
+        )
+    raw_sources = as_array(obj.get("sources"), f"{path}: sources")
+    if len(raw_sources) != 1:
+        raise ClaudeHistoryParseError(f"{path}: expected exactly one history source")
+    return ClaudeSourceCopy.from_json_obj(
+        as_object(raw_sources[0], f"{path}: sources[0]"), f"{path}: sources[0]"
+    )
+
+
+def _ingest_claude_history_locked(
+    archive: Path,
+    history_file: Path,
+    team_slug: str,
+    display_timezone: str,
+    project_pattern: str,
+    covered_session_ids: Sequence[str],
+    date_window: DateWindow | None,
+    identity_overrides: IdentityOverrides | None,
+    requested_snapshot_root: Path | None,
+) -> tuple[TeamData, IngestReport]:
+    """Snapshot and normalize the owner's Claude prompt history as one prompt-only team."""
+
+    _ensure_archive(archive, team_slug, create=True)
+    changed = int(_ensure_bulk_content_ignored(archive))
+    previous_source = _load_claude_history_source_manifest(
+        archive, team_slug, project_pattern
+    )
+    location = _source_snapshot_location(archive, team_slug, requested_snapshot_root)
+    snapshot = snapshot_claude_history(
+        history_file, location.root, previous_source, utc_now()
+    )
+    changed += snapshot.files_changed
+    team, selection = load_claude_history_team(
+        location.root / snapshot.source.snapshot_path,
+        team_slug,
+        display_timezone,
+        project_pattern=project_pattern,
+        covered_session_ids=covered_session_ids,
+    )
+    team = apply_date_window(team, date_window)
+    changed += _record_site_identity(archive, team, ((), ()), identity_overrides)
+    source_manifest: dict[str, object] = {
+        "schema_version": 1,
+        "provider": CLAUDE_HISTORY_PROVIDER,
+        "root_thread_id": team.root_thread_id,
+        "history_file": str(history_file.resolve()),
+        "project_pattern": project_pattern,
+        "covered_session_ids": sorted(set(covered_session_ids)),
+        "snapshot_root": location.archive_relative,
+        "date_window": date_window.to_json_obj() if date_window is not None else None,
+        "sources": [snapshot.source.to_json_obj()],
+    }
+    changed += int(
+        _write_json_durable(
+            _source_manifest_path(archive, team_slug), narrow_json(source_manifest)
+        )
+    )
+    team, report = _write_ingested_team(
+        archive, team_slug, team, date_window, changed, location
+    )
+    return team, replace(
+        report,
+        history_unmatched_prompts=selection.unmatched_prompts,
+        history_covered_prompts=selection.covered_prompts,
+        history_covered_sessions=selection.covered_sessions,
+    )
+
+
+def ingest_claude_history(
+    archive: Path,
+    history_file: Path,
+    team_slug: str,
+    display_timezone: str,
+    project_pattern: str,
+    covered_session_ids: Sequence[str] = (),
+    date_window: DateWindow | None = None,
+    identity_overrides: IdentityOverrides | None = None,
+    snapshot_root: Path | None = None,
+) -> tuple[TeamData, IngestReport]:
+    """Snapshot and normalize one Claude prompt history as one serialized transaction."""
+
+    with archive_writer_lock(archive):
+        return _ingest_claude_history_locked(
+            archive,
+            history_file,
+            team_slug,
+            display_timezone,
+            project_pattern,
+            covered_session_ids,
             date_window,
             identity_overrides,
             snapshot_root,
@@ -4960,6 +5090,7 @@ __all__ = [
     "build_archive",
     "extract_transcripts_archive",
     "ingest_claude",
+    "ingest_claude_history",
     "ingest_codex",
     "ingest_orc",
     "load_archived_team",

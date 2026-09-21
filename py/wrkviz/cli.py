@@ -40,6 +40,7 @@ from wrkviz.pipeline import (
     build_archive,
     extract_transcripts_archive,
     ingest_claude,
+    ingest_claude_history,
     ingest_codex,
     ingest_orc,
     load_archived_team,
@@ -272,6 +273,42 @@ def _add_claude_ingest(parser: argparse.ArgumentParser) -> None:
         "--session-file",
         required=True,
         help="Claude coordinator JSONL; nested subagents are discovered beside it",
+    )
+    _add_date_window(parser)
+    _add_site_identity(parser)
+
+
+def _add_claude_history_ingest(parser: argparse.ArgumentParser) -> None:
+    _add_archive(parser)
+    _add_snapshot_root(parser)
+    parser.add_argument(
+        "--history-file",
+        required=True,
+        help=(
+            "Claude Code prompt history, normally ~/.claude/history.jsonl; one line per prompt "
+            "the owner submitted, kept by Claude Code after the transcript itself is cleaned up"
+        ),
+    )
+    parser.add_argument(
+        "--project-pattern",
+        required=True,
+        metavar="REGEX",
+        help=(
+            "Python regular expression searched against each prompt's recorded working "
+            "directory; only matching prompts join this team, for example "
+            "'/work/widget|/worktrees/widget-'"
+        ),
+    )
+    parser.add_argument(
+        "--covered-session",
+        action="append",
+        default=[],
+        metavar="SESSION_UUID",
+        help=(
+            "a Claude session whose full transcript is archived as its own team; its prompts "
+            "are left out of this team so they are not projected twice; repeatable. "
+            "ingest-project derives this list from the manifest's claude teams by itself"
+        ),
     )
     _add_date_window(parser)
     _add_site_identity(parser)
@@ -545,6 +582,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_claude_ingest(ingest_claude_parser)
     ingest_claude_parser.set_defaults(handler="ingest_claude")
+
+    ingest_claude_history_parser = sub.add_parser(
+        "ingest-claude-history",
+        help="normalize the owner's Claude Code prompt history; do not call a model",
+        description=(
+            "normalize ~/.claude/history.jsonl into one prompt-only team, so prompts whose "
+            "transcripts Claude Code has since deleted still reach the timeline and the prompt "
+            "projection; does not call a model. Example: wrkviz ingest-claude-history "
+            "--history-file ~/.claude/history.jsonl --project-pattern '/work/widget' "
+            "--team claude-history-host01 --output ./timelines/widget"
+        ),
+    )
+    _add_claude_history_ingest(ingest_claude_history_parser)
+    ingest_claude_history_parser.set_defaults(handler="ingest_claude_history")
 
     ingest_orc_parser = sub.add_parser(
         "ingest-orc", help="snapshot and normalize Orc SQLite logs; do not call a model",
@@ -1075,6 +1126,29 @@ def _print_ingest(report: IngestReport) -> None:
         f"{report.tool_calls} outer tools, {report.edges} edges from {report.sources} source files "
         f"({report.source_bytes / (1024 * 1024):.1f} MiB); {report.files_changed} archive files changed"
     )
+
+
+def _print_history_exclusions(report: IngestReport) -> None:
+    """Say what a prompt-history ingest left out and why, on stderr.
+
+    Both numbers are exclusions the operator configured, and both are exclusions all the same: a
+    team that shows 1,900 prompts out of a 4,200-line history should not require opening the
+    receipt to learn where the other 2,300 went.
+    """
+
+    if report.history_unmatched_prompts == 0 and report.history_covered_prompts == 0:
+        return
+    parts: list[str] = []
+    if report.history_unmatched_prompts:
+        parts.append(
+            f"{report.history_unmatched_prompts} prompt(s) typed outside the project pattern"
+        )
+    if report.history_covered_prompts:
+        parts.append(
+            f"{report.history_covered_prompts} prompt(s) from {report.history_covered_sessions} "
+            "session(s) whose full transcript is archived as its own team"
+        )
+    print(f"{PROG}: {report.team_slug}: left out " + "; ".join(parts), file=sys.stderr)
 
 
 def _print_retired_projections(report: IngestReport) -> None:
@@ -1770,6 +1844,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"{team.team_slug} ({team.provider}):", end=" ")
                 _print_ingest(team.ingest)
                 _print_snapshot_root(team.ingest, config.output)
+                _print_history_exclusions(team.ingest)
                 _print_retired_projections(team.ingest)
                 _print_promoted_task_notes(team.ingest)
                 _print_stored_payloads(team.ingest)
@@ -2039,6 +2114,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "refresh",
             "ingest_claude",
             "refresh_claude",
+            "ingest_claude_history",
             "ingest_orc",
             "refresh_orc",
         )
@@ -2062,6 +2138,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _path(str(ns.session_file)),
                     team_slug,
                     str(ns.timezone),
+                    date_window,
+                    identity_overrides,
+                    requested_snapshot_root,
+                )
+            elif handler == "ingest_claude_history":
+                _, ingest_report = ingest_claude_history(
+                    archive,
+                    _path(str(ns.history_file)),
+                    team_slug,
+                    str(ns.timezone),
+                    str(ns.project_pattern),
+                    _string_list(ns.covered_session, "--covered-session"),
                     date_window,
                     identity_overrides,
                     requested_snapshot_root,
@@ -2098,6 +2186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             _print_ingest(ingest_report)
             _print_snapshot_root(ingest_report, archive)
+            _print_history_exclusions(ingest_report)
             _print_retired_projections(ingest_report)
             _print_promoted_task_notes(ingest_report)
             _print_stored_payloads(ingest_report)

@@ -4,8 +4,8 @@
 summaries and a zoomable local website. It answers both “what was happening at 02:13?” and
 “what did this team accomplish this month?” without throwing away the underlying messages.
 
-The importers support Codex multi-agent rollouts, Claude Code coordinator lineages, and Orc SQLite
-coordinator/task history. The archive and browser schema is provider-neutral so additional adapters
+The importers support Codex multi-agent rollouts, Claude Code coordinator lineages, the Claude
+Code prompt history that outlives those lineages, and Orc SQLite coordinator/task history. The archive and browser schema is provider-neutral so additional adapters
 do not require site changes.
 
 ## What the site shows
@@ -117,6 +117,60 @@ Claude Code root sessions live under `~/.claude/projects/<encoded-project>/` as
 assistant text, user prompts, tool calls/results, Agent spawns, and SendMessage edges while omitting
 private thinking blocks.
 
+### Claude prompt history: the prompts that outlive their transcripts
+
+Claude Code removes any transcript under `~/.claude/projects/` that has not been modified within
+its `cleanupPeriodDays` setting -- thirty days unless `~/.claude/settings.json` says otherwise --
+and it does so without a prompt. What it never removes is `~/.claude/history.jsonl`: one line per
+prompt the owner submitted, with the verbatim text, pasted attachments, a millisecond timestamp,
+the working directory, and the session id. Archive it as its own team:
+
+```bash
+wrkviz ingest-claude-history \
+  --history-file ~/.claude/history.jsonl \
+  --project-pattern '/work/example-project|/worktrees/example-' \
+  --covered-session SESSION_UUID \
+  --team claude-history-host01 --output ./timelines/example-team
+```
+
+`--project-pattern` is a Python regular expression searched against each prompt's recorded
+working directory; only matching prompts join the team, and the run says on stderr how many it
+left out. Nothing is inferred from the prompt text. The pattern is the team's identity -- a
+re-ingest under a different pattern is refused, because that would be a different selection
+under the same slug; register another team instead.
+
+`--covered-session` names a Claude session whose full transcript is already archived as a
+`claude` team. Its prompts are left out of the history team so the prompt projection does not
+carry them twice, and the exclusion is counted in the receipt. The history team therefore holds
+exactly the prompts the archive has no other record of. In a project manifest the list is derived
+from the manifest's own `claude` teams:
+
+```json
+{
+  "slug": "claude-history-host01",
+  "provider": "claude-history",
+  "source": {
+    "history_file": "../host01/.claude/history.jsonl",
+    "project_pattern": "/work/example-project|/worktrees/example-",
+    "covered_sessions": "config"
+  }
+}
+```
+
+`covered_sessions` is `config` (the default) or `none`. It is read off the whole manifest, not the
+run's `--team` filter, so ingesting the history team alone gives the same answer as ingesting
+everything.
+
+What the team contains is deliberately narrow and deliberately labelled. Every event is a
+`user_prompt` whose `ingress_kind` is `claude_history` and whose `author_kind` is `owner_human` --
+the history is written only for what the owner typed. Each session is one coordinator agent whose
+lifetime is the span of its prompts, so the transcript projection, which reads coordinator threads,
+sees all of them; a prompt with no session id (the oldest releases wrote none) is filed under the
+`unattributed` thread rather than dropped. There are no responses, tool calls, or edges, and each
+prompt's one-second turn marks an instant rather than measuring anything -- the same convention an
+Orc task note follows. Pasted attachments are appended to the prompt text under their
+`[Pasted text #N]` label. The snapshot is held to append-only like every other vendor source.
+
 For Orc, pass the project directory containing `.orc/` and `.tg/` as `--source-root`. The root
 coordinator UUID names a directory under `.orc/sessions/`; child sessions with an explicit parent
 identifier are followed as nested coordinators. Whole-root restarts use repeatable plain
@@ -222,7 +276,8 @@ may replace any of them. `projects` contains exact `label` and `repository_url` 
 The parser rejects missing and unknown keys, unknown providers, duplicate team slugs, duplicate
 continuations, absolute output paths, invalid identity, and invalid time bounds. Provider `source`
 objects are exact: Codex accepts `sessions_root`, `root_session`, and optional ordered
-`continuation_sessions`; Claude accepts only `session_file`; Orc accepts `source_root` and
+`continuation_sessions`; Claude accepts only `session_file`; `claude-history` accepts
+`history_file`, `project_pattern`, and optional `covered_sessions`; Orc accepts `source_root` and
 `root_session`, plus optional ordered `continuation_sessions`. An Orc continuation is either a
 whole-root session-ID string or an exact object containing `session_id` and `start_message_id`.
 

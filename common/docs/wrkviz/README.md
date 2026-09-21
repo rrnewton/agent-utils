@@ -122,6 +122,22 @@ The bounded form excludes the reused root's earlier events, agents, spawns, and 
 databases from normalized data and summary inputs. The first successful ingest freezes the native
 message boundary; later reruns must preserve the recorded ordered prefix.
 
+Claude Code deletes transcripts older than its `cleanupPeriodDays` (thirty days by default) but
+keeps every prompt the owner typed in `~/.claude/history.jsonl`. Register that history as a
+prompt-only team so the prompts whose transcripts are gone still reach the timeline:
+
+```bash
+wrkviz ingest-claude-history \
+  --history-file ~/.claude/history.jsonl \
+  --project-pattern '/work/example-project|/worktrees/example-' \
+  --team claude-history-host01 --output ./timelines/example-team
+```
+
+Only prompts typed in a working directory matching the pattern join the team; sessions whose full
+transcript is archived as a `claude` team are left out (`ingest-project` derives that list from
+the manifest) so nothing is projected twice. Its events are `user_prompt` records with
+`ingress_kind` `claude_history`; it has no responses, tool calls, or edges to offer.
+
 After ingesting one or more teams, build the combined verbatim transcript projection without any
 model call:
 

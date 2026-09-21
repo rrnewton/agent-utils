@@ -19,12 +19,14 @@ from wrkviz.archive import (
     as_string,
     narrow_json,
 )
+from wrkviz.claude_history import PROVIDER as CLAUDE_HISTORY_PROVIDER, compile_project_pattern
 from wrkviz.identity import IdentityOverrides, parse_identity_overrides
 from wrkviz.orc import OrcContinuationSpec, OrcParseError
 from wrkviz.pipeline import (
     IngestReport,
     extract_transcripts_archive,
     ingest_claude,
+    ingest_claude_history,
     ingest_codex,
     ingest_orc,
 )
@@ -37,7 +39,7 @@ from wrkviz.window import DateWindow, parse_date_window
 
 PROJECT_INGEST_SCHEMA_VERSION = 1
 _TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
-Provider = Literal["codex", "claude", "orc"]
+Provider = Literal["codex", "claude", "orc", "claude-history"]
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,20 @@ class ClaudeProjectSource:
 
 
 @dataclass(frozen=True)
+class ClaudeHistoryProjectSource:
+    """One Claude Code ``history.jsonl`` and the working-directory pattern that selects a team.
+
+    ``covered_sessions`` is ``"config"`` -- every ``claude`` team in the same manifest is a
+    covered session, which is the answer almost every project wants and the one that cannot
+    drift from the manifest -- or ``"none"``, for a history archived on its own.
+    """
+
+    history_file: Path
+    project_pattern: str
+    covered_sessions: Literal["config", "none"]
+
+
+@dataclass(frozen=True)
 class OrcProjectSource:
     """One Orc coordinator root and its explicitly ordered continuations."""
 
@@ -65,7 +81,12 @@ class OrcProjectSource:
     continuation_sessions: tuple[OrcContinuationSpec, ...]
 
 
-ProjectSource = CodexProjectSource | ClaudeProjectSource | OrcProjectSource
+ProjectSource = (
+    CodexProjectSource
+    | ClaudeProjectSource
+    | OrcProjectSource
+    | ClaudeHistoryProjectSource
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +124,25 @@ class ProjectIngestConfig:
             rule
             for team in self.teams
             for rule in team.prompt_authorship_rules
+        )
+
+    @property
+    def claude_session_ids(self) -> tuple[str, ...]:
+        """Every session a ``claude`` team in this manifest archives in full, by transcript stem.
+
+        This is what a ``claude-history`` team with ``covered_sessions: config`` excludes. It is
+        read off the whole manifest rather than off the run's ``--team`` selection, so that
+        ingesting the history team alone gives the same answer as ingesting everything.
+        """
+
+        return tuple(
+            sorted(
+                {
+                    team.source.session_file.stem
+                    for team in self.teams
+                    if isinstance(team.source, ClaudeProjectSource)
+                }
+            )
         )
 
     def select_teams(self, requested: Sequence[str] = ()) -> tuple[ProjectTeamConfig, ...]:
@@ -510,6 +550,37 @@ def _claude_source(
     )
 
 
+def _claude_history_source(
+    value: dict[str, JsonValue], where: str, config_path: Path
+) -> ClaudeHistoryProjectSource:
+    _check_fields(
+        value,
+        where,
+        frozenset({"history_file", "project_pattern"}),
+        frozenset({"covered_sessions"}),
+    )
+    pattern = _required_string(value.get("project_pattern"), where + ".project_pattern")
+    try:
+        compile_project_pattern(pattern)
+    except ValueError as exc:
+        raise ValueError(f"{where}.project_pattern: {exc}") from exc
+    covered = (
+        _required_string(value["covered_sessions"], where + ".covered_sessions")
+        if "covered_sessions" in value
+        else "config"
+    )
+    if covered not in ("config", "none"):
+        raise ValueError(f"{where}.covered_sessions: expected config or none")
+    return ClaudeHistoryProjectSource(
+        _source_path(
+            config_path,
+            _required_string(value.get("history_file"), where + ".history_file"),
+        ),
+        pattern,
+        cast(Literal["config", "none"], covered),
+    )
+
+
 def _orc_source(
     value: dict[str, JsonValue], where: str, config_path: Path
 ) -> OrcProjectSource:
@@ -569,8 +640,10 @@ def _team_config(
             f"{where}.slug: expected 1-64 lowercase letters/digits separated by hyphens"
         )
     raw_provider = _required_string(obj.get("provider"), where + ".provider")
-    if raw_provider not in ("codex", "claude", "orc"):
-        raise ValueError(f"{where}.provider: expected codex, claude, or orc")
+    if raw_provider not in ("codex", "claude", "orc", CLAUDE_HISTORY_PROVIDER):
+        raise ValueError(
+            f"{where}.provider: expected codex, claude, orc, or {CLAUDE_HISTORY_PROVIDER}"
+        )
     provider = cast(Provider, raw_provider)
     source_value = as_object(obj.get("source"), where + ".source")
     source: ProjectSource
@@ -578,6 +651,8 @@ def _team_config(
         source = _codex_source(source_value, where + ".source", config_path)
     elif provider == "claude":
         source = _claude_source(source_value, where + ".source", config_path)
+    elif provider == CLAUDE_HISTORY_PROVIDER:
+        source = _claude_history_source(source_value, where + ".source", config_path)
     else:
         source = _orc_source(source_value, where + ".source", config_path)
     timezone = (
@@ -712,11 +787,24 @@ def _ingest_team(
     team: ProjectTeamConfig,
     accept_prefix_rewrite: Sequence[str],
     snapshot_root: Path | None,
+    claude_session_ids: Sequence[str] = (),
 ) -> IngestReport:
     """Dispatch one configured team to its provider importer."""
 
     source = team.source
-    if isinstance(source, CodexProjectSource):
+    if isinstance(source, ClaudeHistoryProjectSource):
+        _, report = ingest_claude_history(
+            output,
+            source.history_file,
+            team.slug,
+            team.timezone,
+            source.project_pattern,
+            claude_session_ids if source.covered_sessions == "config" else (),
+            team.date_window,
+            team.identity_overrides,
+            snapshot_root,
+        )
+    elif isinstance(source, CodexProjectSource):
         _, report = ingest_codex(
             output,
             source.sessions_root,
@@ -886,6 +974,7 @@ def ingest_project(
                 team,
                 sorted(accepted.get(team.slug, ())),
                 config.snapshot_root,
+                config.claude_session_ids,
             )
         except Exception as error:  # Deliberately broad; see _team_failure.
             # BaseException is deliberately NOT caught: a KeyboardInterrupt or SystemExit means the
@@ -939,6 +1028,7 @@ def ingest_project(
 
 
 __all__ = [
+    "ClaudeHistoryProjectSource",
     "ClaudeProjectSource",
     "CodexProjectSource",
     "ingest_project",
