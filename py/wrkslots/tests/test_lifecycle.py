@@ -6153,7 +6153,20 @@ def test_batch_census_isolated_real_file_alias_mapping_and_socket(
     try:
         assert process.stdout is not None
         assert select.select([process.stdout], [], [], 5)[0], "holder did not become ready"
-        assert process.stdout.readline() == "ready\n"
+        ready = process.stdout.readline()
+        if ready != "ready\n":
+            stdout_tail, stderr_text = process.communicate(timeout=5)
+            exact_capability_denials = {
+                "unshare: unshare failed: Operation not permitted",
+                "unshare: unshare failed: Permission denied",
+            }
+            if (kind == "socket-orphan" and process.returncode != 0
+                    and stderr_text.strip() in exact_capability_denials):
+                pytest.skip(f"user/network namespace unavailable: {stderr_text.strip()}")
+            pytest.fail(
+                f"holder exited before readiness: rc={process.returncode}; "
+                f"stdout={ready + stdout_tail!r}; stderr={stderr_text!r}"
+            )
         proc = Path(f"/proc/{process.pid}")
         generation = wrkslots._process_start_ticks(proc)
         namespace = wrkslots._mount_namespace(proc)
@@ -15830,10 +15843,14 @@ def test_same_byte_legacy_replacement_requires_manual_review(
     config = wrkslots._load_config(str(project), "testhost")
     sidecar = wrkslots._handoff_sidecar_path(config, "slot01", 1)
     sidecar_before = sidecar.read_bytes()
-    old_identity = legacy.stat().st_ino
-    legacy.unlink()
-    legacy.write_text("same bytes, new identity\n", encoding="utf-8")
-    assert legacy.stat().st_ino != old_identity
+    # Keep the unlinked object allocated until its replacement exists. Filesystems
+    # may otherwise immediately recycle the same inode and defeat the fixture's
+    # attempt to exercise a same-byte identity change.
+    with legacy.open("rb") as retained:
+        old_identity = os.fstat(retained.fileno()).st_ino
+        legacy.unlink()
+        legacy.write_text("same bytes, new identity\n", encoding="utf-8")
+        assert legacy.stat().st_ino != old_identity
 
     refused = raw_command(
         project, "read-handoff", "slot01", "--coordinator-pid", str(os.getpid())
