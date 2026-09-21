@@ -194,7 +194,9 @@ salvage candidate and are then the only destination used by isolated network Git
 checkout-config change can only refuse the operation; it cannot choose a new network destination.
 The isolated transport uses plumbing commands that do not apply URL rewrite configuration and
 binds the fresh repository's config bytes before execution; changing that config also refuses before
-the network command starts.
+the network command starts. Remote-ref discovery and salvage readback are metadata-only, and fetch
+transfers only commits reachable from advertised branch heads; tag-only and other unrelated history
+is not imported into the checkout's shared object store.
 
 When `with-proxy` is installed on `PATH`, Wrkslots uses it for Git fetches, pushes, remote ref
 readback, and post-provision hooks. The hook's children, including recursive submodule commands,

@@ -34,8 +34,12 @@ def install_proxy_wrapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
             with Path(os.environ['WRKSLOTS_TEST_PROXY_LOG']).open('a') as output:
                 output.write(json.dumps(command) + '\\n')
             if command[0] == 'git':
-                assert 'GIT_DIR' not in os.environ
+                if 'ls-remote' in command:
+                    assert os.environ['GIT_DIR'] == '/dev/null'
+                else:
+                    assert 'GIT_DIR' not in os.environ
                 assert 'GIT_CONFIG_COUNT' not in os.environ
+                assert 'WRKSLOTS_NETWORK_CONFIG_SHA256' not in os.environ
                 assert os.environ['GIT_CONFIG_GLOBAL'] == '/dev/null'
                 assert os.environ['GIT_CONFIG_SYSTEM'] == '/dev/null'
                 assert os.environ['GIT_NO_REPLACE_OBJECTS'] == '1'
@@ -115,7 +119,7 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
 
     commands = proxy_commands(log)
     assert [command[command.index("-C") + 2] for command in commands] == [
-        "fetch-pack", "fetch-pack", "send-pack", "fetch-pack"
+        "ls-remote", "fetch-pack", "ls-remote", "send-pack", "ls-remote"
     ]
     assert all(command[:4] == [
         "git", "--no-replace-objects", "-c", "core.useReplaceRefs=false"
@@ -129,10 +133,55 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
     fetch = commands[0]
     operation = fetch.index("-C") + 2
     assert fetch[operation:operation + 3] == [
-        "fetch-pack",
-        "--no-progress",
-        "--all",
+        "ls-remote",
+        "--refs",
+        "--heads",
     ]
+
+
+def test_fetch_remote_does_not_download_tag_only_history(tmp_path: Path) -> None:
+    _project, repository, remote = lifecycle.make_project(tmp_path)
+    tag_source = tmp_path / "tag-source"
+    subprocess.run(
+        ["git", "clone", str(remote), str(tag_source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lifecycle.git(tag_source, "config", "user.name", "Wrkslots Test")
+    lifecycle.git(tag_source, "config", "user.email", "wrkslots@example.invalid")
+    lifecycle.git(tag_source, "checkout", "--orphan", "tag-only")
+    (tag_source / "tag-only.txt").write_text("unrelated\n", encoding="utf-8")
+    lifecycle.git(tag_source, "add", "tag-only.txt")
+    lifecycle.git(tag_source, "commit", "-m", "tag-only history")
+    tag_only = lifecycle.git(tag_source, "rev-parse", "HEAD").stdout.strip()
+    lifecycle.git(tag_source, "push", "origin", "HEAD:refs/tags/unreachable")
+    assert (
+        lifecycle.git(
+            repository,
+            "cat-file",
+            "-e",
+            f"{tag_only}^{{commit}}",
+            check=False,
+        ).returncode
+        != 0
+    )
+
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repository, "origin")
+    vcs.fetch_remote(repository, "origin", "refs/remotes/origin/main", authority)
+
+    assert (
+        lifecycle.git(
+            repository,
+            "cat-file",
+            "-e",
+            f"{tag_only}^{{commit}}",
+            check=False,
+        ).returncode
+        != 0
+    )
+    assert not vcs.ref_exists(repository, "refs/tags/unreachable")
 
 
 def test_github_credential_helper_works_with_global_git_config_disabled(
@@ -213,8 +262,16 @@ def test_create_hooks_and_recursive_submodules_inherit_wrapper_environment(
     assert lifecycle.git(target / "component" / "leaf", "rev-parse", "HEAD").stdout.strip() == leaf_head
     assert len(lifecycle.active_slots(project)) == 1
     commands = proxy_commands(log)
-    assert [command[0] for command in commands] == ["git", "/bin/sh", "/bin/sh"]
-    assert commands[0][commands[0].index("-C") + 2] == "fetch-pack"
+    assert [command[0] for command in commands] == [
+        "git",
+        "git",
+        "/bin/sh",
+        "/bin/sh",
+    ]
+    assert [command[command.index("-C") + 2] for command in commands[:2]] == [
+        "ls-remote",
+        "fetch-pack",
+    ]
     assert secret not in made.stdout + made.stderr + log.read_text(encoding="utf-8")
 
 
@@ -234,7 +291,7 @@ def test_failed_fetch_wrapper_never_retries_direct_or_registers_slot(
     assert not lifecycle.create_journal_path(project).exists()
     commands = proxy_commands(log)
     assert len(commands) == 1
-    assert commands[0][commands[0].index("-C") + 2] == "fetch-pack"
+    assert commands[0][commands[0].index("-C") + 2] == "ls-remote"
 
 
 def test_failed_hook_wrapper_preserves_journal_and_recovery_uses_wrapper(
@@ -260,7 +317,11 @@ def test_failed_hook_wrapper_preserves_journal_and_recovery_uses_wrapper(
     assert target.is_dir()
     assert not (target / "hook-completed").exists()
     assert lifecycle.create_journal_path(project).is_file()
-    assert [command[0] for command in proxy_commands(log)] == ["git", "/bin/sh"]
+    assert [command[0] for command in proxy_commands(log)] == [
+        "git",
+        "git",
+        "/bin/sh",
+    ]
 
     monkeypatch.delenv("WRKSLOTS_TEST_PROXY_FAIL")
     recovered = lifecycle.command(
@@ -272,7 +333,10 @@ def test_failed_hook_wrapper_preserves_journal_and_recovery_uses_wrapper(
     assert len(lifecycle.active_slots(project)) == 1
     assert not lifecycle.create_journal_path(project).exists()
     assert [command[0] for command in proxy_commands(log)] == [
-        "git", "/bin/sh", "/bin/sh"
+        "git",
+        "git",
+        "/bin/sh",
+        "/bin/sh",
     ]
 
 

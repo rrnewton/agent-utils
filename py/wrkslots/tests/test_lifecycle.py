@@ -11277,7 +11277,7 @@ def test_salvage_push_ignores_pushurl_installed_at_network_boundary(
         env_overrides: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal mutated
-        if args and args[0] in {"fetch-pack", "send-pack"}:
+        if args and args[0] in {"ls-remote", "fetch-pack", "send-pack"}:
             network_calls.append(tuple(args))
         if args and args[0] == "send-pack" and not mutated:
             git(repository, "config", "remote.origin.pushurl", str(evil_remote))
@@ -11398,7 +11398,7 @@ def test_salvage_reads_refuse_redirect_in_isolated_config(
         env_overrides: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal injected
-        if args and args[0] == "fetch-pack" and not injected:
+        if args and args[0] == "ls-remote" and not injected:
             git(
                 repository_path,
                 "config",
@@ -11949,7 +11949,7 @@ def test_agent_reclaim_refuses_nested_push_redirect_before_network(
         input_text: str | None = None,
         env_overrides: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        if args and args[0] in {"fetch-pack", "send-pack"}:
+        if args and args[0] in {"ls-remote", "fetch-pack", "send-pack"}:
             network_calls.append(tuple(args))
             raise AssertionError(f"network operation preceded pushurl refusal: {args[0]}")
         return original_run(
@@ -12072,7 +12072,7 @@ def test_agent_reclaim_materializes_all_nested_candidates_before_network(
         input_text: str | None = None,
         env_overrides: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        if args and args[0] in {"fetch-pack", "send-pack"}:
+        if args and args[0] in {"ls-remote", "fetch-pack", "send-pack"}:
             network_calls.append(tuple(args))
             raise AssertionError(f"network preceded complete candidate checks: {args[0]}")
         return original_run(

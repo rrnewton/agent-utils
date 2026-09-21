@@ -8337,29 +8337,35 @@ class _GitVcs:
             isolated,
             object_env,
         ):
-            fetched_result = self._run(
+            advertised = self._ls_remote_inventory(
                 isolated,
-                [
-                    "fetch-pack",
-                    "--no-progress",
-                    "--all",
-                    authority.url,
-                ],
+                authority.url,
+                heads_only=True,
                 env_overrides=object_env,
             )
             fetched: dict[str, str] = {}
-            for line in fetched_result.stdout.splitlines():
-                fields = line.split()
-                if len(fields) != 2:
-                    raise Refusal("Git returned a malformed fetched-ref inventory")
-                head, ref = fields
-                heads_prefix = "refs/heads/"
+            if advertised:
+                fetched_result = self._run(
+                    isolated,
+                    ["fetch-pack", "--no-progress", "--stdin", authority.url],
+                    input_text="".join(f"{ref}\n" for ref in sorted(advertised)),
+                    env_overrides=object_env,
+                )
+                transferred = self._parse_remote_ref_inventory(
+                    fetched_result.stdout, "fetched-ref"
+                )
+                if set(transferred) != set(advertised):
+                    raise Refusal(
+                        "Git fetched a different head set than the metadata inventory"
+                    )
+            else:
+                transferred = {}
+            heads_prefix = "refs/heads/"
+            for ref, head in transferred.items():
                 if not ref.startswith(heads_prefix):
-                    continue
+                    raise Refusal(f"Git fetched a non-head ref: {ref}")
                 tracking = prefix + ref.removeprefix(heads_prefix)
                 _validate_full_ref(tracking, "remote-tracking ref")
-                if not SHA_RE.fullmatch(head) or tracking in fetched:
-                    raise Refusal("Git returned an ambiguous fetched-ref inventory")
                 fetched[tracking] = head
         existing = self._direct_ref_inventory(checkout, prefix)
         updates = ["start"]
@@ -8400,6 +8406,44 @@ class _GitVcs:
                 raise Refusal("Git returned an ambiguous remote-ref inventory")
             refs[ref] = head
         return refs
+
+    def _parse_remote_ref_inventory(self, output: str, label: str) -> dict[str, str]:
+        refs: dict[str, str] = {}
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                raise Refusal(f"Git returned a malformed {label} inventory")
+            head, ref = fields
+            _validate_full_ref(ref, label)
+            if not SHA_RE.fullmatch(head) or ref in refs:
+                raise Refusal(f"Git returned an ambiguous {label} inventory")
+            refs[ref] = head
+        return refs
+
+    def _ls_remote_inventory(
+        self,
+        repository: Path,
+        url: str,
+        *,
+        refs: Sequence[str] = (),
+        heads_only: bool = False,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
+        environment = dict(env_overrides or {})
+        # ls-remote needs no repository. /dev/null is an explicit, immutable
+        # non-repository GIT_DIR, so a same-UID .git/config appearing below the
+        # temporary working directory cannot redirect the literal URL.
+        environment["GIT_DIR"] = "/dev/null"
+        arguments = ["ls-remote", "--refs"]
+        if heads_only:
+            arguments.append("--heads")
+        arguments.extend(("--", url, *refs))
+        result = self._run(
+            repository,
+            arguments,
+            env_overrides=environment,
+        )
+        return self._parse_remote_ref_inventory(result.stdout, "remote-ref")
 
     def _assert_no_push_urls(self, checkout: Path, remote: str) -> None:
         _validate_remote(remote)
@@ -8620,30 +8664,17 @@ class _GitVcs:
         *,
         env_overrides: Mapping[str, str],
     ) -> str | None:
-        result = self._run(
+        refs = self._ls_remote_inventory(
             isolated,
-            ["fetch-pack", "--no-progress", url, ref],
-            check=False,
+            url,
+            refs=(ref,),
             env_overrides=env_overrides,
         )
-        if result.returncode != 0:
-            missing = f"error: no such remote ref {ref}"
-            if not result.stdout.strip() and result.stderr.strip() == missing:
-                return None
-            detail = (result.stderr or result.stdout).strip()
-            raise Refusal(
-                f"cannot read authorized remote salvage ref {ref}"
-                + (f": {detail}" if detail else "")
-            )
-        lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
-        if not lines:
+        if not refs:
             return None
-        if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != ref:
+        if set(refs) != {ref}:
             raise Refusal(f"remote returned ambiguous content for salvage ref {ref}")
-        sha = lines[0][0]
-        if not SHA_RE.fullmatch(sha):
-            raise Refusal(f"remote salvage ref {ref} did not resolve to one full commit")
-        return sha
+        return refs[ref]
 
     def push_salvage(
         self,
