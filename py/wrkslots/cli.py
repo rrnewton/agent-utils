@@ -8284,23 +8284,67 @@ class _GitVcs:
 
     def fetch_remote(self, checkout: Path, remote: str, landed_ref: str) -> None:
         _validate_remote(remote)
-        self._remote_url_with_push_authority(checkout, remote)
         _validate_full_ref(landed_ref, "landed ref")
         prefix = f"refs/remotes/{remote}/"
         if not landed_ref.startswith(prefix):
             raise Refusal(f"landed ref must be under {prefix}: {landed_ref}")
-        self._run(
-            checkout,
-            [
-                "fetch",
-                "--no-auto-maintenance",
-                "--prune",
-                "--no-tags",
-                "--no-recurse-submodules",
-                remote,
-                f"+refs/heads/*:{prefix}*",
-            ],
+        with self._isolated_remote(checkout, remote) as (isolated, url, object_env):
+            self._run(
+                isolated,
+                [
+                    "fetch",
+                    "--no-auto-maintenance",
+                    "--prune",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--",
+                    url,
+                    f"+refs/heads/*:{prefix}*",
+                ],
+                env_overrides=object_env,
+            )
+            fetched = self._direct_ref_inventory(
+                isolated, prefix, env_overrides=object_env
+            )
+        existing = self._direct_ref_inventory(checkout, prefix)
+        updates = ["start"]
+        zero = "0" * 40
+        for ref, new_head in sorted(fetched.items()):
+            old_head = existing.get(ref, zero)
+            if old_head != new_head:
+                updates.append(f"update {ref} {new_head} {old_head}")
+        for ref, old_head in sorted(existing.items()):
+            if ref not in fetched:
+                updates.append(f"delete {ref} {old_head}")
+        if len(updates) > 1:
+            updates.extend(("prepare", "commit", ""))
+            self._run(checkout, ["update-ref", "--stdin"], input_text="\n".join(updates))
+
+    def _direct_ref_inventory(
+        self,
+        repository: Path,
+        prefix: str,
+        *,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
+        result = self._run(
+            repository,
+            ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", prefix],
+            env_overrides=env_overrides,
         )
+        refs: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split("\0")
+            if len(fields) != 3:
+                raise Refusal("Git returned a malformed remote-ref inventory")
+            ref, head, symbolic = fields
+            if symbolic:
+                continue
+            _validate_full_ref(ref, "remote-tracking ref")
+            if not SHA_RE.fullmatch(head) or ref in refs:
+                raise Refusal("Git returned an ambiguous remote-ref inventory")
+            refs[ref] = head
+        return refs
 
     def _assert_no_push_urls(self, checkout: Path, remote: str) -> None:
         _validate_remote(remote)
@@ -8339,6 +8383,20 @@ class _GitVcs:
                 "remove pushInsteadOf or other push-only redirection"
             )
         return urls[0]
+
+    @contextlib.contextmanager
+    def _isolated_remote(
+        self, checkout: Path, remote: str
+    ) -> Iterator[tuple[Path, str, Mapping[str, str]]]:
+        url = self._remote_url_with_push_authority(checkout, remote)
+        objects = self.common_directory(checkout) / "objects"
+        if objects.is_symlink() or not objects.is_dir():
+            raise Refusal(f"Git object directory is absent or unsafe: {objects}")
+        with tempfile.TemporaryDirectory(prefix="wrkslots-remote-") as temporary:
+            root = Path(temporary)
+            isolated = root / "network.git"
+            self._run(root, ["init", "--quiet", "--bare", str(isolated)])
+            yield isolated, url, {"GIT_OBJECT_DIRECTORY": str(objects)}
 
     def remote_url_sha256(self, checkout: Path, remote: str) -> str:
         url = self._remote_url_with_push_authority(checkout, remote)
@@ -8449,15 +8507,30 @@ class _GitVcs:
 
     def remote_ref_sha(self, checkout: Path, remote: str, ref: str) -> str | None:
         _validate_remote(remote)
-        self._remote_url_with_push_authority(checkout, remote)
         _validate_full_ref(ref, "remote salvage ref")
+        with self._isolated_remote(checkout, remote) as (isolated, url, object_env):
+            return self._remote_ref_sha_at_url(
+                isolated, url, ref, env_overrides=object_env
+            )
+
+    def _remote_ref_sha_at_url(
+        self,
+        isolated: Path,
+        url: str,
+        ref: str,
+        *,
+        env_overrides: Mapping[str, str],
+    ) -> str | None:
         result = self._run(
-            checkout, ["ls-remote", "--refs", remote, ref], check=False
+            isolated,
+            ["ls-remote", "--refs", "--", url, ref],
+            check=False,
+            env_overrides=env_overrides,
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             raise Refusal(
-                f"cannot read remote {remote!r} salvage ref {ref}"
+                f"cannot read authorized remote salvage ref {ref}"
                 + (f": {detail}" if detail else "")
             )
         lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
@@ -8473,22 +8546,32 @@ class _GitVcs:
     def push_salvage(
         self, checkout: Path, remote: str, commit: str, ref: str
     ) -> None:
-        self._remote_url_with_push_authority(checkout, remote)
-        existing = self.remote_ref_sha(checkout, remote, ref)
-        if existing is not None:
-            if existing != commit:
-                raise Refusal(
-                    f"remote salvage ref {ref} already names {existing}, not {commit}; "
-                    "preserve the checkout and choose a different recorded destination"
-                )
-            return
-        self._run(checkout, ["push", remote, f"{commit}:{ref}"])
-        observed = self.remote_ref_sha(checkout, remote, ref)
-        if observed != commit:
-            raise Refusal(
-                f"salvage push did not leave {ref} at {commit}; remote reports "
-                f"{observed or 'no ref'}. Preserve the checkout and retry"
+        _validate_remote(remote)
+        _validate_full_ref(ref, "remote salvage ref")
+        with self._isolated_remote(checkout, remote) as (isolated, url, object_env):
+            existing = self._remote_ref_sha_at_url(
+                isolated, url, ref, env_overrides=object_env
             )
+            if existing is not None:
+                if existing != commit:
+                    raise Refusal(
+                        f"remote salvage ref {ref} already names {existing}, not {commit}; "
+                        "preserve the checkout and choose a different recorded destination"
+                    )
+                return
+            self._run(
+                isolated,
+                ["push", "--", url, f"{commit}:{ref}"],
+                env_overrides=object_env,
+            )
+            observed = self._remote_ref_sha_at_url(
+                isolated, url, ref, env_overrides=object_env
+            )
+            if observed != commit:
+                raise Refusal(
+                    f"salvage push did not leave {ref} at {commit}; remote reports "
+                    f"{observed or 'no ref'}. Preserve the checkout and retry"
+                )
 
     def delete_branch_at(self, repository: Path, branch: str, expected_head: str) -> None:
         if not self.branch_exists(repository, branch):
@@ -10382,16 +10465,21 @@ def _salvage_one_checkout(
     *,
     path_override: Path | None = None,
     allow_detached: bool = False,
+    prepared: tuple[str, str, str, bool] | None = None,
 ) -> dict[str, object]:
     path = path_override or _stored_path(config, checkout.path, "checkout path")
-    head, status_digest, commit, dirty = _salvage_candidate(
-        config,
-        record,
-        checkout,
-        vcs,
-        path_override=path,
-        allow_detached=allow_detached,
-        verify_repository_membership=not allow_detached,
+    head, status_digest, commit, dirty = (
+        _salvage_candidate(
+            config,
+            record,
+            checkout,
+            vcs,
+            path_override=path,
+            allow_detached=allow_detached,
+            verify_repository_membership=not allow_detached,
+        )
+        if prepared is None
+        else prepared
     )
     vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
     if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
@@ -10442,6 +10530,23 @@ def _salvage_agent_slot(
         candidates.append((checkout, path, False))
         for submodule, path in _submodule_salvage_checkouts(config, checkout, vcs):
             candidates.append((submodule, path, True))
+    prepared = [
+        (
+            checkout,
+            path,
+            detached,
+            _salvage_candidate(
+                config,
+                record,
+                checkout,
+                vcs,
+                path_override=path,
+                allow_detached=detached,
+                verify_repository_membership=not detached,
+            ),
+        )
+        for checkout, path, detached in candidates
+    ]
     return tuple(
         _salvage_one_checkout(
             config,
@@ -10450,8 +10555,9 @@ def _salvage_agent_slot(
             vcs,
             path_override=path,
             allow_detached=detached,
+            prepared=facts,
         )
-        for checkout, path, detached in candidates
+        for checkout, path, detached, facts in prepared
     )
 
 
@@ -10464,20 +10570,25 @@ def _salvage_ownerless_checkout(
     *,
     path_override: Path | None = None,
     allow_detached: bool = False,
+    prepared: tuple[str, str, str, bool] | None = None,
 ) -> dict[str, object]:
     """Publish one ownerless checkout without asserting an owner, task, or handoff."""
 
     path = path_override or _stored_path(config, checkout.path, "ownerless checkout path")
-    head, status_digest, commit, dirty = _salvage_candidate(
-        config,
-        None,
-        checkout,
-        vcs,
-        path_override=path,
-        allow_detached=allow_detached,
-        verify_repository_membership=not allow_detached,
-        ownerless_slot=slot,
-        ownerless_recorded_at=recorded_at,
+    head, status_digest, commit, dirty = (
+        _salvage_candidate(
+            config,
+            None,
+            checkout,
+            vcs,
+            path_override=path,
+            allow_detached=allow_detached,
+            verify_repository_membership=not allow_detached,
+            ownerless_slot=slot,
+            ownerless_recorded_at=recorded_at,
+        )
+        if prepared is None
+        else prepared
     )
     vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
     if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
@@ -10528,17 +10639,38 @@ def _salvage_ownerless_worktree(
         config, checkout, vcs, path_override=path
     ):
         candidates.append((submodule, submodule_path, True))
+    slot = Path(authorization.path).name
+    prepared = [
+        (
+            candidate,
+            candidate_path,
+            detached,
+            _salvage_candidate(
+                config,
+                None,
+                candidate,
+                vcs,
+                path_override=candidate_path,
+                allow_detached=detached,
+                verify_repository_membership=not detached,
+                ownerless_slot=slot,
+                ownerless_recorded_at=authorization.recorded_at,
+            ),
+        )
+        for candidate, candidate_path, detached in candidates
+    ]
     return tuple(
         _salvage_ownerless_checkout(
             config,
-            Path(authorization.path).name,
+            slot,
             authorization.recorded_at,
             candidate,
             vcs,
             path_override=candidate_path,
             allow_detached=detached,
+            prepared=facts,
         )
-        for candidate, candidate_path, detached in candidates
+        for candidate, candidate_path, detached, facts in prepared
     )
 
 
@@ -10582,17 +10714,26 @@ def _assert_salvage_still_matches(
         else not expected_names <= set(by_name)
     ):
         raise StateError("salvage receipts do not name every selected checkout exactly once")
-    for checkout, path, allow_detached in targets:
-        receipt = by_name[checkout.name]
-        head, status_digest, commit, _dirty = _salvage_candidate(
-            config,
-            record,
+    prepared = [
+        (
             checkout,
-            vcs,
-            path_override=path,
-            allow_detached=allow_detached,
-            verify_repository_membership=not allow_detached,
+            path,
+            allow_detached,
+            _salvage_candidate(
+                config,
+                record,
+                checkout,
+                vcs,
+                path_override=path,
+                allow_detached=allow_detached,
+                verify_repository_membership=not allow_detached,
+            ),
         )
+        for checkout, path, allow_detached in targets
+    ]
+    for checkout, path, _allow_detached, facts in prepared:
+        receipt = by_name[checkout.name]
+        head, status_digest, commit, _dirty = facts
         expected = (
             _as_str(receipt.get("source_head"), "salvage receipt.source_head"),
             _as_str(receipt.get("status_sha256"), "salvage receipt.status_sha256"),
@@ -22993,20 +23134,29 @@ def _assert_ownerless_salvage_still_matches(
     )
     if len(candidates) != len(receipts):
         raise StateError("ownerless salvage receipts do not cover every checkout")
-    for (candidate, candidate_path, detached), receipt in zip(candidates, receipts):
+    slot = Path(authorization.path).name
+    prepared = [
+        (
+            candidate,
+            candidate_path,
+            _salvage_candidate(
+                config,
+                None,
+                candidate,
+                vcs,
+                path_override=candidate_path,
+                allow_detached=detached,
+                verify_repository_membership=not detached,
+                ownerless_slot=slot,
+                ownerless_recorded_at=authorization.recorded_at,
+            ),
+        )
+        for candidate, candidate_path, detached in candidates
+    ]
+    for (candidate, candidate_path, facts), receipt in zip(prepared, receipts):
         if receipt.get("checkout") != candidate.name:
             raise StateError("ownerless salvage receipt order changed")
-        head, status_digest, commit, _dirty = _salvage_candidate(
-            config,
-            None,
-            candidate,
-            vcs,
-            path_override=candidate_path,
-            allow_detached=detached,
-            verify_repository_membership=not detached,
-            ownerless_slot=Path(authorization.path).name,
-            ownerless_recorded_at=authorization.recorded_at,
-        )
+        head, status_digest, commit, _dirty = facts
         if (head, status_digest, commit) != (
             receipt.get("source_head"),
             receipt.get("status_sha256"),

@@ -11249,6 +11249,65 @@ def test_remote_authority_accepts_no_pushurl_and_refuses_override(
             vcs.assert_remote_url(repository, "origin", authorized_url)
 
 
+def test_salvage_push_ignores_pushurl_installed_at_network_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project, repository, authorized_remote = make_project(tmp_path)
+    evil_remote = tmp_path / "evil.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(evil_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commit = commit_local(repository, "local-only.txt", "preserve me\n", "local")
+    rescue_ref = "refs/heads/salvage/test-boundary"
+    original_run = wrkslots._GitVcs._run
+    network_calls: list[tuple[str, ...]] = []
+    mutated = False
+
+    def mutate_before_push(
+        repository_path: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal mutated
+        if args and args[0] in {"fetch", "push", "ls-remote"}:
+            network_calls.append(tuple(args))
+        if args and args[0] == "push" and not mutated:
+            git(repository, "config", "remote.origin.pushurl", str(evil_remote))
+            mutated = True
+        return original_run(
+            repository_path,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(mutate_before_push))
+    wrkslots._GitVcs().push_salvage(repository, "origin", commit, rescue_ref)
+
+    assert mutated is True
+    push = next(args for args in network_calls if args[0] == "push")
+    assert str(authorized_remote) in push
+    assert "origin" not in push
+    assert git(authorized_remote, "rev-parse", rescue_ref).stdout.strip() == commit
+    assert (
+        git(evil_remote, "show-ref", "--verify", "--quiet", rescue_ref, check=False)
+        .returncode
+        == 1
+    )
+    assert any(
+        args[0] == "ls-remote" and str(authorized_remote) in args
+        for args in network_calls
+    )
+
+
 def test_ignored_file_is_preserved_by_finish_refusal(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     (repository / ".gitignore").write_text("ignored.bin\n", encoding="utf-8")
@@ -11765,6 +11824,129 @@ def test_agent_reclaim_refuses_nested_push_redirect_before_network(
         ).stdout
         == ""
     )
+
+
+@pytest.mark.parametrize("nested_state", ("operation", "skip-worktree"))
+def test_agent_reclaim_materializes_all_nested_candidates_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    nested_state: str,
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    submodule_remote = tmp_path / "submodule.git"
+    submodule_source = tmp_path / "submodule-source"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(submodule_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "clone", str(submodule_remote), str(submodule_source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(submodule_source, "config", "user.name", "Wrkslots Test")
+    git(submodule_source, "config", "user.email", "wrkslots@example.invalid")
+    (submodule_source / "base.txt").write_text("base\n", encoding="utf-8")
+    git(submodule_source, "add", "base.txt")
+    git(submodule_source, "commit", "-m", "submodule base")
+    git(submodule_source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(submodule_remote),
+        "component",
+    )
+    git(repository, "commit", "-am", "add component")
+    git(repository, "push", "origin", "main")
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init --recursive"
+        ],
+    )
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    nested = tree / "component"
+    (tree / "seed.txt").write_text("dirty parent\n", encoding="utf-8")
+    if nested_state == "operation":
+        merge_head = Path(
+            git(
+                nested,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "MERGE_HEAD",
+            ).stdout.strip()
+        )
+        merge_head.write_text(git(nested, "rev-parse", "HEAD").stdout, encoding="utf-8")
+        expected = "unfinished Git operation"
+    else:
+        git(nested, "update-index", "--skip-worktree", "base.txt")
+        expected = "skip-worktree index state"
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(
+        wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
+    )
+    original_run = wrkslots._GitVcs._run
+    network_calls: list[tuple[str, ...]] = []
+
+    def forbid_network(
+        repository_path: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if args and args[0] in {"fetch", "push", "ls-remote"}:
+            network_calls.append(tuple(args))
+            raise AssertionError(f"network preceded complete candidate checks: {args[0]}")
+        return original_run(
+            repository_path,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(forbid_network))
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert rc == 3
+    assert expected in capsys.readouterr().err
+    assert network_calls == []
+    assert tree.is_dir()
+    assert (tree / "seed.txt").read_text(encoding="utf-8") == "dirty parent\n"
+    for bare in (remote, submodule_remote):
+        assert (
+            git(
+                bare,
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/salvage",
+            ).stdout
+            == ""
+        )
 
 
 def test_validate_slot_removes_dirty_checkout_without_salvage(tmp_path: Path) -> None:
