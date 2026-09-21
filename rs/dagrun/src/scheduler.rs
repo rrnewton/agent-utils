@@ -2522,32 +2522,50 @@ fn structured_test_counts_path(evidence: Option<&RunEvidence>) -> Option<std::pa
     )))
 }
 
-fn read_structured_test_counts(path: &std::path::Path) -> Option<CapturedTestResults> {
-    let bytes = std::fs::read(path).ok()?;
-    let report = TestResults::from_json_slice(&bytes).ok()?;
-    Some(CapturedTestResults {
+fn read_structured_test_counts(
+    path: &std::path::Path,
+) -> Result<Option<CapturedTestResults>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot read structured test results {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let report = TestResults::from_json_slice(&bytes).map_err(|error| {
+        format!(
+            "malformed structured test results {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(Some(CapturedTestResults {
         executed: Some(report.executed_tests),
         filtered: Some(report.filtered_tests),
         results: report.results,
-    })
+    }))
 }
 
 fn resolved_test_counts(
     structured_required: bool,
     path: Option<&std::path::Path>,
     captured: &[u8],
-) -> CapturedTestResults {
-    if let Some(counts) = path.and_then(read_structured_test_counts) {
-        return counts;
+) -> Result<CapturedTestResults, String> {
+    if let Some(path) = path {
+        if let Some(counts) = read_structured_test_counts(path)? {
+            return Ok(counts);
+        }
     }
     if structured_required {
-        CapturedTestResults {
+        Ok(CapturedTestResults {
             executed: None,
             filtered: None,
             results: None,
-        }
+        })
     } else {
-        captured_test_counts(captured)
+        Ok(captured_test_counts(captured))
     }
 }
 
@@ -3544,7 +3562,6 @@ fn run_step(ctx: StepCtx) {
         Some(c) => Some(c as i64),
         None => status.signal().map(|s| -(s as i64)),
     };
-    let ok = returncode == Some(0) && !timed_out && !cpu_timed_out;
 
     // The step's captured output -- both pipes, in arrival order -- for the summary + failure
     // detail. ONE tail, because there is one ring (see `step_capture`).
@@ -3555,11 +3572,25 @@ fn run_step(ctx: StepCtx) {
         (cap.tail(), cap.total, cap.dropped())
     };
     let summary = last_line(&combined);
-    let test_counts = resolved_test_counts(
+    let (test_counts, structured_test_results_error) = match resolved_test_counts(
         structured_test_counts_required,
         test_counts_path.as_deref(),
         &combined,
-    );
+    ) {
+        Ok(counts) => (counts, None),
+        Err(error) => (
+            CapturedTestResults {
+                executed: None,
+                filtered: None,
+                results: None,
+            },
+            Some(error),
+        ),
+    };
+    let ok = returncode == Some(0)
+        && !timed_out
+        && !cpu_timed_out
+        && structured_test_results_error.is_none();
     if let Some(path) = &test_counts_path {
         let _ = std::fs::remove_file(path);
     }
@@ -3704,6 +3735,10 @@ fn run_step(ctx: StepCtx) {
                 test_counts.filtered,
             )
         };
+        if let Some(error) = &structured_test_results_error {
+            outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
+            outcome.ok = false;
+        }
         outcome.test_results = test_counts.results;
         let reason = outcome.reason.clone();
         sh.done.insert(tag.clone(), outcome);
@@ -4499,7 +4534,7 @@ mod tests {
         .unwrap();
         let printed = b"running 999 tests\ntest result: ok. 999 passed; 0 failed; 0 filtered out\n";
         assert_eq!(
-            resolved_test_counts(true, Some(&path), printed),
+            resolved_test_counts(true, Some(&path), printed).unwrap(),
             CapturedTestResults {
                 executed: Some(2),
                 filtered: Some(11),
@@ -4509,9 +4544,32 @@ mod tests {
                 ]),
             }
         );
+        std::fs::write(
+            &path,
+            br#"{"schema":3,"executed_tests":6,"filtered_tests":0,"results":[{"id":"suite$ordinary","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"failed","detail":"exit 7"}]},{"id":"suite$cpu","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cpu_timeout","detail":"used 22000000us CPU"}]},{"id":"suite$wall","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"wall_timeout","detail":"ran 57000ms wall"}]},{"id":"suite$cancelled","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"cancelled","detail":"cancelled by signal 2"}]},{"id":"suite$infra","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"infrastructure_error","detail":"cpu.stat malformed"}]},{"id":"suite$no-result","result":"fail","attempts":1,"attempt_results":[{"attempt":1,"outcome":"no_result","detail":"producer reported cli-error: vector 13"}]}]}"#,
+        )
+        .unwrap();
+        let current = resolved_test_counts(true, Some(&path), printed).unwrap();
+        let outcomes = current
+            .results
+            .unwrap()
+            .into_iter()
+            .map(|result| result.attempt_results.unwrap()[0].outcome)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![
+                crate::test_results::TestAttemptOutcome::Failed,
+                crate::test_results::TestAttemptOutcome::CpuTimeout,
+                crate::test_results::TestAttemptOutcome::WallTimeout,
+                crate::test_results::TestAttemptOutcome::Cancelled,
+                crate::test_results::TestAttemptOutcome::InfrastructureError,
+                crate::test_results::TestAttemptOutcome::NoResult,
+            ]
+        );
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            resolved_test_counts(true, None, printed),
+            resolved_test_counts(true, None, printed).unwrap(),
             CapturedTestResults {
                 executed: None,
                 filtered: None,
@@ -4520,7 +4578,7 @@ mod tests {
             "a printed banner must not create receipt evidence in structured mode"
         );
         assert_eq!(
-            resolved_test_counts(false, None, printed),
+            resolved_test_counts(false, None, printed).unwrap(),
             CapturedTestResults {
                 executed: Some(999),
                 filtered: Some(0),
@@ -4528,6 +4586,12 @@ mod tests {
             },
             "clients that have not opted in retain the compatibility parser"
         );
+        std::fs::write(&path, br#"{"schema":3,"executed_tests":1}"#).unwrap();
+        let error = resolved_test_counts(true, Some(&path), printed)
+            .expect_err("a malformed current structured result must refuse");
+        assert!(error.contains("malformed structured test results"));
+        assert!(error.contains("structured-test-results-filtered_tests"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

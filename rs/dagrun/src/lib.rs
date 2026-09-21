@@ -59,8 +59,9 @@ pub use cgroup::{
     aggregate_slice_cpu_jobs, aggregate_slice_max_cpus, attempt_scope_reexec,
     expected_outer_cpu_count, expected_scope_runtime_max_s, install_scope_teardown,
     observe_own_containment, promised_unit, run_containment, verify_scope_runtime_max,
-    CgroupManager, Cgroups, ContainmentEvidence, ContainmentProof, RunContainment, ScopeAttempt,
-    FORCE_ATTEMPT_ENV,
+    CgroupManager, Cgroups, ContainmentEvidence, ContainmentProof, ManualCpuCgroup,
+    ManualCpuCgroupRoot, ManualCpuCgroupStatus, RunContainment, ScopeAttempt,
+    SharedCpuCgroupParent, FORCE_ATTEMPT_ENV,
 };
 pub use cli::{select_steps_by_labels, select_steps_by_tags};
 pub use estimates::{
@@ -128,7 +129,7 @@ pub use sweep::{
     machine_topology, parse_cpu_list, parse_target_duration, parse_widths, refine_width_grid,
     stable_topological_order, workload_digest, MachineTopology,
 };
-pub use test_results::{TestResult, TestResults};
+pub use test_results::{TestAttemptOutcome, TestAttemptResult, TestResult, TestResults};
 pub use viz::{to_ascii, to_dot};
 
 /// Command name used in diagnostics and version output.
