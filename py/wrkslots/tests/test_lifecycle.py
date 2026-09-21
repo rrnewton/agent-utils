@@ -6079,6 +6079,36 @@ def test_bounded_lsof_reports_installed_binary_file_and_alias_matches(
         terminate_process(process)
 
 
+_SOCKET_ORPHAN_NAMESPACE_DENIALS = frozenset({
+    "unshare: unshare failed: Operation not permitted",
+    "unshare: unshare failed: Permission denied",
+    "unshare: write failed /proc/self/uid_map: Operation not permitted",
+})
+
+
+def _socket_orphan_namespace_unavailable(returncode: int | None, stderr: str) -> bool:
+    return returncode not in (None, 0) and stderr.strip() in _SOCKET_ORPHAN_NAMESPACE_DENIALS
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    [
+        (1, "unshare: unshare failed: Operation not permitted\n", True),
+        (1, "unshare: unshare failed: Permission denied\n", True),
+        (1, "unshare: write failed /proc/self/uid_map: Operation not permitted\n", True),
+        (0, "unshare: write failed /proc/self/uid_map: Operation not permitted\n", False),
+        (1, "unshare: write failed /proc/self/gid_map: Operation not permitted\n", False),
+        (1, "unshare: write failed /proc/self/uid_map: Invalid argument\n", False),
+        (1, "unshare: write failed /proc/self/uid_map: Operation not permitted\nextra", False),
+    ],
+)
+def test_socket_orphan_namespace_unavailable_is_an_exact_classifier(
+    returncode: int, stderr: str, expected: bool,
+) -> None:
+    assert _socket_orphan_namespace_unavailable(returncode, stderr) is expected
+
+
 @pytest.mark.ordinary_environment
 @pytest.mark.parametrize("kind", ["cwd", "open", "hardlink", "symlink", "mapped", "socket", "socket-at", "socket-space", "socket-abstract", "socket-orphan", "eventfd"])
 def test_batch_census_isolated_real_file_alias_mapping_and_socket(
@@ -6156,12 +6186,8 @@ def test_batch_census_isolated_real_file_alias_mapping_and_socket(
         ready = process.stdout.readline()
         if ready != "ready\n":
             stdout_tail, stderr_text = process.communicate(timeout=5)
-            exact_capability_denials = {
-                "unshare: unshare failed: Operation not permitted",
-                "unshare: unshare failed: Permission denied",
-            }
             if (kind == "socket-orphan" and process.returncode != 0
-                    and stderr_text.strip() in exact_capability_denials):
+                    and _socket_orphan_namespace_unavailable(process.returncode, stderr_text)):
                 pytest.skip(f"user/network namespace unavailable: {stderr_text.strip()}")
             pytest.fail(
                 f"holder exited before readiness: rc={process.returncode}; "
