@@ -11277,9 +11277,9 @@ def test_salvage_push_ignores_pushurl_installed_at_network_boundary(
         env_overrides: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal mutated
-        if args and args[0] in {"fetch", "push", "ls-remote"}:
+        if args and args[0] in {"fetch-pack", "send-pack"}:
             network_calls.append(tuple(args))
-        if args and args[0] == "push" and not mutated:
+        if args and args[0] == "send-pack" and not mutated:
             git(repository, "config", "remote.origin.pushurl", str(evil_remote))
             mutated = True
         return original_run(
@@ -11296,7 +11296,7 @@ def test_salvage_push_ignores_pushurl_installed_at_network_boundary(
     vcs.push_salvage(repository, "origin", commit, rescue_ref, authority)
 
     assert mutated is True
-    push = next(args for args in network_calls if args[0] == "push")
+    push = next(args for args in network_calls if args[0] == "send-pack")
     assert str(authorized_remote) in push
     assert "origin" not in push
     assert git(authorized_remote, "rev-parse", rescue_ref).stdout.strip() == commit
@@ -11306,8 +11306,142 @@ def test_salvage_push_ignores_pushurl_installed_at_network_boundary(
         == 1
     )
     assert any(
-        args[0] == "ls-remote" and str(authorized_remote) in args
+        args[0] == "fetch-pack" and str(authorized_remote) in args
         for args in network_calls
+    )
+
+
+def test_salvage_push_refuses_redirect_in_isolated_config_at_network_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project, repository, authorized_remote = make_project(tmp_path)
+    evil_remote = tmp_path / "evil.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(evil_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commit = commit_local(repository, "local-only.txt", "preserve me\n", "local")
+    rescue_ref = "refs/heads/salvage/test-isolated-config-boundary"
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repository, "origin")
+    original_run = wrkslots._GitVcs._run
+    injected = False
+
+    def inject_isolated_redirect(
+        repository_path: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal injected
+        if args and args[0] == "send-pack" and not injected:
+            git(
+                repository_path,
+                "config",
+                f"url.{evil_remote}.pushInsteadOf",
+                authority.url,
+            )
+            injected = True
+        return original_run(
+            repository_path,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(
+        wrkslots._GitVcs, "_run", staticmethod(inject_isolated_redirect)
+    )
+    with pytest.raises(wrkslots.Refusal, match="isolated network Git config changed"):
+        vcs.push_salvage(repository, "origin", commit, rescue_ref, authority)
+
+    assert injected is True
+    for remote in (authorized_remote, evil_remote):
+        assert (
+            git(remote, "show-ref", "--verify", "--quiet", rescue_ref, check=False)
+            .returncode
+            == 1
+        )
+
+
+@pytest.mark.parametrize("operation", ("fetch", "read"))
+def test_salvage_reads_refuse_redirect_in_isolated_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    _project, repository, authorized_remote = make_project(tmp_path)
+    evil_remote = tmp_path / "evil.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(evil_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repository, "origin")
+    original_run = wrkslots._GitVcs._run
+    injected = False
+
+    def inject_isolated_redirect(
+        repository_path: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal injected
+        if args and args[0] == "fetch-pack" and not injected:
+            git(
+                repository_path,
+                "config",
+                f"url.{evil_remote}.insteadOf",
+                authority.url,
+            )
+            injected = True
+        return original_run(
+            repository_path,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(
+        wrkslots._GitVcs, "_run", staticmethod(inject_isolated_redirect)
+    )
+    with pytest.raises(wrkslots.Refusal, match="isolated network Git config changed"):
+        if operation == "fetch":
+            git(repository, "update-ref", "-d", "refs/remotes/origin/main")
+            vcs.fetch_remote(
+                repository,
+                "origin",
+                "refs/remotes/origin/main",
+                authority,
+            )
+        else:
+            vcs.remote_ref_sha(
+                repository,
+                "origin",
+                "refs/heads/salvage/not-present",
+                authority,
+            )
+
+    assert injected is True
+    assert (
+        git(
+            evil_remote,
+            "for-each-ref",
+            "--format=%(refname)",
+        ).stdout
+        == ""
     )
 
 
@@ -11815,7 +11949,7 @@ def test_agent_reclaim_refuses_nested_push_redirect_before_network(
         input_text: str | None = None,
         env_overrides: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        if args and args[0] in {"fetch", "push", "ls-remote"}:
+        if args and args[0] in {"fetch-pack", "send-pack"}:
             network_calls.append(tuple(args))
             raise AssertionError(f"network operation preceded pushurl refusal: {args[0]}")
         return original_run(
@@ -11938,7 +12072,7 @@ def test_agent_reclaim_materializes_all_nested_candidates_before_network(
         input_text: str | None = None,
         env_overrides: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        if args and args[0] in {"fetch", "push", "ls-remote"}:
+        if args and args[0] in {"fetch-pack", "send-pack"}:
             network_calls.append(tuple(args))
             raise AssertionError(f"network preceded complete candidate checks: {args[0]}")
         return original_run(

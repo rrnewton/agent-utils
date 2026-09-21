@@ -192,6 +192,9 @@ readback, or push, this authority check covers every parent checkout and initial
 repository in the salvage set. The exact URL and its digest are captured with each fully checked
 salvage candidate and are then the only destination used by isolated network Git commands. A later
 checkout-config change can only refuse the operation; it cannot choose a new network destination.
+The isolated transport uses plumbing commands that do not apply URL rewrite configuration and
+binds the fresh repository's config bytes before execution; changing that config also refuses before
+the network command starts.
 
 When `with-proxy` is installed on `PATH`, Wrkslots uses it for Git fetches, pushes, remote ref
 readback, and post-provision hooks. The hook's children, including recursive submodule commands,

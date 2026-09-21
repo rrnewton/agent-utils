@@ -49,6 +49,14 @@ _VALIDATE_BATCH_SEAL_SCHEMA = 1
 _VALIDATION_REMOVAL_PROOF_SCHEMA = 1
 _VALIDATION_REMOVAL_PROOF_BYTES_LIMIT = 64 * 1024
 _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT = 16 * 1024 * 1024
+_NETWORK_CONFIG_SHA256_ENV = "WRKSLOTS_NETWORK_CONFIG_SHA256"
+_NETWORK_CONFIG_BYTES_LIMIT = 1024 * 1024
+_NETWORK_CONFIG = (
+    b"[core]\n"
+    b"\trepositoryformatversion = 0\n"
+    b"\tfilemode = true\n"
+    b"\tbare = true\n"
+)
 _VALIDATION_REMOVAL_ARTIFACT_ROLES = frozenset(
     {"run-record", "service-result", "producer-schema", "scorecard-handoff"}
 )
@@ -7947,9 +7955,32 @@ class _GitVcs:
         env["GIT_CONFIG_GLOBAL"] = "/dev/null"
         env["GIT_CONFIG_SYSTEM"] = "/dev/null"
         env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        expected_network_config = (
+            env_overrides.get(_NETWORK_CONFIG_SHA256_ENV)
+            if env_overrides is not None
+            else None
+        )
         if env_overrides:
             env.update(env_overrides)
-        network_operation = bool(args and args[0] in {"fetch", "push", "ls-remote"})
+        env.pop(_NETWORK_CONFIG_SHA256_ENV, None)
+        network_operation = bool(
+            args
+            and args[0]
+            in {"fetch", "push", "ls-remote", "fetch-pack", "send-pack"}
+        )
+        if expected_network_config is not None:
+            observed_network_config = hashlib.sha256(
+                _read_bounded_regular_file(
+                    repository / "config",
+                    "isolated network Git config",
+                    _NETWORK_CONFIG_BYTES_LIMIT,
+                )
+            ).hexdigest()
+            if observed_network_config != expected_network_config:
+                raise Refusal(
+                    "isolated network Git config changed before execution; preserve the "
+                    "checkout and retry"
+                )
         command = [
             "git",
             "--no-replace-objects",
@@ -8306,23 +8337,30 @@ class _GitVcs:
             isolated,
             object_env,
         ):
-            self._run(
+            fetched_result = self._run(
                 isolated,
                 [
-                    "fetch",
-                    "--no-auto-maintenance",
-                    "--prune",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                    "--",
+                    "fetch-pack",
+                    "--no-progress",
+                    "--all",
                     authority.url,
-                    f"+refs/heads/*:{prefix}*",
                 ],
                 env_overrides=object_env,
             )
-            fetched = self._direct_ref_inventory(
-                isolated, prefix, env_overrides=object_env
-            )
+            fetched: dict[str, str] = {}
+            for line in fetched_result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) != 2:
+                    raise Refusal("Git returned a malformed fetched-ref inventory")
+                head, ref = fields
+                heads_prefix = "refs/heads/"
+                if not ref.startswith(heads_prefix):
+                    continue
+                tracking = prefix + ref.removeprefix(heads_prefix)
+                _validate_full_ref(tracking, "remote-tracking ref")
+                if not SHA_RE.fullmatch(head) or tracking in fetched:
+                    raise Refusal("Git returned an ambiguous fetched-ref inventory")
+                fetched[tracking] = head
         existing = self._direct_ref_inventory(checkout, prefix)
         updates = ["start"]
         zero = "0" * 40
@@ -8403,6 +8441,10 @@ class _GitVcs:
 
     def remote_authority(self, checkout: Path, remote: str) -> _RemoteAuthority:
         url = self._remote_url_with_push_authority(checkout, remote)
+        if url.startswith("-"):
+            raise Refusal(
+                f"remote {remote!r} URL cannot begin with '-' for isolated transport"
+            )
         return _RemoteAuthority(
             url=url,
             sha256=hashlib.sha256(url.encode("utf-8")).hexdigest(),
@@ -8432,8 +8474,20 @@ class _GitVcs:
         with tempfile.TemporaryDirectory(prefix="wrkslots-remote-") as temporary:
             root = Path(temporary)
             isolated = root / "network.git"
-            self._run(root, ["init", "--quiet", "--bare", str(isolated)])
-            yield isolated, {"GIT_OBJECT_DIRECTORY": str(objects)}
+            for directory in (
+                isolated / "objects" / "info",
+                isolated / "objects" / "pack",
+                isolated / "refs" / "heads",
+                isolated / "refs" / "tags",
+            ):
+                directory.mkdir(parents=True, exist_ok=False)
+            (isolated / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+            (isolated / "config").write_bytes(_NETWORK_CONFIG)
+            config_digest = hashlib.sha256(_NETWORK_CONFIG).hexdigest()
+            yield isolated, {
+                "GIT_OBJECT_DIRECTORY": str(objects),
+                _NETWORK_CONFIG_SHA256_ENV: config_digest,
+            }
 
     def remote_url_sha256(self, checkout: Path, remote: str) -> str:
         return self.remote_authority(checkout, remote).sha256
@@ -8568,11 +8622,14 @@ class _GitVcs:
     ) -> str | None:
         result = self._run(
             isolated,
-            ["ls-remote", "--refs", "--", url, ref],
+            ["fetch-pack", "--no-progress", url, ref],
             check=False,
             env_overrides=env_overrides,
         )
         if result.returncode != 0:
+            missing = f"error: no such remote ref {ref}"
+            if not result.stdout.strip() and result.stderr.strip() == missing:
+                return None
             detail = (result.stderr or result.stdout).strip()
             raise Refusal(
                 f"cannot read authorized remote salvage ref {ref}"
@@ -8614,7 +8671,7 @@ class _GitVcs:
                 return
             self._run(
                 isolated,
-                ["push", "--", authority.url, f"{commit}:{ref}"],
+                ["send-pack", authority.url, f"{commit}:{ref}"],
                 env_overrides=object_env,
             )
             observed = self._remote_ref_sha_at_url(

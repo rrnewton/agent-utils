@@ -115,7 +115,7 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
 
     commands = proxy_commands(log)
     assert [command[command.index("-C") + 2] for command in commands] == [
-        "fetch", "ls-remote", "push", "ls-remote"
+        "fetch-pack", "fetch-pack", "send-pack", "fetch-pack"
     ]
     assert all(command[:4] == [
         "git", "--no-replace-objects", "-c", "core.useReplaceRefs=false"
@@ -128,8 +128,11 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
     )
     fetch = commands[0]
     operation = fetch.index("-C") + 2
-    assert fetch[operation:operation + 2] == ["fetch", "--no-auto-maintenance"]
-    assert all("--no-auto-maintenance" not in command for command in commands[1:])
+    assert fetch[operation:operation + 3] == [
+        "fetch-pack",
+        "--no-progress",
+        "--all",
+    ]
 
 
 def test_github_credential_helper_works_with_global_git_config_disabled(
@@ -211,7 +214,7 @@ def test_create_hooks_and_recursive_submodules_inherit_wrapper_environment(
     assert len(lifecycle.active_slots(project)) == 1
     commands = proxy_commands(log)
     assert [command[0] for command in commands] == ["git", "/bin/sh", "/bin/sh"]
-    assert commands[0][commands[0].index("-C") + 2] == "fetch"
+    assert commands[0][commands[0].index("-C") + 2] == "fetch-pack"
     assert secret not in made.stdout + made.stderr + log.read_text(encoding="utf-8")
 
 
@@ -231,7 +234,7 @@ def test_failed_fetch_wrapper_never_retries_direct_or_registers_slot(
     assert not lifecycle.create_journal_path(project).exists()
     commands = proxy_commands(log)
     assert len(commands) == 1
-    assert commands[0][commands[0].index("-C") + 2] == "fetch"
+    assert commands[0][commands[0].index("-C") + 2] == "fetch-pack"
 
 
 def test_failed_hook_wrapper_preserves_journal_and_recovery_uses_wrapper(
