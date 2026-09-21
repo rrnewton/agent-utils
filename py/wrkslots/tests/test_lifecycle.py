@@ -2134,6 +2134,31 @@ def git_metadata_snapshot(checkout: Path) -> dict[str, tuple[int, int, int, str]
     return snapshot
 
 
+def exact_tree_snapshot(
+    root: Path,
+) -> dict[str, tuple[int, int, int, int, int, bytes]]:
+    """Capture node identities and bytes without following symbolic links."""
+
+    snapshot: dict[str, tuple[int, int, int, int, int, bytes]] = {}
+    for path in (root, *sorted(root.rglob("*"))):
+        metadata = path.lstat()
+        if path.is_symlink():
+            payload = os.fsencode(os.readlink(path))
+        elif path.is_file():
+            payload = path.read_bytes()
+        else:
+            payload = b""
+        snapshot[path.relative_to(root.parent).as_posix()] = (
+            metadata.st_dev,
+            metadata.st_ino,
+            stat.S_IFMT(metadata.st_mode),
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            payload,
+        )
+    return snapshot
+
+
 @pytest.mark.ordinary_environment
 def test_run1773_historical_frozen_checkout_is_retained_without_blocking_entry(
     tmp_path: Path,
@@ -3203,13 +3228,13 @@ def test_create_refuses_live_owner_outside_the_invoking_coordinator(
         terminate_process_id(owner_pid)
 
 
-def test_recover_removes_only_evidenced_completed_legacy_validate_checkout(
+def test_recover_preserves_evidenced_completed_legacy_validate_checkout(
     tmp_path: Path,
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     checkout_path, record_path = prepare_legacy_validate_checkout(project, repository)
 
-    recovered = command(
+    refused = command(
         project,
         "recover",
         "--coordinator-pid",
@@ -3222,17 +3247,15 @@ def test_recover_removes_only_evidenced_completed_legacy_validate_checkout(
         repository.relative_to(project).as_posix(),
     )
 
-    assert recovered.returncode == 0, recovered.stderr
-    assert "recovered ownerless validation checkout" in recovered.stdout
-    assert not checkout_path.exists()
-    assert checkout_path.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+    assert refused.returncode == 3
+    assert "ownerless linked validation checkout recovery is disabled" in refused.stderr
+    assert checkout_path.is_dir()
+    assert checkout_path.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
     assert active_slots(project) == []
-    config = wrkslots._load_config(str(project), "testhost")
-    events = wrkslots._load_events(config)
-    assert any(event["kind"] == "ownerless-validate-path-removed" for event in events)
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
-def test_ownerless_validate_batch_shares_one_census_and_removes_unheld_checkouts(
+def test_ownerless_validate_batch_shares_one_census_and_preserves_checkouts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -3299,16 +3322,20 @@ def test_ownerless_validate_batch_shares_one_census_and_removes_unheld_checkouts
     report = json.loads(capsys.readouterr().out)
     assert report["process_censuses"] == 1
     assert report["shared_process_censuses"] == 1
-    assert report["same_uid_process_censuses"] == 2
-    assert report["removed"] == [
-        {"checkout": first.relative_to(project).as_posix()},
-        {"checkout": second.relative_to(project).as_posix()},
+    assert report["same_uid_process_censuses"] == 0
+    assert report["removed"] == []
+    assert [item["checkout"] for item in report["retained"]] == [
+        first.relative_to(project).as_posix(),
+        second.relative_to(project).as_posix(),
     ]
-    assert report["retained"] == []
+    assert all(
+        "ownerless linked validation checkout recovery is disabled" in item["reason"]
+        for item in report["retained"]
+    )
     assert shared_calls == [(first, second)]
-    assert len(fresh_calls) == 2
-    assert not first.exists()
-    assert not second.exists()
+    assert fresh_calls == []
+    assert first.is_dir()
+    assert second.is_dir()
 
 
 def test_ownerless_batch_classification_is_read_only_beside_live_dirty_create(
@@ -5897,6 +5924,19 @@ def test_frozen_validate_checkout_flag_is_documented_in_both_help_forms(
     assert "--frozen-validate-checkout" in helped.stdout
 
 
+def test_recover_help_documents_disabled_linked_validation_cleanup(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+
+    helped = raw_command(project, "recover", "--help")
+
+    assert helped.returncode == 0
+    normalized = " ".join(helped.stdout.split())
+    assert "refuses destructive recovery" in normalized
+    assert "same-UID replacement" in normalized
+
+
 def test_batched_lsof_census_attributes_live_process_to_exact_checkout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6502,7 +6542,7 @@ def test_batch_census_two_selected_trees_cannot_mask_socket_holder(
         terminate_process(process)
 
 
-def test_ownerless_validate_batch_retains_shared_census_use_but_removes_other(
+def test_ownerless_validate_batch_retains_shared_census_use_and_other(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -6558,17 +6598,19 @@ def test_ownerless_validate_batch_retains_shared_census_use_but_removes_other(
 
     assert rc == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["removed"] == [
-        {"checkout": unused.relative_to(project).as_posix()}
-    ]
-    assert len(report["retained"]) == 1
-    assert report["retained"][0]["checkout"] == held.relative_to(project).as_posix()
-    assert f"live process {os.getpid()}" in report["retained"][0]["reason"]
+    assert report["removed"] == []
+    assert len(report["retained"]) == 2
+    retained = {item["checkout"]: item["reason"] for item in report["retained"]}
+    assert f"live process {os.getpid()}" in retained[held.relative_to(project).as_posix()]
+    assert (
+        "ownerless linked validation checkout recovery is disabled"
+        in retained[unused.relative_to(project).as_posix()]
+    )
     assert held.is_dir()
-    assert not unused.exists()
+    assert unused.is_dir()
 
 
-def test_ownerless_validate_batch_fresh_census_catches_late_same_uid_use(
+def test_ownerless_validate_batch_refuses_before_fresh_same_uid_census(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -6616,8 +6658,11 @@ def test_ownerless_validate_batch_fresh_census_catches_late_same_uid_use(
     report = json.loads(capsys.readouterr().out)
     assert report["removed"] == []
     assert len(report["retained"]) == 1
-    assert "live process 4343" in report["retained"][0]["reason"]
-    assert report["same_uid_process_censuses"] == 1
+    assert (
+        "ownerless linked validation checkout recovery is disabled"
+        in report["retained"][0]["reason"]
+    )
+    assert report["same_uid_process_censuses"] == 0
     assert checkout.is_dir()
 
 
@@ -6709,12 +6754,12 @@ def test_recover_refuses_legacy_validate_checkout_without_completed_result(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
-def test_recover_resumes_legacy_validate_removal_after_checkout_disappears(
+def test_recover_does_not_start_legacy_validate_removal(
     tmp_path: Path,
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     checkout_path, record_path = prepare_legacy_validate_checkout(project, repository)
-    interrupted = command(
+    refused = command(
         project,
         "recover",
         "--coordinator-pid",
@@ -6727,19 +6772,10 @@ def test_recover_resumes_legacy_validate_removal_after_checkout_disappears(
         repository.relative_to(project).as_posix(),
         env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-remove"},
     )
-    assert interrupted.returncode == 86
-    assert not checkout_path.exists()
+    assert refused.returncode == 3
+    assert "ownerless linked validation checkout recovery is disabled" in refused.stderr
+    assert checkout_path.is_dir()
     journal = control_directory(project) / "ACTIVE.testhost.journal"
-    assert journal.is_file()
-
-    recovered = raw_command(
-        project,
-        "recover",
-        "--coordinator-pid",
-        str(os.getpid()),
-    )
-
-    assert recovered.returncode == 0, recovered.stderr
     assert not journal.exists()
     assert active_slots(project) == []
 
@@ -6844,7 +6880,7 @@ def test_recover_ownerless_validate_checkout_requires_explicit_authority(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
-def test_recover_ownerless_validate_checkout_removes_clean_terminal_worktree(
+def test_recover_ownerless_validate_checkout_preserves_clean_terminal_worktree(
     tmp_path: Path,
 ) -> None:
     project, repository, _remote = make_project(
@@ -6857,7 +6893,7 @@ def test_recover_ownerless_validate_checkout_removes_clean_terminal_worktree(
     git(repository, "worktree", "add", "--detach", str(target), "origin/main")
     record = prepare_terminal_validation_record(project, target, field="checkout")
 
-    recovered = command(
+    refused = command(
         project,
         "recover",
         "--coordinator-pid",
@@ -6870,14 +6906,433 @@ def test_recover_ownerless_validate_checkout_removes_clean_terminal_worktree(
         repository.relative_to(project).as_posix(),
     )
 
-    assert recovered.returncode == 0, recovered.stderr
-    assert not target.exists()
-    assert target.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+    assert refused.returncode == 3
+    assert "ownerless linked validation checkout recovery is disabled" in refused.stderr
+    assert target.is_dir()
+    assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
     assert active_slots(project) == []
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
+
+def test_recover_ownerless_validate_checkout_refuses_hidden_dirty_submodule(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    submodule_remote = tmp_path / "submodule.git"
+    submodule_source = tmp_path / "submodule-source"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(submodule_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "clone", str(submodule_remote), str(submodule_source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(submodule_source, "config", "user.name", "Wrkslots Test")
+    git(submodule_source, "config", "user.email", "wrkslots@example.invalid")
+    (submodule_source / "base.txt").write_text("base\n", encoding="utf-8")
+    git(submodule_source, "add", "base.txt")
+    git(submodule_source, "commit", "-m", "submodule base")
+    git(submodule_source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(submodule_remote),
+        "component",
+    )
+    git(repository, "commit", "-am", "add component")
+    git(repository, "push", "origin", "main")
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    git(
+        target,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    (target / "component" / "untracked.txt").write_text(
+        "must survive\n", encoding="utf-8"
+    )
+    git(target, "config", "submodule.component.ignore", "all")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert "has initialized submodules; preserve it" in refused.stderr
+    assert (target / "component" / "untracked.txt").read_text() == "must survive\n"
+    assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+def test_ownerless_linked_checkout_never_runs_git_through_root_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    (repository / ".gitattributes").write_text(
+        "seed.txt filter=uid-probe\n", encoding="utf-8"
+    )
+    git(repository, "add", ".gitattributes")
+    git(repository, "commit", "-m", "add filter fixture")
+    git(repository, "push", "origin", "main")
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    marker = tmp_path / "filter-uid"
+    filter_script = tmp_path / "filter-probe.sh"
+    filter_script.write_text(
+        f"#!/bin/sh\nid -u > {marker}\ncat\n", encoding="utf-8"
+    )
+    filter_script.chmod(0o755)
+    git(target, "config", "filter.uid-probe.clean", str(filter_script))
+    os.utime(target / "seed.txt", None)
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    original_root_command = wrkslots._run_root_owned_command
+
+    def forbid_root_git(
+        program: Path,
+        arguments: Sequence[str],
+        *,
+        input_data: bytes | None = None,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+    ) -> tuple[int, bytes, bytes]:
+        assert program.name != "git", arguments
+        return original_root_command(
+            program, arguments, input_data=input_data, budget=budget
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", forbid_root_git)
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--ownerless-validate-checkout",
+            target.relative_to(project).as_posix(),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert "ownerless linked validation checkout recovery is disabled" in capsys.readouterr().err
+    if marker.exists():
+        assert marker.read_text(encoding="utf-8").strip() == str(os.geteuid())
+    assert target.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+def test_ownerless_linked_checkout_preserves_post_check_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    displaced = target.with_name(f"{target.name}.original")
+    original_facts = wrkslots._validation_checkout_facts
+
+    def replace_after_facts(
+        config: wrkslots.Config,
+        checkout_path: Path,
+        repository_path: Path,
+        *,
+        expected_head: str | None = None,
+        expected_remote: str | None = None,
+        batch_cleanup: wrkslots._OwnerlessValidationBatchContext | None = None,
+        fresh_same_uid: bool = False,
+        standalone: bool = False,
+        remote_observation_repository: Path | None = None,
+        require_remote_containment: bool = True,
+    ) -> tuple[str, str]:
+        result = original_facts(
+            config,
+            checkout_path,
+            repository_path,
+            expected_head=expected_head,
+            expected_remote=expected_remote,
+            batch_cleanup=batch_cleanup,
+            fresh_same_uid=fresh_same_uid,
+            standalone=standalone,
+            remote_observation_repository=remote_observation_repository,
+            require_remote_containment=require_remote_containment,
+        )
+        target.rename(displaced)
+        target.mkdir()
+        (target / "important-untracked").write_text("preserve me\n", encoding="utf-8")
+        return result
+
+    def forbid_remove(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("linked checkout removal must be unreachable")
+
+    monkeypatch.setattr(wrkslots, "_validation_checkout_facts", replace_after_facts)
+    monkeypatch.setattr(wrkslots._GitVcs, "remove_worktree", forbid_remove)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--ownerless-validate-checkout",
+            target.relative_to(project).as_posix(),
+            "--completed-record",
+            record.relative_to(project).as_posix(),
+            "--repository",
+            repository.relative_to(project).as_posix(),
+        ]
+    )
+
+    assert rc == 3
+    assert "ownerless linked validation checkout recovery is disabled" in capsys.readouterr().err
+    assert (target / "important-untracked").read_text() == "preserve me\n"
+    assert displaced.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+def literal_e360_schema_two_ownerless_checkout_journal(
+    project: Path,
+    repository: Path,
+    target: Path,
+    active: Path,
+    record: Path,
+    fenced: Path,
+    identity: tuple[int, int, int],
+    phase: str,
+) -> bytes:
+    """Encode the exact e360 schema-2 shape without product serializers."""
+
+    actor = wrkslots._capture_caller_process(os.getpid(), "test coordinator")
+    remote_url = git(active, "remote", "get-url", "--all", "origin").stdout.strip()
+    authorization = {
+        "target_kind": "checkout",
+        "path": target.relative_to(project).as_posix(),
+        "identity": list(identity),
+        "actor": {
+            "pid": actor.pid,
+            "start_ticks": actor.start_ticks,
+            "boot_id": actor.boot_id,
+            "host_id": actor.host_id,
+            "cgroup_path": actor.cgroup_path,
+        },
+        "evidence": {
+            "kind": "terminal-record",
+            "path": record.relative_to(project).as_posix(),
+            "sha256": hashlib.sha256(record.read_bytes()).hexdigest(),
+        },
+        "no_authored_work": True,
+        "no_live_use": True,
+        "repository": repository.relative_to(project).as_posix(),
+        "head": git(active, "rev-parse", "HEAD").stdout.strip(),
+        "remote_url_sha256": hashlib.sha256(remote_url.encode("utf-8")).hexdigest(),
+        "parent_identity": None,
+    }
+    journal = {
+        "schema": 2,
+        "kind": "ownerless-validate-remove",
+        "machine": "testhost",
+        "slot": target.name,
+        "phase": phase,
+        "fenced": fenced.relative_to(project).as_posix(),
+        "authorization": authorization,
+    }
+    return (json.dumps(journal, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+@pytest.mark.parametrize("phase", ("prepared", "fenced"))
+def test_literal_e360_schema_two_ownerless_checkout_journal_is_preserved(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    identity = wrkslots._open_directory_identity(target, "test checkout")
+    fenced = target.with_name(f".{target.name}.ownerless-validate.{'a' * 32}")
+    active = target
+    if phase == "fenced":
+        target.rename(fenced)
+        git(repository, "worktree", "repair", str(fenced))
+        active = fenced
+    (active / "important-after-journal-check").write_text(
+        "preserve me\n", encoding="utf-8"
+    )
+    journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+    journal_contents = literal_e360_schema_two_ownerless_checkout_journal(
+        project,
+        repository,
+        target,
+        active,
+        record,
+        fenced,
+        identity,
+        phase,
+    )
+    journal_path.write_bytes(journal_contents)
+    git_directory = Path(
+        git(active, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip()
+    )
+    checkout_before = exact_tree_snapshot(active)
+    admin_before = exact_tree_snapshot(git_directory)
+    registrations_before = wrkslots._GitVcs().listed_worktrees(repository)
+
+    refused = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert refused.returncode == 3
+    assert "ownerless linked validation checkout recovery is disabled" in refused.stderr
+    assert journal_path.read_bytes() == journal_contents
+    assert exact_tree_snapshot(active) == checkout_before
+    assert exact_tree_snapshot(git_directory) == admin_before
+    assert wrkslots._GitVcs().listed_worktrees(repository) == registrations_before
+    assert target.is_dir() == (phase == "prepared")
+    assert fenced.is_dir() == (phase == "fenced")
+
+
+def test_literal_e360_removed_journal_ignores_replacement_content(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    identity = wrkslots._open_directory_identity(target, "test checkout")
+    fenced = target.with_name(f".{target.name}.ownerless-validate.{'b' * 32}")
+    journal_contents = literal_e360_schema_two_ownerless_checkout_journal(
+        project,
+        repository,
+        target,
+        target,
+        record,
+        fenced,
+        identity,
+        "removed",
+    )
+    original_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        git(repository, "worktree", "remove", "--force", "--", str(target))
+        target.mkdir()
+    finally:
+        os.close(original_fd)
+    (target / ".git").mkdir()
+    (target / ".git" / "important-admin-replacement").write_text(
+        "do not touch\n", encoding="utf-8"
+    )
+    (target / "important-untracked").write_text("preserve me\n", encoding="utf-8")
+    replacement_before = exact_tree_snapshot(target)
+    journal_path = control_directory(project) / "ACTIVE.testhost.journal"
+    journal_path.write_bytes(journal_contents)
+
+    recovered = raw_command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not journal_path.exists()
+    assert exact_tree_snapshot(target) == replacement_before
+    assert fenced.exists() is False
+    config = wrkslots._load_config(str(project), "testhost")
+    events = [
+        event
+        for event in wrkslots._load_events(config)
+        if event["kind"] == "ownerless-validate-path-removed"
+    ]
+    assert len(events) == 1
+
+
+def test_recover_ownerless_validate_checkout_preserves_recordless_legacy_worktree(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "old-one-off-review"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    target.chmod(0o755)
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--recovery-note",
+        "no retained run record names this historical checkout",
+    )
+
+    assert refused.returncode == 3
+    assert "ownerless linked validation checkout recovery is disabled" in refused.stderr
+    assert target.is_dir()
+    assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    assert active_slots(project) == []
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 @pytest.mark.parametrize("schema_version", (2, 4))
-def test_legacy_validate_checkout_accepts_exact_validation_removal_proof(
+def test_legacy_validate_checkout_preserves_exact_validation_removal_proof(
     tmp_path: Path, schema_version: int
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
@@ -6892,7 +7347,7 @@ def test_legacy_validate_checkout_accepts_exact_validation_removal_proof(
         run_record=record_path,
     )
 
-    recovered = command(
+    refused = command(
         project,
         "recover",
         "--coordinator-pid",
@@ -6907,16 +7362,17 @@ def test_legacy_validate_checkout_accepts_exact_validation_removal_proof(
         manifest.relative_to(project).as_posix(),
     )
 
-    assert recovered.returncode == 0, recovered.stderr
-    assert not checkout_path.exists()
-    assert checkout_path.absolute() not in wrkslots._GitVcs().listed_worktrees(
+    assert refused.returncode == 3
+    assert "ownerless linked validation checkout recovery is disabled" in refused.stderr
+    assert checkout_path.is_dir()
+    assert checkout_path.absolute() in wrkslots._GitVcs().listed_worktrees(
         repository
     )
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
-def test_ownerless_validation_rechecks_proof_after_private_seal(
+def test_ownerless_validation_does_not_enter_private_seal(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project, repository, _remote = make_project(
@@ -6935,39 +7391,7 @@ def test_ownerless_validation_rechecks_proof_after_private_seal(
         checkout_path=target,
         run_record=record,
     )
-    original_recheck = wrkslots._recheck_validation_removal_proof
-
-    def change_result_before_recheck(
-        config: wrkslots.Config,
-        proof: wrkslots._ValidationRemovalProof,
-        *,
-        expected_slot: str,
-        expected_generation: int | None,
-        canonical_slot: Path,
-        active_slot: Path,
-        canonical_checkout: Path,
-        expected_head: str,
-        target_kind: str = "checkout",
-        repository: Path | None = None,
-    ) -> None:
-        contents = artifacts["service-result"].read_bytes()
-        artifacts["service-result"].write_bytes(b"X" + contents[1:])
-        original_recheck(
-            config,
-            proof,
-            expected_slot=expected_slot,
-            expected_generation=expected_generation,
-            canonical_slot=canonical_slot,
-            active_slot=active_slot,
-            canonical_checkout=canonical_checkout,
-            expected_head=expected_head,
-            target_kind=target_kind,
-            repository=repository,
-        )
-
-    monkeypatch.setattr(
-        wrkslots, "_recheck_validation_removal_proof", change_result_before_recheck
-    )
+    result_before = artifacts["service-result"].read_bytes()
 
     rc = wrkslots.main(
         [
@@ -6989,14 +7413,15 @@ def test_ownerless_validation_rechecks_proof_after_private_seal(
     )
 
     assert rc == 3
-    assert "service-result changed bytes" in capsys.readouterr().err
+    assert "ownerless linked validation checkout recovery is disabled" in capsys.readouterr().err
+    assert artifacts["service-result"].read_bytes() == result_before
     assert target.is_dir()
     assert stat.S_IMODE(target.stat().st_mode) != 0o700
     assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
-def test_ownerless_validation_proof_seal_recovers_after_interruption(
+def test_ownerless_validation_proof_route_preserves_without_journaling(
     tmp_path: Path,
 ) -> None:
     project, repository, _remote = make_project(
@@ -7029,24 +7454,17 @@ def test_ownerless_validation_proof_seal_recovers_after_interruption(
         manifest.relative_to(project).as_posix(),
     )
 
-    interrupted = command(
+    refused = command(
         project,
         *arguments,
         env={
             "WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validation-proof-seal"
         },
     )
-    assert interrupted.returncode == 86
+    assert refused.returncode == 3
+    assert "ownerless linked validation checkout recovery is disabled" in refused.stderr
     assert target.is_dir()
-    assert stat.S_IMODE(target.stat().st_mode) == 0o700
-    assert (control_directory(project) / "ACTIVE.testhost.journal").is_file()
-
-    recovered = raw_command(
-        project, "recover", "--coordinator-pid", str(os.getpid())
-    )
-
-    assert recovered.returncode == 0, recovered.stderr
-    assert not target.exists()
+    assert stat.S_IMODE(target.stat().st_mode) != 0o700
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
@@ -7085,7 +7503,7 @@ def test_ownerless_validation_blocking_status_preserves_every_other_record(
     ) == record
 
 
-def test_recover_ownerless_validate_checkout_allows_validation_owned_ignored_and_cache(
+def test_recover_ownerless_validate_checkout_preserves_validation_owned_cache(
     tmp_path: Path,
 ) -> None:
     project, repository, _remote = make_project(
@@ -7113,7 +7531,7 @@ def test_recover_ownerless_validate_checkout_allows_validation_owned_ignored_and
     assert set(status.splitlines()) == {"! ignored/", "! target/"}
     record = prepare_terminal_validation_record(project, target, field="checkout")
 
-    recovered = command(
+    refused = command(
         project,
         "recover",
         "--coordinator-pid",
@@ -7126,8 +7544,12 @@ def test_recover_ownerless_validate_checkout_allows_validation_owned_ignored_and
         repository.relative_to(project).as_posix(),
     )
 
-    assert recovered.returncode == 0, recovered.stderr
-    assert not target.exists()
+    assert refused.returncode == 3
+    assert "ownerless linked validation checkout recovery is disabled" in refused.stderr
+    assert target.is_dir()
+    assert (target / "ignored" / "run" / "output.log").is_file()
+    assert (target / "target" / "debug" / "program").is_file()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
 def test_recover_ownerless_validate_checkout_refuses_tracked_change(
@@ -7192,7 +7614,52 @@ def test_recover_ownerless_validate_checkout_refuses_handoff_before_cache_status
     )
 
     assert refused.returncode == 3
-    assert "validation checkout contains HANDOFF.md" in refused.stderr
+    assert (
+        "validation checkout contains HANDOFF.md or another HANDOFF* artifact"
+        in refused.stderr
+    )
+    assert "HANDOFF.md" in refused.stderr
+    assert "validation checkout is dirty" not in refused.stderr
+    assert target.is_dir()
+
+
+def test_recover_ownerless_validate_checkout_refuses_tracked_named_handoff(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        cache_globs=("target",),
+    )
+    handoff_name = "HANDOFF_previous_coordinator_20260920.md"
+    (repository / handoff_name).write_text("preserve this\n", encoding="utf-8")
+    git(repository, "add", handoff_name)
+    git(repository, "commit", "-m", "publish retained handoff fixture")
+    git(repository, "push", "origin", "main")
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+        "--recovery-note",
+        "no retained run handle",
+    )
+
+    assert refused.returncode == 3
+    assert (
+        "validation checkout contains HANDOFF.md or another HANDOFF* artifact"
+        in refused.stderr
+    )
+    assert handoff_name in refused.stderr
     assert "validation checkout is dirty" not in refused.stderr
     assert target.is_dir()
 
@@ -7258,7 +7725,7 @@ def test_ownerless_checkout_refuses_remote_change_during_fetch(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
-def test_ownerless_recovery_accepts_nested_source_without_relaxing_import(
+def test_ownerless_recovery_preserves_nested_source_without_relaxing_import(
     tmp_path: Path,
 ) -> None:
     project, repository, _remote = make_project(
@@ -7279,7 +7746,7 @@ def test_ownerless_recovery_accepts_nested_source_without_relaxing_import(
             config, nested_source.relative_to(project).as_posix()
         )
 
-    recovered = raw_command(
+    refused = raw_command(
         project,
         "--allow-existing-unregistered-worktrees",
         "recover",
@@ -7294,8 +7761,9 @@ def test_ownerless_recovery_accepts_nested_source_without_relaxing_import(
         nested_source.relative_to(project).as_posix(),
     )
 
-    assert recovered.returncode == 0, recovered.stderr
-    assert not target.exists()
+    assert refused.returncode == 3
+    assert "ownerless linked validation checkout recovery is disabled" in refused.stderr
+    assert target.is_dir()
     assert nested_source.is_dir()
     assert active_slots(project) == []
 
@@ -22110,6 +22578,43 @@ def test_audit_reports_deletable_blocked_held_and_the_leak_invariant(
         for reason in failed_rows["slot01"]["reasons"]
     )
 
+
+def test_unregistered_validation_reports_preservation_without_inventing_owner(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    assert create(project).returncode == 0
+    target = project / "worktrees" / "validate" / "legacy-review"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+
+    audit = command(project, "audit", "--format", "json")
+    doctor = command(project, "doctor", "--format", "json")
+
+    assert audit.returncode == 0, audit.stderr
+    row = next(
+        row for row in json.loads(audit.stdout)["slots"] if row["slot"] == target.name
+    )
+    assert row["owner_state"] == "unregistered"
+    assert "destructive ownerless Git worktree recovery is disabled" in row["reasons"][0]
+    assert "import-existing only for a demonstrably live owner" in row["reasons"][0]
+    assert doctor.returncode == 0, doctor.stderr
+    finding = next(
+        item
+        for item in json.loads(doctor.stdout)["findings"]
+        if item["kind"] == "git-registration-without-row"
+        and item["slot"] == target.name
+    )
+    assert "destructive recovery is disabled" in finding["remedy"]
+    assert "import-existing only for a demonstrably live owner" in finding["remedy"]
+    assert "recover --ownerless-validate-checkout" not in row["reasons"][0]
+    assert "recover --ownerless-validate-checkout" not in finding["remedy"]
+    assert target.is_dir()
+    assert len(active_slots(project)) == 1
 
 def test_audit_treats_validate_checkout_contents_as_disposable(
     tmp_path: Path,

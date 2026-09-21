@@ -95,12 +95,12 @@ publication so `recover` can finish after the original participant disappears. R
 owner sidecar refuse rather than turning unavailable ownership into permission to delete.
 
 An unregistered validation checkout or `validate-cargo-*` directory with no recoverable owner is
-not imported with invented ownership. The coordinator uses `recover
---coordinator-authorized` with an exact terminal run record, or with an explanation when no record
-survives. The tool records the exact path and filesystem identity and independently verifies that
-no retained record names it, no process uses it, and no authored work would be lost. Git worktrees
-must additionally be clean, ordinary, and remotely contained. Dirty, unpublished, in-use, or
-ambiguous paths are preserved. Ordinary `status` reports every remaining unregistered directory
+not imported with invented ownership. Destructive recovery of an ordinary linked Git worktree is
+disabled: wrkslots cannot atomically exclude both its checkout and same-UID-writable Git
+administration, so the checkout is preserved for inspection. Use `import-existing` only for a
+demonstrably live owner. The separate `validate-cargo-*` recovery route accepts an exact terminal
+run record, or an explanation when no record survives, and records the exact path and filesystem
+identity before bounded cleanup. Ordinary `status` reports every remaining unregistered directory
 as an inconsistency and still returns the readable active roster; it does not authorize cleanup or
 make an inconsistent row healthy.
 

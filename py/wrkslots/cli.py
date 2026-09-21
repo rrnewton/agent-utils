@@ -228,6 +228,11 @@ _OWNERLESS_VALIDATION_EXCLUSION_PHASES = frozenset(
     {"guard-created", "payload-moved"}
 )
 _OWNERLESS_VALIDATION_EXCLUSION_ROOTS = (Path("/data/misc"),)
+_OWNERLESS_LINKED_VALIDATION_REFUSAL = (
+    "ownerless linked validation checkout recovery is disabled because the checkout "
+    "and its Git administration cannot both be fenced against same-UID replacement; "
+    "preserve it or import it only with a demonstrably live owner"
+)
 _OWNERLESS_AGENT_JOURNAL_REQUIRED = frozenset(
     {
         "schema",
@@ -6352,9 +6357,18 @@ def _registry_storage_inconsistencies(
                 f"source repository {source} (Git common directory {common}) registers "
                 f"{registered_path} inside the managed {slot_type} root, but no active "
                 "checkout row for that repository names it",
-                f"inspect 'git -C {source} worktree list --porcelain'; restore and register "
-                "the live slot or remove the stale Git registration before reusing any "
-                "overlapping path",
+                (
+                    f"inspect 'git -C {source} worktree list --porcelain'; for a present "
+                    "ownerless validation checkout preserve and inspect it; destructive "
+                    "recovery is disabled because the checkout and Git administration "
+                    "cannot both be fenced against same-UID replacement; use "
+                    "import-existing only for a demonstrably live owner, and repair a "
+                    "missing stale registration before reusing any overlapping path"
+                    if slot_type == "validate"
+                    else f"inspect 'git -C {source} worktree list --porcelain'; restore and "
+                    "register the live slot or remove the stale Git registration before "
+                    "reusing any overlapping path"
+                ),
                 slot=slot,
                 slot_type=slot_type,
                 machine=None if matched_record is None else matched_record.machine,
@@ -14730,7 +14744,15 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                             else (
                                 "interrupted validation-batch seal requires wrkslots recover"
                                 if sealed is not None
-                                else "directory has no active registry row; inspect or import it"
+                                else (
+                                    "validation directory has no active registry row; preserve "
+                                    "and inspect it, and use import-existing only for a "
+                                    "demonstrably live owner; destructive ownerless Git "
+                                    "worktree recovery is disabled"
+                                    if slot_type == "validate"
+                                    else "directory has no active registry row; inspect or "
+                                    "import it"
+                                )
                             )
                         )
                     ],
@@ -18920,6 +18942,21 @@ def _legacy_validate_recovery_inputs(
     return checkout, repository, record_path, head
 
 
+def _validation_handoff_artifact(path: Path) -> Path | None:
+    """Return the first top-level handoff-shaped artifact, without following it."""
+
+    try:
+        candidates = sorted(
+            (entry for entry in path.iterdir() if entry.name.startswith("HANDOFF")),
+            key=lambda entry: entry.name,
+        )
+    except OSError as exc:
+        raise Refusal(
+            f"cannot inspect validation path for handoff artifacts: {path}: {exc}"
+        ) from exc
+    return candidates[0] if candidates else None
+
+
 def _recover_legacy_validate_remove(
     config: Config,
     path: Path,
@@ -18948,9 +18985,11 @@ def _recover_legacy_validate_remove(
             raise Refusal(f"legacy validation checkout became unsafe: {checkout}")
         _ensure_no_mount_components(config.root, checkout, "legacy validation checkout")
         _assert_no_mountinfo_crossing(checkout, checkout, "legacy validation checkout")
-        if (checkout / "HANDOFF.md").exists() or (checkout / "HANDOFF.md").is_symlink():
+        handoff = _validation_handoff_artifact(checkout)
+        if handoff is not None:
             raise Refusal(
-                f"legacy validation checkout gained HANDOFF.md: {checkout / 'HANDOFF.md'}; "
+                f"legacy validation checkout gained HANDOFF.md or another HANDOFF* "
+                f"artifact: {handoff}; "
                 "preserve it and do not resume deletion"
             )
         observed_head = vcs.verify_existing_worktree(repository, checkout)
@@ -20537,8 +20576,12 @@ def _validation_checkout_facts(
         raise Refusal(f"validation checkout is absent or unsafe: {checkout}")
     _ensure_no_mount_components(checkout.parent, checkout, "validation checkout")
     _assert_no_mountinfo_crossing(checkout, checkout, "validation checkout")
-    if (checkout / "HANDOFF.md").exists() or (checkout / "HANDOFF.md").is_symlink():
-        raise Refusal(f"validation checkout contains HANDOFF.md: {checkout}")
+    handoff = _validation_handoff_artifact(checkout)
+    if handoff is not None:
+        raise Refusal(
+            "validation checkout contains HANDOFF.md or another HANDOFF* artifact; "
+            f"preserve it: {handoff}"
+        )
     vcs = _GitVcs()
     if standalone:
         if (
@@ -20556,6 +20599,10 @@ def _validation_checkout_facts(
         raise Refusal(
             "validation checkout HEAD changed after recovery was authorized; preserve the "
             "checkout and restore the recorded target before retrying"
+        )
+    if not standalone and vcs.initialized_submodules(checkout):
+        raise Refusal(
+            "ownerless linked validation checkout has initialized submodules; preserve it"
         )
     vcs.assert_ordinary_history(checkout)
     vcs.assert_ordinary_index(checkout)
@@ -20666,8 +20713,12 @@ def _validation_cargo_facts(path: Path) -> tuple[int, int, int]:
     _assert_no_mountinfo_crossing(path, path, "validation Cargo home")
     if (path / ".git").exists() or (path / ".git").is_symlink():
         raise Refusal("validation Cargo home is a Git worktree root; preserve it")
-    if (path / "HANDOFF.md").exists() or (path / "HANDOFF.md").is_symlink():
-        raise Refusal("validation Cargo home contains HANDOFF.md; preserve it")
+    handoff = _validation_handoff_artifact(path)
+    if handoff is not None:
+        raise Refusal(
+            "validation Cargo home contains HANDOFF.md or another HANDOFF* artifact; "
+            f"preserve it: {handoff}"
+        )
     _assert_slot_unused(path)
     return _open_directory_identity(path.parent, "validation Cargo-home parent")
 
@@ -20930,6 +20981,8 @@ def _ownerless_validation_journal(
             target_kind=target_kind,
             repository=repository,
         )
+    if target_kind == "checkout":
+        raise Refusal(_OWNERLESS_LINKED_VALIDATION_REFUSAL)
     authorization = ValidationRecoveryAuthorization(
         target_kind=target_kind,
         path=relative,
@@ -21058,7 +21111,19 @@ def _ownerless_validation_inputs(
             "UNKNOWN, so preserve the journal and inspect the authorized identity"
         )
     if phase == "removed" and active is not None:
-        raise Refusal("validation path reappeared after removal was recorded")
+        for candidate in (target, fenced):
+            if (
+                not candidate.is_symlink()
+                and candidate.is_dir()
+                and _open_directory_identity(candidate, "replacement validation path")
+                == authorization.identity
+            ):
+                raise Refusal("authorized validation path reappeared after removal was recorded")
+        # A completed removal journal authorizes bookkeeping for one exact old
+        # inode, not control of a later same-name object.  Ignore replacements
+        # after proving none has the authorized identity, and never inspect or
+        # mutate their repository-controlled contents.
+        active = None
     if active is not None:
         if (
             active.is_symlink()
@@ -22384,9 +22449,14 @@ def _recover_ownerless_validation(
     if path != _journal_path(config):
         raise StateError("ownerless validation journal filename is invalid")
     _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
-    initial_authorization, _target, _fenced, _phase = _ownerless_validation_paths(
+    initial_authorization, _target, _fenced, initial_phase = _ownerless_validation_paths(
         config, raw
     )
+    if (
+        initial_authorization.target_kind == "checkout"
+        and initial_phase != "removed"
+    ):
+        raise Refusal(_OWNERLESS_LINKED_VALIDATION_REFUSAL)
     if initial_authorization.target_kind != "checkout":
         raw = _restore_ownerless_validation_exclusion(config, raw)
     authorization, target, fenced, active, repository = _ownerless_validation_inputs(
@@ -22580,9 +22650,11 @@ def _recover_ownerless_validation(
         journal["phase"] = "removed"
         _write_journal(config, journal)
         _interrupt_for_test("after-ownerless-validate-remove")
-    if target.exists() or target.is_symlink() or fenced.exists() or fenced.is_symlink():
+    if initial_phase != "removed" and (
+        target.exists() or target.is_symlink() or fenced.exists() or fenced.is_symlink()
+    ):
         raise Refusal("validation path still exists after removal")
-    if authorization.target_kind == "checkout":
+    if authorization.target_kind == "checkout" and initial_phase != "removed":
         assert repository is not None
         if target.absolute() in _GitVcs().listed_worktrees(repository) or fenced.absolute() in _GitVcs().listed_worktrees(repository):
             raise Refusal("Git still registers the removed validation checkout")
@@ -29255,11 +29327,12 @@ usage or audit gate unknown, 3 fail-closed refusal.
 
     recover = subparsers.add_parser(
         "recover",
-        help="resume an interrupted mutation from its journal",
+        help="resume a journal or start bounded ownerless validation cleanup",
         description=(
             "Validate and resume one durable create or removal from append-only history and its "
-            "journal compatibility view. Any later participant may help; mismatched registry, "
-            "path, process, or Git evidence refuses. Do not edit the history or journal by hand."
+            "journal compatibility view, or start cleanup of one unregistered ownerless "
+            "validation path. Any later participant may help; mismatched registry, path, process, "
+            "handoff, or Git evidence refuses. Do not edit the history or journal by hand."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -29296,7 +29369,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
     ownerless.add_argument(
         "--ownerless-validate-checkout",
         metavar="PATH",
-        help="project-relative unregistered validation Git worktree",
+        help=(
+            "project-relative unregistered validation Git worktree; performs bounded "
+            "preservation checks but refuses destructive recovery because the checkout and "
+            "Git administration cannot both be fenced against same-UID replacement"
+        ),
     )
     ownerless.add_argument(
         "--ownerless-validate-cargo-home",

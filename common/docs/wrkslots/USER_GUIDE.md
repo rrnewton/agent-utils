@@ -268,31 +268,32 @@ file as history rather than being fabricated as active storage.
 ## Recover ownerless validation paths
 
 Do not fabricate an ACTIVE owner for an unregistered validation path. `import-existing` remains the
-route for a demonstrably live owner or an exact owner generation from a retained row; `remove` remains the
-route for a registered row. An unregistered validation checkout or `validate-cargo-*` directory
-with no recoverable owner instead uses `recover` directly:
+route for a demonstrably live owner or an exact owner generation from a retained row; `remove`
+remains the route for a registered row. Destructive recovery of an ordinary ownerless linked Git
+worktree is disabled because wrkslots cannot atomically exclude both the checkout and its
+same-UID-writable Git administration. Preserve and inspect it. The ownerless recovery route remains
+available for `validate-cargo-*` directories:
 
 ```sh
-wrkslots recover --coordinator-authorized --coordinator-pid "$COORDINATOR_PID" \
-  --ownerless-validate-checkout worktrees/validate/validate-fresh-example \
-  --repository product --completed-record ignored/validate/runs/validate-example.json
-
 wrkslots recover --coordinator-authorized --coordinator-pid "$COORDINATOR_PID" \
   --ownerless-validate-cargo-home worktrees/validate/validate-cargo-example \
   --recovery-note "the retained run handle has no Cargo-home field"
 ```
 
-The first form binds cleanup to an exact terminal run record. A recordless path requires a non-empty
-explanation, but prose is not authority: wrkslots records the exact slot type, path, filesystem
-identity, repository and commit where applicable, and its own positive determinations that no
-retained record names the path, no live process uses it, and no authored work would be lost. A
-checkout must be a clean linked worktree with ordinary Git state, no HANDOFF.md, and a HEAD contained
-by a freshly fetched remote ref. Cargo homes must have the exact configured parent and
-`validate-cargo-*` name and cannot be Git worktree roots. Both forms retain positive cwd,
-executable, root, descriptor, mapping, and mount checks. Any dirty, unpublished, in-use, or
-ambiguous path is preserved. The cleanup first renames the exact inode to a random same-parent path,
-rechecks every fact, then deletes only that fenced path. Any later participant may resume the
-journal with plain `recover --coordinator-pid PID`.
+The Cargo-home form may instead use
+`--completed-record ignored/validate/runs/validate-example.json` to bind cleanup to an exact
+terminal run record. A recordless path requires a non-empty explanation, but prose is not
+authority: wrkslots records the exact path and filesystem identity and independently verifies that
+no retained record names it and no process uses it. Cargo homes must have the exact configured
+parent and `validate-cargo-*` name and cannot be Git worktree roots. The cleanup retains positive
+cwd, executable, root, descriptor, mapping, and mount checks, then deletes only the excluded path.
+Any later participant may resume its journal with plain `recover --coordinator-pid PID`.
+
+`--ownerless-validate-checkout` remains accepted so existing automation and pre-upgrade journals
+fail with an explicit preservation message. It performs the bounded authored-work,
+HANDOFF, submodule, remote-binding, and liveness checks, but it does not create a cleanup journal or
+remove the linked worktree. An initialized submodule is itself a preservation reason even when Git
+configuration would otherwise hide its state.
 
 This targeted route does not hide anything from ordinary `status`: every other unregistered
 directory is returned as a typed inconsistency beside the full readable roster. Status is
