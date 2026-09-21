@@ -189,7 +189,9 @@ URL. Any non-empty `remote.<name>.pushurl`, multiple URL, or push-only rewrite s
 `url.<base>.pushInsteadOf` that changes the effective destination is refused; SSH and HTTPS
 spellings are not normalized into equivalence. Before agent salvage performs its first fetch, ref
 readback, or push, this authority check covers every parent checkout and initialized nested
-repository in the salvage set.
+repository in the salvage set. The exact URL and its digest are captured with each fully checked
+salvage candidate and are then the only destination used by isolated network Git commands. A later
+checkout-config change can only refuse the operation; it cannot choose a new network destination.
 
 When `with-proxy` is installed on `PATH`, Wrkslots uses it for Git fetches, pushes, remote ref
 readback, and post-provision hooks. The hook's children, including recursive submodule commands,

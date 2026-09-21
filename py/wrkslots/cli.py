@@ -7560,6 +7560,14 @@ class RegistryStorageFindings:
     registrations: tuple[str, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class _RemoteAuthority:
+    """Exact remote destination selected before any network operation."""
+
+    url: str
+    sha256: str
+
+
 def _assert_registry_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
@@ -8282,13 +8290,22 @@ class _GitVcs:
                 f"checkout contains replacement refs: {replacements.stdout.splitlines()[0]}"
             )
 
-    def fetch_remote(self, checkout: Path, remote: str, landed_ref: str) -> None:
+    def fetch_remote(
+        self,
+        checkout: Path,
+        remote: str,
+        landed_ref: str,
+        authority: _RemoteAuthority,
+    ) -> None:
         _validate_remote(remote)
         _validate_full_ref(landed_ref, "landed ref")
         prefix = f"refs/remotes/{remote}/"
         if not landed_ref.startswith(prefix):
             raise Refusal(f"landed ref must be under {prefix}: {landed_ref}")
-        with self._isolated_remote(checkout, remote) as (isolated, url, object_env):
+        with self._isolated_remote(checkout, remote, authority) as (
+            isolated,
+            object_env,
+        ):
             self._run(
                 isolated,
                 [
@@ -8298,7 +8315,7 @@ class _GitVcs:
                     "--no-tags",
                     "--no-recurse-submodules",
                     "--",
-                    url,
+                    authority.url,
                     f"+refs/heads/*:{prefix}*",
                 ],
                 env_overrides=object_env,
@@ -8384,11 +8401,31 @@ class _GitVcs:
             )
         return urls[0]
 
+    def remote_authority(self, checkout: Path, remote: str) -> _RemoteAuthority:
+        url = self._remote_url_with_push_authority(checkout, remote)
+        return _RemoteAuthority(
+            url=url,
+            sha256=hashlib.sha256(url.encode("utf-8")).hexdigest(),
+        )
+
+    def assert_remote_authority(
+        self, checkout: Path, remote: str, authority: _RemoteAuthority
+    ) -> None:
+        expected_digest = hashlib.sha256(authority.url.encode("utf-8")).hexdigest()
+        if authority.sha256 != expected_digest:
+            raise StateError("remote authority URL and digest disagree")
+        observed = self.remote_authority(checkout, remote)
+        if observed != authority:
+            raise Refusal(
+                f"remote {remote!r} changed after authority was captured; preserve the "
+                "checkout and restore its recorded remote"
+            )
+
     @contextlib.contextmanager
     def _isolated_remote(
-        self, checkout: Path, remote: str
-    ) -> Iterator[tuple[Path, str, Mapping[str, str]]]:
-        url = self._remote_url_with_push_authority(checkout, remote)
+        self, checkout: Path, remote: str, authority: _RemoteAuthority
+    ) -> Iterator[tuple[Path, Mapping[str, str]]]:
+        self.assert_remote_authority(checkout, remote, authority)
         objects = self.common_directory(checkout) / "objects"
         if objects.is_symlink() or not objects.is_dir():
             raise Refusal(f"Git object directory is absent or unsafe: {objects}")
@@ -8396,19 +8433,18 @@ class _GitVcs:
             root = Path(temporary)
             isolated = root / "network.git"
             self._run(root, ["init", "--quiet", "--bare", str(isolated)])
-            yield isolated, url, {"GIT_OBJECT_DIRECTORY": str(objects)}
+            yield isolated, {"GIT_OBJECT_DIRECTORY": str(objects)}
 
     def remote_url_sha256(self, checkout: Path, remote: str) -> str:
-        url = self._remote_url_with_push_authority(checkout, remote)
-        return hashlib.sha256(url.encode("utf-8")).hexdigest()
+        return self.remote_authority(checkout, remote).sha256
 
     def assert_remote_url(self, checkout: Path, remote: str, authorized_url: str) -> str:
-        observed_url = self._remote_url_with_push_authority(checkout, remote)
-        if observed_url != authorized_url:
+        observed = self.remote_authority(checkout, remote)
+        if observed.url != authorized_url:
             raise Refusal(
                 f"remote {remote!r} URL differs from trusted provisioning input"
             )
-        return hashlib.sha256(authorized_url.encode("utf-8")).hexdigest()
+        return observed.sha256
 
     def operation_paths(self, checkout: Path) -> list[Path]:
         names = (
@@ -8505,12 +8541,21 @@ class _GitVcs:
         args.extend(("--", str(checkout)))
         self._run(repository, args)
 
-    def remote_ref_sha(self, checkout: Path, remote: str, ref: str) -> str | None:
+    def remote_ref_sha(
+        self,
+        checkout: Path,
+        remote: str,
+        ref: str,
+        authority: _RemoteAuthority,
+    ) -> str | None:
         _validate_remote(remote)
         _validate_full_ref(ref, "remote salvage ref")
-        with self._isolated_remote(checkout, remote) as (isolated, url, object_env):
+        with self._isolated_remote(checkout, remote, authority) as (
+            isolated,
+            object_env,
+        ):
             return self._remote_ref_sha_at_url(
-                isolated, url, ref, env_overrides=object_env
+                isolated, authority.url, ref, env_overrides=object_env
             )
 
     def _remote_ref_sha_at_url(
@@ -8544,13 +8589,21 @@ class _GitVcs:
         return sha
 
     def push_salvage(
-        self, checkout: Path, remote: str, commit: str, ref: str
+        self,
+        checkout: Path,
+        remote: str,
+        commit: str,
+        ref: str,
+        authority: _RemoteAuthority,
     ) -> None:
         _validate_remote(remote)
         _validate_full_ref(ref, "remote salvage ref")
-        with self._isolated_remote(checkout, remote) as (isolated, url, object_env):
+        with self._isolated_remote(checkout, remote, authority) as (
+            isolated,
+            object_env,
+        ):
             existing = self._remote_ref_sha_at_url(
-                isolated, url, ref, env_overrides=object_env
+                isolated, authority.url, ref, env_overrides=object_env
             )
             if existing is not None:
                 if existing != commit:
@@ -8561,11 +8614,11 @@ class _GitVcs:
                 return
             self._run(
                 isolated,
-                ["push", "--", url, f"{commit}:{ref}"],
+                ["push", "--", authority.url, f"{commit}:{ref}"],
                 env_overrides=object_env,
             )
             observed = self._remote_ref_sha_at_url(
-                isolated, url, ref, env_overrides=object_env
+                isolated, authority.url, ref, env_overrides=object_env
             )
             if observed != commit:
                 raise Refusal(
@@ -10233,19 +10286,17 @@ def _assert_checkout_safe(
             f"checkout {checkout.name} is dirty or has untracked/ignored files ({first}); "
             "commit intended work and publish it before finishing"
         )
-    remote_url_sha256 = vcs.remote_url_sha256(path, checkout.remote)
-    if remote_url_sha256 != checkout.remote_url_sha256:
+    remote_authority = vcs.remote_authority(path, checkout.remote)
+    if remote_authority.sha256 != checkout.remote_url_sha256:
         raise Refusal(
             f"checkout {checkout.name} remote {checkout.remote} URL changed; "
             "preserve the checkout for inspection"
         )
     if refresh_remote:
-        vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
-        if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
-            raise Refusal(
-                f"checkout {checkout.name} remote {checkout.remote} URL changed during fetch; "
-                "preserve the checkout for inspection"
-            )
+        vcs.fetch_remote(
+            path, checkout.remote, checkout.landed_ref, remote_authority
+        )
+        vcs.assert_remote_authority(path, checkout.remote, remote_authority)
     remote_refs = vcs.remote_refs_containing(path, checkout.remote, head)
     if not remote_refs:
         raise Refusal(_unpushed_refusal(checkout, path, head, vcs))
@@ -10269,6 +10320,15 @@ def _salvage_pathspecs(config: Config, checkout_name: str) -> list[str]:
     return pathspecs
 
 
+@dataclasses.dataclass(frozen=True)
+class _SalvageCandidate:
+    head: str
+    status_digest: str
+    commit: str
+    dirty: bool
+    remote_authority: _RemoteAuthority
+
+
 def _salvage_candidate(
     config: Config,
     record: ActiveRecord | None,
@@ -10280,7 +10340,7 @@ def _salvage_candidate(
     verify_repository_membership: bool = True,
     ownerless_slot: str | None = None,
     ownerless_recorded_at: str | None = None,
-) -> tuple[str, str, str, bool]:
+) -> _SalvageCandidate:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
 
     A temporary index captures tracked and ordinary untracked files outside the
@@ -10325,7 +10385,8 @@ def _salvage_candidate(
         vcs,
         _cache_globs_for(config, checkout.name),
     )
-    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+    remote_authority = vcs.remote_authority(path, checkout.remote)
+    if remote_authority.sha256 != checkout.remote_url_sha256:
         raise Refusal(
             f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
             "recorded remote before reclaim so salvage cannot be sent elsewhere"
@@ -10337,7 +10398,13 @@ def _salvage_candidate(
     )
     status_digest = hashlib.sha256(status.encode("utf-8")).hexdigest()
     if not status:
-        return head, status_digest, head, False
+        return _SalvageCandidate(
+            head=head,
+            status_digest=status_digest,
+            commit=head,
+            dirty=False,
+            remote_authority=remote_authority,
+        )
 
     with tempfile.TemporaryDirectory(prefix="wrkslots-salvage-") as temporary:
         index = str(Path(temporary) / "index")
@@ -10398,7 +10465,13 @@ def _salvage_candidate(
         ).stdout.strip()
     if not SHA_RE.fullmatch(commit):
         raise Refusal(f"salvage commit for checkout {checkout.name} is not a full Git object")
-    return head, status_digest, commit, True
+    return _SalvageCandidate(
+        head=head,
+        status_digest=status_digest,
+        commit=commit,
+        dirty=True,
+        remote_authority=remote_authority,
+    )
 
 
 def _submodule_salvage_checkouts(
@@ -10465,10 +10538,10 @@ def _salvage_one_checkout(
     *,
     path_override: Path | None = None,
     allow_detached: bool = False,
-    prepared: tuple[str, str, str, bool] | None = None,
+    prepared: _SalvageCandidate | None = None,
 ) -> dict[str, object]:
     path = path_override or _stored_path(config, checkout.path, "checkout path")
-    head, status_digest, commit, dirty = (
+    facts = (
         _salvage_candidate(
             config,
             record,
@@ -10481,19 +10554,17 @@ def _salvage_one_checkout(
         if prepared is None
         else prepared
     )
-    vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
-    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
-        raise Refusal(
-            f"checkout {checkout.name} remote {checkout.remote} URL changed during fetch; "
-            "preserve the checkout and restore the recorded remote"
-        )
-    containing = vcs.remote_refs_containing(path, checkout.remote, head)
-    if not dirty and containing:
+    vcs.fetch_remote(
+        path, checkout.remote, checkout.landed_ref, facts.remote_authority
+    )
+    vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
+    containing = vcs.remote_refs_containing(path, checkout.remote, facts.head)
+    if not facts.dirty and containing:
         return {
             "checkout": checkout.name,
-            "source_head": head,
-            "salvage_commit": commit,
-            "status_sha256": status_digest,
+            "source_head": facts.head,
+            "salvage_commit": facts.commit,
+            "status_sha256": facts.status_digest,
             "disposition": "already-published",
             "remote_ref": None,
             "containing_remote_refs": list(containing),
@@ -10501,15 +10572,21 @@ def _salvage_one_checkout(
     salvage_name = checkout.name.replace("/", "-")
     salvage_ref = (
         f"refs/heads/salvage/{record.machine}/{record.slot}/"
-        f"{salvage_name}-{record.generation}-{commit[:12]}"
+        f"{salvage_name}-{record.generation}-{facts.commit[:12]}"
     )
     _validate_full_ref(salvage_ref, "salvage ref")
-    vcs.push_salvage(path, checkout.remote, commit, salvage_ref)
+    vcs.push_salvage(
+        path,
+        checkout.remote,
+        facts.commit,
+        salvage_ref,
+        facts.remote_authority,
+    )
     return {
         "checkout": checkout.name,
-        "source_head": head,
-        "salvage_commit": commit,
-        "status_sha256": status_digest,
+        "source_head": facts.head,
+        "salvage_commit": facts.commit,
+        "status_sha256": facts.status_digest,
         "disposition": "salvaged",
         "remote_ref": salvage_ref,
         "containing_remote_refs": [],
@@ -10570,12 +10647,12 @@ def _salvage_ownerless_checkout(
     *,
     path_override: Path | None = None,
     allow_detached: bool = False,
-    prepared: tuple[str, str, str, bool] | None = None,
+    prepared: _SalvageCandidate | None = None,
 ) -> dict[str, object]:
     """Publish one ownerless checkout without asserting an owner, task, or handoff."""
 
     path = path_override or _stored_path(config, checkout.path, "ownerless checkout path")
-    head, status_digest, commit, dirty = (
+    facts = (
         _salvage_candidate(
             config,
             None,
@@ -10590,31 +10667,35 @@ def _salvage_ownerless_checkout(
         if prepared is None
         else prepared
     )
-    vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
-    if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
-        raise Refusal(
-            f"checkout {checkout.name} remote {checkout.remote} changed during salvage"
-        )
-    containing = vcs.remote_refs_containing(path, checkout.remote, head)
-    if not dirty and containing:
+    vcs.fetch_remote(
+        path, checkout.remote, checkout.landed_ref, facts.remote_authority
+    )
+    vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
+    containing = vcs.remote_refs_containing(path, checkout.remote, facts.head)
+    if not facts.dirty and containing:
         return {
             "checkout": checkout.name,
-            "source_head": head,
-            "salvage_commit": commit,
-            "status_sha256": status_digest,
+            "source_head": facts.head,
+            "salvage_commit": facts.commit,
+            "status_sha256": facts.status_digest,
             "disposition": "already-published",
             "remote_ref": None,
             "containing_remote_refs": list(containing),
         }
     salvage_name = checkout.name.replace("/", "-")
-    ref = f"refs/heads/salvage/{config.machine}/{slot}/{salvage_name}-{commit[:12]}"
+    ref = (
+        f"refs/heads/salvage/{config.machine}/{slot}/"
+        f"{salvage_name}-{facts.commit[:12]}"
+    )
     _validate_full_ref(ref, "ownerless worktree salvage ref")
-    vcs.push_salvage(path, checkout.remote, commit, ref)
+    vcs.push_salvage(
+        path, checkout.remote, facts.commit, ref, facts.remote_authority
+    )
     return {
         "checkout": checkout.name,
-        "source_head": head,
-        "salvage_commit": commit,
-        "status_sha256": status_digest,
+        "source_head": facts.head,
+        "salvage_commit": facts.commit,
+        "status_sha256": facts.status_digest,
         "disposition": "salvaged",
         "remote_ref": ref,
         "containing_remote_refs": [],
@@ -10733,13 +10814,12 @@ def _assert_salvage_still_matches(
     ]
     for checkout, path, _allow_detached, facts in prepared:
         receipt = by_name[checkout.name]
-        head, status_digest, commit, _dirty = facts
         expected = (
             _as_str(receipt.get("source_head"), "salvage receipt.source_head"),
             _as_str(receipt.get("status_sha256"), "salvage receipt.status_sha256"),
             _as_str(receipt.get("salvage_commit"), "salvage receipt.salvage_commit"),
         )
-        if (head, status_digest, commit) != expected:
+        if (facts.head, facts.status_digest, facts.commit) != expected:
             raise Refusal(
                 f"checkout {checkout.name} changed after salvage; preserve it and rerun remove "
                 "so the changed state is published before deletion"
@@ -10749,14 +10829,27 @@ def _assert_salvage_still_matches(
         )
         if disposition == "salvaged":
             remote_ref = _as_str(receipt.get("remote_ref"), "salvage receipt.remote_ref")
-            if vcs.remote_ref_sha(path, checkout.remote, remote_ref) != commit:
+            if (
+                vcs.remote_ref_sha(
+                    path,
+                    checkout.remote,
+                    remote_ref,
+                    facts.remote_authority,
+                )
+                != facts.commit
+            ):
                 raise Refusal(
-                    f"remote salvage ref {remote_ref} no longer contains {commit}; "
+                    f"remote salvage ref {remote_ref} no longer contains {facts.commit}; "
                     "preserve the checkout and restore the remote evidence before deletion"
                 )
         elif disposition == "already-published":
-            vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
-            if not vcs.remote_refs_containing(path, checkout.remote, head):
+            vcs.fetch_remote(
+                path,
+                checkout.remote,
+                checkout.landed_ref,
+                facts.remote_authority,
+            )
+            if not vcs.remote_refs_containing(path, checkout.remote, facts.head):
                 raise Refusal(
                     f"checkout {checkout.name} is no longer present on its recorded remote; "
                     "preserve it and rerun remove to publish salvage"
@@ -11469,20 +11562,15 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: _GitVcs) -> tupl
                 f"landed ref for {name} must be under refs/remotes/{remote}/"
             )
         authorized_url = remote_urls.get(name)
-        remote_url_sha256 = (
-            vcs.remote_url_sha256(repository, remote)
-            if authorized_url is None
-            else vcs.assert_remote_url(repository, remote, authorized_url)
-        )
+        remote_authority = vcs.remote_authority(repository, remote)
+        if authorized_url is not None and remote_authority.url != authorized_url:
+            raise Refusal(
+                f"remote {remote!r} URL differs from trusted provisioning input"
+            )
+        remote_url_sha256 = remote_authority.sha256
         if args.slot_type != "validate" or name not in starts:
-            vcs.fetch_remote(repository, remote, landed_ref)
-        verified_remote_url_sha256 = (
-            vcs.remote_url_sha256(repository, remote)
-            if authorized_url is None
-            else vcs.assert_remote_url(repository, remote, authorized_url)
-        )
-        if verified_remote_url_sha256 != remote_url_sha256:
-            raise Refusal(f"remote {remote!r} URL changed during fetch")
+            vcs.fetch_remote(repository, remote, landed_ref, remote_authority)
+        vcs.assert_remote_authority(repository, remote, remote_authority)
         start = vcs.verify_ref(
             repository, starts.get(name, landed_ref), "start point"
         )
@@ -15176,15 +15264,15 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
                         f"checkout {checkout.name} branch changed: expected "
                         f"{checkout.branch}, found {branch}; preserve it for inspection"
                     )
-                if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+                remote_authority = vcs.remote_authority(path, checkout.remote)
+                if remote_authority.sha256 != checkout.remote_url_sha256:
                     raise Refusal(
                         f"checkout {checkout.name} remote {checkout.remote} URL changed"
                     )
-                vcs.fetch_remote(path, checkout.remote, checkout.landed_ref)
-                if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
-                    raise Refusal(
-                        f"checkout {checkout.name} remote {checkout.remote} URL changed during fetch"
-                    )
+                vcs.fetch_remote(
+                    path, checkout.remote, checkout.landed_ref, remote_authority
+                )
+                vcs.assert_remote_authority(path, checkout.remote, remote_authority)
                 containing = vcs.remote_refs_containing(path, checkout.remote, head)
                 evidence = _unpushed_evidence(checkout, path, head, vcs)
                 rows.append(
@@ -20806,7 +20894,8 @@ def _validation_checkout_facts(
         raise Refusal(f"validation checkout is dirty ({status.splitlines()[0]}); preserve it")
     remote = config.default_remote
     landed_ref = _landed_ref_for_remote(config, remote)
-    remote_digest = vcs.remote_url_sha256(checkout, remote)
+    checkout_authority = vcs.remote_authority(checkout, remote)
+    remote_digest = checkout_authority.sha256
     repository_remote_digest = (
         vcs.remote_url_sha256(repository, remote)
         if standalone or remote_observation_repository is not None
@@ -20820,6 +20909,7 @@ def _validation_checkout_facts(
     if expected_remote is not None and remote_digest != expected_remote:
         raise Refusal("validation checkout remote changed after recovery was authorized")
     remote_observer = checkout
+    observer_authority = checkout_authority
     if remote_observation_repository is not None:
         remote_observer = remote_observation_repository
         if remote_observer == checkout or _path_is_within(remote_observer, checkout):
@@ -20852,7 +20942,8 @@ def _validation_checkout_facts(
             )
         vcs.assert_ordinary_history(remote_observer)
         vcs.assert_ordinary_index(remote_observer)
-        if vcs.remote_url_sha256(remote_observer, remote) != remote_digest:
+        observer_authority = vcs.remote_authority(remote_observer, remote)
+        if observer_authority.sha256 != remote_digest:
             raise Refusal(
                 "validation source repository remote differs from the retained checkout"
             )
@@ -20860,11 +20951,10 @@ def _validation_checkout_facts(
     # path that deliberately retains the checkout needs exact local binding,
     # not a remote copy of a commit that the checkout continues to preserve.
     if require_remote_containment:
-        vcs.fetch_remote(remote_observer, remote, landed_ref)
+        vcs.fetch_remote(remote_observer, remote, landed_ref, observer_authority)
         if vcs.remote_url_sha256(checkout, remote) != remote_digest:
             raise Refusal("validation checkout remote changed during recovery inspection")
-        if vcs.remote_url_sha256(remote_observer, remote) != remote_digest:
-            raise Refusal("validation source repository remote changed during recovery fetch")
+        vcs.assert_remote_authority(remote_observer, remote, observer_authority)
         if not vcs.remote_refs_containing(remote_observer, remote, head):
             raise Refusal(
                 f"validation checkout HEAD {head} is not contained by remote {remote}"
@@ -23156,8 +23246,7 @@ def _assert_ownerless_salvage_still_matches(
     for (candidate, candidate_path, facts), receipt in zip(prepared, receipts):
         if receipt.get("checkout") != candidate.name:
             raise StateError("ownerless salvage receipt order changed")
-        head, status_digest, commit, _dirty = facts
-        if (head, status_digest, commit) != (
+        if (facts.head, facts.status_digest, facts.commit) != (
             receipt.get("source_head"),
             receipt.get("status_sha256"),
             receipt.get("salvage_commit"),
@@ -23165,11 +23254,28 @@ def _assert_ownerless_salvage_still_matches(
             raise Refusal("ownerless worktree changed after salvage; preserve it")
         if receipt.get("disposition") == "salvaged":
             ref = _as_str(receipt.get("remote_ref"), "ownerless salvage ref")
-            if vcs.remote_ref_sha(candidate_path, candidate.remote, ref) != commit:
-                raise Refusal(f"remote salvage ref {ref} no longer preserves {commit}")
+            if (
+                vcs.remote_ref_sha(
+                    candidate_path,
+                    candidate.remote,
+                    ref,
+                    facts.remote_authority,
+                )
+                != facts.commit
+            ):
+                raise Refusal(
+                    f"remote salvage ref {ref} no longer preserves {facts.commit}"
+                )
         elif receipt.get("disposition") == "already-published":
-            vcs.fetch_remote(candidate_path, candidate.remote, candidate.landed_ref)
-            if not vcs.remote_refs_containing(candidate_path, candidate.remote, head):
+            vcs.fetch_remote(
+                candidate_path,
+                candidate.remote,
+                candidate.landed_ref,
+                facts.remote_authority,
+            )
+            if not vcs.remote_refs_containing(
+                candidate_path, candidate.remote, facts.head
+            ):
                 raise Refusal(f"ownerless checkout {candidate.name} is no longer published")
         else:
             raise StateError("ownerless salvage receipt has unknown disposition")
@@ -23920,22 +24026,41 @@ def _recover_absent_agent_row(
         for index, value in enumerate(_as_list(journal["preserved"], "preserved"))
     ]
     vcs = _GitVcs()
-    for checkout, receipt in zip(recorded.checkouts[len(preserved) :], planned[len(preserved) :]):
+    authorities: list[_RemoteAuthority] = []
+    for checkout in recorded.checkouts:
+        _stored, repository = _stored_repository_path(config, checkout.repository)
+        authority = vcs.remote_authority(repository, checkout.remote)
+        if authority.sha256 != checkout.remote_url_sha256:
+            raise Refusal(
+                f"source repository remote changed for absent checkout {checkout.name}"
+            )
+        authorities.append(authority)
+    for checkout, receipt, authority in zip(
+        recorded.checkouts[len(preserved) :],
+        planned[len(preserved) :],
+        authorities[len(preserved) :],
+    ):
         _stored, repository = _stored_repository_path(config, checkout.repository)
         vcs.push_salvage(
             repository,
             checkout.remote,
             checkout.head,
             _as_str(receipt["remote_ref"], "agent-row rescue ref"),
+            authority,
         )
         preserved.append(dict(receipt))
         journal["preserved"] = preserved
         _write_journal(config, journal)
         _interrupt_for_test("after-absent-agent-rescue-ref")
-    for checkout, receipt in zip(recorded.checkouts, planned):
+    for checkout, receipt, authority in zip(recorded.checkouts, planned, authorities):
         remote_ref = _as_str(receipt["remote_ref"], "agent-row rescue ref")
         _stored, repository = _stored_repository_path(config, checkout.repository)
-        if vcs.remote_ref_sha(repository, checkout.remote, remote_ref) != checkout.head:
+        if (
+            vcs.remote_ref_sha(
+                repository, checkout.remote, remote_ref, authority
+            )
+            != checkout.head
+        ):
             raise Refusal(f"remote rescue ref for {checkout.name} no longer preserves its HEAD")
     journal["phase"] = "preserved"
     _write_journal(config, journal)

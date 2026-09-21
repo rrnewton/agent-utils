@@ -104,10 +104,11 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
 
     vcs = wrkslots._GitVcs()
-    vcs.fetch_remote(repository, "origin", "refs/remotes/origin/main")
+    authority = vcs.remote_authority(repository, "origin")
+    vcs.fetch_remote(repository, "origin", "refs/remotes/origin/main", authority)
     assert vcs.verify_ref(repository, "refs/remotes/origin/main", "fetched ref") == expected
     ref = "refs/heads/salvage/testhost/slot01/network-test"
-    vcs.push_salvage(repository, "origin", expected, ref)
+    vcs.push_salvage(repository, "origin", expected, ref, authority)
     assert vcs.verify_ref(remote, ref, "published ref") == expected
     assert vcs.head(repository) == expected
     assert vcs.status(repository) == ""
@@ -300,5 +301,6 @@ def test_create_and_remote_round_trip_work_without_installed_wrapper(
     vcs = wrkslots._GitVcs()
     expected = vcs.head(repository)
     ref = "refs/heads/salvage/testhost/slot01/network-test"
-    vcs.push_salvage(repository, "origin", expected, ref)
+    authority = vcs.remote_authority(repository, "origin")
+    vcs.push_salvage(repository, "origin", expected, ref, authority)
     assert vcs.verify_ref(remote, ref, "published ref") == expected

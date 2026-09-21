@@ -7692,8 +7692,9 @@ def test_ownerless_checkout_refuses_remote_change_during_fetch(
         checkout: Path,
         remote: str,
         landed_ref: str,
+        authority: wrkslots._RemoteAuthority,
     ) -> None:
-        original_fetch(vcs, checkout, remote, landed_ref)
+        original_fetch(vcs, checkout, remote, landed_ref, authority)
         git(checkout, "remote", "set-url", remote, str(alternate))
 
     monkeypatch.setattr(wrkslots._GitVcs, "fetch_remote", mutate_remote_after_fetch)
@@ -11290,7 +11291,9 @@ def test_salvage_push_ignores_pushurl_installed_at_network_boundary(
         )
 
     monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(mutate_before_push))
-    wrkslots._GitVcs().push_salvage(repository, "origin", commit, rescue_ref)
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repository, "origin")
+    vcs.push_salvage(repository, "origin", commit, rescue_ref, authority)
 
     assert mutated is True
     push = next(args for args in network_calls if args[0] == "push")
@@ -11306,6 +11309,34 @@ def test_salvage_push_ignores_pushurl_installed_at_network_boundary(
         args[0] == "ls-remote" and str(authorized_remote) in args
         for args in network_calls
     )
+
+
+def test_salvage_push_refuses_url_changed_after_authority_preflight(
+    tmp_path: Path,
+) -> None:
+    _project, repository, authorized_remote = make_project(tmp_path)
+    evil_remote = tmp_path / "evil.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(evil_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commit = commit_local(repository, "local-only.txt", "preserve me\n", "local")
+    rescue_ref = "refs/heads/salvage/test-preflight-authority"
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repository, "origin")
+
+    git(repository, "remote", "set-url", "origin", str(evil_remote))
+    with pytest.raises(wrkslots.Refusal, match="changed after authority was captured"):
+        vcs.push_salvage(repository, "origin", commit, rescue_ref, authority)
+
+    for remote in (authorized_remote, evil_remote):
+        assert (
+            git(remote, "show-ref", "--verify", "--quiet", rescue_ref, check=False)
+            .returncode
+            == 1
+        )
 
 
 def test_ignored_file_is_preserved_by_finish_refusal(tmp_path: Path) -> None:
@@ -24640,9 +24671,12 @@ def test_recover_absent_agent_row_rechecks_branch_before_archive(
         remote_name: str,
         commit: str,
         rescue_ref: str,
+        authority: wrkslots._RemoteAuthority,
     ) -> None:
         nonlocal advanced
-        original_push(self, checkout_path, remote_name, commit, rescue_ref)
+        original_push(
+            self, checkout_path, remote_name, commit, rescue_ref, authority
+        )
         if not advanced:
             git(repository, "update-ref", branch_ref, ahead, checkout_record.head)
             advanced = True
@@ -24906,6 +24940,75 @@ def test_recover_ownerless_agent_worktree_salvages_dirty_tree_without_owner(
     salvage_commit = git(remote, "rev-parse", rescue_ref).stdout.strip()
     assert salvage_commit == receipt["salvage_commit"]
     assert git(remote, "show", f"{salvage_commit}:uncommitted.txt").stdout == "preserve me\n"
+
+
+def test_ownerless_salvage_refuses_url_changed_after_candidate_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, authorized_remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    (target / "uncommitted.txt").write_text("preserve me\n", encoding="utf-8")
+    evil_remote = tmp_path / "evil.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(evil_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    original_salvage = wrkslots._salvage_ownerless_checkout
+    mutated = False
+
+    def mutate_after_preflight(
+        config: wrkslots.Config,
+        slot: str,
+        recorded_at: str,
+        checkout_record: wrkslots.Checkout,
+        vcs: wrkslots._GitVcs,
+        *,
+        path_override: Path | None = None,
+        allow_detached: bool = False,
+        prepared: wrkslots._SalvageCandidate | None = None,
+    ) -> dict[str, object]:
+        nonlocal mutated
+        assert prepared is not None
+        if not mutated:
+            assert path_override is not None
+            git(path_override, "remote", "set-url", "origin", str(evil_remote))
+            mutated = True
+        return original_salvage(
+            config,
+            slot,
+            recorded_at,
+            checkout_record,
+            vcs,
+            path_override=path_override,
+            allow_detached=allow_detached,
+            prepared=prepared,
+        )
+
+    monkeypatch.setattr(
+        wrkslots, "_salvage_ownerless_checkout", mutate_after_preflight
+    )
+    assert run_ownerless_agent_recovery(
+        project, target, head, remote_digest, apply=True
+    ) == 3
+
+    assert mutated is True
+    assert "changed after authority was captured" in capsys.readouterr().err
+    assert target.is_dir()
+    for remote in (authorized_remote, evil_remote):
+        assert (
+            git(
+                remote,
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/salvage",
+            ).stdout
+            == ""
+        )
 
 
 def test_recover_ownerless_agent_worktree_resumes_literal_pre_handoff_journal(
