@@ -99,6 +99,7 @@ def _validated_unit(fields: dict[str, str], unit_prefix: str) -> str | None:
     unit = fields.get("unit")
     if (
         unit is None
+        or unit.startswith("-")
         or not unit.startswith(unit_prefix)
         or _UNIT_RE.fullmatch(unit) is None
     ):
@@ -194,9 +195,17 @@ def cleanup_reports(
     if not units:
         return ()
     commands = (
-        ["systemctl", "--user", "kill", "--kill-whom=all", "--signal=SIGKILL", *units],
-        ["systemctl", "--user", "stop", *units],
-        ["systemctl", "--user", "reset-failed", *units],
+        [
+            "systemctl",
+            "--user",
+            "kill",
+            "--kill-whom=all",
+            "--signal=SIGKILL",
+            "--",
+            *units,
+        ],
+        ["systemctl", "--user", "stop", "--", *units],
+        ["systemctl", "--user", "reset-failed", "--", *units],
     )
     for command in commands:
         try:

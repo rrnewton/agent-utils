@@ -201,6 +201,10 @@ def test_report_requires_owned_syntax_checked_unit(tmp_path: Path) -> None:
         read_report(report, "worker-")
     _write_report(report, unit="worker-7;poweroff")
     assert known_unit(report, "worker-") is None
+    _write_report(report, unit="-Hhost")
+    with pytest.raises(ValueError, match="owned unit"):
+        read_report(report, "-H")
+    assert known_unit(report, "-H") is None
 
 
 def test_cleanup_batches_only_valid_owned_units(
@@ -232,14 +236,16 @@ def test_cleanup_batches_only_valid_owned_units(
             "kill",
             "--kill-whom=all",
             "--signal=SIGKILL",
+            "--",
             "worker-1.service",
             "worker-2.service",
         ],
-        ["systemctl", "--user", "stop", "worker-1.service", "worker-2.service"],
+        ["systemctl", "--user", "stop", "--", "worker-1.service", "worker-2.service"],
         [
             "systemctl",
             "--user",
             "reset-failed",
+            "--",
             "worker-1.service",
             "worker-2.service",
         ],
