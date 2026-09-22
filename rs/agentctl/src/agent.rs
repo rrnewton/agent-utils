@@ -55,6 +55,20 @@ pub enum QueueOutcome {
     PossiblySubmitted,
 }
 
+/// Exact durable location of one caller-selected queue message identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueMessageState {
+    /// The message is known not to have crossed the injection barrier.
+    Pending,
+    /// The message crossed the barrier and its outcome is not yet settled.
+    Inflight,
+    /// The native working transition confirmed delivery.
+    Processed,
+    /// Delivery may have occurred and automatic replay is unsafe.
+    Failed,
+}
+
 impl QueueOutcome {
     /// Return the stable machine-readable spelling used by both packages.
     #[must_use]
@@ -779,6 +793,50 @@ pub fn status<A: AgentApi + ?Sized>(
         inflight: identifiers_if_directory(&directories.inflight)?,
         failed: identifiers_if_directory(&directories.failed)?,
     })
+}
+
+/// Locate one message identifier without scanning a queue directory.
+///
+/// This is a recovery primitive for durable callers that recorded intent before invoking
+/// [`send_identified`]. `None` proves that no artifact with this identifier exists in any queue
+/// phase while the caller holds the surrounding agent lifecycle lock.
+pub fn message_state(root: &Path, message_id: &str) -> AgentResult<Option<QueueMessageState>> {
+    validate_message_id(message_id)?;
+    if fs::symlink_metadata(root).is_err() {
+        return Ok(None);
+    }
+    validate_existing_queue(root)?;
+    let filename = format!("{message_id}.json");
+    let directories = QueueDirectories::new(root);
+    let candidates = [
+        (&directories.inbox, QueueMessageState::Pending),
+        (&directories.inflight, QueueMessageState::Inflight),
+        (&directories.processed, QueueMessageState::Processed),
+        (&directories.failed, QueueMessageState::Failed),
+    ];
+    let mut observed = None;
+    for (directory, state) in candidates {
+        let path = directory.join(&filename);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let document = load_message(&path)?;
+                if document.get("id").and_then(Value::as_str) != Some(message_id) {
+                    return Err(AgentError::delivery(format!(
+                        "queue artifact {} contains a different message id",
+                        path.display()
+                    )));
+                }
+                if observed.replace(state).is_some() {
+                    return Err(AgentError::delivery(format!(
+                        "message id {message_id:?} exists in multiple queue phases"
+                    )));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect queue message", &path, error)),
+        }
+    }
+    Ok(observed)
 }
 
 /// Read recent terminal output from a validated interactive-agent target.
@@ -2162,6 +2220,28 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("already exists"));
+    }
+
+    #[test]
+    fn exact_message_state_reconciles_without_directory_scan() {
+        let directory = TestDirectory::new("message-state");
+        enqueue(directory.path(), "task", Some("chat-request-1")).unwrap();
+        assert_eq!(
+            message_state(directory.path(), "chat-request-1").unwrap(),
+            Some(QueueMessageState::Pending)
+        );
+        assert_eq!(message_state(directory.path(), "absent").unwrap(), None);
+
+        let directories = QueueDirectories::new(directory.path());
+        transition(
+            &directories.inbox.join("chat-request-1.json"),
+            &directories.processed.join("chat-request-1.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            message_state(directory.path(), "chat-request-1").unwrap(),
+            Some(QueueMessageState::Processed)
+        );
     }
 
     #[test]

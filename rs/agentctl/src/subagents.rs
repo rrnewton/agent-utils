@@ -1232,6 +1232,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.send_record(&record, text, options, message_id)
     }
 
+    /// Reconcile one caller-selected durable delivery identifier by exact path lookup.
+    pub fn message_state(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+    ) -> Result<Option<agent::QueueMessageState>> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        record.supported()?;
+        agent::message_state(&self.queue(agent_name)?, message_id)
+    }
+
     fn send_record(
         &self,
         record: &AgentRecord,

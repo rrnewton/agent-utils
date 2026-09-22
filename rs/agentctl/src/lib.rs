@@ -4,6 +4,7 @@
 //! Chat and headless adapters are supplied by the optional runtime extensions.
 
 pub mod agent;
+pub mod chat_runtime;
 pub mod cli;
 pub mod client;
 pub mod codex_goal;

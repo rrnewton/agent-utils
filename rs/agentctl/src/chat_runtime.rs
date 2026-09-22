@@ -1,0 +1,3129 @@
+//! Durable owner for provider-neutral inbound chat subscriptions.
+//!
+//! This module deliberately stops at the reviewed process-supervision boundary. It owns operator
+//! configuration, replay cursors, event deduplication, request admission, and subscription commit
+//! ordering. Launching a process plugin is integrated separately so the runtime cannot accidentally
+//! grow a second process-group implementation beside `chat-subscription-plugin`.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use chat_subscription::{
+    BackendConfiguration, ChannelId, ChatSubscription, CommittableEvent, DeliveryBatch,
+    ProviderCursor, SenderId, SubscribeRequest, SubscriptionError, SubscriptionItem,
+};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+
+use crate::agent::{self, DrainOptions, QueueMessageState};
+use crate::subagents::{ManagedAgents, ManagedApi};
+
+const STATE_VERSION: u32 = 1;
+const MAX_REQUESTS: u64 = 2_048;
+const MAX_REQUEST_BYTES: u64 = 128 * 1_024 * 1_024;
+const MAX_REQUEST_RECORD_BYTES: usize = 512 * 1_024;
+const MAX_PLUGIN_NAME_BYTES: usize = 128;
+const MAX_AGENT_NAME_BYTES: usize = 32;
+const MAX_AGENT_LABEL_BYTES: usize = 400;
+const REPLY_NONCE_BYTES: usize = 16;
+const MAX_REPLY_BYTES: usize = 30_000;
+const MAX_REPLY_RECORD_BYTES: usize = 64 * 1_024;
+const MAX_REPLY_ORDINAL: u32 = 999_999;
+const MAX_REQUEST_REPLIES: u32 = 4_096;
+const MAX_REQUEST_REPLY_BYTES: u64 = 64 * 1_024 * 1_024;
+const MAX_STATE_REPLIES: u64 = 65_536;
+const MAX_STATE_REPLY_BYTES: u64 = 1_024 * 1_024 * 1_024;
+
+fn default_ack_reaction() -> Option<String> {
+    Some("🤖".to_owned())
+}
+
+/// A durable-runtime failure that never turns an uncertain provider commit into success.
+#[derive(Debug)]
+pub enum ChatRuntimeError {
+    /// Durable coordinator delivery failed.
+    Agent(crate::agent::AgentError),
+    /// Local state I/O failed.
+    Io(io::Error),
+    /// Local JSON encoding failed.
+    Json(serde_json::Error),
+    /// A bounded state or protocol invariant was violated.
+    Invalid(String),
+    /// The provider-neutral subscription generation failed.
+    Subscription(SubscriptionError),
+}
+
+impl ChatRuntimeError {
+    fn invalid(detail: impl Into<String>) -> Self {
+        Self::Invalid(detail.into())
+    }
+}
+
+impl fmt::Display for ChatRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Agent(error) => fmt::Display::fmt(error, formatter),
+            Self::Io(error) => write!(formatter, "chat state I/O failed: {error}"),
+            Self::Json(error) => write!(formatter, "chat state JSON failed: {error}"),
+            Self::Invalid(detail) => formatter.write_str(detail),
+            Self::Subscription(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for ChatRuntimeError {}
+
+impl From<crate::agent::AgentError> for ChatRuntimeError {
+    fn from(error: crate::agent::AgentError) -> Self {
+        Self::Agent(error)
+    }
+}
+
+impl From<io::Error> for ChatRuntimeError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for ChatRuntimeError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+impl From<SubscriptionError> for ChatRuntimeError {
+    fn from(error: SubscriptionError) -> Self {
+        Self::Subscription(error)
+    }
+}
+
+type Result<T> = std::result::Result<T, ChatRuntimeError>;
+
+/// Operator-controlled, non-secret provider configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendConfigurationDocument {
+    /// Provider-owned schema identifier for the non-secret object.
+    pub schema: String,
+    /// Provider-owned non-secret configuration object.
+    pub data: Map<String, Value>,
+}
+
+/// Authority and routing configuration retained for one bridge state directory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeConfiguration {
+    /// Exact discovered process-plugin name.
+    pub subscription_plugin: String,
+    /// Provider channel or space authorities.
+    pub channel_ids: Vec<String>,
+    /// Authenticated provider sender authorities.
+    pub allowed_senders: Vec<String>,
+    /// Stable named coordinator in the agent registry.
+    pub agent_name: String,
+    /// Human-readable agent label used in outbound replies.
+    pub agent_label: String,
+    /// Optional reaction placed only after durable inbound admission.
+    #[serde(default = "default_ack_reaction")]
+    pub ack_reaction: Option<String>,
+    /// Optional provider-specific non-secret resource configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_configuration: Option<BackendConfigurationDocument>,
+}
+
+impl BridgeConfiguration {
+    fn validate(&self) -> Result<()> {
+        validate_slug(
+            &self.subscription_plugin,
+            "subscription plugin",
+            MAX_PLUGIN_NAME_BYTES,
+        )?;
+        validate_slug(&self.agent_name, "agent name", MAX_AGENT_NAME_BYTES)?;
+        validate_single_line(&self.agent_label, "agent label", MAX_AGENT_LABEL_BYTES)?;
+        if let Some(reaction) = self.ack_reaction.as_deref() {
+            validate_single_line(reaction, "ack reaction", 64)?;
+        }
+        let _ = self.subscribe_request(None)?;
+        Ok(())
+    }
+
+    /// Build and validate one provider-neutral subscription request.
+    pub fn subscribe_request(&self, cursor: Option<&str>) -> Result<SubscribeRequest> {
+        let channels = self
+            .channel_ids
+            .iter()
+            .map(|value| ChannelId::new(value.clone()).map_err(|error| error.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ChatRuntimeError::invalid)?;
+        let senders = self
+            .allowed_senders
+            .iter()
+            .map(|value| SenderId::new(value.clone()).map_err(|error| error.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ChatRuntimeError::invalid)?;
+        let cursor = cursor
+            .map(|value| ProviderCursor::new(value.to_owned()))
+            .transpose()
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        let request = SubscribeRequest::new(channels, senders, cursor)
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        match self.backend_configuration.as_ref() {
+            Some(document) => {
+                BackendConfiguration::new(document.schema.clone(), document.data.clone())
+                    .map(|configuration| request.with_backend_configuration(configuration))
+                    .map_err(|error| ChatRuntimeError::invalid(error.to_string()))
+            }
+            None => Ok(request),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigurationEnvelope {
+    version: u32,
+    config: BridgeConfiguration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Checkpoint {
+    version: u32,
+    cursor: Option<String>,
+    request_count: u64,
+    request_bytes: u64,
+    committed_batches: u64,
+    reconciliation_required: bool,
+    reply_count: u64,
+    reply_bytes: u64,
+    updated_at_millis: u64,
+}
+
+impl Checkpoint {
+    fn empty() -> Self {
+        Self {
+            version: STATE_VERSION,
+            cursor: None,
+            request_count: 0,
+            request_bytes: 0,
+            committed_batches: 0,
+            reconciliation_required: false,
+            reply_count: 0,
+            reply_bytes: 0,
+            updated_at_millis: unix_millis(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestPhase {
+    Pending,
+    Submitting,
+    Delivered,
+    DeliveryUncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AckPhase {
+    Disabled,
+    Pending,
+    Sending,
+    Acked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedMessage {
+    channel_id: String,
+    message_id: String,
+    thread_id: String,
+    sender_id: String,
+    text: String,
+    created_at: String,
+    thread_reply: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_payload: Option<ProviderPayloadDocument>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPayloadDocument {
+    schema: String,
+    data: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestRecord {
+    version: u32,
+    key: String,
+    phase: RequestPhase,
+    message: SavedMessage,
+    reply_nonce: String,
+    next_reply_ordinal: u32,
+    next_send_ordinal: u32,
+    reply_count: u32,
+    reply_bytes: u64,
+    delivery_message_id: String,
+    ack_phase: AckPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_reaction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reaction_already_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_error: Option<String>,
+    admitted_at_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_error: Option<String>,
+}
+
+impl RequestRecord {
+    fn from_message(
+        message: &chat_subscription::InboundMessage,
+        ack_reaction: Option<&str>,
+    ) -> Result<Self> {
+        let source = SavedMessage {
+            channel_id: message.channel_id().as_str().to_owned(),
+            message_id: message.message_id().as_str().to_owned(),
+            thread_id: message.thread_id().as_str().to_owned(),
+            sender_id: message.sender_id().as_str().to_owned(),
+            text: message.text().to_owned(),
+            created_at: message.created_at().to_owned(),
+            thread_reply: message.is_thread_reply(),
+            provider_payload: message
+                .provider_payload()
+                .map(|payload| ProviderPayloadDocument {
+                    schema: payload.schema().to_owned(),
+                    data: payload.data().clone(),
+                }),
+        };
+        let key = message_key(&source)?;
+        let ack_request_id = ack_reaction.map(|_| random_operation_uuid()).transpose()?;
+        Ok(Self {
+            version: STATE_VERSION,
+            phase: RequestPhase::Pending,
+            reply_nonce: random_reply_nonce()?,
+            next_reply_ordinal: 1,
+            next_send_ordinal: 1,
+            reply_count: 0,
+            reply_bytes: 0,
+            delivery_message_id: format!("chat-{key}"),
+            ack_phase: if ack_reaction.is_some() {
+                AckPhase::Pending
+            } else {
+                AckPhase::Disabled
+            },
+            ack_reaction: ack_reaction.map(str::to_owned),
+            ack_request_id,
+            reaction_id: None,
+            reaction_already_present: None,
+            ack_error: None,
+            admitted_at_millis: unix_millis(),
+            delivery_error: None,
+            key,
+            message: source,
+        })
+    }
+
+    fn validate(&self, path_key: &str) -> Result<()> {
+        if self.version != STATE_VERSION {
+            return Err(ChatRuntimeError::invalid(format!(
+                "request {} has unsupported version {}",
+                self.key, self.version
+            )));
+        }
+        if self.key != path_key || self.key != message_key(&self.message)? {
+            return Err(ChatRuntimeError::invalid(
+                "saved request identity does not match its normalized message",
+            ));
+        }
+        self.message.validate()?;
+        if self.next_reply_ordinal == 0
+            || self.next_reply_ordinal > MAX_REPLY_ORDINAL.saturating_add(1)
+            || self.next_send_ordinal == 0
+            || self.next_send_ordinal > self.next_reply_ordinal
+            || self.reply_count > MAX_REQUEST_REPLIES
+            || self.reply_bytes > MAX_REQUEST_REPLY_BYTES
+            || self.next_reply_ordinal != self.reply_count.saturating_add(1)
+        {
+            return Err(ChatRuntimeError::invalid(
+                "saved request reply ordinals are inconsistent or outside the protocol range",
+            ));
+        }
+        if !valid_nonce(&self.reply_nonce) {
+            return Err(ChatRuntimeError::invalid(
+                "saved request reply nonce is not 22-character base64url",
+            ));
+        }
+        if self.delivery_message_id != format!("chat-{}", self.key) {
+            return Err(ChatRuntimeError::invalid(
+                "saved request delivery id does not match its request key",
+            ));
+        }
+        if let Some(error) = self.delivery_error.as_deref() {
+            validate_optional_single_line_or_multiline(error, "delivery error", 2_000)?;
+        }
+        if let Some(error) = self.ack_error.as_deref() {
+            validate_optional_single_line_or_multiline(error, "ack error", 2_000)?;
+        }
+        if let Some(reaction) = self.ack_reaction.as_deref() {
+            validate_single_line(reaction, "ack reaction", 64)?;
+        }
+        if let Some(reaction_id) = self.reaction_id.as_deref() {
+            validate_single_line(
+                reaction_id,
+                "provider reaction id",
+                chat_subscription::MAX_RESOURCE_ID_BYTES,
+            )?;
+        }
+        match self.ack_phase {
+            AckPhase::Disabled
+                if self.ack_reaction.is_none()
+                    && self.ack_request_id.is_none()
+                    && self.reaction_id.is_none()
+                    && self.reaction_already_present.is_none() => {}
+            AckPhase::Pending | AckPhase::Sending
+                if self
+                    .ack_reaction
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                    && self
+                        .ack_request_id
+                        .as_deref()
+                        .is_some_and(valid_operation_uuid)
+                    && self.reaction_id.is_none()
+                    && self.reaction_already_present.is_none() => {}
+            AckPhase::Acked
+                if self
+                    .ack_reaction
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                    && self
+                        .ack_request_id
+                        .as_deref()
+                        .is_some_and(valid_operation_uuid)
+                    && self.reaction_id.is_some()
+                    && self.reaction_already_present.is_some() => {}
+            _ => {
+                return Err(ChatRuntimeError::invalid(
+                    "saved request acknowledgement state is inconsistent",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SavedMessage {
+    fn validate(&self) -> Result<()> {
+        let channel = ChannelId::new(self.channel_id.clone())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        let message = chat_subscription::MessageId::new(self.message_id.clone())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        let thread = chat_subscription::ThreadId::new(self.thread_id.clone())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        let sender = SenderId::new(self.sender_id.clone())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        let normalized = chat_subscription::InboundMessage::new(
+            channel,
+            message,
+            thread,
+            sender,
+            self.text.clone(),
+            self.created_at.clone(),
+            self.thread_reply,
+        )
+        .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        if let Some(payload) = &self.provider_payload {
+            let payload = chat_subscription::ProviderPayload::new(
+                payload.schema.clone(),
+                payload.data.clone(),
+            )
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+            let _ = normalized.with_provider_payload(payload);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReplyPhase {
+    Pending,
+    Sending,
+    Sent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyRecord {
+    version: u32,
+    request_key: String,
+    ordinal: u32,
+    body: String,
+    send_request_id: String,
+    reserved_bytes: u64,
+    phase: ReplyPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_message_id: Option<String>,
+    captured_at_millis: u64,
+}
+
+impl ReplyRecord {
+    fn new(request_key: &str, ordinal: u32, body: String) -> Result<Self> {
+        validate_reply_body(&body)?;
+        if !valid_key(request_key) || ordinal == 0 || ordinal > MAX_REPLY_ORDINAL {
+            return Err(ChatRuntimeError::invalid(
+                "reply identity is outside the protocol range",
+            ));
+        }
+        let send_request_id = random_operation_uuid()?;
+        let mut record = Self {
+            version: STATE_VERSION,
+            request_key: request_key.to_owned(),
+            ordinal,
+            body,
+            send_request_id,
+            reserved_bytes: 0,
+            phase: ReplyPhase::Pending,
+            provider_message_id: None,
+            captured_at_millis: unix_millis(),
+        };
+        let initial = encoded_document_bytes(&record)?;
+        let receipt_reservation = chat_subscription::MAX_RESOURCE_ID_BYTES
+            .saturating_mul(6)
+            .saturating_add(128);
+        record.reserved_bytes = u64::try_from(initial.saturating_add(receipt_reservation))
+            .map_err(|_| ChatRuntimeError::invalid("reply reservation does not fit u64"))?;
+        record.validate(request_key, ordinal)?;
+        Ok(record)
+    }
+
+    fn validate(&self, request_key: &str, ordinal: u32) -> Result<()> {
+        if self.version != STATE_VERSION
+            || self.request_key != request_key
+            || self.ordinal != ordinal
+            || !valid_operation_uuid(&self.send_request_id)
+        {
+            return Err(ChatRuntimeError::invalid(
+                "saved reply identity does not match its artifact path",
+            ));
+        }
+        validate_reply_body(&self.body)?;
+        if !valid_operation_uuid(&self.send_request_id) {
+            return Err(ChatRuntimeError::invalid(
+                "saved reply operation id is not an RFC 4122 UUID",
+            ));
+        }
+        let actual = u64::try_from(encoded_document_bytes(self)?)
+            .map_err(|_| ChatRuntimeError::invalid("reply length does not fit u64"))?;
+        if actual > self.reserved_bytes
+            || self.reserved_bytes > u64::try_from(MAX_REPLY_RECORD_BYTES).unwrap_or(u64::MAX)
+        {
+            return Err(ChatRuntimeError::invalid(
+                "saved reply exceeds its durable byte reservation",
+            ));
+        }
+        if matches!(self.phase, ReplyPhase::Sent) && self.provider_message_id.is_none() {
+            return Err(ChatRuntimeError::invalid(
+                "sent reply is missing its provider message receipt",
+            ));
+        }
+        if let Some(message_id) = self.provider_message_id.as_deref() {
+            validate_single_line(
+                message_id,
+                "provider reply message id",
+                chat_subscription::MAX_RESOURCE_ID_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// One outbound provider request. `request_id` remains stable across uncertain retries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplySubmission<'a> {
+    /// Exact provider channel or space resource.
+    pub channel_id: &'a str,
+    /// Exact originating thread resource.
+    pub thread_id: &'a str,
+    /// Validated nonempty reply body.
+    pub body: &'a str,
+    /// Stable idempotency key retained across uncertain retries.
+    pub request_id: &'a str,
+}
+
+/// Request/response transport kept separate from the inbound subscription trait.
+pub trait ReplyTransport {
+    /// Post or reconcile one reply, returning its immutable provider message identifier.
+    fn send(
+        &mut self,
+        submission: ReplySubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure>;
+}
+
+/// One idempotent ensure-reaction request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactionSubmission<'a> {
+    /// Exact provider channel or space resource.
+    pub channel_id: &'a str,
+    /// Exact durably admitted provider message resource.
+    pub message_id: &'a str,
+    /// Configured Unicode reaction.
+    pub emoji: &'a str,
+    /// Stable UUID retained across retries.
+    pub request_id: &'a str,
+}
+
+/// Provider receipt for an ensured reaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactionReceipt {
+    /// Immutable provider reaction resource.
+    pub reaction_id: String,
+    /// Whether reconciliation found the reaction already present.
+    pub already_present: bool,
+}
+
+/// Idempotent outbound reaction transport, independent of inbound subscriptions.
+pub trait ReactionTransport {
+    /// Ensure the configured reaction is present and return an exact receipt.
+    fn ensure_reaction(
+        &mut self,
+        submission: ReactionSubmission<'_>,
+    ) -> std::result::Result<ReactionReceipt, OutboundFailure>;
+}
+
+/// Whether a failed outbound operation is proven absent or may have applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundOutcome {
+    /// The provider operation was proven not to have applied.
+    NotApplied,
+    /// The provider outcome could not be proven; only the identical UUID may be retried.
+    Unknown,
+}
+
+/// Bounded provider or adapter failure for one durable outbound operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboundFailure {
+    /// Stable machine-readable failure code.
+    pub code: String,
+    /// Bounded diagnostic without credentials.
+    pub detail: String,
+    /// Provider application evidence.
+    pub outcome: OutboundOutcome,
+    /// Whether repeating the identical UUID and fields may succeed.
+    pub retryable: bool,
+}
+
+impl OutboundFailure {
+    fn protocol(detail: impl Into<String>) -> Self {
+        Self {
+            code: "adapter_protocol".to_owned(),
+            detail: bounded_detail(&detail.into(), 2_000),
+            outcome: OutboundOutcome::Unknown,
+            retryable: true,
+        }
+    }
+}
+
+impl fmt::Display for OutboundFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}: {} (outcome={:?}, retryable={})",
+            self.code, self.detail, self.outcome, self.retryable
+        )
+    }
+}
+
+impl std::error::Error for OutboundFailure {}
+
+#[derive(Serialize)]
+struct SendWireRequest<'a> {
+    version: u32,
+    id: &'a str,
+    action: &'static str,
+    channel_id: &'a str,
+    thread_id: &'a str,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct ReactionWireRequest<'a> {
+    version: u32,
+    id: &'a str,
+    action: &'static str,
+    channel_id: &'a str,
+    message_id: &'a str,
+    emoji: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WireResponse {
+    Success(WireSuccess),
+    Failure(WireFailure),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireSuccess {
+    version: u32,
+    id: String,
+    action: String,
+    ok: bool,
+    receipt: WireReceipt,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireFailure {
+    version: u32,
+    id: Value,
+    action: Value,
+    ok: bool,
+    error: WireError,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WireReceipt {
+    Send(SendWireReceipt),
+    Reaction(ReactionWireReceipt),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendWireReceipt {
+    message_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReactionWireReceipt {
+    reaction_id: String,
+    already_present: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireError {
+    code: String,
+    detail: String,
+    outcome: OutboundOutcome,
+    retryable: bool,
+}
+
+/// Encode one exact v1 outbound send request as a newline-delimited strict JSON frame.
+pub fn encode_send_request(
+    submission: &ReplySubmission<'_>,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    validate_outbound_send(submission)?;
+    encode_wire_request(&SendWireRequest {
+        version: 1,
+        id: submission.request_id,
+        action: "send",
+        channel_id: submission.channel_id,
+        thread_id: submission.thread_id,
+        text: submission.body,
+    })
+}
+
+/// Encode one exact v1 outbound ensure-reaction request as a newline-delimited strict JSON frame.
+pub fn encode_reaction_request(
+    submission: &ReactionSubmission<'_>,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    validate_outbound_reaction(submission)?;
+    encode_wire_request(&ReactionWireRequest {
+        version: 1,
+        id: submission.request_id,
+        action: "ensure_reaction",
+        channel_id: submission.channel_id,
+        message_id: submission.message_id,
+        emoji: submission.emoji,
+    })
+}
+
+/// Decode and bind one strict v1 send response to its exact requested authority.
+pub fn decode_send_response(
+    payload: &[u8],
+    submission: &ReplySubmission<'_>,
+) -> std::result::Result<String, OutboundFailure> {
+    validate_outbound_send(submission)?;
+    match decode_wire_response(payload, submission.request_id, "send")? {
+        WireReceipt::Send(receipt) => {
+            let prefix = format!("{}/messages/", submission.channel_id);
+            if !receipt.message_id.starts_with(&prefix)
+                || receipt.message_id.len() <= prefix.len()
+                || receipt.message_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+            {
+                return Err(OutboundFailure::protocol(
+                    "send receipt names a message outside the requested channel",
+                ));
+            }
+            Ok(receipt.message_id)
+        }
+        WireReceipt::Reaction(_) => Err(OutboundFailure::protocol(
+            "send response contains a reaction receipt",
+        )),
+    }
+}
+
+/// Decode and bind one strict v1 reaction response to its exact requested message.
+pub fn decode_reaction_response(
+    payload: &[u8],
+    submission: &ReactionSubmission<'_>,
+) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+    validate_outbound_reaction(submission)?;
+    match decode_wire_response(payload, submission.request_id, "ensure_reaction")? {
+        WireReceipt::Reaction(receipt) => {
+            let prefix = format!("{}/reactions/", submission.message_id);
+            if !receipt.reaction_id.starts_with(&prefix)
+                || receipt.reaction_id.len() <= prefix.len()
+                || receipt.reaction_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+            {
+                return Err(OutboundFailure::protocol(
+                    "reaction receipt names a resource outside the requested message",
+                ));
+            }
+            Ok(ReactionReceipt {
+                reaction_id: receipt.reaction_id,
+                already_present: receipt.already_present,
+            })
+        }
+        WireReceipt::Send(_) => Err(OutboundFailure::protocol(
+            "reaction response contains a send receipt",
+        )),
+    }
+}
+
+fn encode_wire_request<T: Serialize>(request: &T) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    let mut encoded = serde_json::to_vec(request)
+        .map_err(|error| OutboundFailure::protocol(format!("cannot encode request: {error}")))?;
+    if encoded.len() >= chat_subscription_plugin::MAX_FRAME_BYTES {
+        return Err(OutboundFailure {
+            code: "request_too_large".to_owned(),
+            detail: "outbound request exceeds the 1 MiB wire limit".to_owned(),
+            outcome: OutboundOutcome::NotApplied,
+            retryable: false,
+        });
+    }
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn decode_wire_response(
+    payload: &[u8],
+    expected_id: &str,
+    expected_action: &str,
+) -> std::result::Result<WireReceipt, OutboundFailure> {
+    if payload.len() > chat_subscription_plugin::MAX_FRAME_BYTES {
+        return Err(OutboundFailure::protocol(
+            "outbound adapter response exceeds the 1 MiB wire limit",
+        ));
+    }
+    let response: WireResponse = chat_subscription_plugin::decode_strict_json(payload)
+        .map_err(|error| OutboundFailure::protocol(error.to_string()))?;
+    match response {
+        WireResponse::Success(success) => {
+            if success.version != 1
+                || !success.ok
+                || success.id != expected_id
+                || success.action != expected_action
+            {
+                return Err(OutboundFailure::protocol(
+                    "outbound success does not match the requested version, UUID, or action",
+                ));
+            }
+            Ok(success.receipt)
+        }
+        WireResponse::Failure(failure) => {
+            if failure.version != 1 || failure.ok {
+                return Err(OutboundFailure::protocol(
+                    "outbound failure has an invalid version or success flag",
+                ));
+            }
+            let id = failure.id.as_str();
+            let action = failure.action.as_str();
+            if id != Some(expected_id) || action != Some(expected_action) {
+                // Null id/action is valid only when the helper could not parse an input request.
+                // This host supplied a valid request and therefore cannot bind such a failure to
+                // the operation whose provider outcome is now unknown.
+                return Err(OutboundFailure::protocol(
+                    "outbound failure does not identify the exact requested UUID and action",
+                ));
+            }
+            validate_failure_code(&failure.error.code)?;
+            if failure.error.detail.is_empty() || failure.error.detail.len() > 2_000 {
+                return Err(OutboundFailure::protocol(
+                    "outbound failure detail is empty or exceeds 2000 bytes",
+                ));
+            }
+            Err(OutboundFailure {
+                code: failure.error.code,
+                detail: failure.error.detail,
+                outcome: failure.error.outcome,
+                retryable: failure.error.retryable,
+            })
+        }
+    }
+}
+
+fn validate_outbound_send(
+    submission: &ReplySubmission<'_>,
+) -> std::result::Result<(), OutboundFailure> {
+    validate_operation_id(submission.request_id)?;
+    validate_resource(submission.channel_id, "channel")?;
+    validate_resource(submission.thread_id, "thread")?;
+    if submission.body.trim().is_empty() || submission.body.len() > MAX_REPLY_BYTES {
+        return Err(not_applied_invalid(
+            "reply body is empty or exceeds 30000 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_outbound_reaction(
+    submission: &ReactionSubmission<'_>,
+) -> std::result::Result<(), OutboundFailure> {
+    validate_operation_id(submission.request_id)?;
+    validate_resource(submission.channel_id, "channel")?;
+    validate_resource(submission.message_id, "message")?;
+    if submission.emoji.is_empty() || submission.emoji.len() > 64 {
+        return Err(not_applied_invalid("reaction is empty or exceeds 64 bytes"));
+    }
+    Ok(())
+}
+
+fn validate_operation_id(value: &str) -> std::result::Result<(), OutboundFailure> {
+    if valid_operation_uuid(value) {
+        Ok(())
+    } else {
+        Err(not_applied_invalid("operation id is not an RFC 4122 UUID"))
+    }
+}
+
+fn validate_resource(value: &str, label: &str) -> std::result::Result<(), OutboundFailure> {
+    if value.is_empty()
+        || value.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+        || value.contains(['\0', '\n', '\r'])
+    {
+        Err(not_applied_invalid(format!(
+            "{label} resource is empty, oversized, or multiline"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_failure_code(value: &str) -> std::result::Result<(), OutboundFailure> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        Err(OutboundFailure::protocol(
+            "outbound failure code is not a bounded lowercase slug",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn not_applied_invalid(detail: impl Into<String>) -> OutboundFailure {
+    OutboundFailure {
+        code: "invalid_request".to_owned(),
+        detail: bounded_detail(&detail.into(), 2_000),
+        outcome: OutboundOutcome::NotApplied,
+        retryable: false,
+    }
+}
+
+/// Durable acknowledgement state after one ensure attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AckResult {
+    /// Reactions are disabled by operator configuration.
+    Disabled,
+    /// The reaction is durably reconciled with its provider receipt.
+    Acked(ReactionReceipt),
+}
+
+/// Newly captured replies plus unavailable fence identifiers for coordinator feedback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplyCapture {
+    /// Consecutive reply ordinals durably captured during this snapshot.
+    pub ordinals: Vec<u32>,
+    /// Unavailable marker identifiers that should be reported to the coordinator.
+    pub unknown_ids: Vec<String>,
+}
+
+/// One bounded result of durably admitting an upstream acknowledgement unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchAdmission {
+    /// Newly created durable request keys; replayed duplicates are omitted.
+    pub new_request_keys: Vec<String>,
+    /// Whether any retained gap still requires request/response reconciliation.
+    pub reconciliation_required: bool,
+}
+
+/// Result of consuming exactly one item from an ordered subscription.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConsumedItem {
+    /// Provider liveness advanced without a durable cursor change.
+    Heartbeat,
+    /// One provider batch was admitted and acknowledged.
+    Batch(BatchAdmission),
+    /// The provider emitted an explicit graceful end.
+    End,
+}
+
+/// Durable result of reconciling one request with the coordinator's delivery queue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoordinatorDeliveryResult {
+    /// The native working transition confirmed prompt delivery.
+    Delivered,
+    /// The request remains known-safe to retry.
+    Pending(String),
+    /// The prompt may have crossed the terminal injection barrier.
+    Uncertain(String),
+    /// The request was already durably confirmed.
+    AlreadyDelivered,
+}
+
+trait CoordinatorDelivery {
+    fn message_state(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+    ) -> std::result::Result<Option<QueueMessageState>, String>;
+    fn submit(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<(), String>;
+    fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String>;
+}
+
+impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
+    fn message_state(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+    ) -> std::result::Result<Option<QueueMessageState>, String> {
+        ManagedAgents::message_state(self, agent_name, message_id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn submit(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<(), String> {
+        ManagedAgents::send_identified(self, agent_name, prompt, options, Some(message_id))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String> {
+        ManagedAgents::drain(self, agent_name, options)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Private, restartable durable state for one coordinator bridge.
+#[derive(Debug)]
+pub struct BridgeState {
+    root: PathBuf,
+    config: BridgeConfiguration,
+}
+
+/// Revalidate and pin the configured provider executable without launching it.
+///
+/// Process containment and protocol connection belong to
+/// `chat_subscription_plugin::process::ProcessPluginChild`; this function intentionally returns
+/// only the immutable launch plan so the runtime cannot fall back to agentctl's legacy supervisor.
+pub fn select_plugin(
+    inventory: &crate::plugins::PluginInventory,
+    config: &BridgeConfiguration,
+) -> Result<crate::plugins::PinnedPluginCommand> {
+    config.validate()?;
+    let plugin = inventory
+        .discovered
+        .iter()
+        .find(|plugin| plugin.name == config.subscription_plugin)
+        .ok_or_else(|| {
+            ChatRuntimeError::invalid(format!(
+                "subscription plugin {:?} is not safely discovered",
+                config.subscription_plugin
+            ))
+        })?;
+    if !plugin.capability.starts_with("chat-subscription.") {
+        return Err(ChatRuntimeError::invalid(format!(
+            "plugin {:?} does not advertise a chat-subscription capability",
+            plugin.name
+        )));
+    }
+    inventory
+        .launch_command(&config.subscription_plugin)
+        .map_err(|refusal| {
+            ChatRuntimeError::invalid(format!(
+                "subscription plugin refused ({}): {}",
+                refusal.code, refusal.detail
+            ))
+        })
+}
+
+impl BridgeState {
+    /// Create a new private bridge state directory.
+    pub fn initialize(root: &Path, config: BridgeConfiguration) -> Result<Self> {
+        config.validate()?;
+        let existed = fs::symlink_metadata(root).is_ok();
+        agent::create_private_directory(root, "chat state directory", true, true)?;
+        if existed && fs::read_dir(root)?.next().is_some() {
+            return Err(ChatRuntimeError::invalid(
+                "chat state directory is not empty; open existing state instead",
+            ));
+        }
+        for (directory, label) in [
+            (root.join("requests"), "chat request directory"),
+            (root.join("replies"), "chat reply directory"),
+        ] {
+            agent::create_private_directory(&directory, label, true, true)?;
+        }
+        let envelope = ConfigurationEnvelope {
+            version: STATE_VERSION,
+            config: config.clone(),
+        };
+        write_document(&root.join("bridge.json"), &envelope)?;
+        write_document(&root.join("checkpoint.json"), &Checkpoint::empty())?;
+        agent::sync_directory(root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            config,
+        })
+    }
+
+    /// Open and recover one existing private bridge state directory.
+    pub fn open(root: &Path) -> Result<Self> {
+        agent::validate_private_directory(root, "chat state directory", false)?;
+        agent::validate_private_directory(&root.join("requests"), "chat request directory", false)?;
+        agent::validate_private_directory(&root.join("replies"), "chat reply directory", false)?;
+        let envelope: ConfigurationEnvelope = read_document(&root.join("bridge.json"), 1 << 20)?;
+        if envelope.version != STATE_VERSION {
+            return Err(ChatRuntimeError::invalid(format!(
+                "chat state has unsupported version {}",
+                envelope.version
+            )));
+        }
+        envelope.config.validate()?;
+        let state = Self {
+            root: root.to_path_buf(),
+            config: envelope.config,
+        };
+        state.recover_population()?;
+        Ok(state)
+    }
+
+    /// Borrow the immutable authority configuration.
+    pub fn config(&self) -> &BridgeConfiguration {
+        &self.config
+    }
+
+    /// Return the last durable inclusive provider replay cursor.
+    pub fn cursor(&self) -> Result<Option<String>> {
+        Ok(self.read_checkpoint()?.cursor)
+    }
+
+    /// Build the next subscription request from durable replay authority.
+    pub fn subscribe_request(&self) -> Result<SubscribeRequest> {
+        let checkpoint = self.read_checkpoint()?;
+        self.config.subscribe_request(checkpoint.cursor.as_deref())
+    }
+
+    /// Acquire the generation-wide owner lease. The descriptor must remain live until shutdown.
+    pub fn acquire_runner_lease(&self) -> Result<File> {
+        let lock = agent::open_private_lock(&self.root.join(".run.lock"), "chat runner lock")?;
+        lock.try_lock_exclusive().map_err(|error| {
+            ChatRuntimeError::invalid(format!("another chat runtime owns this state: {error}"))
+        })?;
+        Ok(lock)
+    }
+
+    /// Persist every child event and the cursor without acknowledging the provider.
+    pub fn admit_batch(&self, batch: &DeliveryBatch) -> Result<BatchAdmission> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut checkpoint = self.read_checkpoint()?;
+        let mut new_records = Vec::new();
+        let mut request_bytes = 0_u64;
+        let mut reconciliation_required = checkpoint.reconciliation_required;
+
+        for event in batch.events() {
+            match event {
+                CommittableEvent::MessageCreated(message) => {
+                    let record =
+                        RequestRecord::from_message(message, self.config.ack_reaction.as_deref())?;
+                    let path = self.request_path(&record.key);
+                    if fs::symlink_metadata(&path).is_ok() {
+                        let saved: RequestRecord = read_document(&path, MAX_REQUEST_RECORD_BYTES)?;
+                        saved.validate(&record.key)?;
+                        if saved.message != record.message {
+                            return Err(ChatRuntimeError::invalid(
+                                "an existing request key names different message content",
+                            ));
+                        }
+                        continue;
+                    }
+                    let encoded_bytes_usize = encoded_document_bytes(&record)?;
+                    let encoded_bytes = u64::try_from(encoded_bytes_usize).map_err(|_| {
+                        ChatRuntimeError::invalid("request record length does not fit u64")
+                    })?;
+                    if encoded_bytes_usize > MAX_REQUEST_RECORD_BYTES {
+                        return Err(ChatRuntimeError::invalid(format!(
+                            "request record exceeds {MAX_REQUEST_RECORD_BYTES} bytes"
+                        )));
+                    }
+                    let next_count = checkpoint
+                        .request_count
+                        .saturating_add(u64::try_from(new_records.len()).unwrap_or(u64::MAX))
+                        .saturating_add(1);
+                    let next_bytes = checkpoint
+                        .request_bytes
+                        .saturating_add(request_bytes)
+                        .saturating_add(encoded_bytes);
+                    if next_count > MAX_REQUESTS || next_bytes > MAX_REQUEST_BYTES {
+                        return Err(ChatRuntimeError::invalid(
+                            "chat request population limit reached; refusing provider commit",
+                        ));
+                    }
+                    write_document(&path, &record)?;
+                    request_bytes = request_bytes.saturating_add(encoded_bytes);
+                    new_records.push(record.key);
+                }
+                CommittableEvent::Checkpoint => {}
+                CommittableEvent::Gap(_) => reconciliation_required = true,
+            }
+        }
+
+        if !new_records.is_empty() {
+            agent::sync_directory(&self.root.join("requests"))?;
+        }
+        checkpoint.cursor = Some(batch.cursor().as_str().to_owned());
+        checkpoint.request_count = checkpoint
+            .request_count
+            .saturating_add(u64::try_from(new_records.len()).unwrap_or(u64::MAX));
+        checkpoint.request_bytes = checkpoint.request_bytes.saturating_add(request_bytes);
+        checkpoint.committed_batches = checkpoint.committed_batches.saturating_add(1);
+        checkpoint.reconciliation_required = reconciliation_required;
+        checkpoint.updated_at_millis = unix_millis();
+        validate_checkpoint(&checkpoint)?;
+        write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        Ok(BatchAdmission {
+            new_request_keys: new_records,
+            reconciliation_required,
+        })
+    }
+
+    /// Read bounded local status without contacting a provider or coordinator.
+    pub fn status(&self) -> Result<Value> {
+        let checkpoint = self.read_checkpoint()?;
+        let mut phases = Map::new();
+        phases.insert("pending".to_owned(), Value::from(0));
+        phases.insert("submitting".to_owned(), Value::from(0));
+        phases.insert("delivered".to_owned(), Value::from(0));
+        phases.insert("delivery_uncertain".to_owned(), Value::from(0));
+        let mut acknowledgements = Map::new();
+        acknowledgements.insert("disabled".to_owned(), Value::from(0));
+        acknowledgements.insert("pending".to_owned(), Value::from(0));
+        acknowledgements.insert("sending".to_owned(), Value::from(0));
+        acknowledgements.insert("acked".to_owned(), Value::from(0));
+        for (record, _) in self.request_records()? {
+            let key = match record.phase {
+                RequestPhase::Pending => "pending",
+                RequestPhase::Submitting => "submitting",
+                RequestPhase::Delivered => "delivered",
+                RequestPhase::DeliveryUncertain => "delivery_uncertain",
+            };
+            let count = phases.get(key).and_then(Value::as_u64).unwrap_or(0);
+            phases.insert(key.to_owned(), Value::from(count.saturating_add(1)));
+            let ack_key = match record.ack_phase {
+                AckPhase::Disabled => "disabled",
+                AckPhase::Pending => "pending",
+                AckPhase::Sending => "sending",
+                AckPhase::Acked => "acked",
+            };
+            let ack_count = acknowledgements
+                .get(ack_key)
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            acknowledgements.insert(ack_key.to_owned(), Value::from(ack_count.saturating_add(1)));
+        }
+        Ok(serde_json::json!({
+            "subscription_plugin": self.config.subscription_plugin,
+            "agent_name": self.config.agent_name,
+            "channel_ids": self.config.channel_ids,
+            "cursor_present": checkpoint.cursor.is_some(),
+            "request_count": checkpoint.request_count,
+            "request_bytes": checkpoint.request_bytes,
+            "committed_batches": checkpoint.committed_batches,
+            "reconciliation_required": checkpoint.reconciliation_required,
+            "reply_count": checkpoint.reply_count,
+            "reply_bytes": checkpoint.reply_bytes,
+            "phases": phases,
+            "acknowledgements": acknowledgements,
+        }))
+    }
+
+    /// Render one generic provider-independent coordinator prompt and reply protocol.
+    pub fn prompt(&self, key: &str) -> Result<String> {
+        let record = self.read_request(key)?;
+        let reply_id = format!("{}_{}", record.reply_nonce, record.next_reply_ordinal);
+        Ok(format!(
+            "The user's request arrived through the configured chat bridge.\n\
+Source: {}\n\
+Sender: {}\n\n\
+{}\n\n\
+Complete this request using your normal instructions and tools. You may send one or multiple replies, including progress updates. \
+Your next reply ID is `{reply_id}`. Compose an opening line from the literal prefix `<CHAT_REPLY_`, that ID, and `>`; \
+compose its closing line from `</CHAT_REPLY_`, the same ID, and `>`. Keep both lines standalone and outside code fences. \
+Increment the numeric suffix for every later reply. Each consecutive complete block is sent as a separate chat message.",
+            record.message.message_id, record.message.sender_id, record.message.text,
+        ))
+    }
+
+    /// Read pending request keys during startup recovery or an explicit delivery pass.
+    pub fn pending_request_keys(&self) -> Result<Vec<String>> {
+        Ok(self
+            .request_records()?
+            .into_iter()
+            .filter_map(|(record, _)| {
+                matches!(
+                    record.phase,
+                    RequestPhase::Pending | RequestPhase::Submitting
+                )
+                .then_some(record.key)
+            })
+            .collect())
+    }
+
+    /// Ensure the configured durable-intake reaction is present for one request.
+    ///
+    /// The operation UUID is persisted with the request before the transport call. A crash or
+    /// unknown transport outcome leaves `sending`; the next attempt must reconcile or repeat the
+    /// identical ensure operation rather than create a second logical reaction.
+    pub fn ensure_ack(
+        &self,
+        key: &str,
+        transport: &mut dyn ReactionTransport,
+    ) -> Result<AckResult> {
+        let request_snapshot = {
+            let state_lock =
+                agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+            state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+            let mut request = self.read_request(key)?;
+            match request.ack_phase {
+                AckPhase::Disabled => return Ok(AckResult::Disabled),
+                AckPhase::Acked => {
+                    return Ok(AckResult::Acked(ReactionReceipt {
+                        reaction_id: request
+                            .reaction_id
+                            .expect("validated acknowledged request has receipt"),
+                        already_present: request
+                            .reaction_already_present
+                            .expect("validated acknowledged request has reconciliation flag"),
+                    }));
+                }
+                AckPhase::Pending | AckPhase::Sending => {}
+            }
+            request.ack_phase = AckPhase::Sending;
+            request.ack_error = None;
+            let mut checkpoint = self.read_checkpoint()?;
+            self.write_request_accounted(&request, &mut checkpoint)?;
+            checkpoint.updated_at_millis = unix_millis();
+            write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+            request
+        };
+
+        let receipt = match transport.ensure_reaction(ReactionSubmission {
+            channel_id: &request_snapshot.message.channel_id,
+            message_id: &request_snapshot.message.message_id,
+            emoji: request_snapshot
+                .ack_reaction
+                .as_deref()
+                .expect("validated enabled acknowledgement has reaction"),
+            request_id: request_snapshot
+                .ack_request_id
+                .as_deref()
+                .expect("validated enabled acknowledgement has operation id"),
+        }) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let state_lock =
+                    agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+                state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+                let mut request = self.read_request(key)?;
+                request.ack_phase = AckPhase::Sending;
+                request.ack_error = Some(bounded_detail(&error.to_string(), 2_000));
+                let mut checkpoint = self.read_checkpoint()?;
+                self.write_request_accounted(&request, &mut checkpoint)?;
+                checkpoint.updated_at_millis = unix_millis();
+                write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+                return Err(ChatRuntimeError::invalid(format!(
+                    "outbound reaction ensure failed: {error}"
+                )));
+            }
+        };
+        validate_single_line(
+            &receipt.reaction_id,
+            "provider reaction id",
+            chat_subscription::MAX_RESOURCE_ID_BYTES,
+        )?;
+
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut request = self.read_request(key)?;
+        if request.ack_request_id != request_snapshot.ack_request_id {
+            return Err(ChatRuntimeError::invalid(
+                "acknowledgement operation identity changed during transport call",
+            ));
+        }
+        request.ack_phase = AckPhase::Acked;
+        request.reaction_id = Some(receipt.reaction_id.clone());
+        request.reaction_already_present = Some(receipt.already_present);
+        request.ack_error = None;
+        let mut checkpoint = self.read_checkpoint()?;
+        self.write_request_accounted(&request, &mut checkpoint)?;
+        checkpoint.updated_at_millis = unix_millis();
+        write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        Ok(AckResult::Acked(receipt))
+    }
+
+    /// Capture every complete, consecutive reply block for one request from one retained snapshot.
+    /// No directory scan occurs: only the request and its next direct reply paths are touched.
+    pub fn capture_replies(&self, key: &str, rendered: &str) -> Result<ReplyCapture> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut request = self.read_request(key)?;
+        let mut scan = scan_reply_blocks(rendered, &request.reply_nonce)?;
+        let mut expected = request.next_reply_ordinal;
+        let mut captured = Vec::new();
+        let mut checkpoint = self.read_checkpoint()?;
+
+        loop {
+            let mut matching = scan.blocks.iter().filter(|block| block.ordinal == expected);
+            let Some(block) = matching.next() else {
+                break;
+            };
+            if matching.next().is_some() {
+                return Err(ChatRuntimeError::invalid(format!(
+                    "reply ordinal {expected} appears more than once in one capture"
+                )));
+            }
+            if request.reply_count >= MAX_REQUEST_REPLIES {
+                return Err(ChatRuntimeError::invalid(
+                    "request reply count limit reached",
+                ));
+            }
+            let reply = ReplyRecord::new(key, expected, block.body.clone())?;
+            let path = self.reply_path(key, expected);
+            let (bytes, exists) = if fs::symlink_metadata(&path).is_ok() {
+                let (saved, _actual_bytes): (ReplyRecord, u64) =
+                    read_document_sized(&path, MAX_REPLY_RECORD_BYTES)?;
+                saved.validate(key, expected)?;
+                if saved.body != reply.body {
+                    return Err(ChatRuntimeError::invalid(
+                        "existing reply ordinal contains different content",
+                    ));
+                }
+                (saved.reserved_bytes, true)
+            } else {
+                let encoded_bytes = encoded_document_bytes(&reply)?;
+                if encoded_bytes > MAX_REPLY_RECORD_BYTES {
+                    return Err(ChatRuntimeError::invalid(format!(
+                        "reply record exceeds {MAX_REPLY_RECORD_BYTES} bytes"
+                    )));
+                }
+                (reply.reserved_bytes, false)
+            };
+            let next_request_bytes = request.reply_bytes.saturating_add(bytes);
+            let next_state_count = checkpoint.reply_count.saturating_add(1);
+            let next_state_bytes = checkpoint.reply_bytes.saturating_add(bytes);
+            if request.reply_count >= MAX_REQUEST_REPLIES
+                || next_request_bytes > MAX_REQUEST_REPLY_BYTES
+                || next_state_count > MAX_STATE_REPLIES
+                || next_state_bytes > MAX_STATE_REPLY_BYTES
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "chat reply population limit reached",
+                ));
+            }
+            if !exists {
+                write_document(&path, &reply)?;
+                agent::sync_directory(&self.root.join("replies"))?;
+            }
+            request.reply_count = request.reply_count.saturating_add(1);
+            request.reply_bytes = next_request_bytes;
+            checkpoint.reply_count = next_state_count;
+            checkpoint.reply_bytes = next_state_bytes;
+            captured.push(expected);
+            expected = expected.saturating_add(1);
+            if expected > MAX_REPLY_ORDINAL.saturating_add(1) {
+                return Err(ChatRuntimeError::invalid(
+                    "reply ordinal space is exhausted",
+                ));
+            }
+        }
+
+        if !captured.is_empty() {
+            validate_checkpoint(&checkpoint)?;
+            request.next_reply_ordinal = expected;
+            request.validate(key)?;
+            self.write_request_accounted(&request, &mut checkpoint)?;
+            checkpoint.updated_at_millis = unix_millis();
+            write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        }
+        for block in &scan.blocks {
+            if block.ordinal >= expected {
+                let identifier = format!("{}_{}", request.reply_nonce, block.ordinal);
+                if !scan.unknown_ids.contains(&identifier) {
+                    scan.unknown_ids.push(identifier);
+                }
+            }
+        }
+        Ok(ReplyCapture {
+            ordinals: captured,
+            unknown_ids: scan.unknown_ids,
+        })
+    }
+
+    /// Publish exactly one retained reply in ordinal order.
+    ///
+    /// A `sending` artifact is retried with the same provider request ID after a crash. The
+    /// transport contract must make that request ID idempotent or reconcile it before returning.
+    pub fn publish_one(
+        &self,
+        key: &str,
+        transport: &mut dyn ReplyTransport,
+    ) -> Result<Option<String>> {
+        let (request_snapshot, mut reply) = {
+            let state_lock =
+                agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+            state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+            let mut request = self.read_request(key)?;
+            let original_send_ordinal = request.next_send_ordinal;
+            while request.next_send_ordinal < request.next_reply_ordinal {
+                let mut reply = self.read_reply(key, request.next_send_ordinal)?;
+                if reply.phase != ReplyPhase::Sent {
+                    reply.phase = ReplyPhase::Sending;
+                    write_document(&self.reply_path(key, reply.ordinal), &reply)?;
+                    break;
+                }
+                request.next_send_ordinal = request.next_send_ordinal.saturating_add(1);
+            }
+            if request.next_send_ordinal != original_send_ordinal {
+                let mut checkpoint = self.read_checkpoint()?;
+                self.write_request_accounted(&request, &mut checkpoint)?;
+                checkpoint.updated_at_millis = unix_millis();
+                write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+            }
+            if request.next_send_ordinal >= request.next_reply_ordinal {
+                return Ok(None);
+            }
+            let reply = self.read_reply(key, request.next_send_ordinal)?;
+            (request, reply)
+        };
+
+        let provider_message_id = transport
+            .send(ReplySubmission {
+                channel_id: &request_snapshot.message.channel_id,
+                thread_id: &request_snapshot.message.thread_id,
+                body: &reply.body,
+                request_id: &reply.send_request_id,
+            })
+            .map_err(|error| {
+                ChatRuntimeError::invalid(format!("outbound chat send failed: {error}"))
+            })?;
+        validate_single_line(
+            &provider_message_id,
+            "provider reply message id",
+            chat_subscription::MAX_RESOURCE_ID_BYTES,
+        )?;
+
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut current = self.read_reply(key, reply.ordinal)?;
+        if current.body != reply.body || current.send_request_id != reply.send_request_id {
+            return Err(ChatRuntimeError::invalid(
+                "reply artifact changed during outbound send",
+            ));
+        }
+        current.phase = ReplyPhase::Sent;
+        current.provider_message_id = Some(provider_message_id.clone());
+        write_document(&self.reply_path(key, current.ordinal), &current)?;
+        reply = current;
+        let mut request = self.read_request(key)?;
+        if request.next_send_ordinal == reply.ordinal {
+            request.next_send_ordinal = request.next_send_ordinal.saturating_add(1);
+            request.validate(key)?;
+            let mut checkpoint = self.read_checkpoint()?;
+            self.write_request_accounted(&request, &mut checkpoint)?;
+            checkpoint.updated_at_millis = unix_millis();
+            write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        }
+        Ok(Some(provider_message_id))
+    }
+
+    fn read_request(&self, key: &str) -> Result<RequestRecord> {
+        if !valid_key(key) {
+            return Err(ChatRuntimeError::invalid(
+                "chat request key must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        let record: RequestRecord =
+            read_document(&self.request_path(key), MAX_REQUEST_RECORD_BYTES)?;
+        self.validate_request_record(&record, key)?;
+        Ok(record)
+    }
+
+    fn validate_request_record(&self, record: &RequestRecord, path_key: &str) -> Result<()> {
+        record.validate(path_key)?;
+        if !self.config.channel_ids.contains(&record.message.channel_id)
+            || !self
+                .config
+                .allowed_senders
+                .contains(&record.message.sender_id)
+        {
+            return Err(ChatRuntimeError::invalid(
+                "saved request is outside configured channel or sender authority",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reply_path(&self, key: &str, ordinal: u32) -> PathBuf {
+        self.root
+            .join("replies")
+            .join(format!("{key}-{ordinal:06}.json"))
+    }
+
+    fn read_reply(&self, key: &str, ordinal: u32) -> Result<ReplyRecord> {
+        if !valid_key(key) || ordinal == 0 || ordinal > MAX_REPLY_ORDINAL {
+            return Err(ChatRuntimeError::invalid("invalid reply artifact identity"));
+        }
+        let reply: ReplyRecord =
+            read_document(&self.reply_path(key, ordinal), MAX_REPLY_RECORD_BYTES)?;
+        reply.validate(key, ordinal)?;
+        Ok(reply)
+    }
+
+    fn set_delivery_phase(
+        &self,
+        key: &str,
+        phase: RequestPhase,
+        detail: Option<&str>,
+    ) -> Result<RequestRecord> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut record = self.read_request(key)?;
+        record.phase = phase;
+        record.delivery_error = detail.map(|value| bounded_detail(value, 2_000));
+        let mut checkpoint = self.read_checkpoint()?;
+        self.write_request_accounted(&record, &mut checkpoint)?;
+        checkpoint.updated_at_millis = unix_millis();
+        write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        Ok(record)
+    }
+
+    fn write_request_accounted(
+        &self,
+        record: &RequestRecord,
+        checkpoint: &mut Checkpoint,
+    ) -> Result<()> {
+        record.validate(&record.key)?;
+        let (_, old_bytes): (RequestRecord, u64) =
+            read_document_sized(&self.request_path(&record.key), MAX_REQUEST_RECORD_BYTES)?;
+        let new_bytes = u64::try_from(encoded_document_bytes(record)?)
+            .map_err(|_| ChatRuntimeError::invalid("request record length does not fit u64"))?;
+        if new_bytes > u64::try_from(MAX_REQUEST_RECORD_BYTES).unwrap_or(u64::MAX) {
+            return Err(ChatRuntimeError::invalid(format!(
+                "request record exceeds {MAX_REQUEST_RECORD_BYTES} bytes"
+            )));
+        }
+        let next_total = checkpoint
+            .request_bytes
+            .checked_sub(old_bytes)
+            .and_then(|bytes| bytes.checked_add(new_bytes))
+            .ok_or_else(|| ChatRuntimeError::invalid("request byte accounting underflow"))?;
+        if next_total > MAX_REQUEST_BYTES {
+            return Err(ChatRuntimeError::invalid(
+                "chat request byte population limit reached",
+            ));
+        }
+        write_document(&self.request_path(&record.key), record)?;
+        checkpoint.request_bytes = next_total;
+        Ok(())
+    }
+
+    fn read_checkpoint(&self) -> Result<Checkpoint> {
+        let checkpoint: Checkpoint = read_document(&self.root.join("checkpoint.json"), 1 << 20)?;
+        validate_checkpoint(&checkpoint)?;
+        Ok(checkpoint)
+    }
+
+    fn request_path(&self, key: &str) -> PathBuf {
+        self.root.join("requests").join(format!("{key}.json"))
+    }
+
+    fn request_records(&self) -> Result<Vec<(RequestRecord, u64)>> {
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(self.root.join("requests"))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| ChatRuntimeError::invalid("request filename is not UTF-8"))?;
+            let key = name
+                .strip_suffix(".json")
+                .filter(|key| valid_key(key))
+                .ok_or_else(|| ChatRuntimeError::invalid("unexpected chat request artifact"))?;
+            paths.push((entry.path(), key.to_owned()));
+            if paths.len() > usize::try_from(MAX_REQUESTS).unwrap_or(usize::MAX) {
+                return Err(ChatRuntimeError::invalid(
+                    "chat request population exceeds its record cap",
+                ));
+            }
+        }
+        paths.sort_by(|left, right| left.1.cmp(&right.1));
+        paths
+            .into_iter()
+            .map(|(path, key)| {
+                let (record, bytes): (RequestRecord, u64) =
+                    read_document_sized(&path, MAX_REQUEST_RECORD_BYTES)?;
+                self.validate_request_record(&record, &key)?;
+                Ok((record, bytes))
+            })
+            .collect()
+    }
+
+    fn reply_records(&self) -> Result<Vec<(ReplyRecord, u64)>> {
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(self.root.join("replies"))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| ChatRuntimeError::invalid("reply filename is not UTF-8"))?;
+            let stem = name
+                .strip_suffix(".json")
+                .ok_or_else(|| ChatRuntimeError::invalid("unexpected chat reply artifact"))?;
+            let (key, ordinal) = stem
+                .rsplit_once('-')
+                .ok_or_else(|| ChatRuntimeError::invalid("malformed chat reply artifact name"))?;
+            let ordinal = ordinal
+                .parse::<u32>()
+                .ok()
+                .filter(|ordinal| *ordinal > 0 && *ordinal <= MAX_REPLY_ORDINAL)
+                .ok_or_else(|| ChatRuntimeError::invalid("invalid chat reply ordinal"))?;
+            if !valid_key(key) {
+                return Err(ChatRuntimeError::invalid("invalid chat reply request key"));
+            }
+            paths.push((entry.path(), key.to_owned(), ordinal));
+            if paths.len() > usize::try_from(MAX_STATE_REPLIES).unwrap_or(usize::MAX) {
+                return Err(ChatRuntimeError::invalid(
+                    "chat reply population exceeds its record cap",
+                ));
+            }
+        }
+        paths.sort_by(|left, right| (&left.1, left.2).cmp(&(&right.1, right.2)));
+        paths
+            .into_iter()
+            .map(|(path, key, ordinal)| {
+                let (record, _actual_bytes): (ReplyRecord, u64) =
+                    read_document_sized(&path, MAX_REPLY_RECORD_BYTES)?;
+                record.validate(&key, ordinal)?;
+                let reserved_bytes = record.reserved_bytes;
+                Ok((record, reserved_bytes))
+            })
+            .collect()
+    }
+
+    /// One explicit startup pass repairs counters after a crash between request creation and the
+    /// cursor write. The provider hot loop thereafter uses the checkpoint and direct key lookups.
+    fn recover_population(&self) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let records = self.request_records()?;
+        let count = u64::try_from(records.len())
+            .map_err(|_| ChatRuntimeError::invalid("request count does not fit u64"))?;
+        let bytes = records
+            .iter()
+            .try_fold(0_u64, |total, (_, bytes)| total.checked_add(*bytes))
+            .ok_or_else(|| ChatRuntimeError::invalid("request byte count overflow"))?;
+        if count > MAX_REQUESTS || bytes > MAX_REQUEST_BYTES {
+            return Err(ChatRuntimeError::invalid(
+                "chat request population exceeds its durable cap",
+            ));
+        }
+        let mut checkpoint = self.read_checkpoint()?;
+        let mut checkpoint_changed = false;
+        if checkpoint.request_count != count || checkpoint.request_bytes != bytes {
+            checkpoint.request_count = count;
+            checkpoint.request_bytes = bytes;
+            checkpoint_changed = true;
+        }
+        let replies = self.reply_records()?;
+        let reply_count = u64::try_from(replies.len())
+            .map_err(|_| ChatRuntimeError::invalid("reply count does not fit u64"))?;
+        let reply_bytes = replies
+            .iter()
+            .try_fold(0_u64, |total, (_, bytes)| total.checked_add(*bytes))
+            .ok_or_else(|| ChatRuntimeError::invalid("reply byte count overflow"))?;
+        if reply_count > MAX_STATE_REPLIES || reply_bytes > MAX_STATE_REPLY_BYTES {
+            return Err(ChatRuntimeError::invalid(
+                "chat reply population exceeds its durable cap",
+            ));
+        }
+        let mut by_request: BTreeMap<String, Vec<(ReplyRecord, u64)>> = records
+            .iter()
+            .map(|(request, _)| (request.key.clone(), Vec::new()))
+            .collect();
+        for (reply, bytes) in replies {
+            by_request
+                .get_mut(&reply.request_key)
+                .ok_or_else(|| ChatRuntimeError::invalid("retained reply names a missing request"))?
+                .push((reply, bytes));
+        }
+        for (key, values) in by_request {
+            if values.len() > usize::try_from(MAX_REQUEST_REPLIES).unwrap_or(usize::MAX) {
+                return Err(ChatRuntimeError::invalid(
+                    "request reply population exceeds its record cap",
+                ));
+            }
+            let mut request = self.read_request(&key)?;
+            let mut expected = 1_u32;
+            let mut first_unsent = None;
+            let mut bytes = 0_u64;
+            for (reply, size) in &values {
+                if reply.ordinal != expected {
+                    return Err(ChatRuntimeError::invalid(
+                        "retained reply ordinals are not contiguous",
+                    ));
+                }
+                if reply.phase != ReplyPhase::Sent && first_unsent.is_none() {
+                    first_unsent = Some(reply.ordinal);
+                }
+                if first_unsent.is_some() && reply.phase == ReplyPhase::Sent {
+                    return Err(ChatRuntimeError::invalid(
+                        "a sent reply follows an unsent ordinal",
+                    ));
+                }
+                bytes = bytes.saturating_add(*size);
+                expected = expected.saturating_add(1);
+            }
+            if bytes > MAX_REQUEST_REPLY_BYTES {
+                return Err(ChatRuntimeError::invalid(
+                    "request reply population exceeds its byte cap",
+                ));
+            }
+            let original = (
+                request.reply_count,
+                request.reply_bytes,
+                request.next_reply_ordinal,
+                request.next_send_ordinal,
+            );
+            request.reply_count = u32::try_from(values.len())
+                .map_err(|_| ChatRuntimeError::invalid("request reply count does not fit u32"))?;
+            request.reply_bytes = bytes;
+            request.next_reply_ordinal = expected;
+            request.next_send_ordinal = first_unsent.unwrap_or(expected);
+            request.validate(&key)?;
+            let repaired = (
+                request.reply_count,
+                request.reply_bytes,
+                request.next_reply_ordinal,
+                request.next_send_ordinal,
+            );
+            if repaired != original {
+                write_document(&self.request_path(&key), &request)?;
+            }
+        }
+        let repaired_requests = self.request_records()?;
+        let repaired_count = u64::try_from(repaired_requests.len())
+            .map_err(|_| ChatRuntimeError::invalid("request count does not fit u64"))?;
+        let repaired_bytes = repaired_requests
+            .iter()
+            .try_fold(0_u64, |total, (_, bytes)| total.checked_add(*bytes))
+            .ok_or_else(|| ChatRuntimeError::invalid("request byte count overflow"))?;
+        if repaired_count > MAX_REQUESTS || repaired_bytes > MAX_REQUEST_BYTES {
+            return Err(ChatRuntimeError::invalid(
+                "repaired request population exceeds its durable cap",
+            ));
+        }
+        if checkpoint.request_count != repaired_count || checkpoint.request_bytes != repaired_bytes
+        {
+            checkpoint.request_count = repaired_count;
+            checkpoint.request_bytes = repaired_bytes;
+            checkpoint_changed = true;
+        }
+        if checkpoint.reply_count != reply_count || checkpoint.reply_bytes != reply_bytes {
+            checkpoint.reply_count = reply_count;
+            checkpoint.reply_bytes = reply_bytes;
+            checkpoint_changed = true;
+        }
+        validate_checkpoint(&checkpoint)?;
+        if checkpoint_changed {
+            checkpoint.updated_at_millis = unix_millis();
+            write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        }
+        Ok(())
+    }
+}
+
+/// Deliver or reconcile one admitted request without ever replaying uncertain terminal input.
+pub fn deliver_request<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    key: &str,
+    options: DrainOptions,
+) -> Result<CoordinatorDeliveryResult> {
+    deliver_request_with(state, manager, key, options)
+}
+
+fn deliver_request_with(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    key: &str,
+    options: DrainOptions,
+) -> Result<CoordinatorDeliveryResult> {
+    let mut record = state.read_request(key)?;
+    match record.phase {
+        RequestPhase::Delivered => return Ok(CoordinatorDeliveryResult::AlreadyDelivered),
+        RequestPhase::DeliveryUncertain => {
+            return Ok(CoordinatorDeliveryResult::Uncertain(
+                record
+                    .delivery_error
+                    .unwrap_or_else(|| "prior coordinator delivery is uncertain".to_owned()),
+            ));
+        }
+        RequestPhase::Pending => {
+            record = state.set_delivery_phase(key, RequestPhase::Submitting, None)?;
+        }
+        RequestPhase::Submitting => {}
+    }
+
+    let agent_name = &state.config.agent_name;
+    let message_id = &record.delivery_message_id;
+    let observed = match delivery.message_state(agent_name, message_id) {
+        Ok(observed) => observed,
+        Err(error) => {
+            state.set_delivery_phase(key, RequestPhase::Submitting, Some(&error))?;
+            return Ok(CoordinatorDeliveryResult::Pending(error));
+        }
+    };
+
+    let operation_error = match observed {
+        Some(QueueMessageState::Processed) => None,
+        Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
+            let detail = "coordinator queue reports a possibly submitted request";
+            state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(detail))?;
+            return Ok(CoordinatorDeliveryResult::Uncertain(detail.to_owned()));
+        }
+        Some(QueueMessageState::Pending) => delivery.drain(agent_name, options).err(),
+        None => delivery
+            .submit(agent_name, &state.prompt(key)?, message_id, options)
+            .err(),
+    };
+
+    if operation_error.is_none() && observed != Some(QueueMessageState::Pending) {
+        state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
+        return Ok(CoordinatorDeliveryResult::Delivered);
+    }
+
+    match delivery.message_state(agent_name, message_id) {
+        Ok(Some(QueueMessageState::Processed)) => {
+            state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
+            Ok(CoordinatorDeliveryResult::Delivered)
+        }
+        Ok(Some(QueueMessageState::Inflight | QueueMessageState::Failed)) => {
+            let detail = operation_error.unwrap_or_else(|| {
+                "coordinator queue reports a possibly submitted request".to_owned()
+            });
+            state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(&detail))?;
+            Ok(CoordinatorDeliveryResult::Uncertain(detail))
+        }
+        Ok(Some(QueueMessageState::Pending) | None) => {
+            let detail = operation_error
+                .unwrap_or_else(|| "coordinator is not ready; request remains pending".to_owned());
+            state.set_delivery_phase(key, RequestPhase::Pending, Some(&detail))?;
+            Ok(CoordinatorDeliveryResult::Pending(detail))
+        }
+        Err(error) => {
+            let detail = operation_error.map_or(error.clone(), |operation| {
+                format!("{operation}; recovery probe failed: {error}")
+            });
+            state.set_delivery_phase(key, RequestPhase::Submitting, Some(&detail))?;
+            Ok(CoordinatorDeliveryResult::Pending(detail))
+        }
+    }
+}
+
+/// Receive, durably admit, and acknowledge one ordered stream item.
+pub fn consume_one(
+    subscription: &mut ChatSubscription,
+    state: &BridgeState,
+) -> Result<ConsumedItem> {
+    match subscription.next_item()? {
+        None => Ok(ConsumedItem::End),
+        Some(SubscriptionItem::Heartbeat(_)) => Ok(ConsumedItem::Heartbeat),
+        Some(SubscriptionItem::Batch(batch)) => {
+            let admission = state.admit_batch(&batch)?;
+            subscription.commit_durable(&batch)?;
+            Ok(ConsumedItem::Batch(admission))
+        }
+    }
+}
+
+fn validate_checkpoint(checkpoint: &Checkpoint) -> Result<()> {
+    if checkpoint.version != STATE_VERSION {
+        return Err(ChatRuntimeError::invalid(format!(
+            "chat checkpoint has unsupported version {}",
+            checkpoint.version
+        )));
+    }
+    if checkpoint.request_count > MAX_REQUESTS
+        || checkpoint.request_bytes > MAX_REQUEST_BYTES
+        || checkpoint.reply_count > MAX_STATE_REPLIES
+        || checkpoint.reply_bytes > MAX_STATE_REPLY_BYTES
+    {
+        return Err(ChatRuntimeError::invalid(
+            "chat checkpoint exceeds a retained population cap",
+        ));
+    }
+    if let Some(cursor) = checkpoint.cursor.as_deref() {
+        ProviderCursor::new(cursor.to_owned())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn validate_slug(value: &str, label: &str, maximum: usize) -> Result<()> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > maximum
+        || !bytes[0].is_ascii_lowercase()
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    {
+        return Err(ChatRuntimeError::invalid(format!(
+            "{label} must be a lowercase slug of 1-{maximum} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_single_line(value: &str, label: &str, maximum: usize) -> Result<()> {
+    if value.trim().is_empty() || value.len() > maximum || value.contains(['\n', '\r', '\0']) {
+        return Err(ChatRuntimeError::invalid(format!(
+            "{label} must be one nonempty line of at most {maximum} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_single_line_or_multiline(
+    value: &str,
+    label: &str,
+    maximum: usize,
+) -> Result<()> {
+    if value.len() > maximum
+        || value.contains('\0')
+        || value.chars().any(invalid_rendered_character)
+    {
+        return Err(ChatRuntimeError::invalid(format!(
+            "{label} must contain at most {maximum} rendered UTF-8 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn message_key(message: &SavedMessage) -> Result<String> {
+    let identity = serde_json::to_vec(&serde_json::json!({
+        "channel_id": message.channel_id,
+        "message_id": message.message_id,
+    }))?;
+    Ok(format!("{:x}", Sha256::digest(identity)))
+}
+
+fn valid_key(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_reply_body(body: &str) -> Result<()> {
+    if body.trim().is_empty() || body.len() > MAX_REPLY_BYTES {
+        return Err(ChatRuntimeError::invalid(format!(
+            "chat reply body must be nonempty and at most {MAX_REPLY_BYTES} UTF-8 bytes"
+        )));
+    }
+    if body.chars().any(invalid_rendered_character) {
+        return Err(ChatRuntimeError::invalid(
+            "chat reply body contains terminal control characters",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScannedReply {
+    ordinal: u32,
+    body: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReplyScan {
+    blocks: Vec<ScannedReply>,
+    unknown_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveReply {
+    protocol: &'static str,
+    identifier: String,
+    ordinal: u32,
+    opening_margin: String,
+    body: Vec<String>,
+}
+
+fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> {
+    if !valid_nonce(expected_nonce) {
+        return Err(ChatRuntimeError::invalid(
+            "expected reply nonce is not 22-character base64url",
+        ));
+    }
+    if rendered.chars().any(invalid_rendered_character) {
+        return Err(ChatRuntimeError::invalid(
+            "reply capture contains terminal control characters",
+        ));
+    }
+    let normalized = rendered.replace("\r\n", "\n");
+    let mut replies = Vec::new();
+    let mut unknown_ids = Vec::new();
+    let mut active: Option<ActiveReply> = None;
+    let mut fence: Option<(char, usize)> = None;
+    let mut prompt_margin: Option<usize> = None;
+
+    for line in normalized.split('\n') {
+        let (undecorated, margin, decorated) = undecorate(line);
+        let stripped = line.trim_start_matches([' ', '\t']);
+        if active.is_none() {
+            if stripped.starts_with("› ") || stripped.starts_with("❯ ") {
+                prompt_margin = Some(line.len() - stripped.len() + 2);
+                continue;
+            }
+            if let Some(expected_margin) = prompt_margin {
+                if stripped.is_empty() || line.len() - stripped.len() >= expected_margin {
+                    continue;
+                }
+                prompt_margin = None;
+            }
+        }
+
+        if let Some((fence_character, fence_length)) = fence {
+            if closing_fence(&undecorated, fence_character, fence_length) {
+                fence = None;
+            }
+            if let Some(active) = active.as_mut() {
+                active.body.push(line.to_owned());
+            }
+            continue;
+        }
+
+        if active.is_none()
+            && decorated
+            && parse_marker(&undecorated).is_some_and(|marker| !marker.closing)
+        {
+            // Native assistant bullets delimit items. An unrelated unmatched Markdown fence
+            // from an older retained item must not hide the fresh reply marker.
+            fence = None;
+        }
+        if let Some(opened) = opening_fence(&undecorated) {
+            fence = Some(opened);
+            if let Some(active) = active.as_mut() {
+                active.body.push(line.to_owned());
+            }
+            continue;
+        }
+
+        let Some(marker) = parse_marker(&undecorated) else {
+            if let Some(active) = active.as_mut() {
+                active.body.push(line.to_owned());
+            }
+            continue;
+        };
+        let expected_ordinal = sequenced_ordinal(&marker.identifier, expected_nonce);
+        if expected_ordinal.is_none() && !unknown_ids.contains(&marker.identifier) {
+            unknown_ids.push(bounded_detail(&marker.identifier, 256));
+        }
+
+        match active.as_mut() {
+            None if !marker.closing => {
+                if let Some(ordinal) = expected_ordinal {
+                    active = Some(ActiveReply {
+                        protocol: marker.protocol,
+                        identifier: marker.identifier,
+                        ordinal,
+                        opening_margin: margin,
+                        body: Vec::new(),
+                    });
+                }
+            }
+            None => {}
+            Some(_) if !marker.closing => {
+                return Err(ChatRuntimeError::invalid(
+                    "nested chat reply markers are ambiguous",
+                ));
+            }
+            Some(opened)
+                if opened.identifier != marker.identifier || opened.protocol != marker.protocol =>
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "chat reply closing marker does not match its opening marker",
+                ));
+            }
+            Some(_) => {
+                let opened = active.take().expect("matched active reply");
+                replies.push(ScannedReply {
+                    ordinal: opened.ordinal,
+                    body: reply_body(opened.body, &opened.opening_margin, &margin)?,
+                });
+            }
+        }
+    }
+    Ok(ReplyScan {
+        blocks: replies,
+        unknown_ids,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct Marker {
+    protocol: &'static str,
+    closing: bool,
+    identifier: String,
+}
+
+fn parse_marker(line: &str) -> Option<Marker> {
+    let (closing, body) = line.strip_prefix("</").map_or_else(
+        || line.strip_prefix('<').map(|body| (false, body)),
+        |body| Some((true, body)),
+    )?;
+    let body = body.strip_suffix('>')?;
+    let (protocol, identifier) = if let Some(identifier) = body.strip_prefix("CHAT_REPLY_") {
+        ("CHAT", identifier)
+    } else {
+        ("GCHAT", body.strip_prefix("GCHAT_REPLY_")?)
+    };
+    if identifier
+        .contains(|character: char| character.is_whitespace() || matches!(character, '<' | '>'))
+    {
+        return None;
+    }
+    Some(Marker {
+        protocol,
+        closing,
+        identifier: identifier.to_owned(),
+    })
+}
+
+fn sequenced_ordinal(identifier: &str, expected_nonce: &str) -> Option<u32> {
+    let suffix = identifier.strip_prefix(expected_nonce)?.strip_prefix('_')?;
+    if suffix.is_empty()
+        || suffix.len() > 6
+        || suffix.starts_with('0')
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    suffix
+        .parse::<u32>()
+        .ok()
+        .filter(|ordinal| *ordinal <= MAX_REPLY_ORDINAL)
+}
+
+fn undecorate(line: &str) -> (String, String, bool) {
+    let stripped = line.trim_start_matches([' ', '\t']);
+    let mut margin = line[..line.len() - stripped.len()].to_owned();
+    let (stripped, decorated) = ["• ", "⏺ "]
+        .into_iter()
+        .find_map(|prefix| stripped.strip_prefix(prefix).map(|value| (value, true)))
+        .unwrap_or((stripped, false));
+    if decorated {
+        margin.push_str("  ");
+    }
+    let extra = stripped.len() - stripped.trim_start_matches([' ', '\t']).len();
+    margin.push_str(&stripped[..extra]);
+    (
+        stripped[extra..].trim_end_matches([' ', '\t']).to_owned(),
+        margin,
+        decorated,
+    )
+}
+
+fn opening_fence(line: &str) -> Option<(char, usize)> {
+    let character = line.chars().next()?;
+    if !matches!(character, '`' | '~') {
+        return None;
+    }
+    let length = line.chars().take_while(|value| *value == character).count();
+    if length < 3 {
+        return None;
+    }
+    let suffix = &line[length..];
+    if character == '`' && suffix.contains('`') {
+        return None;
+    }
+    Some((character, length))
+}
+
+fn closing_fence(line: &str, character: char, minimum: usize) -> bool {
+    let length = line.chars().take_while(|value| *value == character).count();
+    length >= minimum && line[length..].trim().is_empty()
+}
+
+fn reply_body(lines: Vec<String>, opening_margin: &str, closing_margin: &str) -> Result<String> {
+    let mut margin_length = opening_margin.len();
+    for line in std::iter::once(closing_margin).chain(
+        lines
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(String::as_str),
+    ) {
+        let common = opening_margin
+            .bytes()
+            .zip(line.bytes())
+            .take(margin_length)
+            .take_while(|(left, right)| left == right)
+            .count();
+        margin_length = common;
+        if margin_length == 0 {
+            break;
+        }
+    }
+    let margin = &opening_margin[..margin_length];
+    let body = lines
+        .into_iter()
+        .map(|line| line.strip_prefix(margin).unwrap_or(&line).to_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    validate_reply_body(&body)?;
+    Ok(body)
+}
+
+fn invalid_rendered_character(character: char) -> bool {
+    (character < ' ' && !matches!(character, '\t' | '\n' | '\r'))
+        || ('\u{7f}'..='\u{9f}').contains(&character)
+}
+
+fn random_reply_nonce() -> Result<String> {
+    Ok(base64url_nonce(random_bytes()?))
+}
+
+fn random_operation_uuid() -> Result<String> {
+    let mut bytes = random_bytes()?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ))
+}
+
+fn valid_operation_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            14 => byte == b'4',
+            19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+            _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+        })
+}
+
+fn random_bytes() -> Result<[u8; REPLY_NONCE_BYTES]> {
+    let mut bytes = [0_u8; REPLY_NONCE_BYTES];
+    let mut random = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/dev/urandom")?;
+    random.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn base64url_nonce(bytes: [u8; REPLY_NONCE_BYTES]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity(22);
+    for chunk in bytes.chunks_exact(3) {
+        output.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
+        output.push(char::from(
+            ALPHABET[usize::from(((chunk[0] & 3) << 4) | (chunk[1] >> 4))],
+        ));
+        output.push(char::from(
+            ALPHABET[usize::from(((chunk[1] & 15) << 2) | (chunk[2] >> 6))],
+        ));
+        output.push(char::from(ALPHABET[usize::from(chunk[2] & 63)]));
+    }
+    let tail = bytes[15];
+    output.push(char::from(ALPHABET[usize::from(tail >> 2)]));
+    output.push(char::from(ALPHABET[usize::from((tail & 3) << 4)]));
+    output
+}
+
+fn valid_nonce(value: &str) -> bool {
+    value.len() == 22
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn bounded_detail(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut boundary = maximum;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value[..boundary].to_owned()
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn write_document<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    agent::atomic_json(path, &serde_json::to_value(value)?)?;
+    Ok(())
+}
+
+fn encoded_document_bytes<T: Serialize>(value: &T) -> Result<usize> {
+    serde_json::to_vec_pretty(value)?
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| ChatRuntimeError::invalid("encoded document length overflow"))
+}
+
+fn read_document<T: for<'de> Deserialize<'de>>(path: &Path, maximum: usize) -> Result<T> {
+    read_document_sized(path, maximum).map(|(value, _)| value)
+}
+
+fn read_document_sized<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    maximum: usize,
+) -> Result<(T, u64)> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(ChatRuntimeError::invalid(format!(
+            "chat artifact is not a private owner-only regular file: {}",
+            path.display()
+        )));
+    }
+    let maximum_u64 = u64::try_from(maximum).unwrap_or(u64::MAX);
+    if metadata.len() > maximum_u64 {
+        return Err(ChatRuntimeError::invalid(format!(
+            "chat artifact exceeds {maximum_u64} bytes: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(maximum)
+            .min(maximum),
+    );
+    file.by_ref()
+        .take(maximum_u64.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.len() {
+        return Err(ChatRuntimeError::invalid(format!(
+            "chat artifact changed while it was read: {}",
+            path.display()
+        )));
+    }
+    let document = chat_subscription_plugin::decode_strict_json(&bytes)
+        .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+    Ok((document, metadata.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::num::NonZeroU16;
+    use std::sync::{Arc, Mutex};
+
+    use chat_subscription::{
+        BackendCapabilities, BackendFailure, CancellationError, ChatSubscriptionBackend,
+        ChatSubscriptionCancellation, ChatSubscriptionDriver, DeliveryId, EventKind, EventSequence,
+        InboundMessage, MessageId, ProviderPayload, ReplaySupport, SubscriptionItem, ThreadId,
+    };
+
+    use super::*;
+
+    struct Driver {
+        items: VecDeque<SubscriptionItem>,
+        acknowledged: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct NoopCancellation;
+
+    impl ChatSubscriptionCancellation for NoopCancellation {
+        fn cancel(&self) -> std::result::Result<(), CancellationError> {
+            Ok(())
+        }
+    }
+
+    fn noop_cancellation() -> Arc<dyn ChatSubscriptionCancellation> {
+        Arc::new(NoopCancellation)
+    }
+
+    impl ChatSubscriptionDriver for Driver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
+        fn next_item(&mut self) -> std::result::Result<Option<SubscriptionItem>, BackendFailure> {
+            Ok(self.items.pop_front())
+        }
+
+        fn acknowledge(
+            &mut self,
+            delivery_id: &DeliveryId,
+        ) -> std::result::Result<(), BackendFailure> {
+            self.acknowledged
+                .lock()
+                .expect("acknowledgement lock")
+                .push(delivery_id.as_str().to_owned());
+            Ok(())
+        }
+    }
+
+    struct Backend {
+        items: Option<VecDeque<SubscriptionItem>>,
+        acknowledged: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct FakeDelivery {
+        queue_state: Mutex<Option<QueueMessageState>>,
+        submitted_prompts: Mutex<Vec<String>>,
+        drains: Mutex<u64>,
+        submit_error: Mutex<Option<String>>,
+    }
+
+    impl CoordinatorDelivery for FakeDelivery {
+        fn message_state(
+            &self,
+            _agent_name: &str,
+            _message_id: &str,
+        ) -> std::result::Result<Option<QueueMessageState>, String> {
+            Ok(*self.queue_state.lock().expect("queue state lock"))
+        }
+
+        fn submit(
+            &self,
+            _agent_name: &str,
+            prompt: &str,
+            _message_id: &str,
+            _options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            self.submitted_prompts
+                .lock()
+                .expect("prompt lock")
+                .push(prompt.to_owned());
+            if let Some(error) = self.submit_error.lock().expect("error lock").take() {
+                return Err(error);
+            }
+            *self.queue_state.lock().expect("queue state lock") =
+                Some(QueueMessageState::Processed);
+            Ok(())
+        }
+
+        fn drain(
+            &self,
+            _agent_name: &str,
+            _options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            *self.drains.lock().expect("drain lock") += 1;
+            *self.queue_state.lock().expect("queue state lock") =
+                Some(QueueMessageState::Processed);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeReplyTransport {
+        submissions: Vec<(String, String, String, String)>,
+        fail_once: bool,
+    }
+
+    impl ReplyTransport for FakeReplyTransport {
+        fn send(
+            &mut self,
+            submission: ReplySubmission<'_>,
+        ) -> std::result::Result<String, OutboundFailure> {
+            self.submissions.push((
+                submission.channel_id.to_owned(),
+                submission.thread_id.to_owned(),
+                submission.body.to_owned(),
+                submission.request_id.to_owned(),
+            ));
+            if std::mem::take(&mut self.fail_once) {
+                return Err(OutboundFailure {
+                    code: "fixture_unknown".to_owned(),
+                    detail: "uncertain provider response".to_owned(),
+                    outcome: OutboundOutcome::Unknown,
+                    retryable: true,
+                });
+            }
+            Ok(format!("messages/reply-{}", self.submissions.len()))
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeReactionTransport {
+        submissions: Vec<(String, String, String, String)>,
+        fail_once: bool,
+    }
+
+    impl ReactionTransport for FakeReactionTransport {
+        fn ensure_reaction(
+            &mut self,
+            submission: ReactionSubmission<'_>,
+        ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+            self.submissions.push((
+                submission.channel_id.to_owned(),
+                submission.message_id.to_owned(),
+                submission.emoji.to_owned(),
+                submission.request_id.to_owned(),
+            ));
+            if std::mem::take(&mut self.fail_once) {
+                return Err(OutboundFailure {
+                    code: "fixture_unknown".to_owned(),
+                    detail: "provider outcome unknown".to_owned(),
+                    outcome: OutboundOutcome::Unknown,
+                    retryable: true,
+                });
+            }
+            Ok(ReactionReceipt {
+                reaction_id: "spaces/example/messages/one/reactions/robot".to_owned(),
+                already_present: self.submissions.len() > 1,
+            })
+        }
+    }
+
+    impl ChatSubscriptionBackend for Backend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::new(
+                "fixture",
+                ReplaySupport::Cursor,
+                true,
+                NonZeroU16::new(1).expect("one"),
+                vec![
+                    EventKind::MessageCreated,
+                    EventKind::Checkpoint,
+                    EventKind::Gap,
+                    EventKind::Heartbeat,
+                ],
+            )
+            .expect("fixture capabilities")
+        }
+
+        fn subscribe(
+            &mut self,
+            _request: &SubscribeRequest,
+        ) -> std::result::Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+            Ok(Box::new(Driver {
+                items: self.items.take().expect("single fixture subscription"),
+                acknowledged: Arc::clone(&self.acknowledged),
+            }))
+        }
+    }
+
+    fn temporary(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "agentctl-chat-runtime-{name}-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        fs::create_dir(&path).expect("temporary directory");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("private temporary");
+        path
+    }
+
+    fn config() -> BridgeConfiguration {
+        BridgeConfiguration {
+            subscription_plugin: "fixture".to_owned(),
+            channel_ids: vec!["spaces/example".to_owned()],
+            allowed_senders: vec!["users/owner".to_owned()],
+            agent_name: "coordinator".to_owned(),
+            agent_label: "codex coordinator".to_owned(),
+            ack_reaction: Some("🤖".to_owned()),
+            backend_configuration: None,
+        }
+    }
+
+    fn delivery(sequence: u64, cursor: &str, receipt: &str) -> DeliveryBatch {
+        let mut payload = Map::new();
+        payload.insert("name".to_owned(), Value::String("messages/one".to_owned()));
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new("spaces/example/messages/one").expect("message"),
+            ThreadId::new("spaces/example/threads/one").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "run the tests",
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message")
+        .with_provider_payload(
+            ProviderPayload::new("fixture.message.v1", payload).expect("provider payload"),
+        );
+        DeliveryBatch::new(
+            EventSequence::new(sequence).expect("sequence"),
+            ProviderCursor::new(cursor).expect("cursor"),
+            DeliveryId::new(receipt).expect("receipt"),
+            vec![
+                CommittableEvent::Checkpoint,
+                CommittableEvent::message_created(message),
+            ],
+        )
+        .expect("delivery")
+    }
+
+    #[test]
+    fn nonce_encoding_is_canonical_unpadded_base64url() {
+        assert_eq!(base64url_nonce([0; 16]), "AAAAAAAAAAAAAAAAAAAAAA");
+        assert!(valid_nonce("AAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(!valid_nonce("AAAAAAAAAAAAAAAAAAAAAA="));
+    }
+
+    #[test]
+    fn durable_admission_precedes_upstream_acknowledgement_and_deduplicates_replay() {
+        let root = temporary("commit-order");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = Backend {
+            items: Some(VecDeque::from([SubscriptionItem::Batch(delivery(
+                1,
+                "cursor-1",
+                "receipt-1",
+            ))])),
+            acknowledged: Arc::clone(&acknowledged),
+        };
+        let request = state.subscribe_request().expect("request");
+        let mut subscription = ChatSubscription::open(&mut backend, &request).expect("subscribe");
+
+        let ConsumedItem::Batch(admission) =
+            consume_one(&mut subscription, &state).expect("consume")
+        else {
+            panic!("expected batch");
+        };
+        assert_eq!(admission.new_request_keys.len(), 1);
+        assert_eq!(&*acknowledged.lock().expect("ack lock"), &["receipt-1"]);
+        assert_eq!(state.cursor().expect("cursor").as_deref(), Some("cursor-1"));
+        let status = state.status().expect("status");
+        assert_eq!(status["request_count"], 1);
+
+        let reopened = BridgeState::open(&root).expect("reopen state");
+        let replay = delivery(1, "cursor-1", "receipt-replay");
+        let admission = reopened.admit_batch(&replay).expect("deduplicate replay");
+        assert!(admission.new_request_keys.is_empty());
+        assert_eq!(reopened.status().expect("status")["request_count"], 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn startup_repairs_population_after_precheckpoint_crash() {
+        let root = temporary("repair");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let batch = delivery(1, "cursor-1", "receipt-1");
+        let CommittableEvent::MessageCreated(message) = &batch.events()[1] else {
+            panic!("message fixture");
+        };
+        let record = RequestRecord::from_message(message, Some("🤖")).expect("record");
+        write_document(&state.request_path(&record.key), &record).expect("orphan request");
+        assert_eq!(
+            state.read_checkpoint().expect("checkpoint").request_count,
+            0
+        );
+
+        let recovered = BridgeState::open(&root).expect("recover state");
+        let checkpoint = recovered.read_checkpoint().expect("checkpoint");
+        assert_eq!(checkpoint.request_count, 1);
+        assert!(checkpoint.request_bytes > 0);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn runner_lease_is_exclusive() {
+        let root = temporary("lease");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let lease = state.acquire_runner_lease().expect("first lease");
+        let error = state
+            .acquire_runner_lease()
+            .expect_err("second lease refused");
+        assert!(error.to_string().contains("another chat runtime owns"));
+        drop(lease);
+        state.acquire_runner_lease().expect("lease released");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn delivery_uses_stable_id_and_generic_multi_reply_fence() {
+        let root = temporary("deliver");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let target = FakeDelivery::default();
+        assert_eq!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        let prompts = target.submitted_prompts.lock().expect("prompt lock");
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("one or multiple replies"));
+        assert!(prompts[0].contains("<CHAT_REPLY_"));
+        assert!(!prompts[0].contains("GCHAT_REPLY"));
+        assert_eq!(
+            state.read_request(key).expect("request").phase,
+            RequestPhase::Delivered
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn submitting_recovery_never_replays_failed_queue_artifact() {
+        let root = temporary("uncertain");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        state
+            .set_delivery_phase(key, RequestPhase::Submitting, None)
+            .expect("record intent");
+        let target = FakeDelivery::default();
+        *target.queue_state.lock().expect("queue state lock") = Some(QueueMessageState::Failed);
+        assert!(matches!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("reconcile request"),
+            CoordinatorDeliveryResult::Uncertain(_)
+        ));
+        assert!(target
+            .submitted_prompts
+            .lock()
+            .expect("prompt lock")
+            .is_empty());
+        assert_eq!(
+            state.read_request(key).expect("request").phase,
+            RequestPhase::DeliveryUncertain
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn retained_pending_queue_is_drained_without_duplicate_submit() {
+        let root = temporary("pending");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let target = FakeDelivery::default();
+        *target.queue_state.lock().expect("queue state lock") = Some(QueueMessageState::Pending);
+        assert_eq!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("drain request"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(*target.drains.lock().expect("drain lock"), 1);
+        assert!(target
+            .submitted_prompts
+            .lock()
+            .expect("prompt lock")
+            .is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn capture_ignores_fenced_examples_and_retains_consecutive_multi_replies() {
+        let root = temporary("capture");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let nonce = state.read_request(key).expect("request").reply_nonce;
+        let rendered = format!(
+            "```text\n<CHAT_REPLY_{nonce}_1>\nignored\n</CHAT_REPLY_{nonce}_1>\n```\n\
+<CHAT_REPLY_not-available>\nignored unknown\n</CHAT_REPLY_not-available>\n\
+<CHAT_REPLY_{nonce}_1>\nfirst reply\n</CHAT_REPLY_{nonce}_1>\n\
+<CHAT_REPLY_{nonce}_2>\nsecond reply\n</CHAT_REPLY_{nonce}_2>"
+        );
+        let captured = state
+            .capture_replies(key, &rendered)
+            .expect("capture replies");
+        assert_eq!(captured.ordinals, vec![1, 2]);
+        assert_eq!(captured.unknown_ids, vec!["not-available"]);
+        assert_eq!(
+            state.read_reply(key, 1).expect("first reply").body,
+            "first reply"
+        );
+        assert_eq!(
+            state.read_reply(key, 2).expect("second reply").body,
+            "second reply"
+        );
+        assert_eq!(state.read_checkpoint().expect("checkpoint").reply_count, 2);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn outbound_retries_use_one_stable_request_id_and_advance_in_order() {
+        let root = temporary("outbound");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let nonce = state.read_request(key).expect("request").reply_nonce;
+        state
+            .capture_replies(
+                key,
+                &format!("<CHAT_REPLY_{nonce}_1>\nanswer\n</CHAT_REPLY_{nonce}_1>"),
+            )
+            .expect("capture reply");
+        let mut transport = FakeReplyTransport {
+            fail_once: true,
+            ..FakeReplyTransport::default()
+        };
+        assert!(state.publish_one(key, &mut transport).is_err());
+        assert_eq!(
+            state.read_reply(key, 1).expect("sending reply").phase,
+            ReplyPhase::Sending
+        );
+        assert_eq!(
+            state
+                .publish_one(key, &mut transport)
+                .expect("retry send")
+                .as_deref(),
+            Some("messages/reply-2")
+        );
+        assert_eq!(transport.submissions.len(), 2);
+        assert_eq!(transport.submissions[0].3, transport.submissions[1].3);
+        assert_eq!(
+            state
+                .publish_one(key, &mut transport)
+                .expect("outbox empty"),
+            None
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn startup_repairs_reply_counters_and_send_pointer() {
+        let root = temporary("reply-repair");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let reply =
+            ReplyRecord::new(key, 1, "orphaned before summary update".to_owned()).expect("reply");
+        write_document(&state.reply_path(key, 1), &reply).expect("orphan reply");
+
+        let recovered = BridgeState::open(&root).expect("recover state");
+        let request = recovered.read_request(key).expect("request");
+        assert_eq!(request.reply_count, 1);
+        assert_eq!(request.next_reply_ordinal, 2);
+        assert_eq!(request.next_send_ordinal, 1);
+        assert_eq!(
+            recovered.read_checkpoint().expect("checkpoint").reply_count,
+            1
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn acknowledgement_is_after_admission_and_retries_one_stable_uuid() {
+        let root = temporary("ack");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let mut transport = FakeReactionTransport {
+            fail_once: true,
+            ..FakeReactionTransport::default()
+        };
+        assert!(state.ensure_ack(key, &mut transport).is_err());
+        assert_eq!(
+            state.read_request(key).expect("request").ack_phase,
+            AckPhase::Sending
+        );
+        assert_eq!(
+            state
+                .ensure_ack(key, &mut transport)
+                .expect("retry acknowledgement"),
+            AckResult::Acked(ReactionReceipt {
+                reaction_id: "spaces/example/messages/one/reactions/robot".to_owned(),
+                already_present: true,
+            })
+        );
+        assert_eq!(transport.submissions.len(), 2);
+        assert_eq!(transport.submissions[0].3, transport.submissions[1].3);
+        assert!(valid_operation_uuid(&transport.submissions[0].3));
+        assert_eq!(
+            state
+                .ensure_ack(key, &mut transport)
+                .expect("already acknowledged"),
+            AckResult::Acked(ReactionReceipt {
+                reaction_id: "spaces/example/messages/one/reactions/robot".to_owned(),
+                already_present: true,
+            })
+        );
+        assert_eq!(transport.submissions.len(), 2);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn outbound_wire_binds_success_to_exact_uuid_action_and_authority() {
+        let send = ReplySubmission {
+            channel_id: "spaces/example",
+            thread_id: "spaces/example/threads/one",
+            body: "hello",
+            request_id: "123e4567-e89b-42d3-a456-426614174000",
+        };
+        let encoded = encode_send_request(&send).expect("encode send");
+        assert!(encoded.ends_with(b"\n"));
+        let document: Value = serde_json::from_slice(&encoded).expect("request JSON");
+        assert_eq!(
+            document,
+            serde_json::json!({
+                "version": 1,
+                "id": send.request_id,
+                "action": "send",
+                "channel_id": send.channel_id,
+                "thread_id": send.thread_id,
+                "text": send.body,
+            })
+        );
+        let response = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174000","action":"send","ok":true,"receipt":{"message_id":"spaces/example/messages/reply"}}"#;
+        assert_eq!(
+            decode_send_response(response, &send).expect("decode send"),
+            "spaces/example/messages/reply"
+        );
+        let outside = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174000","action":"send","ok":true,"receipt":{"message_id":"spaces/other/messages/reply"}}"#;
+        assert_eq!(
+            decode_send_response(outside, &send)
+                .expect_err("outside authority")
+                .outcome,
+            OutboundOutcome::Unknown
+        );
+
+        let reaction = ReactionSubmission {
+            channel_id: "spaces/example",
+            message_id: "spaces/example/messages/source",
+            emoji: "🤖",
+            request_id: "123e4567-e89b-42d3-a456-426614174001",
+        };
+        let reaction_response = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174001","action":"ensure_reaction","ok":true,"receipt":{"reaction_id":"spaces/example/messages/source/reactions/robot","already_present":true}}"#;
+        assert_eq!(
+            decode_reaction_response(reaction_response, &reaction).expect("decode reaction"),
+            ReactionReceipt {
+                reaction_id: "spaces/example/messages/source/reactions/robot".to_owned(),
+                already_present: true,
+            }
+        );
+    }
+
+    #[test]
+    fn outbound_wire_preserves_provider_failure_evidence_and_rejects_unbound_frames() {
+        let send = ReplySubmission {
+            channel_id: "spaces/example",
+            thread_id: "spaces/example/threads/one",
+            body: "hello",
+            request_id: "123e4567-e89b-42d3-a456-426614174000",
+        };
+        let failure = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174000","action":"send","ok":false,"error":{"code":"quota","detail":"try later","outcome":"not_applied","retryable":true}}"#;
+        assert_eq!(
+            decode_send_response(failure, &send).expect_err("provider failure"),
+            OutboundFailure {
+                code: "quota".to_owned(),
+                detail: "try later".to_owned(),
+                outcome: OutboundOutcome::NotApplied,
+                retryable: true,
+            }
+        );
+        let parser_failure = br#"{"version":1,"id":null,"action":null,"ok":false,"error":{"code":"invalid_json","detail":"bad input","outcome":"not_applied","retryable":false}}"#;
+        assert_eq!(
+            decode_send_response(parser_failure, &send)
+                .expect_err("unbound parser failure")
+                .outcome,
+            OutboundOutcome::Unknown
+        );
+        let duplicate = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174000","action":"send","ok":true,"ok":false,"receipt":{"message_id":"spaces/example/messages/reply"}}"#;
+        assert_eq!(
+            decode_send_response(duplicate, &send)
+                .expect_err("duplicate key")
+                .outcome,
+            OutboundOutcome::Unknown
+        );
+    }
+}
