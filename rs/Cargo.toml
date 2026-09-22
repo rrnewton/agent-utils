@@ -9,6 +9,7 @@ members = [
     "chat-subscription",
     "chat-subscription-plugin",
     "chat-subscription-fake",
+    "wrkslotsd",
 ]
 
 [workspace.package]

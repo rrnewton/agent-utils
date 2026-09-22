@@ -29,7 +29,10 @@ PYTHON_ONLY_TOOLS = (
     "herdr-chat",
 )
 RESOLVER_TOOLS = RUST_TOOLS + PYTHON_ONLY_TOOLS
-TEST_ONLY_RUST_BINARIES = ("chat-subscription-fake-plugin",)
+NON_PUBLISHED_RUST_BINARIES = (
+    "chat-subscription-fake-plugin",
+    "wrkslotsd",
+)
 
 
 def _load_check_deps() -> ModuleType:
@@ -69,11 +72,11 @@ def test_package_manifests_and_source_dispatchers_have_the_same_command_inventor
     assert python_commands == set(RESOLVER_TOOLS)
 
     rust_commands: set[str] = set()
-    test_only_rust_commands: set[str] = set()
+    non_published_rust_commands: set[str] = set()
     for manifest in sorted((REPO_ROOT / "rs").glob("*/Cargo.toml")):
         text = manifest.read_text(encoding="utf-8")
         commands = (
-            test_only_rust_commands
+            non_published_rust_commands
             if re.search(r"(?m)^publish\s*=\s*false\s*$", text)
             else rust_commands
         )
@@ -82,7 +85,7 @@ def test_package_manifests_and_source_dispatchers_have_the_same_command_inventor
             assert name is not None, manifest
             commands.add(name.group(1))
     assert rust_commands == set(RUST_TOOLS)
-    assert test_only_rust_commands == set(TEST_ONLY_RUST_BINARIES)
+    assert non_published_rust_commands == set(NON_PUBLISHED_RUST_BINARIES)
 
 
 def test_tracked_python_launchers_are_directly_executable() -> None:
