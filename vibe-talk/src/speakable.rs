@@ -59,16 +59,60 @@ const CODE_SPOKEN_MAX_LINES: usize = 3;
 /// ABOUT. All of them would be the same wall of text the placeholder exists to remove.
 const TABLE_KEYS_SPOKEN: usize = 4;
 
-/// Rewrite a message so it can be read aloud.
+/// Every letter handed out so far, and the value it stands for.
+///
+/// Held by the CALLER, because the useful lifetime of a letter is not the lifetime of a call. A
+/// table built inside `for_speech` can only make "the same one" audible within a single message:
+/// hear "user id A" in one message and "user id A" in the next and they are the same account only
+/// by coincidence of ordering. Carried across the messages of one session, the letter becomes a
+/// name the listener can actually use — which is the whole point of naming it.
+///
+/// Two readers must not share one of these. A letter is only meaningful beside the transcript that
+/// introduced it, and an id one reader can see is not automatically an id the other may hear.
+#[derive(Debug, Default, Clone)]
+pub struct Names {
+    hashes: BTreeMap<String, String>,
+    numbers: BTreeMap<String, String>,
+}
+
+impl Names {
+    /// An empty table, at the start of a session.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many distinct opaque strings have been named.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hashes.len() + self.numbers.len()
+    }
+
+    /// Whether nothing has been named yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Rewrite a message so it can be read aloud, naming opaque strings in a fresh table.
 ///
 /// `now_ms` is the instant to measure "ago" against, passed in rather than read from the clock so
 /// the behaviour is testable without waiting for time to pass. `zone` is the operator's, and is
 /// used only for the ABSOLUTE fallback — a relative reading is the same in every zone.
+///
+/// Use [`for_speech_with`] wherever the letters should outlive the one message.
 #[must_use]
 pub fn for_speech(content: &str, now_ms: i64, zone: &Zone) -> String {
+    for_speech_with(content, now_ms, zone, &mut Names::new())
+}
+
+/// [`for_speech`], but naming into a table the caller keeps.
+#[must_use]
+pub fn for_speech_with(content: &str, now_ms: i64, zone: &Zone, names: &mut Names) -> String {
     let text = strip_markdown(content);
     let text = speak_times(&text, now_ms, zone);
-    let text = name_opaque_strings(&text);
+    let text = name_opaque_strings(&text, names);
     collapse_whitespace(&text)
 }
 
@@ -506,14 +550,14 @@ fn ordinal_for(day: i8) -> &'static str {
 
 // --- opaque strings -----------------------------------------------------------------------------
 
-/// Replace hashes and long identifiers with placeholders, stable within one message.
+/// Replace hashes and long identifiers with placeholders, stable for as long as the table lives.
 ///
 /// The SAME value gets the same letter every time it appears, which is the one thing about an
 /// opaque string that survives being spoken: a listener can hear that two mentions are the same
-/// commit without hearing the commit.
-fn name_opaque_strings(text: &str) -> String {
-    let mut hashes: BTreeMap<String, String> = BTreeMap::new();
-    let mut numbers: BTreeMap<String, String> = BTreeMap::new();
+/// commit without hearing the commit. How far "every time" reaches is the caller's choice and not
+/// this function's — see [`Names`].
+fn name_opaque_strings(text: &str, names: &mut Names) -> String {
+    let Names { hashes, numbers } = names;
     let mut out = String::with_capacity(text.len());
 
     for token in split_keeping_separators(text) {
@@ -523,9 +567,9 @@ fn name_opaque_strings(text: &str) -> String {
             continue;
         }
         let replacement = if is_big_number(word) {
-            Some(name_for(word, &mut numbers, "large number"))
+            Some(name_for(word, numbers, "large number"))
         } else if is_hashlike(word) {
-            Some(name_for(word, &mut hashes, "hash code"))
+            Some(name_for(word, hashes, "hash code"))
         } else {
             None
         };
@@ -547,14 +591,22 @@ fn name_for(value: &str, seen: &mut BTreeMap<String, String>, kind: &str) -> Str
     said
 }
 
-/// A, B, … Z, then AA. A message with twenty-seven distinct hashes in it has other problems.
+/// A, B, … Z, AA, AB, … — spreadsheet columns, and like them it never repeats itself.
+///
+/// It used to double the letter past Z, on the reasoning that a message with twenty-seven distinct
+/// hashes in it has other problems. That was true of a table that lived for one message and is
+/// false of one that lives for a session: doubling gives `AA` to the twenty-seventh value and `AA`
+/// again to the fifty-third, and two different ids answering to one name is worse than a long name,
+/// because the listener has no way to hear that it happened.
 fn letter_for(index: usize) -> String {
-    let letter = char::from(b'A' + u8::try_from(index % 26).unwrap_or(0));
-    if index < 26 {
-        letter.to_string()
-    } else {
-        format!("{letter}{letter}")
+    let mut remaining = index + 1;
+    let mut letters = Vec::new();
+    while remaining > 0 {
+        remaining -= 1;
+        letters.push(char::from(b'A' + u8::try_from(remaining % 26).unwrap_or(0)));
+        remaining /= 26;
     }
+    letters.iter().rev().collect()
 }
 
 fn is_big_number(word: &str) -> bool {
@@ -676,6 +728,59 @@ mod tests {
             said,
             "deployed hash code A then reverted hash code A, not hash code B"
         );
+    }
+
+    #[test]
+    fn a_carried_table_makes_one_letter_mean_one_account_across_messages() {
+        // The reported symptom is an id read out digit by digit. The fix for THAT is the naming,
+        // which already worked. This is the other half: a name nobody can carry between two
+        // messages is not a name, it is a coincidence — the listener hears "user id A" twice and
+        // cannot tell whether the same person wrote both.
+        let mut names = Names::new();
+        let zone = eastern();
+        let first = for_speech_with("from 1000000000000000009", NOW, &zone, &mut names);
+        let second = for_speech_with("also from 1000000000000000009", NOW, &zone, &mut names);
+        let other = for_speech_with("but 1000000000000000017 replied", NOW, &zone, &mut names);
+
+        assert_eq!(first, "from large number A");
+        assert_eq!(second, "also from large number A");
+        assert_eq!(other, "but large number B replied");
+        assert_eq!(names.len(), 2);
+
+        // And a table that was NOT carried says A for the second account, which is exactly the
+        // confusion the carried one exists to remove.
+        let restarted = for_speech("but 1000000000000000017 replied", NOW, &zone);
+        assert_eq!(restarted, "but large number A replied");
+    }
+
+    #[test]
+    fn a_session_long_table_runs_out_of_single_letters_without_reusing_one() {
+        // Twenty-seven distinct ids in one MESSAGE is a pathology. Twenty-seven across an hour of
+        // a busy channel is a Tuesday, so the sequence has to keep going honestly.
+        let assigned: Vec<String> = (0..80).map(letter_for).collect();
+        let distinct: std::collections::BTreeSet<&String> = assigned.iter().collect();
+        assert_eq!(distinct.len(), assigned.len(), "two values share a name");
+        assert_eq!(assigned[0], "A");
+        assert_eq!(assigned[25], "Z");
+        assert_eq!(assigned[26], "AA");
+        assert_eq!(assigned[27], "AB");
+        // The old doubling scheme said AA here too, and nothing in the audio would have said so.
+        assert_eq!(assigned[52], "BA");
+    }
+
+    #[test]
+    fn hashes_and_numbers_are_counted_apart_so_neither_crowds_the_other() {
+        let mut names = Names::new();
+        assert!(names.is_empty());
+        let said = for_speech_with(
+            "1000000000000000009 touched a1b2c3d4e5f6a7",
+            NOW,
+            &eastern(),
+            &mut names,
+        );
+        // Both are the first of their kind, so both are A, and the KIND is what tells them apart.
+        assert_eq!(said, "large number A touched hash code A");
+        assert_eq!(names.len(), 2);
     }
 
     #[test]
