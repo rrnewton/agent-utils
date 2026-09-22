@@ -63,8 +63,27 @@ jobs:
       # is exactly why they were green while this was not.
       #
       # `types-PyYAML` because PyYAML ships no stubs and mypy --strict refuses without them.
+      #
+      # AND THE SAME TRAP A SECOND TIME, for twenty-two consecutive nights. Installing mypy got the
+      # gate as far as RUNNING, and then it failed at `lint-and-typecheck (make check)` every night
+      # from 2026-09-01 to 2026-09-22 on two errors and only two:
+      #
+      #   vibe-talk/scripts/screenshots.py:118: Cannot find implementation or library stub for
+      #     module named "playwright.sync_api"  [import-not-found]
+      #   vibe-talk/scripts/smoke-agent.py:1237: Cannot find implementation or library stub for
+      #     module named "websockets"  [import-not-found]
+      #
+      # The mypy pass is repository-WIDE, so it type-checks vibe-talk's scripts whether or not this
+      # job ever runs them, and an optional runtime dependency that is merely imported is still a
+      # dependency of the typecheck. Neither package arrives by any other route: the `npx playwright
+      # install` below fetches a BROWSER for node, which is a different thing from the Python
+      # bindings mypy is looking for.
+      #
+      # `cross-dagrun.yml` already learned this and already says so in its own install step. This
+      # line is now the same line, which is the point -- two jobs running the same strict gate
+      # should not be installing two different sets of things for it.
       - name: install the tooling the contract runs on
-        run: python -m pip install --upgrade mypy pytest pyyaml types-PyYAML
+        run: python -m pip install --upgrade mypy 'playwright>=1.40' pytest pyyaml types-PyYAML 'websockets>=12'
 
       # The timeline's browser checks drive a real Chromium, so the runner needs the browser and
       # the suite's dependencies before `validate-all` reaches them. Named as its own step so a
