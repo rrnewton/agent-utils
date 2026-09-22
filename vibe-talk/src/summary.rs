@@ -66,9 +66,15 @@ pub fn condense(content: &str, max_chars: usize) -> String {
 }
 
 /// Build a digest entry for one message.
+///
+/// The summary is condensed from [`Message::spoken_body`], not from the raw body. A digest exists
+/// to be read out, and the prepared body is the one with the markdown off and the snowflakes named
+/// — condensing the raw one put a nineteen-digit id into the very line the agent was told to say
+/// aloud. `full_length` still measures the RAW body, because what it answers is "how much message
+/// is there", and that is a fact about what was written rather than about how it will be said.
 #[must_use]
 pub fn digest_entry(message: &Message, max_chars: usize) -> DigestEntry {
-    let summary = condense(&message.content, max_chars);
+    let summary = condense(message.spoken_body(), max_chars);
     DigestEntry {
         id: message.id.0.clone(),
         author: message.author.clone(),
@@ -174,7 +180,7 @@ mod tests {
             author_id: UserId("2000000000000000001".to_owned()),
             author_is_bot: true,
             timestamp: "2026-08-18T12:00:00+00:00".to_owned(),
-            spoken_time: "08:00:00 EDT".to_owned(),
+            spoken_time: "08:00".to_owned(),
             reply_to: None,
             content: content.to_owned(),
             spoken_content: String::new(),
@@ -266,7 +272,7 @@ mod tests {
         // A digest is what a voice agent reads out, so the speakable form has to survive the
         // condensing step — and the exact instant has to survive alongside it, unrounded.
         let entry = digest_entry(&message("done"), 40);
-        assert_eq!(entry.spoken_time, "08:00:00 EDT");
+        assert_eq!(entry.spoken_time, "08:00");
         assert_eq!(entry.timestamp, "2026-08-18T12:00:00+00:00");
 
         let mut unstamped = message("done");

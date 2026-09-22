@@ -238,10 +238,11 @@ fn initialize_result(params: Option<&Value>) -> Value {
             "name, as <@author id>; to notify that person, put that exact token in the reply. ",
             "Writing @their-name instead is plain text and notifies nobody, and there is no tool ",
             "for looking up someone who has not posted. Every message also carries two times: a ",
-            "local time already converted to the operator's own zone and labelled with it, such ",
-            "as 09:51:25 EDT, and after it the exact instant marked \"exact\". READ THE LOCAL ONE ",
-            "ALOUD, exactly as written — it is already correct, so do not convert it, do not ",
-            "relabel it, and do not read the exact instant aloud or re-zone it."
+            "local time already converted to the operator's own zone, without seconds and without ",
+            "a zone label, such as 09:51, and after it the exact instant marked \"exact\". READ ",
+            "THE LOCAL ONE ALOUD, exactly as written — it is already in the listener's own zone, ",
+            "so do not convert it, do not add a zone to it, do not put the seconds back, and do ",
+            "not read the exact instant aloud or re-zone it."
         ),
     })
 }

@@ -664,8 +664,9 @@ async fn messages_carry_both_a_spoken_time_and_the_exact_instant() {
         "the exact instant must be exactly what the Discord layer reported, unrounded"
     );
     assert_eq!(
-        first["spoken_time"], "08:01:00 EDT",
-        "the display form must be converted and labelled, or the caller has to guess"
+        first["spoken_time"], "08:01",
+        "the display form must be CONVERTED — 12:01 UTC is 08:01 in the configured zone, and a \
+         caller handed the raw instant has to guess"
     );
 
     // The digest, which is the surface a voice agent actually reads, carries both too.
@@ -678,7 +679,7 @@ async fn messages_carry_both_a_spoken_time_and_the_exact_instant() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["entries"][0]["spoken_time"], "08:01:00 EDT");
+    assert_eq!(payload["entries"][0]["spoken_time"], "08:01");
     assert_eq!(
         payload["entries"][0]["timestamp"],
         "2026-08-18T12:01:00+00:00"

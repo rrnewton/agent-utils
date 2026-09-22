@@ -154,7 +154,7 @@ async fn accepted_events_are_typed_stamped_and_duplicate_retries_are_no_ops() {
     assert_eq!(created.event_id, "push:event-1");
     assert_eq!(created.kind, LiveKind::Create);
     assert!(!created.historical);
-    assert_eq!(created.message.spoken_time, "10:00:00 UTC");
+    assert_eq!(created.message.spoken_time, "10:00");
 
     let (status, payload) = post(&app, Some(INGEST_TOKEN), create("event-1", "10", false)).await;
     assert_eq!(status, StatusCode::OK);

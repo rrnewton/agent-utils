@@ -147,14 +147,17 @@ pub struct Message {
     /// to decide which of two messages came first needs it. This field is never spoken; see
     /// [`Message::spoken_time`] for the one that is.
     pub timestamp: String,
-    /// The same instant in the operator's configured zone, already formatted for speech:
-    /// `09:51:25 EDT`. READ THIS ONE ALOUD.
+    /// The same instant in the operator's configured zone, already formatted for speech: `09:51`.
+    /// READ THIS ONE ALOUD.
     ///
     /// Two fields rather than one because they answer different questions, and because a single
     /// field would force whoever renders it to choose — which is exactly the choice that produced
     /// the bug. Handed an ISO string in UTC, the assistant said "thirteen fifty-one Eastern Time":
     /// it kept the digits and relabelled them. A value that is already correct when read verbatim
     /// requires no conversion and admits no such mistake.
+    ///
+    /// No seconds and no zone label: see [`crate::clock::spoken`], which explains what carrying
+    /// them cost a listener and what dropping them trades away.
     ///
     /// EMPTY means "not yet stamped". The Discord layer constructs it empty because it holds no
     /// configuration and therefore does not know the operator's zone; [`crate::ops`] is the only
@@ -353,10 +356,10 @@ mod tests {
         let mut message = msg("7");
         message.timestamp = "2026-08-19T13:51:25+00:00".to_owned();
         assert_eq!(message.spoken(), "2026-08-19T13:51:25+00:00");
-        message.spoken_time = "09:51:25 EDT".to_owned();
+        message.spoken_time = "09:51".to_owned();
         assert_eq!(
             message.spoken(),
-            "09:51:25 EDT",
+            "09:51",
             "once stamped, the spoken form is what a renderer must use"
         );
     }

@@ -12,6 +12,13 @@
 //! a time needs the real one. See [`crate::model::Message::spoken_time`] for the naming rule that
 //! keeps the two apart.
 //!
+//! # What the spoken form deliberately does not carry
+//!
+//! Seconds and a zone label. Both were there, and both were removed on report: they are the two
+//! parts of `09:51:25 EDT` that cost a listener time and tell them nothing they wanted. The
+//! precision is below anything anybody places a chat message to, and the label names the zone
+//! they are already in. [`spoken`] says what that trades away.
+//!
 //! # The zone database is bundled
 //!
 //! `jiff` is depended on with `tzdb-bundle-always`, so the IANA database is compiled into the
@@ -70,7 +77,20 @@ pub fn zone(name: &str) -> Result<Zone, String> {
     })
 }
 
-/// Render an ISO-8601 instant as a labelled local time: `09:51:25 EDT`.
+/// Render an ISO-8601 instant as a bare local time: `09:51`.
+///
+/// **No seconds and no zone label**, because this value exists to be SPOKEN and neither of them
+/// survives the trip. "Nine fifty-one and twenty-five seconds Eastern Daylight Time" is eight
+/// syllables of a sentence the listener asked to be short, and the two things they buy are worth
+/// nothing here: nobody places a chat message to the second, and the label names a zone the
+/// listener is already standing in. The owner reported both, in those words.
+///
+/// It used to be `09:51:25 EDT`, and the label was load-bearing at the time — it was what made the
+/// string safe to read verbatim after an assistant was handed `13:51:25` in UTC and said "thirteen
+/// fifty-one Eastern Time", keeping the digits and relabelling them. What replaces the label is
+/// that there is nothing left to convert: a bare `09:51` offers no zone to reinterpret, and the
+/// tool descriptions say in as many words that this field is already local. Losing the label costs
+/// the ability to detect that mistake from the transcript alone, which is the trade being made.
 ///
 /// An input that does not parse is returned UNCHANGED. That is deliberate: the alternative is
 /// inventing a time, and a caller reading a raw ISO string aloud is merely awkward, whereas a
@@ -82,7 +102,7 @@ pub fn spoken(iso: &str, zone: &Zone) -> String {
     };
     instant
         .to_zoned(zone.tz.clone())
-        .strftime("%H:%M:%S %Z")
+        .strftime("%H:%M")
         .to_string()
 }
 
@@ -112,32 +132,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_instant_is_rendered_in_the_configured_zone_with_its_label() {
+    fn an_instant_is_rendered_in_the_configured_zone() {
         let eastern = zone("America/New_York").expect("a real IANA zone");
         assert_eq!(
             spoken("2026-08-19T13:51:25.123000+00:00", &eastern),
-            "09:51:25 EDT",
+            "09:51",
             "this is the live failure the issue reported: 13:51 UTC is 09:51 in Eastern"
         );
     }
 
     #[test]
-    fn the_same_wall_zone_says_est_in_january_which_a_fixed_offset_could_not() {
-        // The control that proves a real zone database rather than a hard-coded -4.
+    fn nothing_a_listener_cannot_use_survives_into_the_spoken_form() {
+        // Both halves of what the owner asked to lose, asserted as absences rather than as an
+        // equality that would pass for the wrong reason. Seconds are precision nobody places a
+        // chat message to; the zone label names the zone the listener is standing in.
         let eastern = zone("America/New_York").expect("a real IANA zone");
+        let said = spoken("2026-08-19T13:51:25.123000+00:00", &eastern);
+        assert!(!said.contains("25"), "the seconds field survived: {said}");
+        assert!(!said.contains("EDT"), "the zone label survived: {said}");
         assert_eq!(
-            spoken("2026-01-19T13:51:25+00:00", &eastern),
-            "08:51:25 EST"
+            said.chars().count(),
+            5,
+            "anything else is decoration: {said}"
         );
+    }
+
+    #[test]
+    fn the_same_wall_clock_shifts_by_an_hour_in_january_as_a_real_zone_must() {
+        // The control that proves a real zone database rather than a hard-coded -4. It used to
+        // read the EST/EDT label, which is gone; the DST rule shows up just as plainly in the
+        // HOUR, and arguably more so — a wrong label is a cosmetic bug and a wrong hour is not.
+        let eastern = zone("America/New_York").expect("a real IANA zone");
+        assert_eq!(spoken("2026-01-19T13:51:25+00:00", &eastern), "08:51");
+        assert_eq!(spoken("2026-08-19T13:51:25+00:00", &eastern), "09:51");
     }
 
     #[test]
     fn utc_agrees_with_the_instant_it_was_given() {
         let utc = zone("UTC").expect("UTC is always available");
-        assert_eq!(
-            spoken("2026-08-19T13:51:25.123000+00:00", &utc),
-            "13:51:25 UTC"
-        );
+        assert_eq!(spoken("2026-08-19T13:51:25.123000+00:00", &utc), "13:51");
     }
 
     #[test]

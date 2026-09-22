@@ -1107,13 +1107,20 @@ defect the count tool exists for: asked how many messages a channel held, an age
 **100** — the size of the page it had been handed.
 
 **Every message also carries two times, and only one of them is meant to be spoken.**
-`spoken_time` is the instant already converted into `server.timezone` and labelled with it —
-`09:51:25 EDT` — and it is what a voice agent reads out, verbatim, with no conversion of its own.
+`spoken_time` is the instant already converted into `server.timezone`, with no seconds and no zone
+label — `09:51` — and it is what a voice agent reads out, verbatim, with no conversion of its own.
 `timestamp` is the exact ISO-8601 instant Discord reported, unrounded, and it is what anything
 computing with a time must use. The conversion happens once, in `src/ops.rs`, so the phone and the
 voice agent cannot disagree about when something was said. This exists because handing an
 assistant `13:51:25+00:00` and letting it do the arithmetic produced *"thirteen fifty-one Eastern
 Time"* — the right clock with the wrong label, when nine fifty-one was the answer.
+
+The seconds and the label were there at first and were both removed on report: they are the two
+parts a listener cannot use. Nobody places a chat message to the second, and the label names the
+zone they are already standing in — "nine fifty-one and twenty-five seconds Eastern Daylight Time"
+spends its length saying so. What replaces the label as a defence is that a bare `09:51` offers no
+zone to reinterpret, and the tool descriptions say in as many words that the field is already
+local. `src/clock.rs` records what that trades away.
 
 There is deliberately **no user-lookup tool**, and the reason is recorded in `src/model.rs`
 beside the field. First, the id arrives ATTACHED to the message being replied to, so there is no

@@ -6830,6 +6830,9 @@ test("the channel view shows the READER's clock, not the server's and not UTC", 
   // cannot ask a browser. It is wrong for a phone: `server.timezone` defaults to UTC, so an
   // operator who never configured one reads every message in UTC while holding a device that
   // knows its own zone. The browser's zone is not a guess.
+  //
+  // `spoken_time` here is deliberately UNLIKE anything the server sends — the real form is a bare
+  // `21:31`. A fixture that matched it would make this test pass whether the page used it or not.
   const lines = await showDiscord(page, [
     message({ timestamp: "2026-08-19T04:31:00.000Z", spoken_time: "2026-08-18 21:31 PDT" }),
   ]);

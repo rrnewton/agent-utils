@@ -106,7 +106,7 @@ mod tests {
             author_id: UserId("2000000000000000001".to_owned()),
             author_is_bot: false,
             timestamp: "2026-08-18T12:00:00+00:00".to_owned(),
-            spoken_time: "08:00:00 EDT".to_owned(),
+            spoken_time: "08:00".to_owned(),
             reply_to: None,
             content: content.to_owned(),
             spoken_content: String::new(),
@@ -188,7 +188,7 @@ mod tests {
         // whatever needs sub-second ordering silently loses it.
         let rendered = render_for_model(&[message("codex-eng", "green")]);
         assert_eq!(
-            rendered.matches("08:00:00 EDT").count(),
+            rendered.matches("| 08:00 |").count(),
             1,
             "the spoken time must be rendered exactly once: {rendered}"
         );
@@ -196,7 +196,7 @@ mod tests {
             rendered.contains("exact 2026-08-18T12:00:00+00:00"),
             "the exact instant must survive, labelled as the one to compute with: {rendered}"
         );
-        let spoken_at = rendered.find("08:00:00 EDT").expect("spoken form present");
+        let spoken_at = rendered.find("| 08:00 |").expect("spoken form present");
         let exact_at = rendered.find("exact 2026").expect("exact form present");
         assert!(
             spoken_at < exact_at,

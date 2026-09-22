@@ -542,11 +542,11 @@ async fn the_spoken_time_is_in_the_operators_zone_and_the_exact_instant_survives
 
     // The fake stamps the first seeded message at 12:01:00 UTC.
     assert!(
-        utc.contains("12:01:00 UTC"),
+        utc.contains("| 12:01 |"),
         "with the zone set to UTC the spoken form must agree with the instant: {utc}"
     );
     assert!(
-        eastern.contains("08:01:00 EDT"),
+        eastern.contains("| 08:01 |"),
         "the same instant in Eastern is four hours earlier, and says so: {eastern}"
     );
     assert_eq!(
@@ -556,10 +556,22 @@ async fn the_spoken_time_is_in_the_operators_zone_and_the_exact_instant_survives
          reported bug — UTC digits sitting where the local time should be: {eastern}"
     );
     assert!(
-        !utc.contains("08:01:00"),
+        !utc.contains("| 08:01 |"),
         "and the control in the other direction: a UTC-configured server must not be shifting: \
          {utc}"
     );
+    // And neither of them spends a listener's time on a precision nobody uses or a label for the
+    // zone they are standing in. The exact instant carries both and is not for reading.
+    for (text, label) in [(utc, "UTC"), (eastern, "EDT")] {
+        let spoken = text
+            .lines()
+            .find(|line| line.starts_with('['))
+            .unwrap_or_default();
+        assert!(
+            !spoken.contains(label),
+            "the spoken time still carries a zone label: {spoken}"
+        );
+    }
 
     // And the machine-readable half is byte-identical in both, unrounded.
     for text in [utc, eastern] {
@@ -592,6 +604,15 @@ async fn the_server_tells_a_model_which_time_to_read_aloud() {
     assert!(
         instructions.contains("do not convert it"),
         "converting an already-converted time is how the wrong label got attached: {instructions}"
+    );
+    assert!(
+        instructions.contains("do not add a zone to it"),
+        "the local time no longer carries a zone label, so a model that helpfully supplies one is \
+         now the failure mode this instruction exists to prevent: {instructions}"
+    );
+    assert!(
+        !instructions.contains("labelled with it"),
+        "the instructions still promise a label the server stopped sending: {instructions}"
     );
 }
 
