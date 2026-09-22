@@ -714,6 +714,22 @@
 
             <section class="settings-group">
               <div class="group-head">
+                <h2>How messages are said</h2>
+                <button class="help-link" id="help-link-speech-prep" type="button" data-help="speech-prep" aria-label="About how messages are said" title="What the server rewrites">?</button>
+              </div>
+              <!--
+                REPORTED, not controlled. The switch is `speakable.enabled` in the server's own
+                configuration, because the rewrite happens before a message reaches any page and
+                the same prepared body goes to the voice agent's own tool calls, which never touch
+                this browser. A control here would be a switch that silently governed one of the
+                three paths. What the screen owes the reader is which arm this deployment is in —
+                they are flipping it to compare two runs.
+              -->
+              <p id="speech-prep-state" class="hint" aria-live="polite"></p>
+            </section>
+
+            <section class="settings-group">
+              <div class="group-head">
                 <h2>Stored conversations</h2>
                 <button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="Where these are kept">?</button>
               </div>
@@ -1113,6 +1129,35 @@
                 because a burst of older messages read out as though they had just been said is
                 worse than not hearing them at all. Anything that landed while the feed was
                 reconnecting is on screen but was not spoken.
+              </p>
+            </article>
+
+            <article id="help-speech-prep" class="help-entry">
+              <h2>How messages are said</h2>
+              <p class="hint">
+                Before a message is read out — by the agent during a call, or by the tap-to-listen
+                button — this server rewrites it for the ear. Markdown comes off, so
+                <code>**deploy**</code> is not read as <em>asterisk asterisk deploy asterisk
+                asterisk</em>. Timestamps become <em>three hours ago</em> instead of an ISO string
+                read out character by character. And long numeric ids and hash codes are given a
+                letter: <em>large number A</em>. The channel view still shows exactly what was
+                typed; only the spoken form changes.
+              </p>
+              <p class="hint">
+                <strong>The letters are consistent, and that is the point.</strong> The same id is
+                the same letter every time it comes up, so you can hear that two messages are about
+                the same account without hearing nineteen digits twice. The letters are assigned in
+                the order values are first seen and are <strong>lost when the server restarts</strong>,
+                so <em>large number A</em> in a conversation yesterday is not the same value as
+                <em>large number A</em> today.
+              </p>
+              <p class="hint">
+                It is <strong>on unless the operator turned it off</strong>, in this server's own
+                configuration rather than here — the rewrite happens before a message reaches this
+                page, and the voice agent's own tool calls never pass through this browser, so a
+                switch on this screen could only govern one of the three paths. Turning it off is
+                the control arm for tuning the agent's prompt: it makes every difference between
+                two runs the prompt rather than this.
               </p>
             </article>
 

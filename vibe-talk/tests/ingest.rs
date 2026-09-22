@@ -307,6 +307,47 @@ async fn one_letter_means_one_account_across_two_pushed_messages() {
 }
 
 #[tokio::test]
+async fn turning_the_speech_preparation_off_relays_exactly_what_was_typed() {
+    // The control arm. Preparing a body is a judgement about what a listener wants, so an operator
+    // tuning a voice agent's prompt has to be able to hear the same deployment both ways —
+    // otherwise every difference between two runs is confounded with this pass.
+    //
+    // Off means the field is EMPTY, not a second copy of the raw body. That is the same value a
+    // message carries before anything has touched it, so every reader is already correct: the page
+    // falls back, `spoken_body()` falls back, and nothing on the wire changes shape.
+    let text = format!(
+        "{}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n[speakable]\nenabled = false\n",
+        vibe_talk::testing::config_toml()
+    );
+    let (state, _chat, _voice) = vibe_talk::testing::state_from_toml(&text);
+    let live = std::sync::Arc::clone(&state.live);
+    let app = router(state);
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let mut subscription = live.subscribe(&channel, None);
+
+    let mut event = create("event-off", "10", false);
+    let raw = "**shipped** 1000000000000000009 at 2026-08-20T07:00:00+00:00";
+    event["message"]["content"] = json!(raw);
+    assert_eq!(
+        post(&app, Some(INGEST_TOKEN), event).await.0,
+        StatusCode::ACCEPTED
+    );
+
+    let said = subscription.receiver.try_recv().expect("create").message;
+    assert_eq!(
+        said.spoken_content, "",
+        "the switch is off and a prepared body was sent anyway"
+    );
+    assert_eq!(said.spoken_body(), raw, "the raw body is what gets said");
+    assert_eq!(said.content, raw, "and it is still what the screen shows");
+    assert_eq!(
+        said.spoken_time, "10:00",
+        "the switch must NOT take the zone conversion with it: that is not a judgement about \
+         what a listener wants, it is the difference between the right hour and the wrong one"
+    );
+}
+
+#[tokio::test]
 async fn invalid_or_unallowlisted_events_never_enter_the_hub() {
     let (app, live) = enabled();
     let channel = ChannelId(READ_CHANNEL.to_owned());

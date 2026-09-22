@@ -657,6 +657,7 @@ code path the startup probe uses, which is itself in the same position — see *
 | Channels | `[[channels]]` | `VIBE_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated |
 | ElevenLabs agent id | `elevenlabs.agent_id` | `VIBE_TALK_ELEVENLABS_AGENT_ID` | public |
 | Read-aloud backend | `read_aloud.backend` | `VIBE_TALK_READ_ALOUD_BACKEND` | `elevenlabs` (default) or `browser` for the device speech engine; independent of conversational voice mode |
+| Prepare bodies for speech | `speakable.enabled` | `VIBE_TALK_SPEAKABLE` | **on by default**; off relays exactly what was typed. Does not affect the time-zone conversion. A value that is neither `true` nor `false` refuses to start |
 | ElevenLabs API key | `elevenlabs.api_key` | `VIBE_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and for the ElevenLabs read-aloud backend |
 | Your own Discord user id | `discord.owner_user_id` | `VIBE_TALK_DISCORD_OWNER_USER_ID` | public; **cannot be derived** — see below. Without it, messages you type into Discord yourself are drawn as a third party |
 | ElevenLabs voice id | `elevenlabs.voice_id` | `VIBE_TALK_ELEVENLABS_VOICE_ID` | public; **optional** — read-aloud borrows the configured agent's own voice when this is unset |
@@ -1121,6 +1122,31 @@ zone they are already standing in — "nine fifty-one and twenty-five seconds Ea
 spends its length saying so. What replaces the label as a defence is that a bare `09:51` offers no
 zone to reinterpret, and the tool descriptions say in as many words that the field is already
 local. `src/clock.rs` records what that trades away.
+
+**And a third field, `spoken_content`, carries the BODY rewritten for speech.** Same rule as the
+time: `content` is what was typed and what the screen shows, `spoken_content` is what a voice says,
+and the rewrite happens once, in `src/ops.rs`, so nothing downstream computes one. `src/speakable.rs`
+does three things to it, in an order that matters. Markdown comes off, because read aloud
+`**deploy**` is *"asterisk asterisk deploy asterisk asterisk"*. Timestamps become *"three hours
+ago"*, because an ISO string is read out character by character. And long numeric ids and hash
+codes get a **letter** — *"large number A"* — where the same value is the same letter every time it
+appears, so a listener can hear "the same one" without hearing nineteen digits. Times are resolved
+before ids because a Unix epoch and a snowflake are both long runs of digits and only one of them
+is a time.
+
+The letter table lives on the server for as long as the server does, shared by every reader, and
+is bounded at 4096 names per kind — past that a value is spoken as *"a large number"* with no
+letter, which is audibly different from a named one rather than quietly ambiguous. Sharing one
+table across readers is safe **on this deployment** and not in general: there is one channel
+allowlist and everyone reads through it, so a named value is always one already on the reader's
+screen. A deployment where two readers saw different channels would need two tables.
+
+`spoken_content` is **empty when the rewrite changed nothing**, which is most chat, so an ordinary
+sentence is not sent twice down a phone's connection. Empty therefore means both "nothing prepared
+this" and "preparing it was the identity" — deliberately, because `Message::spoken_body()` answers
+both with the raw body and no reader needs to tell them apart. That is also what makes
+`speakable.enabled = false` a one-line switch: off, the field stays empty and every reader is
+already correct.
 
 There is deliberately **no user-lookup tool**, and the reason is recorded in `src/model.rs`
 beside the field. First, the id arrives ATTACHED to the message being replied to, so there is no

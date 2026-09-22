@@ -129,6 +129,24 @@ writable = false
 # Environment: VIBE_TALK_READ_ALOUD_BACKEND
 backend = "elevenlabs"
 
+[speakable]
+# Rewrite message bodies before anything says them out loud. ON when this section is absent.
+#
+# What the pass does: takes Discord's markdown off, so the voice stops saying "asterisk asterisk
+# deploy asterisk asterisk"; turns timestamps into "three hours ago" instead of reading an ISO
+# string character by character; and gives long numeric ids and hash codes a letter — "large
+# number A" — that means the SAME value every time it comes up, so a listener can tell "the same
+# one" from "a different one" without hearing nineteen digits.
+#
+# What it costs: the letters are only meaningful beside a transcript that introduced them, the
+# table is lost on restart, and the spoken body is a second copy of any message the pass actually
+# changed. Turn it off to hear a deployment exactly as it was typed — which is what you want while
+# tuning the voice agent's own prompt, so that a difference between two runs is the prompt.
+#
+# It does NOT control the time-zone conversion: a message carries a local `spoken_time` either way.
+# Environment: VIBE_TALK_SPEAKABLE (true/false — an unreadable value refuses to start)
+enabled = true
+
 [elevenlabs]
 # Optional: the Discord half of this server works without them. Set BOTH to use /voice and
 # GET /api/v1/signed-url, which is how you talk to an agent that has "Enable Authentication"

@@ -306,6 +306,7 @@ const HELP_TOPICS = [
   "reading-width",
   "resuming",
   "live-messages",
+  "speech-prep",
   "storage",
   "connection",
 ];
@@ -7539,6 +7540,32 @@ function renderResumeState() {
 }
 
 /**
+ * Say which arm this deployment is in for the rewrite-for-speech pass.
+ *
+ * Reported, never controlled: the rewrite happens on the server before a message reaches this page
+ * at all, and the voice agent's own tool calls never pass through this browser. A switch here
+ * could only govern one of the three paths that read a message out.
+ *
+ * A server too old to send the field is NOT reported as off. Older servers prepared bodies
+ * unconditionally, so "off" would be a false statement about a deployment that is in fact doing
+ * the rewriting — and the reader is looking at this line precisely to find out which arm they are
+ * in. Only an explicit `false` says off.
+ */
+function renderSpeechPrepState(enabled) {
+  const state = el("speech-prep-state");
+  if (!state) {
+    return;
+  }
+  state.textContent =
+    enabled === false
+      ? "This server reads messages out exactly as they were typed. Markdown, timestamps and " +
+        "long ids are all spoken as written."
+      : "This server rewrites messages for the ear before they are spoken: markdown off, " +
+        "timestamps as “three hours ago”, and long ids as a letter. The channel view " +
+        "still shows what was typed. The operator sets this, not this screen.";
+}
+
+/**
  * Fetch the payload for a new call. NEVER throws, and never leaves the state stale.
  *
  * Answers the payload, or null when there is nothing to send — which includes every failure. The
@@ -8689,6 +8716,7 @@ function applyClientConfig(config) {
   // has asked for — and the screen has to be able to say which of the two is stopping it.
   resumeAllowed = config.replay_enabled === true;
   renderResumeState();
+  renderSpeechPrepState(config.speech_prep_enabled);
   // Started here rather than when the Discord view opens: PUSH TWO is the point of it, and an
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.

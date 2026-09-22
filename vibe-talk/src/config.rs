@@ -63,6 +63,14 @@ pub const ENV_REPLAY_MAX_TURNS: &str = "VIBE_TALK_REPLAY_MAX_TURNS";
 /// Environment variable choosing how the replay reaches the vendor.
 pub const ENV_REPLAY_TRANSPORT: &str = "VIBE_TALK_REPLAY_TRANSPORT";
 
+/// Environment variable turning the rewrite-for-speech pass on or off (`1`/`true`/`yes`/`on`,
+/// or `0`/`false`/`no`/`off`).
+///
+/// An env override exists here and not for every other boolean because this is the switch an
+/// operator reaches for while tuning a voice agent's prompt: it is the difference between two runs
+/// of the same deployment, not a property of the deployment. See [`SpeakableConfig`].
+pub const ENV_SPEAKABLE: &str = "VIBE_TALK_SPEAKABLE";
+
 /// Environment variable overriding the model a summariser is asked for.
 pub const ENV_SUMMARY_MODEL: &str = "VIBE_TALK_SUMMARY_MODEL";
 
@@ -145,6 +153,8 @@ pub struct Config {
     pub channels: Vec<ChannelInfo>,
     /// Read-aloud backend, independent of conversational voice mode.
     pub read_aloud: ReadAloudConfig,
+    /// Whether message bodies are rewritten for speech before anything says them.
+    pub speakable: SpeakableConfig,
     /// ElevenLabs wiring, when configured.
     pub elevenlabs: ElevenLabsConfig,
     /// Durable state: where it lives, and how much of it is kept.
@@ -172,6 +182,42 @@ pub struct ReadAloudConfig {
     /// Speech backend; defaults to ElevenLabs when omitted.
     #[serde(default)]
     pub backend: ReadAloudBackend,
+}
+
+/// Whether a message body is rewritten before it is spoken.
+///
+/// **On by default**, because the unprepared form is what produced the complaint: markdown read as
+/// "asterisk asterisk deploy asterisk asterisk", ISO timestamps read character by character, and
+/// nineteen-digit account ids read digit by digit — each of them noise the listener cannot use and
+/// cannot skip. See [`crate::speakable`] for what the pass does.
+///
+/// It is a switch rather than a fact because the pass is a JUDGEMENT about what a listener wants,
+/// and an operator tuning a voice agent's prompt needs to be able to hear the same deployment
+/// both ways. Turning it off is not a downgrade path for a bug — it is the control arm.
+///
+/// # What it does not switch off
+///
+/// [`Config::timezone`] conversion. A message still carries a local `spoken_time` with the switch
+/// off, because that conversion is not a judgement: handing an assistant a UTC instant and letting
+/// it do the arithmetic produced a real wrong answer, and there is no reading of "turn the
+/// rewriting off" under which the operator was asking for that back.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakableConfig {
+    /// Rewrite bodies for speech. Defaults to `true` when the section or the key is absent.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+impl Default for SpeakableConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// `serde` needs a function, not a literal, for a field that defaults to on.
+fn yes() -> bool {
+    true
 }
 
 /// What a summary is, in numbers.
@@ -444,6 +490,8 @@ struct FileConfig {
     elevenlabs: FileElevenLabs,
     #[serde(default)]
     read_aloud: ReadAloudConfig,
+    #[serde(default)]
+    speakable: SpeakableConfig,
     #[serde(default)]
     storage: FileStorage,
     #[serde(default)]
@@ -777,6 +825,13 @@ impl Config {
             });
         }
 
+        let speakable = SpeakableConfig {
+            enabled: match get(ENV_SPEAKABLE) {
+                None => file.speakable.enabled,
+                Some(raw) => switch(raw, "speakable.enabled")?,
+            },
+        };
+
         let storage = storage_config(get(ENV_STORAGE_PATH), file.storage)?;
         let summaries = summaries_config(
             get(ENV_SUMMARY_MODEL),
@@ -839,6 +894,7 @@ impl Config {
                     }
                 },
             },
+            speakable,
             elevenlabs: ElevenLabsConfig {
                 agent_id: get(ENV_ELEVENLABS_AGENT_ID)
                     .map(str::to_owned)
@@ -862,6 +918,25 @@ impl Config {
 }
 
 /// Resolve the `[replay]` section.
+/// Read an environment value as a boolean, REFUSING anything that is neither.
+///
+/// Deliberately stricter than the `matches!(raw, "1" | "true" | …)` form used for `replay.enabled`,
+/// and for a reason that only applies to a setting whose default is ON: under that form every
+/// unrecognised spelling — `TRUE`, `enabled`, a stray quote — reads as false, so a typo silently
+/// turns the feature off while the operator believes they turned it on. An operator reaching for
+/// this switch is A/B-testing a voice agent, and a run that was quietly the wrong arm is worse
+/// than a server that refused to start and said which value it could not read.
+fn switch(raw: &str, field: &'static str) -> Result<bool, ConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            detail: format!("{other:?} is neither on nor off; write true or false"),
+        }),
+    }
+}
+
 fn replay_config(
     from_env: [Option<&str>; 4],
     file: FileReplay,
@@ -1503,6 +1578,57 @@ writable = true
             matches!(&err, ConfigError::Invalid { field, .. }
                 if field == "discord.live_poll_seconds"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn preparing_a_body_for_speech_is_on_until_somebody_turns_it_off() {
+        // The default is the load-bearing half. A deployment that never heard of this section is
+        // the common case, and it is the one the complaint came from.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(cfg.speakable.enabled, "a silent config must still prepare");
+
+        let text = format!("{FULL}\n[speakable]\nenabled = false\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert!(!cfg.speakable.enabled);
+
+        // Present but empty: the section exists and says nothing, which is still "on".
+        let text = format!("{FULL}\n[speakable]\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert!(cfg.speakable.enabled);
+    }
+
+    #[test]
+    fn the_environment_can_flip_the_speech_switch_both_ways() {
+        for (raw, expected) in [
+            ("0", false),
+            ("false", false),
+            ("off", false),
+            ("No", false),
+            ("1", true),
+            ("TRUE", true),
+            ("on", true),
+        ] {
+            // Set the FILE to the opposite of what the environment says, so a pass could not come
+            // from the override being ignored.
+            let text = format!("{FULL}\n[speakable]\nenabled = {}\n", !expected);
+            let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_SPEAKABLE, raw)]))
+                .expect("valid config");
+            assert_eq!(cfg.speakable.enabled, expected, "{raw:?} read wrong");
+        }
+    }
+
+    #[test]
+    fn a_speech_switch_that_is_neither_on_nor_off_stops_the_server() {
+        // The reason this one refuses where `replay.enabled` shrugs: its default is ON, so the
+        // shrugging form turns a typo into a silently disabled feature, and the operator setting
+        // it is comparing two runs and would attribute the difference to their prompt.
+        let error = Config::from_toml_and_env(FULL, &env(&[(ENV_SPEAKABLE, "enabled")]))
+            .expect_err("a value that is neither must not be read as off");
+        assert!(
+            matches!(&error, ConfigError::Invalid { field, detail }
+                if field == "speakable.enabled" && detail.contains("neither on nor off")),
+            "unexpected error: {error}"
         );
     }
 

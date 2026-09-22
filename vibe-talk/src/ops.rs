@@ -227,7 +227,17 @@ fn stamp(state: &AppState, messages: &mut [Message]) {
 /// Visible to the crate because the live ingest route has to do the same thing to a message that
 /// never passes through [`stamp`] — it arrives already formed, from an adapter, and goes straight
 /// to the page. Two callers, one definition, for exactly the reason `stamp` gives.
+///
+/// This is also where [`crate::config::SpeakableConfig`] is honoured, and the only place it needs
+/// to be. With the switch off the field stays empty, which every reader already handles — it is
+/// the same value a message carries before anything has prepared it, and
+/// [`Message::spoken_body`] answers both with the raw body. So one branch here turns the pass off
+/// for the page, the digest, the model and the audio route at once, and no reader learns a second
+/// way to be given nothing.
 pub(crate) fn prepared_body(state: &AppState, content: &str, now_ms: i64) -> String {
+    if !state.config.speakable.enabled {
+        return String::new();
+    }
     let said = state
         .spoken_names
         .for_speech(content, now_ms, &state.config.timezone);

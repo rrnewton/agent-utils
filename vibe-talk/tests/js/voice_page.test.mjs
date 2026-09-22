@@ -964,6 +964,7 @@ function newPage(store = new Map(), script = SCRIPT) {
         threading_supported: page.threadingSupported,
         upstream_read_mark_supported: page.upstreamReadMarkSupported,
         replay_enabled: page.replayEnabled,
+        speech_prep_enabled: page.speechPrepEnabled,
         self_author_id: page.selfAuthorId,
         owner_author_id: page.ownerAuthorId,
       }),
@@ -1056,6 +1057,11 @@ function newPage(store = new Map(), script = SCRIPT) {
     /** `#46 conversation-replay`: every replay fetch, and the knobs that shape the answer. */
     replayCalls: [],
     replayEnabled: true,
+    /**
+     * Whether this server rewrites bodies for speech. `undefined` is a server too old to say, and
+     * that is a distinct case from `false` — see `renderSpeechPrepState`.
+     */
+    speechPrepEnabled: true,
     /**
      * The agent this server is configured for. `null` is an older server that does not say.
      *
@@ -13767,6 +13773,48 @@ test("turning resuming off forgets what the last call under the old setting did"
     "Settings reported a resumption under a switch that is now off"
   );
   assert.equal(page.el("talk-note").textContent, "the agent starts fresh");
+});
+
+test("Settings says which way this server says a message, and does not offer a switch", async () => {
+  // The operator flips `speakable.enabled` and redeploys to compare two runs of the same agent
+  // prompt. If the screen cannot say which arm they are in, the comparison is worthless — and they
+  // cannot read it off the data, because an empty `spoken_content` means "unchanged" just as often
+  // as it means "off".
+  const page = newPage();
+  await signIn(page);
+  assert.match(page.el("speech-prep-state").textContent, /rewrites messages for the ear/);
+  assert.match(
+    page.el("speech-prep-state").textContent,
+    /still shows what was typed/,
+    "a reader has to be told the channel view is unaffected, or the rewrite looks like a loss"
+  );
+
+  const off = newPage();
+  off.speechPrepEnabled = false;
+  await signIn(off);
+  assert.match(off.el("speech-prep-state").textContent, /exactly as they were typed/);
+
+  // A server too old to send the field prepared bodies unconditionally, so reporting it as off
+  // would be a false statement about a deployment that is in fact rewriting.
+  const old = newPage();
+  old.speechPrepEnabled = undefined;
+  await signIn(old);
+  assert.match(old.el("speech-prep-state").textContent, /rewrites messages for the ear/);
+
+  const settings = settingsGroup("How messages are said");
+  assert.ok(
+    !/<input/.test(settings),
+    "a control here would silently govern one of the three paths that read a message out"
+  );
+  assert.match(settings, /data-help="speech-prep"/, "the group offers no way to reach the detail");
+
+  const block = helpEntry("speech-prep");
+  assert.match(block, /large number A/, "the letter scheme has to be shown, not described");
+  assert.match(
+    block,
+    /lost when the server restarts/,
+    "a letter that silently means a different value tomorrow has to be said out loud"
+  );
 });
 
 test("Settings states the privacy cost of resuming, and that it is a reconstruction", () => {

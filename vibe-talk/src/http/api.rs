@@ -554,6 +554,15 @@ pub struct ClientConfigResponse {
     pub upstream_read_mark_supported: bool,
     /// Whether the backend supports channel, thread-list, and flattened timelines.
     pub threading_supported: bool,
+    /// Whether this server rewrites message bodies for speech before anything says them.
+    ///
+    /// Here for the same reason as `replay_enabled`: Settings has to be able to describe what this
+    /// deployment does, and the page cannot infer this one from any message it holds. An empty
+    /// `spoken_content` means "the rewrite changed nothing" just as often as it means "the pass is
+    /// off" — deliberately, see [`crate::model::Message::spoken_content`] — so a page guessing from
+    /// the data would tell the operator the feature was off every time the channel was plain prose.
+    /// They are flipping this switch to compare two runs; guessing is exactly what they cannot do.
+    pub speech_prep_enabled: bool,
 }
 
 /// `GET /api/v1/client-config`
@@ -579,6 +588,7 @@ pub async fn client_config(
         channel_registration_supported: state.chat.supports_channel_registration(),
         upstream_read_mark_supported: state.chat.supports_upstream_read_mark(),
         threading_supported: state.chat.supports_threading(),
+        speech_prep_enabled: state.config.speakable.enabled,
         replay_enabled: state.config.replay.enabled,
         self_author_id: crate::discord::self_user_id_from_token(
             state.config.discord.bot_token.expose(),
