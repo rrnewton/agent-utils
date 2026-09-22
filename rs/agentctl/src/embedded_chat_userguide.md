@@ -192,11 +192,14 @@ Description=agentctl chat bridge
 After=herdr.service
 
 [Service]
-Type=simple
+Type=exec
 Environment=AGENTCTL_HOME=/home/USER/.agentctl
 ExecStart=/absolute/path/agentctl --registry /work/project/.agentctl chat run --bridge-state /home/USER/.local/state/agentctl/project-chat
 Restart=on-failure
 RestartSec=2
+KillMode=control-group
+OOMPolicy=kill
+TimeoutStopSec=60
 TasksMax=2048
 MemoryMax=4G
 MemorySwapMax=0
@@ -204,6 +207,22 @@ MemorySwapMax=0
 [Install]
 WantedBy=default.target
 ```
+
+After installing the unit as `agentctl-chat.service`, make persistence explicit
+and verify both properties instead of merely starting an ephemeral process:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now agentctl-chat.service
+systemctl --user is-enabled agentctl-chat.service
+systemctl --user is-active agentctl-chat.service
+```
+
+`enable --now` survives a user-manager restart; operation while the user is
+logged out additionally requires lingering to be enabled for that account.
+`Type=exec` makes an `active` transition contingent on successful executable
+startup. `KillMode=control-group` and the bounded stop deadline keep plugin and
+helper descendants inside the unit's cleanup boundary.
 
 The example ceilings are not minimum requirements or evidence about an
 unmeasured plugin. A provider that needs more than 2,048 tasks or 4 GiB must be
