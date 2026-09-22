@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -18383,7 +18384,7 @@ def set_host_context_handoff(
 def prepare_host_context_recover_finish(
     tmp_path: Path,
 ) -> tuple[Path, Path, Path, dict[str, Path]]:
-    """Real exited owner, actual census and proof-bearing interrupted finish."""
+    """Real exited owner and proof-bearing interrupted finish with fixture-scoped census."""
     project, repository, _remote = make_project(tmp_path)
     commit_validation_removal_schema(repository, schema_version=2)
     owner_script = """
@@ -18414,11 +18415,13 @@ raise SystemExit(cli.main([
         value.update(final_validate_status="FAILED", exit_code=1)
         path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         rebind_validation_removal_artifact(project, manifest, role, path)
-    interrupted = raw_command(
-        project, "remove", "slot01", "--validate-complete",
-        "--coordinator-pid", str(os.getpid()), "--expected-generation", str(registered.generation),
+    interrupted = raw_command_with_census_authority_stub(
+        project, "remove-validate-batch", "--coordinator-authorized",
+        "--coordinator-pid", str(os.getpid()),
+        "--slot", f"slot01={registered.generation}",
         "--validation-proof-manifest", manifest.relative_to(project).as_posix(),
         "--completed-record", artifacts["run-record"].relative_to(project).as_posix(),
+        "--format", "json",
         env={"WRKSLOTS_TEST_INTERRUPT": "after-finish-journal"},
     )
     assert interrupted.returncode == 86, interrupted.stderr
@@ -18441,6 +18444,7 @@ def test_host_context_recover_finish_preserves_actor_and_issued_proof(
 ) -> None:
     expected_runner = wrkslots._identity_to_obj(wrkslots._read_process_identity(os.getpid()))
     project, journal, manifest, artifacts = prepare_host_context_recover_finish(tmp_path)
+    stub_validate_batch_censuses(monkeypatch)
     retained = [manifest, artifacts["run-record"], artifacts["service-result"], artifacts["scorecard-handoff"]]
     before = recovery_file_snapshot(retained)
     coordinator, proof_fd = start_host_context_coordinator()
@@ -28262,7 +28266,10 @@ def test_bounded_read_only_command_kills_descendant_holding_output(
 def test_bounded_read_only_command_refuses_when_killed_child_cannot_be_reaped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_wait = subprocess.Popen.wait
+    original_wait = cast(
+        Callable[[subprocess.Popen[bytes], float | None], int],
+        subprocess.Popen.wait,
+    )
     children: list[subprocess.Popen[bytes]] = []
 
     def unreapable_wait(process: subprocess.Popen[bytes], timeout: float | None = None) -> int:
@@ -28280,7 +28287,7 @@ def test_bounded_read_only_command_refuses_when_killed_child_cannot_be_reaped(
     finally:
         # This models an unreapable response, without inducing kernel D-state.
         for process in children:
-            original_wait(process, timeout=5)
+            original_wait(process, 5)
 
 
 @pytest.mark.ordinary_environment
@@ -28289,7 +28296,10 @@ def test_bounded_read_only_command_cleans_up_post_spawn_setup_failure(
     monkeypatch: pytest.MonkeyPatch, interrupt: bool,
 ) -> None:
     failure = KeyboardInterrupt() if interrupt else RuntimeError("selector setup failed")
-    original_wait = subprocess.Popen.wait
+    original_wait = cast(
+        Callable[[subprocess.Popen[bytes], float | None], int],
+        subprocess.Popen.wait,
+    )
     children: list[subprocess.Popen[bytes]] = []
 
     def fail_selector() -> selectors.BaseSelector:
@@ -28298,7 +28308,7 @@ def test_bounded_read_only_command_cleans_up_post_spawn_setup_failure(
     def reap(process: subprocess.Popen[bytes], timeout: float | None = None) -> int:
         assert timeout == 1
         children.append(process)
-        return original_wait(process, timeout=timeout)
+        return original_wait(process, timeout)
 
     monkeypatch.setattr(selectors, "DefaultSelector", fail_selector)
     monkeypatch.setattr(subprocess.Popen, "wait", reap)

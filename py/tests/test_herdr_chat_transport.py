@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from email.message import Message
 from pathlib import Path
 from typing import IO, cast
@@ -1055,7 +1055,10 @@ def test_command_output_read_failure_cleans_the_complete_group(
 def test_command_final_wait_failure_always_wakes_anchor_then_reaps_supervisor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_wait = subprocess.Popen.wait
+    original_wait = cast(
+        Callable[[subprocess.Popen[bytes], float | None], int],
+        subprocess.Popen.wait,
+    )
     original_signal = signal.pidfd_send_signal
     original_open = os.pidfd_open
     handles: list[tuple[int, int]] = []

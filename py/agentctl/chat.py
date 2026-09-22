@@ -27,7 +27,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from functools import cached_property
@@ -1763,7 +1763,7 @@ class Bridge:
         encoded_bytes = 0
         seen: set[str] = set()
         observed_sizes: dict[str, int] = {}
-        source = (
+        source: Iterable[tuple[dict[str, object], str | None, int]] = (
             ((record, None, self._cached_request_record_bytes(record)) for record in records)
             if records is not None else
             ((record, path.stem, size)
@@ -1952,7 +1952,7 @@ class Bridge:
                 request_reason + "; rotate to a fresh Chat state after draining accepted work")
         request_queue_ids: set[str] = set()
         artifact_bounds: dict[str, int] = {}
-        request_source = (
+        request_source: Iterable[tuple[dict[str, object], str | None]] = (
             ((record, None) for record in records) if records is not None else
             ((record, path.stem)
              for path in (self.state / "requests").glob("*.json")

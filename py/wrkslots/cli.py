@@ -27903,11 +27903,10 @@ def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
     )
     if len(canonical_proofs) != len(set(canonical_proofs)):
         raise Refusal("classify-ownerless-validate-batch received a duplicate proof")
-    aligned_proofs: tuple[str | None, ...] = (
-        canonical_proofs
-        if canonical_proofs
-        else tuple(None for _checkout in checkouts)
-    )
+    if canonical_proofs:
+        aligned_proofs: tuple[str | None, ...] = canonical_proofs
+    else:
+        aligned_proofs = (None,) * len(checkouts)
     _refuse_partial_state(config, allow_validate_batch_seals=True)
     if _validate_batch_seal_journals(config):
         raise Refusal(

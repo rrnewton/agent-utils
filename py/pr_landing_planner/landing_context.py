@@ -442,7 +442,11 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
                 f"PR #{pr} {evidence.value} evidence requires exact 'head_sha' "
                 "and 'base_sha'; revalidate and record both fetched identities"
             )
-        if authority not in (None, ValidationAuthority.NONE) and evidence is not ValidationEvidence.CLEAN_VALIDATE_RECORD:
+        if (
+            authority is not None
+            and authority is not ValidationAuthority.NONE
+            and evidence is not ValidationEvidence.CLEAN_VALIDATE_RECORD
+        ):
             raise ValueError(
                 f"PR #{pr} {authority.value} validation_authority requires "
                 "validation_evidence 'clean-validate-record'"
