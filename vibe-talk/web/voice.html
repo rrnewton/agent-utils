@@ -688,11 +688,22 @@
                 is asked for.
               -->
               <p id="live-state" class="hint" aria-live="polite"></p>
-              <label class="toggle">
-                <input id="relay-to-agent" type="checkbox" />
-                Tell the agent about arriving messages
-              </label>
-              <p class="hint">Off by default: it sends channel text to the voice vendor and costs conversation time.</p>
+              <!--
+                THREE options, not a checkbox, because "say something about it" and "read it out
+                word for word" are different amounts of the reader's time and the vendor's money,
+                and a two-state control forces the expensive one to stand in for both.
+
+                No `selected` here on purpose: the live value is filled in by `renderReadNew` from
+                the same key the bar button writes, so there is exactly one truth about the mode
+                and not a markup default that disagrees with it after a reload.
+              -->
+              <label for="relay-to-agent">Arriving messages during a call</label>
+              <select id="relay-to-agent">
+                <option value="off">Don't tell the agent</option>
+                <option value="gist">Say what each one says, briefly</option>
+                <option value="full">Read them out in full</option>
+              </select>
+              <p class="hint">Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.</p>
             </section>
 
             <section class="settings-group">
@@ -1068,12 +1079,21 @@
                 delivery from a provider adapter; Settings says which mode this server is using.
               </p>
               <p class="hint">
-                <strong>Telling the agent</strong> about arriving messages sends each one into a
-                live call as background information, so it can mention a reply that lands
-                mid-conversation instead of waiting to be asked. This <strong>sends channel text to
-                the voice vendor</strong> and it costs conversation time, so it is off by default.
-                Replies this server posted are never sent back — otherwise the agent would hear its
-                own answer and reply to it.
+                <strong>Arriving messages during a call</strong> has three settings, on the bar as
+                <strong>Read new</strong> and in Settings by name. <em>Don't tell the agent</em>
+                leaves a call alone entirely. <em>Briefly</em> — the default — has the agent say in
+                one sentence what arrived. <em>In full</em> has it read each message out word for
+                word, which is what you want when the channel is the conversation and slow going
+                when it is not. Both speaking modes send channel text to
+                <strong>the voice vendor</strong> and spend conversation time. Replies this server
+                posted are never sent back — otherwise the agent would hear its own answer and
+                reply to it.
+              </p>
+              <p class="hint">
+                A burst arriving at once becomes <strong>one</strong> spoken turn, not one per
+                message. Messages that land within about a second of each other are collected and
+                announced together, because a coding agent posting four lines in a row would
+                otherwise interrupt four times and leave no gap to answer in.
               </p>
               <p class="hint">
                 It only works <strong>while this page is open</strong>. The conversation socket
@@ -1241,6 +1261,36 @@
                 <path d="M5.5 12h13M5.5 16h13M5.5 20h8" />
               </svg>
               <span id="prompts-open-label" class="mini-label">Prompts</span>
+            </button>
+
+            <!--
+              THREE STATES, CYCLED BY TAPPING, and the arithmetic is why. A `<select>` needs 5rem
+              before its own padding and border, which the strip does not have once the call view
+              is holding Type and Prompts as well; a `.bar-button` needs 2.75rem, which it does.
+              So the control on the bar is a button that steps off → gist → full → off, and the
+              same three values are also a real `<select>` in Settings, where there is room to name
+              them. Both write one key; see `RELAY_MODES` in web/voice.js.
+
+              The label and the tooltip are filled in from script, by `renderReadNew`, because the
+              live one depends on the mode — there is no honest static text for a control with
+              three meanings, and a copy here would be the wrong one two thirds of the time.
+
+              The icon is a SPEAKER WITH TWO WAVES, and the waves are what carries the mode: none
+              for off, the near one for gist, both for full. That reads as "how much comes out",
+              which is exactly what the three modes differ in.
+            -->
+            <button
+              id="read-new"
+              class="bar-button"
+              type="button"
+              data-mode="gist"
+            >
+              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 9.5h3l4.5-4v13l-4.5-4H4z" />
+                <path class="wave wave-near" d="M15 9.5a4 4 0 0 1 0 5" />
+                <path class="wave wave-far" d="M17.75 7a7.5 7.5 0 0 1 0 10" />
+              </svg>
+              <span id="read-new-label" class="mini-label">Gist</span>
             </button>
           </div>
 

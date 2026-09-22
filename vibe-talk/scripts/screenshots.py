@@ -2896,19 +2896,30 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="27-canned-prompts",
-        what="the control bar packed: gear, Type, Prompts and the view switch, tray open above it",
+        what=(
+            "the control bar packed: gear, Type, Prompts, Read new and the view switch, "
+            "tray open above it"
+        ),
         act=_act_canned_prompts,
         expect=(
             (
                 "every button the bar has is on it at once",
-                "['open-settings', 'text-entry', 'prompts-open', "
+                "['open-settings', 'text-entry', 'prompts-open', 'read-new', "
                 "'view-switch'].every((id) => window.__visible(id))",
             ),
             (
                 "and the tray it opens really holds both prompts",
                 "['canned-summary', 'canned-blockers'].every((id) => window.__visible(id))",
             ),
-            # THE packing claim, and the only place it can be answered: on a 375px phone four
+            # `#126 read-new-selector`. What an untouched page is DOING about arriving messages,
+            # which is now something rather than nothing: the default is the summarising mode, at
+            # the owner's request, and this is the one place the picture and the claim agree.
+            (
+                "Read new shows the summarising mode it defaults to",
+                "document.getElementById('read-new').getAttribute('data-mode') === 'gist' && "
+                "window.__text('read-new-label').length > 0",
+            ),
+            # THE packing claim, and the only place it can be answered: on a 375px phone five
             # controls have to fit a strip that also carries a switch with a 3.6rem word in it.
             # Nothing may hang past the bar's own right edge, because that is where the switch is.
             (

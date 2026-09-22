@@ -319,7 +319,11 @@ const FIXTURE_TREE = {
   // The canned buttons USED to be here, one member each. They are in `#prompts-tray` now: the bar
   // is one 375px row, each prompt cost it a slot, and the list is meant to grow. One opener costs
   // one slot however many prompts it holds.
-  "bar-pack": ["discord-channel", "text-entry", "prompts-open"],
+  //
+  // `read-new` is last, and it is on the strip at all because the tray gave a slot back. It is a
+  // BUTTON rather than a select for the same reason: see `memberPx` — a `.bar-select` is 5rem
+  // before its own padding, which the call view does not have once Type and Prompts are on it.
+  "bar-pack": ["discord-channel", "text-entry", "prompts-open", "read-new"],
   // The tray of canned prompts. A child of the BAR and not of the pack, and both halves of that
   // matter: of the bar because the bar is what moves between the two mounts, and not of the pack
   // because the pack scrolls sideways and a menu that can scroll out from under its own opener is
@@ -1803,6 +1807,17 @@ const sourceConstant = (name) =>
       assert.fail(`web/voice.js no longer states a ${name}`)
   );
 
+/**
+ * The same, for a constant whose value is one quoted string.
+ *
+ * Same argument as above: a test that restated the marker text would keep passing against a page
+ * that had changed it, which for a delimiter is the failure that matters most — the fence is what
+ * tells a model where the quoted third-party text starts and stops.
+ */
+const sourceString = (name) =>
+  new RegExp(`^const ${name} = "([^"]*)";$`, "m").exec(SCRIPT_CODE)?.[1] ??
+  assert.fail(`web/voice.js no longer states a ${name}`);
+
 const COLLAPSE_OVER_CHARS = sourceConstant("COLLAPSE_OVER_CHARS");
 const longMessage = (mark = "long") =>
   `${mark}: ` + "a sentence about the overnight run. ".repeat(
@@ -1913,6 +1928,10 @@ const TUNING_BANDS = {
     "how much of an arriving message is spoken into a live call. Too short and the agent is told " +
     "a headline it cannot act on; too long and one chatty channel message costs a paragraph of " +
     "billed conversation"],
+  RELAY_COALESCE_MS: [200, 10000,
+    "how long arriving messages are held so a burst becomes one spoken turn. Too short and four " +
+    "lines posted in a row take four turns, each interrupting the last; too long and being told " +
+    "about a message stops being news and the pause reads as the feature not working"],
   SWIPE_START_PX: [4, 40,
     "how far a finger travels before the gesture is committed to an axis. Below a few pixels a " +
     "tap with any tremor in it becomes a swipe; far above that the row does not begin to follow " +
@@ -2823,7 +2842,7 @@ test("THE CHANNEL PICKER IS ON THE BAR, AND OUT OF THE SCROLLING ELEMENT ENTIREL
   // is the one on screen without scrolling anything — and being unreachable is the whole defect.
   const pack = HTML.indexOf('id="bar-pack"');
   const picker = HTML.indexOf('id="discord-channel"');
-  for (const later of ["text-entry", "canned-summary", "canned-blockers"]) {
+  for (const later of ["text-entry", "read-new", "canned-summary", "canned-blockers"]) {
     assert.ok(
       picker < HTML.indexOf(`id="${later}"`),
       `#${later} is packed before the channel picker, so the picker is what scrolls off the bar`
@@ -3079,9 +3098,13 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW AND IN BOTH MODES",
     `${PHONE_PX}px phone leaves, so ${Math.ceil(cost - budget)}px of the bar is off the edge — ` +
     "#bar-pack scrolls, so what is off the edge is a control the owner cannot reach";
 
-  // The call view: the gear, the three controls that speak to the agent, and the switch.
+  // The call view: the gear, the three controls that act on the conversation, and the switch.
   const call = barCostPx(page);
   assert.ok(call.shown.includes("prompts-open"), "this is not the call view's full bar");
+  // The slot the tray gave back, spent. `#126 read-new-selector` went onto the strip on the strength
+  // of that arithmetic, so it has to be one of the members this budget is actually pricing — and it
+  // is a `.bar-button` for the same reason: a `.bar-select` here does not fit.
+  assert.ok(call.shown.includes("read-new"), "the read-new control is not on the call view's bar");
   assert.ok(call.cost <= budget, report("the call view", call));
 
   // The channel view: the same strip with the picker instead, which is the widest single member of
@@ -12821,7 +12844,21 @@ test("HOSTILE MESSAGE TEXT NEVER BECOMES MARKUP ON THE LIVE PATH EITHER", async 
   }
 });
 
-/** Every `contextual_update` this page has put on the conversation socket. */
+const RELAY_COALESCE_MS = sourceConstant("RELAY_COALESCE_MS");
+const RELAY_FENCE_OPEN = sourceString("RELAY_FENCE_OPEN");
+
+/**
+ * Every turn this page has spoken on the channel's behalf.
+ *
+ * `user_message`, and the type is the substance of `#126 read-new-selector`: a `contextual_update`
+ * is injected WITHOUT consuming a turn, so the agent silently knows a message arrived and says
+ * nothing about it. That is a background note, which is what this used to be, and it cannot
+ * satisfy "read new" — the reader asked to be told.
+ *
+ * Filtered by the FENCE as well as the type, because typed input and the canned prompts are
+ * `user_message` frames too. What distinguishes a relayed turn is that it carries quoted
+ * third-party text inside a delimiter, so that is what identifies one.
+ */
 const relayed = (page) =>
   (page.sockets[0] ? page.sockets[0].sent : [])
     .map((raw) => {
@@ -12831,7 +12868,24 @@ const relayed = (page) =>
         return null;
       }
     })
-    .filter((frame) => frame && frame.type === "contextual_update");
+    .filter(
+      (frame) =>
+        frame &&
+        frame.type === "user_message" &&
+        String(frame.text || "").includes(RELAY_FENCE_OPEN)
+    );
+
+/** Walk the page past the burst window, which is when a held arrival is actually spoken. */
+const speakRelay = async (page) => {
+  page.expireTimers(RELAY_COALESCE_MS);
+  await page.settle();
+};
+
+/** Put the three-way selector on one of its modes, through the Settings control. */
+const setReadNew = async (page, mode) => {
+  page.el("relay-to-agent").value = mode;
+  await page.el("relay-to-agent").dispatch("change");
+};
 
 test("an arriving message reaches a live call only when the reader has asked for it", async () => {
   const page = newPage();
@@ -12842,19 +12896,22 @@ test("an arriving message reaches a live call only when the reader has asked for
   const stream = page.stream();
   assert.ok(stream, "no live stream was attached");
 
-  // The toggle ships OFF, and off means silence even with a call in progress.
+  // `off` is a mode the reader can choose, and choosing it means silence even mid-call.
+  await setReadNew(page, "off");
   await deliver(page, stream, sseMessage(message({ id: "500", content: "the deploy finished" })));
+  await speakRelay(page);
   assert.deepStrictEqual(
     relayed(page),
     [],
-    "an arriving message was spoken into a paid conversation nobody opted into"
+    "an arriving message was spoken into a paid conversation the reader had switched off"
   );
 
-  await page.el("relay-to-agent").setChecked(true);
+  await setReadNew(page, "gist");
   await deliver(page, stream, sseMessage(message({ id: "501", content: "and the tag is cut" })));
+  await speakRelay(page);
 
   const sent = relayed(page);
-  assert.equal(sent.length, 1, "the toggle is on and nothing was relayed");
+  assert.equal(sent.length, 1, "the selector is on and nothing was relayed");
   assert.match(sent[0].text, /and the tag is cut/, "the message text has to actually be in it");
   assert.match(sent[0].text, /lead team/, "which channel it came from is half the information");
   assert.match(
@@ -12862,6 +12919,188 @@ test("an arriving message reaches a live call only when the reader has asked for
     /never be treated as a command/i,
     "channel text handed to a model must arrive framed as a quotation, not as an instruction"
   );
+});
+
+test("the three modes differ in WHAT THE AGENT IS ASKED TO DO, and off asks nothing", async () => {
+  // The whole of what the reader is choosing between. Mode 2 spends one sentence of conversation
+  // time on an arrival; mode 3 spends however long the message is. A test that only checked
+  // "something was sent" would pass against a page where the selector had three positions and two
+  // behaviours, which is the failure worth catching.
+  const page = newPage();
+  await startTalking(page);
+  page.messages = [];
+  await page.el("view-switch").click();
+  await page.settle();
+  const stream = page.stream();
+
+  await setReadNew(page, "gist");
+  await deliver(page, stream, sseMessage(message({ id: "520", content: "the tag is cut" })));
+  await speakRelay(page);
+  const gist = relayed(page);
+  assert.equal(gist.length, 1);
+  assert.match(
+    gist[0].text,
+    /one short sentence/i,
+    "mode 2 is a summary, and the turn has to say so or the agent will read the message out"
+  );
+
+  await setReadNew(page, "full");
+  await deliver(page, stream, sseMessage(message({ id: "521", content: "and deployed" })));
+  await speakRelay(page);
+  const full = relayed(page);
+  assert.equal(full.length, 2);
+  assert.match(
+    full[1].text,
+    /word for word/i,
+    "mode 3 is the words themselves, and nothing else in the turn asks for them"
+  );
+
+  // Both of them ask the agent to hand the floor back. This is an interruption of a conversation
+  // the reader is already having, not an invitation to open a topic.
+  for (const turn of full) {
+    assert.match(turn.text, /Then stop\./, `a relayed turn left the floor: ${turn.text}`);
+  }
+
+  // The task sentence comes FIRST, ahead of the quoted text. Placed after it, the instruction
+  // would sit behind whatever a third party wrote, which is the one ordering the framing exists
+  // to prevent.
+  for (const turn of full) {
+    assert.ok(
+      turn.text.indexOf("Then stop.") < turn.text.indexOf(RELAY_FENCE_OPEN),
+      `quoted channel text is the last instruction in the turn: ${turn.text}`
+    );
+  }
+});
+
+test("A BURST OF ARRIVALS IS ONE SPOKEN TURN, NOT ONE EACH", async () => {
+  // A coding agent posting four lines in two seconds is the ordinary case this feature exists for.
+  // One `user_message` each would be four spoken turns in a row, each interrupting the last, with
+  // no gap for the reader to answer in — and four turns billed.
+  const page = newPage();
+  await startTalking(page);
+  page.messages = [];
+  await page.el("view-switch").click();
+  await page.settle();
+  const stream = page.stream();
+  await setReadNew(page, "full");
+
+  for (const [id, content] of [
+    ["1200", "starting the build"],
+    ["1201", "tests are running"],
+    ["1202", "one failure in the parser"],
+  ]) {
+    await deliver(page, stream, sseMessage(message({ id, content })));
+  }
+  assert.deepStrictEqual(
+    relayed(page),
+    [],
+    "an arrival was spoken before the burst window closed, so a burst cannot be collected at all"
+  );
+
+  await speakRelay(page);
+  const sent = relayed(page);
+  assert.equal(sent.length, 1, `${sent.length} turns for one burst of three messages`);
+  for (const content of ["starting the build", "tests are running", "one failure in the parser"]) {
+    assert.match(sent[0].text, new RegExp(content), `${content} was dropped from the one turn`);
+  }
+  assert.match(
+    sent[0].text,
+    /these 3 new chat messages/,
+    "a turn about three messages has to say there are three, or the agent reads them as one"
+  );
+});
+
+test("switching the selector off during the burst window cancels what was held", async () => {
+  // The window is short, but it is long enough for the reader to reach the button — and having
+  // pressed Off, hearing the thing you just switched off is the worst reading of the control.
+  const page = newPage();
+  await startTalking(page);
+  page.messages = [];
+  await page.el("view-switch").click();
+  await page.settle();
+  const stream = page.stream();
+  await setReadNew(page, "gist");
+
+  await deliver(page, stream, sseMessage(message({ id: "1300", content: "held, then cancelled" })));
+  await setReadNew(page, "off");
+  await speakRelay(page);
+
+  assert.deepStrictEqual(relayed(page), [], "the held burst was spoken after the reader said no");
+});
+
+test("the bar button cycles the three modes and both controls agree about which one", async () => {
+  // Two controls over one value, which is the failure this is here to catch: a reader who sets the
+  // select and then looks at the bar must not see the old mode looking back at them.
+  assertMarkupContains("bar-pack", "read-new");
+  const page = newPage();
+  await startTalking(page);
+
+  // `#126 read-new-selector`. The default is mode 2, at the owner's request, so this is what an
+  // untouched page is doing.
+  assert.equal(page.el("read-new").getAttribute("data-mode"), "gist");
+  assert.equal(page.el("relay-to-agent").value, "gist");
+
+  await page.el("read-new").click();
+  assert.equal(page.el("read-new").getAttribute("data-mode"), "full");
+  assert.equal(page.el("relay-to-agent").value, "full", "the select did not follow the button");
+
+  await page.el("read-new").click();
+  assert.equal(page.el("read-new").getAttribute("data-mode"), "off", "the cycle does not wrap");
+  assert.equal(page.el("relay-to-agent").value, "off");
+
+  await page.el("read-new").click();
+  assert.equal(page.el("read-new").getAttribute("data-mode"), "gist");
+
+  await setReadNew(page, "full");
+  assert.equal(
+    page.el("read-new").getAttribute("data-mode"),
+    "full",
+    "the button did not follow the select"
+  );
+
+  // The label and the tooltip both change, because a three-state button whose face is constant is
+  // a button whose state cannot be read.
+  const faces = new Set();
+  for (const _ of [0, 1, 2]) {
+    faces.add(`${page.el("read-new-label").text()}|${page.el("read-new").getAttribute("title")}`);
+    await page.el("read-new").click();
+  }
+  assert.equal(faces.size, 3, "two of the three modes look identical on the bar");
+  assert.match(
+    page.el("read-new").getAttribute("aria-label") || "",
+    /new messages/i,
+    "a screen reader is told the tooltip's next action and not the state it is in"
+  );
+});
+
+test("the mode outlives a reload, and an earlier explicit refusal is not overturned", async () => {
+  // The key is SHARED with the boolean this replaced, on purpose. "off" is still a mode, so a
+  // reader who had turned the old switch off stays off; moving to a new key would have read as
+  // "never chose anything" and the new default is ON, silently overturning a refusal. "on" is not
+  // a mode any more and falls through to the default, which is the right answer rather than a
+  // coincidence: "on" meant relay, and summarising is what relaying now means.
+  const store = new Map();
+  const page = newPage(store);
+  await startTalking(page);
+  await setReadNew(page, "full");
+  assert.equal(
+    newPage(store).el("relay-to-agent").value,
+    "full",
+    "the chosen mode did not survive a reload"
+  );
+
+  const stored = (value) => newPage(new Map([["vibe-talk.voice.relay", value]]));
+  assert.equal(
+    stored("off").el("read-new").getAttribute("data-mode"),
+    "off",
+    "a reader who had switched the old relay off was switched back on by the rename"
+  );
+  assert.equal(
+    stored("on").el("read-new").getAttribute("data-mode"),
+    "gist",
+    "the old boolean 'on' has to land on a mode that speaks"
+  );
+  assert.equal(stored("loud").el("read-new").getAttribute("data-mode"), "gist");
 });
 
 test("a message this server posted is shown but never relayed back to the agent", async () => {
@@ -12873,7 +13112,7 @@ test("a message this server posted is shown but never relayed back to the agent"
   await page.el("view-switch").click();
   await page.settle();
   const stream = page.stream();
-  await page.el("relay-to-agent").setChecked(true);
+  await setReadNew(page, "gist");
 
   await deliver(
     page,
@@ -12889,6 +13128,7 @@ test("a message this server posted is shown but never relayed back to the agent"
     1,
     "our own reply still belongs in the channel view — it is the RELAY that is suppressed"
   );
+  await speakRelay(page);
   assert.deepStrictEqual(relayed(page), [], "the agent was told about its own reply");
 });
 
@@ -12905,7 +13145,7 @@ test("THE REPLAY TAIL IS SHOWN BUT NEVER ANNOUNCED TO A LIVE CALL AS NEWS", asyn
   await page.el("view-switch").click();
   await page.settle();
   const stream = page.stream();
-  await page.el("relay-to-agent").setChecked(true);
+  await setReadNew(page, "gist");
 
   for (const id of ["1000", "1001", "1002"]) {
     await deliver(
@@ -12920,6 +13160,7 @@ test("THE REPLAY TAIL IS SHOWN BUT NEVER ANNOUNCED TO A LIVE CALL AS NEWS", asyn
     3,
     "the tail still belongs on screen — it is the RELAY that is suppressed, not the message"
   );
+  await speakRelay(page);
   assert.deepStrictEqual(
     relayed(page),
     [],
@@ -12932,6 +13173,7 @@ test("THE REPLAY TAIL IS SHOWN BUT NEVER ANNOUNCED TO A LIVE CALL AS NEWS", asyn
     stream,
     sseMessage(message({ id: "1003", content: "and this one really did just arrive" }))
   );
+  await speakRelay(page);
   const sent = relayed(page);
   assert.equal(sent.length, 1, "a live arrival must still reach the agent");
   assert.match(sent[0].text, /really did just arrive/);
@@ -12940,7 +13182,7 @@ test("THE REPLAY TAIL IS SHOWN BUT NEVER ANNOUNCED TO A LIVE CALL AS NEWS", asyn
 test("with no call in progress an arriving message is rendered and relayed to nobody", async () => {
   const page = newPage();
   const stream = await withLiveChannel(page, []);
-  await page.el("relay-to-agent").setChecked(true);
+  await setReadNew(page, "gist");
 
   await deliver(page, stream, sseMessage(message({ id: "700", content: "nobody is listening" })));
 
@@ -13098,19 +13340,43 @@ test("Settings says plainly what the relay costs and what it cannot do", () => {
   // only looked at the help screen would pass just as well if nothing linked to it.
   const settings = settingsGroup("Live messages");
   assert.match(settings, /id="relay-to-agent"/);
+  // ALL THREE modes are named on the screen, and none of them is `selected` in the markup. The
+  // live value comes out of storage, so a markup default would be a second opinion about the mode
+  // that disagrees with the real one after a reload.
+  for (const mode of ["off", "gist", "full"]) {
+    assert.match(
+      settings,
+      new RegExp(`value="${mode}"`),
+      `the ${mode} mode has no option the reader can choose`
+    );
+  }
   assert.ok(
-    !/id="relay-to-agent"[^>]*\bchecked\b/.test(settings),
-    "a control that sends channel text to a paid vendor must not ship on"
+    !/<option[^>]*\bselected\b/.test(settings.slice(settings.indexOf('id="relay-to-agent"'))),
+    "the markup states a mode of its own, which is a second truth about a stored setting"
   );
   assert.match(
     settings,
     /data-help="live-messages"/,
     "the group offers no way to reach what it costs"
   );
-  assert.match(settings, /voice vendor/, "the cost is not even summarised beside the switch");
+  assert.match(settings, /voice vendor/, "the cost is not even summarised beside the control");
+  // THE DEFAULT IS NOW ON, at the owner's request, which reverses what this screen used to say. A
+  // setting that spends money without being asked for on the day has to be legible as the default
+  // rather than discovered from a bill.
+  assert.match(
+    settings,
+    /by default/,
+    "the screen no longer says which of the three modes an untouched page is in"
+  );
 
   const block = helpEntry("live-messages");
   assert.match(block, /voice vendor/, "where the channel text goes has to be said, not implied");
+  assert.match(
+    block,
+    /one<\/strong> spoken turn/,
+    "a burst becoming one turn rather than one each is behaviour the reader will notice, so the " +
+      "screen has to account for the pause before the agent speaks"
+  );
   assert.match(
     block,
     /while this page is open/,
@@ -13135,15 +13401,21 @@ test("the relay is cut to a budget rather than sending a whole essay into a call
   page.messages = [];
   await page.el("view-switch").click();
   await page.settle();
-  await page.el("relay-to-agent").setChecked(true);
+  await setReadNew(page, "gist");
 
   const long = "a very long sentence about the overnight run. ".repeat(60);
   await deliver(page, page.stream(), sseMessage(message({ id: "1100", content: long })));
 
+  await speakRelay(page);
   const sent = relayed(page);
   assert.equal(sent.length, 1);
   const budget = sourceConstant("RELAY_MAX_CHARS");
-  const quoted = sent[0].text.slice(sent[0].text.indexOf("said: ") + "said: ".length);
+  // The quoted line only, not the rest of the turn: the task sentence and the fences are this
+  // page's own words and are not what the budget is about.
+  const quoted = sent[0].text
+    .split("\n")
+    .find((line) => line.includes("said: "))
+    .split("said: ")[1];
   assert.ok(quoted.length > 0, `the quoted body is missing: ${sent[0].text}`);
   assert.ok(
     quoted.length <= budget,

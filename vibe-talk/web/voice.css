@@ -1944,6 +1944,31 @@ body {
 }
 
 /*
+ * Read new: three modes on one button, told apart by HOW MUCH COMES OUT OF THE SPEAKER.
+ *
+ * Off hides both waves, gist shows the near one, full shows both. That is a scale rather than
+ * three unrelated marks, which is what the modes actually are — and it survives being looked at
+ * for a tenth of a second on a phone, which a change of icon does not.
+ *
+ * DELIBERATELY NOT the 0.45 opacity of `aria-disabled` above for the off state. A whole button
+ * faded out says "you cannot press this", and off is a state the reader CHOSE and can leave by
+ * pressing exactly here; borrowing the dead look would make a working control read as broken. So
+ * off keeps the ordinary button and simply has a quiet speaker, and the two live modes take the
+ * accent border instead — the change is in what the icon is doing, not in whether the button
+ * looks usable.
+ */
+#read-new[data-mode="off"] .wave,
+#read-new[data-mode="gist"] .wave-far {
+  visibility: hidden;
+}
+
+#read-new[data-mode="gist"],
+#read-new[data-mode="full"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/*
  * The tray of canned prompts, hanging off the bar.
  *
  * OUT OF FLOW, and that is the property the whole arrangement rests on: the bar is one row whose

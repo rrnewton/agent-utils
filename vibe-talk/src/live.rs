@@ -78,18 +78,19 @@
 //!
 //! # Decision two: the PAGE keeps the ElevenLabs conversation socket
 //!
-//! A message arriving in Discord should be able to reach a live voice conversation as a
-//! `contextual_update`. Someone has to hold the socket that carries it, and today that is the
-//! browser: this server only mints a signed URL (`GET /api/v1/signed-url`) and holds no
-//! per-conversation vendor state at all.
+//! A message arriving in Discord should be able to reach a live voice conversation. Someone has to
+//! hold the socket that carries it, and today that is the browser: this server only mints a signed
+//! URL (`GET /api/v1/signed-url`) and holds no per-conversation vendor state at all. The page
+//! decides what to do with the arrival — say nothing, summarise it, or read it out — and sends the
+//! turn itself; nothing about that choice is known here.
 //!
 //! It stays that way. Moving the socket server-side would turn vibe-talk into an always-connected,
 //! BILLED conversation holder — a process whose cost accrues while nobody is in the car — and it
 //! would put third-party channel text on a vendor socket that no human is currently looking at.
 //!
-//! **The cost of that decision, said out loud: contextual updates reach the agent only while the
-//! page is open.** Close the tab and the channel keeps moving, this server keeps ingesting, and
-//! the agent hears nothing until somebody opens `/voice` again and asks. That is a real
+//! **The cost of that decision, said out loud: an arriving message reaches the agent only while
+//! the page is open.** Close the tab and the channel keeps moving, this server keeps ingesting,
+//! and the agent hears nothing until somebody opens `/voice` again and asks. That is a real
 //! limitation, and the page says so rather than implying a relay that is not running.
 //!
 //! # Self-posted messages

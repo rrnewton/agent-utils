@@ -1378,8 +1378,44 @@ credential in a query string — in every proxy log and in the browser's own his
 exact thing `/api/v1/signed-url`'s `no-store` and the page's `redact()` exist to prevent.
 
 Arriving messages are rendered by the same element construction as fetched ones, de-duplicated
-against the rows actually on screen, and — only if the reader has turned it on — relayed into a
-live conversation as a `contextual_update`. Four guards on that relay, all load-bearing:
+against the rows actually on screen, and — in either of the two speaking modes — **spoken** into a
+live conversation as a `user_message`.
+
+**`user_message`, not `contextual_update`, and that is the substance of the feature.** A
+contextual update injects text into the agent's context *without consuming a turn*: the agent
+silently knows a message arrived and says nothing about it until asked. That is right for a
+background note, which is what this used to be, and it cannot satisfy "read new" — the point of
+having the call open is to be *told*. A `user_message` consumes a turn, so the agent answers out
+loud. It deliberately does not go through the page's own `sendUserMessage`, which renders what it
+sends into the transcript as the reader's words: nobody said this, and putting it under "you"
+would be a false record of the conversation.
+
+**Three modes, not a toggle, and the default speaks.** `off` is silence; `gist` has the agent say
+in one sentence what arrived; `full` has it read each message out word for word. They differ only
+in the **task sentence** at the head of the turn, and that sentence comes *first* — ahead of the
+quoted text and its `BEGIN`/`END` fence — so that no line written by a third party is ever the most
+recent instruction in the turn. Both of them end with "Then stop": this is an interruption of a
+conversation already in progress, and the agent's job is to say the one thing and hand the floor
+back. The default is `gist`, which is a **reversal** of the earlier off-by-default and is the
+owner's explicit choice; the screen says so beside the control and in its help entry, because a
+setting that spends money without being asked for on the day must be legible rather than
+discovered from a bill. The storage key is unchanged on purpose — a stored `"off"` is still a mode,
+so an explicit earlier refusal is not overturned by the rename, while the old `"on"` falls through
+to the default it now means.
+
+**A burst is one turn.** Arrivals are held for `RELAY_COALESCE_MS` and sent together. A coding
+agent posting four lines in two seconds would otherwise take four spoken turns, one after another,
+each interrupting the last and leaving no gap to answer in. Both guards below are re-checked at
+the flush as well as at the door, because the call can end and the reader can press Off inside
+that window.
+
+**Two controls over one value.** The bar carries **Read new**, a button that cycles
+off → gist → full → off, because the strip has room for a `.bar-button` and not for a
+`.bar-select`; Settings carries the same three as a named `<select>`, where there is room to say
+what they mean. Both go through one function that writes the key and redraws the other, so the two
+cannot disagree about which mode is in force.
+
+Four guards on the relay, all load-bearing:
 
 * **A replay tail is never relayed.** The stream opens with what the server already published, up
   to 200 messages, and every attach without a `Last-Event-ID` gets all of it. Those rows belong on
@@ -1393,8 +1429,8 @@ live conversation as a `contextual_update`. Four guards on that relay, all load-
   loop that bills. The ids this server posted are recorded and travel with the message as
   `self_posted`. It is deliberately not an author comparison — this server does not know its own
   bot's user id, because `HttpDiscordClient` never calls `/users/@me`.
-* **A Settings toggle, off by default.** Every channel message reaching a live conversation is
-  both a cost and an interruption.
+* **The mode.** `off` is silence. The other two both speak, and both therefore cost a turn of a
+  conversation the reader is already having.
 * **A live socket.** There is nowhere to send it otherwise, and queuing it for the next call would
   deliver stale news at the start of a conversation about something else.
 
@@ -1674,18 +1710,22 @@ width the pack holds for the buttons beside it.
 
 **Every member of the pack says which views it belongs on**, in one table (`PACK_VIEWS` in
 web/voice.js) rather than in a branch. The rule is where the member's effect lands: the picker
-names what the channel view is reading, and Type, Sumry and Blockers all go out through
-`sendUserMessage`, which draws the line into the **transcript** and needs a live call — so on the
-channel view they are three controls whose whole result appears on a screen you are not looking
-at. A member with no line in the table is hidden everywhere and the page suite names it; there is
-no default, because a default is how a control ends up on a view nobody chose for it.
+names what the channel view is reading; Type and Prompts go out through `sendUserMessage`, which
+draws the line into the **transcript** and needs a live call, so on the channel view they are
+controls whose whole result appears on a screen you are not looking at; and Read new decides what
+happens to an arriving message *during a call*, so it belongs where the call is. A member with no
+line in the table is hidden everywhere and the page suite names it; there is no default, because a
+default is how a control ends up on a view nobody chose for it.
 
 That is a layout decision as much as a semantic one, and it is **measured**: the bar is one strip
 on a 375px phone, six controls do not fit on it, and the pack scrolls — so a control pushed past
 the pack's right edge is exactly as unreachable as the picker used to be. "The bar fits on a
 375px phone" costs whatever `renderControlBar` really leaves visible against widths read
 out of web/voice.css, on each view and in text mode, and the same test proves it is not vacuous by
-showing that all six together overflow by about 55px.
+showing that the strip as it stood before the prompts tray — every canned prompt a member in its
+own right — overflows by about 55px. That arithmetic is also **why the tray came first**: Read new
+is on the strip at all because collapsing the prompts gave a slot back, and it is a cycling button
+rather than a `<select>` because a `.bar-select` needs 5rem the call view does not have.
 
 **Refresh stays where it is.** It is a re-read of what is already on screen rather than a choice
 about what to read, it keeps your place, and a keyboard reaches it wherever the list is scrolled
@@ -2012,11 +2052,28 @@ asks the voice agent to summarize; **Blockers** asks it to make the *coding agen
 out through the same `sendUserMessage` a typed turn does, so the sentence lands in the transcript
 as the reader's own words, and a tap with no call open reports itself instead of doing nothing.
 
-They differ in **weight**, and the difference is drawn rather than documented: Blockers spends
-coding-agent work on one tap, so it is coloured in the same warm tone an armed Clear uses. It
-deliberately does **not** ask twice — the issue did not ask for a confirm step, so adding one is a
-decision for somebody to make out loud rather than drift into, and the suite records its absence
-so it is not mistaken for an oversight.
+**They are in a tray, behind one `Prompts` button**, and the reason is arithmetic rather than
+taste: the bar is a single 375px row that was priced to the edge, each prompt cost it a member,
+and the list is meant to grow — custom prompts are the next thing. One opener costs one slot
+however many prompts it holds. The tray is a **sibling of the pack and a child of the bar**: of
+the bar because the bar is what moves between the header mount and the dock mount, and out of the
+pack because the pack scrolls sideways and a menu that can scroll out from under its own opener is
+not a menu. It is absolutely positioned, so it takes no width from the strip at all, opens upward
+in the dock and downward in the header, and wraps rather than scrolling. The budget test reads
+"out of flow" **out of the stylesheet** rather than from a list, so a tray that stopped being
+absolute starts costing the strip real width on the edit that changed it.
+
+It opens **at idle**, deliberately. With no call the prompts grey out, and a reader has to be able
+to see what they are in order to learn why they are dead.
+
+They differ in **weight** — Blockers spends coding-agent work on one tap — and that difference
+used to be drawn, in the warm tone an armed Clear uses. **It no longer is**, at the owner's
+request: on a desktop screen the warm outline did not read as "this one is expensive", it read as
+a warning symbol, as though the button were reporting a fault, and a control that looks broken is
+worse than one whose cost is only in its tooltip. The weight now lives in the `title` and in the
+Settings text. Neither button asks twice — the issue did not ask for a confirm step, so adding one
+is a decision for somebody to make out loud rather than drift into, and the suite records its
+absence so it is not mistaken for an oversight.
 
 It is a **list**, not two cases: `CANNED_PROMPTS` in `web/voice.js`, one entry per button, and one
 loop that restores each field, saves it, and wires its button. A third canned prompt is one entry
