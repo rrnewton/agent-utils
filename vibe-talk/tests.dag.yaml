@@ -105,7 +105,7 @@ steps:
   - group: shots
     job: screenshots
     desc: the screenshot harness — a real server and a real browser
-    cmd: cd vibe-talk && ./scripts/run.sh screenshots --theme dark
+    cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark
     deps: [build.release]
     # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
     # CPU budget alone would let it hang until the run timeout. This is the hang backstop.

@@ -593,6 +593,11 @@ STUB_JS = r"""
         body = {};
       }
       body.live_poll_seconds = 30;
+      // ...and SAY it is pushing. `live_poll_seconds` alone used to imply a stream; the page now
+      // reads `live_delivery` and falls back to "poll" -- a server that re-reads on a timer and
+      // tells the page nothing -- so a stub that sets only the interval describes the opposite
+      // of the state `28-live-message-arrived` exists to photograph, and the page never attaches.
+      body.live_delivery = "push";
       // `#46 conversation-replay`. `replay.enabled` is off by default on the server, for privacy
       // reasons that are exactly right and exactly unhelpful here. Only the ANSWER is patched;
       // the page's own toggle still has to be turned on, and every state below it is the page's.
@@ -1487,11 +1492,17 @@ def _act_channel_picker_reachable(driver: Driver) -> None:
         )
         driver.settle(120)
         steps += 1
-    if steps < 3:
+    # AT LEAST ONE, and then however many the channel has -- not a fixed three. The loop above
+    # already runs until there is nothing above the reader, so what is left to check here is that
+    # the walk really paged rather than finding the whole channel already loaded. How DEEP the
+    # history ended up is a separate claim, and it is asserted where it is also photographed:
+    # `__loadedAfter >= 12` below. Demanding three steps here pinned the walk to a page size and a
+    # seed length instead, and a seeded channel that arrives in two reads is not a broken picture.
+    if steps < 1:
         raise Unreachable(
             "30-channel-picker-in-bar",
-            "the channel walks back several pages, so the picker has history above it",
-            f"only {steps} step(s) were available",
+            "the channel pages at all, so the picker has history above it",
+            "the whole channel arrived in one read, so nothing was ever prepended",
         )
     # Parked mid-history: not at the top, where the walk left the reader, and not at the newest
     # line either. This is the position the picker was unreachable FROM.
@@ -1968,10 +1979,11 @@ def _act_reply_long_target(driver: Driver) -> None:
         # rendered means the marker check below is satisfied by the render that is being replaced,
         # and the element this scene then marks is detached from the document a moment later --
         # which is exactly what happened on the second profile of the first run.
-        # Clicked through the DOM rather than through the pointer. #refresh-discord sits above the
-        # list, so a real click would scroll the view to the top to reach it -- which is itself the
-        # gesture that loads older messages, and this state is not about that.
-        driver.js("(() => { document.getElementById('refresh-discord').click(); })()")
+        # Called rather than gestured. There is no Refresh BUTTON any more -- `#68 pull-to-refresh`
+        # replaced it with the drag, and a drag to the top of the list is itself the gesture that
+        # loads older messages, which is not what this state is about. `loadDiscord` is what the
+        # released pull ends up calling, so this takes the same path with none of the scrolling.
+        driver.page.evaluate("async () => { await window.loadDiscord(); }")
         driver.page.wait_for_function(
             "() => [...document.querySelectorAll('#discord-log li')]"
             ".some((n) => n.textContent.includes('in full, because you asked'))",
@@ -2157,13 +2169,19 @@ def _act_live_message(driver: Driver) -> None:
     is far longer than this scene takes, so a row appearing within it cannot be that.
     """
     _act_open_channel(driver)
+    # Counting the RE-READ, not a button. There is no Refresh button left to attach to -- `#68
+    # pull-to-refresh` replaced it -- and counting `loadDiscord` is the better instrument anyway:
+    # the claim this scene rests on is that nothing went back to the channel and asked, and that
+    # is true of the gesture, the background timer and the vanished button alike. A listener on
+    # one control could only ever have spoken for that control.
     driver.js(
         "(() => { window.__loadedBefore = "
         "document.querySelectorAll('#discord-log li').length; "
         "window.__refreshes = 0; "
-        "document.getElementById('refresh-discord').addEventListener("
-        "'click', () => { window.__refreshes += 1; }); "
-        "return window.__loadedBefore; })()"
+        "const real = window.loadDiscord; "
+        "window.loadDiscord = function (...args) { window.__refreshes += 1; "
+        "return real.apply(this, args); }; "
+                "return window.__loadedBefore; })()"
     )
     driver.js(
         "window.__channelSays('9990000000000000001', 'claude-integ', "
@@ -2277,8 +2295,13 @@ SCENES: tuple[Scene, ...] = (
                 "document.getElementById('talk').className.includes('live')",
             ),
             (
-                "the pulse animation is really running on the ring",
-                "document.querySelector('.control-ring').getAnimations().length > 0",
+                # SCOPED TO THE TALK BUTTON, not to the first ring in the document. Two controls
+                # carry a `.control-ring`, and read-aloud is the earlier of the two in the markup
+                # because it takes Talk's place in the channel view. A bare `.control-ring` here
+                # therefore asked the read-aloud ring whether the TALK button was pulsing, and it
+                # answered no -- correctly, since it only animates while it is working.
+                "the pulse animation is really running on the talk ring",
+                "document.querySelector('.control-talk .control-ring').getAnimations().length > 0",
             ),
             (
                 "the status line reports a live call",
@@ -2418,9 +2441,19 @@ SCENES: tuple[Scene, ...] = (
                 "the view switch is gone, because it acts on a screen that is not up",
                 "!window.__visible('view-switch')",
             ),
+            # This used to assert that the prose explaining the controls was ON this screen.
+            # `#85 voice-desktop-review` moved every such paragraph to `#screen-help` precisely so
+            # that a reader who already knows what echo cancellation is does not have to read past
+            # it to reach the switch. So the claim the picture can still carry is the one that
+            # survived the move: the explanation did not vanish, it went one tap away, and the
+            # affordance that takes you there is on screen beside the controls it is about.
             (
-                "the explanation of what the controls do is on screen",
-                "window.__visible('continuity-note')",
+                "each group of controls offers the explanation rather than reciting it",
+                "document.querySelectorAll('#screen-settings .help-link[data-help]').length >= 5",
+            ),
+            (
+                "and the explanation itself is not what is being photographed here",
+                "!window.__visible('screen-help')",
             ),
         ),
     ),
@@ -2430,9 +2463,15 @@ SCENES: tuple[Scene, ...] = (
         act=_act_discord,
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
+            # The switch says CHANNEL, not the name of the service behind it. The page stopped
+            # naming the provider in its own controls -- the word appears nowhere a reader can
+            # see it -- and this assertion is the last place that still expected the old label.
+            # The state is still slugged `10-discord-view` because a state name is an internal
+            # handle that the README, the `required` pins and every stored PNG agree on; what the
+            # picture must show is the word the READER gets.
             (
                 "the switch says which view you are in",
-                "window.__text('view-switch-label') === 'Discord'",
+                "window.__text('view-switch-label') === 'Channel'",
             ),
             (
                 "the switch reads as thrown",
@@ -2442,9 +2481,18 @@ SCENES: tuple[Scene, ...] = (
                 "there are several real messages rendered",
                 "document.querySelectorAll('#discord-log li').length >= 5",
             ),
+            # This used to read "every message SHOWS its id". It no longer shows it: the id moved
+            # into the press-and-hold details sheet, and the row got its width back. What the
+            # verifiability claim rests on now is that the id is still ON every row, where that
+            # sheet reads it from -- so a message can still be checked against a real one, by a
+            # gesture rather than by reciting an 18-digit number beside every line.
             (
-                "every message shows its id, so it can be checked against a real one",
-                "[...document.querySelectorAll('#discord-log li .msg-id')].length >= 5",
+                "every message carries its id, so it can still be checked against a real one",
+                "[...document.querySelectorAll('#discord-log li[data-id]')].length >= 5",
+            ),
+            (
+                "and no row is reciting it: the sheet that shows it is shut in this picture",
+                "document.querySelectorAll('#discord-log .msg-id').length === 0",
             ),
             # `#63 status-line-placement`. The channel's summary is an entry at the head of the
             # list now, where it scrolls away, rather than a line on a strip that takes itself
@@ -3007,7 +3055,7 @@ SCENES: tuple[Scene, ...] = (
             (
                 # THE claim. A scene that only asserted the list grew would be satisfied by the
                 # background re-read, which is the very thing this feature replaces.
-                "and it grew without anybody pressing Refresh",
+                "and it grew without the page going back to ask",
                 "window.__refreshes === 0",
             ),
             (
@@ -3199,8 +3247,14 @@ SCENES: tuple[Scene, ...] = (
                 # than an assertion: `#61 unread-status` says this has to be said in the
                 # interface, and whether a sentence is legible on a 375px phone above a list is
                 # not a question any fixture can answer.
-                "the page says on screen that this read state is not Discord's",
-                "/Discord/.test(window.__text('inbox-note') || '') && "
+                # Matched on what the sentence CLAIMS, not on the vendor's name. The server's
+                # notice stopped naming the service -- it says "the source chat service" now,
+                # because the bridge is no longer written against exactly one of them -- and a
+                # regex for the old name failed while the sentence it was checking for was on
+                # screen, correct, and legible. The two halves below are the claim itself.
+                "the page says on screen that this read state is its own, not the source's",
+                "/vibe-talk's own/.test(window.__text('inbox-note') || '') && "
+                "/source/.test(window.__text('inbox-note') || '') && "
                 "window.__visible('inbox-note')",
             ),
             ("there is a way back from the dismissal", "window.__visible('undo-dismiss')"),
