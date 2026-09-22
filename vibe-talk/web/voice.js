@@ -2417,9 +2417,9 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
-// Linear resample to 16 kHz, which is the input format the agent expects. Doing this explicitly
-// beats asking for an AudioContext at 16 kHz and hoping: a browser is allowed to give you a
-// different rate, and the failure is silent and sounds like a chipmunk.
+// Linear resample to the rate in the session descriptor. Doing this explicitly beats asking for
+// an AudioContext at that rate and hoping: a browser is allowed to give you a different rate, and
+// the failure is silent and sounds like a chipmunk.
 function downsampleTo(input, inputRate, outputRate) {
   if (inputRate === outputRate) {
     return input;

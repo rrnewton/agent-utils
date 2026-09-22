@@ -3,7 +3,7 @@
 A small Rust web server for reading, discussing, and replying to your coding agents' chat messages
 from a phone. It supports Discord directly and other services, including Google Chat, through a
 compatible HTTP bridge. Messages can be read with the phone's speech engine or ElevenLabs;
-voice conversations use an optional ElevenLabs agent.
+voice conversations use ElevenLabs by default or a deployment-managed WebSocket provider.
 
 It is a **bridge, not an agent host**. It holds the chat backend's credential, answers questions about
 channels over an authenticated HTTP API, and serves a phone web app. It is deliberately **not**
