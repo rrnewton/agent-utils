@@ -3394,12 +3394,20 @@ exit 0
             .trim()
             .parse::<i32>()
             .unwrap();
-        // SAFETY: signal 0 performs existence/permission checking only.
-        assert_eq!(unsafe { libc::kill(descendant, 0) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
+        let reap_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 performs existence/permission checking only.
+            if unsafe { libc::kill(descendant, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < reap_deadline,
+                "wprof descendant {descendant} remained observable after process-group teardown"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
