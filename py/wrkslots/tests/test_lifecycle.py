@@ -40,14 +40,26 @@ sys.path.insert(0, str(PY_ROOT))
 from wrkslots import cli as wrkslots  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def select_fixture_machine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the suite's synthetic config shard an intentional override."""
+
+    monkeypatch.setenv("WRKSLOTS_MACHINE", "testhost")
+
+
 def source_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
     environment = os.environ.copy()
+    overrides = dict(extra or {})
+    suppress_fixture_machine = overrides.pop(
+        "WRKSLOTS_TEST_NO_MACHINE_OVERRIDE", None
+    )
+    if suppress_fixture_machine is None:
+        environment.setdefault("WRKSLOTS_MACHINE", "testhost")
     previous = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (
         str(PY_ROOT) if not previous else f"{PY_ROOT}{os.pathsep}{previous}"
     )
-    if extra:
-        environment.update(extra)
+    environment.update(overrides)
     return environment
 
 
@@ -937,6 +949,178 @@ def create(
         machine=machine,
         env=env,
     )
+
+
+def test_create_refuses_stale_implicit_machine_but_accepts_explicit_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("WRKSLOTS_MACHINE")
+    local_machine = wrkslots._short_hostname()
+    stale_machine = "stale-host" if local_machine != "stale-host" else "other-host"
+    project, _repository, _remote = make_project(tmp_path, machine=stale_machine)
+
+    refused = raw_command(
+        project,
+        "create",
+        "slot01",
+        "--slot-type",
+        "agent",
+        "--coordinator-authorized",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-slot01",
+        "--purpose",
+        "test stale configured shard",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--repo",
+        "product=repo",
+        "--branch",
+        "product=codex/task",
+        env={"WRKSLOTS_TEST_NO_MACHINE_OVERRIDE": "1"},
+    )
+
+    assert refused.returncode == 3
+    assert f"configured machine shard '{stale_machine}'" in refused.stderr
+    assert f"current host '{local_machine}'" in refused.stderr
+    assert f"--machine {local_machine}" in refused.stderr
+    assert "repair or reinitialize the configuration" in refused.stderr
+    assert not (control_directory(project) / f"ACTIVE.{local_machine}.json").exists()
+    assert active_slots(project, stale_machine) == []
+    assert not (slots_directory(project) / "slot01").exists()
+
+    made = create(project, machine=local_machine)
+
+    assert made.returncode == 0, made.stderr
+    assert len(active_slots(project, local_machine)) == 1
+    assert active_slots(project, stale_machine) == []
+
+
+def test_create_accepts_matching_implicit_configured_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("WRKSLOTS_MACHINE")
+    local_machine = wrkslots._short_hostname()
+    project, _repository, _remote = make_project(tmp_path, machine=local_machine)
+
+    made = create(
+        project, env={"WRKSLOTS_TEST_NO_MACHINE_OVERRIDE": "1"}
+    )
+
+    assert made.returncode == 0, made.stderr
+    assert len(active_slots(project, local_machine)) == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments"),
+    [
+        (
+            "worktree registration",
+            (
+                "register",
+                "slot01",
+                "--slot-type",
+                "agent",
+                "--coordinator-authorized",
+                "--agent",
+                "codex-1",
+                "--task",
+                "task-slot01",
+                "--purpose",
+                "test registration",
+                "--owner-pid",
+                "{pid}",
+                "--coordinator-pid",
+                "{pid}",
+                "--verified-live",
+                "--repo",
+                "product=repo",
+            ),
+        ),
+        (
+            "worktree import --apply",
+            (
+                "import-existing",
+                "slot01",
+                "--slot-type",
+                "agent",
+                "--coordinator-authorized",
+                "--agent",
+                "codex-1",
+                "--task",
+                "task-slot01",
+                "--purpose",
+                "test import",
+                "--owner-pid",
+                "{pid}",
+                "--coordinator-pid",
+                "{pid}",
+                "--verified-live",
+                "--repo",
+                "product=repo",
+                "--apply",
+            ),
+        ),
+    ],
+)
+def test_new_row_registration_refuses_stale_implicit_machine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    arguments: tuple[str, ...],
+) -> None:
+    monkeypatch.delenv("WRKSLOTS_MACHINE")
+    local_machine = wrkslots._short_hostname()
+    stale_machine = "stale-host" if local_machine != "stale-host" else "other-host"
+    project, _repository, _remote = make_project(tmp_path, machine=stale_machine)
+    argv = tuple(value.format(pid=os.getpid()) for value in arguments)
+
+    refused = raw_command(
+        project, *argv, env={"WRKSLOTS_TEST_NO_MACHINE_OVERRIDE": "1"}
+    )
+
+    assert refused.returncode == 3
+    assert f"refusing {operation}" in refused.stderr
+    assert f"configured machine shard '{stale_machine}'" in refused.stderr
+    assert not (control_directory(project) / f"ACTIVE.{local_machine}.json").exists()
+    assert active_slots(project, stale_machine) == []
+
+
+def test_import_dry_run_preserves_cross_shard_read_only_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("WRKSLOTS_MACHINE")
+    local_machine = wrkslots._short_hostname()
+    stale_machine = "stale-host" if local_machine != "stale-host" else "other-host"
+    project, repository, _remote = make_project(tmp_path, machine=stale_machine)
+    tree = checkout(project)
+    tree.parent.mkdir()
+    git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+
+    inspected = raw_command(
+        project,
+        "import-existing",
+        "slot01",
+        "--slot-type",
+        "agent",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-slot01",
+        "--purpose",
+        "inspect foreign shard",
+        "--repo",
+        "product=repo",
+        env={"WRKSLOTS_TEST_NO_MACHINE_OVERRIDE": "1"},
+    )
+
+    assert inspected.returncode == 0, inspected.stderr
+    assert f"machine={stale_machine}" in inspected.stdout
+    assert "dry-run: no state changed" in inspected.stdout
+    assert active_slots(project, stale_machine) == []
 
 
 def configuration(project: Path) -> dict[str, object]:

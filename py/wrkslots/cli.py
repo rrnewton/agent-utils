@@ -2785,6 +2785,33 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
     )
 
 
+def _load_new_slot_config(args: argparse.Namespace, operation: str) -> Config:
+    """Load the shard for an operation that creates a new active row.
+
+    A checked-in configuration can outlive the host on which it was written.
+    Silently using that stale default makes a locally owned slot look foreign
+    immediately after allocation. Deliberate CLI/environment overrides retain
+    their existing cross-shard semantics; only an implicit config-file default
+    must agree with the current host.
+    """
+
+    machine_was_implicit = (
+        args.machine is None and os.environ.get("WRKSLOTS_MACHINE") is None
+    )
+    config = _load_config(args.project_root, args.machine)
+    if machine_was_implicit:
+        local_machine = _short_hostname()
+        if config.machine != local_machine:
+            raise Refusal(
+                f"refusing {operation}: configured machine shard {config.machine!r} "
+                f"differs from current host {local_machine!r}, and no machine override "
+                f"was supplied. Pass global '--machine {local_machine}' before the "
+                "subcommand, or inspect the existing shards and deliberately repair or "
+                "reinitialize the configuration before allocating a slot"
+            )
+    return config
+
+
 def _active_path(config: Config, machine: str | None = None) -> Path:
     selected = machine or config.machine
     _validate_name(selected, "machine")
@@ -12040,7 +12067,7 @@ def _run_post_provision_hooks(
 def _cmd_create(args: argparse.Namespace) -> int:
     _require_coordinator_authorized(args, "worktree creation")
     args.slot_type = _require_slot_type(args, "worktree creation")
-    config = _load_config(args.project_root, args.machine)
+    config = _load_new_slot_config(args, "worktree creation")
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
     if not args.task or not args.purpose:
@@ -12857,7 +12884,7 @@ def _cmd_register(
 ) -> int:
     _require_coordinator_authorized(args, "worktree registration")
     args.slot_type = _require_slot_type(args, "worktree registration")
-    config = _load_config(args.project_root, args.machine)
+    config = _load_new_slot_config(args, "worktree registration")
     owner = _capture_registration_owner(args.owner_pid)
     coordinator_lease = _capture_caller_process(
         args.coordinator_pid, "coordinator"
@@ -12952,7 +12979,11 @@ def _publish_import(
 
 def _cmd_import_existing(args: argparse.Namespace) -> int:
     args.slot_type = _require_slot_type(args, "worktree import")
-    config = _load_config(args.project_root, args.machine)
+    config = (
+        _load_new_slot_config(args, "worktree import --apply")
+        if args.apply
+        else _load_config(args.project_root, args.machine)
+    )
     vcs = _GitVcs()
     _validate_name(args.slot, "slot")
     historical = (
@@ -28658,7 +28689,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     parser.add_argument(
         "--machine",
-        help="override the configured machine shard (or set WRKSLOTS_MACHINE)",
+        help=(
+            "override the configured machine shard (or set WRKSLOTS_MACHINE); create, "
+            "register, and import-existing --apply refuse an implicit configured shard "
+            "that differs from the current host"
+        ),
     )
     parser.add_argument(
         "--wait-lock",
