@@ -4,7 +4,9 @@
 //! Chat and headless adapters are supplied by the optional runtime extensions.
 
 pub mod agent;
+pub(crate) mod chat_events;
 pub mod chat_runtime;
+pub mod chat_service;
 pub mod cli;
 pub mod client;
 pub mod codex_goal;
@@ -19,3 +21,5 @@ pub const USER_GUIDE: &str = include_str!("embedded_userguide.md");
 pub const QUICKSTART: &str = include_str!("embedded_quickstart.md");
 /// Compatibility reference for the former messaging command.
 pub const AGENT_USER_GUIDE: &str = include_str!("embedded_agent_userguide.md");
+/// Operator reference for the Rust chat subscription service.
+pub const CHAT_USER_GUIDE: &str = include_str!("embedded_chat_userguide.md");

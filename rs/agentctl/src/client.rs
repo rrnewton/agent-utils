@@ -6,6 +6,7 @@ use crate::error::{AdapterError, Result};
 use serde_json::{Map, Value};
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -384,6 +385,37 @@ impl HerdrClient {
             )));
         }
         required_string(workspace, "label", "workspace get")
+    }
+    /// Resolve the compatible running server's absolute event-socket path.
+    pub fn event_socket(&self) -> Result<PathBuf> {
+        let completed = self.invoke(&strings(&["status", "server", "--json"]))?;
+        if completed.status != 0 {
+            return Err(AdapterError::unavailable(format!(
+                "cannot discover the running Herdr server: {}",
+                stderr_detail(&completed)
+            )));
+        }
+        let document = serde_json::from_str::<Value>(&completed.stdout).map_err(|error| {
+            AdapterError::unavailable(format!("invalid Herdr server status: {error}"))
+        })?;
+        let status = document.as_object().ok_or_else(|| {
+            AdapterError::unavailable("invalid Herdr server status: expected an object")
+        })?;
+        if status.get("running").and_then(Value::as_bool) != Some(true)
+            || status.get("compatible").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(AdapterError::unavailable(
+                "output subscriptions require a running, compatible Herdr server",
+            ));
+        }
+        let socket = required_string(status, "socket", "Herdr server status")?;
+        let socket = PathBuf::from(socket);
+        if !socket.is_absolute() || socket.as_os_str().as_bytes().contains(&0) {
+            return Err(AdapterError::unavailable(
+                "Herdr event socket must be an absolute NUL-free path",
+            ));
+        }
+        Ok(socket)
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn wait_agent_status(&self, pane_id: &str, status: &str, timeout_ms: u64) -> Result<()> {

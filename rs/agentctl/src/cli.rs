@@ -18,8 +18,8 @@ use crate::subagents::{environment_entries, AdoptOptions, ManagedAgents, StartOp
     name = "agentctl",
     version,
     about = "Manage persistent coding agents that you can message and inspect",
-    long_about = "Manage named coding-agent sessions with durable prompt delivery and direct human access.\nThe Rust implementation controls interactive Codex/Claude sessions through Herdr.\nUse an installation with the worker extension for headless workers and the Google Chat bridge.",
-    after_help = "Examples:\n  agentctl quickstart\n  agentctl start reviewer --cwd .\n  agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex\n  agentctl send reviewer 'Review the current changes'\n  agentctl pause reviewer\n  agentctl attach reviewer\n  agentctl resume reviewer\n  agentctl stop reviewer"
+    long_about = "Manage named coding-agent sessions with durable prompt delivery and direct human access.\nThe Rust implementation controls interactive Codex/Claude sessions through Herdr and can run a durable event-driven chat bridge through installed subscription plugins.",
+    after_help = "Examples:\n  agentctl quickstart\n  agentctl start reviewer --cwd .\n  agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex\n  agentctl send reviewer 'Review the current changes'\n  agentctl chat status --bridge-state ~/.local/state/agentctl/chat\n  agentctl pause reviewer\n  agentctl attach reviewer\n  agentctl resume reviewer\n  agentctl stop reviewer"
 )]
 struct Cli {
     /// Registry directory containing agent records and durable queues
@@ -96,6 +96,11 @@ enum Commands {
     /// Re-enable automation input; queued messages still require drain or send
     #[command(after_help = "Example: agentctl resume reviewer && agentctl drain reviewer")]
     Resume(Named),
+    /// Initialize, inspect, recover, or run a durable chat bridge
+    #[command(
+        after_help = "Example: agentctl chat status --bridge-state ~/.local/state/agentctl/chat"
+    )]
+    Chat(Chat),
     /// Print a short, runnable introduction to starting and controlling a worker
     Quickstart,
     /// Print the operator reference, including dependencies and delivery guarantees
@@ -288,6 +293,84 @@ struct BindSession {
     goal_command_json: Option<GoalCommand>,
 }
 
+#[derive(Args)]
+struct Chat {
+    #[command(subcommand)]
+    command: ChatCommand,
+}
+
+#[derive(Subcommand)]
+enum ChatCommand {
+    /// Print the chat bridge configuration and operations guide
+    Userguide,
+    /// Validate plugin, target, helper, and config authority, then create state
+    Init(ChatInit),
+    /// Inspect durable bridge state without contacting Herdr or a provider
+    Status(ChatState),
+    /// Run one bounded delivery, terminal-capture, and outbound recovery pass
+    Tick(ChatOperate),
+    /// Run event-driven provider and Herdr subscriptions until SIGINT or SIGTERM
+    Run(ChatOperate),
+    /// Stop accepting fenced replies for one exact retained request
+    Close(ChatClose),
+}
+
+#[derive(Args)]
+struct ChatState {
+    /// Private durable bridge state directory
+    #[arg(long, value_name = "DIR")]
+    bridge_state: PathBuf,
+}
+
+#[derive(Args)]
+struct ChatInit {
+    #[command(flatten)]
+    state: ChatState,
+    /// Private owner-only JSON bridge configuration (maximum 1 MiB)
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+}
+
+#[derive(Args)]
+struct ChatOperate {
+    #[command(flatten)]
+    state: ChatState,
+    /// Seconds to wait for coordinator readiness; zero keeps daemon passes nonblocking
+    #[arg(long, default_value = "0", value_parser = seconds)]
+    ready_timeout: f64,
+    /// Positive seconds to wait for evidence a delivered prompt started work
+    #[arg(long, default_value = "5", value_parser = positive_seconds)]
+    working_timeout: f64,
+    /// Maximum safe terminal-injection attempts for one request
+    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
+    max_attempts: u64,
+    /// Seconds between disk-backed recovery snapshots; provider intake remains event-driven
+    #[arg(long, default_value = "300", value_parser = positive_seconds)]
+    reconcile_interval: f64,
+}
+
+impl ChatOperate {
+    fn options(&self) -> crate::chat_service::ServiceOptions {
+        crate::chat_service::ServiceOptions {
+            delivery: DrainOptions {
+                ready_timeout: Duration::from_secs_f64(self.ready_timeout),
+                working_timeout: Duration::from_secs_f64(self.working_timeout),
+                max_attempts: self.max_attempts,
+            },
+            reconciliation_interval: Duration::from_secs_f64(self.reconcile_interval),
+        }
+    }
+}
+
+#[derive(Args)]
+struct ChatClose {
+    #[command(flatten)]
+    state: ChatState,
+    /// Exact 64-character lowercase hexadecimal request key
+    #[arg(long)]
+    request: String,
+}
+
 fn seconds(value: &str) -> Result<f64, String> {
     let value: f64 = value.parse().map_err(|_| "expected a number of seconds")?;
     if !value.is_finite() || !(0.0..=31_536_000.0).contains(&value) {
@@ -363,6 +446,10 @@ pub fn main<I: IntoIterator<Item = OsString>>(arguments: I) -> i32 {
             eprintln!("agentctl: cannot write output: {error}");
             1
         }
+        Err(Failure::Chat(error)) => {
+            eprintln!("agentctl: {error}");
+            1
+        }
     }
 }
 
@@ -370,6 +457,7 @@ enum Failure {
     Agent(AgentError),
     Usage(String),
     Output(io::Error),
+    Chat(crate::chat_service::ChatServiceError),
 }
 impl From<AgentError> for Failure {
     fn from(error: AgentError) -> Self {
@@ -416,6 +504,9 @@ fn run(args: Cli) -> Result<i32, Failure> {
         Commands::Userguide => {
             print!("{}", crate::USER_GUIDE);
             return Ok(0);
+        }
+        Commands::Chat(value) => {
+            return run_chat(args.registry, args.herdr_bin, value);
         }
         _ => {}
     }
@@ -522,11 +613,65 @@ fn run(args: Cli) -> Result<i32, Failure> {
         Commands::Attach(value) => manager.attach(&value.name)?,
         Commands::Pause(value) => manager.pause(&value.name, true)?,
         Commands::Resume(value) => manager.pause(&value.name, false)?,
-        Commands::Capabilities | Commands::Quickstart | Commands::Userguide => unreachable!(),
+        Commands::Capabilities | Commands::Quickstart | Commands::Userguide | Commands::Chat(_) => {
+            unreachable!()
+        }
     };
     add_capabilities(&mut result);
     write_json(&result).map_err(Failure::Output)?;
     Ok(0)
+}
+
+fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Failure> {
+    match chat.command {
+        ChatCommand::Userguide => {
+            print!("{}", crate::CHAT_USER_GUIDE);
+            Ok(0)
+        }
+        ChatCommand::Status(value) => {
+            let result = crate::chat_service::status(&value.bridge_state).map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Close(value) => {
+            let result = crate::chat_service::close(&value.state.bridge_state, &value.request)
+                .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Init(value) => {
+            let client =
+                HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
+            let manager = ManagedAgents::new(&client, &registry)?;
+            let result =
+                crate::chat_service::initialize(&value.state.bridge_state, &value.config, &manager)
+                    .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Tick(value) => {
+            let options = value.options();
+            let client =
+                HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
+            let manager = ManagedAgents::new(&client, &registry)?;
+            let result = crate::chat_service::tick(&value.state.bridge_state, &manager, options)
+                .map_err(Failure::Chat)?;
+            let code = if result.has_errors() { 75 } else { 0 };
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(code)
+        }
+        ChatCommand::Run(value) => {
+            let options = value.options();
+            let client =
+                HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
+            let manager = ManagedAgents::new(&client, &registry)?;
+            let result =
+                crate::chat_service::run(&value.state.bridge_state, &client, &manager, options)
+                    .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+    }
 }
 
 fn capabilities_document(
@@ -540,7 +685,11 @@ fn capabilities_document(
             "harnesses": ["codex", "claude"]
         },
         "headless": null,
-        "services": [],
+        "services": [{
+            "name": "chat-bridge",
+            "origin": "built_in",
+            "status": crate::plugins::MaturityStatus::discovered(true)
+        }],
         "registry": registry,
         "chat_subscriptions": {
             "core": {
@@ -639,6 +788,28 @@ mod tests {
             assert!(help.contains(required));
         }
         assert!(help.contains("without taking ownership"));
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "status",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--registry",
+            "/tmp/registry",
+        ])
+        .is_ok());
+        let error = Cli::try_parse_from(["agentctl", "chat", "run", "--help"])
+            .err()
+            .expect("chat run help");
+        let help = error.to_string();
+        for required in [
+            "--bridge-state",
+            "--ready-timeout",
+            "--working-timeout",
+            "--reconcile-interval",
+        ] {
+            assert!(help.contains(required));
+        }
     }
     #[test]
     fn invalid_timeouts_and_ambiguous_prompts_are_rejected() {

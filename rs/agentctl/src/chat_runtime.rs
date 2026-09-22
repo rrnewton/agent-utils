@@ -6,12 +6,17 @@
 //! grow a second process-group implementation beside `chat-subscription-plugin`.
 
 use std::collections::BTreeMap;
+use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileExt as UnixFileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chat_subscription::{
     BackendConfiguration, ChannelId, ChatSubscription, CommittableEvent, DeliveryBatch,
@@ -43,6 +48,18 @@ const MAX_STATE_REPLY_BYTES: u64 = 1_024 * 1_024 * 1_024;
 
 fn default_ack_reaction() -> Option<String> {
     Some("🤖".to_owned())
+}
+
+const fn default_outbound_enabled() -> bool {
+    true
+}
+
+const fn default_outbound_timeout_millis() -> u64 {
+    30_000
+}
+
+const fn default_outbound_shutdown_grace_millis() -> u64 {
+    2_000
 }
 
 /// A durable-runtime failure that never turns an uncertain provider commit into success.
@@ -116,6 +133,70 @@ pub struct BackendConfigurationDocument {
     pub data: Map<String, Value>,
 }
 
+/// Operator-selected one-shot outbound helper configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundCommandConfiguration {
+    /// Absolute canonical native helper executable.
+    pub executable: PathBuf,
+    /// Literal helper arguments; no shell is involved.
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    /// Exact inherited environment-variable names; values are never persisted.
+    #[serde(default)]
+    pub environment: Vec<String>,
+    /// End-to-end stdin/stdout deadline in milliseconds.
+    #[serde(default = "default_outbound_timeout_millis")]
+    pub timeout_millis: u64,
+    /// Cooperative process-exit grace before whole-group termination.
+    #[serde(default = "default_outbound_shutdown_grace_millis")]
+    pub shutdown_grace_millis: u64,
+}
+
+impl OutboundCommandConfiguration {
+    fn validate(&self) -> Result<()> {
+        if !self.executable.is_absolute()
+            || self.arguments.len() > 128
+            || self
+                .arguments
+                .iter()
+                .any(|value| value.is_empty() || value.contains('\0'))
+            || self.environment.len() > 64
+            || self
+                .environment
+                .iter()
+                .any(|value| !valid_environment_name(value))
+            || self.timeout_millis == 0
+            || self.timeout_millis > 30_000
+            || self.shutdown_grace_millis > 30_000
+        {
+            return Err(ChatRuntimeError::invalid(
+                "invalid outbound helper path, arguments, environment names, or deadlines",
+            ));
+        }
+        let mut deduplicated = self.environment.clone();
+        deduplicated.sort();
+        deduplicated.dedup();
+        if deduplicated.len() != self.environment.len() {
+            return Err(ChatRuntimeError::invalid(
+                "outbound helper environment names must be unique",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open(&self) -> Result<CommandOutboundTransport> {
+        self.validate()?;
+        CommandOutboundTransport::new(
+            self.executable.clone(),
+            self.arguments.iter().map(OsString::from).collect(),
+            &self.environment,
+            Duration::from_millis(self.timeout_millis),
+            Duration::from_millis(self.shutdown_grace_millis),
+        )
+    }
+}
+
 /// Authority and routing configuration retained for one bridge state directory.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,12 +211,18 @@ pub struct BridgeConfiguration {
     pub agent_name: String,
     /// Human-readable agent label used in outbound replies.
     pub agent_label: String,
+    /// Whether coordinator output is captured and published back to chat.
+    #[serde(default = "default_outbound_enabled")]
+    pub outbound_enabled: bool,
     /// Optional reaction placed only after durable inbound admission.
     #[serde(default = "default_ack_reaction")]
     pub ack_reaction: Option<String>,
     /// Optional provider-specific non-secret resource configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_configuration: Option<BackendConfigurationDocument>,
+    /// Optional bounded request/response adapter for replies and reactions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_command: Option<OutboundCommandConfiguration>,
 }
 
 impl BridgeConfiguration {
@@ -150,8 +237,33 @@ impl BridgeConfiguration {
         if let Some(reaction) = self.ack_reaction.as_deref() {
             validate_single_line(reaction, "ack reaction", 64)?;
         }
+        if let Some(outbound) = &self.outbound_command {
+            outbound.validate()?;
+        }
+        if !self.outbound_enabled
+            && (self.ack_reaction.is_some() || self.outbound_command.is_some())
+        {
+            return Err(ChatRuntimeError::invalid(
+                "outbound-disabled chat configuration cannot enable reactions or a reply helper",
+            ));
+        }
         let _ = self.subscribe_request(None)?;
         Ok(())
+    }
+
+    /// Read a strict, bounded, private owner-only configuration document.
+    pub fn load_private(path: &Path) -> Result<Self> {
+        let configuration: Self = read_document(path, 1 << 20)?;
+        configuration.validate()?;
+        Ok(configuration)
+    }
+
+    /// Validate and pin the configured one-shot outbound helper, when present.
+    pub fn outbound_transport(&self) -> Result<Option<CommandOutboundTransport>> {
+        self.outbound_command
+            .as_ref()
+            .map(OutboundCommandConfiguration::open)
+            .transpose()
     }
 
     /// Build and validate one provider-neutral subscription request.
@@ -273,6 +385,7 @@ struct RequestRecord {
     next_send_ordinal: u32,
     reply_count: u32,
     reply_bytes: u64,
+    reply_closed: bool,
     delivery_message_id: String,
     ack_phase: AckPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,6 +433,7 @@ impl RequestRecord {
             next_send_ordinal: 1,
             reply_count: 0,
             reply_bytes: 0,
+            reply_closed: false,
             delivery_message_id: format!("chat-{key}"),
             ack_phase: if ack_reaction.is_some() {
                 AckPhase::Pending
@@ -638,6 +752,24 @@ impl OutboundFailure {
             retryable: true,
         }
     }
+
+    fn not_applied(code: &str, detail: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code: code.to_owned(),
+            detail: bounded_detail(&detail.into(), 2_000),
+            outcome: OutboundOutcome::NotApplied,
+            retryable,
+        }
+    }
+
+    fn unknown(code: &str, detail: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code: code.to_owned(),
+            detail: bounded_detail(&detail.into(), 2_000),
+            outcome: OutboundOutcome::Unknown,
+            retryable,
+        }
+    }
 }
 
 impl fmt::Display for OutboundFailure {
@@ -651,6 +783,219 @@ impl fmt::Display for OutboundFailure {
 }
 
 impl std::error::Error for OutboundFailure {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PinnedExecutableIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mode: u32,
+    digest: [u8; 32],
+}
+
+/// Bounded one-shot NDJSON adapter hosted by the reviewed process supervisor.
+///
+/// The native executable is opened and identity-pinned at construction. Every operation rechecks
+/// its inode metadata and SHA-256 through the retained descriptor immediately before
+/// [`chat_subscription_plugin::process::ProcessPluginChild::spawn`]. The command receives one
+/// request line followed by EOF and must emit exactly one response line before exiting. Only the
+/// explicitly named environment values are captured; credentials never enter protocol frames.
+pub struct CommandOutboundTransport {
+    executable: File,
+    executable_path: PathBuf,
+    identity: PinnedExecutableIdentity,
+    arguments: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+    timeout: Duration,
+    shutdown_grace: Duration,
+}
+
+impl CommandOutboundTransport {
+    /// Validate and pin one native helper and its non-secret launch configuration.
+    ///
+    /// `environment_names` is an operator-controlled allowlist. Each named value must already be
+    /// present. The helper must be an absolute canonical regular file owned by the current UID,
+    /// single-linked, owner-executable, and not group/world writable.
+    pub fn new(
+        executable_path: PathBuf,
+        arguments: Vec<OsString>,
+        environment_names: &[String],
+        timeout: Duration,
+        shutdown_grace: Duration,
+    ) -> Result<Self> {
+        if !executable_path.is_absolute() || fs::canonicalize(&executable_path)? != executable_path
+        {
+            return Err(ChatRuntimeError::invalid(
+                "outbound helper path must be absolute and canonical",
+            ));
+        }
+        if arguments.len() > 128
+            || arguments
+                .iter()
+                .any(|argument| argument.is_empty() || argument.as_bytes().contains(&0))
+        {
+            return Err(ChatRuntimeError::invalid(
+                "outbound helper accepts at most 128 nonempty NUL-free arguments",
+            ));
+        }
+        if timeout.is_zero()
+            || timeout > Duration::from_secs(30)
+            || shutdown_grace > Duration::from_secs(30)
+        {
+            return Err(ChatRuntimeError::invalid(
+                "outbound helper timeout must be 1ns-30s and shutdown grace at most 30s",
+            ));
+        }
+        if environment_names.len() > 64 {
+            return Err(ChatRuntimeError::invalid(
+                "outbound helper environment allowlist exceeds 64 names",
+            ));
+        }
+        let mut seen_environment = BTreeMap::new();
+        for name in environment_names {
+            if !valid_environment_name(name) || seen_environment.contains_key(name) {
+                return Err(ChatRuntimeError::invalid(
+                    "outbound helper environment names must be unique shell identifiers",
+                ));
+            }
+            let value = env::var_os(name).ok_or_else(|| {
+                ChatRuntimeError::invalid(format!(
+                    "outbound helper environment value {name:?} is unavailable"
+                ))
+            })?;
+            seen_environment.insert(name.clone(), value);
+        }
+        let metadata = fs::symlink_metadata(&executable_path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ChatRuntimeError::invalid(
+                "outbound helper executable must not be a symlink",
+            ));
+        }
+        let executable = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&executable_path)?;
+        let identity = executable_identity(&executable)?;
+        Ok(Self {
+            executable,
+            executable_path,
+            identity,
+            arguments,
+            environment: seen_environment
+                .into_iter()
+                .map(|(name, value)| (OsString::from(name), value))
+                .collect(),
+            timeout,
+            shutdown_grace,
+        })
+    }
+
+    fn exchange(&self, request: &[u8]) -> std::result::Result<Vec<u8>, OutboundFailure> {
+        let observed = executable_identity(&self.executable).map_err(|error| {
+            OutboundFailure::not_applied("helper_identity_unavailable", error.to_string(), true)
+        })?;
+        if observed != self.identity {
+            return Err(OutboundFailure::not_applied(
+                "helper_identity_changed",
+                "outbound helper executable changed after it was pinned",
+                false,
+            ));
+        }
+        let deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
+            OutboundFailure::not_applied(
+                "invalid_deadline",
+                "outbound helper deadline is unrepresentable",
+                false,
+            )
+        })?;
+        let descriptor_path =
+            PathBuf::from(format!("/proc/self/fd/{}", self.executable.as_raw_fd()));
+        let mut command = Command::new(descriptor_path);
+        command
+            .args(&self.arguments)
+            .env_clear()
+            .envs(self.environment.iter().cloned())
+            .env("AGENTCTL_PROCESS_SUPERVISED", "1");
+        if let Some(parent) = self.executable_path.parent() {
+            command.current_dir(parent);
+        }
+        let mut child = chat_subscription_plugin::process::ProcessPluginChild::spawn(command)
+            .map_err(|error| {
+                OutboundFailure::not_applied("helper_spawn_failed", error.to_string(), true)
+            })?;
+        let (mut reader, mut writer) = match child.take_transport() {
+            Ok(transport) => transport,
+            Err(error) => {
+                let cleanup = child.shutdown(Duration::ZERO);
+                return Err(OutboundFailure::not_applied(
+                    "helper_transport_failed",
+                    cleanup_detail(error.to_string(), cleanup),
+                    true,
+                ));
+            }
+        };
+        if let Err(error) = set_nonblocking(writer.as_raw_fd())
+            .and_then(|()| set_nonblocking(reader.as_raw_fd()))
+            .and_then(|()| write_nonblocking(&mut writer, request, deadline))
+        {
+            drop(writer);
+            drop(reader);
+            let cleanup = child.shutdown(Duration::ZERO);
+            return Err(OutboundFailure::unknown(
+                "helper_request_unknown",
+                cleanup_detail(error.to_string(), cleanup),
+                true,
+            ));
+        }
+        drop(writer);
+        let output = match read_nonblocking(&mut reader, deadline) {
+            Ok(output) => output,
+            Err(error) => {
+                drop(reader);
+                let cleanup = child.shutdown(Duration::ZERO);
+                return Err(OutboundFailure::unknown(
+                    "helper_response_unknown",
+                    cleanup_detail(error.to_string(), cleanup),
+                    true,
+                ));
+            }
+        };
+        drop(reader);
+        let status = child.shutdown(self.shutdown_grace).map_err(|error| {
+            OutboundFailure::unknown("helper_cleanup_unknown", error.to_string(), true)
+        })?;
+        if !status.success() {
+            return Err(OutboundFailure::unknown(
+                "helper_exit_failed",
+                format!("outbound helper exited with {status}"),
+                true,
+            ));
+        }
+        exact_response_line(output)
+    }
+}
+
+impl ReplyTransport for CommandOutboundTransport {
+    fn send(
+        &mut self,
+        submission: ReplySubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure> {
+        let request = encode_send_request(&submission)?;
+        let response = self.exchange(&request)?;
+        decode_send_response(&response, &submission)
+    }
+}
+
+impl ReactionTransport for CommandOutboundTransport {
+    fn ensure_reaction(
+        &mut self,
+        submission: ReactionSubmission<'_>,
+    ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+        let request = encode_reaction_request(&submission)?;
+        let response = self.exchange(&request)?;
+        decode_reaction_response(&response, &submission)
+    }
+}
 
 #[derive(Serialize)]
 struct SendWireRequest<'a> {
@@ -954,6 +1299,204 @@ fn not_applied_invalid(detail: impl Into<String>) -> OutboundFailure {
     }
 }
 
+fn executable_identity(file: &File) -> io::Result<PinnedExecutableIdentity> {
+    let before = file.metadata()?;
+    let uid = fs::metadata("/proc/self")?.uid();
+    let mode = before.permissions().mode();
+    if !before.is_file()
+        || before.uid() != uid
+        || before.nlink() != 1
+        || mode & 0o100 == 0
+        || mode & 0o022 != 0
+        || before.len() == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "outbound helper must be a nonempty, single-linked, owner-executable regular file owned by this UID and not group/world writable",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 64 * 1_024];
+    loop {
+        let count = file.read_at(&mut buffer, offset)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        offset = offset.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        if offset > before.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "outbound helper grew while hashing",
+            ));
+        }
+    }
+    let after = file.metadata()?;
+    if offset != before.len()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "outbound helper changed while hashing",
+        ));
+    }
+    Ok(PinnedExecutableIdentity {
+        device: before.dev(),
+        inode: before.ino(),
+        size: before.len(),
+        mode,
+        digest: hasher.finalize().into(),
+    })
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn set_nonblocking(descriptor: libc::c_int) -> io::Result<()> {
+    let flags = loop {
+        let result = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if result >= 0 {
+            break result;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
+    loop {
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn poll_descriptor(descriptor: libc::c_int, events: i16, deadline: Instant) -> io::Result<()> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "outbound helper I/O exceeded its deadline",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let milliseconds = remaining
+            .as_millis()
+            .saturating_add(u128::from(remaining.subsec_nanos() > 0))
+            .clamp(1, i32::MAX as u128) as i32;
+        let mut poll = libc::pollfd {
+            fd: descriptor,
+            events,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut poll, 1, milliseconds) };
+        if result > 0 {
+            if poll.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "outbound helper pipe became invalid",
+                ));
+            }
+            if poll.revents & (events | libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(());
+            }
+            continue;
+        }
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "outbound helper I/O exceeded its deadline",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn write_nonblocking(file: &mut File, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match file.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "outbound helper accepted zero request bytes",
+                ));
+            }
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_descriptor(file.as_raw_fd(), libc::POLLOUT, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn read_nonblocking(file: &mut File, deadline: Instant) -> io::Result<Vec<u8>> {
+    let maximum = chat_subscription_plugin::MAX_FRAME_BYTES.saturating_add(1);
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 64 * 1_024];
+    loop {
+        let remaining = maximum.saturating_sub(output.len());
+        if remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "outbound helper response exceeds the 1 MiB wire limit",
+            ));
+        }
+        let read_limit = remaining.min(buffer.len());
+        match file.read(&mut buffer[..read_limit]) {
+            Ok(0) => return Ok(output),
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_descriptor(file.as_raw_fd(), libc::POLLIN, deadline)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn exact_response_line(mut output: Vec<u8>) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    if output.pop() != Some(b'\n')
+        || output.is_empty()
+        || output.contains(&b'\n')
+        || output.len() > chat_subscription_plugin::MAX_FRAME_BYTES
+    {
+        return Err(OutboundFailure::protocol(
+            "outbound helper must emit exactly one nonempty newline-terminated JSON object",
+        ));
+    }
+    Ok(output)
+}
+
+fn cleanup_detail(prefix: String, cleanup: io::Result<ExitStatus>) -> String {
+    match cleanup {
+        Ok(_) => prefix,
+        Err(error) => format!("{prefix}; process cleanup also failed: {error}"),
+    }
+}
+
 /// Durable acknowledgement state after one ensure attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AckResult {
@@ -970,6 +1513,24 @@ pub struct ReplyCapture {
     pub ordinals: Vec<u32>,
     /// Unavailable marker identifiers that should be reported to the coordinator.
     pub unknown_ids: Vec<String>,
+}
+
+/// One retained pane snapshot captured across all active request nonces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotCapture {
+    /// Request key and newly durable ordinals for each completed reply sequence.
+    pub replies: Vec<(String, Vec<u32>)>,
+    /// First-seen unavailable marker identifiers requiring coordinator feedback.
+    pub unknown_ids: Vec<String>,
+}
+
+/// One exact active fencing route used to arm a line-local terminal subscription.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplyRoute {
+    /// Durable request key addressed by this fence.
+    pub key: String,
+    /// Exact next reply identifier expected for the request.
+    pub identifier: String,
 }
 
 /// One bounded result of durably admitting an upstream acknowledgement unit.
@@ -1051,7 +1612,7 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
 }
 
 /// Private, restartable durable state for one coordinator bridge.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BridgeState {
     root: PathBuf,
     config: BridgeConfiguration,
@@ -1125,6 +1686,13 @@ impl BridgeState {
 
     /// Open and recover one existing private bridge state directory.
     pub fn open(root: &Path) -> Result<Self> {
+        let state = Self::inspect(root)?;
+        state.recover_population()?;
+        Ok(state)
+    }
+
+    /// Open existing state without recovery writes, for read-only inspection.
+    pub fn inspect(root: &Path) -> Result<Self> {
         agent::validate_private_directory(root, "chat state directory", false)?;
         agent::validate_private_directory(&root.join("requests"), "chat request directory", false)?;
         agent::validate_private_directory(&root.join("replies"), "chat reply directory", false)?;
@@ -1136,17 +1704,20 @@ impl BridgeState {
             )));
         }
         envelope.config.validate()?;
-        let state = Self {
+        Ok(Self {
             root: root.to_path_buf(),
             config: envelope.config,
-        };
-        state.recover_population()?;
-        Ok(state)
+        })
     }
 
     /// Borrow the immutable authority configuration.
     pub fn config(&self) -> &BridgeConfiguration {
         &self.config
+    }
+
+    /// Pin and open the configured one-shot outbound helper, when present.
+    pub fn outbound_transport(&self) -> Result<Option<CommandOutboundTransport>> {
+        self.config.outbound_transport()
     }
 
     /// Return the last durable inclusive provider replay cursor.
@@ -1281,12 +1852,22 @@ impl BridgeState {
         }
         Ok(serde_json::json!({
             "subscription_plugin": self.config.subscription_plugin,
+            "backend_configuration_schema": self.config.backend_configuration.as_ref().map(|value| &value.schema),
             "agent_name": self.config.agent_name,
+            "agent_label": self.config.agent_label,
             "channel_ids": self.config.channel_ids,
+            "outbound_enabled": self.config.outbound_enabled,
+            "outbound_command_configured": self.config.outbound_command.is_some(),
             "cursor_present": checkpoint.cursor.is_some(),
             "request_count": checkpoint.request_count,
             "request_bytes": checkpoint.request_bytes,
             "committed_batches": checkpoint.committed_batches,
+            "runtime_evidence": {
+                "configuration_initialized": true,
+                "connected_now": Value::Null,
+                "durable_batch_verified": checkpoint.committed_batches > 0,
+                "basis": "provider-free durable status; use the service manager for current process liveness",
+            },
             "reconciliation_required": checkpoint.reconciliation_required,
             "reply_count": checkpoint.reply_count,
             "reply_bytes": checkpoint.reply_bytes,
@@ -1298,6 +1879,16 @@ impl BridgeState {
     /// Render one generic provider-independent coordinator prompt and reply protocol.
     pub fn prompt(&self, key: &str) -> Result<String> {
         let record = self.read_request(key)?;
+        if !self.config.outbound_enabled {
+            return Ok(format!(
+                "The user's request arrived through your configured inbound-only chat bridge.\n\
+Source: {}\n\
+Sender: {}\n\n\
+{}\n\n\
+Complete this request using your normal instructions and tools. Outbound chat is disabled for this bridge; do not emit CHAT_REPLY fences.",
+                record.message.message_id, record.message.sender_id, record.message.text,
+            ));
+        }
         let reply_id = format!("{}_{}", record.reply_nonce, record.next_reply_ordinal);
         Ok(format!(
             "The user's request arrived through the configured chat bridge.\n\
@@ -1325,6 +1916,176 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                 .then_some(record.key)
             })
             .collect())
+    }
+
+    /// Return every retained request key in deterministic order.
+    pub fn request_keys(&self) -> Result<Vec<String>> {
+        Ok(self
+            .request_records()?
+            .into_iter()
+            .map(|(record, _)| record.key)
+            .collect())
+    }
+
+    /// Return requests whose durable reaction operation is not yet reconciled.
+    pub fn pending_ack_keys(&self) -> Result<Vec<String>> {
+        Ok(self
+            .request_records()?
+            .into_iter()
+            .filter_map(|(record, _)| {
+                matches!(record.ack_phase, AckPhase::Pending | AckPhase::Sending)
+                    .then_some(record.key)
+            })
+            .collect())
+    }
+
+    /// Return requests with at least one captured reply not durably sent yet.
+    pub fn pending_reply_keys(&self) -> Result<Vec<String>> {
+        Ok(self
+            .request_records()?
+            .into_iter()
+            .filter_map(|(record, _)| {
+                (record.next_send_ordinal < record.next_reply_ordinal).then_some(record.key)
+            })
+            .collect())
+    }
+
+    /// Capture complete blocks for every request referenced in one bounded pane snapshot.
+    pub fn capture_snapshot(&self, rendered: &str) -> Result<SnapshotCapture> {
+        if !self.config.outbound_enabled {
+            return Ok(SnapshotCapture {
+                replies: Vec::new(),
+                unknown_ids: Vec::new(),
+            });
+        }
+        let records = self
+            .request_records()?
+            .into_iter()
+            .filter(|(record, _)| !record.reply_closed)
+            .collect::<Vec<_>>();
+        if records.len() > 128 {
+            return Err(ChatRuntimeError::invalid(
+                "more than 128 requests await reply capture; close old requests first",
+            ));
+        }
+        let expected_ids = records
+            .iter()
+            .map(|(record, _)| format!("{}_{}", record.reply_nonce, record.next_reply_ordinal))
+            .collect::<Vec<_>>();
+        let marker_ids = visible_marker_ids(rendered, &expected_ids)?;
+        let mut referenced = Vec::new();
+        for (record, _) in &records {
+            let prefix = format!("{}_", record.reply_nonce);
+            if marker_ids
+                .iter()
+                .any(|identifier| identifier.starts_with(&prefix))
+            {
+                referenced.push(record.key.clone());
+            }
+        }
+        let mut replies = Vec::new();
+        for key in referenced {
+            let capture = self.capture_replies(&key, rendered)?;
+            if !capture.ordinals.is_empty() {
+                replies.push((key, capture.ordinals));
+            }
+        }
+
+        let refreshed = self
+            .request_records()?
+            .into_iter()
+            .filter(|(record, _)| !record.reply_closed)
+            .collect::<Vec<_>>();
+        let mut unknown_ids = Vec::new();
+        for identifier in marker_ids {
+            let mut known = false;
+            for (record, _) in &refreshed {
+                if let Some(ordinal) = sequenced_ordinal(&identifier, &record.reply_nonce) {
+                    known = ordinal < record.next_reply_ordinal;
+                    break;
+                }
+            }
+            if !known && !unknown_ids.contains(&identifier) {
+                unknown_ids.push(bounded_detail(&identifier, 256));
+            }
+        }
+        Ok(SnapshotCapture {
+            replies,
+            unknown_ids,
+        })
+    }
+
+    /// Return exact currently available reply IDs for coordinator diagnostics and subscriptions.
+    pub fn available_reply_ids(&self) -> Result<Vec<String>> {
+        if !self.config.outbound_enabled {
+            return Ok(Vec::new());
+        }
+        let records = self
+            .request_records()?
+            .into_iter()
+            .filter(|(record, _)| !record.reply_closed)
+            .collect::<Vec<_>>();
+        if records.len() > 128 {
+            return Err(ChatRuntimeError::invalid(
+                "more than 128 requests await reply capture; close old requests first",
+            ));
+        }
+        Ok(records
+            .into_iter()
+            .map(|(record, _)| format!("{}_{}", record.reply_nonce, record.next_reply_ordinal))
+            .collect())
+    }
+
+    /// Build the bounded active route cache during startup or explicit recovery.
+    pub fn active_reply_routes(&self) -> Result<Vec<ReplyRoute>> {
+        if !self.config.outbound_enabled {
+            return Ok(Vec::new());
+        }
+        let records = self
+            .request_records()?
+            .into_iter()
+            .filter(|(record, _)| !record.reply_closed)
+            .collect::<Vec<_>>();
+        if records.len() > 128 {
+            return Err(ChatRuntimeError::invalid(
+                "more than 128 requests await reply capture; close old requests first",
+            ));
+        }
+        Ok(records
+            .into_iter()
+            .map(|(record, _)| ReplyRoute {
+                key: record.key,
+                identifier: format!("{}_{}", record.reply_nonce, record.next_reply_ordinal),
+            })
+            .collect())
+    }
+
+    /// Read one request directly and return its current active route, if capture remains open.
+    pub fn next_reply_route(&self, key: &str) -> Result<Option<ReplyRoute>> {
+        if !self.config.outbound_enabled {
+            return Ok(None);
+        }
+        let record = self.read_request(key)?;
+        Ok((!record.reply_closed).then(|| ReplyRoute {
+            key: record.key,
+            identifier: format!("{}_{}", record.reply_nonce, record.next_reply_ordinal),
+        }))
+    }
+
+    /// Stop reply capture for one exact request while retaining its history and outbox.
+    pub fn close_replies(&self, key: &str) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut request = self.read_request(key)?;
+        if request.reply_closed {
+            return Ok(());
+        }
+        request.reply_closed = true;
+        let mut checkpoint = self.read_checkpoint()?;
+        self.write_request_accounted(&request, &mut checkpoint)?;
+        checkpoint.updated_at_millis = unix_millis();
+        write_document(&self.root.join("checkpoint.json"), &checkpoint)
     }
 
     /// Ensure the configured durable-intake reaction is present for one request.
@@ -1427,6 +2188,11 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let mut request = self.read_request(key)?;
+        if request.reply_closed {
+            return Err(ChatRuntimeError::invalid(
+                "reply capture is closed for this request",
+            ));
+        }
         let mut scan = scan_reply_blocks(rendered, &request.reply_nonce)?;
         let mut expected = request.next_reply_ordinal;
         let mut captured = Vec::new();
@@ -1560,7 +2326,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             .send(ReplySubmission {
                 channel_id: &request_snapshot.message.channel_id,
                 thread_id: &request_snapshot.message.thread_id,
-                body: &reply.body,
+                body: &outbound_text(&self.config.agent_label, &reply.body),
                 request_id: &reply.send_request_id,
             })
             .map_err(|error| {
@@ -1915,6 +2681,77 @@ pub fn deliver_request<A: ManagedApi + ?Sized>(
     deliver_request_with(state, manager, key, options)
 }
 
+/// Inject one deduplicated coordinator diagnostic for unavailable reply fence identifiers.
+pub fn deliver_fence_feedback<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    unknown_ids: &[String],
+    options: DrainOptions,
+) -> Result<CoordinatorDeliveryResult> {
+    if unknown_ids.is_empty() {
+        return Ok(CoordinatorDeliveryResult::AlreadyDelivered);
+    }
+    if unknown_ids.len() > 128
+        || unknown_ids
+            .iter()
+            .any(|identifier| identifier.is_empty() || identifier.len() > 256)
+    {
+        return Err(ChatRuntimeError::invalid(
+            "unavailable reply marker diagnostics exceed their bounded population",
+        ));
+    }
+    let available = state.available_reply_ids()?;
+    let mut unavailable = unknown_ids.to_vec();
+    unavailable.sort();
+    unavailable.dedup();
+    let identity = serde_json::to_vec(&serde_json::json!({
+        "unavailable": unavailable,
+        "available": available,
+    }))?;
+    let message_id = format!("chat-feedback-{:x}", Sha256::digest(identity));
+    let prompt = format!(
+        "Chat reply routing error: your output referenced unavailable reply ID(s): {}. \
+The currently available reply ID(s) are: {}. Emit a complete reply block using one exact available ID.",
+        unavailable.join(", "),
+        if available.is_empty() {
+            "<none>".to_owned()
+        } else {
+            available.join(", ")
+        }
+    );
+    let agent_name = &state.config.agent_name;
+    let initial = manager.message_state(agent_name, &message_id)?;
+    let operation = match initial {
+        Some(QueueMessageState::Processed) => {
+            return Ok(CoordinatorDeliveryResult::AlreadyDelivered)
+        }
+        Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
+            return Ok(CoordinatorDeliveryResult::Uncertain(
+                "fence feedback may already have reached the coordinator".to_owned(),
+            ));
+        }
+        Some(QueueMessageState::Pending) => manager.drain(agent_name, options).map(|_| ()),
+        None => manager
+            .send_identified(agent_name, &prompt, options, Some(&message_id))
+            .map(|_| ()),
+    };
+    if operation.is_ok() && initial.is_none() {
+        return Ok(CoordinatorDeliveryResult::Delivered);
+    }
+    let detail = operation.err().map(|error| error.to_string());
+    match manager.message_state(agent_name, &message_id)? {
+        Some(QueueMessageState::Processed) => Ok(CoordinatorDeliveryResult::Delivered),
+        Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
+            Ok(CoordinatorDeliveryResult::Uncertain(detail.unwrap_or_else(
+                || "fence feedback may already have reached the coordinator".to_owned(),
+            )))
+        }
+        Some(QueueMessageState::Pending) | None => Ok(CoordinatorDeliveryResult::Pending(
+            detail.unwrap_or_else(|| "fence feedback remains pending".to_owned()),
+        )),
+    }
+}
+
 fn deliver_request_with(
     state: &BridgeState,
     delivery: &dyn CoordinatorDelivery,
@@ -2123,6 +2960,54 @@ struct ActiveReply {
     body: Vec<String>,
 }
 
+fn visible_marker_ids(rendered: &str, expected_ids: &[String]) -> Result<Vec<String>> {
+    if rendered.chars().any(invalid_rendered_character) {
+        return Err(ChatRuntimeError::invalid(
+            "reply capture contains terminal control characters",
+        ));
+    }
+    let normalized = rendered.replace("\r\n", "\n");
+    let mut identifiers = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut prompt_margin: Option<usize> = None;
+    for line in normalized.split('\n') {
+        let (undecorated, _, decorated) = undecorate(line);
+        let stripped = line.trim_start_matches([' ', '\t']);
+        if stripped.starts_with("› ") || stripped.starts_with("❯ ") {
+            prompt_margin = Some(line.len() - stripped.len() + 2);
+            continue;
+        }
+        if let Some(expected_margin) = prompt_margin {
+            if stripped.is_empty() || line.len() - stripped.len() >= expected_margin {
+                continue;
+            }
+            prompt_margin = None;
+        }
+        if decorated
+            && parse_marker(&undecorated)
+                .is_some_and(|marker| !marker.closing && expected_ids.contains(&marker.identifier))
+        {
+            fence = None;
+        }
+        if let Some((character, length)) = fence {
+            if closing_fence(&undecorated, character, length) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(opened) = opening_fence(&undecorated) {
+            fence = Some(opened);
+            continue;
+        }
+        if let Some(marker) = parse_marker(&undecorated) {
+            if !identifiers.contains(&marker.identifier) {
+                identifiers.push(marker.identifier);
+            }
+        }
+    }
+    Ok(identifiers)
+}
+
 fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> {
     if !valid_nonce(expected_nonce) {
         return Err(ChatRuntimeError::invalid(
@@ -2157,6 +3042,16 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
             }
         }
 
+        if active.is_none()
+            && decorated
+            && parse_marker(&undecorated).is_some_and(|marker| {
+                !marker.closing && sequenced_ordinal(&marker.identifier, expected_nonce).is_some()
+            })
+        {
+            // Native assistant bullets delimit items. An unrelated unmatched Markdown fence
+            // from an older retained item must not hide the fresh expected reply marker.
+            fence = None;
+        }
         if let Some((fence_character, fence_length)) = fence {
             if closing_fence(&undecorated, fence_character, fence_length) {
                 fence = None;
@@ -2167,14 +3062,6 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
             continue;
         }
 
-        if active.is_none()
-            && decorated
-            && parse_marker(&undecorated).is_some_and(|marker| !marker.closing)
-        {
-            // Native assistant bullets delimit items. An unrelated unmatched Markdown fence
-            // from an older retained item must not hide the fresh reply marker.
-            fence = None;
-        }
         if let Some(opened) = opening_fence(&undecorated) {
             fence = Some(opened);
             if let Some(active) = active.as_mut() {
@@ -2357,7 +3244,7 @@ fn random_reply_nonce() -> Result<String> {
     Ok(base64url_nonce(random_bytes()?))
 }
 
-fn random_operation_uuid() -> Result<String> {
+pub(crate) fn random_operation_uuid() -> Result<String> {
     let mut bytes = random_bytes()?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
@@ -2425,6 +3312,15 @@ fn bounded_detail(value: &str, maximum: usize) -> String {
     value[..boundary].to_owned()
 }
 
+fn outbound_text(agent_label: &str, body: &str) -> String {
+    let prefix = format!("[{agent_label}]");
+    if body.starts_with(&prefix) {
+        body.to_owned()
+    } else {
+        format!("{prefix} {body}")
+    }
+}
+
 fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2481,7 +3377,7 @@ fn read_document_sized<T: for<'de> Deserialize<'de>>(
             .unwrap_or(maximum)
             .min(maximum),
     );
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(maximum_u64.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.len() {
@@ -2704,6 +3600,15 @@ mod tests {
         path
     }
 
+    fn copied_shell(root: &Path) -> PathBuf {
+        let source = fs::canonicalize("/bin/sh").expect("canonical shell");
+        let destination = root.join("outbound-helper");
+        fs::copy(source, &destination).expect("copy native helper fixture");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
+            .expect("set helper mode");
+        destination
+    }
+
     fn config() -> BridgeConfiguration {
         BridgeConfiguration {
             subscription_plugin: "fixture".to_owned(),
@@ -2711,8 +3616,10 @@ mod tests {
             allowed_senders: vec!["users/owner".to_owned()],
             agent_name: "coordinator".to_owned(),
             agent_label: "codex coordinator".to_owned(),
+            outbound_enabled: true,
             ack_reaction: Some("🤖".to_owned()),
             backend_configuration: None,
+            outbound_command: None,
         }
     }
 
@@ -2967,6 +3874,7 @@ mod tests {
         );
         assert_eq!(transport.submissions.len(), 2);
         assert_eq!(transport.submissions[0].3, transport.submissions[1].3);
+        assert_eq!(transport.submissions[0].2, "[codex coordinator] answer");
         assert_eq!(
             state
                 .publish_one(key, &mut transport)
@@ -2974,6 +3882,44 @@ mod tests {
             None
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn inbound_only_mode_disables_reaction_work_and_reply_fences() {
+        let root = temporary("inbound-only");
+        let mut configuration = config();
+        configuration.outbound_enabled = false;
+        configuration.ack_reaction = None;
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let prompt = state.prompt(key).expect("render inbound-only prompt");
+        assert!(prompt.contains("inbound-only chat bridge"));
+        assert!(prompt.contains("do not emit CHAT_REPLY fences"));
+        assert!(state.available_reply_ids().expect("reply ids").is_empty());
+        assert!(state
+            .pending_ack_keys()
+            .expect("pending acknowledgements")
+            .is_empty());
+        assert_eq!(
+            state
+                .capture_snapshot("<CHAT_REPLY_unavailable_1>\nno\n</CHAT_REPLY_unavailable_1>")
+                .expect("disabled capture"),
+            SnapshotCapture {
+                replies: Vec::new(),
+                unknown_ids: Vec::new(),
+            }
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn inbound_only_configuration_refuses_outbound_side_effects() {
+        let mut configuration = config();
+        configuration.outbound_enabled = false;
+        assert!(configuration.validate().is_err());
     }
 
     #[test]
@@ -3125,5 +4071,83 @@ mod tests {
                 .outcome,
             OutboundOutcome::Unknown
         );
+    }
+
+    #[test]
+    fn command_outbound_uses_reviewed_supervisor_and_exact_one_line_protocol() {
+        let root = temporary("command-outbound");
+        let helper = copied_shell(&root);
+        let response = r#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174000","action":"send","ok":true,"receipt":{"message_id":"spaces/example/messages/reply"}}"#;
+        let script = format!("IFS= read -r request || exit 2; printf '%s\\n' '{response}'");
+        let mut transport = CommandOutboundTransport::new(
+            helper,
+            vec![OsString::from("-c"), OsString::from(script)],
+            &[],
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        )
+        .expect("pin helper");
+        assert_eq!(
+            transport
+                .send(ReplySubmission {
+                    channel_id: "spaces/example",
+                    thread_id: "spaces/example/threads/one",
+                    body: "hello",
+                    request_id: "123e4567-e89b-42d3-a456-426614174000",
+                })
+                .expect("send through helper"),
+            "spaces/example/messages/reply"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn command_outbound_refuses_changed_identity_before_spawn() {
+        let root = temporary("command-identity");
+        let helper = copied_shell(&root);
+        let transport = CommandOutboundTransport::new(
+            helper.clone(),
+            vec![OsString::from("-c"), OsString::from("exit 0")],
+            &[],
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .expect("pin helper");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&helper)
+            .expect("open helper")
+            .write_all(b"x")
+            .expect("change helper");
+        let error = transport
+            .exchange(b"{}\n")
+            .expect_err("identity change refused");
+        assert_eq!(error.outcome, OutboundOutcome::NotApplied);
+        assert_eq!(error.code, "helper_identity_changed");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn command_outbound_deadline_kills_descendants_without_detaching() {
+        let root = temporary("command-timeout");
+        let helper = copied_shell(&root);
+        let transport = CommandOutboundTransport::new(
+            helper,
+            vec![
+                OsString::from("-c"),
+                OsString::from("IFS= read -r request; /bin/sleep 10"),
+            ],
+            &[],
+            Duration::from_millis(50),
+            Duration::ZERO,
+        )
+        .expect("pin helper");
+        let started = Instant::now();
+        let error = transport
+            .exchange(b"{}\n")
+            .expect_err("blocked helper times out");
+        assert_eq!(error.outcome, OutboundOutcome::Unknown);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -1168,6 +1168,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.status_record(&self.load(agent_name)?)
     }
 
+    /// Resolve and verify the exact live pane owned by one registered agent.
+    pub fn pane_info(&self, agent_name: &str) -> Result<AgentPaneInfo> {
+        self.checked(&self.load(agent_name)?)
+    }
+
     fn status_record(&self, record: &AgentRecord) -> Result<Value> {
         let agent_name = &record.name;
         let mut result = json!(record);
