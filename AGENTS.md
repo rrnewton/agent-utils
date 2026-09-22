@@ -19,6 +19,16 @@ working: `git pull --rebase` and push again. Never force-push, never rewind,
 never amend shared history, and never reach for `--no-verify` to get past a
 refusal.
 
+**If `git` or `gh` cannot reach the network**, that is a restriction on your own
+process, not a repository problem. You are authorized to run them through
+`herdr-run`, which executes in a pane outside it — `git` and `gh` are already
+allowlisted:
+
+```bash
+herdr-run run 'git pull --rebase origin main'
+herdr-run run 'gh pr list'
+```
+
 **Keep `main` linear.** Rebase; do not merge. `git pull --rebase` (not a bare
 `git pull`) is the habit that makes this automatic — a merge commit on `main`
 is rejected by the server, so a bare pull will simply waste your time.
