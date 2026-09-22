@@ -7964,9 +7964,7 @@ class _GitVcs:
             env.update(env_overrides)
         env.pop(_NETWORK_CONFIG_SHA256_ENV, None)
         network_operation = bool(
-            args
-            and args[0]
-            in {"fetch", "push", "ls-remote", "fetch-pack", "send-pack"}
+            args and args[0] in {"fetch", "push", "ls-remote"}
         )
         if expected_network_config is not None:
             observed_network_config = hashlib.sha256(
@@ -8345,18 +8343,32 @@ class _GitVcs:
             )
             fetched: dict[str, str] = {}
             if advertised:
-                fetched_result = self._run(
+                self._run(
                     isolated,
-                    ["fetch-pack", "--no-progress", "--stdin", authority.url],
-                    input_text="".join(f"{ref}\n" for ref in sorted(advertised)),
+                    [
+                        "fetch",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        "--no-auto-maintenance",
+                        "--force",
+                        "--no-recurse-submodules",
+                        "--stdin",
+                        "--",
+                        authority.url,
+                    ],
+                    input_text="".join(
+                        f"+{ref}:{ref}\n" for ref in sorted(advertised)
+                    ),
                     env_overrides=object_env,
                 )
-                transferred = self._parse_remote_ref_inventory(
-                    fetched_result.stdout, "fetched-ref"
+                transferred = self._direct_ref_inventory(
+                    isolated,
+                    "refs/heads/",
+                    env_overrides=object_env,
                 )
-                if set(transferred) != set(advertised):
+                if transferred != advertised:
                     raise Refusal(
-                        "Git fetched a different head set than the metadata inventory"
+                        "Git fetched a different head inventory than the metadata inventory"
                     )
             else:
                 transferred = {}
@@ -8702,7 +8714,14 @@ class _GitVcs:
                 return
             self._run(
                 isolated,
-                ["send-pack", authority.url, f"{commit}:{ref}"],
+                [
+                    "push",
+                    "--porcelain",
+                    f"--force-with-lease={ref}:",
+                    "--",
+                    authority.url,
+                    f"{commit}:{ref}",
+                ],
                 env_overrides=object_env,
             )
             observed = self._remote_ref_sha_at_url(

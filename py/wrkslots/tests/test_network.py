@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,83 @@ def install_proxy_wrapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("WRKSLOTS_TEST_PROXY_LOG", str(log))
     return log
+
+
+def install_https_transport_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remote: Path,
+) -> None:
+    """Route an HTTPS-shaped URL through Git's real remote-helper protocol."""
+
+    tools = tmp_path / "network-tools"
+    real_git_value = shutil.which("git")
+    assert real_git_value is not None
+    real_git = Path(real_git_value).resolve()
+    exec_path = Path(
+        subprocess.run(
+            [str(real_git), "--exec-path"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    upload_pack = exec_path / "git-upload-pack"
+    receive_pack = exec_path / "git-receive-pack"
+    assert upload_pack.is_file()
+    assert receive_pack.is_file()
+    git_wrapper = tools / "git"
+    git_wrapper.write_text(
+        f"#!{sys.executable}\n"
+        + textwrap.dedent(
+            f"""\
+            import os
+            import sys
+
+            os.environ['GIT_EXEC_PATH'] = {str(tools)!r}
+            os.execv({str(real_git)!r}, [{str(real_git)!r}, *sys.argv[1:]])
+            """
+        ),
+        encoding="utf-8",
+    )
+    git_wrapper.chmod(0o755)
+    helper = tools / "git-remote-https"
+    helper.write_text(
+        f"#!{sys.executable}\n"
+        + textwrap.dedent(
+            f"""\
+            import os
+            import sys
+
+            stdin = sys.stdin.buffer
+            stdout = sys.stdout.buffer
+            if stdin.readline() != b'capabilities\\n':
+                raise SystemExit('expected remote-helper capabilities request')
+            stdout.write(b'connect\\n\\n')
+            stdout.flush()
+            request = stdin.readline()
+            services = {{
+                b'connect git-upload-pack\\n': {str(upload_pack)!r},
+                b'connect git-receive-pack\\n': {str(receive_pack)!r},
+            }}
+            executable = services.get(request)
+            if executable is None:
+                raise SystemExit(f'unexpected remote-helper request: {{request!r}}')
+            stdout.write(b'\\n')
+            stdout.flush()
+            environment = dict(os.environ)
+            environment.pop('GIT_OBJECT_DIRECTORY', None)
+            os.execve(
+                executable,
+                [executable, os.environ['WRKSLOTS_TEST_HTTPS_REMOTE']],
+                environment,
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    monkeypatch.setenv("WRKSLOTS_TEST_HTTPS_REMOTE", str(remote))
 
 
 def proxy_commands(log: Path) -> list[list[str]]:
@@ -119,7 +197,7 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
 
     commands = proxy_commands(log)
     assert [command[command.index("-C") + 2] for command in commands] == [
-        "ls-remote", "fetch-pack", "ls-remote", "send-pack", "ls-remote"
+        "ls-remote", "fetch", "ls-remote", "push", "ls-remote"
     ]
     assert all(command[:4] == [
         "git", "--no-replace-objects", "-c", "core.useReplaceRefs=false"
@@ -137,6 +215,74 @@ def test_network_git_commands_use_wrapper_and_preserve_git_isolation(
         "--refs",
         "--heads",
     ]
+    assert "--no-auto-maintenance" in commands[1]
+
+
+def test_https_shaped_remote_fetch_and_salvage_use_transport_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project, repository, remote = lifecycle.make_project(tmp_path)
+    publisher = tmp_path / "publisher"
+    subprocess.run(
+        ["git", "clone", str(remote), str(publisher)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lifecycle.git(publisher, "config", "user.name", "Wrkslots Test")
+    lifecycle.git(publisher, "config", "user.email", "wrkslots@example.invalid")
+    expected = lifecycle.commit_local(
+        publisher,
+        "https-fetched.txt",
+        "remote-helper object transfer\n",
+        "https fetched",
+    )
+    lifecycle.git(publisher, "push", "origin", "main")
+    assert (
+        lifecycle.git(
+            repository,
+            "cat-file",
+            "-e",
+            f"{expected}^{{commit}}",
+            check=False,
+        ).returncode
+        != 0
+    )
+    log = install_proxy_wrapper(tmp_path, monkeypatch)
+    install_https_transport_helper(tmp_path, monkeypatch, remote)
+    authorized_url = "https://authority.invalid/repository.git"
+    lifecycle.git(repository, "remote", "set-url", "origin", authorized_url)
+    lifecycle.git(repository, "update-ref", "-d", "refs/remotes/origin/main")
+
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repository, "origin")
+    assert authority.url == authorized_url
+    vcs.fetch_remote(repository, "origin", "refs/remotes/origin/main", authority)
+    assert vcs.verify_ref(repository, "refs/remotes/origin/main", "fetched ref") == expected
+    lifecycle.git(repository, "cat-file", "-e", f"{expected}^{{commit}}")
+
+    commit = lifecycle.commit_local(
+        repository,
+        "https-salvage.txt",
+        "transport helper exercised\n",
+        "https salvage",
+    )
+    ref = "refs/heads/salvage/testhost/https-shaped"
+    vcs.push_salvage(repository, "origin", commit, ref, authority)
+    assert lifecycle.git(remote, "rev-parse", ref).stdout.strip() == commit
+
+    commands = proxy_commands(log)
+    assert [command[command.index("-C") + 2] for command in commands] == [
+        "ls-remote",
+        "fetch",
+        "ls-remote",
+        "push",
+        "ls-remote",
+    ]
+    assert all(authorized_url in command for command in commands)
+    assert all(str(remote) not in command for command in commands)
+    assert "--no-auto-maintenance" in commands[1]
 
 
 def test_fetch_remote_does_not_download_tag_only_history(tmp_path: Path) -> None:
@@ -182,6 +328,106 @@ def test_fetch_remote_does_not_download_tag_only_history(tmp_path: Path) -> None
         != 0
     )
     assert not vcs.ref_exists(repository, "refs/tags/unreachable")
+
+
+def test_fetch_remote_refuses_head_change_after_advertisement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project, repository, remote = lifecycle.make_project(tmp_path)
+    publisher = tmp_path / "moving-publisher"
+    subprocess.run(
+        ["git", "clone", str(remote), str(publisher)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lifecycle.git(publisher, "config", "user.name", "Wrkslots Test")
+    lifecycle.git(publisher, "config", "user.email", "wrkslots@example.invalid")
+    lifecycle.git(repository, "update-ref", "-d", "refs/remotes/origin/main")
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repository, "origin")
+    original_run = wrkslots._GitVcs._run
+    moved = False
+
+    def move_before_fetch(
+        repository_path: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal moved
+        if args and args[0] == "fetch" and not moved:
+            lifecycle.commit_local(
+                publisher,
+                "moved.txt",
+                "changed after advertisement\n",
+                "move advertised head",
+            )
+            lifecycle.git(publisher, "push", "origin", "main")
+            moved = True
+        return original_run(
+            repository_path,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(move_before_fetch))
+    with pytest.raises(wrkslots.Refusal, match="different head inventory"):
+        vcs.fetch_remote(repository, "origin", "refs/remotes/origin/main", authority)
+
+    assert moved is True
+    assert not vcs.ref_exists(repository, "refs/remotes/origin/main")
+
+
+def test_salvage_push_preserves_ref_created_after_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project, repository, remote = lifecycle.make_project(tmp_path)
+    original = lifecycle.git(repository, "rev-parse", "HEAD").stdout.strip()
+    commit = lifecycle.commit_local(
+        repository,
+        "salvage-race.txt",
+        "must not overwrite a concurrent ref\n",
+        "salvage race",
+    )
+    ref = "refs/heads/salvage/testhost/concurrent"
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repository, "origin")
+    original_run = wrkslots._GitVcs._run
+    created = False
+
+    def create_before_push(
+        repository_path: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal created
+        if args and args[0] == "push" and not created:
+            lifecycle.git(remote, "update-ref", ref, original)
+            created = True
+        return original_run(
+            repository_path,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(create_before_push))
+    with pytest.raises(wrkslots.Refusal, match="Git refused"):
+        vcs.push_salvage(repository, "origin", commit, ref, authority)
+
+    assert created is True
+    assert lifecycle.git(remote, "rev-parse", ref).stdout.strip() == original
 
 
 def test_github_credential_helper_works_with_global_git_config_disabled(
@@ -270,7 +516,7 @@ def test_create_hooks_and_recursive_submodules_inherit_wrapper_environment(
     ]
     assert [command[command.index("-C") + 2] for command in commands[:2]] == [
         "ls-remote",
-        "fetch-pack",
+        "fetch",
     ]
     assert secret not in made.stdout + made.stderr + log.read_text(encoding="utf-8")
 
