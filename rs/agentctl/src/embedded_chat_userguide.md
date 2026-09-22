@@ -8,7 +8,14 @@ from its manifest: the operator chooses routing, sender allowlists, environment
 names, and the exact outbound helper path.
 
 The bridge admits each provider batch and its replay cursor durably before it
-acknowledges that batch. It then sends the request to the configured named agent.
+acknowledges that batch. It writes a bounded `prepared` receipt first, calls the
+plugin commit callback, waits for the exact matching `Committed` frame, and only
+then atomically replaces that slot with a `committed` receipt containing the
+delivery ID, provider sequence, host batch sequence, cursor, event count, and
+timestamp. A `prepared` receipt is never reported as confirmed. This artifact
+proves that the local plugin callback was released and returned exact protocol
+confirmation; it does not prove a later provider network or server-side action.
+The bridge then sends the request to the configured named agent.
 Replies use the exact `CHAT_REPLY` fence supplied in the prompt and are retained
 with one stable outbound UUID before any send attempt. A restart retries the same
 operation identity; an unknown transport result is never converted into success.
@@ -87,6 +94,15 @@ a local wake descriptor. A disk-backed terminal and delivery reconciliation
 occurs every 300 seconds by default and can be changed with
 `--reconcile-interval`.
 
+A provider `Gap` is a terminal loss signal in protocol v1. Its reason does not
+contain a recoverable range or completeness proof, so the host journals the
+incident, keeps the prior safe cursor, sends no commit, cancels that provider
+generation, and exits degraded. `chat status` reports `healthy: false` and the
+exact unresolved incident; `chat run` refuses automatic reconnect. Repair needs
+a future provider history protocol or an explicit operator procedure—one later
+message or checkpoint is not treated as proof that the missing interval was
+recovered.
+
 For a bounded manual recovery while the daemon is stopped:
 
 ```sh
@@ -102,13 +118,31 @@ agentctl chat status \
   --bridge-state /home/me/.local/state/agentctl/project-chat
 ```
 
-Close reply capture for an old request while retaining its history:
+Explicitly close reply capture for an old request:
 
 ```sh
 agentctl chat close \
   --bridge-state /home/me/.local/state/agentctl/project-chat \
   --request 64_LOWERCASE_HEX_CHARACTERS
 ```
+
+Closure is the provider-neutral terminal route lifecycle; idle/done status and
+the first reply do not close a route because a request may send later progress
+updates. A closed request remains active until its prompt delivery is confirmed,
+its reaction is disabled or confirmed, and every captured reply is sent. It is
+also retained while it belongs to the current inclusive replay cursor. Once all
+conditions hold and a later cursor is durable, the bridge fsyncs a retirement
+journal containing the exact reaction and reply operation/provider receipts,
+installs a compact replay and closed-nonce guard, and only then deletes the
+active request/reply files. Startup completes an interrupted retirement.
+
+The active population remains capped at 2,048 requests. The compact route and
+replay ring retains the latest 4,096 retired identities, matching the pane
+marker bound, and the parallel retirement audit ring has 4,096 slots of at most
+256 KiB each. Older replay safety relies on the subscription contract's
+inclusive monotone cursor; a cursor regression or a reused message identity
+with different content fails closed. This is bounded local retention, not a
+claim of infinite local audit history.
 
 ## Service management
 
@@ -146,7 +180,7 @@ The example ceilings are not minimum requirements or evidence about an
 unmeasured plugin. A provider that needs more than 2,048 tasks or 4 GiB must be
 given a measured larger bound; a smaller provider should use a smaller one.
 
-The host bounds retained requests, replies, per-frame data, event drains,
+The host bounds retained requests, replies, retirement records, commit receipts, per-frame data, event drains,
 mailboxes, process cleanup admissions, and helper deadlines. Ordinary provider
 or terminal events touch direct durable records. Full directory scans happen at
 startup and explicit/periodic recovery, not in the subscription inner loop.

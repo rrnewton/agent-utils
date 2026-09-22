@@ -177,6 +177,19 @@ pub trait ManagedApi: AgentApi {
     ) -> crate::error::Result<()>;
     /// Resolve an exact live Herdr agent name.
     fn agent_pane(&self, name: &str) -> crate::error::Result<String>;
+    /// Resolve an exact live Herdr agent name with service cancellation.
+    fn agent_pane_with_runtime(
+        &self,
+        name: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "Herdr control operation was cancelled",
+            ));
+        }
+        self.agent_pane(name)
+    }
     /// Report the explicitly supplied native session identity.
     fn report_agent_session(
         &self,
@@ -187,6 +200,20 @@ pub trait ManagedApi: AgentApi {
     ) -> crate::error::Result<()>;
     /// Send one explicit key to the named pane.
     fn send_keys(&self, pane: &str, key: &str) -> crate::error::Result<()>;
+    /// Send one key with service cancellation.
+    fn send_keys_with_runtime(
+        &self,
+        pane: &str,
+        key: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "Herdr control operation was cancelled",
+            ));
+        }
+        self.send_keys(pane, key)
+    }
     /// Close one owned tab; never close its workspace.
     fn close_tab(&self, tab: &str) -> crate::error::Result<()>;
 }
@@ -194,6 +221,13 @@ pub trait ManagedApi: AgentApi {
 impl ManagedApi for HerdrClient {
     fn agent_pane(&self, name: &str) -> crate::error::Result<String> {
         HerdrClient::agent_pane(self, name)
+    }
+    fn agent_pane_with_runtime(
+        &self,
+        name: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        HerdrClient::agent_pane_with_cancellation(self, name, &|| runtime.cancelled())
     }
     fn report_agent_session(
         &self,
@@ -206,6 +240,14 @@ impl ManagedApi for HerdrClient {
     }
     fn send_keys(&self, pane: &str, key: &str) -> crate::error::Result<()> {
         HerdrClient::send_keys(self, pane, key)
+    }
+    fn send_keys_with_runtime(
+        &self,
+        pane: &str,
+        key: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        HerdrClient::send_keys_with_cancellation(self, pane, key, &|| runtime.cancelled())
     }
 
     fn workspace_id_for_label(&self, label: &str) -> crate::error::Result<Option<String>> {
@@ -477,6 +519,168 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
     ) -> crate::error::Result<String> {
         self.client.read(pane_id, source, lines)
     }
+
+    fn panes_with_runtime(
+        &self,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Vec<Pane>> {
+        Ok(self
+            .client
+            .panes_with_runtime(runtime)?
+            .into_iter()
+            .filter(|pane| Some(&pane.workspace_id) == self.record.workspace_id.as_ref())
+            .collect())
+    }
+
+    fn pane_info_with_runtime(
+        &self,
+        pane_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<AgentPaneInfo> {
+        if self.record.adapter == "herdr"
+            && Some(
+                self.client
+                    .agent_pane_with_runtime(&self.record.name, runtime)?,
+            ) != self.record.pane_id
+        {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "agent {:?} no longer owns its recorded pane",
+                self.record.name
+            )));
+        }
+        let info = self.client.pane_info_with_runtime(pane_id, runtime)?;
+        if Some(&info.workspace_id) != self.record.workspace_id.as_ref() {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "agent {:?} workspace identity changed",
+                self.record.name
+            )));
+        }
+        if Some(pane_id) == self.record.pane_id.as_deref() {
+            if self.record.goal_session_id.is_some()
+                && info.session_value.is_some()
+                && info.session_value != self.record.goal_session_id
+            {
+                return Err(crate::error::AdapterError::unavailable(format!(
+                    "agent {:?} native session identity changed",
+                    self.record.name
+                )));
+            }
+            if self.check_prompt
+                && matches!(info.status.as_str(), "idle" | "done")
+                && info.agent.as_deref() == Some("claude")
+            {
+                let screen =
+                    self.client
+                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                if screen
+                    .contains("Quick safety check: Is this a project you created or one you trust?")
+                    && screen.contains("No, exit")
+                    && screen.contains("Yes, I trust this folder")
+                {
+                    return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
+                }
+            }
+        }
+        Ok(info)
+    }
+
+    fn workspace_label_with_runtime(
+        &self,
+        workspace_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        self.client
+            .workspace_label_with_runtime(workspace_id, runtime)
+    }
+
+    fn run_with_runtime(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "Herdr control operation was cancelled",
+            ));
+        }
+        *self
+            .goal_objective
+            .lock()
+            .expect("goal operation lock poisoned") = None;
+        if let Some(queue) = self.queue {
+            for (identifier, objective) in &self.record.goal_messages {
+                let path = queue.join("inflight").join(format!("{identifier}.json"));
+                if text == format!("/goal {objective}") && fs::symlink_metadata(&path).is_ok() {
+                    let document = agent::read_private_json(&path).map_err(|error| {
+                        crate::error::AdapterError::unavailable(error.to_string())
+                    })?;
+                    if document["text"].as_str() == Some(text) {
+                        *self
+                            .goal_objective
+                            .lock()
+                            .expect("goal operation lock poisoned") = Some(objective.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        self.client.run_with_runtime(pane_id, text, runtime)
+    }
+
+    fn wait_agent_status_with_runtime(
+        &self,
+        pane_id: &str,
+        status: &str,
+        timeout_ms: u64,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        let Some(objective) = self
+            .goal_objective
+            .lock()
+            .expect("goal operation lock poisoned")
+            .clone()
+            .filter(|_| status == "working")
+        else {
+            return self
+                .client
+                .wait_agent_status_with_runtime(pane_id, status, timeout_ms, runtime);
+        };
+        let start = Instant::now();
+        if self
+            .client
+            .wait_agent_status_with_runtime(pane_id, status, timeout_ms.min(1000), runtime)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.pane_info_with_runtime(pane_id, runtime)?;
+        let screen = self
+            .client
+            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+        if goal_replacement_selected(&screen, &objective) {
+            self.client
+                .send_keys_with_runtime(pane_id, "Enter", runtime)?;
+        }
+        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.client.wait_agent_status_with_runtime(
+            pane_id,
+            status,
+            timeout_ms.saturating_sub(elapsed).max(1),
+            runtime,
+        )
+    }
+
+    fn read_with_runtime(
+        &self,
+        pane_id: &str,
+        source: &str,
+        lines: Option<usize>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        self.client
+            .read_with_runtime(pane_id, source, lines, runtime)
+    }
 }
 
 /// Options for a new visible subagent; the working directory is always explicit.
@@ -557,14 +761,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn lock(&self, agent_name: &str) -> Result<File> {
+        self.lock_with_runtime(agent_name, &agent::SystemRuntime::default())
+    }
+
+    fn lock_with_runtime(
+        &self,
+        agent_name: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<File> {
         name(agent_name)?;
         agent::create_private_directory(&self.registry, "agent registry", true, true)?;
-        let file = agent::open_private_lock(
-            &self.registry.join(format!(".{agent_name}.lock")),
-            "agent lifecycle lock",
-        )?;
-        file.lock_exclusive()
-            .map_err(|error| fail(error.to_string()))?;
+        let path = self.registry.join(format!(".{agent_name}.lock"));
+        let file = agent::open_private_lock(&path, "agent lifecycle lock")?;
+        agent::lock_exclusive_with_runtime(&file, &path, "agent lifecycle", runtime)?;
         Ok(file)
     }
 
@@ -1173,6 +1382,27 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.checked(&self.load(agent_name)?)
     }
 
+    /// Resolve the exact live pane while allowing a service owner to cancel control waits.
+    pub(crate) fn pane_info_with_runtime(
+        &self,
+        agent_name: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<AgentPaneInfo> {
+        let _lock = self.lock_with_runtime(agent_name, runtime)?;
+        let record = self.load(agent_name)?;
+        agent::resolve_target_with_runtime(
+            &WorkspaceClient {
+                client: self.client,
+                record: &record,
+                goal_objective: Mutex::new(None),
+                queue: None,
+                check_prompt: false,
+            },
+            &record.target()?,
+            runtime,
+        )
+    }
+
     fn status_record(&self, record: &AgentRecord) -> Result<Value> {
         let agent_name = &record.name;
         let mut result = json!(record);
@@ -1238,15 +1468,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     /// Submit through an injected runtime that can interrupt bounded readiness waits.
-    pub(crate) fn send_identified_with_runtime<R: agent::AgentRuntime + ?Sized>(
+    pub(crate) fn send_identified_with_runtime(
         &self,
         agent_name: &str,
         text: &str,
         options: DrainOptions,
         message_id: &str,
-        runtime: &R,
+        runtime: &dyn agent::AgentRuntime,
     ) -> Result<QueueResult> {
-        let _lock = self.lock(agent_name)?;
+        let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
@@ -1275,6 +1505,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         message_id: &str,
     ) -> Result<Option<agent::QueueMessageState>> {
         let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        record.supported()?;
+        agent::message_state(&self.queue(agent_name)?, message_id)
+    }
+
+    pub(crate) fn message_state_with_runtime(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<Option<agent::QueueMessageState>> {
+        let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
         record.supported()?;
         agent::message_state(&self.queue(agent_name)?, message_id)
@@ -1348,13 +1590,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     /// Drain through an injected runtime that can interrupt bounded readiness waits.
-    pub(crate) fn drain_with_runtime<R: agent::AgentRuntime + ?Sized>(
+    pub(crate) fn drain_with_runtime(
         &self,
         agent_name: &str,
         options: DrainOptions,
-        runtime: &R,
+        runtime: &dyn agent::AgentRuntime,
     ) -> Result<QueueResult> {
-        let _lock = self.lock(agent_name)?;
+        let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
@@ -1390,6 +1632,34 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let record = self.load(agent_name)?;
         self.checked(&record)?;
         let text = agent::read(self.client, &record.target()?, lines)?;
+        self.snapshot(&record, &text)?;
+        Ok(text)
+    }
+
+    /// Read and persist a snapshot while allowing service cancellation during locks and control.
+    pub(crate) fn read_with_runtime(
+        &self,
+        agent_name: &str,
+        lines: usize,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<String> {
+        let _lock = self.lock_with_runtime(agent_name, runtime)?;
+        let record = self.load(agent_name)?;
+        let target = record.target()?;
+        let info = agent::resolve_target_with_runtime(
+            &WorkspaceClient {
+                client: self.client,
+                record: &record,
+                goal_objective: Mutex::new(None),
+                queue: None,
+                check_prompt: false,
+            },
+            &target,
+            runtime,
+        )?;
+        let text = self
+            .client
+            .read_with_runtime(&info.pane_id, "recent", Some(lines), runtime)?;
         self.snapshot(&record, &text)?;
         Ok(text)
     }
@@ -1758,6 +2028,24 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    #[derive(Default)]
+    struct CancelLifecycleWait {
+        cancelled: AtomicBool,
+    }
+
+    impl agent::AgentRuntime for CancelLifecycleWait {
+        fn monotonic(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn sleep(&self, _duration: Duration) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+
+        fn cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+    }
     struct Fixture {
         root: PathBuf,
         client: Fake,
@@ -1827,6 +2115,24 @@ mod tests {
                 .adopt("foreign", self.adopt_options())
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn service_cancellation_bounds_lifecycle_lock_contention() {
+        let fixture = Fixture::new();
+        let registry = fixture.root.join("registry");
+        let manager = ManagedAgents::new(&fixture.client, &registry).expect("manager");
+        agent::create_private_directory(&registry, "agent registry", true, true).expect("registry");
+        let path = registry.join(".coordinator.lock");
+        let holder = agent::open_private_lock(&path, "held lifecycle lock").expect("holder");
+        holder.lock_exclusive().expect("hold lifecycle lock");
+        let runtime = CancelLifecycleWait::default();
+        let started = Instant::now();
+        let error = manager
+            .lock_with_runtime("coordinator", &runtime)
+            .expect_err("cancel contended lifecycle lock");
+        assert!(error.to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
     impl Drop for Fixture {
         fn drop(&mut self) {

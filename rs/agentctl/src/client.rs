@@ -21,9 +21,18 @@ pub(crate) struct BoundedOutput {
 }
 
 /// Capture a subprocess while enforcing a wall-clock bound and draining both pipes concurrently.
+#[cfg(test)]
 pub(crate) fn bounded_output(
     command: &mut Command,
     timeout: Duration,
+) -> io::Result<BoundedOutput> {
+    bounded_output_with_cancellation(command, timeout, &|| false)
+}
+
+fn bounded_output_with_cancellation(
+    command: &mut Command,
+    timeout: Duration,
+    cancelled: &dyn Fn() -> bool,
 ) -> io::Result<BoundedOutput> {
     command
         .stdout(Stdio::piped())
@@ -60,7 +69,8 @@ pub(crate) fn bounded_output(
                 break status;
             }
         }
-        if deadline.is_some_and(|value| Instant::now() >= value) {
+        let was_cancelled = cancelled();
+        if was_cancelled || deadline.is_some_and(|value| Instant::now() >= value) {
             // The child owns a fresh process group. Killing the group also closes pipes inherited
             // by descendants, so reader threads cannot keep this timeout path blocked forever.
             let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
@@ -68,10 +78,14 @@ pub(crate) fn bounded_output(
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("control command timed out after {}s", timeout.as_secs()),
-            ));
+            return Err(if was_cancelled {
+                io::Error::new(io::ErrorKind::Interrupted, "control command was cancelled")
+            } else {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("control command timed out after {}s", timeout.as_secs()),
+                )
+            });
         }
         thread::sleep(Duration::from_millis(10));
     };
@@ -147,9 +161,21 @@ impl HerdrClient {
         })
     }
     fn invoke_with_timeout(&self, args: &[String], timeout: Duration) -> Result<CommandOutput> {
+        self.invoke_with_timeout_and_cancellation(args, timeout, &|| false)
+    }
+    fn invoke_with_timeout_and_cancellation(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CommandOutput> {
         let executable = resolve_executable(&self.executable)?;
-        let output = bounded_output(Command::new(executable).args(args), timeout)
-            .map_err(|error| AdapterError::unavailable(format!("cannot invoke Herdr: {error}")))?;
+        let output = bounded_output_with_cancellation(
+            Command::new(executable).args(args),
+            timeout,
+            cancelled,
+        )
+        .map_err(|error| AdapterError::unavailable(format!("cannot invoke Herdr: {error}")))?;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -266,9 +292,17 @@ impl HerdrClient {
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn agent_pane(&self, name: &str) -> Result<String> {
-        let result = self.call(
+        self.agent_pane_with_cancellation(name, &|| false)
+    }
+    pub(crate) fn agent_pane_with_cancellation(
+        &self,
+        name: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String> {
+        let result = self.call_with_cancellation(
             &strings(&["agent", "get", name]),
             &format!("agent get {name:?}"),
+            cancelled,
         )?;
         let info = required_object(&result, "agent", "agent get")?;
         if required_string(info, "name", "agent get")? != name {
@@ -308,11 +342,18 @@ impl HerdrClient {
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn panes(&self, workspace_id: Option<&str>) -> Result<Vec<Pane>> {
+        self.panes_with_cancellation(workspace_id, &|| false)
+    }
+    pub(crate) fn panes_with_cancellation(
+        &self,
+        workspace_id: Option<&str>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<Pane>> {
         let mut args = strings(&["pane", "list"]);
         if let Some(workspace_id) = workspace_id {
             args.extend(strings(&["--workspace", workspace_id]));
         }
-        let result = self.call(&args, "pane list")?;
+        let result = self.call_with_cancellation(&args, "pane list", cancelled)?;
         let values = value_array(result.get("panes"), "pane list.panes")?;
         let entries = object_entries(values, "pane list entry")?;
         let panes = entries
@@ -337,9 +378,17 @@ impl HerdrClient {
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn pane_info(&self, pane_id: &str) -> Result<AgentPaneInfo> {
-        let result = self.call(
+        self.pane_info_with_cancellation(pane_id, &|| false)
+    }
+    pub(crate) fn pane_info_with_cancellation(
+        &self,
+        pane_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<AgentPaneInfo> {
+        let result = self.call_with_cancellation(
             &strings(&["pane", "get", pane_id]),
             &format!("pane get {pane_id}"),
+            cancelled,
         )?;
         let pane = required_object(&result, "pane", "pane get")?;
         let returned = required_string(pane, "pane_id", "pane get")?;
@@ -373,9 +422,17 @@ impl HerdrClient {
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn workspace_label(&self, workspace_id: &str) -> Result<String> {
-        let result = self.call(
+        self.workspace_label_with_cancellation(workspace_id, &|| false)
+    }
+    pub(crate) fn workspace_label_with_cancellation(
+        &self,
+        workspace_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String> {
+        let result = self.call_with_cancellation(
             &strings(&["workspace", "get", workspace_id]),
             &format!("workspace get {workspace_id}"),
+            cancelled,
         )?;
         let workspace = required_object(&result, "workspace", "workspace get")?;
         let returned = required_string(workspace, "workspace_id", "workspace get")?;
@@ -388,7 +445,17 @@ impl HerdrClient {
     }
     /// Resolve the compatible running server's absolute event-socket path.
     pub fn event_socket(&self) -> Result<PathBuf> {
-        let completed = self.invoke(&strings(&["status", "server", "--json"]))?;
+        self.event_socket_with_cancellation(&|| false)
+    }
+    pub(crate) fn event_socket_with_cancellation(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PathBuf> {
+        let completed = self.invoke_with_timeout_and_cancellation(
+            &strings(&["status", "server", "--json"]),
+            CONTROL_TIMEOUT,
+            cancelled,
+        )?;
         if completed.status != 0 {
             return Err(AdapterError::unavailable(format!(
                 "cannot discover the running Herdr server: {}",
@@ -419,8 +486,17 @@ impl HerdrClient {
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn wait_agent_status(&self, pane_id: &str, status: &str, timeout_ms: u64) -> Result<()> {
+        self.wait_agent_status_with_cancellation(pane_id, status, timeout_ms, &|| false)
+    }
+    pub(crate) fn wait_agent_status_with_cancellation(
+        &self,
+        pane_id: &str,
+        status: &str,
+        timeout_ms: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
         let purpose = format!("wait for pane {pane_id} status {status}");
-        let completed = self.invoke_with_timeout(
+        let completed = self.invoke_with_timeout_and_cancellation(
             &[
                 "agent".to_owned(),
                 "wait".to_owned(),
@@ -432,6 +508,7 @@ impl HerdrClient {
             ],
             CONTROL_TIMEOUT
                 .max(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(5))),
+            cancelled,
         )?;
         if completed.status != 0 {
             return Err(AdapterError::unavailable(format!(
@@ -458,11 +535,21 @@ impl HerdrClient {
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn read(&self, pane_id: &str, source: &str, lines: Option<usize>) -> Result<String> {
+        self.read_with_cancellation(pane_id, source, lines, &|| false)
+    }
+    pub(crate) fn read_with_cancellation(
+        &self,
+        pane_id: &str,
+        source: &str,
+        lines: Option<usize>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String> {
         let mut args = strings(&["pane", "read", pane_id, "--source", source]);
         if let Some(lines) = lines {
             args.extend(["--lines".to_owned(), lines.to_string()]);
         }
-        let completed = self.invoke(&args)?;
+        let completed =
+            self.invoke_with_timeout_and_cancellation(&args, CONTROL_TIMEOUT, cancelled)?;
         if completed.status != 0 {
             return Err(AdapterError::unavailable(format!(
                 "pane read {pane_id}: {}",
@@ -473,16 +560,34 @@ impl HerdrClient {
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn prompt_agent(&self, pane_id: &str, text: &str) -> Result<()> {
-        self.call_ok(
+        self.prompt_agent_with_cancellation(pane_id, text, &|| false)
+    }
+    pub(crate) fn prompt_agent_with_cancellation(
+        &self,
+        pane_id: &str,
+        text: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.call_ok_with_cancellation(
             &strings(&["agent", "prompt", pane_id, text]),
             &format!("agent prompt {pane_id}"),
+            cancelled,
         )
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn send_keys(&self, pane_id: &str, keys: &str) -> Result<()> {
-        self.call_ok(
+        self.send_keys_with_cancellation(pane_id, keys, &|| false)
+    }
+    pub(crate) fn send_keys_with_cancellation(
+        &self,
+        pane_id: &str,
+        keys: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.call_ok_with_cancellation(
             &strings(&["pane", "send-keys", pane_id, keys]),
             &format!("pane send-keys {pane_id}"),
+            cancelled,
         )
     }
     fn workspace_entries(&self) -> Result<Vec<Map<String, Value>>> {
@@ -490,11 +595,17 @@ impl HerdrClient {
         let values = value_array(result.get("workspaces"), "workspace list.workspaces")?;
         object_entries(values, "workspace list entry")
     }
-    fn invoke(&self, args: &[String]) -> Result<CommandOutput> {
-        self.invoke_with_timeout(args, CONTROL_TIMEOUT)
-    }
     fn call(&self, args: &[String], purpose: &str) -> Result<Map<String, Value>> {
-        let completed = self.invoke(args)?;
+        self.call_with_cancellation(args, purpose, &|| false)
+    }
+    fn call_with_cancellation(
+        &self,
+        args: &[String],
+        purpose: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Map<String, Value>> {
+        let completed =
+            self.invoke_with_timeout_and_cancellation(args, CONTROL_TIMEOUT, cancelled)?;
         if completed.status != 0 {
             return Err(AdapterError::unavailable(format!(
                 "{purpose}: {}",
@@ -519,7 +630,16 @@ impl HerdrClient {
             })
     }
     fn call_ok(&self, args: &[String], purpose: &str) -> Result<()> {
-        let completed = self.invoke(args)?;
+        self.call_ok_with_cancellation(args, purpose, &|| false)
+    }
+    fn call_ok_with_cancellation(
+        &self,
+        args: &[String],
+        purpose: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let completed =
+            self.invoke_with_timeout_and_cancellation(args, CONTROL_TIMEOUT, cancelled)?;
         if completed.status == 0 {
             Ok(())
         } else {
@@ -700,7 +820,8 @@ fn unique_label_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static EXECUTABLE_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -852,6 +973,28 @@ mod tests {
             Duration::from_millis(100),
         );
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn control_cancellation_kills_command_group_and_inherited_pipes_promptly() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancelled);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = bounded_output_with_cancellation(
+            Command::new("/bin/sh").args(["-c", "sleep 30 & wait"]),
+            Duration::from_secs(30),
+            &|| cancelled.load(Ordering::SeqCst),
+        );
+        worker.join().expect("join cancellation trigger");
+        assert_eq!(
+            result.err().expect("cancel command").kind(),
+            io::ErrorKind::Interrupted
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

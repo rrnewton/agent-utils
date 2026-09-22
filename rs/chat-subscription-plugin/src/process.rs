@@ -14,7 +14,7 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1346,6 +1346,60 @@ fn wait_pidfd_until(pidfd: &OwnedFd, deadline: Instant) -> io::Result<bool> {
     wait_fd_until(pidfd.as_raw_fd(), libc::POLLIN, deadline)
 }
 
+fn wait_pidfd_until_or_cancelled(
+    pidfd: &OwnedFd,
+    cancellation_fd: RawFd,
+    deadline: Instant,
+) -> io::Result<bool> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let seconds = libc::time_t::try_from(remaining.as_secs()).unwrap_or(libc::time_t::MAX);
+        let nanoseconds = libc::c_long::from(remaining.subsec_nanos());
+        let timeout = libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: nanoseconds,
+        };
+        let mut descriptors = [
+            libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cancellation_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: descriptors and timeout point to initialized local values for the duration of
+        // the call. Both descriptors remain borrowed by the caller for the whole wait.
+        let result = unsafe {
+            libc::ppoll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                &timeout,
+                std::ptr::null::<libc::sigset_t>(),
+            )
+        };
+        if result > 0 {
+            if descriptors[1].revents != 0 {
+                return Ok(false);
+            }
+            if descriptors[0].revents != 0 {
+                return Ok(true);
+            }
+            continue;
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 fn pidfd_proves_status_consumed(pidfd: &OwnedFd) -> io::Result<bool> {
     loop {
         // SAFETY: signal zero performs no delivery and addresses the stable pidfd identity. Linux
@@ -2051,6 +2105,41 @@ impl ProcessPluginChild {
         self.shutdown_with_reap_timeout(grace, KILL_REAP_TIMEOUT)
     }
 
+    /// Wait cooperatively until either the executable exits, the grace expires, or an external
+    /// event descriptor becomes readable, then terminate and reap the complete process group.
+    ///
+    /// `cancellation_fd` is borrowed for this call and must be a pollable descriptor whose
+    /// readability means cancellation. This keeps cancellation inside the pidfd/process-group
+    /// supervisor instead of making callers signal a numeric PID or process group themselves.
+    pub fn shutdown_cancellable(
+        &mut self,
+        grace: Duration,
+        cancellation_fd: RawFd,
+    ) -> io::Result<ExitStatus> {
+        let started = Instant::now();
+        let cooperative_deadline = started.checked_add(grace).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plugin cooperative shutdown deadline is too large",
+            )
+        })?;
+        let final_deadline = cooperative_deadline
+            .checked_add(KILL_REAP_TIMEOUT)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "plugin post-kill reap deadline is too large",
+                )
+            })?;
+        if let Some(result) = &self.shutdown {
+            return result.result();
+        }
+        let result =
+            self.shutdown_once_cancellable(cooperative_deadline, final_deadline, cancellation_fd);
+        self.shutdown = Some(StoredShutdown::from_result(&result));
+        result
+    }
+
     fn shutdown_with_reap_timeout(
         &mut self,
         grace: Duration,
@@ -2097,6 +2186,72 @@ impl ProcessPluginChild {
             io::Error::new(
                 error.kind(),
                 format!("cannot observe plugin exit during cooperative wait: {error}"),
+            )
+        });
+        let mut plugin_status = cooperative.unwrap_or(None);
+        let termination = self.terminate_processes();
+        if plugin_status.is_none() && supervision_error.is_none() {
+            match self.wait_plugin_until(final_deadline) {
+                Ok(Some(status)) => plugin_status = Some(status),
+                Ok(None) => {
+                    supervision_error = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "plugin did not exit after bounded process-group termination",
+                    ));
+                }
+                Err(error) => supervision_error = Some(error),
+            }
+        }
+        let supervisor_result = match wait_pidfd_until(self.supervisor_pidfd(), final_deadline) {
+            Ok(true) => self.reap_supervisor(),
+            Ok(false) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "plugin process-group supervisor did not exit after bounded kill",
+            )),
+            Err(error) => {
+                if supervision_error.is_none() {
+                    supervision_error = Some(io::Error::new(
+                        error.kind(),
+                        format!("cannot observe plugin supervisor after kill: {error}"),
+                    ));
+                }
+                Err(error)
+            }
+        };
+        if let Err(error) = termination {
+            if supervision_error.is_none() {
+                supervision_error = Some(error);
+            }
+        }
+        if let Err(error) = supervisor_result {
+            if supervision_error.is_none() {
+                supervision_error = Some(error);
+            }
+        }
+        if let Some(error) = supervision_error {
+            Err(error)
+        } else {
+            plugin_status.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "plugin exit status was unavailable after bounded cleanup",
+                )
+            })
+        }
+    }
+
+    fn shutdown_once_cancellable(
+        &mut self,
+        cooperative_deadline: Instant,
+        final_deadline: Instant,
+        cancellation_fd: RawFd,
+    ) -> io::Result<ExitStatus> {
+        let cooperative =
+            self.wait_plugin_until_or_cancelled(cooperative_deadline, cancellation_fd);
+        let mut supervision_error = cooperative.as_ref().err().map(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot observe plugin exit during cancellable cooperative wait: {error}"),
             )
         });
         let mut plugin_status = cooperative.unwrap_or(None);
@@ -2200,6 +2355,22 @@ impl ProcessPluginChild {
             return Ok(Some(status));
         }
         if !wait_pidfd_until(self.plugin_pidfd(), deadline)? {
+            return Ok(None);
+        }
+        let status = waitid_reap_pidfd(self.plugin_pidfd())?;
+        self.plugin_status = Some(status);
+        Ok(Some(status))
+    }
+
+    fn wait_plugin_until_or_cancelled(
+        &mut self,
+        deadline: Instant,
+        cancellation_fd: RawFd,
+    ) -> io::Result<Option<ExitStatus>> {
+        if let Some(status) = self.plugin_status {
+            return Ok(Some(status));
+        }
+        if !wait_pidfd_until_or_cancelled(self.plugin_pidfd(), cancellation_fd, deadline)? {
             return Ok(None);
         }
         let status = waitid_reap_pidfd(self.plugin_pidfd())?;

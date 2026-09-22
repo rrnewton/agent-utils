@@ -237,6 +237,15 @@ impl ProcessPluginChild {
     pub fn shutdown(&mut self, _grace: Duration) -> io::Result<ExitStatus> {
         Err(unsupported())
     }
+
+    /// Refuse cancellable process shutdown on this unsupported platform.
+    pub fn shutdown_cancellable(
+        &mut self,
+        _grace: Duration,
+        _cancellation_fd: std::os::fd::RawFd,
+    ) -> io::Result<ExitStatus> {
+        Err(unsupported())
+    }
 }
 
 #[cfg(test)]

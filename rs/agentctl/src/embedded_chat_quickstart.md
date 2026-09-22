@@ -59,4 +59,7 @@ directory.
 Use `agentctl chat status --bridge-state DIR` for a read-only durable status
 snapshot. Stop `run` before `agentctl chat tick --bridge-state DIR`, which runs
 one bounded recovery pass. `agentctl chat userguide` documents plugin safety,
-the outbound NDJSON contract, recovery, and service-manager limits.
+the outbound NDJSON contract, exact local commit receipts, explicit route
+closure and bounded retirement, fail-closed provider gaps, recovery, and
+service-manager limits. A status with `healthy: false` and an unresolved gap is
+not live success; protocol v1 intentionally refuses automatic reconnect.

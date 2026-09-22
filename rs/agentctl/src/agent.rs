@@ -235,6 +235,56 @@ pub trait AgentApi: Send + Sync {
         source: &str,
         lines: Option<usize>,
     ) -> crate::error::Result<String>;
+
+    /// Cancellation-aware pane enumeration used by long-running service owners.
+    fn panes_with_runtime(&self, _runtime: &dyn AgentRuntime) -> crate::error::Result<Vec<Pane>> {
+        self.panes()
+    }
+    /// Cancellation-aware pane inspection used by long-running service owners.
+    fn pane_info_with_runtime(
+        &self,
+        pane_id: &str,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<AgentPaneInfo> {
+        self.pane_info(pane_id)
+    }
+    /// Cancellation-aware workspace inspection used by long-running service owners.
+    fn workspace_label_with_runtime(
+        &self,
+        workspace_id: &str,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<String> {
+        self.workspace_label(workspace_id)
+    }
+    /// Cancellation-aware prompt submission used by long-running service owners.
+    fn run_with_runtime(
+        &self,
+        pane_id: &str,
+        text: &str,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<()> {
+        self.run(pane_id, text)
+    }
+    /// Cancellation-aware native status wait used by long-running service owners.
+    fn wait_agent_status_with_runtime(
+        &self,
+        pane_id: &str,
+        status: &str,
+        timeout_ms: u64,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<()> {
+        self.wait_agent_status(pane_id, status, timeout_ms)
+    }
+    /// Cancellation-aware pane read used by long-running service owners.
+    fn read_with_runtime(
+        &self,
+        pane_id: &str,
+        source: &str,
+        lines: Option<usize>,
+        _runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<String> {
+        self.read(pane_id, source, lines)
+    }
 }
 
 impl AgentApi for HerdrClient {
@@ -270,6 +320,57 @@ impl AgentApi for HerdrClient {
         lines: Option<usize>,
     ) -> crate::error::Result<String> {
         HerdrClient::read(self, pane_id, source, lines)
+    }
+
+    fn panes_with_runtime(&self, runtime: &dyn AgentRuntime) -> crate::error::Result<Vec<Pane>> {
+        HerdrClient::panes_with_cancellation(self, None, &|| runtime.cancelled())
+    }
+
+    fn pane_info_with_runtime(
+        &self,
+        pane_id: &str,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<AgentPaneInfo> {
+        HerdrClient::pane_info_with_cancellation(self, pane_id, &|| runtime.cancelled())
+    }
+
+    fn workspace_label_with_runtime(
+        &self,
+        workspace_id: &str,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<String> {
+        HerdrClient::workspace_label_with_cancellation(self, workspace_id, &|| runtime.cancelled())
+    }
+
+    fn run_with_runtime(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<()> {
+        HerdrClient::prompt_agent_with_cancellation(self, pane_id, text, &|| runtime.cancelled())
+    }
+
+    fn wait_agent_status_with_runtime(
+        &self,
+        pane_id: &str,
+        status: &str,
+        timeout_ms: u64,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<()> {
+        HerdrClient::wait_agent_status_with_cancellation(self, pane_id, status, timeout_ms, &|| {
+            runtime.cancelled()
+        })
+    }
+
+    fn read_with_runtime(
+        &self,
+        pane_id: &str,
+        source: &str,
+        lines: Option<usize>,
+        runtime: &dyn AgentRuntime,
+    ) -> crate::error::Result<String> {
+        HerdrClient::read_with_cancellation(self, pane_id, source, lines, &|| runtime.cancelled())
     }
 }
 
@@ -339,13 +440,23 @@ pub fn resolve_target<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
 ) -> AgentResult<AgentPaneInfo> {
+    resolve_target_with_runtime(client, target, &SystemRuntime::default())
+}
+
+pub(crate) fn resolve_target_with_runtime<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<AgentPaneInfo> {
     validate_target_authority(target)?;
     let asserted_pane = target.pane_id.as_deref();
     let mut pane_id = target.pane_id.clone();
     if let Some(session_value) = target.session_value.as_deref() {
         let mut matches = Vec::new();
-        for pane in client.panes().map_err(client_error)? {
-            let info = client.pane_info(&pane.pane_id).map_err(client_error)?;
+        for pane in client.panes_with_runtime(runtime).map_err(client_error)? {
+            let info = client
+                .pane_info_with_runtime(&pane.pane_id, runtime)
+                .map_err(client_error)?;
             if info.session_value.as_deref() == Some(session_value)
                 && target
                     .session_agent
@@ -371,15 +482,18 @@ pub fn resolve_target<A: AgentApi + ?Sized>(
     }
     let pane_id = pane_id
         .ok_or_else(|| AgentError::delivery("target needs --pane or a stable session value"))?;
-    let info = client.pane_info(&pane_id).map_err(client_error)?;
-    validate_target(client, &info, target)?;
+    let info = client
+        .pane_info_with_runtime(&pane_id, runtime)
+        .map_err(client_error)?;
+    validate_target_with_runtime(client, &info, target, runtime)?;
     Ok(info)
 }
 
-fn validate_target<A: AgentApi + ?Sized>(
+fn validate_target_with_runtime<A: AgentApi + ?Sized>(
     client: &A,
     info: &AgentPaneInfo,
     target: &Target,
+    runtime: &dyn AgentRuntime,
 ) -> AgentResult<()> {
     let mut failures = Vec::new();
     if let Some(expected) = target.expected_agent.as_deref() {
@@ -405,7 +519,7 @@ fn validate_target<A: AgentApi + ?Sized>(
     }
     if let Some(expected) = target.expected_workspace.as_deref() {
         let actual = client
-            .workspace_label(&info.workspace_id)
+            .workspace_label_with_runtime(&info.workspace_id, runtime)
             .map_err(client_error)?;
         if actual != expected {
             failures.push(format!("workspace is {actual:?}, expected {expected:?}"));
@@ -435,7 +549,7 @@ fn validate_target<A: AgentApi + ?Sized>(
 
 /// Persist one prompt before any readiness or transport operation.
 pub fn enqueue(root: &Path, text: &str, message_id: Option<&str>) -> AgentResult<String> {
-    enqueue_internal(root, text, message_id, true)
+    enqueue_internal(root, text, message_id, true, &SystemRuntime::default())
 }
 
 fn enqueue_internal(
@@ -443,6 +557,7 @@ fn enqueue_internal(
     text: &str,
     message_id: Option<&str>,
     serialize: bool,
+    runtime: &dyn AgentRuntime,
 ) -> AgentResult<String> {
     if text.is_empty() {
         return Err(AgentError::delivery("message must not be empty"));
@@ -455,8 +570,7 @@ fn enqueue_internal(
     let _lock = if serialize {
         let lock_path = root.join(".delivery.lock");
         let lock = open_private_lock(&lock_path, "queue delivery lock")?;
-        FileExt::lock_exclusive(&lock)
-            .map_err(|error| io_error("lock queue delivery", &lock_path, error))?;
+        lock_exclusive_with_runtime(&lock, &lock_path, "queue delivery", runtime)?;
         Some(lock)
     } else {
         None
@@ -497,19 +611,18 @@ pub fn drain<A: AgentApi + ?Sized>(
 }
 
 /// Serialize and drain a FIFO using an injected runtime.
-pub fn drain_with_runtime<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
+pub fn drain_with_runtime<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
     root: &Path,
     options: DrainOptions,
-    runtime: &R,
+    runtime: &dyn AgentRuntime,
 ) -> AgentResult<QueueResult> {
-    bind_queue(root, target)?;
+    bind_queue_with_runtime(root, target, runtime)?;
     let directories = prepare(root)?;
     let queue_lock_path = root.join(".delivery.lock");
     let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
-    FileExt::lock_exclusive(&queue_lock)
-        .map_err(|error| io_error("lock queue delivery", &queue_lock_path, error))?;
+    lock_exclusive_with_runtime(&queue_lock, &queue_lock_path, "queue delivery", runtime)?;
     let mut delivered = Vec::new();
     let mut quarantined = recover_inflight(&directories)?;
     let mut blocked = None;
@@ -553,7 +666,7 @@ pub fn drain_with_runtime<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
 
         let readiness = (|| -> AgentResult<AgentPaneInfo> {
             if target_lock.is_none() {
-                let (lock, info) = lock_resolved_target(client, target)?;
+                let (lock, info) = lock_resolved_target_with_runtime(client, target, runtime)?;
                 target_lock = Some(lock);
                 locked_pane_id = Some(info.pane_id.clone());
                 initial_info = Some(info);
@@ -669,13 +782,13 @@ pub fn send<A: AgentApi + ?Sized>(
 }
 
 /// Send one prompt using an injected readiness runtime.
-pub fn send_with_runtime<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
+pub fn send_with_runtime<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
     root: &Path,
     text: &str,
     options: DrainOptions,
-    runtime: &R,
+    runtime: &dyn AgentRuntime,
 ) -> AgentResult<QueueResult> {
     send_identified_with_runtime(client, target, root, text, options, runtime, None)
 }
@@ -700,20 +813,20 @@ pub fn send_identified<A: AgentApi + ?Sized>(
     )
 }
 
-pub(crate) fn send_identified_with_runtime<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
+pub(crate) fn send_identified_with_runtime<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
     root: &Path,
     text: &str,
     options: DrainOptions,
-    runtime: &R,
+    runtime: &dyn AgentRuntime,
     message_id: Option<&str>,
 ) -> AgentResult<QueueResult> {
-    bind_queue(root, target)?;
+    bind_queue_with_runtime(root, target, runtime)?;
     // Explicit IDs serialize their cross-directory check against delivery transitions. Generated
     // identifiers plus no-replace creation need not wait behind a long-running drain. The drain and terminal-artifact inspection below resolve any message
     // consumed by another sender between these phases.
-    let identifier = enqueue_internal(root, text, message_id, message_id.is_some())?;
+    let identifier = enqueue_internal(root, text, message_id, message_id.is_some(), runtime)?;
     let result = drain_with_runtime(client, target, root, options, runtime)?;
     let filename = format!("{identifier}.json");
     let failed_path = root.join("failed").join(&filename);
@@ -875,11 +988,11 @@ pub fn pane_lock_digest(pane_id: &str) -> String {
     format!("{:x}", Sha256::digest(encoded))
 }
 
-fn wait_ready<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
+fn wait_ready<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
     timeout: Duration,
-    runtime: &R,
+    runtime: &dyn AgentRuntime,
     locked_pane_id: &str,
     mut initial_info: Option<AgentPaneInfo>,
 ) -> AgentResult<AgentPaneInfo> {
@@ -892,7 +1005,7 @@ fn wait_ready<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
         }
         let info = match initial_info.take() {
             Some(info) => info,
-            None => resolve_target(client, target)?,
+            None => resolve_target_with_runtime(client, target, runtime)?,
         };
         if info.pane_id != locked_pane_id {
             return Err(AgentError::delivery(format!(
@@ -922,23 +1035,25 @@ fn wait_ready<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
     }
 }
 
-fn deliver_one<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
+fn deliver_one<A: AgentApi + ?Sized>(
     client: &A,
     info: &AgentPaneInfo,
     text: &str,
     working_timeout: Duration,
-    runtime: &R,
+    runtime: &dyn AgentRuntime,
 ) -> AgentResult<()> {
-    client.run(&info.pane_id, text).map_err(|error| {
-        AgentError::delivery(format!(
-            "pane {} agent-prompt outcome is unknown; prompt may have been submitted: {error}",
-            info.pane_id
-        ))
-    })?;
+    client
+        .run_with_runtime(&info.pane_id, text, runtime)
+        .map_err(|error| {
+            AgentError::delivery(format!(
+                "pane {} agent-prompt outcome is unknown; prompt may have been submitted: {error}",
+                info.pane_id
+            ))
+        })?;
     let Some(chunk) = runtime.delivery_wait_chunk() else {
         let millis = working_timeout.as_millis().clamp(1, u64::MAX.into()) as u64;
         return client
-            .wait_agent_status(&info.pane_id, "working", millis)
+            .wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime)
             .map_err(|error| {
                 AgentError::delivery(format!(
                     "pane {} did not confirm idle/done -> working submission: {error}",
@@ -965,7 +1080,7 @@ fn deliver_one<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
         }
         let wait = chunk.min(remaining);
         let millis = wait.as_millis().clamp(1, u64::MAX.into()) as u64;
-        match client.wait_agent_status(&info.pane_id, "working", millis) {
+        match client.wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error.to_string()),
         }
@@ -1107,14 +1222,22 @@ fn binding(target: &Target) -> AgentResult<Value> {
     }
 }
 
+#[cfg(test)]
 fn bind_queue(root: &Path, target: &Target) -> AgentResult<()> {
+    bind_queue_with_runtime(root, target, &SystemRuntime::default())
+}
+
+fn bind_queue_with_runtime(
+    root: &Path,
+    target: &Target,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<()> {
     validate_target_authority(target)?;
     prepare(root)?;
     let lock_path = root.join(".binding.lock");
     let binding_path = root.join("target.json");
     let lock = open_private_lock(&lock_path, "queue binding lock")?;
-    FileExt::lock_exclusive(&lock)
-        .map_err(|error| io_error("lock queue binding", &lock_path, error))?;
+    lock_exclusive_with_runtime(&lock, &lock_path, "queue binding", runtime)?;
     let expected = binding(target)?;
     match fs::symlink_metadata(&binding_path) {
         Ok(_) => {
@@ -1209,12 +1332,19 @@ pub(crate) fn lock_resolved_target<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
 ) -> AgentResult<(File, AgentPaneInfo)> {
-    let initial = resolve_target(client, target)?;
+    lock_resolved_target_with_runtime(client, target, &SystemRuntime::default())
+}
+
+pub(crate) fn lock_resolved_target_with_runtime<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<(File, AgentPaneInfo)> {
+    let initial = resolve_target_with_runtime(client, target, runtime)?;
     let lock_path = target_lock_path(&initial.pane_id)?;
     let lock = open_private_lock(&lock_path, "host-wide target lock")?;
-    FileExt::lock_exclusive(&lock)
-        .map_err(|error| io_error("lock interactive-agent target", &lock_path, error))?;
-    let confirmed = resolve_target(client, target)?;
+    lock_exclusive_with_runtime(&lock, &lock_path, "interactive-agent target", runtime)?;
+    let confirmed = resolve_target_with_runtime(client, target, runtime)?;
     if confirmed.pane_id != initial.pane_id {
         return Err(AgentError::delivery(format!(
             "target moved from pane {:?} to {:?} while waiting for its host-wide lock",
@@ -1222,6 +1352,29 @@ pub(crate) fn lock_resolved_target<A: AgentApi + ?Sized>(
         )));
     }
     Ok((lock, confirmed))
+}
+
+pub(crate) fn lock_exclusive_with_runtime(
+    lock: &File,
+    path: &Path,
+    purpose: &str,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<()> {
+    loop {
+        match FileExt::try_lock_exclusive(lock) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if runtime.cancelled() {
+                    return Err(AgentError::delivery(format!(
+                        "cancelled while waiting to lock {purpose}: {}",
+                        path.display()
+                    )));
+                }
+                runtime.sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(io_error(&format!("lock {purpose}"), path, error)),
+        }
+    }
 }
 
 pub(crate) fn atomic_json(path: &Path, value: &Value) -> AgentResult<()> {
@@ -1597,7 +1750,7 @@ fn io_error(action: &str, path: &Path, error: io::Error) -> AgentError {
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Instant;
 
@@ -1862,6 +2015,25 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CancelOnSleep {
+        cancelled: AtomicBool,
+    }
+
+    impl AgentRuntime for CancelOnSleep {
+        fn monotonic(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn sleep(&self, _duration: Duration) {
+            self.cancelled.store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn cancelled(&self) -> bool {
+            self.cancelled.load(AtomicOrdering::SeqCst)
+        }
+    }
+
     fn default_info(pane_id: &str, session: &str) -> AgentPaneInfo {
         AgentPaneInfo {
             pane_id: pane_id.to_owned(),
@@ -2118,6 +2290,31 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn cancellation_bounds_binding_delivery_and_target_flock_contention() {
+        let directory = TestDirectory::new("cancel-lock-contention");
+        let lock_paths = [
+            directory.path().join(".binding.lock"),
+            directory.path().join(".delivery.lock"),
+            target_lock_path("w1:p1").expect("target lock path"),
+        ];
+        for path in lock_paths {
+            if let Some(parent) = path.parent() {
+                create_private_directory(parent, "test lock parent", true, true)
+                    .expect("lock parent");
+            }
+            let holder = open_private_lock(&path, "held test lock").expect("open holder");
+            holder.lock_exclusive().expect("hold lock");
+            let contender = open_private_lock(&path, "contended test lock").expect("contender");
+            let runtime = CancelOnSleep::default();
+            let started = Instant::now();
+            let error = lock_exclusive_with_runtime(&contender, &path, "test contention", &runtime)
+                .expect_err("contention is cancelled");
+            assert!(error.to_string().contains("cancelled"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
     }
 
     #[test]

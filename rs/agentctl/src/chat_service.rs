@@ -20,7 +20,7 @@ use crate::agent::{AgentError, AgentRuntime, DrainOptions, QueueMessageState};
 use crate::chat_events::{PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
-    CoordinatorDeliveryResult, OutboundCancellation, ReplyRoute,
+    CoordinatorDeliveryResult, OutboundCancellation, ReplyRoute, ReplyRouteEntry,
 };
 use crate::client::HerdrClient;
 use crate::subagents::{ManagedAgents, ManagedApi};
@@ -33,6 +33,7 @@ const MAX_SENDS_PER_PASS: usize = 64;
 const PROVIDER_NOTICE_CAPACITY: usize = 64;
 const MAX_PROVIDER_NOTICES_PER_PASS: usize = 64;
 const MAX_DIRECT_REQUEST_KEYS: usize = 2_048;
+const MAX_IMMEDIATE_BACKLOG_CHUNKS: usize = 64;
 const EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_RETRY_MAX: Duration = Duration::from_secs(60);
 const PROVIDER_JOIN_TIMEOUT: Duration = Duration::from_secs(45);
@@ -116,6 +117,12 @@ pub struct CycleReport {
     pub errors: Vec<String>,
     /// More bounded work remains for a later event or recovery pass.
     pub more_work: bool,
+    #[serde(skip)]
+    deferred_keys: Vec<String>,
+    #[serde(skip)]
+    recovery_requested: bool,
+    #[serde(skip)]
+    processed_keys: Vec<String>,
 }
 
 impl CycleReport {
@@ -137,6 +144,9 @@ impl CycleReport {
         self.snapshot_revision = other.snapshot_revision.or(self.snapshot_revision);
         self.errors.append(&mut other.errors);
         self.more_work |= other.more_work;
+        self.deferred_keys.append(&mut other.deferred_keys);
+        self.recovery_requested |= other.recovery_requested;
+        self.processed_keys.append(&mut other.processed_keys);
     }
 
     fn error(&mut self, operation: &str, key: &str, error: impl fmt::Display) {
@@ -168,7 +178,7 @@ pub fn status(state_root: &Path) -> Result<Value, ChatServiceError> {
     Ok(BridgeState::inspect(state_root)?.status()?)
 }
 
-/// Close capture for one exact request without removing retained audit history.
+/// Close capture for one exact request and durably retire it when terminal and replay-safe.
 pub fn close(state_root: &Path, key: &str) -> Result<Value, ChatServiceError> {
     let state = BridgeState::open(state_root)?;
     state.close_replies(key)?;
@@ -182,12 +192,13 @@ pub fn tick<A: ManagedApi + ?Sized>(
     options: ServiceOptions,
 ) -> Result<CycleReport, ChatServiceError> {
     let state = BridgeState::open(state_root)?;
+    let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
     let _lease = state.acquire_runner_lease()?;
     let info = manager.pane_info(&state.config().agent_name)?;
     let snapshot = manager.read(&state.config().agent_name, SNAPSHOT_LINES)?;
     validate_snapshot(&snapshot)?;
-    let mut routes = RouteCache::new(state.active_reply_routes()?);
+    let mut routes = RouteCache::from_entries(state.reply_route_entries()?);
     let mut transport = state.outbound_transport()?;
     let mut control = PassControl {
         transport: &mut transport,
@@ -222,6 +233,7 @@ pub fn run<A: ManagedApi + ?Sized>(
     options: ServiceOptions,
 ) -> Result<Value, ChatServiceError> {
     let state = BridgeState::open(state_root)?;
+    let _resume_request = state.subscribe_request()?;
     validate_service_outbound(state.config())?;
     let outbound_cancellation = OutboundCancellation::new()?;
     let mut outbound = state.outbound_transport()?;
@@ -347,16 +359,12 @@ fn recover_pass<A: ManagedApi + ?Sized>(
     routes: &mut RouteCache,
     control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
-    let mut keys = BTreeSet::new();
-    keys.extend(state.pending_request_keys()?);
-    keys.extend(state.pending_ack_keys()?);
-    keys.extend(state.pending_reply_keys()?);
-    let keys = keys.into_iter().collect::<Vec<_>>();
+    let keys = state.pending_work_keys()?;
     let mut report = process_keys(state, manager, delivery, &keys, control)?;
     if keys.len() > MAX_KEYS_PER_PASS {
         report.more_work = true;
     }
-    *routes = RouteCache::new(state.active_reply_routes()?);
+    *routes = RouteCache::from_entries(state.reply_route_entries()?);
     Ok(report)
 }
 
@@ -367,11 +375,38 @@ fn process_keys<A: ManagedApi + ?Sized>(
     keys: &[String],
     control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
+    match control.stop {
+        Some(stop) => process_keys_with_delivery(
+            state,
+            &CancellableDelivery {
+                manager,
+                runtime: StopRuntime::new(stop),
+            },
+            delivery,
+            keys,
+            control,
+        ),
+        None => process_keys_with_delivery(state, manager, delivery, keys, control),
+    }
+}
+
+fn process_keys_with_delivery(
+    state: &BridgeState,
+    coordinator: &dyn chat_runtime::CoordinatorDelivery,
+    delivery: DrainOptions,
+    keys: &[String],
+    control: &mut PassControl<'_>,
+) -> Result<CycleReport, ChatServiceError> {
     if keys.is_empty() {
         return Ok(CycleReport::default());
     }
-    let mut report = CycleReport::default();
+    let mut report = CycleReport {
+        deferred_keys: keys.iter().skip(MAX_KEYS_PER_PASS).cloned().collect(),
+        more_work: keys.len() > MAX_KEYS_PER_PASS,
+        ..CycleReport::default()
+    };
     for key in keys.iter().take(MAX_KEYS_PER_PASS) {
+        report.processed_keys.push(key.clone());
         if control.stopped() {
             report.more_work = true;
             break;
@@ -387,7 +422,7 @@ fn process_keys<A: ManagedApi + ?Sized>(
             report.more_work = true;
             break;
         }
-        match deliver_request(state, manager, key, delivery, control.stop) {
+        match chat_runtime::deliver_request_with(state, coordinator, key, delivery) {
             Ok(
                 CoordinatorDeliveryResult::Delivered | CoordinatorDeliveryResult::AlreadyDelivered,
             ) => report.delivered.push(key.clone()),
@@ -440,6 +475,7 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
 ) -> Result<CycleReport, ChatServiceError> {
     validate_snapshot(snapshot.text)?;
     let capture = state.capture_snapshot(snapshot.text)?;
+    let route_entries = capture.route_entries.clone();
     let mut report = CycleReport {
         captured: capture.replies.clone(),
         snapshot_truncated: snapshot.truncated,
@@ -468,7 +504,7 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
         &captured_keys,
         control,
     )?);
-    *routes = RouteCache::new(state.active_reply_routes()?);
+    *routes = RouteCache::from_entries(route_entries);
     Ok(report)
 }
 
@@ -484,7 +520,12 @@ fn capture_direct<A: ManagedApi + ?Sized>(
     validate_snapshot(snapshot.text)?;
     let key = match refresh_matched_route(state, routes, identifier)? {
         MatchedRoute::Unknown => {
-            return capture_recovery_snapshot(state, manager, delivery, routes, snapshot, control);
+            return Ok(CycleReport {
+                snapshot_truncated: snapshot.truncated,
+                snapshot_revision: snapshot.revision,
+                recovery_requested: true,
+                ..CycleReport::default()
+            });
         }
         MatchedRoute::Stale => {
             return Ok(CycleReport {
@@ -536,7 +577,11 @@ fn refresh_matched_route(
     identifier: &str,
 ) -> Result<MatchedRoute, ChatRuntimeError> {
     let Some(key) = routes.key(identifier).map(str::to_owned) else {
-        return Ok(MatchedRoute::Unknown);
+        return Ok(if routes.knows_identifier_nonce(identifier) {
+            MatchedRoute::Stale
+        } else {
+            MatchedRoute::Unknown
+        });
     };
     let current = state.next_reply_route(&key)?;
     if current.as_ref().map(|route| route.identifier.as_str()) == Some(identifier) {
@@ -568,35 +613,77 @@ impl PassControl<'_> {
 #[derive(Debug)]
 struct RouteCache {
     by_identifier: BTreeMap<String, String>,
-    by_key: BTreeMap<String, String>,
+    by_key: BTreeMap<String, (String, Option<String>)>,
+    by_nonce: BTreeMap<String, String>,
 }
 
 impl RouteCache {
+    #[cfg(test)]
     fn new(routes: Vec<ReplyRoute>) -> Self {
+        Self::from_entries(
+            routes
+                .into_iter()
+                .filter_map(|route| {
+                    let nonce = route.identifier.rsplit_once('_')?.0.to_owned();
+                    Some(ReplyRouteEntry {
+                        key: route.key,
+                        nonce,
+                        current_identifier: Some(route.identifier),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn from_entries(entries: Vec<ReplyRouteEntry>) -> Self {
         let mut result = Self {
             by_identifier: BTreeMap::new(),
             by_key: BTreeMap::new(),
+            by_nonce: BTreeMap::new(),
         };
-        for route in routes {
-            let key = route.key.clone();
-            result.replace(&key, Some(route));
+        for entry in entries {
+            if let Some(identifier) = entry.current_identifier.as_ref() {
+                result
+                    .by_identifier
+                    .insert(identifier.clone(), entry.key.clone());
+            }
+            result
+                .by_nonce
+                .insert(entry.nonce.clone(), entry.key.clone());
+            result
+                .by_key
+                .insert(entry.key, (entry.nonce, entry.current_identifier));
         }
         result
     }
 
     fn replace(&mut self, key: &str, route: Option<ReplyRoute>) {
-        if let Some(identifier) = self.by_key.remove(key) {
-            self.by_identifier.remove(&identifier);
+        let previous = self.by_key.remove(key);
+        if let Some((_, Some(identifier))) = previous.as_ref() {
+            self.by_identifier.remove(identifier);
         }
         if let Some(route) = route {
-            self.by_key
-                .insert(route.key.clone(), route.identifier.clone());
-            self.by_identifier.insert(route.identifier, route.key);
+            if let Some((nonce, _)) = route.identifier.rsplit_once('_') {
+                let nonce = nonce.to_owned();
+                self.by_nonce.insert(nonce.clone(), route.key.clone());
+                self.by_key
+                    .insert(route.key.clone(), (nonce, Some(route.identifier.clone())));
+                self.by_identifier.insert(route.identifier, route.key);
+            }
+        } else if let Some((nonce, _)) = previous {
+            self.by_nonce.insert(nonce.clone(), key.to_owned());
+            self.by_key.insert(key.to_owned(), (nonce, None));
         }
     }
 
     fn key(&self, identifier: &str) -> Option<&str> {
         self.by_identifier.get(identifier).map(String::as_str)
+    }
+
+    fn knows_identifier_nonce(&self, identifier: &str) -> bool {
+        identifier
+            .rsplit_once('_')
+            .is_some_and(|(nonce, _)| self.by_nonce.contains_key(nonce))
     }
 
     fn patterns(&self) -> Vec<String> {
@@ -620,7 +707,14 @@ fn matched_identifier(line: &str) -> Option<&str> {
 enum ProviderNotice {
     Batch(Vec<String>),
     Error(String),
+    Fatal(String),
     End,
+}
+
+#[derive(Debug)]
+enum ProviderGenerationError {
+    Retryable(String),
+    Fatal(String),
 }
 
 #[derive(Default)]
@@ -715,7 +809,7 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
         message_id: &str,
     ) -> std::result::Result<Option<QueueMessageState>, String> {
         self.manager
-            .message_state(agent_name, message_id)
+            .message_state_with_runtime(agent_name, message_id, &self.runtime)
             .map_err(|error| error.to_string())
     }
 
@@ -743,27 +837,6 @@ impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDe
             .drain_with_runtime(agent_name, options, &self.runtime)
             .map(|_| ())
             .map_err(|error| error.to_string())
-    }
-}
-
-fn deliver_request<A: ManagedApi + ?Sized>(
-    state: &BridgeState,
-    manager: &ManagedAgents<'_, A>,
-    key: &str,
-    options: DrainOptions,
-    stop: Option<&StopState>,
-) -> Result<CoordinatorDeliveryResult, ChatRuntimeError> {
-    match stop {
-        Some(stop) => chat_runtime::deliver_request_with(
-            state,
-            &CancellableDelivery {
-                manager,
-                runtime: StopRuntime::new(stop),
-            },
-            key,
-            options,
-        ),
-        None => chat_runtime::deliver_request(state, manager, key, options),
     }
 }
 
@@ -818,16 +891,21 @@ fn spawn_provider(
                     }
                     Err(error) if stop.is_stopped() => {
                         stop.record_cleanup_error(format!(
-                            "provider shutdown generation failed: {error}"
+                            "provider shutdown generation failed: {error:?}"
                         ));
                         break;
                     }
-                    Err(error) => send_notice(
+                    Err(ProviderGenerationError::Retryable(error)) => send_notice(
                         &notices,
                         ProviderNotice::Error(error),
                         &output_wake,
                         &overflowed,
                     ),
+                    Err(ProviderGenerationError::Fatal(error)) => {
+                        let _ = notices.send(ProviderNotice::Fatal(error));
+                        wake_output(&output_wake);
+                        break;
+                    }
                 }
                 clear_cancellation(&cancellation);
                 if stop.is_stopped() {
@@ -848,10 +926,10 @@ fn provider_generation(
     notices: &mpsc::SyncSender<ProviderNotice>,
     output_wake: &SharedWake,
     overflowed: &AtomicBool,
-) -> Result<(), String> {
+) -> Result<(), ProviderGenerationError> {
     let inventory = crate::plugins::discover();
     let command = chat_runtime::select_plugin(&inventory, state.config())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))?;
     let timeouts = ProcessPhaseTimeouts::new(
         Duration::from_secs(10),
         Duration::from_secs(30),
@@ -859,34 +937,49 @@ fn provider_generation(
         Duration::from_secs(10),
         Duration::from_secs(2),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))?;
     let (mut backend, process_cancellation) = command
         .connect(timeouts)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))?;
     *cancellation
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(process_cancellation.clone());
     if stop.is_stopped() {
-        process_cancellation
-            .cancel()
-            .map_err(|error| format!("provider cancellation cleanup failed: {error}"))?;
+        process_cancellation.cancel().map_err(|error| {
+            ProviderGenerationError::Retryable(format!(
+                "provider cancellation cleanup failed: {error}"
+            ))
+        })?;
         return Ok(());
     }
-    let request = state
-        .subscribe_request()
-        .map_err(|error| error.to_string())?;
-    let mut subscription =
-        ChatSubscription::open(&mut backend, &request).map_err(|error| error.to_string())?;
+    let request = state.subscribe_request().map_err(|error| match error {
+        ChatRuntimeError::UnresolvedGap(detail) => ProviderGenerationError::Fatal(detail),
+        other => ProviderGenerationError::Retryable(other.to_string()),
+    })?;
+    let mut subscription = ChatSubscription::open(&mut backend, &request)
+        .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))?;
     loop {
         if stop.is_stopped() {
-            process_cancellation
-                .cancel()
-                .map_err(|error| format!("provider cancellation cleanup failed: {error}"))?;
+            process_cancellation.cancel().map_err(|error| {
+                ProviderGenerationError::Retryable(format!(
+                    "provider cancellation cleanup failed: {error}"
+                ))
+            })?;
             return Ok(());
         }
-        match chat_runtime::consume_one(&mut subscription, state)
-            .map_err(|error| error.to_string())?
-        {
+        let consumed = match chat_runtime::consume_one(&mut subscription, state) {
+            Ok(consumed) => consumed,
+            Err(ChatRuntimeError::UnresolvedGap(detail)) => {
+                process_cancellation.cancel().map_err(|error| {
+                    ProviderGenerationError::Fatal(format!(
+                        "{detail}; provider cancellation cleanup failed: {error}"
+                    ))
+                })?;
+                return Err(ProviderGenerationError::Fatal(detail));
+            }
+            Err(error) => return Err(ProviderGenerationError::Retryable(error.to_string())),
+        };
+        match consumed {
             chat_runtime::ConsumedItem::Heartbeat => {}
             chat_runtime::ConsumedItem::End => return Ok(()),
             chat_runtime::ConsumedItem::Batch(admission) => {
@@ -980,12 +1073,15 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     notices: &mpsc::Receiver<ProviderNotice>,
     transport: &mut Option<CommandOutboundTransport>,
 ) -> Result<(), ChatServiceError> {
-    let mut routes = RouteCache::new(state.active_reply_routes()?);
+    let owner_runtime = StopRuntime::new(stop);
+    let mut routes = RouteCache::from_entries(state.reply_route_entries()?);
     let mut control = PassControl {
         transport,
         stop: Some(stop),
     };
-    let initial = manager.read(&state.config().agent_name, SNAPSHOT_LINES)?;
+    let mut direct_keys = DirectKeyQueue::default();
+    let initial =
+        manager.read_with_runtime(&state.config().agent_name, SNAPSHOT_LINES, &owner_runtime)?;
     let initial_report = capture_recovery_snapshot(
         state,
         manager,
@@ -998,8 +1094,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         },
         &mut control,
     )?;
+    enqueue_report_backlog(&mut direct_keys, &initial_report, overflowed);
     log_report(&initial_report);
     let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
+    enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
     log_report(&recovery);
 
     let mut stream: Option<PaneEventStream> = None;
@@ -1007,8 +1105,6 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let mut output_retry_at = Instant::now();
     let mut output_retry_delay = Duration::from_secs(1);
     let mut next_reconciliation = Instant::now() + options.reconciliation_interval;
-    let mut direct_keys = VecDeque::new();
-
     while !stop.is_stopped() {
         for _ in 0..MAX_PROVIDER_NOTICES_PER_PASS {
             let Ok(notice) = notices.try_recv() else {
@@ -1019,6 +1115,11 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                     enqueue_direct_keys(&mut direct_keys, keys, overflowed)
                 }
                 ProviderNotice::Error(error) => eprintln!("agentctl: chat provider: {error}"),
+                ProviderNotice::Fatal(error) => {
+                    return Err(ChatServiceError::Generation(format!(
+                        "chat provider stopped on an unrecoverable stream gap: {error}"
+                    )));
+                }
                 ProviderNotice::End => {
                     eprintln!("agentctl: chat provider stream ended; reconnecting")
                 }
@@ -1026,23 +1127,33 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
         }
         if direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst) {
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
+            enqueue_report_backlog(&mut direct_keys, &report, overflowed);
             log_report(&report);
         }
         if !direct_keys.is_empty() {
-            let keys = direct_keys
-                .drain(..direct_keys.len().min(MAX_KEYS_PER_PASS))
-                .collect::<Vec<_>>();
-            let report = process_keys(state, manager, options.delivery, &keys, &mut control)?;
+            let report = drain_immediate_backlog(
+                state,
+                manager,
+                options.delivery,
+                &mut direct_keys,
+                &mut control,
+                overflowed,
+            )?;
             log_report(&report);
-            for key in &keys {
+            for key in &report.processed_keys {
                 routes.replace(key, state.next_reply_route(key)?);
             }
         }
 
         if Instant::now() >= next_reconciliation {
-            let info = manager.pane_info(&state.config().agent_name)?;
+            let info =
+                manager.pane_info_with_runtime(&state.config().agent_name, &owner_runtime)?;
             if matches!(info.status.as_str(), "idle" | "done") {
-                let snapshot = manager.read(&state.config().agent_name, SNAPSHOT_LINES)?;
+                let snapshot = manager.read_with_runtime(
+                    &state.config().agent_name,
+                    SNAPSHOT_LINES,
+                    &owner_runtime,
+                )?;
                 let report = capture_recovery_snapshot(
                     state,
                     manager,
@@ -1055,9 +1166,11 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                     },
                     &mut control,
                 )?;
+                enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                 log_report(&report);
             }
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
+            enqueue_report_backlog(&mut direct_keys, &report, overflowed);
             log_report(&report);
             next_reconciliation = Instant::now() + options.reconciliation_interval;
         }
@@ -1077,7 +1190,13 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             output_retry_delay = Duration::from_secs(1);
         }
         if stream.is_none() && Instant::now() >= output_retry_at {
-            match connect_output(client, manager, state, desired_patterns.clone()) {
+            match connect_output(
+                client,
+                manager,
+                state,
+                desired_patterns.clone(),
+                Some(&owner_runtime),
+            ) {
                 Ok(connected) => {
                     let wake = connected
                         .wake_handle()
@@ -1106,14 +1225,16 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             };
             match active.wait(timeout) {
                 Ok(events) => {
+                    let info = manager
+                        .pane_info_with_runtime(&state.config().agent_name, &owner_runtime)?;
+                    if info.pane_id != subscribed_pane {
+                        return Err(ChatServiceError::Generation(format!(
+                            "coordinator moved from subscribed pane {subscribed_pane:?} to {:?}",
+                            info.pane_id
+                        )));
+                    }
+                    let mut unknown_route_seen = false;
                     for event in events {
-                        let info = manager.pane_info(&state.config().agent_name)?;
-                        if info.pane_id != subscribed_pane {
-                            return Err(ChatServiceError::Generation(format!(
-                                "coordinator moved from subscribed pane {subscribed_pane:?} to {:?}",
-                                info.pane_id
-                            )));
-                        }
                         match event {
                             PaneEvent::Output {
                                 matched_line,
@@ -1135,14 +1256,19 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                     },
                                     &mut control,
                                 )?;
+                                unknown_route_seen |= report.recovery_requested;
+                                enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                                 log_report(&report);
                             }
                             PaneEvent::Settled { status }
                                 if info.status == status
                                     && matches!(status.as_str(), "idle" | "done") =>
                             {
-                                let snapshot =
-                                    manager.read(&state.config().agent_name, SNAPSHOT_LINES)?;
+                                let snapshot = manager.read_with_runtime(
+                                    &state.config().agent_name,
+                                    SNAPSHOT_LINES,
+                                    &owner_runtime,
+                                )?;
                                 let report = capture_recovery_snapshot(
                                     state,
                                     manager,
@@ -1155,6 +1281,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                     },
                                     &mut control,
                                 )?;
+                                enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                                 log_report(&report);
                                 let recovery = recover_pass(
                                     state,
@@ -1163,10 +1290,32 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                     &mut routes,
                                     &mut control,
                                 )?;
+                                enqueue_report_backlog(&mut direct_keys, &recovery, overflowed);
                                 log_report(&recovery);
                             }
                             PaneEvent::Settled { .. } => {}
                         }
+                    }
+                    if unknown_route_seen {
+                        let snapshot = manager.read_with_runtime(
+                            &state.config().agent_name,
+                            SNAPSHOT_LINES,
+                            &owner_runtime,
+                        )?;
+                        let report = capture_recovery_snapshot(
+                            state,
+                            manager,
+                            options.delivery,
+                            &mut routes,
+                            SnapshotInput {
+                                text: &snapshot,
+                                truncated: false,
+                                revision: None,
+                            },
+                            &mut control,
+                        )?;
+                        enqueue_report_backlog(&mut direct_keys, &report, overflowed);
+                        log_report(&report);
                     }
                 }
                 Err(error) => {
@@ -1197,6 +1346,11 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                     ProviderNotice::Error(error) => {
                         eprintln!("agentctl: chat provider: {error}")
                     }
+                    ProviderNotice::Fatal(error) => {
+                        return Err(ChatServiceError::Generation(format!(
+                            "chat provider stopped on an unrecoverable stream gap: {error}"
+                        )));
+                    }
                     ProviderNotice::End => {}
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1213,14 +1367,110 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     Ok(())
 }
 
-fn enqueue_direct_keys(queued: &mut VecDeque<String>, keys: Vec<String>, overflowed: &AtomicBool) {
-    let available = MAX_DIRECT_REQUEST_KEYS.saturating_sub(queued.len());
-    if keys.len() > available {
-        // Every key is already durable. The bounded queue is only a low-latency hint; the recovery
-        // pass owns anything that does not fit without allowing a fast provider to grow memory.
-        overflowed.store(true, Ordering::SeqCst);
+#[derive(Debug, Default)]
+struct DirectKeyQueue {
+    keys: VecDeque<String>,
+    members: BTreeSet<String>,
+}
+
+impl DirectKeyQueue {
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
     }
-    queued.extend(keys.into_iter().take(available));
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn take(&mut self, maximum: usize) -> Vec<String> {
+        let mut result = Vec::with_capacity(maximum.min(self.keys.len()));
+        for _ in 0..maximum.min(self.keys.len()) {
+            let key = self
+                .keys
+                .pop_front()
+                .expect("bounded queue length was checked");
+            self.members.remove(&key);
+            result.push(key);
+        }
+        result
+    }
+}
+
+fn enqueue_direct_keys(queued: &mut DirectKeyQueue, keys: Vec<String>, overflowed: &AtomicBool) {
+    let available = MAX_DIRECT_REQUEST_KEYS.saturating_sub(queued.len());
+    let mut inserted = 0_usize;
+    for key in keys {
+        if queued.members.contains(&key) {
+            continue;
+        }
+        if inserted == available {
+            overflowed.store(true, Ordering::SeqCst);
+            break;
+        }
+        queued.members.insert(key.clone());
+        queued.keys.push_back(key);
+        inserted = inserted.saturating_add(1);
+    }
+}
+
+fn enqueue_report_backlog(
+    queued: &mut DirectKeyQueue,
+    report: &CycleReport,
+    overflowed: &AtomicBool,
+) {
+    if report.more_work && !report.deferred_keys.is_empty() {
+        enqueue_direct_keys(queued, report.deferred_keys.clone(), overflowed);
+    }
+}
+
+fn drain_immediate_backlog<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    delivery: DrainOptions,
+    queued: &mut DirectKeyQueue,
+    control: &mut PassControl<'_>,
+    overflowed: &AtomicBool,
+) -> Result<CycleReport, ChatServiceError> {
+    match control.stop {
+        Some(stop) => drain_immediate_backlog_with_delivery(
+            state,
+            &CancellableDelivery {
+                manager,
+                runtime: StopRuntime::new(stop),
+            },
+            delivery,
+            queued,
+            control,
+            overflowed,
+        ),
+        None => drain_immediate_backlog_with_delivery(
+            state, manager, delivery, queued, control, overflowed,
+        ),
+    }
+}
+
+fn drain_immediate_backlog_with_delivery(
+    state: &BridgeState,
+    coordinator: &dyn chat_runtime::CoordinatorDelivery,
+    delivery: DrainOptions,
+    queued: &mut DirectKeyQueue,
+    control: &mut PassControl<'_>,
+    overflowed: &AtomicBool,
+) -> Result<CycleReport, ChatServiceError> {
+    let mut combined = CycleReport::default();
+    for _ in 0..MAX_IMMEDIATE_BACKLOG_CHUNKS {
+        if queued.is_empty() || control.stopped() {
+            break;
+        }
+        let keys = queued.take(MAX_KEYS_PER_PASS);
+        let report = process_keys_with_delivery(state, coordinator, delivery, &keys, control)?;
+        enqueue_report_backlog(queued, &report, overflowed);
+        combined.merge(report);
+    }
+    if !queued.is_empty() {
+        combined.more_work = true;
+    }
+    Ok(combined)
 }
 
 fn connect_output<A: ManagedApi + ?Sized>(
@@ -1228,12 +1478,18 @@ fn connect_output<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
     state: &BridgeState,
     patterns: Vec<String>,
+    runtime: Option<&dyn AgentRuntime>,
 ) -> Result<PaneEventStream, ChatServiceError> {
-    let info = manager.pane_info(&state.config().agent_name)?;
-    let socket = client
-        .event_socket()
-        .map_err(AgentError::from)
-        .map_err(ChatServiceError::Agent)?;
+    let info = match runtime {
+        Some(runtime) => manager.pane_info_with_runtime(&state.config().agent_name, runtime)?,
+        None => manager.pane_info(&state.config().agent_name)?,
+    };
+    let socket = match runtime {
+        Some(runtime) => client.event_socket_with_cancellation(&|| runtime.cancelled()),
+        None => client.event_socket(),
+    }
+    .map_err(AgentError::from)
+    .map_err(ChatServiceError::Agent)?;
     PaneEventStream::connect(
         &socket,
         &info.pane_id,
@@ -1265,6 +1521,48 @@ mod tests {
     };
 
     static NEXT_STATE: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Default)]
+    struct RecordingDelivery {
+        states: Mutex<BTreeMap<String, QueueMessageState>>,
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl chat_runtime::CoordinatorDelivery for RecordingDelivery {
+        fn message_state(
+            &self,
+            _agent_name: &str,
+            message_id: &str,
+        ) -> std::result::Result<Option<QueueMessageState>, String> {
+            Ok(self.states.lock().expect("states").get(message_id).copied())
+        }
+
+        fn submit(
+            &self,
+            _agent_name: &str,
+            prompt: &str,
+            message_id: &str,
+            _options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            self.prompts
+                .lock()
+                .expect("prompts")
+                .push(prompt.to_owned());
+            self.states
+                .lock()
+                .expect("states")
+                .insert(message_id.to_owned(), QueueMessageState::Processed);
+            Ok(())
+        }
+
+        fn drain(
+            &self,
+            _agent_name: &str,
+            _options: DrainOptions,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
 
     fn state_with_request() -> (BridgeState, String, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -1379,7 +1677,7 @@ mod tests {
 
     #[test]
     fn provider_hint_queue_is_bounded_and_marks_durable_recovery() {
-        let mut queued = VecDeque::new();
+        let mut queued = DirectKeyQueue::default();
         let overflowed = AtomicBool::new(false);
         enqueue_direct_keys(
             &mut queued,
@@ -1390,6 +1688,93 @@ mod tests {
         );
         assert_eq!(queued.len(), MAX_DIRECT_REQUEST_KEYS);
         assert!(overflowed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn restart_drains_full_256_request_batch_without_waiting_for_reconciliation_timer() {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-chat-service-backlog-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private fixture");
+        let state = BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                subscription_plugin: "fixture".to_owned(),
+                channel_ids: vec!["spaces/example".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                agent_name: "coordinator".to_owned(),
+                agent_label: "coordinator".to_owned(),
+                outbound_enabled: false,
+                ack_reaction: None,
+                backend_configuration: None,
+                outbound_command: None,
+            },
+        )
+        .expect("initialize state");
+        let events = (0..chat_subscription::MAX_BATCH_EVENTS)
+            .map(|index| {
+                CommittableEvent::message_created(
+                    InboundMessage::new(
+                        ChannelId::new("spaces/example").expect("channel"),
+                        MessageId::new(format!("spaces/example/messages/{index}"))
+                            .expect("message"),
+                        ThreadId::new("spaces/example/threads/one").expect("thread"),
+                        SenderId::new("users/owner").expect("sender"),
+                        format!("request {index}"),
+                        "2026-09-21T12:00:00Z",
+                        false,
+                    )
+                    .expect("message"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-256").expect("cursor"),
+            DeliveryId::new("delivery-256").expect("delivery"),
+            events,
+        )
+        .expect("batch");
+        state.admit_batch(&batch).expect("admit batch");
+        drop(state);
+
+        let reopened = BridgeState::open(&root).expect("restart state");
+        let mut queued = DirectKeyQueue::default();
+        enqueue_direct_keys(
+            &mut queued,
+            reopened.pending_request_keys().expect("pending keys"),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(queued.len(), chat_subscription::MAX_BATCH_EVENTS);
+        let delivery = RecordingDelivery::default();
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let report = drain_immediate_backlog_with_delivery(
+            &reopened,
+            &delivery,
+            DrainOptions::default(),
+            &mut queued,
+            &mut control,
+            &AtomicBool::new(false),
+        )
+        .expect("drain causal backlog");
+        assert!(queued.is_empty());
+        assert_eq!(report.delivered.len(), chat_subscription::MAX_BATCH_EVENTS);
+        assert_eq!(
+            delivery.prompts.lock().expect("prompts").len(),
+            chat_subscription::MAX_BATCH_EVENTS
+        );
+        assert!(reopened
+            .pending_request_keys()
+            .expect("durable pending keys")
+            .is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1428,6 +1813,82 @@ mod tests {
         assert!(report.captured.is_empty());
         assert_eq!(report.snapshot_revision, Some(7));
         assert_eq!(routes.key(&route.identifier), None);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sixty_four_unknown_fences_coalesce_to_one_recovery_and_find_late_route() {
+        let (state, key, root) = state_with_request();
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("active route");
+        let client = HerdrClient::with_executable("direct", Path::new("/missing/herdr"))
+            .expect("construct client");
+        let manager = ManagedAgents::new(&client, &root.join("registry")).expect("manager");
+        let mut routes = RouteCache::from_entries(Vec::new());
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let mut recovery_requests = 0_usize;
+        for index in 0..64 {
+            let report = capture_direct(
+                &state,
+                &manager,
+                DrainOptions::default(),
+                &mut routes,
+                &format!("unknownnonce{index:02}_1"),
+                SnapshotInput {
+                    text: "bogus terminal marker",
+                    truncated: false,
+                    revision: Some(index),
+                },
+                &mut control,
+            )
+            .expect("unknown route is deferred");
+            recovery_requests += usize::from(report.recovery_requested);
+        }
+        assert_eq!(recovery_requests, 64);
+        let rendered = format!(
+            "<CHAT_REPLY_{}>\nlate route reply\n</CHAT_REPLY_{}>",
+            route.identifier, route.identifier
+        );
+        let report = capture_recovery_snapshot(
+            &state,
+            &manager,
+            DrainOptions::default(),
+            &mut routes,
+            SnapshotInput {
+                text: &rendered,
+                truncated: false,
+                revision: Some(65),
+            },
+            &mut control,
+        )
+        .expect("one coalesced recovery scan");
+        assert_eq!(report.captured.len(), 1);
+        assert_eq!(report.captured[0].0, key);
+        assert!(routes.knows_identifier_nonce(&route.identifier));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn closed_nonce_index_keeps_repeated_old_markers_stale() {
+        let (state, _, root) = state_with_request();
+        let key = "a".repeat(64);
+        let mut routes = RouteCache::from_entries(vec![ReplyRouteEntry {
+            key: key.clone(),
+            nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            current_identifier: Some("AAAAAAAAAAAAAAAAAAAAAA_2".to_owned()),
+        }]);
+        routes.replace(&key, None);
+        assert_eq!(
+            refresh_matched_route(&state, &mut routes, "AAAAAAAAAAAAAAAAAAAAAA_1")
+                .expect("stale route"),
+            MatchedRoute::Stale
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

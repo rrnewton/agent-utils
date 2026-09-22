@@ -423,7 +423,13 @@ plugin, named Herdr target, helper, and authority before creating state; `chat
 run` owns the provider and Herdr subscriptions; `chat tick` performs one bounded
 recovery pass; `chat status` is read-only; and `chat close` retires one exact
 reply route. Its dedicated `chat userguide` documents the schemas and service
-manager limits.
+manager limits. A protocol-v1 provider Gap is journaled without advancing or
+acknowledging its cursor and makes `run` stop fail-closed; automatic reconnect
+is refused until a future explicit repair mechanism can prove completeness.
+Status distinguishes a prepared local commit attempt from an exact confirmed
+plugin callback receipt. Explicitly closed, fully delivered requests outside
+the current inclusive cursor are retired through a bounded fsynced audit and
+replay-guard ring rather than exhausting the 2,048 active-request cap.
 
 One `run` or `tick` process owns each Chat state directory. Stop `run` before
 using `tick` for manual recovery. In the polling edition, explicit `chat reply`
