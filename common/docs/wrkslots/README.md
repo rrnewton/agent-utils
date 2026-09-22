@@ -88,6 +88,27 @@ deliberate migration, place the global `--allow-existing-unregistered-worktrees`
 command. The command retains those directories and acts only on registered slots; use `wrkslots
 audit --format json` to inventory what still needs evidence-based import.
 
+Remote salvage remains the default and preferred preservation path. If a recorded remote refuses
+an agent slot's salvage ref, an operator may rerun that one removal with an existing, absolute
+archive directory outside the project:
+
+```sh
+wrkslots remove slot01 --coordinator-authorized \
+  --coordinator-pid "$CURRENT_COORDINATOR_PID" --expected-generation 1 \
+  --salvage-archive-root "$HOME/temp/agent_checkouts"
+```
+
+This opt-in fallback writes a separate self-contained Git bundle and schema-1 receipt for each
+affected top-level or initialized nested repository. Wrkslots verifies the SHA-256, exact archive
+ref, complete restoration into an empty bare repository, and full object connectivity before the
+ordinary path fence may remove anything. A failed push is recorded as `archived-local`, never as
+remote `salvaged`; omission of the option leaves the slot untouched.
+
+For initialized nested repositories, a later source-checkout switch between recognized GitHub
+HTTPS and SSH spellings does not block cleanup when both URLs still name the same owner and
+repository. Wrkslots salvages through the slot's own checked URL. Different hosts, owners, or
+repository names, and non-GitHub URL spelling changes, still refuse.
+
 `import-existing --from-state-file worktree-state.json --source-host-id ID` admits a slot whose
 owner has already exited from an exact version 3 source row. It preserves the row and source-file
 digest, starts a fresh heartbeat time-to-live, and records the complete candidate ACTIVE row before

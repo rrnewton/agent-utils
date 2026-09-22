@@ -221,6 +221,34 @@ paths, pushes the commit to `refs/heads/salvage/<machine>/<slot>/...`, reads tha
 records the result. If the checkout was already clean and published, the existing remote containment
 is recorded instead. A failed or unverifiable push preserves the checkout.
 
+When the recorded remote cannot accept a salvage ref, an operator may explicitly choose durable
+local custody by adding `--salvage-archive-root ABSOLUTE_PATH` to `remove`. There is no default: the
+directory must already exist, must be owned by the current user, must not be group/world writable,
+must have no symlink component, and must be separate from the managed project tree. Wrkslots still
+tries the recorded remote first. Only after that push attempt refuses does it
+write one self-contained Git bundle per affected repository under the supplied root. Each bundle has
+a schema-1 JSON receipt binding the machine, slot generation, checkout and repository identities,
+remote URL digest, source and salvage commits, status digest, archive ref, byte count, and SHA-256.
+Wrkslots clones the bundle into a fresh empty bare repository, resolves the exact archive ref, and
+runs `git fsck --full --strict --no-dangling` before recording `archived-local`. The same bundle,
+receipt, digest, and fresh-clone verification are read back again at the destructive boundary.
+
+An interrupted removal can be resumed with ordinary `wrkslots recover`; its finish journal carries
+the verified local receipt. If interruption occurred just before the finish journal was created,
+repeat the original `remove` command with the same archive root. The deterministic archive path is
+reused only when its receipt and bundle still exactly verify. A missing, changed, partial, or
+wrongly-bound archive refuses and leaves the checkout intact. Local archive custody is intentionally
+not available through `retire-pending`, because selecting that durability boundary must be an
+explicit per-slot operator action.
+
+```sh
+mkdir -p "$HOME/temp/agent_checkouts"
+wrkslots remove slot01 \
+  --coordinator-pid "$CURRENT_COORDINATOR_PID" \
+  --expected-generation 1 \
+  --salvage-archive-root "$HOME/temp/agent_checkouts"
+```
+
 Gitignored content is excluded by repository policy, not by size. It is never added with `--force`,
 never included in the salvage status digest, and never uploaded to the recorded remote. Authored work
 that must survive belongs in tracked or ordinary untracked paths, or in a separately recorded
@@ -228,7 +256,13 @@ artifact store; an ignored build tree is not remote preservation evidence.
 
 Initialized Git submodules are checked separately against the corresponding source repository's
 remote URL. Each nested repository gets its own salvage commit and remote readback, so an
-uncommitted file inside a submodule cannot disappear behind an outer gitlink that did not move.
+uncommitted file inside a submodule cannot disappear behind an outer gitlink that did not move. If
+explicit local custody is enabled, a nested repository whose own remote refuses gets its own bundle
+and receipt; a successful parent remote publication does not weaken that nested check.
+The source checkout is allowed to switch between the recognized GitHub HTTPS, SCP-style SSH, and
+`ssh://git@github.com/` spellings only when the lowercase owner and repository components remain
+identical. Salvage continues to use and recheck the managed slot's own URL. A different host, owner,
+or repository still refuses; arbitrary local URLs and other hosting providers remain byte-exact.
 
 ## Import older slots
 

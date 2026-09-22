@@ -51,6 +51,8 @@ _VALIDATION_REMOVAL_PROOF_BYTES_LIMIT = 64 * 1024
 _VALIDATION_REMOVAL_ARTIFACT_BYTES_LIMIT = 16 * 1024 * 1024
 _NETWORK_CONFIG_SHA256_ENV = "WRKSLOTS_NETWORK_CONFIG_SHA256"
 _NETWORK_CONFIG_BYTES_LIMIT = 1024 * 1024
+_LOCAL_SALVAGE_RECEIPT_SCHEMA = 1
+_LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT = 256 * 1024
 _NETWORK_CONFIG = (
     b"[core]\n"
     b"\trepositoryformatversion = 0\n"
@@ -10454,6 +10456,386 @@ def _salvage_pathspecs(config: Config, checkout_name: str) -> list[str]:
     return pathspecs
 
 
+def _local_salvage_archive_root(config: Config, raw: str | None) -> Path | None:
+    """Validate the explicit operator-owned root for local salvage bundles."""
+    if raw is None:
+        return None
+    root = Path(raw)
+    if not root.is_absolute() or ".." in root.parts:
+        raise Refusal("--salvage-archive-root must be an absolute path without '..'")
+    root = Path(os.path.normpath(str(root)))
+    if root == Path("/"):
+        raise Refusal("--salvage-archive-root must not be the filesystem root")
+    current = Path("/")
+    for part in root.parts[1:]:
+        current /= part
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise Refusal(
+                f"--salvage-archive-root must already exist as a real directory: {root}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise Refusal(f"--salvage-archive-root crosses a symlink: {current}")
+    if not root.is_dir():
+        raise Refusal(f"--salvage-archive-root is not a directory: {root}")
+    root_metadata = root.stat(follow_symlinks=False)
+    if root_metadata.st_uid != os.getuid() or root_metadata.st_mode & 0o022:
+        raise Refusal(
+            "--salvage-archive-root must be owned by the current user and not group/world writable"
+        )
+    if _path_is_within(root, config.root) or _path_is_within(config.root, root):
+        raise Refusal(
+            "--salvage-archive-root must be separate from the managed project tree"
+        )
+    return root
+
+
+def _sha256_regular_file(path: Path, label: str) -> tuple[str, int]:
+    """Hash a stable regular file without following a replacement symlink."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot open {label} {path}: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise Refusal(f"{label} is not a regular file: {path}")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+        path_after = path.stat(follow_symlinks=False)
+    except Refusal:
+        raise
+    except OSError as exc:
+        raise Refusal(f"cannot read {label} {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+    stable = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in stable) or any(
+        getattr(after, field) != getattr(path_after, field) for field in stable
+    ):
+        raise Refusal(f"{label} changed while it was read: {path}")
+    if size != after.st_size:
+        raise Refusal(f"{label} size changed while it was read: {path}")
+    return digest.hexdigest(), size
+
+
+def _local_salvage_paths(
+    archive_root: Path,
+    record: ActiveRecord,
+    checkout: Checkout,
+    commit: str,
+) -> tuple[Path, Path, str]:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", checkout.name).strip("-.") or "checkout"
+    name_digest = hashlib.sha256(checkout.name.encode("utf-8")).hexdigest()[:12]
+    directory = (
+        archive_root
+        / "wrkslots-salvage"
+        / record.machine
+        / record.slot
+        / str(record.generation)
+        / f"{safe_name}-{name_digest}-{commit[:12]}"
+    )
+    ref = (
+        f"refs/heads/wrkslots-salvage/{record.machine}/{record.slot}/"
+        f"{record.generation}/{safe_name}-{name_digest}"
+    )
+    _validate_full_ref(ref, "local salvage archive ref")
+    return directory / "repository.bundle", directory / "receipt.json", ref
+
+
+def _prepare_local_salvage_directory(root: Path, directory: Path) -> None:
+    """Create private archive descendants and reject unsafe pre-existing ones."""
+    relative = directory.relative_to(root)
+    current = root
+    for part in relative.parts:
+        current /= part
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise Refusal(f"cannot create local salvage archive directory {current}: {exc}") from exc
+        metadata = current.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise Refusal(
+                f"local salvage archive directory is not private current-user storage: {current}"
+            )
+
+
+def _verify_local_salvage_bundle(
+    bundle: Path,
+    expected_sha256: str,
+    expected_size: int,
+    archive_ref: str,
+    commit: str,
+    vcs: _GitVcs,
+) -> None:
+    observed_digest, observed_size = _sha256_regular_file(bundle, "local salvage bundle")
+    if (observed_digest, observed_size) != (expected_sha256, expected_size):
+        raise Refusal(f"local salvage bundle changed after publication: {bundle}")
+    with tempfile.TemporaryDirectory(prefix="wrkslots-archive-verify-") as temporary:
+        root = Path(temporary)
+        restored = root / "restored.git"
+        vcs._run(root, ["clone", "--bare", "--", str(bundle), str(restored)])
+        restored_commit = vcs._run(
+            restored, ["rev-parse", "--verify", archive_ref]
+        ).stdout.strip()
+        if restored_commit != commit:
+            raise Refusal(
+                f"local salvage bundle ref {archive_ref} names {restored_commit}, not {commit}"
+            )
+        vcs._run(restored, ["cat-file", "-e", f"{commit}^{{tree}}"])
+        vcs._run(restored, ["fsck", "--full", "--strict", "--no-dangling"])
+
+
+def _local_salvage_receipt_payload(
+    archive_root: Path,
+    bundle: Path,
+    archive_ref: str,
+    record: ActiveRecord,
+    checkout: Checkout,
+    facts: _SalvageCandidate,
+    bundle_sha256: str,
+    bundle_size: int,
+) -> dict[str, object]:
+    return {
+        "schema": _LOCAL_SALVAGE_RECEIPT_SCHEMA,
+        "kind": "wrkslots-local-salvage-archive",
+        "machine": record.machine,
+        "slot": record.slot,
+        "generation": record.generation,
+        "checkout": checkout.name,
+        "repository": checkout.repository,
+        "remote": checkout.remote,
+        "remote_url_sha256": checkout.remote_url_sha256,
+        "source_head": facts.head,
+        "salvage_commit": facts.commit,
+        "status_sha256": facts.status_digest,
+        "archive_root": str(archive_root),
+        "bundle": str(bundle.relative_to(archive_root)),
+        "bundle_sha256": bundle_sha256,
+        "bundle_bytes": bundle_size,
+        "archive_ref": archive_ref,
+        "verification": {
+            "fresh_bare_clone": True,
+            "exact_ref": True,
+            "full_fsck": True,
+            "complete_history": True,
+        },
+    }
+
+
+def _archive_salvage_locally(
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    path: Path,
+    facts: _SalvageCandidate,
+    archive_root: Path,
+    remote_failure: Refusal,
+    vcs: _GitVcs,
+) -> dict[str, object]:
+    """Create and read back a self-contained bundle after remote salvage refused."""
+    checked_root = _local_salvage_archive_root(config, str(archive_root))
+    assert checked_root is not None
+    bundle, receipt_path, archive_ref = _local_salvage_paths(
+        checked_root, record, checkout, facts.commit
+    )
+    _prepare_local_salvage_directory(checked_root, bundle.parent)
+    _ensure_no_symlink_components(checked_root, bundle.parent, "local salvage archive")
+
+    if not bundle.exists():
+        with tempfile.TemporaryDirectory(prefix="wrkslots-bundle-stage-") as temporary:
+            stage_root = Path(temporary)
+            stage = stage_root / "stage.git"
+            temp_bundle = (
+                bundle.parent
+                / f".{bundle.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            )
+            vcs._run(stage_root, ["init", "--bare", "--", str(stage)])
+            objects = vcs.common_directory(path) / "objects"
+            object_env = {"GIT_OBJECT_DIRECTORY": str(objects)}
+            vcs._run(
+                stage,
+                ["update-ref", archive_ref, facts.commit],
+                env_overrides=object_env,
+            )
+            try:
+                vcs._run(
+                    stage,
+                    ["bundle", "create", str(temp_bundle), archive_ref],
+                    env_overrides=object_env,
+                )
+                descriptor = os.open(temp_bundle, os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                os.chmod(temp_bundle, 0o444)
+                temp_digest, temp_size = _sha256_regular_file(
+                    temp_bundle, "temporary local salvage bundle"
+                )
+                _verify_local_salvage_bundle(
+                    temp_bundle, temp_digest, temp_size, archive_ref, facts.commit, vcs
+                )
+                try:
+                    os.link(temp_bundle, bundle, follow_symlinks=False)
+                    _fsync_directory(bundle.parent)
+                except FileExistsError:
+                    pass
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    temp_bundle.unlink()
+
+    bundle_digest, bundle_size = _sha256_regular_file(bundle, "local salvage bundle")
+    _verify_local_salvage_bundle(
+        bundle, bundle_digest, bundle_size, archive_ref, facts.commit, vcs
+    )
+    expected_receipt = _local_salvage_receipt_payload(
+        checked_root,
+        bundle,
+        archive_ref,
+        record,
+        checkout,
+        facts,
+        bundle_digest,
+        bundle_size,
+    )
+    if receipt_path.exists() or receipt_path.is_symlink():
+        contents = _read_bounded_regular_file(
+            receipt_path,
+            "local salvage archive receipt",
+            _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
+        )
+        observed = _strict_json_object(contents, "local salvage archive receipt")
+        if not _json_equal(observed, expected_receipt):
+            raise Refusal(
+                f"local salvage archive receipt disagrees with the current checkout: {receipt_path}"
+            )
+    else:
+        _atomic_write_json(receipt_path, expected_receipt)
+        contents = _read_bounded_regular_file(
+            receipt_path,
+            "local salvage archive receipt",
+            _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
+        )
+        if not _json_equal(
+            _strict_json_object(contents, "local salvage archive receipt"),
+            expected_receipt,
+        ):
+            raise Refusal(f"local salvage archive receipt readback failed: {receipt_path}")
+    receipt_sha256 = hashlib.sha256(contents).hexdigest()
+    _interrupt_for_test("after-local-salvage-archive")
+    print(
+        f"WARNING: remote salvage refused for checkout {checkout.name}; "
+        f"using verified local archive {bundle}",
+        file=sys.stderr,
+    )
+    return {
+        "checkout": checkout.name,
+        "source_head": facts.head,
+        "salvage_commit": facts.commit,
+        "status_sha256": facts.status_digest,
+        "disposition": "archived-local",
+        "remote_ref": None,
+        "containing_remote_refs": [],
+        "archive_root": str(checked_root),
+        "archive_receipt": str(receipt_path),
+        "archive_receipt_sha256": receipt_sha256,
+        "archive_bundle": str(bundle),
+        "archive_bundle_sha256": bundle_digest,
+        "archive_bundle_bytes": bundle_size,
+        "archive_ref": archive_ref,
+        "complete_history": True,
+        "remote_failure": str(remote_failure),
+    }
+
+
+def _assert_local_salvage_receipt(
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    facts: _SalvageCandidate,
+    salvage: Mapping[str, object],
+    vcs: _GitVcs,
+) -> None:
+    root = _local_salvage_archive_root(
+        config,
+        _as_str(salvage.get("archive_root"), "salvage receipt.archive_root"),
+    )
+    assert root is not None
+    bundle, receipt_path, archive_ref = _local_salvage_paths(
+        root, record, checkout, facts.commit
+    )
+    if _as_str(
+        salvage.get("archive_receipt"), "salvage receipt.archive_receipt"
+    ) != str(receipt_path):
+        raise Refusal("local salvage receipt path does not match its bound checkout")
+    if _as_str(
+        salvage.get("archive_bundle"), "salvage receipt.archive_bundle"
+    ) != str(bundle):
+        raise Refusal("local salvage bundle path does not match its bound checkout")
+    if _as_str(salvage.get("archive_ref"), "salvage receipt.archive_ref") != archive_ref:
+        raise Refusal("local salvage archive ref does not match its bound checkout")
+    receipt_contents = _read_bounded_regular_file(
+        receipt_path,
+        "local salvage archive receipt",
+        _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
+    )
+    receipt_digest = hashlib.sha256(receipt_contents).hexdigest()
+    if receipt_digest != _as_str(
+        salvage.get("archive_receipt_sha256"),
+        "salvage receipt.archive_receipt_sha256",
+    ):
+        raise Refusal(f"local salvage archive receipt changed: {receipt_path}")
+    bundle_digest = _as_str(
+        salvage.get("archive_bundle_sha256"), "salvage receipt.archive_bundle_sha256"
+    )
+    bundle_size = _as_int(
+        salvage.get("archive_bundle_bytes"),
+        "salvage receipt.archive_bundle_bytes",
+        minimum=1,
+    )
+    expected_receipt = _local_salvage_receipt_payload(
+        root,
+        bundle,
+        archive_ref,
+        record,
+        checkout,
+        facts,
+        bundle_digest,
+        bundle_size,
+    )
+    observed_receipt = _strict_json_object(
+        receipt_contents, "local salvage archive receipt"
+    )
+    if not _json_equal(observed_receipt, expected_receipt):
+        raise Refusal(
+            f"local salvage archive receipt no longer binds the current checkout: {receipt_path}"
+        )
+    if salvage.get("complete_history") is not True:
+        raise StateError("local salvage receipt does not assert complete history")
+    _verify_local_salvage_bundle(
+        bundle, bundle_digest, bundle_size, archive_ref, facts.commit, vcs
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _SalvageCandidate:
     head: str
@@ -10636,8 +11018,9 @@ def _submodule_salvage_checkouts(
         if vcs.repository_root(source) != source.absolute():
             raise Refusal(f"source submodule is not a Git root: {source}")
         remote = config.default_remote
-        authorized_remote = vcs.remote_url_sha256(source, remote)
-        if vcs.remote_url_sha256(managed, remote) != authorized_remote:
+        source_authority = vcs.remote_authority(source, remote)
+        managed_authority = vcs.remote_authority(managed, remote)
+        if not _same_repository_remote(source_authority.url, managed_authority.url):
             raise Refusal(
                 f"submodule {checkout.name}/{relative_value} remote {remote} differs "
                 "from its configured source; preserve the slot for inspection"
@@ -10654,7 +11037,9 @@ def _submodule_salvage_checkouts(
                     branch="",
                     start_point=head,
                     remote=remote,
-                    remote_url_sha256=authorized_remote,
+                    # The source checkout may change transport independently.
+                    # Salvage still uses and rechecks the slot's own URL.
+                    remote_url_sha256=managed_authority.sha256,
                     landed_ref=_landed_ref_for_remote(config, remote),
                     head=head,
                 ),
@@ -10662,6 +11047,27 @@ def _submodule_salvage_checkouts(
             )
         )
     return tuple(result)
+
+
+def _github_repository_identity(url: str) -> tuple[str, str] | None:
+    patterns = (
+        r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+        r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+        r"ssh://git@github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, url)
+        if match is not None:
+            return match.group(1).lower(), match.group(2).lower()
+    return None
+
+
+def _same_repository_remote(left: str, right: str) -> bool:
+    """Accept exact URLs, or known GitHub transports for the same owner/repo."""
+    if left == right:
+        return True
+    left_identity = _github_repository_identity(left)
+    return left_identity is not None and left_identity == _github_repository_identity(right)
 
 
 def _salvage_one_checkout(
@@ -10673,6 +11079,7 @@ def _salvage_one_checkout(
     path_override: Path | None = None,
     allow_detached: bool = False,
     prepared: _SalvageCandidate | None = None,
+    archive_root: Path | None = None,
 ) -> dict[str, object]:
     path = path_override or _stored_path(config, checkout.path, "checkout path")
     facts = (
@@ -10709,13 +11116,21 @@ def _salvage_one_checkout(
         f"{salvage_name}-{record.generation}-{facts.commit[:12]}"
     )
     _validate_full_ref(salvage_ref, "salvage ref")
-    vcs.push_salvage(
-        path,
-        checkout.remote,
-        facts.commit,
-        salvage_ref,
-        facts.remote_authority,
-    )
+    try:
+        vcs.push_salvage(
+            path,
+            checkout.remote,
+            facts.commit,
+            salvage_ref,
+            facts.remote_authority,
+        )
+    except Refusal as exc:
+        if archive_root is None:
+            raise
+        vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
+        return _archive_salvage_locally(
+            config, record, checkout, path, facts, archive_root, exc, vcs
+        )
     return {
         "checkout": checkout.name,
         "source_head": facts.head,
@@ -10728,7 +11143,11 @@ def _salvage_one_checkout(
 
 
 def _salvage_agent_slot(
-    config: Config, record: ActiveRecord, vcs: _GitVcs
+    config: Config,
+    record: ActiveRecord,
+    vcs: _GitVcs,
+    *,
+    archive_root: Path | None = None,
 ) -> tuple[dict[str, object], ...]:
     candidates: list[tuple[Checkout, Path, bool]] = []
     for checkout in record.checkouts:
@@ -10767,6 +11186,7 @@ def _salvage_agent_slot(
             path_override=path,
             allow_detached=detached,
             prepared=facts,
+            archive_root=archive_root,
         )
         for checkout, path, detached, facts in prepared
     )
@@ -10988,6 +11408,10 @@ def _assert_salvage_still_matches(
                     f"checkout {checkout.name} is no longer present on its recorded remote; "
                     "preserve it and rerun remove to publish salvage"
                 )
+        elif disposition == "archived-local":
+            _assert_local_salvage_receipt(
+                config, record, checkout, facts, receipt, vcs
+            )
         else:
             raise StateError(f"unknown salvage disposition {disposition!r}")
 
@@ -17392,6 +17816,9 @@ def _cmd_remove(
 ) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
+    salvage_archive_root = _local_salvage_archive_root(
+        config, getattr(args, "salvage_archive_root", None)
+    )
     proof_manifest = getattr(args, "validation_proof_manifest", None)
     completed_record = getattr(args, "completed_record", None)
     if (proof_manifest is None) != (completed_record is None):
@@ -17505,6 +17932,10 @@ def _cmd_remove(
                 "state: REFUSED -- no checkout was salvaged or removed. remedy: omit the flag "
                 "and satisfy the ordinary agent-slot reclaim conditions"
             )
+        if salvage_archive_root is not None and record.slot_type != "agent":
+            raise Refusal(
+                "--salvage-archive-root applies only to agent slots that require Git salvage"
+            )
         create_rows: tuple[_CreateJournalClassification, ...] = ()
         if scoped_validation_finish:
             create_rows = _classify_disjoint_create_journals_for_record(
@@ -17616,6 +18047,9 @@ def _cmd_remove(
                 "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
                 "validate_complete": bool(args.validate_complete),
                 "live_validate_owner": live_validate_owner,
+                "salvage_archive_root": (
+                    None if salvage_archive_root is None else str(salvage_archive_root)
+                ),
             },
         )
         salvage: tuple[dict[str, object], ...]
@@ -17632,14 +18066,20 @@ def _cmd_remove(
                 "verified before deletion, so there was no checkout to salvage",
             )
         else:
-            salvage = _salvage_agent_slot(config, record, _GitVcs())
+            salvage = _salvage_agent_slot(
+                config, record, _GitVcs(), archive_root=salvage_archive_root
+            )
             evidence = tuple(
                 f"checkout {item['checkout']}: {item['disposition']} commit "
                 f"{item['salvage_commit']}"
                 + (
                     f" at {item['remote_ref']}"
                     if item.get("remote_ref") is not None
-                    else " on an existing remote ref"
+                    else (
+                        f" in {item['archive_bundle']}"
+                        if item["disposition"] == "archived-local"
+                        else " on an existing remote ref"
+                    )
                 )
                 for item in salvage
             )
@@ -28606,10 +29046,16 @@ wrkslots manages durable agent and validation worktree slots.
 
 6. After the registered running command and exact process identity prove the owner dead, and the
    recorded time-to-live expires without renewal, any later coordinator may remove the slot.
-   Agent slots publish dirty and unpushed work first; validate slots skip salvage.
+   Agent slots publish dirty and unpushed work first; validate slots skip salvage. If remote
+   publication refuses and an operator explicitly approves durable local custody, pass an existing
+   absolute directory outside the project. Remote publication is still attempted first, and
+   removal begins only after the self-contained Git bundle and receipt pass readback checks.
 
      wrkslots remove slot01 \\
        --coordinator-pid "$CURRENT_COORDINATOR_PID" --expected-generation 1
+
+   Add `--salvage-archive-root "$HOME/temp/agent_checkouts"` to that remove command to enable
+   this fallback. There is no default archive directory.
 
 If a create or removal is interrupted, preserve all paths and run:
 
@@ -29422,7 +29868,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "the heartbeat TTL to be expired, the registered running command to return dead, the "
             "exact owner process generation to be absent, and independent process, mount, Git, "
             "and path checks to agree. Agent slots are salvaged to their recorded remote first; "
-            "validate slots skip salvage. Ambiguity refuses."
+            "an explicit --salvage-archive-root permits a verified local bundle only when remote "
+            "preservation refuses. Validate slots skip salvage. Ambiguity refuses."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -29456,6 +29903,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         required=True,
         metavar="N",
         help="current slot generation",
+    )
+    remove.add_argument(
+        "--salvage-archive-root",
+        metavar="ABSOLUTE_PATH",
+        help=(
+            "operator-approved existing directory outside the managed project, owned by the "
+            "current user and not group/world writable; after the remote salvage push refuses, "
+            "preserve each commit as a self-contained, read-back-verified Git bundle beneath "
+            "this root before removal (default: disabled)"
+        ),
     )
     remove.add_argument(
         "--validation-proof-manifest",

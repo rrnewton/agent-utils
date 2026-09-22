@@ -77,6 +77,12 @@ def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     return completed
 
 
+def reject_all_pushes(remote: Path) -> None:
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+
 _FROZEN_RECORD_PARSER = r'''#!/usr/bin/env python3
 from __future__ import annotations
 
@@ -11680,6 +11686,89 @@ def test_salvage_push_refuses_url_changed_after_authority_preflight(
         )
 
 
+@pytest.mark.parametrize(
+    ("left", "right"),
+    (
+        (
+            "https://github.com/rrnewton/agent-utils.git",
+            "git@github.com:rrnewton/agent-utils.git",
+        ),
+        (
+            "ssh://git@github.com/rrnewton/agent-utils.git",
+            "https://github.com/RRNEWTON/AGENT-UTILS",
+        ),
+        ("/srv/git/repository.git", "/srv/git/repository.git"),
+    ),
+)
+def test_submodule_remote_identity_accepts_same_repository_across_transport(
+    left: str, right: str
+) -> None:
+    assert wrkslots._same_repository_remote(left, right) is True
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    (
+        (
+            "https://github.com/rrnewton/agent-utils.git",
+            "git@github.com:someone-else/agent-utils.git",
+        ),
+        (
+            "https://github.com/rrnewton/agent-utils.git",
+            "git@github.com:rrnewton/different.git",
+        ),
+        (
+            "https://github.com/rrnewton/agent-utils.git",
+            "git@evil.example:rrnewton/agent-utils.git",
+        ),
+        ("/srv/git/repository.git", "/other/repository.git"),
+    ),
+)
+def test_submodule_remote_identity_refuses_different_owner_repository_or_host(
+    left: str, right: str
+) -> None:
+    assert wrkslots._same_repository_remote(left, right) is False
+
+
+def test_submodule_salvage_uses_slot_transport_after_equivalent_source_drift(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    assert create(project).returncode == 0
+    managed = checkout(project) / "component"
+    source = repository / "component"
+    managed_url = "https://github.com/rrnewton/agent-utils.git"
+    git(managed, "remote", "set-url", "origin", managed_url)
+    git(
+        source,
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:rrnewton/agent-utils.git",
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+
+    nested = wrkslots._submodule_salvage_checkouts(
+        config, record.checkouts[0], wrkslots._GitVcs()
+    )
+
+    component = next(value for value, _path in nested if value.name == "product/component")
+    assert component.remote_url_sha256 == hashlib.sha256(managed_url.encode()).hexdigest()
+    git(
+        source,
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:someone-else/agent-utils.git",
+    )
+    with pytest.raises(wrkslots.Refusal, match="differs from its configured source"):
+        wrkslots._submodule_salvage_checkouts(
+            config, record.checkouts[0], wrkslots._GitVcs()
+        )
+
+
 def test_ignored_file_is_preserved_by_finish_refusal(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     (repository / ".gitignore").write_text("ignored.bin\n", encoding="utf-8")
@@ -11888,6 +11977,202 @@ def test_agent_reclaim_pushes_unpushed_commits_and_nonignored_files(
     assert payload["coordinator_authorized"] is False
 
 
+def prepare_refused_salvage(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path]:
+    project, _repository, remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_local(tree, "local.txt", "must survive\n", "local")
+    reject_all_pushes(remote)
+    archive_root = tmp_path / "approved-archive"
+    archive_root.mkdir()
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    return project, tree, remote, archive_root
+
+
+def local_archive_remove(
+    project: Path,
+    archive_root: Path,
+    *,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--salvage-archive-root",
+        str(archive_root),
+        env=env,
+    )
+
+
+def test_agent_reclaim_requires_explicit_root_when_remote_salvage_refuses(
+    tmp_path: Path,
+) -> None:
+    project, tree, _remote, _archive_root = prepare_refused_salvage(tmp_path)
+
+    refused = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert refused.returncode == 3
+    assert "Git refused" in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+
+
+def test_explicit_archive_root_does_not_replace_successful_remote_salvage(
+    tmp_path: Path,
+) -> None:
+    project, _repository, remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_local(tree, "local.txt", "publish remotely\n", "local")
+    archive_root = tmp_path / "approved-archive"
+    archive_root.mkdir()
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+
+    receipts = wrkslots._salvage_agent_slot(
+        config, record, wrkslots._GitVcs(), archive_root=archive_root
+    )
+
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["disposition"] == "salvaged"
+    remote_ref = receipt["remote_ref"]
+    assert isinstance(remote_ref, str)
+    assert (
+        git(remote, "rev-parse", remote_ref).stdout.strip()
+        == receipt["salvage_commit"]
+    )
+    assert list(archive_root.iterdir()) == []
+
+
+def test_agent_reclaim_uses_verified_local_archive_only_after_remote_refuses(
+    tmp_path: Path,
+) -> None:
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+    source_head = git(tree, "rev-parse", "HEAD").stdout.strip()
+    (tree / "untracked.txt").write_text("untracked work\n", encoding="utf-8")
+
+    removed = local_archive_remove(project, archive_root)
+
+    assert removed.returncode == 0, removed.stderr
+    assert "using verified local archive" in removed.stderr
+    assert not tree.exists()
+    archived = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipt = archived["records"][0]["salvage"][0]
+    assert receipt["source_head"] == source_head
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["remote_ref"] is None
+    assert receipt["complete_history"] is True
+    assert "Git refused" in receipt["remote_failure"]
+    bundle = Path(receipt["archive_bundle"])
+    receipt_path = Path(receipt["archive_receipt"])
+    assert hashlib.sha256(bundle.read_bytes()).hexdigest() == receipt["archive_bundle_sha256"]
+    assert hashlib.sha256(receipt_path.read_bytes()).hexdigest() == receipt["archive_receipt_sha256"]
+    restored = tmp_path / "restored.git"
+    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    salvage_commit = receipt["salvage_commit"]
+    assert git(restored, "rev-parse", receipt["archive_ref"]).stdout.strip() == salvage_commit
+    assert git(restored, "show", f"{salvage_commit}:local.txt").stdout == "must survive\n"
+    assert git(restored, "show", f"{salvage_commit}:untracked.txt").stdout == "untracked work\n"
+
+
+def test_agent_reclaim_refuses_tampered_local_archive_before_deletion(
+    tmp_path: Path,
+) -> None:
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+    interrupted = local_archive_remove(
+        project,
+        archive_root,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-local-salvage-archive"},
+    )
+    assert interrupted.returncode == 86
+    receipt_path = next(archive_root.rglob("receipt.json"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    bundle = archive_root / receipt["bundle"]
+    bundle.chmod(0o644)
+    with bundle.open("ab") as output:
+        output.write(b"tampered")
+
+    refused = local_archive_remove(project, archive_root)
+
+    assert refused.returncode == 3
+    assert "bundle" in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+
+
+def test_recover_resumes_verified_local_archive_from_finish_journal(
+    tmp_path: Path,
+) -> None:
+    project, tree, _remote, archive_root = prepare_refused_salvage(tmp_path)
+    interrupted = local_archive_remove(
+        project,
+        archive_root,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-finish-journal"},
+    )
+    assert interrupted.returncode == 86
+    journal = project / "worktrees" / "ACTIVE.testhost.journal"
+    assert journal.is_file()
+    assert tree.is_dir()
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not tree.exists()
+    assert not journal.exists()
+    archived = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    assert archived["records"][0]["salvage"][0]["disposition"] == "archived-local"
+
+
+@pytest.mark.parametrize("archive_root_kind", ("relative", "missing", "symlink", "inside"))
+def test_agent_reclaim_refuses_unapproved_archive_root_before_mutation(
+    tmp_path: Path, archive_root_kind: str
+) -> None:
+    project, tree, _remote, approved = prepare_refused_salvage(tmp_path)
+    if archive_root_kind == "relative":
+        archive_root = Path("relative-archive")
+    elif archive_root_kind == "missing":
+        archive_root = tmp_path / "missing"
+    elif archive_root_kind == "inside":
+        archive_root = project / "archive"
+        archive_root.mkdir()
+    else:
+        archive_root = tmp_path / "archive-link"
+        archive_root.symlink_to(approved, target_is_directory=True)
+
+    refused = local_archive_remove(project, archive_root)
+
+    assert refused.returncode == 3
+    assert "--salvage-archive-root" in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+
+
 def test_agent_reclaim_never_uploads_oversized_ignored_file(
     tmp_path: Path,
 ) -> None:
@@ -12072,6 +12357,82 @@ def test_agent_reclaim_salvages_uncommitted_submodule_files_before_removal(
             f"{nested_receipt['salvage_commit']}:uncommitted.txt",
         ).stdout
         == "must survive\n"
+    )
+
+
+def test_agent_reclaim_archives_nested_repository_when_its_remote_refuses(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    submodule_remote = tmp_path / "submodule.git"
+    submodule_source = tmp_path / "submodule-source"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(submodule_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "clone", str(submodule_remote), str(submodule_source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(submodule_source, "config", "user.name", "Wrkslots Test")
+    git(submodule_source, "config", "user.email", "wrkslots@example.invalid")
+    (submodule_source / "base.txt").write_text("base\n", encoding="utf-8")
+    git(submodule_source, "add", "base.txt")
+    git(submodule_source, "commit", "-m", "submodule base")
+    git(submodule_source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(submodule_remote),
+        "component",
+    )
+    git(repository, "commit", "-am", "add component")
+    git(repository, "push", "origin", "main")
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init --recursive"
+        ],
+    )
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    nested = tree / "component"
+    (nested / "uncommitted.txt").write_text("nested must survive\n", encoding="utf-8")
+    reject_all_pushes(submodule_remote)
+    archive_root = tmp_path / "approved-archive"
+    archive_root.mkdir()
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = local_archive_remove(project, archive_root)
+
+    assert removed.returncode == 0, removed.stderr
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipts = {
+        receipt["checkout"]: receipt for receipt in archive["records"][0]["salvage"]
+    }
+    assert receipts["product"]["disposition"] in {"already-published", "salvaged"}
+    assert "archive_bundle" not in receipts["product"]
+    nested_receipt = receipts["product/component"]
+    assert nested_receipt["disposition"] == "archived-local"
+    restored = tmp_path / "restored-nested.git"
+    git(tmp_path, "clone", "--bare", nested_receipt["archive_bundle"], str(restored))
+    assert (
+        git(
+            restored,
+            "show",
+            f"{nested_receipt['salvage_commit']}:uncommitted.txt",
+        ).stdout
+        == "nested must survive\n"
     )
 
 
