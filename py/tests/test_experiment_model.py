@@ -15,9 +15,12 @@ from parallel_experiment_runner.model import (
     STATUS_CPU_TIMEOUT,
     STATUS_DISK_CAP,
     STATUS_MEMORY_CAP,
+    STATUS_LOG_CAP,
     STATUS_PIDS_CAP,
+    STATUS_RESOURCE_REPORT_ERROR,
     STATUS_TIMEOUT,
     WALL_CPU_BACKSTOP_FACTOR,
+    ExperimentSpec,
     WorkerLimits,
 )
 
@@ -26,7 +29,13 @@ def test_pids_cap_is_a_breach_status() -> None:
     # The fork-bomb axis must be counted as a limit breach (never a hit), alongside the others.
     assert STATUS_PIDS_CAP in BREACH_STATUSES
     assert BREACH_STATUSES >= {
-        STATUS_TIMEOUT, STATUS_CPU_TIMEOUT, STATUS_MEMORY_CAP, STATUS_PIDS_CAP, STATUS_DISK_CAP
+        STATUS_TIMEOUT,
+        STATUS_CPU_TIMEOUT,
+        STATUS_MEMORY_CAP,
+        STATUS_PIDS_CAP,
+        STATUS_DISK_CAP,
+        STATUS_LOG_CAP,
+        STATUS_RESOURCE_REPORT_ERROR,
     }
 
 
@@ -64,3 +73,31 @@ def test_explicit_wall_wins_over_derivation() -> None:
 def test_wall_timeout_rejects_non_positive_when_set() -> None:
     with pytest.raises(ValueError):
         WorkerLimits(wall_timeout_s=0)
+
+
+def test_detached_resource_report_and_unit_prefix_are_atomic() -> None:
+    with pytest.raises(ValueError, match="must be set together"):
+        ExperimentSpec(
+            name="s",
+            command=("run", "{seed}"),
+            detached_resource_report="reports/{seed}.txt",
+        )
+    with pytest.raises(ValueError, match="must contain"):
+        ExperimentSpec(
+            name="s",
+            command=("run", "{seed}"),
+            detached_resource_report="reports/static.txt",
+            detached_unit_prefix="worker-",
+        )
+
+
+def test_detached_execution_requires_every_enforceable_limit() -> None:
+    with pytest.raises(
+        ValueError, match="explicit memory_bytes, cpu_timeout_s, and pids_max"
+    ):
+        ExperimentSpec(
+            name="s",
+            command=("run", "{seed}"),
+            detached_resource_report="reports/{seed}.txt",
+            detached_unit_prefix="worker-",
+        )

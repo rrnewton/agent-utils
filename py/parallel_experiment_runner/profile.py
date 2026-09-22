@@ -82,6 +82,11 @@ def profile_identity(spec: ExperimentSpec) -> ProfileIdentity:
         "hit_regex": spec.hit.regex,
         "hit_exit_codes": list(spec.hit.hit_exit_codes),
     }
+    if spec.detached_resource_report is not None:
+        # Preserve existing profile keys for ordinary workloads while never mixing their
+        # wrapper-only samples with complete detached-child accounting.
+        mandatory["detached_resource_accounting"] = "true"
+        canonical["detached_resource_accounting"] = True
     digest = hashlib.sha256(
         json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:12]
@@ -107,6 +112,7 @@ class Sample:
     cpu_s: float | None
     peak_bytes: int | None
     disk_bytes: int | None
+    tasks_peak: int | None = None
 
 
 def _percentile(values: Sequence[float], pctl: int) -> float:
@@ -155,6 +161,7 @@ class ProfileStore:
                     "cpu_s": s.cpu_s,
                     "peak_bytes": s.peak_bytes,
                     "disk_bytes": s.disk_bytes,
+                    "tasks_peak": s.tasks_peak,
                 }
             )
         if len(bucket) > MAX_SAMPLES_PER_KEY:
@@ -180,8 +187,8 @@ class ProfileStore:
         return out
 
     def estimate(self, key: str) -> CostEstimate:
-        """A DERIVED per-worker estimate for ``key``: conservative (p90) CPU/memory, median
-        wall (wall is contention-inflated, so its median is the fairer central figure).
+        """A DERIVED per-worker estimate for ``key``: conservative (p90) CPU/memory/tasks,
+        median wall (wall is contention-inflated, so its median is the fairer central figure).
 
         Returns :meth:`CostEstimate.unset` when the key has no samples — honest "not measured".
         """
@@ -190,9 +197,16 @@ class ProfileStore:
             return CostEstimate.unset(source=key)
         cpus = self._floats(key, "cpu_s")
         peaks = self._floats(key, "peak_bytes")
+        task_peaks = self._floats(key, "tasks_peak")
         wall_s = _percentile(walls, 50)
         cpu_s = _percentile(cpus, CONSERVATIVE_PCTL) if cpus else None
         peak = int(_percentile(peaks, CONSERVATIVE_PCTL)) if peaks else None
+        peak_tasks = int(_percentile(task_peaks, CONSERVATIVE_PCTL)) if task_peaks else None
         return CostEstimate(
-            wall_s=wall_s, cpu_s=cpu_s, peak_mem_bytes=peak, samples=len(walls), source=key
+            wall_s=wall_s,
+            cpu_s=cpu_s,
+            peak_mem_bytes=peak,
+            samples=len(walls),
+            source=key,
+            peak_tasks=peak_tasks,
         )

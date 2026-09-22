@@ -47,6 +47,10 @@ WALL_CPU_BACKSTOP_FACTOR = 3
 #: Placeholder substituted with each concrete seed in a command template argument.
 SEED_PLACEHOLDER = "{seed}"
 
+#: A machine-level safety ceiling.  A caller may choose a smaller lane or command-line limit,
+#: but no sweep may fan out beyond the largest host class this runner is intended to manage.
+MAX_CONCURRENCY = 316
+
 
 # Worker terminal-status vocabulary. A HIT is the target condition the sweep hunts for; a
 # MISS ran cleanly without it. Everything else is an infrastructure outcome that is NEVER
@@ -60,12 +64,22 @@ STATUS_CPU_TIMEOUT = "cpu-timeout"
 STATUS_MEMORY_CAP = "memory-cap"
 STATUS_PIDS_CAP = "pids-cap"
 STATUS_DISK_CAP = "disk-cap"
+STATUS_LOG_CAP = "log-cap"
+STATUS_RESOURCE_REPORT_ERROR = "resource-report-error"
 STATUS_CANCELLED = "cancelled"
 
 #: Statuses that represent a breach of a declared per-worker limit (reported distinctly and
 #: never as a hit). ``command-error`` is a workload failure, not a limit breach.
 BREACH_STATUSES = frozenset(
-    {STATUS_TIMEOUT, STATUS_CPU_TIMEOUT, STATUS_MEMORY_CAP, STATUS_PIDS_CAP, STATUS_DISK_CAP}
+    {
+        STATUS_TIMEOUT,
+        STATUS_CPU_TIMEOUT,
+        STATUS_MEMORY_CAP,
+        STATUS_PIDS_CAP,
+        STATUS_DISK_CAP,
+        STATUS_LOG_CAP,
+        STATUS_RESOURCE_REPORT_ERROR,
+    }
 )
 
 
@@ -112,19 +126,25 @@ class WorkerLimits:
         if self.cpu_cores < 1:
             raise ValueError(f"cpu_cores must be >= 1, got {self.cpu_cores}")
         if self.memory_bytes is not None and self.memory_bytes <= 0:
-            raise ValueError(f"memory_bytes must be positive when set, got {self.memory_bytes}")
+            raise ValueError(
+                f"memory_bytes must be positive when set, got {self.memory_bytes}"
+            )
         if self.cpu_timeout_s is not None and self.cpu_timeout_s <= 0:
             raise ValueError(
                 f"cpu_timeout_s must be positive when set (None = UNSET), got {self.cpu_timeout_s}"
             )
         if self.pids_max is not None and self.pids_max < 1:
-            raise ValueError(f"pids_max must be >= 1 when set (None = no cap), got {self.pids_max}")
+            raise ValueError(
+                f"pids_max must be >= 1 when set (None = no cap), got {self.pids_max}"
+            )
         if self.wall_timeout_s is not None and self.wall_timeout_s <= 0:
             raise ValueError(
                 f"wall_timeout_s must be positive when set (None = derive), got {self.wall_timeout_s}"
             )
         if self.disk_bytes is not None and self.disk_bytes <= 0:
-            raise ValueError(f"disk_bytes must be positive when set, got {self.disk_bytes}")
+            raise ValueError(
+                f"disk_bytes must be positive when set, got {self.disk_bytes}"
+            )
 
     def resolved_wall_timeout_s(self) -> int:
         """The effective wall backstop in seconds, applying the derive-when-unset idiom.
@@ -148,9 +168,9 @@ class HitCondition:
     """Predicate deciding whether a worker exhibited the target condition.
 
     A hit is declared when the worker's log matches ``regex`` OR its exit code is in
-    ``hit_exit_codes``. An infrastructure breach (timeout / CPU-timeout / OOM / disk / cancel)
-    is classified FIRST and is never a hit, so a worker the runner had to kill can never be
-    mistaken for a discovered bug.
+    ``hit_exit_codes``. An infrastructure breach (CPU/wall timeout, memory/PID/log/disk cap, or
+    cancellation) is classified FIRST and is never a hit, so a worker the runner had to kill can
+    never be mistaken for a discovered bug.
     """
 
     regex: str | None = None
@@ -171,6 +191,8 @@ class ExperimentSpec:
     ``identity`` carries the apples-to-apples fields hashed into the automatic profile key
     (backend, image, kernel, vCPU/mem class, …); ``profile_key`` overrides the key with a
     human-readable label when an agent has judged the grouping comparable (see profile.py).
+    Detached execution requires explicit memory, CPU-time, and PID limits because a producer
+    must enforce and attest the same envelope on the child that left the worker cgroup.
     """
 
     name: str
@@ -180,6 +202,8 @@ class ExperimentSpec:
     identity: Mapping[str, str] = field(default_factory=dict)
     profile_key: str | None = None
     env: Mapping[str, str] = field(default_factory=dict)
+    detached_resource_report: str | None = None
+    detached_unit_prefix: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -191,10 +215,39 @@ class ExperimentSpec:
                 f"ExperimentSpec.command must contain the {SEED_PLACEHOLDER!r} placeholder "
                 "in at least one argument (else every worker runs the identical command)"
             )
+        if self.detached_resource_report is not None and (
+            SEED_PLACEHOLDER not in self.detached_resource_report
+        ):
+            raise ValueError(
+                "detached_resource_report must contain the '{seed}' placeholder"
+            )
+        if (self.detached_resource_report is None) != (
+            self.detached_unit_prefix is None
+        ):
+            raise ValueError(
+                "detached_resource_report and detached_unit_prefix must be set together"
+            )
+        if self.detached_unit_prefix is not None and not self.detached_unit_prefix:
+            raise ValueError("detached_unit_prefix must be non-empty when set")
+        if self.detached_resource_report is not None and (
+            self.worker_limits.memory_bytes is None
+            or self.worker_limits.cpu_timeout_s is None
+            or self.worker_limits.pids_max is None
+        ):
+            raise ValueError(
+                "detached execution requires explicit memory_bytes, cpu_timeout_s, and pids_max"
+            )
 
     def render(self, seed: int) -> tuple[str, ...]:
         """The concrete argv for one seed (every ``{seed}`` substituted)."""
         return tuple(part.replace(SEED_PLACEHOLDER, str(seed)) for part in self.command)
+
+    def resource_report_path(self, seed: int) -> str | None:
+        """Render the optional report produced by a detached child resource domain."""
+
+        if self.detached_resource_report is None:
+            return None
+        return self.detached_resource_report.replace(SEED_PLACEHOLDER, str(seed))
 
 
 @dataclass(frozen=True)
@@ -205,7 +258,8 @@ class ResourceSlice:
     concurrent workstreams (a btrfs sweep, backend builds, CI). A runner reloads its lane
     before every round; a shrink takes effect before the next launch, a grow only permits the
     next calibration doubling (never an instant jump). ``revision`` lets the summary record
-    exactly which carve each round observed.
+    exactly which carve each round observed. ``memory_reserve_bytes`` is subtracted from the
+    live ``MemAvailable`` reading on every round, rather than only from a stale startup snapshot.
     """
 
     revision: int
@@ -213,9 +267,15 @@ class ResourceSlice:
     memory_bytes: int
     disk_bytes: int
     lane: str = ""
+    memory_reserve_bytes: int = 0
 
     def __post_init__(self) -> None:
-        if self.cpu_cores < 0 or self.memory_bytes < 0 or self.disk_bytes < 0:
+        if (
+            self.cpu_cores < 0
+            or self.memory_bytes < 0
+            or self.disk_bytes < 0
+            or self.memory_reserve_bytes < 0
+        ):
             raise ValueError("ResourceSlice envelope values must be non-negative")
 
 
@@ -234,11 +294,14 @@ class CostEstimate:
     peak_mem_bytes: int | None
     samples: int
     source: str  # the profile key the estimate came from, or "UNSET"
+    peak_tasks: int | None = None
 
     @classmethod
     def unset(cls, source: str = "UNSET") -> "CostEstimate":
         """Return an estimate that truthfully carries no measured samples."""
-        return cls(wall_s=None, cpu_s=None, peak_mem_bytes=None, samples=0, source=source)
+        return cls(
+            wall_s=None, cpu_s=None, peak_mem_bytes=None, samples=0, source=source
+        )
 
     @property
     def is_set(self) -> bool:
@@ -250,9 +313,10 @@ class CostEstimate:
 class SeedOutcome:
     """Terminal, structured result of ONE seed's worker.
 
-    ``cpu_s`` and ``peak_bytes`` are the MEASURED actuals (from the worker's cgroup), the
-    other half of requirement 3. ``breach`` is a human-readable "what breached and by how
-    much" string for the four :data:`BREACH_STATUSES`, "" otherwise.
+    ``cpu_s``, ``peak_bytes``, and ``tasks_peak`` are the MEASURED actuals (including an
+    opted-in detached resource domain), the other half of requirement 3. ``breach`` is a
+    human-readable "what breached and by how much" string for :data:`BREACH_STATUSES`, ""
+    otherwise.
     """
 
     seed: int
@@ -261,8 +325,10 @@ class SeedOutcome:
     wall_s: float
     cpu_s: float | None
     peak_bytes: int | None
+    tasks_peak: int | None
     breach: str
     log_path: str
+    resource_report_error: str = ""
 
     @property
     def is_hit(self) -> bool:

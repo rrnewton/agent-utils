@@ -114,6 +114,8 @@ def _spec_from_args(ns: argparse.Namespace) -> "object":
         hit=hit,
         identity=identity,
         profile_key=ns.profile_key or None,
+        detached_resource_report=ns.detached_resource_report,
+        detached_unit_prefix=ns.detached_unit_prefix,
     )
 
 
@@ -170,6 +172,16 @@ def _spec_from_file(path: Path) -> "object":
         identity=identity,
         profile_key=(str(data["profile_key"]) if data.get("profile_key") else None),
         env=env,
+        detached_resource_report=(
+            str(data["detached_resource_report"])
+            if data.get("detached_resource_report")
+            else None
+        ),
+        detached_unit_prefix=(
+            str(data["detached_unit_prefix"])
+            if data.get("detached_unit_prefix")
+            else None
+        ),
     )
 
 
@@ -193,7 +205,15 @@ def _default_slice(work_dir: Path, ns: argparse.Namespace) -> "object":
             disk = st.f_bavail * st.f_frsize
         except OSError:
             disk = 0
-    return ResourceSlice(revision=0, cpu_cores=cpu, memory_bytes=mem, disk_bytes=disk, lane=ns.lane)
+    reserve = parse_size(ns.memory_reserve) if ns.memory_reserve else 0
+    return ResourceSlice(
+        revision=0,
+        cpu_cores=cpu,
+        memory_bytes=mem,
+        disk_bytes=disk,
+        lane=ns.lane,
+        memory_reserve_bytes=reserve or 0,
+    )
 
 
 def _cmd_run(ns: argparse.Namespace) -> int:
@@ -268,6 +288,7 @@ def _sweep_json(sweep: "object") -> str:
             "wall_s": s.up_front.wall_s,
             "cpu_s": s.up_front.cpu_s,
             "peak_mem_bytes": s.up_front.peak_mem_bytes,
+            "peak_tasks": s.up_front.peak_tasks,
             "samples": s.up_front.samples,
             "source": s.up_front.source,
         },
@@ -290,8 +311,10 @@ def _sweep_json(sweep: "object") -> str:
                         "wall_s": o.wall_s,
                         "cpu_s": o.cpu_s,
                         "peak_bytes": o.peak_bytes,
+                        "tasks_peak": o.tasks_peak,
                         "breach": o.breach,
                         "log_path": o.log_path,
+                        "resource_report_error": o.resource_report_error,
                     }
                     for o in r.outcomes
                 ],
@@ -440,15 +463,41 @@ def build_parser() -> argparse.ArgumentParser:
             "--max-concurrency",
             type=int,
             default=64,
-            help="hard ceiling on concurrent workers (declared cap; default 64)",
+            help=(
+                "requested ceiling on concurrent workers (default 64; machine hard cap 316)"
+            ),
         )
         sp.add_argument("--slice-cpu", type=int, default=None, help="lane CPU cores (default: all)")
         sp.add_argument("--slice-memory", default=None, help="lane memory, e.g. 64G (default: avail)")
+        sp.add_argument(
+            "--memory-reserve",
+            default="0",
+            help=(
+                "memory kept outside the lane and subtracted from live MemAvailable every round "
+                "(default: 0; e.g. 64G)"
+            ),
+        )
         sp.add_argument("--slice-disk", default=None, help="lane disk, e.g. 200G (default: free)")
         sp.add_argument("--lane", default="", help="lane label (informational)")
         sp.add_argument("--work-dir", default=".", help="base dir for logs + profile store")
         sp.add_argument("--log-dir", default=None, help="per-worker log dir (default: <wd>/ignored/logs)")
         sp.add_argument("--profile-store", default=None, help="profile-store JSON path")
+        sp.add_argument(
+            "--detached-resource-report",
+            default=None,
+            help=(
+                "per-seed append-friendly key=value report for a child unit outside the worker "
+                "cgroup; must contain {seed}"
+            ),
+        )
+        sp.add_argument(
+            "--detached-unit-prefix",
+            default=None,
+            help=(
+                "required unit-name prefix for detached report accounting and cleanup; must be "
+                "set with --detached-resource-report"
+            ),
+        )
         sp.add_argument("--format", choices=["human", "json"], default="human", help="output format")
         if name == "run":
             sp.add_argument(

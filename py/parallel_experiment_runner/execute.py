@@ -27,11 +27,22 @@ from parallel_experiment_runner.calibrate import (
     ramp_next_width,
     resolve_width,
 )
+from parallel_experiment_runner.detached import (
+    cleanup_registered_reports,
+    cleanup_reports,
+    read_report,
+    register_reports,
+    unregister_reports,
+    verify_limits,
+)
 from parallel_experiment_runner.model import (
+    MAX_CONCURRENCY,
     STATUS_CANCELLED,
     STATUS_CPU_TIMEOUT,
     STATUS_MEMORY_CAP,
+    STATUS_LOG_CAP,
     STATUS_PIDS_CAP,
+    STATUS_RESOURCE_REPORT_ERROR,
     STATUS_TIMEOUT,
     BREACH_STATUSES,
     CostEstimate,
@@ -73,6 +84,24 @@ LOG_TAIL_BYTES = 256 * 1024
 Emit = Callable[[str], None]
 
 
+def _contained_reexec_argv(
+    arguments: Sequence[str], *, python_root: Path | None = None
+) -> list[str]:
+    """Build a re-exec argv that survives systemd's clean import environment.
+
+    A repository-local invocation entered through ``py/bin`` only has the source root because
+    that launcher inserted it into ``sys.path``. Re-executing ``python -m`` loses that in a fresh
+    user-manager environment, so prefer the durable absolute launcher when it exists. Installed
+    distributions have no adjacent launcher and can safely use their installed module.
+    """
+
+    root = python_root or Path(__file__).resolve().parents[1]
+    launcher = root / "bin" / PROG
+    if launcher.is_file():
+        return [sys.executable, str(launcher.resolve()), *arguments]
+    return [sys.executable, "-m", "parallel_experiment_runner", *arguments]
+
+
 def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, int]:
     """Establish the two-level cgroup-v2 RESOURCE CONTAINMENT for a sweep (mirrors ``dagrun``'s
     CLI bring-up).
@@ -91,7 +120,9 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
     if os.environ.get(naming.env_in_scope) == "1":
         manager = cg.Cgroups(naming)
         if manager.enabled:
-            cg.install_scope_teardown(naming=naming)
+            cg.install_scope_teardown(
+                naming=naming, on_teardown=cleanup_registered_reports
+            )
             print(
                 f"{PROG}: resource containment ACTIVE (two-level cgroup-v2 scope; per-worker "
                 "CPU-time/memory/PID caps + setsid-proof teardown).",
@@ -128,7 +159,7 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
             file=sys.stderr,
         )
         return None, 0
-    argv = [sys.executable, "-m", "parallel_experiment_runner", *sys.argv[1:]]
+    argv = _contained_reexec_argv(sys.argv[1:])
     reexeced_or_skipped = cg.reexec_in_scope(argv, memory_max=None, naming=naming)
     detail = (
         "containment was skipped (e.g. CI without a systemd --user scope)"
@@ -168,9 +199,17 @@ def _read_log_tail(path: Path, limit: int = LOG_TAIL_BYTES) -> str:
 
 
 def _breach_message(
-    status: str, *, limits_cpu: int | None, limits_mem: int | None, limits_wall: int,
-    limits_pids: int | None, cpu_s: float | None, peak_bytes: int | None, wall_s: float,
-    oom_kills: int, pids_events: int,
+    status: str,
+    *,
+    limits_cpu: int | None,
+    limits_mem: int | None,
+    limits_wall: int,
+    limits_pids: int | None,
+    cpu_s: float | None,
+    peak_bytes: int | None,
+    wall_s: float,
+    oom_kills: int,
+    pids_events: int,
 ) -> str:
     """A human-readable 'what breached and by how much' line for a breach status (requirement 4)."""
     if status == STATUS_CPU_TIMEOUT:
@@ -187,6 +226,8 @@ def _breach_message(
             "(fork-bomb / PID-exhaustion containment; worker contained not killed, reaped by "
             "the cpu/wall guard)"
         )
+    if status == STATUS_LOG_CAP:
+        return "LOG-CAP: detached producer killed the worker at its output byte cap"
     if status == STATUS_TIMEOUT:
         return f"TIMEOUT: wall {wall_s:.0f}s >= {limits_wall}s backstop"
     if status == STATUS_CANCELLED:
@@ -213,6 +254,22 @@ def _classify_outcome(
     cpu_s = cpu_s / 1_000_000 if cpu_s is not None else None
     peak = row.get("peak_bytes")
     peak_bytes = int(peak) if isinstance(peak, (int, float)) else None
+    tasks_peak: int | None = None
+    report_error = ""
+    report_path_text = spec.resource_report_path(seed)
+    if report_path_text is not None:
+        assert spec.detached_unit_prefix is not None
+        try:
+            detached = read_report(
+                Path(report_path_text).resolve(), spec.detached_unit_prefix
+            )
+            verify_limits(detached, limits)
+        except (OSError, UnicodeError, ValueError) as error:
+            report_error = str(error)
+        else:
+            peak_bytes = (peak_bytes or 0) + detached.memory_peak_bytes
+            cpu_s = (cpu_s or 0.0) + detached.cpu_usage_nsec / 1_000_000_000
+            tasks_peak = detached.tasks_peak
     wall_s = _row_float(row, "elapsed_s") or outcome.duration_s
     oom = _row_int(row, "oom_kills")
     # pids.events rides on the in-memory StepOutcome, NOT the CSV row: it stays off the
@@ -220,6 +277,13 @@ def _classify_outcome(
     pids_events = outcome.pids_events
     cpu_timed_out = bool(row.get("cpu_timed_out"))
     timed_out = bool(row.get("timed_out"))
+    log_capped = False
+    if report_path_text is not None and not report_error:
+        oom += detached.memory_oom_kills
+        pids_events += detached.tasks_limit_hits
+        cpu_timed_out = cpu_timed_out or bool(detached.cpu_time_limit_hit)
+        timed_out = timed_out or bool(detached.wall_time_limit_hit)
+        log_capped = bool(detached.log_cap_hit)
 
     if outcome.aborted:
         status = STATUS_CANCELLED
@@ -229,14 +293,20 @@ def _classify_outcome(
         status = STATUS_MEMORY_CAP
     elif pids_events > 0:
         status = STATUS_PIDS_CAP
+    elif log_capped:
+        status = STATUS_LOG_CAP
     elif timed_out:
         status = STATUS_TIMEOUT
+    elif report_error:
+        status = STATUS_RESOURCE_REPORT_ERROR
     else:
         log_text = _read_log_tail(log_path) if spec.hit.regex else ""
         status = classify_workload(spec.hit, outcome.returncode, log_text)
 
-    breach = (
-        _breach_message(
+    if status == STATUS_RESOURCE_REPORT_ERROR:
+        breach = f"RESOURCE-REPORT-ERROR: {report_error}"
+    elif status in BREACH_STATUSES:
+        breach = _breach_message(
             status,
             limits_cpu=limits.cpu_timeout_s,
             limits_mem=limits.memory_bytes,
@@ -248,9 +318,8 @@ def _classify_outcome(
             oom_kills=oom,
             pids_events=pids_events,
         )
-        if status in BREACH_STATUSES
-        else ""
-    )
+    else:
+        breach = ""
     return SeedOutcome(
         seed=seed,
         status=status,
@@ -258,8 +327,10 @@ def _classify_outcome(
         wall_s=wall_s,
         cpu_s=cpu_s,
         peak_bytes=peak_bytes,
+        tasks_peak=tasks_peak,
         breach=breach,
         log_path=str(log_path),
+        resource_report_error=report_error,
     )
 
 
@@ -273,18 +344,42 @@ def execute_round(plan: RoundPlan, *, cgroups: CgroupManager | None) -> RoundRes
     """
     plan.log_dir.mkdir(parents=True, exist_ok=True)
     dag = generate_round_dag(plan)
-    jobs = max(1, min(plan.width, len(plan.seeds)))
+    # ``run_sweep`` already resolves through the machine cap, but keep the execution boundary
+    # independently safe for programmatic callers constructing a RoundPlan directly.
+    jobs = max(1, min(plan.width, len(plan.seeds), MAX_CONCURRENCY))
     max_cpus = jobs * plan.spec.worker_limits.cpu_cores
 
-    start = time.time()
-    result: RunResult = run_dag_limited(
-        dag,
-        max_steps=jobs,
-        max_cpus=max_cpus,
-        cgroups=cgroups,
-        keep_going=True,
-        verbosity=1,
+    detached_reports = tuple(
+        (Path(path).resolve(), plan.spec.detached_unit_prefix)
+        for seed in plan.seeds
+        if (path := plan.spec.resource_report_path(seed)) is not None
+        and plan.spec.detached_unit_prefix is not None
     )
+    duplicate_paths = len({path for path, _prefix in detached_reports}) != len(
+        detached_reports
+    )
+    if duplicate_paths:
+        raise ValueError("detached resource report paths must be unique per seed")
+    preexisting = [path for path, _prefix in detached_reports if path.exists()]
+    if preexisting:
+        raise ValueError(
+            "detached resource report paths must not exist before launch: "
+            + ", ".join(str(path) for path in preexisting)
+        )
+    register_reports(detached_reports)
+    start = time.time()
+    try:
+        result: RunResult = run_dag_limited(
+            dag,
+            max_steps=jobs,
+            max_cpus=max_cpus,
+            cgroups=cgroups,
+            keep_going=True,
+            verbosity=1,
+        )
+    finally:
+        cleanup_reports(detached_reports)
+        unregister_reports(detached_reports)
     wall_s = time.time() - start
 
     rows_by_tag: dict[str, Mapping[str, object]] = {
@@ -307,6 +402,7 @@ def execute_round(plan: RoundPlan, *, cgroups: CgroupManager | None) -> RoundRes
                     wall_s=0.0,
                     cpu_s=None,
                     peak_bytes=None,
+                    tasks_peak=None,
                     breach="CANCELLED: worker never ran (skipped by scheduler)",
                     log_path=str(worker_log_path(plan.log_dir, seed)),
                 )
@@ -359,7 +455,9 @@ class SweepResult:
         return len(self.outcomes) / self.total_wall_s if self.total_wall_s > 0 else 0.0
 
 
-def _record_samples(store: ProfileStore, key: str, round_result: RoundResult) -> int | None:
+def _record_samples(
+    store: ProfileStore, key: str, round_result: RoundResult
+) -> int | None:
     """Persist the COMPLETED (non-breach) workers of a round under ``key`` for future estimates.
 
     Breached workers are excluded: a CPU-timeout worker's CPU seconds are the budget, not the
@@ -371,9 +469,19 @@ def _record_samples(store: ProfileStore, key: str, round_result: RoundResult) ->
     for o in round_result.outcomes:
         if o.is_breach:
             continue
-        samples.append(Sample(wall_s=o.wall_s, cpu_s=o.cpu_s, peak_bytes=o.peak_bytes, disk_bytes=None))
+        samples.append(
+            Sample(
+                wall_s=o.wall_s,
+                cpu_s=o.cpu_s,
+                peak_bytes=o.peak_bytes,
+                disk_bytes=None,
+                tasks_peak=o.tasks_peak,
+            )
+        )
         if o.peak_bytes is not None:
-            peak_seen = o.peak_bytes if peak_seen is None else max(peak_seen, o.peak_bytes)
+            peak_seen = (
+                o.peak_bytes if peak_seen is None else max(peak_seen, o.peak_bytes)
+            )
     store.record(key, samples)
     return peak_seen
 
@@ -447,7 +555,9 @@ def run_sweep(
         if not identity.ephemeral:
             peak = _record_samples(profile_store, identity.key, round_result)
             if peak is not None:
-                measured_peak = peak if measured_peak is None else max(measured_peak, peak)
+                measured_peak = (
+                    peak if measured_peak is None else max(measured_peak, peak)
+                )
         _emit_round_actual(emit, round_index, round_result)
 
     total_wall = sum(r.wall_s for r in rounds)
@@ -478,7 +588,11 @@ def _fmt_mem(value: int | None) -> str:
 
 
 def _emit_up_front(
-    emit: Emit, spec: ExperimentSpec, seeds: Sequence[int], key: str, ephemeral: bool,
+    emit: Emit,
+    spec: ExperimentSpec,
+    seeds: Sequence[int],
+    key: str,
+    ephemeral: bool,
     est: CostEstimate,
 ) -> None:
     n = len(seeds)
@@ -488,7 +602,9 @@ def _emit_up_front(
         emit(
             f"ESTIMATE for '{spec.name}' [{key}{marker}] over {n} seed(s), from {est.samples} "
             f"prior sample(s): per-worker wall~{_fmt_secs(est.wall_s)}, cpu~{_fmt_secs(est.cpu_s)}, "
-            f"peak~{_fmt_mem(est.peak_mem_bytes)}; aggregate cpu~{_fmt_secs(agg_cpu)} "
+            f"peak~{_fmt_mem(est.peak_mem_bytes)}, tasks~"
+            f"{est.peak_tasks if est.peak_tasks is not None else 'UNSET'}; "
+            f"aggregate cpu~{_fmt_secs(agg_cpu)} "
             f"(wall depends on the calibrated width)."
         )
     else:
