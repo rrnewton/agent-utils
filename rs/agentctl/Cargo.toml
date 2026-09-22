@@ -12,6 +12,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+chat-subscription-plugin = { version = "0.1.0", path = "../chat-subscription-plugin" }
 clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
 libc = "0.2"

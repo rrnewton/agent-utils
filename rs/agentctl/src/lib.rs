@@ -9,6 +9,7 @@ pub mod client;
 pub mod codex_goal;
 pub mod error;
 pub mod legacy_cli;
+pub mod plugins;
 pub mod subagents;
 
 /// Reference for the canonical command and its supported adapters.

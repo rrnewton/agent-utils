@@ -6,6 +6,8 @@ version, license, README, and embedded user guide.
 
 | Crate | Binaries | Purpose |
 |---|---|---|
+| `chat-subscription` | library | Model ordered inbound events, replay gaps, and durable acknowledgement boundaries. |
+| `chat-subscription-plugin` | library | Carry the subscription contract over a bounded, versioned process protocol. |
 | `dagrun` | `dagrun`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr-landing-planner` | Produce advisory, conflict-aware pull-request landing plans. |
@@ -21,6 +23,9 @@ cargo install pr-landing-planner
 cargo install herdr-run
 cargo install agentctl
 ```
+
+The two chat-subscription libraries are ordinary Cargo dependencies for provider
+and host implementations; they do not install command-line programs.
 
 For workspace development:
 

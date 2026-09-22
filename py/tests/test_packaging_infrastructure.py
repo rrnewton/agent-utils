@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import subprocess
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 from types import ModuleType
@@ -175,8 +177,12 @@ def test_embed_check_rejects_regular_copy_and_wrong_link_target(
 def test_package_docs_and_licenses_are_authoritative_links() -> None:
     docs = _load_script("embed_userguides")
 
-    assert len(docs.PACKAGE_LINKS) == 45
+    assert len(docs.PACKAGE_LINKS) == 49
     assert {
+        "rs/chat-subscription/README.md",
+        "rs/chat-subscription/LICENSE",
+        "rs/chat-subscription-plugin/README.md",
+        "rs/chat-subscription-plugin/LICENSE",
         "py/agentctl/AGENT_USER_GUIDE.md",
         "py/agentctl/FOREIGN_USER_GUIDE.md",
         "rs/agentctl/src/embedded_userguide.md",
@@ -243,6 +249,185 @@ def test_agentctl_capability_comparison_exemption_is_scoped_to_its_operator_guid
         project, comparison + " Cargo", document_name="USER_GUIDE.md")
     assert "foreign-package term 'pip'" in rust_check._doc_violations(
         crate, comparison + " pip", document_name="src/embedded_userguide.md")
+
+
+def test_agentctl_protocol_identity_exemption_does_not_allow_sibling_package_prose() -> None:
+    rust_check = _load_script("check_rust_packages")
+    agentctl = next(crate for crate in rust_check.CRATES if crate.name == "agentctl")
+
+    assert not rust_check._doc_violations(
+        agentctl,
+        '"capability":"chat-subscription.example" '
+        '"protocol":{"name":"agentctl-chat-subscription"} '
+        "chat-subscription.google-chat.workspace-events "
+        "chat-subscription.google-chat.polling "
+        "https://docs.rs/chat-subscription-plugin/0.1.0/chat_subscription_plugin/",
+    )
+    assert "sibling package 'chat-subscription'" in rust_check._doc_violations(
+        agentctl, "Import the chat-subscription package."
+    )
+    assert "sibling package 'chat-subscription'" in rust_check._doc_violations(
+        agentctl, '"capability":"chat-subscription.unreviewed"'
+    )
+    plugin = next(
+        crate for crate in rust_check.CRATES if crate.name == "chat-subscription-plugin"
+    )
+    assert not rust_check._doc_violations(plugin, "agentctl-chat-subscription")
+    assert "sibling package 'chat-subscription'" in rust_check._doc_violations(
+        plugin, "Import the chat-subscription package."
+    )
+
+
+def test_rust_package_dependency_patch_uses_the_exact_prior_archive(tmp_path: Path) -> None:
+    rust_check = _load_script("check_rust_packages")
+    source = tmp_path / "source" / "chat-subscription-0.1.0"
+    (source / "src").mkdir(parents=True)
+    (source / "Cargo.toml").write_text(
+        '[package]\nname="chat-subscription"\nversion="0.1.0"\n',
+        encoding="utf-8",
+    )
+    (source / "src" / "lib.rs").write_text("archive bytes\n", encoding="utf-8")
+    archive = tmp_path / "chat-subscription-0.1.0.crate"
+    with tarfile.open(archive, mode="w:gz") as package:
+        package.add(source, arcname=source.name)
+    (source / "src" / "lib.rs").write_text("changed live bytes\n", encoding="utf-8")
+    plugin = next(
+        crate for crate in rust_check.CRATES if crate.name == "chat-subscription-plugin"
+    )
+
+    arguments = rust_check._package_patch_arguments(
+        plugin, {"chat-subscription": archive}, tmp_path / "target"
+    )
+
+    assert arguments[0] == "--config"
+    prefix = "patch.crates-io.chat-subscription.path="
+    assert arguments[1].startswith(prefix)
+    extracted = Path(json.loads(arguments[1][len(prefix) :]))
+    assert (extracted / "src" / "lib.rs").read_text(encoding="utf-8") == "archive bytes\n"
+    assert extracted != source
+
+
+def test_rust_package_creation_shim_is_locked_and_never_verifies_live_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rust_check = _load_script("check_rust_packages")
+    plugin = next(
+        crate for crate in rust_check.CRATES if crate.name == "chat-subscription-plugin"
+    )
+    fake_rs_root = tmp_path / "rs"
+    (fake_rs_root / plugin.name).mkdir(parents=True)
+    (fake_rs_root / "chat-subscription").mkdir()
+    monkeypatch.setattr(rust_check, "RS_ROOT", fake_rs_root)
+    observed: list[str] = []
+
+    def run(command: list[str]) -> subprocess.CompletedProcess[str]:
+        observed.extend(command)
+        target = Path(command[command.index("--target-dir") + 1])
+        archive = target / "package" / f"{plugin.name}-0.1.0.crate"
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"fixture archive")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(rust_check, "_run", run)
+    rust_check._package(plugin, "0.1.0", tmp_path / "target")
+
+    assert "--no-verify" in observed
+    assert "--locked" in observed
+    patch = next(value for value in observed if value.startswith("patch.crates-io."))
+    assert str(fake_rs_root / "chat-subscription") in patch
+
+
+def test_rust_archive_lock_subset_binds_versions_but_allows_smaller_feature_graph(
+    tmp_path: Path,
+) -> None:
+    rust_check = _load_script("check_rust_packages")
+
+    def lock(path: Path, version: str, dependencies: str) -> None:
+        path.write_text(
+            "# This file is automatically @generated by Cargo.\n"
+            "# It is not intended for manual editing.\n"
+            "version = 4\n\n"
+            "[[package]]\n"
+            'name = "fixture"\n'
+            f'version = "{version}"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            'checksum = "abc"\n'
+            f"dependencies = [{dependencies}]\n",
+            encoding="utf-8",
+        )
+
+    workspace = tmp_path / "workspace.lock"
+    generated = tmp_path / "generated.lock"
+    lock(workspace, "1.2.3", '\n "extra",\n')
+    lock(generated, "1.2.3", "")
+    rust_check._verify_lock_subset(generated, workspace)
+
+    lock(generated, "1.2.4", "")
+    with pytest.raises(rust_check.CheckError, match="fixture 1.2.4"):
+        rust_check._verify_lock_subset(generated, workspace)
+
+
+def test_rust_package_dependency_patch_requires_prior_archive_and_rejects_links(
+    tmp_path: Path,
+) -> None:
+    rust_check = _load_script("check_rust_packages")
+    plugin = next(
+        crate for crate in rust_check.CRATES if crate.name == "chat-subscription-plugin"
+    )
+    with pytest.raises(rust_check.CheckError, match="was not packaged and inspected first"):
+        rust_check._package_patch_arguments(plugin, {}, tmp_path / "target")
+
+    archive = tmp_path / "chat-subscription-0.1.0.crate"
+    with tarfile.open(archive, mode="w:gz") as package:
+        manifest = tarfile.TarInfo("chat-subscription-0.1.0/Cargo.toml")
+        manifest.size = 0
+        package.addfile(manifest)
+        link = tarfile.TarInfo("chat-subscription-0.1.0/src/lib.rs")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/tmp/outside"
+        package.addfile(link)
+    with pytest.raises(rust_check.CheckError, match="contains non-file"):
+        rust_check._extract_dependency_archive(
+            "chat-subscription", archive, tmp_path / "extract"
+        )
+
+
+def test_rust_workspace_topology_requires_public_members_and_exempts_only_publish_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rust_check = _load_script("check_rust_packages")
+    checked = rust_check.Crate("checked", (), "checked", ())
+    monkeypatch.setattr(rust_check, "CRATES", (checked,))
+
+    def metadata(packages: list[dict[str, object]]) -> object:
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps({"packages": packages}), stderr=""
+        )
+
+    monkeypatch.setattr(
+        rust_check,
+        "_run",
+        lambda _argv: metadata(
+            [
+                {"name": "checked", "publish": None},
+                {"name": "fake", "publish": []},
+            ]
+        ),
+    )
+    rust_check._check_workspace_topology()
+
+    monkeypatch.setattr(
+        rust_check,
+        "_run",
+        lambda _argv: metadata(
+            [
+                {"name": "checked", "publish": None},
+                {"name": "omitted", "publish": None},
+            ]
+        ),
+    )
+    with pytest.raises(rust_check.CheckError, match="omitted.*missing from the package gate"):
+        rust_check._check_workspace_topology()
 
 
 def test_python_sibling_dependency_requires_a_project_local_exemption() -> None:

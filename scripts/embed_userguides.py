@@ -173,6 +173,18 @@ class PackageLink:
 
 
 STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
+    StandaloneDocument(
+        tool="chat-subscription",
+        document="README",
+        language="rust",
+        source="common/docs/chat-subscription/README.md",
+    ),
+    StandaloneDocument(
+        tool="chat-subscription-plugin",
+        document="README",
+        language="rust",
+        source="common/docs/chat-subscription-plugin/README.md",
+    ),
     # agentctl keeps its operator reference as package-owned CLI assets. The
     # shared core guide is checked under both language rules; Chat is an extension.
     *(StandaloneDocument(tool="agentctl", document=document, language=language,
@@ -285,6 +297,16 @@ def _package_links() -> tuple[PackageLink, ...]:
         )
     links.extend(
         (
+            PackageLink(
+                "rs/chat-subscription/README.md",
+                "common/docs/chat-subscription/README.md",
+            ),
+            PackageLink("rs/chat-subscription/LICENSE", "LICENSE"),
+            PackageLink(
+                "rs/chat-subscription-plugin/README.md",
+                "common/docs/chat-subscription-plugin/README.md",
+            ),
+            PackageLink("rs/chat-subscription-plugin/LICENSE", "LICENSE"),
             PackageLink("py/agentctl/LICENSE", "LICENSE"),
             PackageLink("py/agentctl/AGENT_USER_GUIDE.md", "py/agentctl/USER_GUIDE.md"),
             PackageLink("py/agentctl/FOREIGN_USER_GUIDE.md", "py/agentctl/USER_GUIDE.md"),

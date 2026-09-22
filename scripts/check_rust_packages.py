@@ -18,7 +18,7 @@ import sys
 import tarfile
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RS_ROOT = REPO_ROOT / "rs"
@@ -34,6 +34,8 @@ class Crate:
 
 
 CRATES: tuple[Crate, ...] = (
+    Crate("chat-subscription", (), "chat_subscription", ()),
+    Crate("chat-subscription-plugin", (), "chat_subscription_plugin", ()),
     Crate(
         "dagrun",
         ("dagrun", "cpuset-alloc"),
@@ -59,6 +61,15 @@ CRATES: tuple[Crate, ...] = (
         ("src/embedded_quickstart.md",),
     ),
 )
+
+# Cargo rewrites versioned path dependencies to registry dependencies while verifying an archive.
+# These libraries are released in dependency order, so the first local package check necessarily
+# precedes their registry availability. Dependents are patched to sources extracted from the exact
+# already-inspected dependency archives, never to the live checkout.
+LOCAL_PACKAGE_PATCHES: dict[str, tuple[str, ...]] = {
+    "chat-subscription-plugin": ("chat-subscription",),
+    "agentctl": ("chat-subscription", "chat-subscription-plugin"),
+}
 
 _FOREIGN_DOC_TERMS = re.compile(
     r"\bpython(?:[0-9]+(?:\.[0-9]+)*)?\b|\b(?:pip|pypi)\b|"
@@ -150,6 +161,44 @@ def _check_missing_docs() -> None:
         ],
         env=env,
     )
+
+
+def _check_workspace_topology() -> None:
+    """Require every workspace member to be checked here or explicitly non-published."""
+
+    result = _run(
+        [
+            "cargo",
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--manifest-path",
+            str(RS_ROOT / "Cargo.toml"),
+        ]
+    )
+    payload: object = json.loads(result.stdout)
+    if not isinstance(payload, dict) or not isinstance(payload.get("packages"), list):
+        raise CheckError("Rust workspace metadata has no package list")
+    checked = {crate.name for crate in CRATES}
+    observed: set[str] = set()
+    for package in payload["packages"]:
+        if not isinstance(package, dict) or not isinstance(package.get("name"), str):
+            raise CheckError("Rust workspace metadata contains an invalid package")
+        name = package["name"]
+        observed.add(name)
+        publish = package.get("publish")
+        if name in checked and publish == []:
+            raise CheckError(f"{name}: package gate lists a non-published crate")
+        if name not in checked and publish != []:
+            raise CheckError(
+                f"{name}: publishable workspace member is missing from the package gate"
+            )
+    missing = sorted(checked - observed)
+    if missing:
+        raise CheckError(f"package gate names absent workspace members: {missing}")
+
+
 def _doc_violations(crate: Crate, text: str, *, document_name: str | None = None) -> list[str]:
     errors: list[str] = []
     for foreign in _FOREIGN_DOC_TERMS.finditer(text):
@@ -163,11 +212,27 @@ def _doc_violations(crate: Crate, text: str, *, document_name: str | None = None
         match = pattern.search(text)
         if match is not None:
             errors.append(f"{description} {match.group(0)!r}")
+    sibling_text = text
+    machine_values: tuple[str, ...] = ()
+    if crate.name == "agentctl":
+        # These are serialized capability/protocol identities, not package references. Remove the
+        # complete machine values only; a prose mention of either library remains a violation.
+        machine_values = (
+            "chat-subscription.example",
+            "chat-subscription.google-chat.workspace-events",
+            "chat-subscription.google-chat.polling",
+            "agentctl-chat-subscription",
+            "https://docs.rs/chat-subscription-plugin/0.1.0/chat_subscription_plugin/",
+        )
+    elif crate.name == "chat-subscription-plugin":
+        machine_values = ("agentctl-chat-subscription",)
+    for machine_value in machine_values:
+        sibling_text = sibling_text.replace(machine_value, " " * len(machine_value))
     for sibling in CRATES:
         if sibling == crate:
             continue
         for name in (sibling.name, sibling.library):
-            match = re.search(re.escape(name), text, re.IGNORECASE)
+            match = re.search(re.escape(name), sibling_text, re.IGNORECASE)
             if match is not None:
                 errors.append(f"sibling package {match.group(0)!r}")
                 break
@@ -265,25 +330,187 @@ def _metadata(crate: Crate) -> tuple[str, set[str], set[str]]:
     return version, bins, libraries
 
 
-def _package(crate: Crate, version: str, target_root: Path) -> Path:
+def _extract_dependency_archive(
+    dependency: str, archive: Path, target_root: Path
+) -> Path:
+    destination = target_root / "package-dependencies" / dependency
+    if destination.exists():
+        raise CheckError(f"{dependency}: dependency archive was extracted more than once")
+    destination.mkdir(parents=True)
+    with tarfile.open(archive, mode="r:gz") as package:
+        members = package.getmembers()
+        roots: set[str] = set()
+        for member in members:
+            relative = PurePosixPath(member.name)
+            if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+                raise CheckError(
+                    f"{dependency}: dependency archive contains unsafe path {member.name!r}"
+                )
+            roots.add(relative.parts[0])
+            if not member.isfile() and not member.isdir():
+                raise CheckError(
+                    f"{dependency}: dependency archive contains non-file {member.name!r}"
+                )
+            target = destination.joinpath(*relative.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            source = package.extractfile(member)
+            if source is None:
+                raise CheckError(
+                    f"{dependency}: cannot read dependency archive member {member.name!r}"
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read())
+            target.chmod(member.mode & 0o777)
+    if len(roots) != 1:
+        raise CheckError(
+            f"{dependency}: dependency archive has unexpected roots {sorted(roots)}"
+        )
+    root_name = next(iter(roots))
+    if not root_name.startswith(f"{dependency}-"):
+        raise CheckError(
+            f"{dependency}: dependency archive root {root_name!r} does not match its package"
+        )
+    source_root = destination / root_name
+    if not (source_root / "Cargo.toml").is_file():
+        raise CheckError(f"{dependency}: extracted dependency has no Cargo.toml")
+    return source_root
+
+
+def _package_patch_arguments(
+    crate: Crate,
+    dependency_archives: dict[str, Path],
+    target_root: Path,
+) -> list[str]:
+    arguments: list[str] = []
+    for dependency in LOCAL_PACKAGE_PATCHES.get(crate.name, ()):
+        archive = dependency_archives.get(dependency)
+        if archive is None:
+            raise CheckError(
+                f"{crate.name}: dependency {dependency} was not packaged and inspected first"
+            )
+        extraction_root = target_root / "package-patches" / crate.name
+        path = _extract_dependency_archive(dependency, archive, extraction_root)
+        arguments.extend(
+            (
+                "--config",
+                f"patch.crates-io.{dependency}.path={json.dumps(str(path))}",
+            )
+        )
+    return arguments
+
+
+def _package_creation_patch_arguments(crate: Crate) -> list[str]:
+    """Satisfy Cargo's first-publication lookup without compiling a live dependency."""
+
+    arguments: list[str] = []
+    for dependency in LOCAL_PACKAGE_PATCHES.get(crate.name, ()):
+        arguments.extend(
+            (
+                "--config",
+                f"patch.crates-io.{dependency}.path={json.dumps(str(RS_ROOT / dependency))}",
+            )
+        )
+    return arguments
+
+
+def _package(
+    crate: Crate,
+    version: str,
+    target_root: Path,
+) -> Path:
     manifest = RS_ROOT / crate.name / "Cargo.toml"
-    _run(
-        [
-            "cargo",
-            "package",
-            "--allow-dirty",
-            "--locked",
-            "--offline",
-            "--target-dir",
-            str(target_root),
-            "--manifest-path",
-            str(manifest),
-        ]
-    )
+    command = [
+        "cargo",
+        "package",
+        "--allow-dirty",
+        # Cargo cannot resolve a registry dependency before its first publication. Verification is
+        # performed explicitly below against this exact archive and exact prior archives.
+        "--no-verify",
+        "--locked",
+        "--offline",
+        "--target-dir",
+        str(target_root),
+        "--manifest-path",
+        str(manifest),
+    ]
+    # `--no-verify` means this resolution shim is never compiled. The resulting subject archive is
+    # inspected, extracted, and then compiled below with dependencies extracted from prior exact
+    # archives. Keeping creation locked also proves this metadata-only step cannot alter Cargo.lock.
+    command.extend(_package_creation_patch_arguments(crate))
+    _run(command)
     archive = target_root / "package" / f"{crate.name}-{version}.crate"
     if not archive.is_file():
         raise CheckError(f"{crate.name}: Cargo reported success but {archive} is missing")
     return archive
+
+
+def _verify_package_archive(
+    crate: Crate,
+    archive: Path,
+    target_root: Path,
+    dependency_archives: dict[str, Path],
+) -> None:
+    verification_root = target_root / "package-verification" / crate.name
+    source_root = _extract_dependency_archive(crate.name, archive, verification_root / "subject")
+    patch_arguments = _package_patch_arguments(
+        crate, dependency_archives, verification_root / "dependencies"
+    )
+    # Seed resolution from the workspace lock; Cargo prunes unrelated packages for this archive.
+    # The subset comparison below ensures it did not upgrade or substitute any retained package.
+    (source_root / "Cargo.lock").write_bytes((RS_ROOT / "Cargo.lock").read_bytes())
+    command = [
+        "cargo",
+        "build",
+        "--all-targets",
+        "--offline",
+        "--target-dir",
+        str(target_root),
+        "--manifest-path",
+        str(source_root / "Cargo.toml"),
+    ]
+    command.extend(patch_arguments)
+    _run(command)
+    _verify_lock_subset(source_root / "Cargo.lock", RS_ROOT / "Cargo.lock")
+    command.insert(3, "--locked")
+    _run(command)
+
+
+def _lock_packages(path: Path) -> set[tuple[str, str, str | None, str | None]]:
+    text = path.read_text(encoding="utf-8")
+    marker = "\n[[package]]\n"
+    if not text.startswith("# This file is automatically @generated by Cargo.") or marker not in text:
+        raise CheckError(f"invalid Cargo lockfile: {path}")
+    packages = set()
+    for block in text.split(marker)[1:]:
+        fields: dict[str, str] = {}
+        for key in ("name", "version", "source", "checksum"):
+            match = re.search(rf'^{key} = "([^"]+)"$', block, re.MULTILINE)
+            if match is not None:
+                fields[key] = match.group(1)
+        if "name" not in fields or "version" not in fields:
+            raise CheckError(f"invalid Cargo package block in {path}")
+        packages.add(
+            (
+                fields["name"],
+                fields["version"],
+                fields.get("source"),
+                fields.get("checksum"),
+            )
+        )
+    return packages
+
+
+def _verify_lock_subset(generated: Path, workspace: Path) -> None:
+    generated_packages = _lock_packages(generated)
+    workspace_packages = _lock_packages(workspace)
+    unexpected = sorted(generated_packages - workspace_packages)
+    if unexpected:
+        names = [f"{name} {version}" for name, version, _source, _checksum in unexpected]
+        raise CheckError(
+            "package archive resolved outside the workspace lock: " + ", ".join(names)
+        )
 
 
 def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
@@ -418,6 +645,7 @@ def _smoke(
 
 def main() -> int:
     try:
+        _check_workspace_topology()
         _check_public_rustdoc()
         _check_missing_docs()
         index_text = (RS_ROOT / "README.md").read_text(encoding="utf-8")
@@ -432,6 +660,7 @@ def main() -> int:
             target_root = package_root / "target"
             smoke_root = package_root / "smoke"
             smoke_root.mkdir()
+            dependency_archives: dict[str, Path] = {}
             for crate in CRATES:
                 version, bins, libraries = _metadata(crate)
                 if bins != set(crate.bins):
@@ -446,6 +675,9 @@ def main() -> int:
                     )
                 archive = _package(crate, version, target_root)
                 documents = _inspect(crate, version, archive)
+                _verify_package_archive(crate, archive, target_root, dependency_archives)
+                # Only inspected and independently compiled archives become dependency inputs.
+                dependency_archives[crate.name] = archive
                 _smoke(crate, version, documents, target_root, smoke_root / crate.name)
                 print(
                     f"check_rust_packages: ok {crate.name} {version} "

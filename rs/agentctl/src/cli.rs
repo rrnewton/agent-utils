@@ -381,6 +381,11 @@ fn write_json(value: &impl Serialize) -> io::Result<()> {
     serde_json::to_writer_pretty(&mut output, value)?;
     output.write_all(b"\n")
 }
+
+fn plugin_discovery_required(command: &Commands) -> bool {
+    matches!(command, Commands::Capabilities)
+}
+
 fn run(args: Cli) -> Result<i32, Failure> {
     use clap::CommandFactory;
     if args.userguide {
@@ -392,9 +397,16 @@ fn run(args: Cli) -> Result<i32, Failure> {
         println!();
         return Ok(0);
     };
+    // Directory and manifest I/O is lazy. Session-control commands never inspect the user plugin
+    // home; capability inspection and an actual plugin runtime startup own discovery.
+    let plugin_inventory = plugin_discovery_required(&command).then(crate::plugins::discover);
     match command {
         Commands::Capabilities => {
-            write_json(&json!({"interactive":{"backends":["herdr"],"harnesses":["codex","claude"]},"headless":null,"services":[],"registry":args.registry})).map_err(Failure::Output)?;
+            write_json(&capabilities_document(
+                args.registry,
+                plugin_inventory.expect("capabilities requires plugin discovery"),
+            ))
+            .map_err(Failure::Output)?;
             return Ok(0);
         }
         Commands::Quickstart => {
@@ -517,6 +529,54 @@ fn run(args: Cli) -> Result<i32, Failure> {
     Ok(0)
 }
 
+fn capabilities_document(
+    registry: PathBuf,
+    plugins: crate::plugins::PluginInventory,
+) -> serde_json::Value {
+    let not_live = crate::plugins::MaturityStatus::discovered(false);
+    json!({
+        "interactive": {
+            "backends": ["herdr"],
+            "harnesses": ["codex", "claude"]
+        },
+        "headless": null,
+        "services": [],
+        "registry": registry,
+        "chat_subscriptions": {
+            "core": {
+                "origin": "built_in",
+                "protocol_name": chat_subscription_plugin::PROTOCOL_NAME,
+                "protocol_version": chat_subscription_plugin::PROTOCOL_VERSION,
+                "max_frame_bytes": chat_subscription_plugin::MAX_FRAME_BYTES,
+                "status": crate::plugins::MaturityStatus::discovered(true)
+            },
+            "reference_backends": [
+                {
+                    "name": "google-workspace-events",
+                    "origin": "reference",
+                    "status": not_live,
+                    "available": ["design"],
+                    "missing": [
+                        "rust-provider",
+                        "cloud-topic",
+                        "pull-subscription",
+                        "application-default-credentials",
+                        "live-end-to-end-verification"
+                    ]
+                },
+                {
+                    "name": "discord-gateway",
+                    "origin": "reference",
+                    "status": crate::plugins::MaturityStatus::discovered(false),
+                    "available": ["request-response-client"],
+                    "missing": ["gateway-subscription", "live-end-to-end-verification"]
+                }
+            ],
+            "plugins": plugins
+        }
+    })
+}
+
 fn add_capabilities(value: &mut serde_json::Value) {
     if let Some(values) = value.as_array_mut() {
         for value in values {
@@ -602,6 +662,59 @@ mod tests {
     }
 
     #[test]
+    fn chat_capabilities_separate_code_installation_from_runtime_evidence() {
+        let plugins = crate::plugins::PluginInventory {
+            home: Some(PathBuf::from("/tmp/fixture-home")),
+            discovered: vec![crate::plugins::DiscoveredPlugin {
+                name: "fixture-chat".to_owned(),
+                capability: "chat-subscription.fixture".to_owned(),
+                executable: "backend".to_owned(),
+                protocol_name: chat_subscription_plugin::PROTOCOL_NAME,
+                protocol_min: 1,
+                protocol_max: 1,
+                origin: "discovered",
+                status: crate::plugins::MaturityStatus::discovered(true),
+                executable_identity: None,
+            }],
+            refused: vec![crate::plugins::RefusedPlugin {
+                entry: "old-chat".to_owned(),
+                code: "incompatible_protocol",
+                detail: "fixture refusal".to_owned(),
+            }],
+        };
+        let document = capabilities_document(PathBuf::from("registry"), plugins);
+        assert_eq!(document["chat_subscriptions"]["core"]["origin"], "built_in");
+        assert_eq!(
+            document["chat_subscriptions"]["core"]["protocol_name"],
+            "agentctl-chat-subscription"
+        );
+        let discovered = &document["chat_subscriptions"]["plugins"]["discovered"][0];
+        assert_eq!(discovered["origin"], "discovered");
+        assert_eq!(discovered["status"]["implemented"], true);
+        assert_eq!(discovered["status"]["configured"], false);
+        assert_eq!(discovered["status"]["connected"], false);
+        assert_eq!(discovered["status"]["live_verified"], false);
+        assert_eq!(
+            document["chat_subscriptions"]["plugins"]["refused"][0]["code"],
+            "incompatible_protocol"
+        );
+        assert_eq!(
+            document["chat_subscriptions"]["reference_backends"][0]["status"]["implemented"],
+            false
+        );
+        assert_eq!(
+            document["chat_subscriptions"]["reference_backends"][0]["available"],
+            json!(["design"])
+        );
+        assert!(
+            document["chat_subscriptions"]["reference_backends"][0]["missing"]
+                .as_array()
+                .expect("missing capability list")
+                .contains(&json!("rust-provider"))
+        );
+    }
+
+    #[test]
     fn adopted_interactive_records_advertise_the_full_named_interface() {
         let mut record = json!({
             "name": "foreign",
@@ -628,4 +741,12 @@ mod tests {
             ])
         );
     }
+}
+#[test]
+fn ordinary_session_control_does_not_discover_plugins() {
+    assert!(plugin_discovery_required(&Commands::Capabilities));
+    assert!(!plugin_discovery_required(&Commands::List));
+    assert!(!plugin_discovery_required(&Commands::Status(Named {
+        name: "worker".to_owned(),
+    })));
 }

@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["dagrun", "tick-hub", "pr-landing-planner", "herdr-run", "agentctl"]
+members = [
+    "dagrun",
+    "tick-hub",
+    "pr-landing-planner",
+    "herdr-run",
+    "agentctl",
+    "chat-subscription",
+    "chat-subscription-plugin",
+    "chat-subscription-fake",
+]
 
 [workspace.package]
 edition = "2021"

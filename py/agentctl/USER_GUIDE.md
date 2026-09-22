@@ -20,9 +20,10 @@ keep alive. The manager is independent of shell-command execution utilities.
 Run `agentctl capabilities` to inspect the modes, backends, harnesses, and
 services present in this installation. **The Python distribution includes the
 interactive core, headless workers, Chat, and MCP. The Rust distribution provides the
-interactive core only.** The worker, Chat, and MCP extensions are bundled
-capabilities of the Python distribution, not separately installable package
-extras or runtime-loaded plugins.
+interactive core plus a provider-neutral inbound-subscription protocol and safe
+plugin discovery.** It does not ship a provider executable or a Chat bridge
+command. The worker, Chat, and MCP extensions remain bundled capabilities of
+the Python distribution rather than plugin claims.
 
 | Mode or service | What it controls | Additional dependency |
 | --- | --- | --- |
@@ -30,6 +31,90 @@ extras or runtime-loaded plugins.
 | Headless worker extension | Resumable Codex or AGY structured turns; a terminal shows the transcript | Herdr or tmux and the chosen harness |
 | Chat extension | One Google Chat space connected to an interactive coordinator | Google Chat access and Herdr |
 | MCP extension | The same session operations over local MCP stdio | An MCP client |
+
+### Rust subscription plugin discovery
+
+The Rust command inspects `~/.agentctl/plugins/` only when `agentctl
+capabilities` runs. Ordinary session-control commands do not scan the plugin
+directory. This installation provides the protocol, safe discovery, and launch
+command builder; it does not provide a durable subscription host command or a
+provider executable. Set `AGENTCTL_HOME` to an absolute directory to use an
+isolated user-level home.
+This home is separate from the project-local session registry selected by
+`--registry`; installing a backend cannot change or acquire a project session.
+Manifests are discovered automatically in deterministic filename order; there
+is no registration command and no project-local plugin registry to update.
+
+Discovery is manifest-only and never executes every file in a directory. One
+plugin occupies `plugins/NAME/`, with a private `manifest.json` and the contained
+direct-child executable named by that manifest:
+
+See the [normative version 1 process
+protocol](https://docs.rs/chat-subscription-plugin/0.1.0/chat_subscription_plugin/) for exact frame
+shapes, ordering, durable Commit semantics, and canonical bounds.
+
+```json
+{
+  "schema": "agentctl-plugin-manifest/v1alpha1",
+  "name": "example-chat",
+  "capability": "chat-subscription.example",
+  "executable": "backend",
+  "protocol": {"name": "agentctl-chat-subscription", "min": 1, "max": 1},
+  "implementation": "implemented"
+}
+```
+
+The home, plugin directory, manifest, and executable must be owned by the
+current account and must not be group/world writable. Symlinks, hard-linked
+files, path traversal, oversized or changing manifests, duplicate capability
+identities, and incompatible protocol ranges are refused. `agentctl
+capabilities` lists safe compatible entries under `discovered` and rejected
+entries under `refused`; it distinguishes these from the built-in subscription
+core.
+
+Installers should assemble and validate a complete private staging directory on
+the same filesystem, with real single-link `manifest.json` and executable
+files, then atomically rename it into `plugins/NAME/`. Upgrades may use an
+atomic directory exchange before retiring the old directory. A versioned store
+may live outside `plugins/`, but activation must copy real files rather than
+symlink or hard-link them into the discovery tree. This keeps discovery from
+observing a partial install. Launch reopens every path through pinned directory
+descriptors, requires the exact executable identity discovered earlier, and
+executes through that pinned descriptor; exchanging the activation directory
+before or after command construction cannot redirect execution. Provider
+plugins are native executables rather than interpreter scripts, because the
+pinned executable descriptor is close-on-exec.
+
+Capability identities name both provider and implementation so alternatives
+can coexist, for example `chat-subscription.google-chat.workspace-events` and
+`chat-subscription.google-chat.polling`. Reusing the exact capability identity
+is a collision: every colliding entry is refused rather than selecting a
+filename-order winner.
+
+When a subscription host launches an accepted plugin, it clears the inherited
+environment first. Only a small non-secret process baseline (`HOME`, `USER`,
+`LOGNAME`, `PATH`, locale variables, `TMPDIR`, and `XDG_RUNTIME_DIR`) is copied.
+The manifest cannot request environment names, arguments, or credentials and
+cannot self-authorize access to unrelated API keys. Provider credentials belong
+to an explicit host-controlled mechanism or to the provider's ambient user
+credential service.
+
+A future durable host must retain the returned process supervisor for the
+entire subscription. Normal shutdown sends the protocol Close frame through the
+public subscription cancellation method, drops both pipes, and waits for a
+chosen grace period. The supervisor then kills and reaps within a fixed
+two-second backstop; cooperative Close alone cannot interrupt provider code
+blocked while obtaining its next event. The current Rust CLI exposes these
+launch/protocol building blocks but still ships no subscription runtime command.
+
+A manifest can report only static implementation maturity. Discovery always
+reports `configured`, `connected`, and `live_verified` as false. Those are
+runtime facts requiring separate evidence; installing a manifest cannot claim a
+live provider connection. The reference inventory reports Google Workspace
+Events design material with no Rust provider, cloud topic, pull
+subscription, application-default credentials, or live end-to-end verification.
+It reports Discord request/response support separately from the absent Gateway
+subscription. Neither entry is advertised as a working inbound backend.
 
 Extension commands are not available in every installation. An interactive
 agent requires Herdr; selecting tmux does not provide interactive agent control.
