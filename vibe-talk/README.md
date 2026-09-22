@@ -348,7 +348,14 @@ a regression:
 cargo run -- --config vibe-talk.toml
 ```
 
-Then open `http://<host>:8080/`, go to **Settings**, paste the read token, and press Save.
+Then open `http://<host>:8080/`, go to **Settings**, paste one of **this deployment's own** two
+tokens into **vibe-talk API token**, and press Save. Not the bot token and not the ElevenLabs key:
+neither is ever entered into the page. `VIBE_TALK_READ_TOKEN` is enough to read, search and
+listen; `VIBE_TALK_WRITE_TOKEN` is what replying from the page needs, and what `/voice` needs to
+start a conversation at all. The page cannot tell you which one you pasted — `/api/v1/client-config`
+answers both identically — so a read token loads the whole interface and then fails at the first
+write, which is why both refusals now name the scope. It is stored per browser **and per
+hostname**, so a second URL onto the same deployment asks again.
 
 ### Podman
 

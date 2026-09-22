@@ -2285,9 +2285,9 @@ test("the explanatory text lives on the sign-in screen, not over the transcript"
     HTML.indexOf('id="screen-signin"'),
     HTML.indexOf('id="screen-main"')
   );
-  assert.match(signin, /Your ElevenLabs agent has authentication enabled/);
+  assert.match(signin, /Signing in is between this browser and/);
   const main = HTML.slice(HTML.indexOf('id="screen-main"'), HTML.indexOf('id="screen-settings"'));
-  assert.doesNotMatch(main, /Your ElevenLabs agent has authentication enabled/);
+  assert.doesNotMatch(main, /Signing in is between this browser and/);
 });
 
 test("a token the server accepts leads to the main interface", async () => {
@@ -2326,6 +2326,56 @@ test("a token the server REFUSES sends you back to sign in, and says which thing
   assert.equal(page.screen(), "signin");
   assert.match(page.el("error").textContent, /refused that token/);
   assert.match(page.el("error").textContent, /unknown token/);
+});
+
+test("a READ token is told it is the wrong SCOPE, not that it was refused", async () => {
+  // The expensive case. /api/v1/client-config takes a read-scope token, so a read token signs in
+  // and only fails where something writes — and "refused" would send the owner looking for a typo
+  // in a token that is not wrong. 403 and 401 are different sentences here for that reason.
+  const page = newPage();
+  page.clientConfig = async () =>
+    json(403, { error: "forbidden", detail: "this token may read but not post" });
+  page.el("api-token").value = "read-token-aaaaaaaaaaaaaaaaa";
+
+  await page.el("save-token").click();
+  await page.settle();
+
+  assert.equal(page.screen(), "signin");
+  assert.match(page.el("error").textContent, /read but not post/);
+  assert.match(page.el("error").textContent, /write-scope/i);
+  assert.match(page.el("error").textContent, /VIBE_TALK_WRITE_TOKEN/);
+  // ...and it must NOT be the sentence a 401 gets, which is the whole point of separating them.
+  assert.doesNotMatch(page.el("error").textContent, /refused that token/);
+  // BOTH halves. The panel and the status strip are written from two different expressions, and
+  // asserting only the panel left the strip free to keep saying "refused" — which a mutation of
+  // exactly that expression proved, by passing this test while the strip was collapsed back.
+  // `#status` is the text; `#status-line` is the strip around it, and reading the strip returns
+  // an empty string that matches nothing and fails for the wrong reason.
+  assert.match(page.el("status").textContent, /READ token/);
+  assert.doesNotMatch(page.el("status").textContent, /refused/);
+});
+
+test("a browser signed out BY THE RENAME is told that, rather than looking like a broken deploy", async () => {
+  // Same origin, token still sitting under the pre-rename key. Without this the first load after
+  // a rename is a sign-in screen on a URL that worked yesterday, with nothing saying why.
+  const store = new Map([["gent-talk.token", "write-token-aaaaaaaaaaaaaaaa"]]);
+  const page = newPage(store);
+  await page.settle();
+
+  assert.equal(page.screen(), "signin");
+  assert.match(page.el("token-state").textContent, /renamed/i);
+  assert.match(page.el("token-state").textContent, /paste your write-scope token/i);
+  // Read, never adopted: a token the owner cannot see must not be reused on their behalf.
+  assert.equal(store.get("vibe-talk.token"), undefined, "the old token was silently adopted");
+});
+
+test("a first-time visitor is NOT told about a rename that has nothing to do with them", async () => {
+  // The negative half. A sentence that fires for everyone explains nothing to anyone.
+  const page = newPage();
+  await page.settle();
+
+  assert.match(page.el("token-state").textContent, /paste your write-scope token/i);
+  assert.doesNotMatch(page.el("token-state").textContent, /renamed/i);
 });
 
 test("a server that is merely DOWN does not get mistaken for a bad token", async () => {

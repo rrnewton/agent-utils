@@ -10,6 +10,10 @@
 //    never put in a URL, so it cannot leak through a referrer or a server log.
 
 const TOKEN_KEY = "vibe-talk.token";
+// Read, never written. See the matching comment in voice.js: a browser that signed in before the
+// service was renamed still holds its token under the old key on this same origin, and saying so
+// is the difference between "you were signed out" and "this deployment is broken".
+const RENAMED_FROM_KEY = "gent-talk.token";
 const state = {
   channels: [],
   digest: [],
@@ -41,9 +45,34 @@ async function api(path, options = {}) {
   }
   if (!response.ok) {
     const detail = payload && payload.detail ? payload.detail : `HTTP ${response.status}`;
-    throw new Error(detail);
+    // 403 is the right token with the wrong scope, and this page cannot tell which one was pasted
+    // until something writes: /api/v1/client-config answers a read-scope token exactly as it
+    // answers a write-scope one, so a read token loads the whole interface and then fails on the
+    // first Reply. The server's sentence alone ("this token may read but not post") leaves the
+    // reader to work out that there IS a second token and which config key holds it.
+    const error = new Error(
+      response.status === 403
+        ? `${detail} — that looks like a READ token; replying needs the write-scope one ` +
+          `(VIBE_TALK_WRITE_TOKEN rather than VIBE_TALK_READ_TOKEN)`
+        : detail
+    );
+    error.status = response.status;
+    throw error;
   }
   return payload;
+}
+
+/**
+ * True when nothing is stored under the current key but something is stored under the pre-rename
+ * one. Guarded, because a browser with storage disabled throws on `getItem` rather than answering,
+ * and this runs on the load path.
+ */
+function signedOutByRename() {
+  try {
+    return !localStorage.getItem(TOKEN_KEY) && !!localStorage.getItem(RENAMED_FROM_KEY);
+  } catch (_error) {
+    return false;
+  }
 }
 
 // How many messages there are, or an honest refusal to say.
@@ -139,7 +168,11 @@ function fillChannelSelects() {
 
 async function loadConfig() {
   if (!token()) {
-    setStatus("no API token yet — open Settings");
+    setStatus(
+      signedOutByRename()
+        ? "this deployment was renamed, so your saved token needs pasting again — open Settings"
+        : "no API token yet — open Settings"
+    );
     return;
   }
   const config = await api("/api/v1/client-config");

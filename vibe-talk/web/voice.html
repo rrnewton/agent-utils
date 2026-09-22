@@ -108,16 +108,22 @@
         <section id="screen-signin" class="screen">
           <h1>vibe-talk</h1>
           <p class="hint">
-            Your ElevenLabs agent has authentication enabled, so a conversation can only start from
-            a short-lived signed URL. This page asks <code>vibe-talk</code> for one — with your API
-            token — and then talks to the agent directly. No vendor script, no CDN, nothing
-            bundled.
+            Signing in is between this browser and <strong>this vibe-talk server</strong>. The page
+            asks this server — with the token below — for a short-lived signed URL, and then talks
+            to the ElevenLabs agent directly with it. The ElevenLabs key and the chat provider's
+            bot token stay on the server and are never pasted into this page. No vendor script, no
+            CDN, nothing bundled.
           </p>
 
-          <label for="api-token">API token</label>
+          <label for="api-token">vibe-talk API token</label>
           <p class="hint">
-            The <strong>write-scope</strong> token. Minting a conversation is gated on it, because
-            the agent on the other end can post to your channels. Stored in this browser only.
+            <strong>This deployment's own token</strong> — <code>VIBE_TALK_WRITE_TOKEN</code> from
+            the configuration it was started with. It is not your ElevenLabs key and not your chat
+            provider's bot token; neither of those is ever entered here. Write scope is what is
+            asked for, because starting a conversation lets the agent post to your channels. The
+            read-scope token will sign in and will read, digest and speak — but it fails on replies
+            and on starting a conversation. Stored per browser <em>and per hostname</em>, so
+            another URL for this same deployment will ask you again.
           </p>
           <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
           <div class="row">

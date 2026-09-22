@@ -70,10 +70,15 @@
       </section>
 
       <section id="tab-settings" class="tab">
-        <label for="api-token">API token</label>
+        <label for="api-token">vibe-talk API token</label>
         <p class="hint">
-          Stored in this browser only, and sent as a bearer token to this server. Use the
-          read-scope token unless you intend to post from this phone.
+          <strong>This deployment's own token</strong> — <code>VIBE_TALK_READ_TOKEN</code> or
+          <code>VIBE_TALK_WRITE_TOKEN</code> from the configuration it was started with. It is not
+          your ElevenLabs key and not your chat provider's bot token; neither of those is ever
+          entered here. Read scope is enough to read, search and listen; the write-scope one is
+          what replying from this page needs. Sent to this server as a bearer token, and stored per
+          browser <em>and per hostname</em> — so another URL for this same deployment will ask you
+          again.
         </p>
         <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
         <div class="row">

@@ -24,6 +24,15 @@
 //   belongs to the transcript and the controls.
 
 const TOKEN_KEY = "vibe-talk.token"; // shared with the main app on purpose.
+// The key this page used before the service was renamed. It is READ and never written: a browser
+// that signed in to the old name still holds the token under here, on the same origin, and the
+// rename is why the page is suddenly asking for it again. Without this the first load after a
+// rename is indistinguishable from a broken deployment — the owner is signed out of a URL that
+// worked yesterday and nothing says why. Adopting the old value automatically was the other
+// option and is deliberately not taken: a token that was revoked in the meantime would produce a
+// refusal loop nobody could see the cause of, and silently reusing a credential the owner cannot
+// see is worse than asking for it once.
+const RENAMED_FROM_KEY = "gent-talk.token";
 const MIC_SETTINGS_KEY = "vibe-talk.voice.mic";
 const WIDTH_KEY = "vibe-talk.voice.width";
 const MSG_SCALE_KEY = "vibe-talk.voice.msg-scale";
@@ -183,6 +192,37 @@ const session = {
 let recordingBroken = false;
 
 const token = () => localStorage.getItem(TOKEN_KEY) || "";
+
+/**
+ * True when this browser has no token under the current key but does have one under the key this
+ * page used before the rename. Every read is guarded: a browser with storage disabled throws on
+ * `getItem` rather than returning null, and this runs on the sign-in path, so an exception here
+ * would replace the sign-in screen with nothing.
+ */
+function signedOutByRename() {
+  try {
+    return !localStorage.getItem(TOKEN_KEY) && !!localStorage.getItem(RENAMED_FROM_KEY);
+  } catch (_error) {
+    return false;
+  }
+}
+
+/**
+ * The sentence for a refusal, chosen by WHICH refusal it was.
+ *
+ * 403 is not a bad token — it is the right token with the wrong scope, and the two are fixed
+ * differently: one is a typo, the other is a different string in the same config file. The
+ * server's own taxonomy already separates them (`forbidden`, "this token may read but not post"),
+ * and this is the one place the difference is expensive, because `/api/v1/client-config` answers
+ * a read-scope token exactly as it answers a write-scope one. So a read token signs in cleanly
+ * and fails only at the first thing that writes, which is minting a conversation. Calling that
+ * "refused" sends the owner hunting for a typo in a token that is not wrong.
+ */
+function refusalSentence(error) {
+  return error && error.status === 403
+    ? "that looks like a READ token — this page needs the write-scope one"
+    : "that token was refused — paste the write-scope token";
+}
 
 // --- screens ----------------------------------------------------------------------------------
 //
@@ -8507,6 +8547,17 @@ function setTokenState(text) {
 // asking. `#63 status-line-placement`.
 const NO_TOKEN_YET = "no token saved in this browser — paste your write-scope token above.";
 
+// The same fact, for the one browser that can explain WHY it is being asked. `#63
+// status-line-placement` put the instruction here rather than in a toast; this keeps it one
+// sentence and adds the cause, because "you were signed out" and "this deployment is broken" look
+// identical from the sign-in screen and only one of them is worth a message to the owner.
+const NO_TOKEN_AFTER_RENAME =
+  "this deployment was renamed, so the token saved under its old name is no longer read — " +
+  "paste your write-scope token above once and it will stick.";
+
+/** Whichever of the two sentences this browser has earned. */
+const noTokenSentence = () => (signedOutByRename() ? NO_TOKEN_AFTER_RENAME : NO_TOKEN_YET);
+
 // --- the way out to the agent's own configuration -----------------------------------------------
 //
 // Everything about HOW THE AGENT BEHAVES — the system prompt above all, but also the voice, the
@@ -8644,8 +8695,14 @@ async function signIn() {
     config = await api("/api/v1/client-config");
   } catch (error) {
     if (error.refused) {
-      showError(`This server refused that token: ${error.message}`);
-      setStatus("that token was refused — paste the write-scope token");
+      showError(
+        error.status === 403
+          ? `That token may read but not post, and this page needs the write-scope one — ` +
+              `VIBE_TALK_WRITE_TOKEN rather than VIBE_TALK_READ_TOKEN. The server said: ` +
+              `${error.message}`
+          : `This server refused that token: ${error.message}`
+      );
+      setStatus(refusalSentence(error));
       showScreen("signin");
       return false;
     }
@@ -9144,7 +9201,10 @@ function guardQuietly(fn) {
     });
 }
 
-setTokenState(token() ? "token saved in this browser" : NO_TOKEN_YET);
+// The LOAD-TIME sentence only, which is why this site uses `noTokenSentence()` and the three
+// below it do not: `forgetToken` and an empty Save are causes the owner just supplied themselves,
+// and blaming the rename for either would be a wrong explanation of something they already know.
+setTokenState(token() ? "token saved in this browser" : noTokenSentence());
 // With no token there is nothing to report YET, and firing a toast at page load to say so would
 // put a message over a screen whose entire subject is the thing it is asking for. The sign-in
 // screen says it in its own body; see `setTokenState`. `#63 status-line-placement`.
