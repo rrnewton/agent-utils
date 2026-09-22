@@ -113,11 +113,27 @@ steps:
     cpu_timeout: 600
     hint:
       resources: {browser: 1}
-      est_duration_s: 120
+      # MEASURED, not guessed. Everything in this block used to be an estimate for a step that had
+      # never once started -- the `cmd` above did not parse, so the job failed in milliseconds and
+      # no profile of it could exist. The first run that got through put the walk at 284s wall,
+      # 170s CPU and a 682MB peak, against guesses of 120s and 4GiB. Both were wrong by more than
+      # a factor of two, in opposite directions, which is the worst way for a scheduler estimate
+      # to be wrong: it under-books the time and over-books the memory at the same time.
+      #
+      # 300 rather than 284 because this is a whole-walk figure and the walk grows a state at a
+      # time; re-measure with `dagrun run --dag vibe-talk/tests.dag.yaml --selected
+      # shots.screenshots --ignore-selected-deps` and read `.dagrun/profiles/step_profiles_*.csv`.
+      # Unusually for this file, the number travels: at 0.60 effective cores this step is waiting,
+      # not computing, so a slower machine does not stretch it the way it stretches clippy.
+      est_duration_s: 300
       # latency-bound, not cpu-bound: most of its wall time is waiting for a page to settle, and
-      # telling the scheduler otherwise makes it reserve cores it will not use.
+      # telling the scheduler otherwise makes it reserve cores it will not use. Confirmed by the
+      # same run -- 0.60 effective cores over 284 seconds.
       classification: latency-bound
-      rss_baseline_bytes: 4294967296
-      # A browser is the one thing here that can genuinely run away. Cap it rather than discover
-      # the ceiling by watching the machine swap.
+      # 1GiB against a 682MB observed peak. This is what the scheduler RESERVES, so the old 4GiB
+      # held back six times what the step takes and cost concurrency the machine did have.
+      rss_baseline_bytes: 1073741824
+      # The cap is a different question from the reservation and stays generous: a browser is the
+      # one thing here that can genuinely run away, and the point of a backstop is to be nowhere
+      # near the normal peak. Cap it rather than discover the ceiling by watching the machine swap.
       hard_mem_max_bytes: 6442450944
