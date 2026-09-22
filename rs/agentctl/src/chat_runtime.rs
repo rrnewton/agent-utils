@@ -52,9 +52,12 @@ const MAX_FEEDBACK_AVAILABLE_IDS: usize = 32;
 const MAX_OUTBOUND_EXECUTABLE_BYTES: u64 = 64 * 1_024 * 1_024;
 const COMMIT_RECEIPT_SLOTS: u64 = 256;
 const RETIRED_ROUTE_SLOTS: u64 = 4_096;
+const RETIREMENT_AUDIT_SLOTS: u64 = 4_096;
 const MAX_RETIREMENT_RECORD_BYTES: usize = 256 * 1_024;
+const MAX_RETIREMENT_CHUNK_BYTES: usize = 256 * 1_024;
 const MAX_COMMIT_RECEIPT_BYTES: usize = 64 * 1_024;
 const MAX_GAP_DIAGNOSTIC_BYTES: usize = 64 * 1_024;
+const MAX_ADMISSION_INTENT_BYTES: usize = 1_024 * 1_024;
 
 fn default_ack_reaction() -> Option<String> {
     Some("🤖".to_owned())
@@ -334,6 +337,14 @@ struct Checkpoint {
     retirement_sequence: u64,
     #[serde(default)]
     retired_route_count: u64,
+    #[serde(default)]
+    boundary_batch_fingerprint: Option<String>,
+    #[serde(default)]
+    boundary_event_count: u32,
+    #[serde(default)]
+    boundary_ever_committed: bool,
+    #[serde(default)]
+    boundary_messages: Vec<BoundaryMessageGuard>,
     reply_count: u64,
     reply_bytes: u64,
     updated_at_millis: u64,
@@ -351,10 +362,166 @@ impl Checkpoint {
             host_batch_sequence: 0,
             retirement_sequence: 0,
             retired_route_count: 0,
+            boundary_batch_fingerprint: None,
+            boundary_event_count: 0,
+            boundary_ever_committed: false,
+            boundary_messages: Vec::new(),
             reply_count: 0,
             reply_bytes: 0,
             updated_at_millis: unix_millis(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundaryMessageGuard {
+    request_key: String,
+    message_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionRequestIntent {
+    request_key: String,
+    message_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeferredAdmissionGuard {
+    target_cursor: String,
+    provider_sequence: u64,
+    delivery_id: String,
+    event_count: u32,
+    batch_fingerprint: String,
+    requests: Vec<AdmissionRequestIntent>,
+    prepared_at_millis: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionIntent {
+    version: u32,
+    #[serde(default)]
+    rolled_back: bool,
+    prior_cursor: Option<String>,
+    prior_host_batch_sequence: u64,
+    target_cursor: String,
+    host_batch_sequence: u64,
+    provider_sequence: u64,
+    delivery_id: String,
+    event_count: u32,
+    batch_fingerprint: String,
+    requests: Vec<AdmissionRequestIntent>,
+    prepared_at_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_guard: Option<DeferredAdmissionGuard>,
+}
+
+impl AdmissionIntent {
+    fn validate(&self) -> Result<()> {
+        if self.version != STATE_VERSION
+            || self.host_batch_sequence
+                != self.prior_host_batch_sequence.checked_add(1).unwrap_or(0)
+            || self.host_batch_sequence == 0
+            || self.provider_sequence == 0
+            || self.delivery_id.is_empty()
+            || self.delivery_id.len() > chat_subscription::MAX_TOKEN_BYTES
+            || self.target_cursor.is_empty()
+            || self.target_cursor.len() > chat_subscription::MAX_TOKEN_BYTES
+            || self.event_count == 0
+            || usize::try_from(self.event_count).unwrap_or(usize::MAX)
+                > chat_subscription::MAX_BATCH_EVENTS
+            || !valid_key(&self.batch_fingerprint)
+            || self.requests.len() > chat_subscription::MAX_BATCH_EVENTS
+            || self.requests.len() > usize::try_from(self.event_count).unwrap_or(usize::MAX)
+            || self.requests.iter().any(|request| {
+                !valid_key(&request.request_key) || !valid_key(&request.message_fingerprint)
+            })
+        {
+            return Err(ChatRuntimeError::invalid(
+                "admission intent is inconsistent or outside protocol bounds",
+            ));
+        }
+        ProviderCursor::new(self.target_cursor.clone())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        if let Some(cursor) = self.prior_cursor.as_deref() {
+            ProviderCursor::new(cursor.to_owned())
+                .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        }
+        if let Some(guard) = self.restore_guard.as_ref() {
+            guard.validate()?;
+        }
+        let mut keys = self
+            .requests
+            .iter()
+            .map(|request| request.request_key.as_str())
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ChatRuntimeError::invalid(
+                "admission intent repeats a request key",
+            ));
+        }
+        Ok(())
+    }
+
+    fn deferred_guard(&self) -> DeferredAdmissionGuard {
+        DeferredAdmissionGuard {
+            target_cursor: self.target_cursor.clone(),
+            provider_sequence: self.provider_sequence,
+            delivery_id: self.delivery_id.clone(),
+            event_count: self.event_count,
+            batch_fingerprint: self.batch_fingerprint.clone(),
+            requests: self.requests.clone(),
+            prepared_at_millis: self.prepared_at_millis,
+        }
+    }
+}
+
+impl DeferredAdmissionGuard {
+    fn validate(&self) -> Result<()> {
+        let synthetic = AdmissionIntent {
+            version: STATE_VERSION,
+            rolled_back: true,
+            prior_cursor: None,
+            prior_host_batch_sequence: 0,
+            target_cursor: self.target_cursor.clone(),
+            host_batch_sequence: 1,
+            provider_sequence: self.provider_sequence,
+            delivery_id: self.delivery_id.clone(),
+            event_count: self.event_count,
+            batch_fingerprint: self.batch_fingerprint.clone(),
+            requests: self.requests.clone(),
+            prepared_at_millis: self.prepared_at_millis,
+            restore_guard: None,
+        };
+        synthetic.validate()
+    }
+
+    fn restore_after(&self, checkpoint: &Checkpoint) -> Result<AdmissionIntent> {
+        let host_batch_sequence = checkpoint
+            .host_batch_sequence
+            .checked_add(1)
+            .ok_or_else(|| ChatRuntimeError::invalid("chat host batch sequence is exhausted"))?;
+        let restored = AdmissionIntent {
+            version: STATE_VERSION,
+            rolled_back: true,
+            prior_cursor: checkpoint.cursor.clone(),
+            prior_host_batch_sequence: checkpoint.host_batch_sequence,
+            target_cursor: self.target_cursor.clone(),
+            host_batch_sequence,
+            provider_sequence: self.provider_sequence,
+            delivery_id: self.delivery_id.clone(),
+            event_count: self.event_count,
+            batch_fingerprint: self.batch_fingerprint.clone(),
+            requests: self.requests.clone(),
+            prepared_at_millis: self.prepared_at_millis,
+            restore_guard: None,
+        };
+        restored.validate()?;
+        Ok(restored)
     }
 }
 
@@ -466,6 +633,7 @@ impl GapDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RetirementPhase {
+    Preparing,
     Prepared,
     Retired,
 }
@@ -476,6 +644,55 @@ struct RetiredReplyReceipt {
     ordinal: u32,
     send_request_id: String,
     provider_message_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementReceiptChunk {
+    version: u32,
+    retirement_sequence: u64,
+    chunk_index: u32,
+    chunk_count: u32,
+    first_ordinal: u32,
+    receipts: Vec<RetiredReplyReceipt>,
+}
+
+impl RetirementReceiptChunk {
+    fn validate(&self) -> Result<()> {
+        if self.version != STATE_VERSION
+            || self.retirement_sequence == 0
+            || self.chunk_count == 0
+            || self.chunk_index >= self.chunk_count
+            || self.receipts.is_empty()
+            || self.receipts.len() > usize::try_from(MAX_REQUEST_REPLIES).unwrap_or(usize::MAX)
+            || self.first_ordinal == 0
+        {
+            return Err(ChatRuntimeError::invalid(
+                "retirement receipt chunk is inconsistent or outside protocol bounds",
+            ));
+        }
+        for (offset, reply) in self.receipts.iter().enumerate() {
+            let expected = self
+                .first_ordinal
+                .checked_add(u32::try_from(offset).unwrap_or(u32::MAX))
+                .unwrap_or(0);
+            if reply.ordinal != expected
+                || !valid_operation_uuid(&reply.send_request_id)
+                || reply.provider_message_id.is_empty()
+                || reply.provider_message_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "retirement receipt chunk contains an invalid provider receipt",
+                ));
+            }
+        }
+        if encoded_document_bytes(self)? > MAX_RETIREMENT_CHUNK_BYTES {
+            return Err(ChatRuntimeError::invalid(
+                "retirement receipt chunk exceeds its bounded artifact size",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -500,7 +717,8 @@ struct RetirementRecord {
     reaction_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reaction_already_present: Option<bool>,
-    replies: Vec<RetiredReplyReceipt>,
+    reply_chunk_count: u32,
+    reply_receipts_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     evicted_request_key: Option<String>,
     prepared_at_millis: u64,
@@ -515,12 +733,16 @@ impl RetirementRecord {
             || !valid_key(&self.request_key)
             || !valid_key(&self.message_fingerprint)
             || !valid_nonce(&self.reply_nonce)
-            || self.reply_count != u32::try_from(self.replies.len()).unwrap_or(u32::MAX)
+            || self.reply_count > MAX_REQUEST_REPLIES
+            || (self.reply_count == 0) != (self.reply_chunk_count == 0)
+            || usize::try_from(self.reply_chunk_count).unwrap_or(usize::MAX)
+                > usize::try_from(MAX_REQUEST_REPLIES).unwrap_or(usize::MAX)
+            || !valid_key(&self.reply_receipts_digest)
             || self
                 .evicted_request_key
                 .as_deref()
                 .is_some_and(|key| !valid_key(key))
-            || matches!(self.phase, RetirementPhase::Prepared) != self.retired_at_millis.is_none()
+            || matches!(self.phase, RetirementPhase::Retired) == self.retired_at_millis.is_none()
         {
             return Err(ChatRuntimeError::invalid(
                 "retirement journal is inconsistent or outside protocol bounds",
@@ -546,16 +768,6 @@ impl RetirementRecord {
         }
         ProviderCursor::new(self.admitted_cursor.clone())
             .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
-        if self.replies.iter().enumerate().any(|(index, reply)| {
-            reply.ordinal != u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1)
-                || !valid_operation_uuid(&reply.send_request_id)
-                || reply.provider_message_id.is_empty()
-                || reply.provider_message_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
-        }) {
-            return Err(ChatRuntimeError::invalid(
-                "retirement reply receipts are inconsistent or outside protocol bounds",
-            ));
-        }
         Ok(())
     }
 }
@@ -1287,8 +1499,16 @@ impl CommandOutboundTransport {
             Err(error) => {
                 drop(reader);
                 let cleanup = child.shutdown(Duration::ZERO);
+                let cancelled = self
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(OutboundCancellation::is_cancelled);
                 return Err(OutboundFailure::unknown(
-                    "helper_response_unknown",
+                    if cancelled {
+                        "helper_cancelled"
+                    } else {
+                        "helper_response_unknown"
+                    },
                     cleanup_detail(error.to_string(), cleanup),
                     true,
                 ));
@@ -2065,6 +2285,14 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
 pub struct BridgeState {
     root: PathBuf,
     config: BridgeConfiguration,
+    #[cfg(test)]
+    admission_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
+    #[cfg(test)]
+    retirement_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
+    #[cfg(test)]
+    retirement_boundary_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    confirm_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
 }
 
 /// Revalidate and pin the configured provider executable without launching it.
@@ -2126,6 +2354,10 @@ impl BridgeState {
                 root.join("retirements"),
                 "chat retirement journal directory",
             ),
+            (
+                root.join("retirement-receipts"),
+                "chat retirement receipt directory",
+            ),
         ] {
             agent::create_private_directory(&directory, label, true, true)?;
         }
@@ -2139,12 +2371,21 @@ impl BridgeState {
         Ok(Self {
             root: root.to_path_buf(),
             config,
+            #[cfg(test)]
+            admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            retirement_fault_after: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            retirement_boundary_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            confirm_fault_after: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
     /// Open and recover one existing private bridge state directory.
     pub fn open(root: &Path) -> Result<Self> {
         agent::validate_private_directory(root, "chat state directory", false)?;
+        let mut created_upgrade_directory = false;
         for (directory, label) in [
             (
                 root.join("commit-receipts"),
@@ -2155,12 +2396,21 @@ impl BridgeState {
                 root.join("retirements"),
                 "chat retirement journal directory",
             ),
+            (
+                root.join("retirement-receipts"),
+                "chat retirement receipt directory",
+            ),
         ] {
             if fs::symlink_metadata(&directory).is_err() {
                 agent::create_private_directory(&directory, label, false, true)?;
+                created_upgrade_directory = true;
             }
         }
+        if created_upgrade_directory {
+            agent::sync_directory(root)?;
+        }
         let state = Self::inspect(root)?;
+        state.recover_admission()?;
         state.complete_retirements()?;
         state.recover_population()?;
         Ok(state)
@@ -2181,6 +2431,10 @@ impl BridgeState {
                 root.join("retirements"),
                 "chat retirement journal directory",
             ),
+            (
+                root.join("retirement-receipts"),
+                "chat retirement receipt directory",
+            ),
         ] {
             if fs::symlink_metadata(&directory).is_ok() {
                 agent::validate_private_directory(&directory, label, false)?;
@@ -2197,6 +2451,14 @@ impl BridgeState {
         Ok(Self {
             root: root.to_path_buf(),
             config: envelope.config,
+            #[cfg(test)]
+            admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            retirement_fault_after: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            retirement_boundary_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            confirm_fault_after: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -2213,6 +2475,254 @@ impl BridgeState {
     /// Return the last durable inclusive provider replay cursor.
     pub fn cursor(&self) -> Result<Option<String>> {
         Ok(self.read_checkpoint()?.cursor)
+    }
+
+    fn admission_path(&self) -> PathBuf {
+        self.root.join("admission.json")
+    }
+
+    fn recover_admission(&self) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        for directory in [
+            self.root.clone(),
+            self.root.join("requests"),
+            self.root.join("replies"),
+            self.root.join("commit-receipts"),
+            self.root.join("tombstones"),
+            self.root.join("retirements"),
+        ] {
+            agent::cleanup_atomic_json_temporaries(&directory)?;
+        }
+        let mut checkpoint = self.read_checkpoint()?;
+        self.repair_boundary_commit_locked(&mut checkpoint)?;
+        self.recover_admission_locked(&checkpoint)
+    }
+
+    fn repair_boundary_commit_locked(&self, checkpoint: &mut Checkpoint) -> Result<()> {
+        if checkpoint.host_batch_sequence == 0 {
+            return Ok(());
+        }
+        let receipt = self.current_commit_receipt(checkpoint)?.ok_or_else(|| {
+            ChatRuntimeError::invalid(
+                "checkpoint boundary authority is missing its current receipt",
+            )
+        })?;
+        if let Some(fingerprint) = checkpoint.boundary_batch_fingerprint.as_deref() {
+            if fingerprint != receipt.batch_fingerprint
+                || checkpoint.boundary_event_count != receipt.event_count
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "checkpoint boundary authority does not match its current receipt",
+                ));
+            }
+        }
+        if !checkpoint.boundary_ever_committed
+            && checkpoint.boundary_batch_fingerprint.is_some()
+            && receipt.phase == CommitReceiptPhase::Committed
+        {
+            checkpoint.boundary_ever_committed = true;
+            checkpoint.updated_at_millis = unix_millis();
+            write_document(&self.root.join("checkpoint.json"), checkpoint)?;
+        }
+        Ok(())
+    }
+
+    fn recover_admission_locked(&self, checkpoint: &Checkpoint) -> Result<()> {
+        let path = self.admission_path();
+        let intent: AdmissionIntent = match read_document(&path, MAX_ADMISSION_INTENT_BYTES) {
+            Ok(intent) => intent,
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        intent.validate()?;
+        let checkpoint_is_prior = checkpoint.host_batch_sequence
+            == intent.prior_host_batch_sequence
+            && checkpoint.cursor == intent.prior_cursor;
+        let checkpoint_is_target = checkpoint.host_batch_sequence == intent.host_batch_sequence
+            && checkpoint.cursor.as_deref() == Some(intent.target_cursor.as_str());
+        if !checkpoint_is_prior && !checkpoint_is_target {
+            return Err(ChatRuntimeError::invalid(
+                "admission intent does not match either side of the durable checkpoint boundary",
+            ));
+        }
+
+        let reply_artifact_keys = if checkpoint_is_prior && !intent.requests.is_empty() {
+            Some(self.reply_artifact_keys()?)
+        } else {
+            None
+        };
+        for request in &intent.requests {
+            let request_path = self.request_path(&request.request_key);
+            let record: RequestRecord = match read_document(&request_path, MAX_REQUEST_RECORD_BYTES)
+            {
+                Ok(record) => record,
+                Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    if checkpoint_is_target {
+                        return Err(ChatRuntimeError::invalid(
+                            "committed admission intent is missing a request record",
+                        ));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            self.validate_request_record(&record, &request.request_key)?;
+            if checkpoint_is_prior && intent.rolled_back {
+                return Err(ChatRuntimeError::invalid(
+                    "rolled-back admission request key was recreated before exact replay",
+                ));
+            }
+            if record.admitted_cursor.as_deref() != Some(intent.target_cursor.as_str())
+                || saved_message_fingerprint(&record.message)? != request.message_fingerprint
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "admission intent request identity does not match its durable record",
+                ));
+            }
+            if checkpoint_is_prior {
+                if record.phase != RequestPhase::Pending
+                    || record.reply_count != 0
+                    || record.reply_bytes != 0
+                    || record.next_reply_ordinal != 1
+                    || record.next_send_ordinal != 1
+                    || record.reply_closed
+                    || reply_artifact_keys
+                        .as_ref()
+                        .is_some_and(|keys| keys.contains(&request.request_key))
+                {
+                    return Err(ChatRuntimeError::invalid(
+                        "uncommitted admission acquired downstream state before its checkpoint",
+                    ));
+                }
+                remove_if_exists(&request_path)?;
+            }
+        }
+        if checkpoint_is_prior && !intent.requests.is_empty() {
+            agent::sync_directory(&self.root.join("requests"))?;
+        }
+
+        let receipt_path = self.commit_receipt_path(intent.host_batch_sequence);
+        match read_document::<CommitReceipt>(&receipt_path, MAX_COMMIT_RECEIPT_BYTES) {
+            Ok(receipt) => {
+                receipt.validate()?;
+                let exact = receipt.host_batch_sequence == intent.host_batch_sequence
+                    && receipt.provider_sequence == intent.provider_sequence
+                    && receipt.delivery_id == intent.delivery_id
+                    && receipt.cursor == intent.target_cursor
+                    && receipt.event_count == intent.event_count
+                    && receipt.batch_fingerprint == intent.batch_fingerprint;
+                if checkpoint_is_target && !exact {
+                    return Err(ChatRuntimeError::invalid(
+                        "committed admission intent does not match its prepared receipt",
+                    ));
+                }
+                if checkpoint_is_prior && intent.rolled_back && exact {
+                    return Err(ChatRuntimeError::invalid(
+                        "rolled-back admission receipt was recreated before exact replay",
+                    ));
+                }
+                if checkpoint_is_prior && exact {
+                    remove_if_exists(&receipt_path)?;
+                    agent::sync_directory(&self.root.join("commit-receipts"))?;
+                }
+            }
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                if checkpoint_is_target {
+                    return Err(ChatRuntimeError::invalid(
+                        "committed admission intent is missing its prepared receipt",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        if checkpoint_is_prior {
+            let mut replay_guard = match intent.restore_guard.as_ref() {
+                Some(guard) => guard.restore_after(checkpoint)?,
+                None => intent,
+            };
+            replay_guard.restore_guard = None;
+            replay_guard.prior_cursor = checkpoint.cursor.clone();
+            replay_guard.prior_host_batch_sequence = checkpoint.host_batch_sequence;
+            replay_guard.host_batch_sequence = checkpoint
+                .host_batch_sequence
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ChatRuntimeError::invalid("chat host batch sequence is exhausted")
+                })?;
+            replay_guard.rolled_back = true;
+            replay_guard.validate()?;
+            write_document(&path, &replay_guard)?;
+        } else if let Some(guard) = intent.restore_guard.as_ref() {
+            let replay_guard = guard.restore_after(checkpoint)?;
+            write_document(&path, &replay_guard)?;
+        } else {
+            remove_if_exists(&path)?;
+            agent::sync_directory(&self.root)?;
+        }
+        Ok(())
+    }
+
+    fn admission_boundary(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .admission_fault_after
+                .lock()
+                .expect("admission fault lock");
+            if let Some(value) = remaining.as_mut() {
+                if *value == 0 {
+                    *remaining = None;
+                    return Err(ChatRuntimeError::invalid(
+                        "injected admission boundary failure",
+                    ));
+                }
+                *value = value.saturating_sub(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn retirement_boundary(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.retirement_boundary_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut remaining = self
+                .retirement_fault_after
+                .lock()
+                .expect("retirement fault lock");
+            if let Some(value) = remaining.as_mut() {
+                if *value == 0 {
+                    *remaining = None;
+                    return Err(ChatRuntimeError::invalid(
+                        "injected retirement boundary failure",
+                    ));
+                }
+                *value = value.saturating_sub(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn confirm_boundary(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut remaining = self.confirm_fault_after.lock().expect("confirm fault lock");
+            if let Some(value) = remaining.as_mut() {
+                if *value == 0 {
+                    *remaining = None;
+                    return Err(ChatRuntimeError::invalid(
+                        "injected commit-confirmation boundary failure",
+                    ));
+                }
+                *value = value.saturating_sub(1);
+            }
+        }
+        Ok(())
     }
 
     /// Build the next subscription request from durable replay authority.
@@ -2244,21 +2754,9 @@ impl BridgeState {
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let mut checkpoint = self.read_checkpoint()?;
+        self.repair_boundary_commit_locked(&mut checkpoint)?;
+        self.recover_admission_locked(&checkpoint)?;
         let batch_fingerprint = batch_fingerprint(batch)?;
-        if checkpoint.cursor.as_deref() == Some(batch.cursor().as_str())
-            && checkpoint.host_batch_sequence > 0
-        {
-            let previous = self.current_commit_receipt(&checkpoint)?.ok_or_else(|| {
-                ChatRuntimeError::invalid(
-                    "current inclusive cursor is missing its prepared or committed receipt",
-                )
-            })?;
-            if previous.batch_fingerprint != batch_fingerprint {
-                return Err(ChatRuntimeError::invalid(
-                    "provider reused the current inclusive cursor for different batch content",
-                ));
-            }
-        }
         let mut gap_reasons = batch
             .events()
             .iter()
@@ -2286,7 +2784,7 @@ impl BridgeState {
                 proposed_cursor: batch.cursor().as_str().to_owned(),
                 resume_cursor: checkpoint.cursor.clone(),
                 reasons: gap_reasons,
-                batch_fingerprint,
+                batch_fingerprint: batch_fingerprint.clone(),
                 observed_at_millis: unix_millis(),
                 resolved_at_millis: None,
                 resolved_host_batch_sequence: None,
@@ -2301,6 +2799,69 @@ impl BridgeState {
                 batch.sequence().get(),
                 batch.delivery_id().as_str()
             )));
+        }
+        let mut restore_guard = None;
+        match read_document::<AdmissionIntent>(&self.admission_path(), MAX_ADMISSION_INTENT_BYTES) {
+            Ok(intent) => {
+                intent.validate()?;
+                let guard_matches_target = intent.rolled_back
+                    && checkpoint.host_batch_sequence == intent.prior_host_batch_sequence
+                    && checkpoint.cursor == intent.prior_cursor
+                    && batch.cursor().as_str() == intent.target_cursor
+                    && batch_fingerprint == intent.batch_fingerprint;
+                if !guard_matches_target {
+                    let current = self.current_commit_receipt(&checkpoint)?;
+                    let current_receipt_exact = current.as_ref().is_some_and(|receipt| {
+                        receipt.batch_fingerprint == batch_fingerprint
+                            && usize::try_from(receipt.event_count).ok()
+                                == Some(batch.events().len())
+                    });
+                    let committed_boundary_authority =
+                        match checkpoint.boundary_batch_fingerprint.as_deref() {
+                            Some(fingerprint) => {
+                                checkpoint.boundary_ever_committed
+                                    && fingerprint == batch_fingerprint
+                                    && usize::try_from(checkpoint.boundary_event_count).ok()
+                                        == Some(batch.events().len())
+                            }
+                            // Legacy checkpoints did not retain boundary guards. The durable
+                            // receipt still binds the exact cursor, event count, and batch
+                            // fingerprint even when its provider callback confirmation was
+                            // interrupted in Prepared. A distinct replay installs the complete
+                            // authority and obtains its own acknowledgement receipt.
+                            None => current.is_some(),
+                        };
+                    let exact_current_replay = intent.rolled_back
+                        && checkpoint.host_batch_sequence == intent.prior_host_batch_sequence
+                        && checkpoint.cursor == intent.prior_cursor
+                        && checkpoint.cursor.as_deref() == Some(batch.cursor().as_str())
+                        && committed_boundary_authority
+                        && current_receipt_exact;
+                    if exact_current_replay {
+                        restore_guard = Some(intent.deferred_guard());
+                    } else {
+                        return Err(ChatRuntimeError::invalid(
+                            "provider replay does not match the rolled-back admission transaction or current inclusive boundary",
+                        ));
+                    }
+                }
+            }
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if checkpoint.cursor.as_deref() == Some(batch.cursor().as_str())
+            && checkpoint.host_batch_sequence > 0
+        {
+            let previous = self.current_commit_receipt(&checkpoint)?.ok_or_else(|| {
+                ChatRuntimeError::invalid(
+                    "current inclusive cursor is missing its prepared or committed receipt",
+                )
+            })?;
+            if previous.batch_fingerprint != batch_fingerprint {
+                return Err(ChatRuntimeError::invalid(
+                    "provider reused the current inclusive cursor for different batch content",
+                ));
+            }
         }
         let mut candidate_records = Vec::new();
         let mut candidate_messages = BTreeMap::new();
@@ -2320,6 +2881,7 @@ impl BridgeState {
                         }
                         continue;
                     }
+                    candidate_messages.insert(record.key.clone(), record.message.clone());
                     let path = self.request_path(&record.key);
                     if fs::symlink_metadata(&path).is_ok() {
                         let saved: RequestRecord = read_document(&path, MAX_REQUEST_RECORD_BYTES)?;
@@ -2364,12 +2926,36 @@ impl BridgeState {
                         )));
                     }
                     request_bytes = request_bytes.saturating_add(encoded_bytes);
-                    candidate_messages.insert(record.key.clone(), record.message.clone());
                     candidate_records.push(record);
                 }
                 CommittableEvent::Checkpoint => {}
                 CommittableEvent::Gap(_) => unreachable!("gaps were rejected before admission"),
             }
+        }
+
+        let boundary_messages = candidate_messages
+            .iter()
+            .map(|(key, message)| {
+                Ok(BoundaryMessageGuard {
+                    request_key: key.clone(),
+                    message_fingerprint: saved_message_fingerprint(message)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if checkpoint.cursor.as_deref() == Some(batch.cursor().as_str()) {
+            if checkpoint.boundary_batch_fingerprint.is_some()
+                && (checkpoint.boundary_batch_fingerprint.as_deref()
+                    != Some(batch_fingerprint.as_str())
+                    || usize::try_from(checkpoint.boundary_event_count).ok()
+                        != Some(batch.events().len())
+                    || checkpoint.boundary_messages != boundary_messages)
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "current inclusive replay does not match checkpoint boundary authority",
+                ));
+            }
+            candidate_records.clear();
+            request_bytes = 0;
         }
 
         self.retire_for_capacity_locked(
@@ -2394,19 +2980,60 @@ impl BridgeState {
             .iter()
             .map(|record| record.key.clone())
             .collect::<Vec<_>>();
-        for record in &candidate_records {
-            write_document(&self.request_path(&record.key), record)?;
-        }
-
-        if !new_records.is_empty() {
-            agent::sync_directory(&self.root.join("requests"))?;
-        }
         let host_batch_sequence = checkpoint
             .host_batch_sequence
             .checked_add(1)
             .ok_or_else(|| ChatRuntimeError::invalid("chat host batch sequence is exhausted"))?;
         let event_count = u32::try_from(batch.events().len())
             .map_err(|_| ChatRuntimeError::invalid("batch event count does not fit u32"))?;
+        let prior_boundary_committed =
+            if checkpoint.cursor.as_deref() == Some(batch.cursor().as_str()) {
+                checkpoint.boundary_ever_committed
+                    || self
+                        .current_commit_receipt(&checkpoint)?
+                        .is_some_and(|receipt| receipt.phase == CommitReceiptPhase::Committed)
+            } else {
+                false
+            };
+        let intent = AdmissionIntent {
+            version: STATE_VERSION,
+            rolled_back: false,
+            prior_cursor: checkpoint.cursor.clone(),
+            prior_host_batch_sequence: checkpoint.host_batch_sequence,
+            target_cursor: batch.cursor().as_str().to_owned(),
+            host_batch_sequence,
+            provider_sequence: batch.sequence().get(),
+            delivery_id: batch.delivery_id().as_str().to_owned(),
+            event_count,
+            batch_fingerprint: batch_fingerprint.clone(),
+            requests: candidate_records
+                .iter()
+                .map(|record| {
+                    Ok(AdmissionRequestIntent {
+                        request_key: record.key.clone(),
+                        message_fingerprint: saved_message_fingerprint(&record.message)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            prepared_at_millis: unix_millis(),
+            restore_guard,
+        };
+        intent.validate()?;
+        if encoded_document_bytes(&intent)? > MAX_ADMISSION_INTENT_BYTES {
+            return Err(ChatRuntimeError::invalid(
+                "admission intent exceeds its durable artifact bound",
+            ));
+        }
+        write_document(&self.admission_path(), &intent)?;
+        self.admission_boundary()?;
+        for record in &candidate_records {
+            write_document(&self.request_path(&record.key), record)?;
+            self.admission_boundary()?;
+        }
+        if !new_records.is_empty() {
+            agent::sync_directory(&self.root.join("requests"))?;
+            self.admission_boundary()?;
+        }
         let receipt = CommitReceipt {
             version: STATE_VERSION,
             phase: CommitReceiptPhase::Prepared,
@@ -2421,15 +3048,32 @@ impl BridgeState {
         };
         receipt.validate()?;
         write_document(&self.commit_receipt_path(host_batch_sequence), &receipt)?;
+        self.admission_boundary()?;
+        let preserves_committed_boundary = checkpoint.cursor.as_deref()
+            == Some(batch.cursor().as_str())
+            && prior_boundary_committed;
         checkpoint.cursor = Some(batch.cursor().as_str().to_owned());
         checkpoint.request_count = checkpoint
             .request_count
             .saturating_add(u64::try_from(new_records.len()).unwrap_or(u64::MAX));
         checkpoint.request_bytes = checkpoint.request_bytes.saturating_add(request_bytes);
         checkpoint.host_batch_sequence = host_batch_sequence;
+        checkpoint.boundary_batch_fingerprint = Some(batch_fingerprint.clone());
+        checkpoint.boundary_event_count = event_count;
+        checkpoint.boundary_ever_committed = preserves_committed_boundary;
+        checkpoint.boundary_messages = boundary_messages;
         checkpoint.updated_at_millis = unix_millis();
         validate_checkpoint(&checkpoint)?;
         write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        self.admission_boundary()?;
+        if let Some(guard) = intent.restore_guard.as_ref() {
+            let replay_guard = guard.restore_after(&checkpoint)?;
+            write_document(&self.admission_path(), &replay_guard)?;
+        } else {
+            remove_if_exists(&self.admission_path())?;
+            agent::sync_directory(&self.root)?;
+        }
+        self.admission_boundary()?;
         Ok(BatchAdmission {
             new_request_keys: new_records,
             reconciliation_required: checkpoint.reconciliation_required,
@@ -2447,8 +3091,12 @@ impl BridgeState {
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let mut checkpoint = self.read_checkpoint()?;
+        self.repair_boundary_commit_locked(&mut checkpoint)?;
         if checkpoint.host_batch_sequence != admission.host_batch_sequence
             || checkpoint.cursor.as_deref() != Some(admission.cursor.as_str())
+            || checkpoint.boundary_batch_fingerprint.as_deref()
+                != Some(admission.batch_fingerprint.as_str())
+            || checkpoint.boundary_event_count != admission.event_count
         {
             return Err(ChatRuntimeError::invalid(
                 "durable checkpoint changed before provider commit confirmation",
@@ -2473,9 +3121,21 @@ impl BridgeState {
         receipt.committed_at_millis = Some(unix_millis());
         receipt.validate()?;
         write_document(&path, &receipt)?;
+        self.confirm_boundary()?;
         checkpoint.committed_batches = checkpoint.committed_batches.saturating_add(1);
+        checkpoint.boundary_ever_committed = true;
         checkpoint.updated_at_millis = unix_millis();
-        write_document(&self.root.join("checkpoint.json"), &checkpoint)
+        write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        self.confirm_boundary()?;
+        let boundary_keys = checkpoint
+            .boundary_messages
+            .iter()
+            .map(|guard| guard.request_key.clone())
+            .collect::<Vec<_>>();
+        for key in boundary_keys {
+            let _ = self.retire_if_eligible_locked(&mut checkpoint, &key)?;
+        }
+        Ok(())
     }
 
     /// Read bounded local status without contacting a provider or coordinator.
@@ -2647,6 +3307,14 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
 
     /// Capture complete blocks for every request through one bounded pane-snapshot parse.
     pub fn capture_snapshot(&self, rendered: &str) -> Result<SnapshotCapture> {
+        self.capture_snapshot_with_hook(rendered, || {})
+    }
+
+    fn capture_snapshot_with_hook(
+        &self,
+        rendered: &str,
+        after_state_scan: impl FnOnce(),
+    ) -> Result<SnapshotCapture> {
         if !self.config.outbound_enabled {
             return Ok(SnapshotCapture {
                 replies: Vec::new(),
@@ -2654,8 +3322,12 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                 route_entries: Vec::new(),
             });
         }
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let records = self.request_records()?;
         let retired_routes = self.retired_routes()?;
+        after_state_scan();
         let mut known_nonces = records
             .iter()
             .map(|(record, _)| record.reply_nonce.clone())
@@ -2684,7 +3356,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                 // Closed retained requests stay recognized so a stale terminal marker is a no-op.
                 continue;
             };
-            let capture = self.capture_scanned_replies(
+            let capture = self.capture_scanned_replies_locked(
                 key,
                 ReplyScan {
                     blocks,
@@ -2827,6 +3499,8 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut checkpoint = self.read_checkpoint()?;
+        self.complete_pending_retirement_locked(&mut checkpoint)?;
         let mut request = match self.read_request(key) {
             Ok(request) => request,
             Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
@@ -2837,7 +3511,6 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             }
             Err(error) => return Err(error),
         };
-        let mut checkpoint = self.read_checkpoint()?;
         if !request.reply_closed {
             request.reply_closed = true;
             self.write_request_accounted(&request, &mut checkpoint)?;
@@ -2858,6 +3531,9 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         {
             return Ok(());
         }
+        // Eligible requests are retired directly at their terminal transition or from the bounded
+        // committed-current-boundary authority. Only true cap pressure performs this one bounded
+        // legacy/crash-recovery scan; steady-state churn returns above without directory I/O.
         let keys = self
             .request_records()?
             .into_iter()
@@ -2868,15 +3544,22 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             if checkpoint.request_count.saturating_add(additional_count) <= MAX_REQUESTS
                 && checkpoint.request_bytes.saturating_add(additional_bytes) <= MAX_REQUEST_BYTES
             {
-                return Ok(());
+                break;
             }
         }
         Ok(())
     }
 
     fn retire_if_eligible_locked(&self, checkpoint: &mut Checkpoint, key: &str) -> Result<bool> {
+        self.complete_pending_retirement_locked(checkpoint)?;
         let (request, request_bytes): (RequestRecord, u64) =
-            read_document_sized(&self.request_path(key), MAX_REQUEST_RECORD_BYTES)?;
+            match read_document_sized(&self.request_path(key), MAX_REQUEST_RECORD_BYTES) {
+                Ok(value) => value,
+                Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(self.retired_key(key)?.is_some());
+                }
+                Err(error) => return Err(error),
+            };
         self.validate_request_record(&request, key)?;
         let Some(admitted_cursor) = request.admitted_cursor.as_deref() else {
             return Ok(false);
@@ -2885,9 +3568,22 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             || !matches!(request.ack_phase, AckPhase::Disabled | AckPhase::Acked)
             || !request.reply_closed
             || request.next_send_ordinal != request.next_reply_ordinal
-            || checkpoint.cursor.as_deref() == Some(admitted_cursor)
         {
             return Ok(false);
+        }
+        if checkpoint.cursor.as_deref() == Some(admitted_cursor) {
+            let fingerprint = saved_message_fingerprint(&request.message)?;
+            let receipt_committed = self
+                .current_commit_receipt(checkpoint)?
+                .is_some_and(|receipt| receipt.phase == CommitReceiptPhase::Committed);
+            let authorized = (checkpoint.boundary_ever_committed || receipt_committed)
+                && checkpoint.boundary_batch_fingerprint.is_some()
+                && checkpoint.boundary_messages.iter().any(|guard| {
+                    guard.request_key == key && guard.message_fingerprint == fingerprint
+                });
+            if !authorized {
+                return Ok(false);
+            }
         }
         let mut replies =
             Vec::with_capacity(usize::try_from(request.reply_count).unwrap_or(usize::MAX));
@@ -2908,6 +3604,29 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             .retirement_sequence
             .checked_add(1)
             .ok_or_else(|| ChatRuntimeError::invalid("retirement sequence is exhausted"))?;
+        let retirement_path = self.retirement_path(retirement_sequence);
+        match read_document::<RetirementRecord>(&retirement_path, MAX_RETIREMENT_RECORD_BYTES) {
+            Ok(previous) => {
+                previous.validate()?;
+                if previous.phase != RetirementPhase::Retired
+                    || retirement_sequence <= RETIREMENT_AUDIT_SLOTS
+                    || previous.retirement_sequence
+                        != retirement_sequence.saturating_sub(RETIREMENT_AUDIT_SLOTS)
+                {
+                    return Err(ChatRuntimeError::invalid(
+                        "retirement audit ring slot is not safely reusable",
+                    ));
+                }
+            }
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                if retirement_sequence > RETIREMENT_AUDIT_SLOTS {
+                    return Err(ChatRuntimeError::invalid(
+                        "retirement audit ring is missing the generation being replaced",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
         let route_path = self.retired_route_path(retirement_sequence);
         let evicted =
             match read_document::<RetiredRouteIndex>(&route_path, MAX_REQUEST_RECORD_BYTES) {
@@ -2918,10 +3637,22 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                 Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error),
             };
+        match (&evicted, retirement_sequence > RETIRED_ROUTE_SLOTS) {
+            (None, false) => {}
+            (Some(route), true)
+                if route.retirement_sequence
+                    == retirement_sequence.saturating_sub(RETIRED_ROUTE_SLOTS) => {}
+            _ => {
+                return Err(ChatRuntimeError::invalid(
+                    "retired route ring slot is not the exact generation being replaced",
+                ));
+            }
+        }
         let prepared_at_millis = unix_millis();
+        let reply_chunks = retirement_receipt_chunks(retirement_sequence, &replies)?;
         let mut retirement = RetirementRecord {
             version: STATE_VERSION,
-            phase: RetirementPhase::Prepared,
+            phase: RetirementPhase::Preparing,
             retirement_sequence,
             request_key: key.to_owned(),
             message_fingerprint: saved_message_fingerprint(&request.message)?,
@@ -2935,7 +3666,10 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             ack_request_id: request.ack_request_id.clone(),
             reaction_id: request.reaction_id.clone(),
             reaction_already_present: request.reaction_already_present,
-            replies,
+            reply_chunk_count: u32::try_from(reply_chunks.len()).map_err(|_| {
+                ChatRuntimeError::invalid("retirement chunk count does not fit u32")
+            })?,
+            reply_receipts_digest: retirement_receipts_digest(&replies)?,
             evicted_request_key: evicted
                 .as_ref()
                 .filter(|route| route.request_key != key)
@@ -2949,56 +3683,173 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                 "retirement audit record exceeds its bounded artifact size",
             ));
         }
-        let retirement_path = self.retirement_path(retirement_sequence);
         write_document(&retirement_path, &retirement)?;
+        self.retirement_boundary()?;
+        self.write_retirement_receipt_chunks(&retirement, &replies, &reply_chunks)?;
+        retirement.phase = RetirementPhase::Prepared;
+        retirement.validate()?;
+        write_document(&retirement_path, &retirement)?;
+        self.retirement_boundary()?;
+        self.finish_prepared_retirement_locked(checkpoint, &retirement_path, &mut retirement)?;
+        Ok(true)
+    }
+
+    fn finish_prepared_retirement_locked(
+        &self,
+        checkpoint: &mut Checkpoint,
+        retirement_path: &Path,
+        retirement: &mut RetirementRecord,
+    ) -> Result<()> {
+        retirement.validate()?;
+        if retirement.phase == RetirementPhase::Retired {
+            return Ok(());
+        }
+        if retirement.phase != RetirementPhase::Prepared {
+            return Err(ChatRuntimeError::invalid(
+                "retirement destruction started before receipt preparation completed",
+            ));
+        }
+        let _ = self.read_retirement_receipts(retirement)?;
+        if retirement.retirement_sequence == checkpoint.retirement_sequence {
+            // The atomic checkpoint proves every destructive step and both directory syncs were
+            // completed. Only the final audit phase transition was interrupted.
+            retirement.phase = RetirementPhase::Retired;
+            retirement.retired_at_millis = Some(unix_millis());
+            retirement.validate()?;
+            write_document(retirement_path, retirement)?;
+            self.retirement_boundary()?;
+            return Ok(());
+        }
+        if retirement.retirement_sequence
+            != checkpoint
+                .retirement_sequence
+                .checked_add(1)
+                .ok_or_else(|| ChatRuntimeError::invalid("retirement sequence is exhausted"))?
+        {
+            return Err(ChatRuntimeError::invalid(
+                "prepared retirement is not the unique next checkpoint generation",
+            ));
+        }
         let index = RetiredRouteIndex {
             version: STATE_VERSION,
-            retirement_sequence,
-            request_key: key.to_owned(),
+            retirement_sequence: retirement.retirement_sequence,
+            request_key: retirement.request_key.clone(),
             message_fingerprint: retirement.message_fingerprint.clone(),
-            reply_nonce: request.reply_nonce,
-            admitted_cursor: admitted_cursor.to_owned(),
-            retired_at_millis: prepared_at_millis,
+            reply_nonce: retirement.reply_nonce.clone(),
+            admitted_cursor: retirement.admitted_cursor.clone(),
+            retired_at_millis: retirement.prepared_at_millis,
         };
         index.validate()?;
-        write_document(&self.retired_key_path(key), &index)?;
-        write_document(&route_path, &index)?;
-        if let Some(evicted) = evicted.filter(|route| route.request_key != key) {
-            remove_if_exists(&self.retired_key_path(&evicted.request_key))?;
+        write_document(&self.retired_key_path(&retirement.request_key), &index)?;
+        self.retirement_boundary()?;
+        write_document(
+            &self.retired_route_path(retirement.retirement_sequence),
+            &index,
+        )?;
+        self.retirement_boundary()?;
+        if let Some(evicted) = retirement.evicted_request_key.as_deref() {
+            if evicted != retirement.request_key {
+                remove_if_exists(&self.retired_key_path(evicted))?;
+                agent::sync_directory(&self.root.join("tombstones"))?;
+                self.retirement_boundary()?;
+            }
         }
-        for ordinal in 1..=request.reply_count {
-            remove_if_exists(&self.reply_path(key, ordinal))?;
+        for ordinal in 1..=retirement.reply_count {
+            remove_if_exists(&self.reply_path(&retirement.request_key, ordinal))?;
+            self.retirement_boundary()?;
         }
-        remove_if_exists(&self.request_path(key))?;
+        remove_if_exists(&self.request_path(&retirement.request_key))?;
+        self.retirement_boundary()?;
         agent::sync_directory(&self.root.join("replies"))?;
+        self.retirement_boundary()?;
         agent::sync_directory(&self.root.join("requests"))?;
-        checkpoint.request_count = checkpoint.request_count.checked_sub(1).ok_or_else(|| {
-            ChatRuntimeError::invalid("request count underflow during retirement")
-        })?;
-        checkpoint.request_bytes = checkpoint
+        self.retirement_boundary()?;
+        let mut next_checkpoint = checkpoint.clone();
+        next_checkpoint.request_count =
+            next_checkpoint
+                .request_count
+                .checked_sub(1)
+                .ok_or_else(|| {
+                    ChatRuntimeError::invalid("request count underflow during retirement")
+                })?;
+        next_checkpoint.request_bytes = next_checkpoint
             .request_bytes
-            .checked_sub(request_bytes)
+            .checked_sub(retirement.request_bytes)
             .ok_or_else(|| ChatRuntimeError::invalid("request byte underflow during retirement"))?;
-        checkpoint.reply_count = checkpoint
+        next_checkpoint.reply_count = next_checkpoint
             .reply_count
-            .checked_sub(u64::from(request.reply_count))
+            .checked_sub(u64::from(retirement.reply_count))
             .ok_or_else(|| ChatRuntimeError::invalid("reply count underflow during retirement"))?;
-        checkpoint.reply_bytes = checkpoint
+        next_checkpoint.reply_bytes = next_checkpoint
             .reply_bytes
-            .checked_sub(request.reply_bytes)
+            .checked_sub(retirement.reply_bytes)
             .ok_or_else(|| ChatRuntimeError::invalid("reply byte underflow during retirement"))?;
-        checkpoint.retirement_sequence = retirement_sequence;
-        checkpoint.retired_route_count = checkpoint
+        next_checkpoint.retirement_sequence = retirement.retirement_sequence;
+        next_checkpoint.retired_route_count = next_checkpoint
             .retired_route_count
             .saturating_add(1)
             .min(RETIRED_ROUTE_SLOTS);
-        checkpoint.updated_at_millis = unix_millis();
-        write_document(&self.root.join("checkpoint.json"), checkpoint)?;
+        next_checkpoint.updated_at_millis = unix_millis();
+        validate_checkpoint(&next_checkpoint)?;
+        write_document(&self.root.join("checkpoint.json"), &next_checkpoint)?;
+        *checkpoint = next_checkpoint;
+        self.retirement_boundary()?;
         retirement.phase = RetirementPhase::Retired;
         retirement.retired_at_millis = Some(unix_millis());
         retirement.validate()?;
-        write_document(&retirement_path, &retirement)?;
-        Ok(true)
+        write_document(retirement_path, &retirement)?;
+        self.retirement_boundary()?;
+        Ok(())
+    }
+
+    fn resume_retirement_preparation_locked(
+        &self,
+        retirement_path: &Path,
+        retirement: &mut RetirementRecord,
+    ) -> Result<()> {
+        if retirement.phase != RetirementPhase::Preparing {
+            return Ok(());
+        }
+        let (request, request_bytes): (RequestRecord, u64) = read_document_sized(
+            &self.request_path(&retirement.request_key),
+            MAX_REQUEST_RECORD_BYTES,
+        )?;
+        self.validate_request_record(&request, &retirement.request_key)?;
+        if request_bytes != retirement.request_bytes
+            || request.reply_count != retirement.reply_count
+            || request.reply_bytes != retirement.reply_bytes
+            || request.reply_nonce != retirement.reply_nonce
+            || request.admitted_cursor.as_deref() != Some(retirement.admitted_cursor.as_str())
+            || saved_message_fingerprint(&request.message)? != retirement.message_fingerprint
+        {
+            return Err(ChatRuntimeError::invalid(
+                "preparing retirement no longer matches its active request",
+            ));
+        }
+        let mut receipts =
+            Vec::with_capacity(usize::try_from(retirement.reply_count).unwrap_or(usize::MAX));
+        for ordinal in 1..=retirement.reply_count {
+            let reply = self.read_reply(&retirement.request_key, ordinal)?;
+            if reply.phase != ReplyPhase::Sent {
+                return Err(ChatRuntimeError::invalid(
+                    "preparing retirement contains a nonterminal reply",
+                ));
+            }
+            receipts.push(RetiredReplyReceipt {
+                ordinal,
+                send_request_id: reply.send_request_id,
+                provider_message_id: reply.provider_message_id.ok_or_else(|| {
+                    ChatRuntimeError::invalid("sent retirement reply is missing its receipt")
+                })?,
+            });
+        }
+        let chunks = retirement_receipt_chunks(retirement.retirement_sequence, &receipts)?;
+        self.write_retirement_receipt_chunks(retirement, &receipts, &chunks)?;
+        retirement.phase = RetirementPhase::Prepared;
+        retirement.validate()?;
+        write_document(retirement_path, retirement)?;
+        self.retirement_boundary()?;
+        Ok(())
     }
 
     /// Ensure the configured durable-intake reaction is present for one request.
@@ -3098,6 +3949,9 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
     /// Capture every complete, consecutive reply block for one request from one retained snapshot.
     /// No directory scan occurs: only the request and its next direct reply paths are touched.
     pub fn capture_replies(&self, key: &str, rendered: &str) -> Result<ReplyCapture> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let request = self.read_request(key)?;
         if request.reply_closed {
             return Ok(ReplyCapture {
@@ -3106,13 +3960,14 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             });
         }
         let scan = scan_reply_blocks(rendered, &request.reply_nonce)?;
-        self.capture_scanned_replies(key, scan)
+        self.capture_scanned_replies_locked(key, scan)
     }
 
-    fn capture_scanned_replies(&self, key: &str, mut scan: ReplyScan) -> Result<ReplyCapture> {
-        let state_lock =
-            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
-        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+    fn capture_scanned_replies_locked(
+        &self,
+        key: &str,
+        mut scan: ReplyScan,
+    ) -> Result<ReplyCapture> {
         let mut request = self.read_request(key)?;
         if request.reply_closed {
             return Ok(ReplyCapture {
@@ -3432,6 +4287,46 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         self.root.join("requests").join(format!("{key}.json"))
     }
 
+    fn reply_artifact_keys(&self) -> Result<BTreeSet<String>> {
+        let mut keys = BTreeSet::new();
+        let mut count = 0_u64;
+        for entry in fs::read_dir(self.root.join("replies"))? {
+            let entry = entry?;
+            if agent::is_atomic_json_temporary(&entry.path())? {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ChatRuntimeError::invalid("reply filename is not UTF-8"))?;
+            let stem = name
+                .strip_suffix(".json")
+                .ok_or_else(|| ChatRuntimeError::invalid("unexpected chat reply artifact"))?;
+            let (key, ordinal) = stem
+                .rsplit_once('-')
+                .ok_or_else(|| ChatRuntimeError::invalid("malformed chat reply artifact name"))?;
+            if !valid_key(key)
+                || ordinal
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|ordinal| *ordinal > 0 && *ordinal <= MAX_REPLY_ORDINAL)
+                    .is_none()
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "invalid chat reply artifact identity",
+                ));
+            }
+            keys.insert(key.to_owned());
+            count = count.saturating_add(1);
+            if count > MAX_STATE_REPLIES {
+                return Err(ChatRuntimeError::invalid(
+                    "chat reply population exceeds its record cap",
+                ));
+            }
+        }
+        Ok(keys)
+    }
+
     fn commit_receipt_path(&self, host_batch_sequence: u64) -> PathBuf {
         let slot = host_batch_sequence.saturating_sub(1) % COMMIT_RECEIPT_SLOTS;
         self.root
@@ -3451,10 +4346,22 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
     }
 
     fn retirement_path(&self, retirement_sequence: u64) -> PathBuf {
-        let slot = retirement_sequence.saturating_sub(1) % RETIRED_ROUTE_SLOTS;
+        let slot = retirement_sequence.saturating_sub(1) % RETIREMENT_AUDIT_SLOTS;
         self.root
             .join("retirements")
             .join(format!("slot-{slot:04}.json"))
+    }
+
+    fn retirement_receipt_slot(&self, retirement_sequence: u64) -> PathBuf {
+        let slot = retirement_sequence.saturating_sub(1) % RETIREMENT_AUDIT_SLOTS;
+        self.root
+            .join("retirement-receipts")
+            .join(format!("slot-{slot:04}"))
+    }
+
+    fn retirement_receipt_chunk_path(&self, retirement_sequence: u64, chunk_index: u32) -> PathBuf {
+        self.retirement_receipt_slot(retirement_sequence)
+            .join(format!("chunk-{chunk_index:03}.json"))
     }
 
     fn retired_key(&self, key: &str) -> Result<Option<RetiredRouteIndex>> {
@@ -3504,6 +4411,9 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         let mut paths = Vec::new();
         for entry in fs::read_dir(self.root.join("requests"))? {
             let entry = entry?;
+            if agent::is_atomic_json_temporary(&entry.path())? {
+                continue;
+            }
             let name = entry.file_name();
             let name = name
                 .to_str()
@@ -3535,6 +4445,9 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         let mut paths = Vec::new();
         for entry in fs::read_dir(self.root.join("replies"))? {
             let entry = entry?;
+            if agent::is_atomic_json_temporary(&entry.path())? {
+                continue;
+            }
             let name = entry.file_name();
             let name = name
                 .to_str()
@@ -3573,75 +4486,317 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             .collect()
     }
 
+    fn retirement_records(&self) -> Result<Vec<(PathBuf, RetirementRecord)>> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(self.root.join("retirements"))? {
+            let entry = entry?;
+            if agent::is_atomic_json_temporary(&entry.path())? {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ChatRuntimeError::invalid("retirement filename is not UTF-8"))?;
+            let slot = name
+                .strip_prefix("slot-")
+                .and_then(|value| value.strip_suffix(".json"))
+                .filter(|value| value.len() == 4)
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|slot| *slot < RETIREMENT_AUDIT_SLOTS)
+                .ok_or_else(|| ChatRuntimeError::invalid("unexpected chat retirement artifact"))?;
+            if name != format!("slot-{slot:04}.json") {
+                return Err(ChatRuntimeError::invalid(
+                    "chat retirement slot name is not canonical",
+                ));
+            }
+            let record: RetirementRecord =
+                read_document(&entry.path(), MAX_RETIREMENT_RECORD_BYTES)?;
+            record.validate()?;
+            if self.retirement_path(record.retirement_sequence) != entry.path() {
+                return Err(ChatRuntimeError::invalid(
+                    "retirement journal sequence does not match its ring slot",
+                ));
+            }
+            records.push((entry.path(), record));
+            if records.len() > usize::try_from(RETIREMENT_AUDIT_SLOTS).unwrap_or(usize::MAX) {
+                return Err(ChatRuntimeError::invalid(
+                    "retirement journal exceeds its bounded slot count",
+                ));
+            }
+        }
+        records.sort_by_key(|(_, record)| record.retirement_sequence);
+        Ok(records)
+    }
+
+    fn write_retirement_receipt_chunks(
+        &self,
+        retirement: &RetirementRecord,
+        receipts: &[RetiredReplyReceipt],
+        chunks: &[RetirementReceiptChunk],
+    ) -> Result<()> {
+        if u32::try_from(chunks.len()).unwrap_or(u32::MAX) != retirement.reply_chunk_count
+            || retirement_receipts_digest(receipts)? != retirement.reply_receipts_digest
+            || u32::try_from(receipts.len()).unwrap_or(u32::MAX) != retirement.reply_count
+        {
+            return Err(ChatRuntimeError::invalid(
+                "retirement receipt chunks do not match their preparing header",
+            ));
+        }
+        let directory = self.retirement_receipt_slot(retirement.retirement_sequence);
+        agent::create_private_directory(&directory, "chat retirement receipt slot", false, true)?;
+        // The slot directory itself is part of the durable receipt transaction. Syncing only the
+        // child cannot make a newly created directory entry survive a crash.
+        agent::sync_directory(&self.root.join("retirement-receipts"))?;
+        self.retirement_boundary()?;
+        agent::cleanup_atomic_json_temporaries(&directory)?;
+        for chunk in chunks {
+            write_document(
+                &self.retirement_receipt_chunk_path(
+                    retirement.retirement_sequence,
+                    chunk.chunk_index,
+                ),
+                chunk,
+            )?;
+            self.retirement_boundary()?;
+        }
+        let mut removed = false;
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            if agent::is_atomic_json_temporary(&entry.path())? {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ChatRuntimeError::invalid("retirement chunk name is not UTF-8"))?;
+            let index = name
+                .strip_prefix("chunk-")
+                .and_then(|value| value.strip_suffix(".json"))
+                .filter(|value| value.len() == 3)
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or_else(|| {
+                    ChatRuntimeError::invalid("unexpected retirement receipt artifact")
+                })?;
+            if name != format!("chunk-{index:03}.json") {
+                return Err(ChatRuntimeError::invalid(
+                    "retirement receipt chunk name is not canonical",
+                ));
+            }
+            if index >= retirement.reply_chunk_count {
+                remove_if_exists(&entry.path())?;
+                removed = true;
+            }
+        }
+        if removed {
+            agent::sync_directory(&directory)?;
+        }
+        // One explicit sync covers both chunk creation and removal before the header may become
+        // Prepared. Atomic writes already sync individually; this also orders the complete set.
+        agent::sync_directory(&directory)?;
+        self.retirement_boundary()?;
+        let persisted = self.read_retirement_receipts(retirement)?;
+        if persisted != receipts {
+            return Err(ChatRuntimeError::invalid(
+                "persisted retirement receipt chunks changed during preparation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_retirement_receipts(
+        &self,
+        retirement: &RetirementRecord,
+    ) -> Result<Vec<RetiredReplyReceipt>> {
+        if retirement.reply_chunk_count == 0 {
+            if retirement.reply_count != 0 {
+                return Err(ChatRuntimeError::invalid(
+                    "retirement header omits nonempty receipt chunks",
+                ));
+            }
+            return Ok(Vec::new());
+        }
+        let directory = self.retirement_receipt_slot(retirement.retirement_sequence);
+        agent::validate_private_directory(&directory, "chat retirement receipt slot", false)?;
+        let mut receipts =
+            Vec::with_capacity(usize::try_from(retirement.reply_count).unwrap_or(usize::MAX));
+        for index in 0..retirement.reply_chunk_count {
+            let chunk: RetirementReceiptChunk = read_document(
+                &self.retirement_receipt_chunk_path(retirement.retirement_sequence, index),
+                MAX_RETIREMENT_CHUNK_BYTES,
+            )?;
+            chunk.validate()?;
+            if chunk.retirement_sequence != retirement.retirement_sequence
+                || chunk.chunk_index != index
+                || chunk.chunk_count != retirement.reply_chunk_count
+                || chunk.first_ordinal
+                    != u32::try_from(receipts.len())
+                        .unwrap_or(u32::MAX)
+                        .saturating_add(1)
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "retirement receipt chunk does not match its header or path",
+                ));
+            }
+            receipts.extend(chunk.receipts);
+        }
+        if u32::try_from(receipts.len()).unwrap_or(u32::MAX) != retirement.reply_count
+            || retirement_receipts_digest(&receipts)? != retirement.reply_receipts_digest
+        {
+            return Err(ChatRuntimeError::invalid(
+                "retirement receipt chunks fail their exact count or digest",
+            ));
+        }
+        Ok(receipts)
+    }
+
+    fn validate_retirement_chunk_presence(&self, retirement: &RetirementRecord) -> Result<()> {
+        if retirement.reply_chunk_count == 0 {
+            return Ok(());
+        }
+        let directory = self.retirement_receipt_slot(retirement.retirement_sequence);
+        agent::validate_private_directory(&directory, "chat retirement receipt slot", false)?;
+        for index in 0..retirement.reply_chunk_count {
+            let path = self.retirement_receipt_chunk_path(retirement.retirement_sequence, index);
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+                || metadata.permissions().mode() & 0o077 != 0
+                || metadata.len() > u64::try_from(MAX_RETIREMENT_CHUNK_BYTES).unwrap_or(u64::MAX)
+            {
+                return Err(ChatRuntimeError::invalid(format!(
+                    "retirement receipt chunk is not a bounded private regular file: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_pending_retirement_locked(&self, checkpoint: &mut Checkpoint) -> Result<()> {
+        if checkpoint.retirement_sequence > 0 {
+            let current_path = self.retirement_path(checkpoint.retirement_sequence);
+            let mut current: RetirementRecord =
+                read_document(&current_path, MAX_RETIREMENT_RECORD_BYTES)?;
+            current.validate()?;
+            if current.retirement_sequence != checkpoint.retirement_sequence {
+                return Err(ChatRuntimeError::invalid(
+                    "current retirement audit slot does not match the durable checkpoint",
+                ));
+            }
+            if current.phase != RetirementPhase::Retired {
+                self.resume_retirement_preparation_locked(&current_path, &mut current)?;
+                self.finish_prepared_retirement_locked(checkpoint, &current_path, &mut current)?;
+            }
+        }
+
+        let next_sequence = checkpoint
+            .retirement_sequence
+            .checked_add(1)
+            .ok_or_else(|| ChatRuntimeError::invalid("retirement sequence is exhausted"))?;
+        let next_path = self.retirement_path(next_sequence);
+        match read_document::<RetirementRecord>(&next_path, MAX_RETIREMENT_RECORD_BYTES) {
+            Ok(mut next) => {
+                next.validate()?;
+                if next.retirement_sequence == next_sequence {
+                    if next.phase == RetirementPhase::Retired {
+                        return Err(ChatRuntimeError::invalid(
+                            "retirement audit advanced beyond the durable checkpoint",
+                        ));
+                    }
+                    self.resume_retirement_preparation_locked(&next_path, &mut next)?;
+                    self.finish_prepared_retirement_locked(checkpoint, &next_path, &mut next)?;
+                } else if next_sequence <= RETIREMENT_AUDIT_SLOTS
+                    || next.phase != RetirementPhase::Retired
+                    || next.retirement_sequence
+                        != next_sequence.saturating_sub(RETIREMENT_AUDIT_SLOTS)
+                {
+                    return Err(ChatRuntimeError::invalid(
+                        "next retirement audit slot contains an unexpected generation",
+                    ));
+                }
+            }
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                if next_sequence > RETIREMENT_AUDIT_SLOTS {
+                    return Err(ChatRuntimeError::invalid(
+                        "next retirement audit slot is missing its retained generation",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    fn complete_all_prepared_retirements_locked(&self, checkpoint: &mut Checkpoint) -> Result<()> {
+        let records = self.retirement_records()?;
+        let prepared_count = records
+            .iter()
+            .filter(|(_, record)| record.phase != RetirementPhase::Retired)
+            .count();
+        if prepared_count > 1 {
+            return Err(ChatRuntimeError::invalid(
+                "more than one retirement generation is prepared",
+            ));
+        }
+        for (path, mut retirement) in records {
+            if retirement.phase == RetirementPhase::Retired {
+                if retirement.retirement_sequence > checkpoint.retirement_sequence {
+                    return Err(ChatRuntimeError::invalid(
+                        "retired audit generation is newer than the durable checkpoint",
+                    ));
+                }
+                continue;
+            }
+            if retirement.retirement_sequence < checkpoint.retirement_sequence {
+                return Err(ChatRuntimeError::invalid(
+                    "stale prepared retirement predates the durable checkpoint",
+                ));
+            }
+            self.resume_retirement_preparation_locked(&path, &mut retirement)?;
+            self.finish_prepared_retirement_locked(checkpoint, &path, &mut retirement)?;
+        }
+        Ok(())
+    }
+
     fn complete_retirements(&self) -> Result<()> {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
-        let mut paths = fs::read_dir(self.root.join("retirements"))?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if paths.len() > usize::try_from(RETIRED_ROUTE_SLOTS).unwrap_or(usize::MAX) {
+        agent::cleanup_atomic_json_temporaries(&self.root.join("retirements"))?;
+        let mut checkpoint = self.read_checkpoint()?;
+        self.complete_all_prepared_retirements_locked(&mut checkpoint)?;
+        let records = self.retirement_records()?;
+        let expected_count = checkpoint.retirement_sequence.min(RETIREMENT_AUDIT_SLOTS);
+        if u64::try_from(records.len()).unwrap_or(u64::MAX) != expected_count {
             return Err(ChatRuntimeError::invalid(
-                "retirement journal exceeds its bounded slot count",
+                "retirement audit ring is missing a retained generation",
             ));
         }
-        paths.sort();
-        for path in paths {
-            let mut retirement: RetirementRecord =
-                read_document(&path, MAX_RETIREMENT_RECORD_BYTES)?;
-            retirement.validate()?;
-            if retirement.phase == RetirementPhase::Retired {
-                continue;
+        let first_sequence = checkpoint
+            .retirement_sequence
+            .saturating_sub(expected_count.saturating_sub(1));
+        for (offset, (_, record)) in records.iter().enumerate() {
+            let expected_sequence = first_sequence
+                .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
+                .ok_or_else(|| ChatRuntimeError::invalid("retirement sequence overflow"))?;
+            if record.retirement_sequence != expected_sequence
+                || record.phase != RetirementPhase::Retired
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "retirement audit ring generations are not contiguous and terminal",
+                ));
             }
-            let index = RetiredRouteIndex {
-                version: STATE_VERSION,
-                retirement_sequence: retirement.retirement_sequence,
-                request_key: retirement.request_key.clone(),
-                message_fingerprint: retirement.message_fingerprint.clone(),
-                reply_nonce: retirement.reply_nonce.clone(),
-                admitted_cursor: retirement.admitted_cursor.clone(),
-                retired_at_millis: retirement.prepared_at_millis,
-            };
-            index.validate()?;
-            write_document(&self.retired_key_path(&retirement.request_key), &index)?;
-            write_document(
-                &self.retired_route_path(retirement.retirement_sequence),
-                &index,
-            )?;
-            if let Some(evicted) = retirement.evicted_request_key.as_deref() {
-                if evicted != retirement.request_key {
-                    remove_if_exists(&self.retired_key_path(evicted))?;
-                }
-            }
-            for ordinal in 1..=retirement.reply_count {
-                remove_if_exists(&self.reply_path(&retirement.request_key, ordinal))?;
-            }
-            remove_if_exists(&self.request_path(&retirement.request_key))?;
-            agent::sync_directory(&self.root.join("replies"))?;
-            agent::sync_directory(&self.root.join("requests"))?;
-            retirement.phase = RetirementPhase::Retired;
-            retirement.retired_at_millis = Some(unix_millis());
-            retirement.validate()?;
-            write_document(&path, &retirement)?;
+            self.validate_retirement_chunk_presence(record)?;
         }
-        let mut route_count = 0_u64;
-        let mut latest_sequence = 0_u64;
-        for entry in fs::read_dir(self.root.join("tombstones"))? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if !name.to_string_lossy().starts_with("slot-") {
-                continue;
-            }
-            let route: RetiredRouteIndex = read_document(&entry.path(), MAX_REQUEST_RECORD_BYTES)?;
-            route.validate()?;
-            route_count = route_count.saturating_add(1);
-            latest_sequence = latest_sequence.max(route.retirement_sequence);
+        let route_count = u64::try_from(self.retired_routes()?.len())
+            .map_err(|_| ChatRuntimeError::invalid("retired route count does not fit u64"))?;
+        if route_count != checkpoint.retired_route_count {
+            return Err(ChatRuntimeError::invalid(
+                "retired route ring count does not match the durable checkpoint",
+            ));
         }
-        let mut checkpoint = self.read_checkpoint()?;
-        checkpoint.retirement_sequence = checkpoint.retirement_sequence.max(latest_sequence);
-        checkpoint.retired_route_count = route_count.min(RETIRED_ROUTE_SLOTS);
-        checkpoint.updated_at_millis = unix_millis();
-        write_document(&self.root.join("checkpoint.json"), &checkpoint)
+        Ok(())
     }
 
     /// One explicit startup pass repairs counters after a crash between request creation and the
@@ -3650,7 +4805,17 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        agent::cleanup_atomic_json_temporaries(&self.root.join("requests"))?;
+        agent::cleanup_atomic_json_temporaries(&self.root.join("replies"))?;
         let records = self.request_records()?;
+        if records
+            .iter()
+            .any(|(record, _)| record.admitted_cursor.is_none())
+        {
+            return Err(ChatRuntimeError::invalid(
+                "request without a committed admission cursor has no replay authority",
+            ));
+        }
         let count = u64::try_from(records.len())
             .map_err(|_| ChatRuntimeError::invalid("request count does not fit u64"))?;
         let bytes = records
@@ -3664,8 +4829,12 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         }
         let mut checkpoint = self.read_checkpoint()?;
         let mut checkpoint_changed = false;
-        if checkpoint.request_count != count || checkpoint.request_bytes != bytes {
-            checkpoint.request_count = count;
+        if checkpoint.request_count != count {
+            return Err(ChatRuntimeError::invalid(
+                "request population count has no admission or retirement transaction authority",
+            ));
+        }
+        if checkpoint.request_bytes != bytes {
             checkpoint.request_bytes = bytes;
             checkpoint_changed = true;
         }
@@ -3757,9 +4926,12 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                 "repaired request population exceeds its durable cap",
             ));
         }
-        if checkpoint.request_count != repaired_count || checkpoint.request_bytes != repaired_bytes
-        {
-            checkpoint.request_count = repaired_count;
+        if checkpoint.request_count != repaired_count {
+            return Err(ChatRuntimeError::invalid(
+                "repaired request count differs from its transaction-authorized checkpoint",
+            ));
+        }
+        if checkpoint.request_bytes != repaired_bytes {
             checkpoint.request_bytes = repaired_bytes;
             checkpoint_changed = true;
         }
@@ -3992,9 +5164,54 @@ fn validate_checkpoint(checkpoint: &Checkpoint) -> Result<()> {
         || checkpoint.reply_count > MAX_STATE_REPLIES
         || checkpoint.reply_bytes > MAX_STATE_REPLY_BYTES
         || checkpoint.retired_route_count > RETIRED_ROUTE_SLOTS
+        || checkpoint.boundary_messages.len() > chat_subscription::MAX_BATCH_EVENTS
+        || usize::try_from(checkpoint.boundary_event_count).unwrap_or(usize::MAX)
+            > chat_subscription::MAX_BATCH_EVENTS
+        || checkpoint
+            .boundary_messages
+            .iter()
+            .any(|guard| !valid_key(&guard.request_key) || !valid_key(&guard.message_fingerprint))
     {
         return Err(ChatRuntimeError::invalid(
             "chat checkpoint exceeds a retained population cap",
+        ));
+    }
+    let mut boundary_keys = checkpoint
+        .boundary_messages
+        .iter()
+        .map(|guard| guard.request_key.as_str())
+        .collect::<Vec<_>>();
+    let canonical_boundary_keys = boundary_keys.clone();
+    boundary_keys.sort_unstable();
+    if boundary_keys != canonical_boundary_keys {
+        return Err(ChatRuntimeError::invalid(
+            "chat checkpoint boundary guards are not in canonical key order",
+        ));
+    }
+    boundary_keys.dedup();
+    if boundary_keys.len() != checkpoint.boundary_messages.len()
+        || checkpoint
+            .boundary_batch_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| !valid_key(fingerprint))
+        || (checkpoint.host_batch_sequence == 0
+            && (checkpoint.boundary_batch_fingerprint.is_some()
+                || checkpoint.boundary_event_count != 0
+                || checkpoint.boundary_ever_committed
+                || !checkpoint.boundary_messages.is_empty()))
+        || (checkpoint.host_batch_sequence > 0
+            && ((checkpoint.boundary_batch_fingerprint.is_none()
+                && (checkpoint.boundary_event_count != 0
+                    || checkpoint.boundary_ever_committed
+                    || !checkpoint.boundary_messages.is_empty()))
+                || (checkpoint.boundary_batch_fingerprint.is_some()
+                    && (checkpoint.boundary_event_count == 0
+                        || checkpoint.boundary_messages.len()
+                            > usize::try_from(checkpoint.boundary_event_count)
+                                .unwrap_or(usize::MAX)))))
+    {
+        return Err(ChatRuntimeError::invalid(
+            "chat checkpoint boundary replay authority is inconsistent",
         ));
     }
     if let Some(cursor) = checkpoint.cursor.as_deref() {
@@ -4021,7 +5238,11 @@ fn validate_slug(value: &str, label: &str, maximum: usize) -> Result<()> {
 }
 
 fn validate_single_line(value: &str, label: &str, maximum: usize) -> Result<()> {
-    if value.trim().is_empty() || value.len() > maximum || value.contains(['\n', '\r', '\0']) {
+    if value.trim().is_empty()
+        || value.len() > maximum
+        || value.contains(['\n', '\r', '\0'])
+        || value.chars().any(invalid_rendered_character)
+    {
         return Err(ChatRuntimeError::invalid(format!(
             "{label} must be one nonempty line of at most {maximum} bytes"
         )));
@@ -4058,6 +5279,104 @@ fn saved_message_fingerprint(message: &SavedMessage) -> Result<String> {
         "{:x}",
         Sha256::digest(serde_json::to_vec(message)?)
     ))
+}
+
+fn retirement_receipts_digest(receipts: &[RetiredReplyReceipt]) -> Result<String> {
+    let mut digest = Sha256::new();
+    digest.update(b"agentctl.retirement.receipts.v1\0");
+    digest.update(
+        u64::try_from(receipts.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for receipt in receipts {
+        digest.update(receipt.ordinal.to_be_bytes());
+        for value in [&receipt.send_request_id, &receipt.provider_message_id] {
+            digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn retirement_receipt_chunks(
+    retirement_sequence: u64,
+    receipts: &[RetiredReplyReceipt],
+) -> Result<Vec<RetirementReceiptChunk>> {
+    if receipts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut groups = Vec::<Vec<RetiredReplyReceipt>>::new();
+    let mut current = Vec::<RetiredReplyReceipt>::new();
+    // Compact serialization accounts for worst-case JSON escaping in each provider string. The
+    // fixed/per-record allowance covers pretty-print whitespace and the chunk envelope; a final
+    // exact-size pass below splits any unexpectedly large group before anything reaches disk.
+    let mut estimated_bytes = 4_096_usize;
+    for receipt in receipts {
+        let receipt_bytes = serde_json::to_vec(receipt)?
+            .len()
+            .checked_add(128)
+            .ok_or_else(|| ChatRuntimeError::invalid("retirement receipt length overflow"))?;
+        if !current.is_empty()
+            && estimated_bytes.saturating_add(receipt_bytes) > MAX_RETIREMENT_CHUNK_BYTES
+        {
+            groups.push(std::mem::take(&mut current));
+            estimated_bytes = 4_096;
+        }
+        current.push(receipt.clone());
+        estimated_bytes = estimated_bytes.saturating_add(receipt_bytes);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    if groups.len() > usize::try_from(MAX_REQUEST_REPLIES).unwrap_or(usize::MAX) {
+        return Err(ChatRuntimeError::invalid(
+            "retirement receipt chunk count exceeds the request reply cap",
+        ));
+    }
+    loop {
+        let chunk_count = u32::try_from(groups.len())
+            .map_err(|_| ChatRuntimeError::invalid("retirement chunk count does not fit u32"))?;
+        let mut chunks = Vec::with_capacity(groups.len());
+        let mut oversized = None;
+        for (index, values) in groups.iter().enumerate() {
+            let chunk = RetirementReceiptChunk {
+                version: STATE_VERSION,
+                retirement_sequence,
+                chunk_index: u32::try_from(index).map_err(|_| {
+                    ChatRuntimeError::invalid("retirement chunk index does not fit u32")
+                })?,
+                chunk_count,
+                first_ordinal: values
+                    .first()
+                    .map(|value| value.ordinal)
+                    .ok_or_else(|| ChatRuntimeError::invalid("retirement chunk is empty"))?,
+                receipts: values.clone(),
+            };
+            if encoded_document_bytes(&chunk)? > MAX_RETIREMENT_CHUNK_BYTES {
+                oversized = Some(index);
+                break;
+            }
+            chunk.validate()?;
+            chunks.push(chunk);
+        }
+        let Some(index) = oversized else {
+            return Ok(chunks);
+        };
+        if groups[index].len() == 1 {
+            return Err(ChatRuntimeError::invalid(
+                "one valid retirement receipt exceeds the chunk artifact bound",
+            ));
+        }
+        let split_at = groups[index].len() / 2;
+        let right = groups[index].split_off(split_at);
+        groups.insert(index + 1, right);
+        if groups.len() > usize::try_from(MAX_REQUEST_REPLIES).unwrap_or(usize::MAX) {
+            return Err(ChatRuntimeError::invalid(
+                "retirement receipt chunk count exceeds the request reply cap",
+            ));
+        }
+    }
 }
 
 fn batch_fingerprint(batch: &DeliveryBatch) -> Result<String> {
@@ -4597,7 +5916,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
 
     use chat_subscription::{
         BackendCapabilities, BackendFailure, CancellationError, ChatSubscriptionBackend,
@@ -4930,7 +6249,14 @@ mod tests {
             "2026-09-21T12:00:00Z",
             false,
         )
-        .expect("normalized message");
+        .expect("normalized message")
+        .with_provider_payload(
+            ProviderPayload::new(
+                "fixture.message.v1",
+                Map::from_iter([("index".to_owned(), Value::from(index))]),
+            )
+            .expect("provider payload"),
+        );
         DeliveryBatch::new(
             EventSequence::new(sequence).expect("sequence"),
             ProviderCursor::new(cursor).expect("cursor"),
@@ -4938,6 +6264,36 @@ mod tests {
             vec![CommittableEvent::message_created(message)],
         )
         .expect("indexed delivery")
+    }
+
+    fn boundary_delivery_at(sequence: u64, index: u64, cursor: &str, text: &str) -> DeliveryBatch {
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new(format!("spaces/example/messages/{index}")).expect("message"),
+            ThreadId::new(format!("spaces/example/threads/{index}")).expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            text,
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message")
+        .with_provider_payload(
+            ProviderPayload::new(
+                "fixture.message.v1",
+                Map::from_iter([("index".to_owned(), Value::from(index))]),
+            )
+            .expect("provider payload"),
+        );
+        DeliveryBatch::new(
+            EventSequence::new(sequence).expect("sequence"),
+            ProviderCursor::new(cursor).expect("cursor"),
+            DeliveryId::new(format!("delivery-{sequence}-{index}")).expect("delivery"),
+            vec![
+                CommittableEvent::Checkpoint,
+                CommittableEvent::message_created(message),
+            ],
+        )
+        .expect("boundary delivery")
     }
 
     fn maximum_message_delivery(sequence: u64, cursor: &str, receipt: &str) -> DeliveryBatch {
@@ -5038,6 +6394,565 @@ mod tests {
             "prepared"
         );
         assert_eq!(status["runtime_evidence"]["durable_batch_verified"], false);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn interrupted_target_accepts_exact_inclusive_boundary_before_exact_target_replay() {
+        let root = temporary("admission-inclusive-replay");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let initial_acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let current = boundary_delivery_at(1, 9_999, "cursor-current", "current request");
+        let target = maximum_message_delivery(2, "cursor-target", "target-before-crash");
+        let mut initial_backend = Backend {
+            items: Some(VecDeque::from([
+                SubscriptionItem::Batch(current),
+                SubscriptionItem::Batch(target),
+            ])),
+            acknowledged: Arc::clone(&initial_acknowledged),
+            next_calls: Arc::new(AtomicU64::new(0)),
+            fail_ack: false,
+            sabotage_receipt_directory: None,
+        };
+        let mut initial = ChatSubscription::open(
+            &mut initial_backend,
+            &state.subscribe_request().expect("initial request"),
+        )
+        .expect("initial subscription");
+        consume_one(&mut initial, &state).expect("commit current boundary");
+        *state
+            .admission_fault_after
+            .lock()
+            .expect("admission fault lock") = Some(128);
+        assert!(consume_one(&mut initial, &state).is_err());
+        drop(initial);
+
+        let reopened = BridgeState::open(&root).expect("recover admission intent");
+        assert!(reopened.admission_path().exists());
+        assert_eq!(
+            reopened
+                .subscribe_request()
+                .expect("resume request")
+                .resume_from()
+                .map(ProviderCursor::as_str),
+            Some("cursor-current")
+        );
+        let altered_current =
+            boundary_delivery_at(1, 9_999, "cursor-current", "altered current request");
+        assert!(reopened.admit_batch(&altered_current).is_err());
+        assert!(reopened.admission_path().exists());
+
+        let replay_acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let current_replay = boundary_delivery_at(1, 9_999, "cursor-current", "current request");
+        let altered_target = indexed_delivery_at(2, 1, "cursor-target", "altered target");
+        let mut mismatch_backend = Backend {
+            items: Some(VecDeque::from([
+                SubscriptionItem::Batch(current_replay),
+                SubscriptionItem::Batch(altered_target),
+            ])),
+            acknowledged: Arc::clone(&replay_acknowledged),
+            next_calls: Arc::new(AtomicU64::new(0)),
+            fail_ack: false,
+            sabotage_receipt_directory: None,
+        };
+        let mut mismatch = ChatSubscription::open(
+            &mut mismatch_backend,
+            &reopened.subscribe_request().expect("mismatch request"),
+        )
+        .expect("mismatch subscription");
+        let ConsumedItem::Batch(current_admission) =
+            consume_one(&mut mismatch, &reopened).expect("ack exact current replay")
+        else {
+            panic!("expected current boundary replay");
+        };
+        assert!(current_admission.new_request_keys.is_empty());
+        assert!(reopened.admission_path().exists());
+        assert!(consume_one(&mut mismatch, &reopened).is_err());
+        assert_eq!(
+            &*replay_acknowledged.lock().expect("ack lock"),
+            &["delivery-1-9999"]
+        );
+        drop(mismatch);
+
+        let final_acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let current_replay = boundary_delivery_at(1, 9_999, "cursor-current", "current request");
+        let target_replay = maximum_message_delivery(2, "cursor-target", "target-after-crash");
+        let mut final_backend = Backend {
+            items: Some(VecDeque::from([
+                SubscriptionItem::Batch(current_replay),
+                SubscriptionItem::Batch(target_replay),
+            ])),
+            acknowledged: Arc::clone(&final_acknowledged),
+            next_calls: Arc::new(AtomicU64::new(0)),
+            fail_ack: false,
+            sabotage_receipt_directory: None,
+        };
+        let mut final_subscription = ChatSubscription::open(
+            &mut final_backend,
+            &reopened.subscribe_request().expect("final request"),
+        )
+        .expect("final subscription");
+        consume_one(&mut final_subscription, &reopened).expect("ack current again");
+        let ConsumedItem::Batch(target_admission) =
+            consume_one(&mut final_subscription, &reopened).expect("commit target replay")
+        else {
+            panic!("expected target batch");
+        };
+        assert_eq!(target_admission.new_request_keys.len(), 256);
+        assert_eq!(
+            &*final_acknowledged.lock().expect("ack lock"),
+            &["delivery-1-9999", "target-after-crash"]
+        );
+        assert!(!reopened.admission_path().exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn admission_transaction_recovers_every_maximum_batch_write_boundary() {
+        let boundary_count = chat_subscription::MAX_BATCH_EVENTS + 5;
+        for boundary in 0..boundary_count {
+            let root = temporary(&format!("admission-boundary-{boundary}"));
+            let state = BridgeState::initialize(&root, config()).expect("initialize state");
+            let acknowledged = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = Backend {
+                items: Some(VecDeque::from([
+                    SubscriptionItem::Batch(boundary_delivery_at(
+                        1,
+                        9_999,
+                        "cursor-current",
+                        "current request",
+                    )),
+                    SubscriptionItem::Batch(maximum_message_delivery(
+                        2,
+                        "cursor-target",
+                        "target-before-crash",
+                    )),
+                ])),
+                acknowledged: Arc::clone(&acknowledged),
+                next_calls: Arc::new(AtomicU64::new(0)),
+                fail_ack: false,
+                sabotage_receipt_directory: None,
+            };
+            let mut subscription = ChatSubscription::open(
+                &mut backend,
+                &state.subscribe_request().expect("initial request"),
+            )
+            .expect("initial subscription");
+            consume_one(&mut subscription, &state).expect("commit current boundary");
+            *state
+                .admission_fault_after
+                .lock()
+                .expect("admission fault lock") = Some(boundary);
+            assert!(
+                consume_one(&mut subscription, &state).is_err(),
+                "boundary {boundary} must interrupt before provider acknowledgement"
+            );
+            assert_eq!(
+                &*acknowledged.lock().expect("ack lock"),
+                &["delivery-1-9999"]
+            );
+            drop(subscription);
+
+            let reopened = BridgeState::open(&root).expect("recover interrupted admission");
+            let resume = reopened.cursor().expect("resume cursor");
+            let replay_acknowledged = Arc::new(Mutex::new(Vec::new()));
+            let replay_items = if resume.as_deref() == Some("cursor-current") {
+                VecDeque::from([
+                    SubscriptionItem::Batch(boundary_delivery_at(
+                        1,
+                        9_999,
+                        "cursor-current",
+                        "current request",
+                    )),
+                    SubscriptionItem::Batch(maximum_message_delivery(
+                        2,
+                        "cursor-target",
+                        "target-after-crash",
+                    )),
+                ])
+            } else {
+                assert_eq!(resume.as_deref(), Some("cursor-target"));
+                VecDeque::from([SubscriptionItem::Batch(maximum_message_delivery(
+                    1,
+                    "cursor-target",
+                    "target-after-checkpoint-crash",
+                ))])
+            };
+            let mut replay_backend = Backend {
+                items: Some(replay_items),
+                acknowledged: Arc::clone(&replay_acknowledged),
+                next_calls: Arc::new(AtomicU64::new(0)),
+                fail_ack: false,
+                sabotage_receipt_directory: None,
+            };
+            let mut replay = ChatSubscription::open(
+                &mut replay_backend,
+                &reopened.subscribe_request().expect("replay request"),
+            )
+            .expect("replay subscription");
+            if resume.as_deref() == Some("cursor-current") {
+                consume_one(&mut replay, &reopened).expect("ack inclusive current boundary");
+            }
+            consume_one(&mut replay, &reopened).expect("commit exact target replay");
+            assert_eq!(reopened.status().expect("status")["request_count"], 257);
+            assert!(!reopened.admission_path().exists());
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn interrupted_target_provider_gap_is_durable_and_stops_reconnect_before_guard_matching() {
+        let root = temporary("admission-gap-after-interruption");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let mut backend = Backend {
+            items: Some(VecDeque::from([
+                SubscriptionItem::Batch(boundary_delivery_at(
+                    1,
+                    9_999,
+                    "cursor-current",
+                    "current request",
+                )),
+                SubscriptionItem::Batch(maximum_message_delivery(
+                    2,
+                    "cursor-target",
+                    "target-before-crash",
+                )),
+            ])),
+            acknowledged: Arc::new(Mutex::new(Vec::new())),
+            next_calls: Arc::new(AtomicU64::new(0)),
+            fail_ack: false,
+            sabotage_receipt_directory: None,
+        };
+        let mut subscription = ChatSubscription::open(
+            &mut backend,
+            &state.subscribe_request().expect("initial request"),
+        )
+        .expect("initial subscription");
+        consume_one(&mut subscription, &state).expect("commit current boundary");
+        *state
+            .admission_fault_after
+            .lock()
+            .expect("admission fault lock") = Some(0);
+        assert!(consume_one(&mut subscription, &state).is_err());
+        drop(subscription);
+
+        let reopened = BridgeState::open(&root).expect("recover interrupted target");
+        assert!(reopened.admission_path().exists());
+        let acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let next_calls = Arc::new(AtomicU64::new(0));
+        let mut gap_backend = Backend {
+            items: Some(VecDeque::from([SubscriptionItem::Batch(gap_delivery(
+                1,
+                "cursor-gap",
+                "delivery-gap-after-interruption",
+            ))])),
+            acknowledged: Arc::clone(&acknowledged),
+            next_calls: Arc::clone(&next_calls),
+            fail_ack: false,
+            sabotage_receipt_directory: None,
+        };
+        let mut gap_subscription = ChatSubscription::open(
+            &mut gap_backend,
+            &reopened.subscribe_request().expect("resume current cursor"),
+        )
+        .expect("gap subscription");
+        assert!(matches!(
+            consume_one(&mut gap_subscription, &reopened),
+            Err(ChatRuntimeError::UnresolvedGap(_))
+        ));
+        assert_eq!(next_calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(acknowledged.lock().expect("ack lock").is_empty());
+        assert_eq!(
+            reopened.cursor().expect("safe cursor").as_deref(),
+            Some("cursor-current")
+        );
+        assert!(reopened.admission_path().exists());
+        assert_eq!(
+            reopened.status().expect("status")["unresolved_gap"]["phase"],
+            "unresolved"
+        );
+        assert!(matches!(
+            reopened.subscribe_request(),
+            Err(ChatRuntimeError::UnresolvedGap(_))
+        ));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn distinct_inclusive_replay_crash_keeps_next_guard_and_committed_boundary_authority() {
+        let root = temporary("distinct-replay-crash");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let mut backend = Backend {
+            items: Some(VecDeque::from([
+                SubscriptionItem::Batch(boundary_delivery_at(
+                    1,
+                    9_999,
+                    "cursor-current",
+                    "current request",
+                )),
+                SubscriptionItem::Batch(maximum_message_delivery(
+                    2,
+                    "cursor-target",
+                    "target-before-crash",
+                )),
+            ])),
+            acknowledged: Arc::new(Mutex::new(Vec::new())),
+            next_calls: Arc::new(AtomicU64::new(0)),
+            fail_ack: false,
+            sabotage_receipt_directory: None,
+        };
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &state.subscribe_request().expect("request"))
+                .expect("subscription");
+        consume_one(&mut subscription, &state).expect("commit current");
+        *state
+            .admission_fault_after
+            .lock()
+            .expect("admission fault lock") = Some(0);
+        assert!(consume_one(&mut subscription, &state).is_err());
+        drop(subscription);
+
+        let reopened = BridgeState::open(&root).expect("recover target guard");
+        let replay_one = reopened
+            .admit_batch(&boundary_delivery_at(
+                1,
+                9_999,
+                "cursor-current",
+                "current request",
+            ))
+            .expect("prepare distinct current replay");
+        assert!(replay_one.new_request_keys.is_empty());
+        assert!(reopened.admission_path().exists());
+        assert!(
+            reopened
+                .read_checkpoint()
+                .expect("prepared replay checkpoint")
+                .boundary_ever_committed
+        );
+
+        let reopened_again = BridgeState::open(&root).expect("restart prepared current replay");
+        assert!(reopened_again.admission_path().exists());
+        let replay_two = reopened_again
+            .admit_batch(&boundary_delivery_at(
+                1,
+                9_999,
+                "cursor-current",
+                "current request",
+            ))
+            .expect("repeat current after prepared replay crash");
+        assert!(replay_two.new_request_keys.is_empty());
+        reopened_again
+            .confirm_batch_commit(&replay_two)
+            .expect("confirm repeated current delivery");
+        let target = reopened_again
+            .admit_batch(&maximum_message_delivery(
+                2,
+                "cursor-target",
+                "target-after-replay-crash",
+            ))
+            .expect("next guarded target survives repeated current replay");
+        assert_eq!(target.new_request_keys.len(), 256);
+        assert!(!reopened_again.admission_path().exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn legacy_boundary_authority_upgrades_through_guarded_inclusive_replay() {
+        let root = temporary("legacy-authority-upgrade");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let current = state
+            .admit_batch(&boundary_delivery_at(
+                1,
+                9_999,
+                "cursor-current",
+                "current request",
+            ))
+            .expect("admit current");
+        state
+            .confirm_batch_commit(&current)
+            .expect("commit current");
+        let mut legacy = state.read_checkpoint().expect("checkpoint");
+        legacy.boundary_batch_fingerprint = None;
+        legacy.boundary_event_count = 0;
+        legacy.boundary_ever_committed = false;
+        legacy.boundary_messages.clear();
+        write_document(&root.join("checkpoint.json"), &legacy).expect("plant legacy checkpoint");
+
+        *state
+            .admission_fault_after
+            .lock()
+            .expect("admission fault lock") = Some(0);
+        assert!(state
+            .admit_batch(&maximum_message_delivery(
+                2,
+                "cursor-target",
+                "legacy-target-before-crash",
+            ))
+            .is_err());
+        let reopened = BridgeState::open(&root).expect("open legacy guarded state");
+        let current_replay = reopened
+            .admit_batch(&boundary_delivery_at(
+                1,
+                9_999,
+                "cursor-current",
+                "current request",
+            ))
+            .expect("upgrade exact legacy current replay");
+        assert!(current_replay.new_request_keys.is_empty());
+        reopened
+            .confirm_batch_commit(&current_replay)
+            .expect("confirm legacy replay delivery");
+        let upgraded = reopened.read_checkpoint().expect("upgraded checkpoint");
+        assert!(upgraded.boundary_batch_fingerprint.is_some());
+        assert!(upgraded.boundary_ever_committed);
+        assert_eq!(upgraded.boundary_messages.len(), 1);
+        let target = reopened
+            .admit_batch(&maximum_message_delivery(
+                2,
+                "cursor-target",
+                "legacy-target-after-crash",
+            ))
+            .expect("admit exact guarded target");
+        assert_eq!(target.new_request_keys.len(), 256);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn legacy_prepared_boundary_upgrades_through_guarded_inclusive_replay() {
+        let root = temporary("legacy-prepared-authority-upgrade");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        state
+            .admit_batch(&boundary_delivery_at(
+                1,
+                9_999,
+                "cursor-current",
+                "current request",
+            ))
+            .expect("prepare current delivery without confirming callback");
+        let mut legacy = state.read_checkpoint().expect("checkpoint");
+        assert_eq!(
+            state
+                .current_commit_receipt(&legacy)
+                .expect("read current receipt")
+                .expect("prepared current receipt")
+                .phase,
+            CommitReceiptPhase::Prepared
+        );
+        legacy.boundary_batch_fingerprint = None;
+        legacy.boundary_event_count = 0;
+        legacy.boundary_ever_committed = false;
+        legacy.boundary_messages.clear();
+        write_document(&root.join("checkpoint.json"), &legacy).expect("plant legacy checkpoint");
+
+        *state
+            .admission_fault_after
+            .lock()
+            .expect("admission fault lock") = Some(0);
+        assert!(state
+            .admit_batch(&maximum_message_delivery(
+                2,
+                "cursor-target",
+                "legacy-target-before-crash",
+            ))
+            .is_err());
+
+        let reopened = BridgeState::open(&root).expect("open prepared legacy guarded state");
+        let current_replay = reopened
+            .admit_batch(&boundary_delivery_at(
+                1,
+                9_999,
+                "cursor-current",
+                "current request",
+            ))
+            .expect("upgrade exact prepared legacy current replay");
+        assert!(current_replay.new_request_keys.is_empty());
+        reopened
+            .confirm_batch_commit(&current_replay)
+            .expect("confirm distinct legacy replay delivery");
+        let upgraded = reopened.read_checkpoint().expect("upgraded checkpoint");
+        assert!(upgraded.boundary_batch_fingerprint.is_some());
+        assert!(upgraded.boundary_ever_committed);
+        assert_eq!(upgraded.boundary_messages.len(), 1);
+        let target = reopened
+            .admit_batch(&maximum_message_delivery(
+                2,
+                "cursor-target",
+                "legacy-target-after-crash",
+            ))
+            .expect("admit exact guarded target after prepared legacy replay");
+        assert_eq!(target.new_request_keys.len(), 256);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn maximum_worst_escaped_retirement_receipts_fit_bounded_digest_chunks() {
+        let escaped_id = "\\\"".repeat(chat_subscription::MAX_RESOURCE_ID_BYTES / 2);
+        assert_eq!(escaped_id.len(), chat_subscription::MAX_RESOURCE_ID_BYTES);
+        let receipts = (1..=MAX_REQUEST_REPLIES)
+            .map(|ordinal| RetiredReplyReceipt {
+                ordinal,
+                send_request_id: "123e4567-e89b-42d3-a456-426614174000".to_owned(),
+                provider_message_id: escaped_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let chunks = retirement_receipt_chunks(1, &receipts).expect("pack maximum receipts");
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(
+            |chunk| encoded_document_bytes(chunk).expect("encoded chunk")
+                <= MAX_RETIREMENT_CHUNK_BYTES
+        ));
+        let flattened = chunks
+            .iter()
+            .flat_map(|chunk| chunk.receipts.iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(flattened, receipts);
+        assert_eq!(
+            retirement_receipts_digest(&flattened).expect("chunk digest"),
+            retirement_receipts_digest(&receipts).expect("source digest")
+        );
+        let root = temporary("maximum-retirement-receipts");
+        let state =
+            BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
+        let retirement = RetirementRecord {
+            version: STATE_VERSION,
+            phase: RetirementPhase::Preparing,
+            retirement_sequence: 1,
+            request_key: "a".repeat(64),
+            message_fingerprint: "b".repeat(64),
+            reply_nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            admitted_cursor: "cursor-maximum".to_owned(),
+            request_bytes: 1,
+            reply_bytes: MAX_REQUEST_REPLY_BYTES,
+            reply_count: MAX_REQUEST_REPLIES,
+            delivery_message_id: format!("chat-{}", "a".repeat(64)),
+            ack_reaction: None,
+            ack_request_id: None,
+            reaction_id: None,
+            reaction_already_present: None,
+            reply_chunk_count: u32::try_from(chunks.len()).expect("chunk count"),
+            reply_receipts_digest: retirement_receipts_digest(&receipts).expect("digest"),
+            evicted_request_key: None,
+            prepared_at_millis: unix_millis(),
+            retired_at_millis: None,
+        };
+        retirement.validate().expect("maximum retirement header");
+        state
+            .write_retirement_receipt_chunks(&retirement, &receipts, &chunks)
+            .expect("persist maximum receipt chunks");
+        let persisted = state
+            .read_retirement_receipts(&retirement)
+            .expect("read maximum receipt chunks");
+        assert_eq!(persisted, receipts);
+        for chunk in &chunks {
+            let metadata =
+                fs::metadata(state.retirement_receipt_chunk_path(
+                    retirement.retirement_sequence,
+                    chunk.chunk_index,
+                ))
+                .expect("chunk metadata");
+            assert!(metadata.len() <= MAX_RETIREMENT_CHUNK_BYTES as u64);
+            assert_eq!(chunk.retirement_sequence, retirement.retirement_sequence);
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -5167,6 +7082,59 @@ mod tests {
     }
 
     #[test]
+    fn committed_receipt_repairs_boundary_authority_after_precheckpoint_crash() {
+        let root = temporary("commit-bit-repair");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        *state
+            .confirm_fault_after
+            .lock()
+            .expect("confirm fault lock") = Some(0);
+        let acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = Backend {
+            items: Some(VecDeque::from([SubscriptionItem::Batch(delivery(
+                1,
+                "cursor-1",
+                "delivery-1",
+            ))])),
+            acknowledged: Arc::clone(&acknowledged),
+            next_calls: Arc::new(AtomicU64::new(0)),
+            fail_ack: false,
+            sabotage_receipt_directory: None,
+        };
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &state.subscribe_request().expect("request"))
+                .expect("subscription");
+        assert!(consume_one(&mut subscription, &state).is_err());
+        assert_eq!(&*acknowledged.lock().expect("ack lock"), &["delivery-1"]);
+        assert!(
+            !state
+                .read_checkpoint()
+                .expect("pre-repair checkpoint")
+                .boundary_ever_committed
+        );
+
+        let replay = delivery(1, "cursor-1", "delivery-replay");
+        let admission = state
+            .admit_batch(&replay)
+            .expect("same-process exact replay repairs committed authority");
+        assert!(admission.new_request_keys.is_empty());
+        assert!(
+            state
+                .read_checkpoint()
+                .expect("repaired checkpoint")
+                .boundary_ever_committed
+        );
+        let reopened = BridgeState::open(&root).expect("restart repaired authority");
+        assert!(
+            reopened
+                .read_checkpoint()
+                .expect("reopened checkpoint")
+                .boundary_ever_committed
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn maximum_message_batch_remains_restartable_after_provider_acknowledgement() {
         let root = temporary("maximum-active-routes");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
@@ -5238,11 +7206,17 @@ mod tests {
         let state = BridgeState::initialize(&root, configuration).expect("initialize state");
         let delivery = FakeDelivery::default();
         let mut admitted = Vec::new();
-        for index in 1..=MAX_REQUESTS.saturating_add(2) {
+        let mut first_retired_key = None;
+        let mut planted_surplus_chunk = None;
+        for index in 1..=RETIREMENT_AUDIT_SLOTS.saturating_add(1) {
             let batch = indexed_delivery(index, index);
-            let key = state
+            let admission = state
                 .admit_batch(&batch)
-                .expect("admit through retirement churn")
+                .expect("admit through retirement churn");
+            state
+                .confirm_batch_commit(&admission)
+                .expect("confirm provider acknowledgement");
+            let key = admission
                 .new_request_keys
                 .into_iter()
                 .next()
@@ -5255,10 +7229,48 @@ mod tests {
             );
             state.close_replies(&key).expect("explicit close");
             admitted.push((index, key));
+            let checkpoint = state.read_checkpoint().expect("churn checkpoint");
+            if checkpoint.retirement_sequence == 1 && first_retired_key.is_none() {
+                first_retired_key = admitted.first().map(|(_, key)| key.clone());
+            }
+            if checkpoint.retirement_sequence == RETIREMENT_AUDIT_SLOTS
+                && planted_surplus_chunk.is_none()
+            {
+                let slot = state.retirement_receipt_slot(1);
+                let surplus = slot.join("chunk-000.json");
+                fs::write(&surplus, b"old surplus chunk").expect("plant old surplus chunk");
+                fs::set_permissions(&surplus, fs::Permissions::from_mode(0o600))
+                    .expect("surplus mode");
+                planted_surplus_chunk = Some(surplus);
+            }
         }
         let status = state.status().expect("status");
         assert!(status["request_count"].as_u64().expect("count") <= MAX_REQUESTS);
         assert!(status["retired_route_count"].as_u64().expect("retired") > 0);
+        assert_eq!(
+            state
+                .read_checkpoint()
+                .expect("wrapped checkpoint")
+                .retirement_sequence,
+            RETIREMENT_AUDIT_SLOTS + 1
+        );
+        assert!(!planted_surplus_chunk
+            .as_ref()
+            .expect("surplus was planted")
+            .exists());
+        assert!(state
+            .retired_key(first_retired_key.as_deref().expect("first retired key"))
+            .expect("old retired lookup")
+            .is_none());
+        let wrapped_header: RetirementRecord = read_document(
+            &state.retirement_path(RETIREMENT_AUDIT_SLOTS + 1),
+            MAX_RETIREMENT_RECORD_BYTES,
+        )
+        .expect("wrapped audit header");
+        assert_eq!(
+            wrapped_header.retirement_sequence,
+            RETIREMENT_AUDIT_SLOTS + 1
+        );
         let (retired_index, retired_key) = admitted
             .iter()
             .find(|(_, key)| state.retired_key(key).expect("retired guard").is_some())
@@ -5399,14 +7411,133 @@ mod tests {
     }
 
     #[test]
-    fn restart_completes_retirement_after_each_delete_crash_boundary_exactly_once() {
-        for (boundary, restore_request, restore_reply) in [
-            ("after-journal", true, true),
-            ("mid-reply-delete", true, false),
-            ("after-request-delete", false, false),
-        ] {
+    fn committed_current_boundary_retires_and_exact_replay_uses_checkpoint_authority() {
+        let root = temporary("retire-committed-current");
+        let state =
+            BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
+        let admission = state
+            .admit_batch(&indexed_delivery(1, 1))
+            .expect("admit current request");
+        let key = admission.new_request_keys[0].clone();
+        state
+            .confirm_batch_commit(&admission)
+            .expect("confirm current provider delivery");
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        state.close_replies(&key).expect("close and retire current");
+        assert!(!state.request_path(&key).exists());
+        assert_eq!(
+            state.read_checkpoint().expect("checkpoint").request_count,
+            0
+        );
+        let tombstone = state.retired_key_path(&key);
+        fs::remove_file(&tombstone).expect("remove key tombstone to require boundary authority");
+        agent::sync_directory(&root.join("tombstones")).expect("sync tombstone removal");
+        assert!(state
+            .retired_routes()
+            .expect("retained route audit")
+            .iter()
+            .any(|route| route.request_key == key));
+
+        let replay = state
+            .admit_batch(&indexed_delivery_at(1, 1, "cursor-1", "request 1"))
+            .expect("exact current replay");
+        assert!(replay.new_request_keys.is_empty());
+        assert!(!state.request_path(&key).exists());
+        assert_eq!(replay.host_batch_sequence, 2);
+        assert!(state
+            .admit_batch(&indexed_delivery_at(1, 1, "cursor-1", "altered request"))
+            .is_err());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn full_population_reclaims_only_terminal_current_boundary_before_next_admission() {
+        let root = temporary("full-current-boundary-capacity");
+        let state =
+            BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
+        let current = state
+            .admit_batch(&indexed_delivery_at(
+                1,
+                9_999,
+                "cursor-current",
+                "current terminal request",
+            ))
+            .expect("admit current");
+        let current_key = current.new_request_keys[0].clone();
+        state
+            .confirm_batch_commit(&current)
+            .expect("commit current boundary");
+        let mut current_record = state.read_request(&current_key).expect("current record");
+        current_record.phase = RequestPhase::Delivered;
+        current_record.reply_closed = true;
+        write_document(&state.request_path(&current_key), &current_record)
+            .expect("terminal current record");
+
+        let mut first_nonterminal_key = None;
+        for index in 1..MAX_REQUESTS {
+            let batch = indexed_delivery_at(
+                index.saturating_add(1),
+                index,
+                &format!("cursor-old-{index}"),
+                &format!("nonterminal old request {index}"),
+            );
+            let CommittableEvent::MessageCreated(message) = &batch.events()[0] else {
+                panic!("message fixture");
+            };
+            let mut record = RequestRecord::from_message(message, None).expect("old record");
+            record.admitted_cursor = Some(format!("cursor-old-{index}"));
+            if first_nonterminal_key.is_none() {
+                first_nonterminal_key = Some(record.key.clone());
+            }
+            let mut encoded = serde_json::to_vec_pretty(&record).expect("encode old record");
+            encoded.push(b'\n');
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(state.request_path(&record.key))
+                .expect("create old record fixture");
+            file.write_all(&encoded).expect("write old record fixture");
+        }
+        agent::sync_directory(&root.join("requests")).expect("sync full request fixture");
+        let records = state.request_records().expect("full request population");
+        assert_eq!(
+            records.len(),
+            usize::try_from(MAX_REQUESTS).expect("request cap")
+        );
+        let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+        checkpoint.request_count = MAX_REQUESTS;
+        checkpoint.request_bytes = records.iter().map(|(_, bytes)| *bytes).sum();
+        write_document(&root.join("checkpoint.json"), &checkpoint).expect("full checkpoint");
+
+        let reopened = BridgeState::open(&root).expect("full-cap control state opens");
+        let next = reopened
+            .admit_batch(&indexed_delivery_at(
+                MAX_REQUESTS + 1,
+                20_000,
+                "cursor-next",
+                "next request",
+            ))
+            .expect("cap-pressure scan retires the only eligible current request");
+        assert_eq!(next.new_request_keys.len(), 1);
+        let after = reopened.read_checkpoint().expect("after next");
+        assert_eq!(after.request_count, MAX_REQUESTS);
+        assert_eq!(after.retirement_sequence, 1);
+        assert!(!reopened.request_path(&current_key).exists());
+        assert!(reopened
+            .request_path(first_nonterminal_key.as_deref().expect("nonterminal key"))
+            .exists());
+        assert!(reopened.request_path(&next.new_request_keys[0]).exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn retirement_retries_every_live_boundary_exactly_once_in_process_and_after_restart() {
+        fn exercise(boundary: Option<usize>, reopen_immediately: bool) -> (bool, usize) {
             let (state, key, root) = state_with_old_request(
-                &format!("retirement-crash-{boundary}"),
+                &format!("retirement-boundary-{boundary:?}-{reopen_immediately}"),
                 config_without_reaction(),
             );
             state
@@ -5430,50 +7561,120 @@ mod tests {
                 .publish_one(&key, &mut transport)
                 .expect("publish reply")
                 .expect("provider receipt");
-            let request = state.read_request(&key).expect("request before retirement");
-            let reply = state.read_reply(&key, 1).expect("reply before retirement");
-            state.close_replies(&key).expect("retire request");
-            assert!(state.retired_key(&key).expect("retired key").is_some());
-            let retirement_path = state.retirement_path(1);
-            let mut retirement: RetirementRecord =
-                read_document(&retirement_path, MAX_RETIREMENT_RECORD_BYTES)
-                    .expect("retirement record");
-            assert_eq!(retirement.phase, RetirementPhase::Retired);
-            assert_eq!(retirement.replies[0].send_request_id, reply.send_request_id);
-            assert_eq!(
-                retirement.replies[0].provider_message_id,
-                reply.provider_message_id.clone().expect("reply receipt")
-            );
-            retirement.phase = RetirementPhase::Prepared;
-            retirement.retired_at_millis = None;
-            retirement.validate().expect("prepared journal");
-            write_document(&retirement_path, &retirement).expect("plant crash journal");
-            if restore_request {
-                write_document(&state.request_path(&key), &request).expect("restore request");
+            let expected_reply = state.read_reply(&key, 1).expect("reply before retirement");
+            *state
+                .retirement_fault_after
+                .lock()
+                .expect("retirement fault lock") = boundary;
+            if state.close_replies(&key).is_ok() {
+                let count = state
+                    .retirement_boundary_count
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                fs::remove_dir_all(root).expect("cleanup successful boundary probe");
+                return (false, count);
             }
-            if restore_reply {
-                write_document(&state.reply_path(&key, 1), &reply).expect("restore reply");
-            }
-
-            let reopened = BridgeState::open(&root).expect("complete retirement on restart");
+            let recovered = if reopen_immediately {
+                BridgeState::open(&root).expect("restart completes prepared retirement")
+            } else {
+                state
+                    .close_replies(&key)
+                    .expect("same-process retry completes prepared retirement");
+                BridgeState::open(&root).expect("restart completed state")
+            };
+            let reopened = recovered;
             assert!(!reopened.request_path(&key).exists());
             assert!(!reopened.reply_path(&key, 1).exists());
+            let checkpoint = reopened.read_checkpoint().expect("checkpoint");
+            assert_eq!(checkpoint.retirement_sequence, 1);
+            assert_eq!(checkpoint.request_count, 1);
+            assert_eq!(checkpoint.reply_count, 0);
             let completed: RetirementRecord =
-                read_document(&retirement_path, MAX_RETIREMENT_RECORD_BYTES)
+                read_document(&reopened.retirement_path(1), MAX_RETIREMENT_RECORD_BYTES)
                     .expect("completed retirement");
             assert_eq!(completed.phase, RetirementPhase::Retired);
-            assert!(reopened.retired_key(&key).expect("retired guard").is_some());
-            assert_eq!(reopened.status().expect("status")["request_count"], 1);
+            let receipts = reopened
+                .read_retirement_receipts(&completed)
+                .expect("exact retirement receipts");
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].send_request_id, expected_reply.send_request_id);
             assert_eq!(
-                reopened
-                    .admit_batch(&indexed_delivery(3, 100))
-                    .expect("admit after recovery")
-                    .new_request_keys
-                    .len(),
-                1
+                receipts[0].provider_message_id,
+                expected_reply
+                    .provider_message_id
+                    .expect("provider receipt")
             );
+            assert!(reopened.retired_key(&key).expect("retired guard").is_some());
+            let count = state
+                .retirement_boundary_count
+                .load(std::sync::atomic::Ordering::SeqCst);
             fs::remove_dir_all(root).expect("cleanup");
+            (true, count)
         }
+
+        let (interrupted, exact_boundary_count) = exercise(None, false);
+        assert!(!interrupted);
+        assert!(exact_boundary_count > 0);
+        for reopen_immediately in [false, true] {
+            for boundary in 0..exact_boundary_count {
+                let (interrupted, observed) = exercise(Some(boundary), reopen_immediately);
+                assert!(interrupted, "boundary {boundary} was not faulted");
+                assert!(observed > boundary, "boundary hook was not reached");
+            }
+            let (interrupted, observed) = exercise(Some(exact_boundary_count), reopen_immediately);
+            assert!(
+                !interrupted,
+                "one-past-final boundary must complete normally"
+            );
+            assert_eq!(observed, exact_boundary_count);
+        }
+    }
+
+    #[test]
+    fn startup_refuses_a_missing_retained_retirement_audit_generation() {
+        let (state, key, root) =
+            state_with_old_request("retirement-missing-audit", config_without_reaction());
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        state.close_replies(&key).expect("retire request");
+        assert_eq!(
+            state
+                .read_checkpoint()
+                .expect("checkpoint")
+                .retirement_sequence,
+            1
+        );
+        drop(BridgeState::open(&root).expect("control retirement state opens"));
+        fs::remove_file(state.retirement_path(1)).expect("delete retained audit header");
+        let error = BridgeState::open(&root).expect_err("missing audit header must fail closed");
+        assert!(error.to_string().contains("missing a retained generation"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn live_retirement_recovery_reads_only_current_and_next_audit_slots() {
+        let (state, key, root) =
+            state_with_old_request("retirement-direct-slots", config_without_reaction());
+        let unrelated = root.join("retirements/slot-2000.json");
+        fs::write(&unrelated, b"not JSON and not the current or next slot")
+            .expect("plant unrelated audit artifact");
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o600)).expect("unrelated mode");
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        state
+            .close_replies(&key)
+            .expect("live path must not scan unrelated ring slots");
+        assert_eq!(
+            state
+                .read_checkpoint()
+                .expect("checkpoint")
+                .retirement_sequence,
+            1
+        );
+        fs::remove_file(unrelated).expect("remove planted artifact");
+        BridgeState::open(&root).expect("startup scan after cleanup");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -5511,24 +7712,99 @@ mod tests {
     }
 
     #[test]
-    fn startup_repairs_population_after_precheckpoint_crash() {
-        let root = temporary("repair");
+    fn startup_refuses_bare_request_without_admission_transaction_authority() {
+        let root = temporary("orphan-count");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
         let batch = delivery(1, "cursor-1", "receipt-1");
         let CommittableEvent::MessageCreated(message) = &batch.events()[1] else {
             panic!("message fixture");
         };
-        let record = RequestRecord::from_message(message, Some("🤖")).expect("record");
+        let mut record = RequestRecord::from_message(message, Some("🤖")).expect("record");
+        record.admitted_cursor = Some("forged-cursor".to_owned());
         write_document(&state.request_path(&record.key), &record).expect("orphan request");
         assert_eq!(
             state.read_checkpoint().expect("checkpoint").request_count,
             0
         );
 
-        let recovered = BridgeState::open(&root).expect("recover state");
-        let checkpoint = recovered.read_checkpoint().expect("checkpoint");
-        assert_eq!(checkpoint.request_count, 1);
-        assert!(checkpoint.request_bytes > 0);
+        let error = BridgeState::open(&root).expect_err("orphan count must fail closed");
+        assert!(error.to_string().contains("no admission or retirement"));
+        assert!(state.request_path(&record.key).exists());
+        fs::remove_dir_all(root).expect("cleanup");
+
+        let root = temporary("orphan-cursor-substitution");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admitted = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit authorized request");
+        let authorized_key = &admitted.new_request_keys[0];
+        remove_if_exists(&state.request_path(authorized_key)).expect("remove authorized request");
+        let batch = indexed_delivery(2, 42);
+        let CommittableEvent::MessageCreated(message) = &batch.events()[0] else {
+            panic!("message fixture");
+        };
+        let cursorless = RequestRecord::from_message(message, Some("🤖")).expect("cursorless");
+        write_document(&state.request_path(&cursorless.key), &cursorless)
+            .expect("substitute cursorless request");
+        let error = BridgeState::open(&root).expect_err("cursorless substitution must fail");
+        assert!(error.to_string().contains("no replay authority"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn startup_cleans_exact_atomic_residue_and_refuses_lookalikes_in_scanned_directories() {
+        let root = temporary("atomic-residue");
+        BridgeState::initialize(&root, config()).expect("initialize state");
+        let mut residues = Vec::new();
+        for directory in ["requests", "replies", "retirements"] {
+            let path = root.join(directory).join(".message.123.456");
+            fs::write(&path, b"interrupted atomic write").expect("plant residue");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("residue mode");
+            residues.push(path);
+        }
+        BridgeState::open(&root).expect("clean exact owned residue");
+        assert!(residues.iter().all(|path| !path.exists()));
+        fs::remove_dir_all(root).expect("cleanup");
+
+        for directory in ["requests", "replies", "retirements"] {
+            let root = temporary(&format!("atomic-lookalike-{directory}"));
+            BridgeState::initialize(&root, config()).expect("initialize state");
+            let lookalike = root.join(directory).join(".message.123.bad");
+            fs::write(&lookalike, b"must not be silently deleted").expect("plant lookalike");
+            fs::set_permissions(&lookalike, fs::Permissions::from_mode(0o600))
+                .expect("lookalike mode");
+            assert!(BridgeState::open(&root).is_err());
+            assert!(lookalike.exists());
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn opening_legacy_state_durably_creates_all_upgrade_directories() {
+        let root = temporary("legacy-upgrade-directories");
+        BridgeState::initialize(&root, config()).expect("initialize state");
+        for directory in [
+            "commit-receipts",
+            "tombstones",
+            "retirements",
+            "retirement-receipts",
+        ] {
+            fs::remove_dir(root.join(directory)).expect("remove empty upgrade directory");
+        }
+        BridgeState::open(&root).expect("upgrade legacy state");
+        for directory in [
+            "commit-receipts",
+            "tombstones",
+            "retirements",
+            "retirement-receipts",
+        ] {
+            agent::validate_private_directory(
+                &root.join(directory),
+                "upgraded chat directory",
+                false,
+            )
+            .expect("private upgraded directory");
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -5675,6 +7951,73 @@ mod tests {
         assert_eq!(scan.blocks_by_nonce[second][0].body, "second");
         assert_eq!(scan.observed_ids.len(), 3);
         assert_eq!(scan.unknown_ids, vec!["unknown_1"]);
+    }
+
+    #[test]
+    fn capture_snapshot_serializes_full_scan_and_capture_against_close_retirement() {
+        let (state, key, root) =
+            state_with_old_request("capture-close-barrier", config_without_reaction());
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        let route = state
+            .next_reply_route(&key)
+            .expect("read route")
+            .expect("open route");
+        let expected_next_identifier = format!(
+            "{}_2",
+            state.read_request(&key).expect("request nonce").reply_nonce
+        );
+        let rendered = format!(
+            "<CHAT_REPLY_{}>\nserialized reply\n</CHAT_REPLY_{}>",
+            route.identifier, route.identifier
+        );
+        let (start_sender, start_receiver) = mpsc::channel();
+        let (attempted_sender, attempted_receiver) = mpsc::channel();
+        let close_finished = Arc::new(AtomicBool::new(false));
+        let close_state = state.clone();
+        let close_key = key.clone();
+        let close_finished_worker = Arc::clone(&close_finished);
+        let closer = std::thread::spawn(move || {
+            start_receiver.recv().expect("capture scan signal");
+            attempted_sender.send(()).expect("close attempt signal");
+            close_state
+                .close_replies(&close_key)
+                .expect("close after capture releases state lock");
+            close_finished_worker.store(true, AtomicOrdering::SeqCst);
+        });
+        let capture = state
+            .capture_snapshot_with_hook(&rendered, || {
+                start_sender.send(()).expect("start close");
+                attempted_receiver.recv().expect("close thread started");
+                let probe =
+                    agent::open_private_lock(&state.root.join(".state.lock"), "capture lock probe")
+                        .expect("open capture lock probe");
+                let error = probe
+                    .try_lock_exclusive()
+                    .expect_err("capture must retain the state lock across scan and capture");
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                assert!(!close_finished.load(AtomicOrdering::SeqCst));
+            })
+            .expect("serialized full snapshot capture");
+        assert_eq!(capture.replies, vec![(key.clone(), vec![1])]);
+        assert!(capture.route_entries.iter().any(|entry| {
+            entry.key == key
+                && entry.current_identifier.as_deref() == Some(expected_next_identifier.as_str())
+        }));
+        closer.join().expect("join closer");
+        assert!(close_finished.load(AtomicOrdering::SeqCst));
+        assert!(state
+            .next_reply_route(&key)
+            .expect("closed route")
+            .is_none());
+        let mut transport = FakeReplyTransport::default();
+        state
+            .publish_one(&key, &mut transport)
+            .expect("publish captured reply")
+            .expect("provider receipt");
+        assert!(state.retired_key(&key).expect("retired key").is_some());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

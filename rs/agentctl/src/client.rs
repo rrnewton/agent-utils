@@ -3,81 +3,63 @@
 //! Herdr owns protocol negotiation and terminal processes. This adapter starts no
 //! server and has no shell executor, broker, or allowlist dependency.
 use crate::error::{AdapterError, Result};
+use chat_subscription_plugin::process::ProcessPluginChild;
 use serde_json::{Map, Value};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const CONTROL_STDERR_BYTES: usize = 64 * 1024;
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CAPTURE_READ_BURST: usize = 256 * 1024;
+#[derive(Debug)]
 pub(crate) struct BoundedOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 
-/// Capture a subprocess while enforcing a wall-clock bound and draining both pipes concurrently.
+/// Capture a subprocess while enforcing wall-clock and byte bounds on multiplexed output pipes.
 #[cfg(test)]
-pub(crate) fn bounded_output(
-    command: &mut Command,
-    timeout: Duration,
-) -> io::Result<BoundedOutput> {
+pub(crate) fn bounded_output(command: Command, timeout: Duration) -> io::Result<BoundedOutput> {
     bounded_output_with_cancellation(command, timeout, &|| false)
 }
 
 fn bounded_output_with_cancellation(
-    command: &mut Command,
+    command: Command,
     timeout: Duration,
     cancelled: &dyn Fn() -> bool,
 ) -> io::Result<BoundedOutput> {
-    command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let mut child = command.spawn()?;
-    let child_pid = child.id();
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("child stdout pipe was not captured"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("child stderr pipe was not captured"))?;
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let deadline = Instant::now().checked_add(timeout);
-    let mut observed_status = None;
-    let status = loop {
-        if observed_status.is_none() {
-            observed_status = child.try_wait()?;
-        }
-        // A command can exit while a child retains stdout/stderr. The outer bound
-        // includes pipe draining, so an inherited pipe cannot hang agent control.
-        if stdout_reader.is_finished() && stderr_reader.is_finished() {
-            if let Some(status) = observed_status {
-                break status;
-            }
-        }
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control command timeout is too large",
+        )
+    })?;
+    let mut captured = CapturedProcess::spawn(command)?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    loop {
         let was_cancelled = cancelled();
-        if was_cancelled || deadline.is_some_and(|value| Instant::now() >= value) {
-            // The child owns a fresh process group. Killing the group also closes pipes inherited
-            // by descendants, so reader threads cannot keep this timeout path blocked forever.
-            let _ = unsafe { libc::kill(-(child_pid as i32), libc::SIGKILL) };
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+        if was_cancelled || Instant::now() >= deadline {
+            // ProcessPluginChild's live atomic supervisor pins the private process-group identity
+            // until shutdown has signalled the group. In particular, no reaped command leader can
+            // turn this cleanup into a signal to a numerically reused process group. Escaped
+            // setsid descendants can retain their copies of these pipes, but dropping our readers
+            // below is nonblocking and does not wait for their EOF.
+            let _ = captured.child.shutdown(Duration::ZERO);
             return Err(if was_cancelled {
                 io::Error::new(io::ErrorKind::Interrupted, "control command was cancelled")
             } else {
@@ -87,19 +69,183 @@ fn bounded_output_with_cancellation(
                 )
             });
         }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| io::Error::other("stdout reader thread panicked"))??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| io::Error::other("stderr reader thread panicked"))??;
-    Ok(BoundedOutput {
-        status,
-        stdout,
-        stderr,
+        if !stdout_eof {
+            stdout_eof = drain_available(
+                &mut captured.stdout,
+                &mut stdout,
+                CONTROL_STDOUT_BYTES,
+                "stdout",
+            )?;
+        }
+        if !stderr_eof {
+            stderr_eof = drain_available(
+                &mut captured.stderr,
+                &mut stderr,
+                CONTROL_STDERR_BYTES,
+                "stderr",
+            )?;
+        }
+        // executable_status uses waitid(P_PIDFD, WNOWAIT): observing exit does not release the
+        // executable's numeric identity before the pinned private group has been terminated.
+        if stdout_eof && stderr_eof && captured.child.executable_status()?.is_some() {
+            let status = captured.child.shutdown(Duration::ZERO)?;
+            return Ok(BoundedOutput {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        poll_capture(
+            (!stdout_eof).then_some(&captured.stdout),
+            (!stderr_eof).then_some(&captured.stderr),
+            remaining.min(CAPTURE_POLL_INTERVAL),
+        )?;
+    }
+}
+
+struct CapturedProcess {
+    child: ProcessPluginChild,
+    stdout: File,
+    stderr: File,
+}
+
+impl CapturedProcess {
+    #[cfg(target_os = "linux")]
+    fn spawn(mut command: Command) -> io::Result<Self> {
+        let (stderr, stderr_writer) = pipe_cloexec()?;
+        // ProcessPluginChild deliberately sends a protocol plugin's stderr to /dev/null. Herdr is
+        // an ordinary control command, so restore this private capture pipe after Command has
+        // installed its standard descriptors but before exec. The captured OwnedFd keeps the
+        // writer live in the pre-exec child and O_CLOEXEC closes the extra copy on successful exec.
+        unsafe {
+            command.pre_exec(move || loop {
+                if libc::dup2(stderr_writer.as_raw_fd(), libc::STDERR_FILENO) >= 0 {
+                    return Ok(());
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            });
+        }
+        let mut child = ProcessPluginChild::spawn(command)?;
+        let (stdout, stdin) = child.take_transport()?;
+        drop(stdin);
+        set_nonblocking(&stdout)?;
+        set_nonblocking(&stderr)?;
+        Ok(Self {
+            child,
+            stdout,
+            stderr,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn spawn(command: Command) -> io::Result<Self> {
+        let _ = ProcessPluginChild::spawn(command)?;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded control commands require Linux pidfd supervision",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pipe_cloexec() -> io::Result<(File, OwnedFd)> {
+    let mut descriptors = [-1_i32; 2];
+    // SAFETY: descriptors points to writable storage for exactly two file descriptors.
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful pipe2 returned two fresh descriptors owned by this function.
+    Ok(unsafe {
+        (
+            File::from_raw_fd(descriptors[0]),
+            OwnedFd::from_raw_fd(descriptors[1]),
+        )
     })
+}
+
+fn set_nonblocking(file: &File) -> io::Result<()> {
+    // SAFETY: fcntl receives a live descriptor and F_GETFL has no third argument.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL accepts the retrieved flags plus O_NONBLOCK for the same descriptor.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain_available(
+    reader: &mut File,
+    output: &mut Vec<u8>,
+    limit: usize,
+    stream: &str,
+) -> io::Result<bool> {
+    let mut drained = 0;
+    let mut buffer = [0_u8; 16 * 1024];
+    while drained < CAPTURE_READ_BURST {
+        let remaining = limit.saturating_sub(output.len());
+        let read_bound = remaining.saturating_add(1).min(buffer.len());
+        match reader.read(&mut buffer[..read_bound]) {
+            Ok(0) => return Ok(true),
+            Ok(count) if count > remaining => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("control command {stream} exceeds its {limit}-byte limit"),
+                ));
+            }
+            Ok(count) => {
+                output.extend_from_slice(&buffer[..count]);
+                drained += count;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn poll_capture(stdout: Option<&File>, stderr: Option<&File>, timeout: Duration) -> io::Result<()> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: stdout.map_or(-1, AsRawFd::as_raw_fd),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: stderr.map_or(-1, AsRawFd::as_raw_fd),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let milliseconds = timeout
+        .as_millis()
+        .max(u128::from(!timeout.is_zero()))
+        .min(i32::MAX as u128) as i32;
+    // SAFETY: descriptors is initialized and remains live for the matching array length.
+    let result = unsafe {
+        libc::poll(
+            descriptors.as_mut_ptr(),
+            descriptors.len() as libc::nfds_t,
+            milliseconds,
+        )
+    };
+    if result >= 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    // Return EINTR to the absolute-deadline owner loop instead of restarting the full relative
+    // timeout here; a signal stream must not extend control-command cancellation indefinitely.
+    if error.kind() == io::ErrorKind::Interrupted {
+        return Ok(());
+    }
+    Err(error)
 }
 
 /// One terminal pane and its owning tab and workspace.
@@ -170,12 +316,10 @@ impl HerdrClient {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<CommandOutput> {
         let executable = resolve_executable(&self.executable)?;
-        let output = bounded_output_with_cancellation(
-            Command::new(executable).args(args),
-            timeout,
-            cancelled,
-        )
-        .map_err(|error| AdapterError::unavailable(format!("cannot invoke Herdr: {error}")))?;
+        let mut command = Command::new(executable);
+        command.args(args);
+        let output = bounded_output_with_cancellation(command, timeout, cancelled)
+            .map_err(|error| AdapterError::unavailable(format!("cannot invoke Herdr: {error}")))?;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -817,11 +961,13 @@ fn unique_label_id(
     Ok(matches.into_iter().next())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::process::Child;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::thread;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static EXECUTABLE_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -857,6 +1003,95 @@ mod tests {
     impl Drop for FakeExecutable {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct RecordedChild {
+        root: PathBuf,
+        pid_file: PathBuf,
+    }
+
+    impl RecordedChild {
+        fn new(kind: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "agentctl-{kind}-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            let pid_file = root.join("pid");
+            Self { root, pid_file }
+        }
+
+        fn escaped_pipe_command(&self) -> Command {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "/usr/bin/setsid /bin/sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+                    "agentctl-test",
+                ])
+                .arg(&self.pid_file);
+            command
+        }
+
+        fn group_stdout_overflow_command(&self) -> Command {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "/bin/sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; exec /usr/bin/head -c \"$2\" /dev/zero",
+                    "agentctl-test",
+                ])
+                .arg(&self.pid_file)
+                .arg((CONTROL_STDOUT_BYTES + 1).to_string());
+            command
+        }
+
+        fn pid(&self) -> libc::pid_t {
+            fs::read_to_string(&self.pid_file)
+                .expect("setsid holder wrote its pid")
+                .trim()
+                .parse()
+                .expect("setsid holder pid is numeric")
+        }
+    }
+
+    impl Drop for RecordedChild {
+        fn drop(&mut self) {
+            if let Ok(value) = fs::read_to_string(&self.pid_file) {
+                if let Ok(pid) = value.trim().parse::<libc::pid_t>() {
+                    // SAFETY: this fixture recorded the exact process it created and is solely
+                    // responsible for bounding that deliberately escaped test descendant.
+                    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn wait_until_process_is_gone(pid: libc::pid_t, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // SAFETY: signal zero only probes the numeric identity recorded by this test fixture.
+            if unsafe { libc::kill(pid, 0) } < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -938,6 +1173,19 @@ mod tests {
     }
 
     #[test]
+    fn bounded_capture_preserves_stdout_stderr_and_exit_status() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf 'ordinary stdout'; printf 'ordinary stderr' >&2; exit 7",
+        ]);
+        let output = bounded_output(command, Duration::from_secs(5)).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"ordinary stdout");
+        assert_eq!(output.stderr, b"ordinary stderr");
+    }
+
+    #[test]
     fn focus_uses_agent_focus_and_shutdown_targets_one_exact_pane() {
         let executable = FakeExecutable::new("{}");
         executable.client().focus_pane("workspace:pane").unwrap();
@@ -967,34 +1215,83 @@ mod tests {
 
     #[test]
     fn control_timeout_includes_pipes_inherited_after_the_parent_exits() {
+        let escaped = RecordedChild::new("setsid-holder");
+        let mut unrelated = ChildGuard(Command::new("/bin/sleep").arg("30").spawn().unwrap());
         let started = Instant::now();
-        let result = bounded_output(
-            Command::new("/bin/sh").args(["-c", "sleep 30 & exit 0"]),
-            Duration::from_millis(100),
-        );
+        let result = bounded_output(escaped.escaped_pipe_command(), Duration::from_millis(100));
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
+        // The setsid child escaped the supervised group and really was retaining both capture
+        // pipes, so returning promptly did not depend on receiving EOF from reader threads.
+        assert_eq!(unsafe { libc::kill(escaped.pid(), 0) }, 0);
+        // The pinned private group must not be confused with any unrelated numeric identity.
+        assert!(unrelated.0.try_wait().unwrap().is_none());
     }
 
     #[test]
     fn control_cancellation_kills_command_group_and_inherited_pipes_promptly() {
+        let escaped = RecordedChild::new("setsid-holder");
         let cancelled = Arc::new(AtomicBool::new(false));
         let trigger = Arc::clone(&cancelled);
+        let pid_file = escaped.pid_file.clone();
         let worker = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            trigger.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let marker_is_complete = fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+                    .is_some();
+                if marker_is_complete || Instant::now() >= deadline {
+                    trigger.store(true, Ordering::SeqCst);
+                    return marker_is_complete;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
         });
         let started = Instant::now();
         let result = bounded_output_with_cancellation(
-            Command::new("/bin/sh").args(["-c", "sleep 30 & wait"]),
+            escaped.escaped_pipe_command(),
             Duration::from_secs(30),
             &|| cancelled.load(Ordering::SeqCst),
         );
-        worker.join().expect("join cancellation trigger");
+        assert!(
+            worker.join().expect("join cancellation trigger"),
+            "cancellation fixture must record the escaped pipe holder before cancellation"
+        );
         assert_eq!(
-            result.err().expect("cancel command").kind(),
+            result.expect_err("cancel command").kind(),
             io::ErrorKind::Interrupted
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(unsafe { libc::kill(escaped.pid(), 0) }, 0);
+    }
+
+    #[test]
+    fn control_capture_enforces_independent_stream_byte_caps() {
+        let group_child = RecordedChild::new("group-holder");
+        let stdout_error = bounded_output(
+            group_child.group_stdout_overflow_command(),
+            Duration::from_secs(5),
+        )
+        .expect_err("oversized stdout must be refused");
+        assert_eq!(stdout_error.kind(), io::ErrorKind::InvalidData);
+        assert!(stdout_error.to_string().contains("stdout"));
+        assert!(
+            wait_until_process_is_gone(group_child.pid(), Duration::from_secs(2)),
+            "output-cap refusal must terminate a descendant in the supervised group"
+        );
+
+        let mut stderr_command = Command::new("/bin/sh");
+        stderr_command
+            .args([
+                "-c",
+                "exec /usr/bin/head -c \"$1\" /dev/zero >&2",
+                "agentctl-test",
+            ])
+            .arg((CONTROL_STDERR_BYTES + 1).to_string());
+        let stderr_error = bounded_output(stderr_command, Duration::from_secs(5))
+            .expect_err("oversized stderr must be refused");
+        assert_eq!(stderr_error.kind(), io::ErrorKind::InvalidData);
+        assert!(stderr_error.to_string().contains("stderr"));
     }
 }

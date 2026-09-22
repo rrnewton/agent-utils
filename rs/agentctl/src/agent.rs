@@ -4,9 +4,12 @@
 //! submission, working-state confirmation, and at-most-once quarantine after an ambiguous pane
 //! injection. Queue and target locks use the command's stable, package-independent disk format.
 
+use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1399,6 +1402,164 @@ pub(crate) fn atomic_json(path: &Path, value: &Value) -> AgentResult<()> {
     write_result.map_err(|error| io_error("write durable JSON", path, error))
 }
 
+pub(crate) fn atomic_temporary_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(suffix) = name.strip_prefix(".message.") else {
+        return false;
+    };
+    let Some((process, sequence)) = suffix.split_once('.') else {
+        return false;
+    };
+    !process.is_empty()
+        && !sequence.is_empty()
+        && process.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn open_atomic_temporary_at(directory: &File, name: &OsStr) -> AgentResult<Option<File>> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| AgentError::delivery("durable JSON temporary name contains NUL".to_owned()))?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(io_error(
+            "open durable JSON temporary without following links",
+            Path::new(name.to_str().unwrap_or("<non-UTF8>")),
+            error,
+        ));
+    }
+    Ok(Some(unsafe { File::from_raw_fd(descriptor) }))
+}
+
+fn validate_atomic_temporary(file: &File, path: &Path) -> AgentResult<()> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_error("inspect durable JSON temporary", path, error))?;
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != uid
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(AgentError::delivery(format!(
+            "unsafe durable JSON temporary: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Recognize one securely owned named temporary created by [`atomic_json`].
+pub(crate) fn is_atomic_json_temporary(path: &Path) -> AgentResult<bool> {
+    let Some(name) = path.file_name().filter(|name| atomic_temporary_name(name)) else {
+        return Ok(false);
+    };
+    let parent = path.parent().ok_or_else(|| {
+        AgentError::delivery(format!(
+            "durable JSON temporary has no parent: {}",
+            path.display()
+        ))
+    })?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent)
+        .map_err(|error| io_error("open durable JSON temporary directory", parent, error))?;
+    let Some(file) = open_atomic_temporary_at(&directory, name)? else {
+        return Ok(false);
+    };
+    validate_atomic_temporary(&file, path)?;
+    Ok(true)
+}
+
+/// Remove only securely recognized atomic-write residue and fsync the containing directory.
+///
+/// The containing state directory is private mode 0700 and the same UID is trusted. Linux has no
+/// inode-conditional unlink, so the held descriptor plus immediate `fstatat` identity comparison
+/// prevents traversal and accidental foreign-artifact removal but cannot defeat a malicious
+/// same-UID process that swaps the pathname after that comparison.
+pub(crate) fn cleanup_atomic_json_temporaries(directory: &Path) -> AgentResult<()> {
+    let directory_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(directory)
+        .map_err(|error| io_error("open durable JSON temporary directory", directory, error))?;
+    let mut removed = false;
+    for entry in fs::read_dir(directory)
+        .map_err(|error| io_error("scan durable JSON temporaries", directory, error))?
+    {
+        let entry = entry
+            .map_err(|error| io_error("read durable JSON temporary entry", directory, error))?;
+        let name = entry.file_name();
+        if !atomic_temporary_name(&name) {
+            continue;
+        }
+        let Some(file) = open_atomic_temporary_at(&directory_file, &name)? else {
+            continue;
+        };
+        validate_atomic_temporary(&file, &entry.path())?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| io_error("inspect durable JSON temporary", &entry.path(), error))?;
+        let name_c = CString::new(name.as_bytes()).map_err(|_| {
+            AgentError::delivery("durable JSON temporary name contains NUL".to_owned())
+        })?;
+        let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let status = unsafe {
+            libc::fstatat(
+                directory_file.as_raw_fd(),
+                name_c.as_ptr(),
+                current.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(io_error(
+                "revalidate durable JSON temporary",
+                &entry.path(),
+                error,
+            ));
+        }
+        let current = unsafe { current.assume_init() };
+        if current.st_dev != metadata.dev() || current.st_ino != metadata.ino() {
+            return Err(AgentError::delivery(format!(
+                "durable JSON temporary changed before cleanup: {}",
+                entry.path().display()
+            )));
+        }
+        let status = unsafe { libc::unlinkat(directory_file.as_raw_fd(), name_c.as_ptr(), 0) };
+        if status < 0 {
+            return Err(io_error(
+                "remove durable JSON temporary",
+                &entry.path(),
+                io::Error::last_os_error(),
+            ));
+        }
+        removed = true;
+    }
+    if removed {
+        directory_file
+            .sync_all()
+            .map_err(|error| io_error("sync durable JSON temporary directory", directory, error))?;
+    }
+    Ok(())
+}
+
 fn atomic_json_create(path: &Path, value: &Value) -> io::Result<()> {
     let parent = path
         .parent()
@@ -1749,6 +1910,7 @@ fn io_error(action: &str, path: &Path, error: io::Error) -> AgentError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
     use std::sync::{Arc, Condvar, Mutex};
@@ -1802,6 +1964,7 @@ mod tests {
         workspace_label: String,
         state: Mutex<FakeState>,
         run_gate: Option<Arc<RunGate>>,
+        cancel_after_run: Option<Arc<AtomicBool>>,
     }
 
     impl FakeAgent {
@@ -1822,12 +1985,19 @@ mod tests {
                     ..FakeState::default()
                 }),
                 run_gate: None,
+                cancel_after_run: None,
             }
         }
 
         fn with_run_gate(states: &[&str], run_gate: Arc<RunGate>) -> Self {
             let mut fake = Self::new(states);
             fake.run_gate = Some(run_gate);
+            fake
+        }
+
+        fn with_cancel_after_run(states: &[&str], cancelled: Arc<AtomicBool>) -> Self {
+            let mut fake = Self::new(states);
+            fake.cancel_after_run = Some(cancelled);
             fake
         }
 
@@ -1884,6 +2054,9 @@ mod tests {
             }
             let mut state = self.state.lock().expect("fake state");
             state.runs.push(text.to_owned());
+            if let Some(cancelled) = &self.cancel_after_run {
+                cancelled.store(true, AtomicOrdering::SeqCst);
+            }
             if state.fail_run {
                 Err(AdapterError::unavailable("connection vanished after write"))
             } else {
@@ -2008,6 +2181,26 @@ mod tests {
 
         fn cancelled(&self) -> bool {
             self.checks.fetch_add(1, AtomicOrdering::SeqCst) >= self.cancel_after_checks
+        }
+
+        fn delivery_wait_chunk(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+    }
+
+    struct CancellationFlagRuntime {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl AgentRuntime for CancellationFlagRuntime {
+        fn monotonic(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn sleep(&self, _duration: Duration) {}
+
+        fn cancelled(&self) -> bool {
+            self.cancelled.load(AtomicOrdering::SeqCst)
         }
 
         fn delivery_wait_chunk(&self) -> Option<Duration> {
@@ -2272,14 +2465,15 @@ mod tests {
     #[test]
     fn cancellation_after_injection_quarantines_unknown_outcome() {
         let directory = TestDirectory::new("cancel-after-injection");
-        let fake = FakeAgent::new(&["idle"]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let fake = FakeAgent::with_cancel_after_run(&["idle"], Arc::clone(&cancelled));
         let error = send_with_runtime(
             &fake,
             &target(),
             directory.path(),
             "inject once",
             DrainOptions::default(),
-            &CancelRuntime::new(1),
+            &CancellationFlagRuntime { cancelled },
         )
         .expect_err("post-injection cancellation is uncertain");
         assert_eq!(error.outcome(), Some(QueueOutcome::PossiblySubmitted));
@@ -2652,5 +2846,60 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("target needs"));
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn atomic_json_cleanup_removes_only_exact_secure_owned_temporaries() {
+        let directory = TestDirectory::new("atomic-temp-cleanup");
+        let qualifying = directory.path().join(".message.123.456");
+        fs::write(&qualifying, b"partial").expect("write qualifying temporary");
+        fs::set_permissions(&qualifying, fs::Permissions::from_mode(0o600))
+            .expect("qualifying mode");
+        let noncanonical = directory.path().join(".message.123.bad");
+        fs::write(&noncanonical, b"preserve").expect("write noncanonical file");
+        let non_utf8 = directory.path().join(std::ffi::OsString::from_vec(vec![
+            b'.', b'm', b'e', b's', b's', b'a', b'g', b'e', b'.', 0xff, b'.', b'1',
+        ]));
+        fs::write(&non_utf8, b"preserve").expect("write non-UTF8 file");
+
+        cleanup_atomic_json_temporaries(directory.path()).expect("clean qualifying temporary");
+        assert!(!qualifying.exists());
+        assert!(noncanonical.exists());
+        assert!(non_utf8.exists());
+
+        for label in ["symlink", "directory", "mode", "hardlink", "fifo"] {
+            let unsafe_directory = TestDirectory::new(&format!("atomic-temp-{label}"));
+            let path = unsafe_directory.path().join(".message.1.2");
+            match label {
+                "symlink" => {
+                    let target = unsafe_directory.path().join("target");
+                    fs::write(&target, b"target").expect("write symlink target");
+                    symlink(&target, &path).expect("plant symlink");
+                }
+                "directory" => fs::create_dir(&path).expect("plant directory"),
+                "mode" => {
+                    fs::write(&path, b"wide").expect("plant wide file");
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+                        .expect("wide mode");
+                }
+                "hardlink" => {
+                    let source = unsafe_directory.path().join("source");
+                    fs::write(&source, b"linked").expect("write hardlink source");
+                    fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
+                        .expect("hardlink mode");
+                    fs::hard_link(&source, &path).expect("plant hardlink");
+                }
+                "fifo" => {
+                    let path_c = CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+                    assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                cleanup_atomic_json_temporaries(unsafe_directory.path()).is_err(),
+                "unsafe canonical temporary {label} must be refused"
+            );
+            assert!(path.exists() || fs::symlink_metadata(&path).is_ok());
+        }
     }
 }
