@@ -3436,8 +3436,12 @@ def test_ownerless_batch_classification_is_read_only_beside_live_dirty_create(
     )
     assert rc == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["classifications"][0]["blocks_entry"] is False
-    assert report["classifications"][0]["state"] == "terminal-retained"
+    assert report["classifications"][0]["blocks_entry"] is True
+    assert report["classifications"][0]["state"] == "could-not-classify"
+    assert (
+        "ownerless linked validation checkout recovery is disabled"
+        in report["classifications"][0]["reason"]
+    )
     assert report["create_journals"][0]["dirty_checkouts"] == ["product"]
     assert status_refreshes and not any(status_refreshes)
     assert retained.is_dir()
@@ -8937,8 +8941,12 @@ def test_ownerless_cleanup_resumes_after_fence_before_journal_update(
     assert not fenced.exists()
 
 
-@pytest.mark.parametrize("target_kind", ["checkout", "cargo-home"])
-def test_ownerless_cleanup_rolls_back_when_process_enters_fenced_path(
+@pytest.mark.parametrize(
+    "target_kind",
+    ["checkout", "cargo-home"],
+    ids=["checkout-refuses-before-fence", "cargo-home-rolls-back-after-fence"],
+)
+def test_ownerless_cleanup_refuses_linked_checkout_or_rolls_back_cache_after_fence(
     tmp_path: Path, target_kind: str
 ) -> None:
     project, repository, _remote = make_project(
@@ -8974,6 +8982,16 @@ def test_ownerless_cleanup_rolls_back_when_process_enters_fenced_path(
         *args,
         env={"WRKSLOTS_TEST_INTERRUPT": "after-ownerless-validate-path-fence"},
     )
+    if target_kind == "checkout":
+        assert interrupted.returncode == 3
+        assert (
+            "ownerless linked validation checkout recovery is disabled"
+            in interrupted.stderr
+        )
+        assert target.is_dir()
+        assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+        assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+        return
     assert interrupted.returncode == 86
     journal_path = control_directory(project) / "ACTIVE.testhost.journal"
     journal = json.loads(journal_path.read_text())
