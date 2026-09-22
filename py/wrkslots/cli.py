@@ -352,16 +352,22 @@ _RETAINED_HANDLE_COUNT_LIMIT = 4096
 _RETAINED_HANDLE_BYTES_LIMIT = 64 * 1024 * 1024
 _RETAINED_HANDLE_CENSUS_SECONDS = 30.0
 _MOUNTINFO_FILE_BYTES_LIMIT = 4 * 1024 * 1024
+_UNIX_SOCKET_TABLE_BYTES_LIMIT = 16 * 1024 * 1024
+# The full identity census must enumerate every descriptor inode and one Unix
+# socket table even though ordinary path links are filtered at the producer.
+# A 2026-09-22 production namespace used about 7.5 MiB for each half. Keep the
+# operation bounded while leaving enough headroom for normal host fluctuation.
+_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT = 64 * 1024 * 1024
 _FILE_HANDLE_BYTES_LIMIT = 128
 _AT_FDCWD = -100
 _AT_SYMLINK_FOLLOW = 0x400
 # This is an operation-wide limit, not a per-file limit.  Hosts where procfs
 # hides mount-namespace identities must conservatively read one mountinfo file
-# per process.  A 2026-09-20 production census had 3,459 readable files totaling
-# 92,473,348 bytes, so the former 64 MiB ceiling made every otherwise healthy
+# per process.  A 2026-09-22 production census had 3,736 readable files totaling
+# 177,236,979 bytes, so the former 128 MiB ceiling made every otherwise healthy
 # ownerless-validation cleanup fail closed.  Keep a finite ceiling with useful
 # headroom while retaining the independent 4 MiB per-file and 60 second bounds.
-_MOUNTINFO_CENSUS_BYTES_LIMIT = 128 * 1024 * 1024
+_MOUNTINFO_CENSUS_BYTES_LIMIT = 256 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
 _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # Keep this provider command inside the intended 30-second integration envelope:
@@ -18350,7 +18356,7 @@ def _remove_validate_batch(args: argparse.Namespace) -> dict[str, object]:
     same_uid_census_count = 0
     census_budget = _ReadOnlyCommandBudget.start(
         timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
-        stdout_limit=16 * 1024 * 1024,
+        stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
     )
@@ -19574,7 +19580,7 @@ def _recover_finish(
                 identity_verified = False
                 recovery_budget = _ReadOnlyCommandBudget.start(
                     timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
-                    stdout_limit=16 * 1024 * 1024,
+                    stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
                     stderr_limit=64 * 1024,
                     input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
                 )
@@ -23023,7 +23029,7 @@ def _assert_excluded_validation_unused(
     if batch_cleanup is None:
         budget = _ReadOnlyCommandBudget.start(
             timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
-            stdout_limit=16 * 1024 * 1024,
+            stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
             stderr_limit=64 * 1024,
             input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
         )
@@ -23031,7 +23037,7 @@ def _assert_excluded_validation_unused(
         batch_cleanup.same_uid_census_count += 1
         budget = _ReadOnlyCommandBudget.start(
             timeout_seconds=batch_cleanup.census_budget.remaining_seconds(),
-            stdout_limit=16 * 1024 * 1024,
+            stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
             stderr_limit=64 * 1024,
             input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
         )
@@ -25735,6 +25741,28 @@ def _process_symlink_roots(
     return tuple(roots)
 
 
+def _find_link_selection(targets: Mapping[Path, str]) -> tuple[str, ...]:
+    """Build GNU find predicates that emit only links into selected trees.
+
+    A full-host process census can contain millions of unrelated descriptors.
+    Filtering their link targets in ``find`` keeps the bounded command channel
+    proportional to relevant evidence while the parser below still validates
+    every emitted record and the command runner still refuses an oversized
+    relevant result.
+    """
+
+    tests: list[str] = []
+    for target in sorted(targets, key=str):
+        literal = str(target)
+        for character in ("\\", "*", "?", "["):
+            literal = literal.replace(character, f"\\{character}")
+        for pattern in (literal, f"{literal}/*", f"{literal} (deleted)"):
+            if tests:
+                tests.append("-o")
+            tests.extend(("-lname", pattern))
+    return tuple(tests)
+
+
 def _pid_from_proc_evidence(path: Path) -> int:
     parts = path.parts
     if len(parts) < 4 or parts[1] != "proc" or not parts[2].isdigit():
@@ -25978,12 +26006,16 @@ def _absent_validate_find_matches(
     roots = _process_symlink_roots(processes)
     if not roots:
         return ()
+    link_selection = _find_link_selection(targets)
     suffix = (
         "-ignore_readdir_race",
         "-maxdepth",
         "1",
         "-type",
         "l",
+        "(",
+        *link_selection,
+        ")",
         "-printf",
         "%p\\0%l\\0",
     )
@@ -26178,15 +26210,7 @@ def _same_uid_batched_path_matches(
     matches: list[tuple[int, str, str, str]] = []
     indeterminate = {process.pid: process for process in fallback_processes}
     roots = _process_symlink_roots(direct_processes)
-    link_tests: list[str] = []
-    for target in sorted(targets, key=str):
-        literal = str(target)
-        for character in ("\\", "*", "?", "["):
-            literal = literal.replace(character, f"\\{character}")
-        for pattern in (literal, f"{literal}/*", f"{literal} (deleted)"):
-            if link_tests:
-                link_tests.append("-o")
-            link_tests.extend(("-lname", pattern))
+    link_tests = _find_link_selection(targets)
     find_suffix = (
         "-ignore_readdir_race",
         "-maxdepth",
@@ -26404,15 +26428,7 @@ def _batch_link_matches(
 ) -> tuple[tuple[int, str, str, str], ...]:
     # Use the same literal link selection as the existing final same-UID pass.
     # Outside aliases are covered separately by followed device/inode stats.
-    tests: list[str] = []
-    for target in sorted(targets, key=str):
-        literal = str(target)
-        for character in ("\\", "*", "?", "["):
-            literal = literal.replace(character, f"\\{character}")
-        for pattern in (literal, f"{literal}/*", f"{literal} (deleted)"):
-            if tests:
-                tests.append("-o")
-            tests.extend(("-lname", pattern))
+    tests = _find_link_selection(targets)
     suffix = ("-ignore_readdir_race", "-maxdepth", "1", "-type", "l",
               "(", *tests, ")", "-printf", "%p\\0%l\\0")
     observed = {process.pid: process for process in processes}
@@ -26746,7 +26762,7 @@ def _batch_unix_socket_matches(
             path = Path(f"/proc/{process.pid}/net/unix")
             try:
                 rc, contents, stderr = _run_root_owned_command(Path("/usr/bin/cat"), ("--", str(path)), budget=budget)
-                if rc or stderr or len(contents) > _MOUNTINFO_FILE_BYTES_LIMIT:
+                if rc or stderr or len(contents) > _UNIX_SOCKET_TABLE_BYTES_LIMIT:
                     raise Refusal(f"Unix socket census is incomplete for PID {process.pid}")
                 budget.remaining_seconds()
                 if not _process_generation_is_current(process):
@@ -26930,7 +26946,7 @@ class _OwnerlessValidationBatchContext:
         self.same_uid_census_count += 1
         fresh_budget = _ReadOnlyCommandBudget.start(
             timeout_seconds=self.census_budget.remaining_seconds(),
-            stdout_limit=16 * 1024 * 1024,
+            stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
             stderr_limit=64 * 1024,
             input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
         )
@@ -26992,7 +27008,7 @@ def _capture_process_path_census(
         )
     selected_budget = budget or _ReadOnlyCommandBudget.start(
         timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
-        stdout_limit=16 * 1024 * 1024,
+        stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
     )
@@ -27039,7 +27055,7 @@ def _assert_absent_validate_processes_unrelated(
     targets = {path: record.slot for record, row_paths in rows for path in row_paths}
     budget = _ReadOnlyCommandBudget.start(
         timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
-        stdout_limit=16 * 1024 * 1024,
+        stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
     )
@@ -28192,7 +28208,7 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         )
     census_budget = _ReadOnlyCommandBudget.start(
         timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
-        stdout_limit=16 * 1024 * 1024,
+        stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
     )
@@ -28453,7 +28469,7 @@ def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
         )
     budget = _ReadOnlyCommandBudget.start(
         timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
-        stdout_limit=16 * 1024 * 1024,
+        stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
     )

@@ -6628,6 +6628,44 @@ def test_batch_unix_census_preserves_uncertainty_and_generation_guards(
         wrkslots._batch_unix_socket_matches((process,), {tmp_path: str(tmp_path)}, {}, wrkslots._ReadOnlyCommandBudget.start(timeout_seconds=22, stdout_limit=4096, stderr_limit=4096))
 
 
+def test_batch_unix_census_accepts_current_scale_but_retains_file_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(4242, 17, "", "mnt:[1]")
+    header = b"Num RefCount Protocol Flags Type St Inode Path\n"
+    row = b"0: 2 0 0 1 1 123\n"
+    contents = header + row * ((5 * 1024 * 1024) // len(row) + 1)
+    assert 4 * 1024 * 1024 < len(contents) < wrkslots._UNIX_SOCKET_TABLE_BYTES_LIMIT
+    monkeypatch.setattr(
+        wrkslots, "_batch_network_namespaces", lambda *_args: {4242: "net:[1]"}
+    )
+    monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _p: True)
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_root_owned_command",
+        lambda *_args, **_kwargs: (0, contents, b""),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=22,
+        stdout_limit=wrkslots._PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
+        stderr_limit=4096,
+    )
+    assert wrkslots._batch_unix_socket_matches(
+        (process,), {tmp_path: str(tmp_path)}, {}, budget
+    ) == ()
+
+    oversized = b"x" * (wrkslots._UNIX_SOCKET_TABLE_BYTES_LIMIT + 1)
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_root_owned_command",
+        lambda *_args, **_kwargs: (0, oversized, b""),
+    )
+    with pytest.raises(wrkslots.Refusal, match="Unix socket census is incomplete"):
+        wrkslots._batch_unix_socket_matches(
+            (process,), {tmp_path: str(tmp_path)}, {}, budget
+        )
+
+
 @pytest.mark.ordinary_environment
 def test_batch_maps_filter_preserves_large_inode_strings_and_read_errors(tmp_path: Path) -> None:
     path = tmp_path / "maps"
@@ -23934,6 +23972,40 @@ def test_audit_keeps_genuinely_indeterminate_census_out_of_deletable_and_running
     assert payload["running_agent_count"] == 0
 
 
+def test_audit_keeps_oversized_relevant_census_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    expire_heartbeat(project)
+
+    def oversized(_paths: Sequence[Path]) -> wrkslots._ProcessPathCensus:
+        raise wrkslots.Refusal(
+            "privileged read-only census stdout exceeded 16777216 bytes"
+        )
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", oversized)
+
+    assert (
+        wrkslots.main(
+            ["--project-root", str(project), "audit", "--gate", "--format", "json"]
+        )
+        == 2
+    )
+    payload = json.loads(capsys.readouterr().out)
+    row = next(row for row in payload["slots"] if row["slot"] == "slot01")
+    assert row["verdict"] == "UNKNOWN"
+    assert row["reasons"] == [
+        "process/path census failed: privileged read-only census stdout "
+        "exceeded 16777216 bytes"
+    ]
+    assert payload["attention_slots"] == []
+    assert payload["unknown_slots"] == ["slot01"]
+    assert checkout(project, slot_type="validate").is_dir()
+
+
 def test_audit_process_exit_race_preserves_other_deletable_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -28262,7 +28334,7 @@ def test_mountinfo_census_enforces_file_aggregate_and_deadline_bounds(
         wrkslots._mountinfo_path_references(3, expired)
 
 
-def test_mountinfo_census_accepts_observed_fleet_scale_above_sixty_four_mib(
+def test_mountinfo_census_accepts_observed_fleet_scale_above_one_twenty_eight_mib(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     one_mib = b"x" * (1024 * 1024)
@@ -28279,13 +28351,13 @@ def test_mountinfo_census_accepts_observed_fleet_scale_above_sixty_four_mib(
         input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
     )
 
-    # A real fleet census reached 92,473,348 bytes before parsing its final
-    # process.  Exercise 96 MiB so the regression covers that observation with
-    # headroom; the old 64 MiB aggregate ceiling would refuse this sequence.
-    for pid in range(96):
+    # A real fleet census reached 177,236,979 bytes. Exercise 192 MiB so the
+    # regression covers that observation with headroom; the old 128 MiB
+    # aggregate ceiling would refuse this sequence.
+    for pid in range(192):
         assert wrkslots._mountinfo_path_references(pid + 1, budget) == ()
     assert budget.input_remaining == (
-        wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT - 96 * 1024 * 1024
+        wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT - 192 * 1024 * 1024
     )
 
 
@@ -28308,14 +28380,27 @@ def test_privileged_find_census_reports_deleted_process_links(
         lambda _processes: ("/proc/123/fd",),
     )
     monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
-    monkeypatch.setattr(
-        wrkslots,
-        "_run_root_owned_command",
-        lambda *_args, **_kwargs: (
+
+    def filtered_find(
+        _program: Path,
+        arguments: Sequence[str],
+        **_kwargs: object,
+    ) -> tuple[int, bytes, bytes]:
+        assert ("-lname", str(target)) in tuple(zip(arguments, arguments[1:]))
+        assert ("-lname", f"{target}/*") in tuple(zip(arguments, arguments[1:]))
+        assert ("-lname", f"{target} (deleted)") in tuple(
+            zip(arguments, arguments[1:])
+        )
+        return (
             0,
             evidence_path.encode() + b"\0" + observed.encode() + b" (deleted)\0",
             b"",
-        ),
+        )
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_root_owned_command",
+        filtered_find,
     )
     assert wrkslots._absent_validate_find_match((process,), {target: "gone"}) == (
         123,
@@ -28323,6 +28408,62 @@ def test_privileged_find_census_reports_deleted_process_links(
         "link",
         f"{observed} (deleted)",
     )
+
+
+def test_find_link_selection_bounds_large_irrelevant_census_without_truncation(
+    tmp_path: Path,
+) -> None:
+    proc_links = tmp_path / "proc-links"
+    proc_links.mkdir()
+    target = tmp_path / "selected"
+    target.mkdir()
+
+    # Model a busy host where the unfiltered /proc link stream is much larger
+    # than the command budget. GNU find must discard unrelated link targets
+    # before they enter the bounded stdout pipe.
+    for index in range(2048):
+        (proc_links / f"unrelated-{index:04d}-{'x' * 80}").symlink_to(
+            f"/outside/{index:04d}/{'y' * 120}"
+        )
+    selected_link = proc_links / "selected-link"
+    selected_link.symlink_to(target / "held")
+    unfiltered_size = sum(
+        len(os.fsencode(str(path))) + len(os.fsencode(os.readlink(path))) + 2
+        for path in proc_links.iterdir()
+    )
+    assert unfiltered_size > 512 * 1024
+
+    command = (
+        "/usr/bin/find",
+        "-P",
+        str(proc_links),
+        "-maxdepth",
+        "1",
+        "-type",
+        "l",
+        "(",
+        *wrkslots._find_link_selection({target: "selected"}),
+        ")",
+        "-printf",
+        "%p\\0%l\\0",
+    )
+    returncode, stdout, stderr = wrkslots._run_bounded_read_only_command(
+        command, stdout_limit=512
+    )
+    assert returncode == 0
+    assert stderr == b""
+    assert wrkslots._census_nul_records(stdout, 2, "test find") == [
+        [str(selected_link), str(target / "held")]
+    ]
+
+    # Selection is not truncation: if relevant evidence itself exceeds the
+    # bound, the command remains fail-closed instead of returning a prefix.
+    for index in range(8):
+        (proc_links / f"selected-{'z' * 80}-{index}").symlink_to(
+            target / f"{'q' * 120}-{index}"
+        )
+    with pytest.raises(wrkslots.Refusal, match="stdout exceeded 512 bytes"):
+        wrkslots._run_bounded_read_only_command(command, stdout_limit=512)
 
 
 def test_privileged_grep_census_reports_deleted_mapping(
