@@ -175,6 +175,18 @@
                      here is what made the typed path look like a mode of the spoken one. -->
                 <p id="empty-line">Tap Talk to speak, or Type to write.</p>
               </div>
+              <!--
+                `#128 transcript-history`. The transcript is durable, and a durable record is
+                longer than a screen. The page restores a BOUNDED suffix of it and walks further
+                back one server-cursored step at a time, exactly as the channel view does.
+
+                Above the turns and inside the scrolling element, so it scrolls away as the reader
+                moves down — it is the top of the record, not a fixture of the screen. A real
+                control as well as an automatic one: scrolling to the top takes the next step,
+                and this is what says a step is possible, what a keyboard can reach, and what
+                reports one in flight.
+              -->
+              <button id="load-older-turns" class="chip" type="button" hidden>Earlier turns</button>
               <ol id="transcript" class="messages"></ol>
             </div>
 

@@ -658,9 +658,11 @@ function stamp(atMs) {
 //     the list for no reason they asked for, which is the same class of defect as the scroll one.
 //   * A SHORT MESSAGE GETS NO CONTROL AT ALL. A fold button that would reveal nothing, on every
 //     line of the list, is chrome charging rent.
-//   * THE STATE IS NOT PERSISTED across a reload. The voice transcript does not survive one today
-//     and the channel view re-reads from the server, so there is nothing yet to persist it
-//     against; worth revisiting if the transcript ever starts to survive a reload.
+//   * THE STATE IS NOT PERSISTED across a reload. It was once true that there was nothing to
+//     persist it against; `#48 transcript-storage` and `#128 transcript-history` have since made
+//     the transcript durable and browsable, so the honest statement is that a reopened record
+//     arrives folded, deliberately: opening a message is an act on the list in front of you, not
+//     a preference, and a restored page that came back open would be a wall of text every time.
 //   * COLLAPSE ALL IS ONE ACTION, not a preference. It puts the list back the way it arrived.
 //
 // 280 characters is about four lines at phone width — comfortably past the three the fold shows, so
@@ -1332,15 +1334,19 @@ function setAllFolded(folded) {
 }
 
 /**
- * One turn.
+ * One turn, built but not yet anywhere.
  *
  * `mine` and `theirs` differ in side, colour and corner — three signals at once — because the two
  * speakers used to be told apart by nothing but a small grey word.
+ *
+ * Split out of `line()` for the stored record, which arrives a page at a time ABOVE what is
+ * already on screen (`#128 transcript-history`). Those rows cannot be appended one by one: every
+ * append asks whether the reader is parked at the bottom and then either follows the list or
+ * raises the jump-to-newest chip, and neither is right for forty turns landing over the reader's
+ * head. They are assembled here and prepended in one anchored mutation.
  */
-function line(who, text, atMs) {
+function turnNode(who, text, atMs) {
   const mine = who === "you";
-  // Measured BEFORE the append: appending is what changes the answer.
-  const pinned = atBottom(el("scroll-area"));
   const li = document.createElement("li");
   li.className = mine ? "mine" : "theirs";
   const meta = document.createElement("div");
@@ -1359,8 +1365,16 @@ function line(who, text, atMs) {
   body.className = "body";
   body.textContent = text; // untrusted text: never innerHTML.
   li.append(meta, body);
-  el("transcript").append(li);
   foldable(li, meta, body, text);
+  return li;
+}
+
+/** One turn, at the end of the transcript — where everything said in the LIVE call goes. */
+function line(who, text, atMs) {
+  // Measured BEFORE the append: appending is what changes the answer.
+  const pinned = atBottom(el("scroll-area"));
+  const li = turnNode(who, text, atMs);
+  el("transcript").append(li);
   renderEmptyState();
   followIfPinned(pinned);
   return li;
@@ -1412,11 +1426,21 @@ function seam(label, detail) {
  *
  * `seam()` above only BUILDS one, because `#63 status-line-placement` gave the channel list a seam
  * of its own and that one belongs at the TOP of its list rather than at the end. Placement is
- * therefore the caller's, and the two transcript callers share this.
+ * therefore the caller's, and the transcript's callers share this.
+ *
+ * `into` is for the stored record, whose rows are collected off-screen and put on the list in one
+ * anchored mutation (`#128 transcript-history`). A seam among THOSE must not append to the live
+ * list and must not ask where the reader is: it is not arriving at the end, and the reader is not
+ * looking at it. Everything else places at the end, which is what the default does.
  */
-function transcriptSeam(label, detail) {
-  const pinned = atBottom(el("scroll-area"));
+function transcriptSeam(label, detail, into = null) {
   const li = seam(label, detail);
+  if (into !== null) {
+    into.push(li);
+    return li;
+  }
+  // Measured before the append and not before the build: building one attaches nothing.
+  const pinned = atBottom(el("scroll-area"));
   el("transcript").append(li);
   renderEmptyState();
   followIfPinned(pinned);
@@ -1557,6 +1581,10 @@ function onClear() {
   el("transcript").replaceChildren();
   renderEmptyState();
   renderScrollTools(); // the folds went with the lines they were attached to.
+  // ...and so did the walk back through the record. Clear empties the SCREEN — offering "Earlier
+  // turns" on the empty screen it just made would quietly refill it, which is the one thing the
+  // sentence beside this control promises it does not do. `#128 transcript-history`.
+  forgetTranscriptWalk();
   if (session.socket) {
     transcriptSeam(
       "view cleared",
@@ -2085,11 +2113,127 @@ function recordTurn(who, text) {
   });
 }
 
+// --- browsing the record -------------------------------------------------------------------------
+//
+// `#128 transcript-history`. `#48` above made the transcript durable; what came BACK was one
+// conversation — the newest, whole, and nothing else. Two things were wrong with that, and they
+// pull in opposite directions: the call before the newest one was unreachable from the interface
+// entirely, and a single long call was restored in its entirety whether or not the reader ever
+// scrolled to the top of it.
+//
+// So the record is walked the way the channel is walked, through `GET /api/v1/transcript`: the
+// newest page of turns wherever they were said, a server cursor to step back from, and a chip
+// that says more exists. One mechanism for both lists, `preservingScroll` included, because
+// prepending above the viewport is the one mutation a browser's own scroll anchoring does not
+// cover — see `#65 scrollback-paging` and `#47 scrollback-stability`.
+//
+// TWO THINGS THIS IS NOT, because both were asked about and both belong elsewhere:
+//
+//   * It sends NOTHING to the voice agent. Catching a new call up on what was said before is
+//     `#46 conversation-replay`, which has its own switch and is off unless the operator turns
+//     it on. Browsing the record costs nothing; replaying it spends tokens at a vendor, so the
+//     two are deliberately not one feature.
+//   * It does not decide what is KEPT. That is `storage.retain_days`, on the server.
+
+/** What one step back asks for. The server clamps it, so this is a want and not a promise. */
+const TRANSCRIPT_PAGE_LIMIT = 40;
+
 /**
- * Put the most recent stored conversation back on the screen, once, at sign-in.
+ * Is anything older than the topmost row still in the record?
+ *
+ * Three values, for the same reason `discordMoreAbove` has three: `true` there is more, `false`
+ * the reader has reached the beginning of everything stored, `undefined` the server did not say.
+ */
+let transcriptMoreAbove = false;
+let transcriptOlderCursor = null;
+let transcriptFetchInFlight = false;
+
+/**
+ * Which conversation the TOPMOST restored row belongs to.
+ *
+ * A boundary is a property of the PAIR of rows on either side of it, so a step back has to know
+ * what it is arriving above. Without this, two different calls are prepended flush against each
+ * other and nothing on the screen says the agent below the join never heard the words above it —
+ * which is the one claim this page draws rules to avoid making by accident.
+ */
+let oldestRestoredConversation = null;
+
+// One wording for every boundary in the stored record, because it is the same boundary each time:
+// above the rule is a call that has ended and that nothing below it remembers. Held to the same
+// word budget as the other seams the page draws.
+const STORED_SEAM_LABEL = "earlier conversation";
+const STORED_SEAM_DETAIL =
+  "These lines are from a conversation that has already ended, restored from this server. " +
+  "The agent has no memory of them: a new call starts from nothing.";
+
+/**
+ * How a stored speaker is shown.
+ *
+ * THREE stored speakers, not two. A `note` is something the PAGE recorded — a hang-up, an error it
+ * wanted kept — and the server accepts and stores it as its own speaker. Folding it into
+ * "assistant" would put words in the assistant's mouth that it never said, which is the one
+ * attribution this screen is careful about everywhere else. It comes back labelled as what it is.
+ * (A line rather than a seam on purpose: a seam's explanation is held to a word budget, and a
+ * stored note is text of whatever length it was written with.)
+ */
+const restoredSpeaker = (speaker) =>
+  speaker === "you" ? "you" : speaker === "note" ? "note" : "assistant";
+
+/**
+ * The nodes for a run of stored turns, oldest first, with a rule wherever the call changes.
+ *
+ * ONE builder for both paths — the first page goes at the end of an empty transcript, every step
+ * back goes at the front of a full one — because two builders would be two definitions of where a
+ * boundary belongs, and they would drift the first time one of them was touched.
+ *
+ * `trailingSeam` says whether a rule is owed BELOW the last turn here: at the first load it always
+ * is, because whatever the live call says next is a different conversation from anything in the
+ * record; on a step back it is owed only when the run ends in a different call from the row it is
+ * landing above.
+ */
+function restoredRun(turns, trailingSeam) {
+  const rows = [];
+  // Drawn from one place on purpose. A boundary between two stored calls and a boundary between
+  // the record and the live one are the same boundary, and a second call site here is how the
+  // two wordings would come to differ.
+  const rule = () => transcriptSeam(STORED_SEAM_LABEL, STORED_SEAM_DETAIL, rows);
+  let previous = null;
+  for (const turn of turns) {
+    if (previous !== null && turn.conversation_id !== previous) {
+      rule();
+    }
+    rows.push(turnNode(restoredSpeaker(turn.speaker), turn.text, turn.at_ms));
+    previous = turn.conversation_id;
+  }
+  if (previous !== null && trailingSeam) {
+    rule();
+  }
+  return rows;
+}
+
+/** Newest first on the wire — a page is taken from the end the reader is at. Read the other way. */
+const oldestFirst = (payload) => [...((payload && payload.turns) || [])].reverse();
+
+function renderOlderTurnsControl() {
+  const button = el("load-older-turns");
+  button.hidden = transcriptMoreAbove !== true;
+  button.disabled = transcriptFetchInFlight;
+  button.textContent = transcriptFetchInFlight ? "Loading earlier turns…" : "Earlier turns";
+}
+
+/** Forget where the walk had got to. The rows it produced are gone, so its cursor is meaningless. */
+function forgetTranscriptWalk() {
+  transcriptMoreAbove = false;
+  transcriptOlderCursor = null;
+  oldestRestoredConversation = null;
+  renderOlderTurnsControl();
+}
+
+/**
+ * Put a bounded suffix of the stored record back on the screen, once, at sign-in.
  *
  * A failure here is NOT an error panel. The page works perfectly well without a store — that is
- * what it did until this landed — and a server with no `storage.path` answers 503 by design, so
+ * what it did until `#48` landed — and a server with no `storage.path` answers 503 by design, so
  * treating that as a fault would put a red banner on a correctly configured deployment.
  *
  * ONCE PER PAGE, and the flag is why. `signIn()` runs again whenever a token is saved, so pasting
@@ -2104,6 +2248,10 @@ async function loadStoredConversation() {
     return;
   }
   restoredStoredConversation = true;
+  // The LISTING is still read, and for two things the record itself cannot answer: how many
+  // conversations are stored, which is the standing sentence in Settings; and which one a new
+  // call would resume from, because `#46 conversation-replay` resumes A conversation and there is
+  // no such thing as resuming "the last forty turns".
   let listing = null;
   try {
     listing = await api("/api/v1/conversations");
@@ -2116,40 +2264,101 @@ async function loadStoredConversation() {
     setStorageState("Nothing stored yet. This screen is recorded from the next call onwards.");
     return;
   }
-  let restored = null;
+  let payload = null;
   try {
-    restored = await api(`/api/v1/conversations/${conversations[0].id}`);
+    payload = await api(`/api/v1/transcript?limit=${TRANSCRIPT_PAGE_LIMIT}`);
   } catch (error) {
-    setStorageState(`Could not read the stored conversation: ${error.message}`);
+    setStorageState(`Could not read the stored transcript: ${error.message}`);
     return;
   }
-  for (const turn of (restored && restored.turns) || []) {
-    // THREE stored speakers, not two. A `note` is something the PAGE recorded — a hang-up, an
-    // error it wanted kept — and the server accepts and stores it as its own speaker. Folding it
-    // into "assistant" would put words in the assistant's mouth that it never said, which is the
-    // one attribution this screen is careful about everywhere else. It comes back labelled as
-    // what it is. (A line rather than a seam on purpose: a seam's explanation is held to a word
-    // budget, and a stored note is text of whatever length it was written with.)
-    const who =
-      turn.speaker === "you" ? "you" : turn.speaker === "note" ? "note" : "assistant";
-    line(who, turn.text, turn.at_ms);
+  const turns = oldestFirst(payload);
+  transcriptMoreAbove = normaliseHasMore(payload.has_more);
+  transcriptOlderCursor = payload.next_before || null;
+  oldestRestoredConversation = turns.length > 0 ? turns[0].conversation_id : null;
+  if (turns.length > 0) {
+    el("transcript").append(...restoredRun(turns, true));
+    renderEmptyState();
+    renderScrollTools(); // the folds arrived with the rows they are attached to.
+    // Entering a view lands on the NEWEST turn, which is what `line()` would have done for the
+    // last of these had they been appended one at a time. A restored record opens at its end.
+    scrollToNewest();
   }
-  // `#46 conversation-replay`. The conversation a new call would resume from is the one just
-  // restored: the most recent the server holds. Set even when resuming is off, because the toggle
-  // can be turned on without a reload and the answer must not then be "nothing to resume from".
+  renderOlderTurnsControl();
+  // `#46 conversation-replay`. The conversation a new call would resume from is the most recent
+  // the server holds. Set even when resuming is off, because the toggle can be turned on without
+  // a reload and the answer must not then be "nothing to resume from".
   resumeConversationId = conversations[0].id;
   renderResumeState();
-  if (((restored && restored.turns) || []).length > 0) {
-    transcriptSeam(
-      "earlier conversation",
-      "These lines are from a conversation that has already ended, restored from this server. " +
-        "The agent has no memory of them: a new call starts from nothing."
-    );
-  }
   setStorageState(
     `${conversations.length} conversation${conversations.length === 1 ? "" : "s"} stored on the ` +
       `server. Clear empties this screen only; Forget below is what erases them.`
   );
+}
+
+/**
+ * One step further back through the record.
+ *
+ * Guarded against re-entry rather than debounced, exactly like the channel's walk: the automatic
+ * trigger fires on every scroll event and a phone produces a great many of those.
+ */
+async function loadOlderTurns() {
+  if (transcriptMoreAbove !== true || !transcriptOlderCursor || transcriptFetchInFlight) {
+    return;
+  }
+  transcriptFetchInFlight = true;
+  renderOlderTurnsControl();
+  try {
+    const payload = await api(
+      `/api/v1/transcript?limit=${TRANSCRIPT_PAGE_LIMIT}` +
+        `&before=${encodeURIComponent(transcriptOlderCursor)}`
+    );
+    const turns = oldestFirst(payload);
+    // The step is OVER before the anchored mutation, so that every consequence of it — the rows,
+    // the boundary and the chip's final state — is one change of height rather than three.
+    transcriptMoreAbove = normaliseHasMore(payload.has_more);
+    transcriptOlderCursor = payload.next_before || null;
+    transcriptFetchInFlight = false;
+    if (turns.length === 0) {
+      renderOlderTurnsControl();
+      return;
+    }
+    const endsIn = turns[turns.length - 1].conversation_id;
+    const arriving = restoredRun(turns, endsIn !== oldestRestoredConversation);
+    oldestRestoredConversation = turns[0].conversation_id;
+    const list = el("transcript");
+    preservingScroll(() => {
+      // Prepending, expressed the way the channel's walk expresses it: the rows already on screen
+      // are handed back in place behind the arriving ones, in one mutation.
+      list.replaceChildren(...arriving, ...list.children);
+      // Inside the SAME anchored mutation, and this is the step nobody photographs: the LAST step
+      // of the walk HIDES the chip, which is a sibling above the transcript inside the scrolling
+      // element. Taking its height away afterwards jerks the reader by the height of a button on
+      // the one step where they have finally arrived at the beginning.
+      renderOlderTurnsControl();
+    });
+    renderEmptyState();
+    renderScrollTools();
+  } catch (error) {
+    // Said in Settings rather than on the call screen, for the same reason a failed recording is:
+    // the owner may be in a car, and a step back that did not happen has cost them nothing.
+    setStorageState(`Could not read further back: ${error.message}`);
+  } finally {
+    // The success path has already done both and doing them again is a no-op. This is for the
+    // FAILURE path, where the step must stop reporting itself in flight.
+    transcriptFetchInFlight = false;
+    renderOlderTurnsControl();
+  }
+}
+
+/** The reader has arrived at the top of what is loaded. Take the next step for them. */
+function maybeLoadOlderTurns() {
+  if (currentView !== "voice" || transcriptMoreAbove !== true || transcriptFetchInFlight) {
+    return;
+  }
+  if (el("scroll-area").scrollTop > OLDER_TRIGGER_PX) {
+    return;
+  }
+  loadOlderTurns();
 }
 
 /** Erase every stored conversation. Leaves the screen exactly as it is, and says so. */
@@ -9204,6 +9413,7 @@ el("remove-channel").addEventListener("click", guardQuietly(removeChannel));
 el("save-alias").addEventListener("click", guardQuietly(saveAlias));
 el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));
 el("load-older").addEventListener("click", guardQuietly(loadOlder));
+el("load-older-turns").addEventListener("click", guardQuietly(loadOlderTurns));
 el("collapse-all").addEventListener("click", () => setAllFolded(true));
 el("expand-all").addEventListener("click", () => setAllFolded(false));
 el("todo-filter").addEventListener("click", () => setTodoMode(!todoMode));
@@ -9218,7 +9428,11 @@ el("scroll-area").addEventListener("scroll", () => {
     setJumpNewest(false);
   }
   // ...and the other end of the same list: arriving at the top is a request for what is above it.
+  // Both lists, because both of them now have something above them: the channel has older
+  // messages and the transcript has an older record. Each declines unless its own view is the one
+  // on screen, so exactly one of them can act on any given scroll.
   maybeLoadOlder();
+  maybeLoadOlderTurns();
   // `#49 cached-summaries`. Summaries are produced as the reader scrolls, so this is where they
   // are asked for. It is cheap on the ordinary event: `summariesAsked` answers for every row that
   // has already been asked about, and a scroll that reveals nothing new issues nothing.

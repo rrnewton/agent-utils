@@ -97,6 +97,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/conversations/{conversation_id}/replay",
             get(api::replay),
         )
+        // The record as one continuous thing, newest first, a page at a time. Beside the
+        // conversation routes rather than under them because it is not about A conversation: the
+        // newest forty turns routinely span two calls. Write scope, same as its neighbours.
+        .route("/api/v1/transcript", get(api::transcript))
         // The operator's erase, and the only COMPLETE one over HTTP: the conversation routes
         // clear transcripts and say so, this one clears everything the store holds.
         .route("/api/v1/storage", axum::routing::delete(api::purge_storage))

@@ -27,8 +27,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::{
-    now_ms, ChannelAlias, ConversationId, ConversationSummary, ReadMark, Retention, StateStore,
-    StoreError, SummaryKey, Turn, MAX_TURN_CHARS,
+    now_ms, ChannelAlias, ConversationId, ConversationSummary, ReadMark, RecordedTurn, Retention,
+    StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
+    MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -244,6 +245,64 @@ impl StateStore for FakeStore {
             .get(conversation.as_str())
             .cloned()
             .ok_or(StoreError::NotFound)
+    }
+
+    async fn transcript(
+        &self,
+        limit: u16,
+        before: Option<&TranscriptCursor>,
+    ) -> Result<TranscriptPage, StoreError> {
+        let limit = usize::from(limit.clamp(1, MAX_TRANSCRIPT_PAGE));
+        let mut state = self.lock();
+        armed(&mut state)?;
+        // Flattened and sorted here rather than kept sorted, because the fake's job is to answer
+        // the same way the shipped store does and not to be fast. Built from the SAME
+        // `conversations` map every other method reads, so a fake transcript cannot show
+        // something a fake `turns` would deny.
+        let mut all: Vec<RecordedTurn> = state
+            .conversations
+            .iter()
+            .flat_map(|(id, turns)| {
+                turns
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, turn)| RecordedTurn {
+                        conversation: ConversationId::parse(id)
+                            .unwrap_or_else(|_| unreachable!("stored id")),
+                        // From 1, exactly as SQLite's `MAX(seq) + 1` assigns it.
+                        seq: i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1),
+                        turn: turn.clone(),
+                    })
+            })
+            .collect();
+        let key = |entry: &RecordedTurn| {
+            (
+                entry.turn.at_ms,
+                entry.conversation.as_str().to_owned(),
+                entry.seq,
+            )
+        };
+        all.sort_by_key(|entry| std::cmp::Reverse(key(entry)));
+        if let Some(cursor) = before {
+            let edge = (
+                cursor.at_ms,
+                cursor.conversation.as_str().to_owned(),
+                cursor.seq,
+            );
+            all.retain(|entry| key(entry) < edge);
+        }
+        let has_more = all.len() > limit;
+        all.truncate(limit);
+        let next = all.last().map(|last| TranscriptCursor {
+            at_ms: last.turn.at_ms,
+            conversation: last.conversation.clone(),
+            seq: last.seq,
+        });
+        Ok(TranscriptPage {
+            turns: all,
+            has_more,
+            next,
+        })
     }
 
     async fn forget_conversation(&self, conversation: &ConversationId) -> Result<(), StoreError> {

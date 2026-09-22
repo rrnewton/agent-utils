@@ -15,7 +15,7 @@ use async_trait::async_trait;
 
 use super::{
     ChannelAlias, ConversationId, ConversationSummary, ReadMark, StateStore, StoreError,
-    SummaryKey, Turn,
+    SummaryKey, TranscriptCursor, TranscriptPage, Turn,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -49,6 +49,17 @@ impl StateStore for DisabledStore {
     }
 
     async fn turns(&self, _: &ConversationId) -> Result<Vec<Turn>, StoreError> {
+        refuse()
+    }
+
+    async fn transcript(
+        &self,
+        _: u16,
+        _: Option<&TranscriptCursor>,
+    ) -> Result<TranscriptPage, StoreError> {
+        // A refusal rather than an empty page, which is the whole posture of this module: "you
+        // have said nothing yet" and "this server keeps no record of what you say" are different
+        // facts, and a screen that cannot tell them apart will quietly claim the first.
         refuse()
     }
 
@@ -155,6 +166,7 @@ mod tests {
                 .expect_err("append"),
             store.conversations().await.expect_err("list"),
             store.turns(&id).await.expect_err("turns"),
+            store.transcript(10, None).await.expect_err("transcript"),
             store.forget_conversation(&id).await.expect_err("forget"),
             store
                 .forget_all_conversations()

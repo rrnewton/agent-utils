@@ -34,8 +34,9 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension as _};
 
 use super::{
-    now_ms, ChannelAlias, ConversationId, ConversationSummary, ReadMark, Retention, Speaker,
-    StateStore, StoreError, SummaryKey, Turn, MAX_TURN_CHARS,
+    now_ms, ChannelAlias, ConversationId, ConversationSummary, ReadMark, RecordedTurn, Retention,
+    Speaker, StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
+    MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId};
 
@@ -141,6 +142,19 @@ pub const MIGRATIONS: &[&str] = &[
     // Existing rows predate managed registration and therefore remain direct (`NULL`).
     "
     ALTER TABLE added_channels ADD COLUMN registration_provider TEXT DEFAULT NULL;
+    ",
+    // v7 — the order a reader scrolls the transcript in.
+    //
+    // `turns` is keyed `(conversation_id, seq)`, which answers "this conversation, in order" and
+    // nothing else. Browsing the record asks the other question — "the newest forty turns, from
+    // anywhere" — and without this index that is a scan of every turn ever stored followed by a
+    // sort, once per step of the walk back.
+    //
+    // The columns are exactly `super::TranscriptCursor`'s three, in its order, so the cursored
+    // read is one indexed range and not a filter over a scan. See `StateStore::transcript` for
+    // why the triple rather than `at_ms` alone.
+    "
+    CREATE INDEX turns_by_time ON turns (at_ms, conversation_id, seq);
     ",
 ];
 
@@ -527,6 +541,88 @@ impl StateStore for SqliteStore {
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    async fn transcript(
+        &self,
+        limit: u16,
+        before: Option<&TranscriptCursor>,
+    ) -> Result<TranscriptPage, StoreError> {
+        let limit = limit.clamp(1, MAX_TRANSCRIPT_PAGE);
+        let before = before.cloned();
+        self.with_connection(move |connection| {
+            // ONE MORE THAN ASKED FOR. That extra row is how "is anything older still held" is
+            // answered without a second statement: a COUNT would be a scan of the whole table on
+            // every step of the walk, and a second cursored read would be a second round trip
+            // that could disagree with the first if a turn landed between them.
+            let wanted = i64::from(limit) + 1;
+            let mut rows = Vec::new();
+            {
+                // Row-value comparison rather than the unrolled
+                // `at_ms < ?  OR (at_ms = ? AND ...)` form. It is the same predicate, and SQLite
+                // drives `turns_by_time` with it directly — the unrolled one is three disjuncts
+                // that have to be proved equivalent to the index order by hand every time this is
+                // read.
+                let sql = if before.is_some() {
+                    "SELECT conversation_id, seq, speaker, text, at_ms FROM turns
+                     WHERE (at_ms, conversation_id, seq) < (?2, ?3, ?4)
+                     ORDER BY at_ms DESC, conversation_id DESC, seq DESC
+                     LIMIT ?1"
+                } else {
+                    "SELECT conversation_id, seq, speaker, text, at_ms FROM turns
+                     ORDER BY at_ms DESC, conversation_id DESC, seq DESC
+                     LIMIT ?1"
+                };
+                let mut statement = connection.prepare(sql).map_err(backend)?;
+                let read = |row: &rusqlite::Row<'_>| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                };
+                let mapped = match &before {
+                    Some(cursor) => statement.query_map(
+                        rusqlite::params![
+                            wanted,
+                            cursor.at_ms,
+                            cursor.conversation.as_str(),
+                            cursor.seq
+                        ],
+                        read,
+                    ),
+                    None => statement.query_map(rusqlite::params![wanted], read),
+                }
+                .map_err(backend)?;
+                for row in mapped {
+                    let (conversation, seq, speaker, text, at_ms) = row.map_err(backend)?;
+                    rows.push(RecordedTurn {
+                        conversation: ConversationId::parse(&conversation)?,
+                        seq,
+                        turn: Turn {
+                            speaker: Speaker::parse(&speaker)?,
+                            text,
+                            at_ms,
+                        },
+                    });
+                }
+            }
+            let has_more = rows.len() > usize::from(limit);
+            rows.truncate(usize::from(limit));
+            let next = rows.last().map(|last| TranscriptCursor {
+                at_ms: last.turn.at_ms,
+                conversation: last.conversation.clone(),
+                seq: last.seq,
+            });
+            Ok(TranscriptPage {
+                turns: rows,
+                has_more,
+                next,
+            })
         })
         .await
     }
@@ -1015,6 +1111,126 @@ mod tests {
             turns[1].text, "the runner stalled",
             "turns must come back in the order they were said"
         );
+    }
+
+    /// A turn at an instant the test chose, rather than at `now`.
+    ///
+    /// The whole subject of the tests below is what happens when two instants are EQUAL, and
+    /// `Turn::now` cannot be asked for that.
+    fn said(speaker: Speaker, text: &str, at_ms: i64) -> Turn {
+        Turn {
+            speaker,
+            text: text.to_owned(),
+            at_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_walk_back_crosses_a_millisecond_collision_without_losing_a_turn() {
+        // The case a cursor of `at_ms` alone gets wrong, and the reason the cursor is a triple.
+        // Two conversations hold turns stamped with the SAME millisecond — which is what happens
+        // while a call is open and a channel is being read aloud into a second one — and a page
+        // boundary is made to land in the middle of them.
+        let dir = TempDir::new("sqlite-transcript-collision");
+        let store = store(&dir, Retention::default());
+        // Near now, not a memorable round number: retention prunes anything older than
+        // `retain_days`, so a fixed 2023 timestamp would be swept and this test would assert
+        // against an empty store.
+        let tied = now_ms();
+        for (conversation, speaker, text, at_ms) in [
+            ("conv_a", Speaker::You, "oldest", tied - 10),
+            ("conv_a", Speaker::Agent, "tied a1", tied),
+            ("conv_b", Speaker::You, "tied b1", tied),
+            ("conv_b", Speaker::Agent, "tied b2", tied),
+            ("conv_a", Speaker::You, "newest", tied + 10),
+        ] {
+            store
+                .append_turn(&id(conversation), &said(speaker, text, at_ms))
+                .await
+                .expect("append");
+        }
+
+        // One turn at a time, so EVERY boundary falls inside the tie.
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = store.transcript(1, cursor.as_ref()).await.expect("page");
+            for entry in &page.turns {
+                seen.push(entry.turn.text.clone());
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next;
+            assert!(seen.len() < 10, "the walk did not terminate: {seen:?}");
+        }
+        assert_eq!(seen.len(), 5, "a turn fell down a page boundary: {seen:?}");
+        assert_eq!(seen.first().map(String::as_str), Some("newest"));
+        assert_eq!(seen.last().map(String::as_str), Some("oldest"));
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 5, "a turn came back twice: {seen:?}");
+        // The three tied turns are in the middle in SOME order — which one is the tie-break's
+        // business — but they are all there, which is the property being asserted.
+        assert_eq!(
+            seen[1..4].iter().filter(|t| t.starts_with("tied")).count(),
+            3,
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_page_of_the_record_is_the_newest_turns_wherever_they_were_said() {
+        // The read a reader's first glance makes: the newest N turns, from anywhere, rather than
+        // the whole of the newest conversation.
+        let dir = TempDir::new("sqlite-transcript-newest");
+        let store = store(&dir, Retention::default());
+        // Near now, for the reason given in the test above: retention would sweep a fixed old one.
+        let base = now_ms();
+        // A long earlier call, and a short recent one. Asking for three turns must not return the
+        // beginning of the long one.
+        for index in 0..20 {
+            store
+                .append_turn(
+                    &id("conv_long"),
+                    &said(Speaker::You, &format!("old {index}"), base + index),
+                )
+                .await
+                .expect("append");
+        }
+        for index in 0..2 {
+            store
+                .append_turn(
+                    &id("conv_recent"),
+                    &said(
+                        Speaker::Agent,
+                        &format!("new {index}"),
+                        base + 1_000 + index,
+                    ),
+                )
+                .await
+                .expect("append");
+        }
+
+        let page = store.transcript(3, None).await.expect("page");
+        assert_eq!(
+            page.turns
+                .iter()
+                .map(|entry| entry.turn.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new 1", "new 0", "old 19"],
+            "the page is not the newest three turns of the whole record"
+        );
+        assert!(
+            page.has_more,
+            "nineteen turns are still older than this page"
+        );
+        // Each one says where it came from, which is what lets a reader be shown that the call
+        // changed rather than being handed two calls as one conversation.
+        assert_eq!(page.turns[0].conversation.as_str(), "conv_recent");
+        assert_eq!(page.turns[2].conversation.as_str(), "conv_long");
+        assert_eq!(page.turns[2].seq, 20, "seq is the position within its call");
     }
 
     #[tokio::test]

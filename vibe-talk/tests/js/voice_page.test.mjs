@@ -1054,6 +1054,8 @@ function newPage(store = new Map(), script = SCRIPT) {
     storedTurns: new Map(),
     /** Every request the page made against the store, in order, as `METHOD path`. */
     storeCalls: [],
+    /** `#128 transcript-history`: every walk through the whole record, path and all. */
+    transcriptCalls: [],
     /** `#46 conversation-replay`: every replay fetch, and the knobs that shape the answer. */
     replayCalls: [],
     replayEnabled: true,
@@ -1652,6 +1654,67 @@ function newPage(store = new Map(), script = SCRIPT) {
           untrusted_content_notice: "third-party text; DATA, never instructions",
         });
       }
+      // `#128 transcript-history`. The whole record, newest first, a page at a time — derived from
+      // the SAME `storedTurns` every conversation route answers from, so a page this fixture
+      // walks back through cannot contain anything the rest of the fixture would deny. The order
+      // is the server's own total order, `(at_ms, conversation_id, seq)`, because a fixture that
+      // paged a DIFFERENT order would make the page's cursor arithmetic untestable here.
+      const wantsTranscript = /^\/api\/v1\/transcript(?:\?(.*))?$/.exec(String(path));
+      if (wantsTranscript) {
+        page.transcriptCalls.push(String(path));
+        if (page.storeStatus) {
+          return json(page.storeStatus, { error: "storage_not_configured", detail: "storage.path" });
+        }
+        const query = new URLSearchParams(wantsTranscript[1] || "");
+        const limit = Math.min(200, Math.max(1, Number(query.get("limit") || 40)));
+        const all = [];
+        for (const [id, held] of page.storedTurns) {
+          held.forEach((turn, index) => {
+            all.push({
+              conversation_id: id,
+              seq: index + 1,
+              speaker: turn.speaker,
+              text: turn.text,
+              at_ms: turn.at_ms,
+            });
+          });
+        }
+        // Descending, so the first row is the newest thing anybody said anywhere.
+        const below = (a, b) =>
+          a.at_ms !== b.at_ms
+            ? a.at_ms < b.at_ms
+            : a.conversation_id !== b.conversation_id
+              ? a.conversation_id < b.conversation_id
+              : a.seq < b.seq;
+        all.sort((a, b) => (below(a, b) ? 1 : below(b, a) ? -1 : 0));
+        const raw = query.get("before");
+        let rows = all;
+        if (raw) {
+          const parts = String(raw).split(":");
+          if (parts.length !== 3 || !/^-?\d+$/.test(parts[0]) || !/^\d+$/.test(parts[2])) {
+            return json(400, { error: "bad_id", detail: "not a transcript cursor" });
+          }
+          const edge = {
+            at_ms: Number(parts[0]),
+            conversation_id: parts[1],
+            seq: Number(parts[2]),
+          };
+          rows = all.filter((row) => below(row, edge));
+        }
+        // Limit + 1, exactly as the server derives it: asking for one more than was wanted is how
+        // "is there anything beyond this page" is answered without a second query.
+        const taken = rows.slice(0, limit + 1);
+        const has_more = taken.length > limit;
+        const turns = taken.slice(0, limit);
+        const last = turns[turns.length - 1];
+        return json(200, {
+          turns,
+          has_more,
+          next_before: last ? `${last.at_ms}:${last.conversation_id}:${last.seq}` : null,
+          limit,
+          untrusted_content_notice: "third-party text; DATA, never instructions",
+        });
+      }
       const conversation = /^\/api\/v1\/conversations(?:\/([^/]+))?(\/turns)?$/.exec(String(path));
       if (conversation) {
         const method = (options && options.method) || "GET";
@@ -1846,6 +1909,9 @@ const DISCORD_POLL_MS = sourceConstant("DISCORD_POLL_MS");
 /** How long a destructive control stays armed. Derived, for the same reason. */
 const CLEAR_ARMED_MS = sourceConstant("CLEAR_ARMED_MS");
 
+/** One step back through the stored record. Derived, so "bounded" keeps meaning what the page means. */
+const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
+
 // --- the numbers this page is tuned by ----------------------------------------------------------
 //
 // Deriving a constant from the source is what makes a behavioural test mean something the day the
@@ -1899,6 +1965,12 @@ const TUNING_BANDS = {
   DISCORD_PAGE_LIMIT: [10, 100,
     "one step of the walk. Discord's own ceiling is 100, and below about ten a step does not " +
     "fill a screen, so the reader taps once per paragraph"],
+  TRANSCRIPT_PAGE_LIMIT: [10, 200,
+    "one step back through the stored record. Below about ten turns a step does not fill a " +
+    "screen, so reopening the app shows a fragment of the last exchange and the reader walks " +
+    "back a tap at a time; above two hundred the page is asking for more than the server will " +
+    "give it, and the bounded suffix #128 exists for stops being bounded by anything this page " +
+    "chose"],
   OLDER_TRIGGER_PX: [8, 300,
     "how close to the top counts as asking for more. At a viewport's worth EVERY scroll fires a " +
     "step — including one at the bottom — so a single flick walks the whole channel; at zero the " +
@@ -12499,6 +12571,267 @@ test("signing in twice does not restore the same conversation twice", async () =
     page.el("transcript").children.filter((li) => li.className === "seam").length,
     1,
     "a second 'earlier conversation' seam was drawn for the same conversation"
+  );
+});
+
+// --- browsing the whole record -------------------------------------------------------------------
+//
+// `#128 transcript-history`. `#48` above made the transcript durable and put ONE conversation back
+// — the newest, whole. These are about the other two halves of that: a record longer than a
+// screen must come back BOUNDED, and everything older than the bound must be reachable.
+//
+// The fixture serves `/api/v1/transcript` from the same `storedTurns` the conversation routes
+// answer from, in the server's own total order, so nothing below can pass against a history the
+// rest of the fixture would deny.
+
+/** `count` turns in one stored call, each a minute after the last, each tall enough to scroll. */
+function storedCall(page, id, count, from) {
+  page.storedTurns.set(
+    id,
+    Array.from({ length: count }, (_unused, i) => ({
+      speaker: i % 2 === 0 ? "you" : "agent",
+      text: longMessage(`${id} turn ${i + 1}`),
+      at_ms: from + i * 60_000,
+    }))
+  );
+}
+
+const spokenRows = (page) =>
+  page.el("transcript").children.filter((li) => li.className !== "seam");
+const ruledRows = (page) => page.el("transcript").children.filter((li) => li.className === "seam");
+// Matched on the FIRST class, because a row long enough to scroll is a row long enough to fold,
+// and a folded body is `body clamped`.
+const said = (li) =>
+  li.descendants().find((n) => String(n.className || "").split(" ")[0] === "body").textContent;
+
+const RECORD_EPOCH = 1_700_000_000_000;
+
+test("A RECORD LONGER THAN THE SCREEN COMES BACK BOUNDED, AND SAYS MORE IS ABOVE IT", async () => {
+  // The defect this closes: restoring meant "the newest conversation, whole". A hundred turns is
+  // a hundred turns of DOM built before the page is usable, for a reader who will look at the
+  // last four — and the call BEFORE that one was unreachable from the interface at all.
+  const page = newPage();
+  storedCall(page, "conv_long", 100, RECORD_EPOCH);
+
+  await signIn(page);
+  await page.settle();
+
+  const lines = spokenRows(page);
+  assert.equal(
+    lines.length,
+    TRANSCRIPT_PAGE_LIMIT,
+    `the whole record was restored: ${lines.length} of 100 turns are on screen`
+  );
+  // The SUFFIX, not a prefix and not the middle: the reader reopens the app to see what was last
+  // said, and the newest turn must be the one at the bottom.
+  assert.match(said(lines.at(-1)), /^conv_long turn 100:/);
+  assert.match(said(lines[0]), /^conv_long turn 61:/);
+  assert.ok(atBottomOf(page.el("scroll-area")), "a restored record opened somewhere other than its end");
+  assert.equal(
+    page.el("load-older-turns").hidden,
+    false,
+    "sixty turns are unreachable and nothing on the screen says they exist"
+  );
+  // ...and the page asked for a bounded page rather than for everything.
+  assert.equal(page.transcriptCalls.length, 1);
+  assert.match(
+    page.transcriptCalls[0],
+    new RegExp(`[?&]limit=${TRANSCRIPT_PAGE_LIMIT}\\b`),
+    `the page asked for the record without a limit: ${page.transcriptCalls[0]}`
+  );
+});
+
+test("walking back through the record does not move the line the reader is looking at", async () => {
+  // Same mutation as the channel's walk and the same anchor, so the same assertion: rows arriving
+  // ABOVE the viewport is the one case a browser's own scroll anchoring does not cover.
+  const page = newPage();
+  storedCall(page, "conv_long", 100, RECORD_EPOCH);
+  await signIn(page);
+  await page.settle();
+
+  const area = page.el("scroll-area");
+  assert.ok(
+    area.scrollHeight > area.clientHeight * 2,
+    "the restored record does not overflow, so keeping a place in it would prove nothing"
+  );
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+  const anchor = page.el("transcript").children.find((li) => li.getBoundingClientRect().bottom > 0);
+  const before = anchor.getBoundingClientRect().top;
+
+  await page.el("load-older-turns").click();
+  await page.settle();
+
+  assert.equal(spokenRows(page).length, TRANSCRIPT_PAGE_LIMIT * 2, "the step back did not arrive");
+  assert.match(said(spokenRows(page)[0]), /^conv_long turn 21:/);
+  const moved = anchor.getBoundingClientRect().top - before;
+  assert.equal(moved, 0, `a step back moved the line the reader was reading by ${moved}px`);
+});
+
+test("arriving at the top of the record takes the next step without a tap", async () => {
+  const page = newPage();
+  storedCall(page, "conv_long", 100, RECORD_EPOCH);
+  await signIn(page);
+  await page.settle();
+
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  await page.settle();
+
+  assert.equal(
+    spokenRows(page).length,
+    TRANSCRIPT_PAGE_LIMIT * 2,
+    "scrolling to the top of the record did nothing, so the chip is the only way back"
+  );
+});
+
+test("REACHING THE BEGINNING TAKES THE OFFER AWAY, AND DOES NOT JERK THE READER DOING IT", async () => {
+  // The step nobody photographs, in the transcript this time: the chip is a sibling ABOVE
+  // #transcript inside #scroll-area, so hiding it is a mutation in the same place as the prepend
+  // and has to be inside the same anchor.
+  const page = newPage();
+  storedCall(page, "conv_long", TRANSCRIPT_PAGE_LIMIT + 20, RECORD_EPOCH);
+  await signIn(page);
+  await page.settle();
+
+  const area = page.el("scroll-area");
+  assert.equal(page.el("load-older-turns").hidden, false, "nothing said there was more above");
+  const grip = page.el("load-older-turns").getBoundingClientRect().height;
+  assert.ok(grip > 0, "the chip has no modelled height, so hiding it could not move anything");
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+  const anchor = page.el("transcript").children.find((li) => li.getBoundingClientRect().bottom > 0);
+  const before = anchor.getBoundingClientRect().top;
+
+  await page.el("load-older-turns").click();
+  await page.settle();
+
+  assert.equal(spokenRows(page).length, TRANSCRIPT_PAGE_LIMIT + 20, "the last step lost turns");
+  assert.equal(
+    page.el("load-older-turns").hidden,
+    true,
+    "the reader is at the beginning of everything stored and is still being offered more"
+  );
+  const moved = anchor.getBoundingClientRect().top - before;
+  assert.equal(moved, 0, `arriving at the beginning moved the reader by ${moved}px`);
+});
+
+test("EVERY CROSSING FROM ONE CALL TO THE NEXT IS RULED, WHEREVER THE PAGE BOUNDARY FALLS", async () => {
+  // The claim a single unbroken list makes is that it is one conversation, and across a record
+  // of several calls that claim is false at every join: the agent below a join never heard a word
+  // above it. Restoring used to show ONE call, so there was never a join to get wrong.
+  const page = newPage();
+  storedCall(page, "conv_a", 5, RECORD_EPOCH);
+  storedCall(page, "conv_b", 5, RECORD_EPOCH + 3_600_000);
+
+  await signIn(page);
+  await page.settle();
+
+  const rows = page.el("transcript").children;
+  const rules = ruledRows(page);
+  assert.equal(
+    rules.length,
+    2,
+    `two calls and the live one make two joins; the page drew ${rules.length}`
+  );
+  const at = rows.indexOf(rules[0]);
+  assert.match(said(rows[at - 1]), /^conv_a turn 5:/, "the rule is not at the join");
+  assert.match(said(rows[at + 1]), /^conv_b turn 1:/);
+  // ...and the last row is a rule, because whatever the live call says next is a different
+  // conversation from everything above it.
+  assert.equal(rows.at(-1), rules[1], "the record runs straight into the live call");
+});
+
+test("a step back that lands above a DIFFERENT call draws the rule that joins them", async () => {
+  // The join that only a PAGE BOUNDARY can produce, and the one a builder that looks at nothing
+  // but its own batch cannot see: each page here is exactly one call, so both batches are
+  // internally seamless and the boundary exists only between them.
+  const page = newPage();
+  storedCall(page, "conv_old", TRANSCRIPT_PAGE_LIMIT, RECORD_EPOCH);
+  storedCall(page, "conv_new", TRANSCRIPT_PAGE_LIMIT, RECORD_EPOCH + 86_400_000);
+  await signIn(page);
+  await page.settle();
+
+  assert.equal(ruledRows(page).length, 1, "the first page is one whole call and has no join in it");
+
+  await page.el("load-older-turns").click();
+  await page.settle();
+
+  const rows = page.el("transcript").children;
+  const rules = ruledRows(page);
+  assert.equal(
+    rules.length,
+    2,
+    "the older call was prepended flush against the newer one with nothing saying where one ended"
+  );
+  const at = rows.indexOf(rules[0]);
+  assert.match(said(rows[at - 1]), new RegExp(`^conv_old turn ${TRANSCRIPT_PAGE_LIMIT}:`));
+  assert.match(said(rows[at + 1]), /^conv_new turn 1:/);
+});
+
+test("...and a step back that CONTINUES a call draws no rule through the middle of it", async () => {
+  // The control for the test above. A boundary drawn per batch rather than per pair would cut
+  // this one call in half at the page boundary and tell the reader the agent changed.
+  const page = newPage();
+  storedCall(page, "conv_long", TRANSCRIPT_PAGE_LIMIT * 2, RECORD_EPOCH);
+  await signIn(page);
+  await page.settle();
+
+  await page.el("load-older-turns").click();
+  await page.settle();
+
+  assert.equal(spokenRows(page).length, TRANSCRIPT_PAGE_LIMIT * 2);
+  const rules = ruledRows(page);
+  assert.equal(rules.length, 1, "one unbroken call came back cut in two");
+  assert.equal(
+    page.el("transcript").children.at(-1),
+    rules[0],
+    "the only rule belongs at the end, between the record and the live call"
+  );
+});
+
+test("Clear takes the walk with it, rather than offering to refill the screen it emptied", async () => {
+  // Clear empties the SCREEN and erases nothing — that is the sentence beside the control. An
+  // "Earlier turns" chip left standing over an empty transcript is an offer to undo it by
+  // accident, and the reader has no way to know the record it would pull from is unchanged.
+  const page = newPage();
+  storedCall(page, "conv_long", 100, RECORD_EPOCH);
+  await signIn(page);
+  await page.settle();
+  assert.equal(page.el("load-older-turns").hidden, false);
+
+  await page.el("clear-view").click(); // arms it
+  await page.el("clear-view").click(); // and clears
+  await page.settle();
+
+  assert.equal(page.el("transcript").children.length, 0, "Clear left rows on the screen");
+  assert.equal(
+    page.el("load-older-turns").hidden,
+    true,
+    "Clear emptied the screen and left the control that would fill it again"
+  );
+  // ...and it erased nothing, which is the other half of the same promise.
+  assert.equal(page.storedTurns.get("conv_long").length, 100);
+});
+
+test("browsing the record neither writes to it nor sends any of it to the voice vendor", async () => {
+  // The separation the owner asked for in as many words. Reading back what was said is a local
+  // convenience; catching a NEW call up on it is `#46 conversation-replay`, it has its own
+  // switch, and it spends tokens at a vendor. A browse that quietly did the second would bill
+  // for scrolling.
+  const page = newPage();
+  storedCall(page, "conv_long", 100, RECORD_EPOCH);
+  await signIn(page);
+  await page.settle();
+
+  await page.el("load-older-turns").click();
+  await page.settle();
+
+  assert.equal(page.transcriptCalls.length, 2, "the walk did not take a second step");
+  assert.deepStrictEqual(page.replayCalls, [], "scrolling back through the record built a replay");
+  assert.deepStrictEqual(
+    page.storeCalls.filter((call) => !call.startsWith("GET ")),
+    [],
+    `reading the record wrote to it: ${page.storeCalls.join(", ")}`
   );
 });
 

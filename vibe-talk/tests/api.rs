@@ -197,6 +197,9 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
         // `#46 conversation-replay`. It renders the transcript, so it is exactly as reachable as
         // the transcript and belongs in this table for the same reason.
         ("GET", "/api/v1/conversations/abc/replay".to_owned(), None),
+        // The browsable record. It hands back the SAME words the routes above do, only paged, so
+        // an unauthenticated caller must get exactly as far with it as with them: nowhere.
+        ("GET", "/api/v1/transcript".to_owned(), None),
         ("DELETE", "/api/v1/storage".to_owned(), None),
         ("GET", "/api/v1/inbox".to_owned(), None),
         (
@@ -1266,6 +1269,186 @@ async fn a_transcript_can_be_written_read_back_and_forgotten() {
 }
 
 #[tokio::test]
+async fn the_record_is_walked_backwards_across_conversations_without_a_gap_or_a_repeat() {
+    // The property that makes the walk usable, and the one a limit alone does not give: every
+    // turn appears EXACTLY ONCE across the pages, in the order it was said. A cursor that is not
+    // a total order loses turns at a page boundary — silently, and only when two land in the same
+    // millisecond, which is precisely what happens while a channel is being read aloud.
+    let (harness, _store) = store_harness();
+
+    // Two conversations, interleaved, so the walk has to cross a boundary rather than merely
+    // reach the start of one call.
+    let said = [
+        ("conv_a", "you", "what happened overnight"),
+        ("conv_b", "you", "read me the build channel"),
+        ("conv_a", "agent", "the mac runner stalled"),
+        ("conv_b", "agent", "three failures since midnight"),
+        ("conv_a", "you", "anything else"),
+    ];
+    for (conversation, speaker, text) in said {
+        let (status, payload) = call(
+            &harness,
+            "POST",
+            &format!("/api/v1/conversations/{conversation}/turns"),
+            Some(WRITE_TOKEN),
+            Some(serde_json::json!({"speaker": speaker, "text": text})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut steps = 0;
+    loop {
+        let path = match &cursor {
+            Some(before) => format!("/api/v1/transcript?limit=2&before={before}"),
+            None => "/api/v1/transcript?limit=2".to_owned(),
+        };
+        let (status, payload) = call(&harness, "GET", &path, Some(WRITE_TOKEN), None).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let turns = payload["turns"].as_array().expect("array");
+        assert!(
+            turns.len() <= 2,
+            "the page size was not honoured: {payload}"
+        );
+        for turn in turns {
+            // Every turn says which call it came from, which is what lets the page draw a
+            // boundary rather than presenting two calls as one conversation.
+            assert!(
+                turn["conversation_id"] == "conv_a" || turn["conversation_id"] == "conv_b",
+                "{payload}"
+            );
+            seen.push(turn["text"].as_str().expect("text").to_owned());
+        }
+        steps += 1;
+        assert!(steps < 10, "the walk did not terminate: {seen:?}");
+        if payload["has_more"] != true {
+            break;
+        }
+        cursor = Some(
+            payload["next_before"]
+                .as_str()
+                .expect("a step that says there is more must say where to resume")
+                .to_owned(),
+        );
+    }
+
+    // EXACTLY ONCE. Sorted, because these five turns land in the same millisecond — the server
+    // stamps them itself and the test posts them as fast as it can — so their order relative to
+    // each other ACROSS the two calls is the cursor's tie-break and not anything a reader could
+    // predict. What must hold whatever the clock did is that nothing fell down a page boundary
+    // and nothing came back twice.
+    let mut got = seen.clone();
+    got.sort();
+    let mut expected: Vec<String> = said.iter().map(|(_, _, text)| (*text).to_owned()).collect();
+    expected.sort();
+    assert_eq!(got, expected, "the walk lost or repeated something");
+
+    // ...and WITHIN one call the order is the order it was said in, reversed, whatever the
+    // timestamps collided on. That is the half of the total order a reader can actually see.
+    let within = |conversation: &str| -> Vec<&String> {
+        let spoken: Vec<&str> = said
+            .iter()
+            .filter(|(id, _, _)| *id == conversation)
+            .map(|(_, _, text)| *text)
+            .collect();
+        seen.iter()
+            .filter(|text| spoken.contains(&text.as_str()))
+            .collect()
+    };
+    assert_eq!(
+        within("conv_a"),
+        vec![
+            "anything else",
+            "the mac runner stalled",
+            "what happened overnight"
+        ],
+        "one call came back out of order"
+    );
+    assert_eq!(
+        within("conv_b"),
+        vec!["three failures since midnight", "read me the build channel"],
+        "one call came back out of order"
+    );
+}
+
+#[tokio::test]
+async fn a_transcript_cursor_that_this_server_did_not_write_is_refused_rather_than_rewound() {
+    // Treating an unreadable cursor as "start from the newest" is the failure that looks like it
+    // works: the reader scrolls up, the walk silently jumps back to the bottom of the record, and
+    // nothing on the screen says the history they were reading has been replaced.
+    let (harness, _store) = store_harness();
+    for hostile in [
+        "not-a-cursor",
+        "17:conv:1:extra",
+        "abc:conv:1",
+        "17:../etc/passwd:1",
+        "17:conv:notanumber",
+    ] {
+        let (status, payload) = call(
+            &harness,
+            "GET",
+            &format!("/api/v1/transcript?before={hostile}"),
+            Some(WRITE_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{hostile}: {payload}");
+        assert_eq!(payload["error"], "bad_id", "{hostile}: {payload}");
+    }
+}
+
+#[tokio::test]
+async fn an_empty_record_is_an_empty_page_and_not_a_missing_one() {
+    // Having said nothing yet is an ordinary state of this screen. A 404 here would be reported
+    // to the owner as a fault in a deployment that is working correctly.
+    let (harness, _store) = store_harness();
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/transcript",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["turns"].as_array().expect("array").len(), 0);
+    assert_eq!(payload["has_more"], false);
+    assert!(payload["next_before"].is_null(), "{payload}");
+}
+
+#[tokio::test]
+async fn the_page_size_is_this_servers_business_and_not_the_callers() {
+    // Clamped, not refused. A page size is a request, and a client asking for a thousand turns
+    // should get a workable answer rather than an error it has to learn to avoid.
+    let (harness, _store) = store_harness();
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/transcript?limit=9999",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["limit"], 200, "{payload}");
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/transcript?limit=0",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        payload["limit"], 1,
+        "a zero-turn page is not a page: {payload}"
+    );
+}
+
+#[tokio::test]
 async fn the_read_token_cannot_reach_a_transcript_or_move_a_mark() {
     // Asserted, not assumed. A transcript is the owner's own speech plus channel text read aloud
     // to him, and the read token is the one that gets pasted into an agent platform.
@@ -1280,6 +1463,9 @@ async fn the_read_token_cannot_reach_a_transcript_or_move_a_mark() {
             "/api/v1/conversations/conv_01/turns".to_owned(),
             Some(serde_json::json!({"speaker": "you", "text": "hello"})),
         ),
+        // Paging the record is still reading the record. A route that returned forty turns at a
+        // time to a read token would be the transcript, handed over in instalments.
+        ("GET", "/api/v1/transcript".to_owned(), None),
         (
             "POST",
             format!("/api/v1/channels/{WRITE_CHANNEL}/read"),

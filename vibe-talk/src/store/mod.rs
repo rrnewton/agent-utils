@@ -213,6 +213,111 @@ impl Turn {
     }
 }
 
+/// One turn, together with enough of its filing to walk backwards over the whole record.
+///
+/// [`Turn`] alone cannot be paged over: two turns a millisecond apart in two different
+/// conversations are indistinguishable by it, so a cursor built from one would either skip the
+/// other or return it twice. This carries the rest of the key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedTurn {
+    /// Which conversation it was said in.
+    pub conversation: ConversationId,
+    /// Its position within that conversation, from 1. Assigned by the store on append.
+    pub seq: i64,
+    /// What was said, and when.
+    pub turn: Turn,
+}
+
+/// Where a backward walk over the transcript resumes.
+///
+/// # Why three parts and not just an instant
+///
+/// The walk needs a TOTAL order — one no two rows share — or a page boundary that lands in the
+/// middle of a group of equal keys drops rows silently. `at_ms` is nearly that and not quite:
+/// turns are stamped by the server clock in milliseconds, so two of them can collide, and a
+/// collision across two conversations is not even unlikely on a machine holding a call while a
+/// channel is being read aloud into a second one.
+///
+/// `(at_ms, conversation, seq)` is total. `seq` is unique within a conversation and
+/// `conversation` is unique across them, so the triple cannot repeat. It also agrees with the
+/// order inside a conversation, which is the property that stops a page boundary reordering one:
+/// `at_ms` is non-decreasing within a conversation because turns are appended one at a time, and
+/// `seq` breaks any tie in the direction they were said.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptCursor {
+    /// The instant of the turn to resume BELOW, exclusive.
+    pub at_ms: i64,
+    /// Its conversation.
+    pub conversation: ConversationId,
+    /// Its position in that conversation.
+    pub seq: i64,
+}
+
+impl TranscriptCursor {
+    /// The cursor as one opaque token, for a query string.
+    ///
+    /// `:` is the separator because it is the one character here that cannot occur in any of the
+    /// three parts: a conversation id is letters, digits, `-` and `_` (see
+    /// [`ConversationId::parse`]) and the other two are integers. So the split is unambiguous
+    /// without escaping, and a caller cannot smuggle a fourth field into the middle of one.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        format!("{}:{}:{}", self.at_ms, self.conversation, self.seq)
+    }
+
+    /// Read back a token this server handed out.
+    ///
+    /// CALLER-CONTROLLED TEXT: nothing stops a client inventing one, so every part is validated
+    /// rather than trusted, and the conversation goes through [`ConversationId::parse`] exactly as
+    /// it would arriving in a path.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BadId`] when the token is not one this server could have produced. It is
+    /// deliberately not "start from the beginning": a cursor the server cannot read means the page
+    /// would silently jump somewhere other than where the reader was.
+    pub fn parse(raw: &str) -> Result<Self, StoreError> {
+        let mut parts = raw.split(':');
+        let (Some(at_ms), Some(conversation), Some(seq), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(StoreError::BadId(
+                "a transcript cursor is three parts separated by ':'".to_owned(),
+            ));
+        };
+        Ok(Self {
+            at_ms: at_ms.parse().map_err(|_| {
+                StoreError::BadId("a transcript cursor starts with an instant".to_owned())
+            })?,
+            conversation: ConversationId::parse(conversation)?,
+            seq: seq.parse().map_err(|_| {
+                StoreError::BadId("a transcript cursor ends with a turn number".to_owned())
+            })?,
+        })
+    }
+}
+
+/// One step of a backward walk over everything that has been said.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPage {
+    /// The turns, NEWEST FIRST. See [`StateStore::transcript`] for why this direction.
+    pub turns: Vec<RecordedTurn>,
+    /// Whether anything older than the last of them is still held.
+    pub has_more: bool,
+    /// Hand back as `before` to take the next step. `None` only when nothing was returned at all.
+    pub next: Option<TranscriptCursor>,
+}
+
+/// How many turns one transcript step returns when the caller does not say.
+///
+/// A phone screen holds a dozen or so lines, so this is a few screens of scrollback in hand
+/// before the first step back is needed — enough that an ordinary glance at the history never
+/// waits on a request, and small enough that signing in does not pull a thousand turns.
+pub const DEFAULT_TRANSCRIPT_PAGE: u16 = 40;
+
+/// The most turns one transcript step will return, whatever the caller asks for.
+pub const MAX_TRANSCRIPT_PAGE: u16 = 200;
+
 /// One conversation, described without its contents.
 ///
 /// This is what a listing returns. The transcript itself is a separate, explicit read, so a page
@@ -518,6 +623,36 @@ pub trait StateStore: Send + Sync {
     ///
     /// [`StoreError::NotFound`] when the conversation is not stored, plus the errors above.
     async fn turns(&self, conversation: &ConversationId) -> Result<Vec<Turn>, StoreError>;
+
+    /// One step backwards through EVERYTHING that has been said, across conversations.
+    ///
+    /// # Why this is not [`StateStore::turns`] in a loop
+    ///
+    /// What a reader scrolls back through is a continuous record; the conversation is a boundary
+    /// inside it, not the unit of browsing. Assembling that from the per-conversation read means
+    /// pulling whole conversations out of the store in order to throw most of them away, and "the
+    /// newest forty turns" then costs however large the newest conversation happens to be.
+    ///
+    /// # Newest first
+    ///
+    /// So that the limit is applied at the end the reader is actually at. Oldest-first with a
+    /// limit returns the BEGINNING of the record, which is the one part nobody opening the app
+    /// wants. Whatever draws it reverses.
+    ///
+    /// `limit` is clamped to at least 1 and at most [`MAX_TRANSCRIPT_PAGE`] rather than refused: a
+    /// page size is a request, and the ceiling is this server's business.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BadId`] when `before` names a conversation that is not a usable id;
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure. Never [`StoreError::NotFound`] — an empty record is an empty page, because having
+    /// said nothing yet is an ordinary state of this screen and not a missing resource.
+    async fn transcript(
+        &self,
+        limit: u16,
+        before: Option<&TranscriptCursor>,
+    ) -> Result<TranscriptPage, StoreError>;
 
     /// Erase one conversation.
     ///

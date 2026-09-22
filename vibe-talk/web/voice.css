@@ -1553,12 +1553,14 @@ body {
    nothing older — the same rule Hang up follows. A control that is always there and usually inert
    teaches the eye to skip the place it lives in, and the place this lives in is the one the reader
    arrives at when they are looking for something old. */
-#load-older {
+#load-older,
+#load-older-turns {
   display: block;
   margin: 0.6rem auto 0.2rem;
 }
 
-#load-older[disabled] {
+#load-older[disabled],
+#load-older-turns[disabled] {
   opacity: 0.7;
 }
 

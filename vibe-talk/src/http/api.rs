@@ -1462,11 +1462,27 @@ mod tests {
             VOICE_JS.contains("function foldable("),
             "the folding idiom must be ONE function, not a behaviour each list implements"
         );
-        for renderer in ["function line(", "function discordNode("] {
+        // `function line(` used to be the transcript's entry here. `#128 transcript-history`
+        // split BUILDING a transcript row from PLACING one, for the same reason `#63` split the
+        // seam: a row restored from the record is PREPENDED above the reader in one anchored
+        // mutation, so it cannot go through the function that appends to the end and follows.
+        // `turnNode` is now the thing that decides what a turn looks like, and therefore the
+        // thing that has to fold. The property asserted is unchanged; the name moved.
+        for renderer in ["function turnNode(", "function discordNode("] {
             assert!(
                 function_body(VOICE_JS, renderer).contains("foldable("),
                 "`{renderer}` in web/voice.js no longer folds long messages, so the two message \
                  lists on /voice disagree about what a long message looks like"
+            );
+        }
+        // Which only means anything while both places that put a turn on screen go through it:
+        // the live call's `line`, and the run of restored turns the walk back prepends. A second
+        // row builder is how the record ends up folding differently from the call.
+        for placer in ["function line(", "function restoredRun("] {
+            assert!(
+                function_body(VOICE_JS, placer).contains("turnNode("),
+                "`{placer}` in web/voice.js builds a transcript row of its own instead of the \
+                 one that folds"
             );
         }
         // And the anchoring that goes with it: an arrival must be conditional, never the old
@@ -1765,6 +1781,101 @@ pub async fn conversation(
     Ok(no_store(Json(ConversationResponse {
         id,
         turns,
+        untrusted_content_notice: untrusted::NOTICE,
+    })))
+}
+
+/// Query parameters for one step of a walk back through the transcript.
+#[derive(Debug, Default, Deserialize)]
+pub struct TranscriptQuery {
+    /// How many turns this step should return. Clamped to
+    /// [`crate::store::MAX_TRANSCRIPT_PAGE`]; defaults to
+    /// [`crate::store::DEFAULT_TRANSCRIPT_PAGE`].
+    pub limit: Option<u16>,
+    /// The `next` token from the previous step. Absent means "start at the newest".
+    pub before: Option<String>,
+}
+
+/// One turn of the record, with what a page needs to place it.
+#[derive(Debug, Serialize)]
+pub struct TranscriptTurn {
+    /// Which conversation it was said in, so a reader can be shown where one call ended.
+    pub conversation_id: ConversationId,
+    /// Its position within that conversation.
+    pub seq: i64,
+    /// Who said it.
+    pub speaker: Speaker,
+    /// What was said. UNTRUSTED when the agent was reading a channel aloud.
+    pub text: String,
+    /// When the server recorded it.
+    pub at_ms: i64,
+}
+
+/// One step backwards through everything that has been said.
+#[derive(Debug, Serialize)]
+pub struct TranscriptResponse {
+    /// The turns, NEWEST FIRST. The page reverses what it draws; see
+    /// [`crate::store::StateStore::transcript`] for why the limit is applied at this end.
+    pub turns: Vec<TranscriptTurn>,
+    /// Whether anything older than the last of them is still held.
+    pub has_more: bool,
+    /// Hand this back as `before` to take the next step. Absent only when nothing came back.
+    pub next_before: Option<String>,
+    /// The page size that actually applied, after clamping.
+    pub limit: u16,
+    /// Standing reminder that a transcript quotes third-party channel text.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// `GET /api/v1/transcript`
+///
+/// **Write scope, like every other route over the transcript**, and for the reason in the block
+/// comment above them: this is the owner's own speech plus whatever channel text the agent read
+/// out to him.
+///
+/// A SEPARATE ROUTE FROM `GET /api/v1/conversations/{id}`, not a `limit` bolted onto it. The two
+/// answer different questions and a single route could not answer both honestly: that one returns
+/// ONE conversation whole, which is what resuming needs and what a page cannot bound; this one
+/// returns the newest N turns from ANYWHERE, which is what browsing needs and which no
+/// conversation-shaped read can express — the newest forty turns routinely span two calls, and on
+/// a long call they are a suffix of one.
+pub async fn transcript(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<TranscriptQuery>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    // Parsed, never trusted, and a bad one is refused rather than quietly treated as "start from
+    // the newest": silently rewinding a walk puts the reader somewhere other than where they were
+    // with nothing on screen saying so.
+    let before = query
+        .before
+        .as_deref()
+        .map(crate::store::TranscriptCursor::parse)
+        .transpose()?;
+    let limit = query
+        .limit
+        .unwrap_or(crate::store::DEFAULT_TRANSCRIPT_PAGE)
+        .clamp(1, crate::store::MAX_TRANSCRIPT_PAGE);
+    let page = state.store.transcript(limit, before.as_ref()).await?;
+    Ok(no_store(Json(TranscriptResponse {
+        has_more: page.has_more,
+        next_before: page
+            .next
+            .as_ref()
+            .map(crate::store::TranscriptCursor::encode),
+        limit,
+        turns: page
+            .turns
+            .into_iter()
+            .map(|entry| TranscriptTurn {
+                conversation_id: entry.conversation,
+                seq: entry.seq,
+                speaker: entry.turn.speaker,
+                text: entry.turn.text,
+                at_ms: entry.turn.at_ms,
+            })
+            .collect(),
         untrusted_content_notice: untrusted::NOTICE,
     })))
 }
