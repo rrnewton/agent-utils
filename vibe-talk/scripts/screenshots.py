@@ -2702,9 +2702,16 @@ SCENES: tuple[Scene, ...] = (
                 "window.__visible('error')",
             ),
             (
+                # Matched on what the sentence CLAIMS, not on who the far end is. The page names
+                # whichever conversational voice provider is configured, so pinning one vendor's
+                # name here made a provider-neutral rewording look like a page that had stopped
+                # explaining itself. What has to survive is the localisation: our side got as far
+                # as a session, and the step that failed was this browser opening the socket.
                 "it says where the failure is, not 'see the console'",
-                "/between this browser and ElevenLabs/.test("
-                "document.getElementById('error').textContent)",
+                "(() => { const said = document.getElementById('error').textContent || ''; "
+                "return /The connection to .+ failed/.test(said) && "
+                "/accepted your token/.test(said) && "
+                "/could not open its WebSocket/.test(said); })()",
             ),
             (
                 "the dot says error, not suspended",
