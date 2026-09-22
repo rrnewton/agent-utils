@@ -59,6 +59,15 @@ const CODE_SPOKEN_MAX_LINES: usize = 3;
 /// ABOUT. All of them would be the same wall of text the placeholder exists to remove.
 const TABLE_KEYS_SPOKEN: usize = 4;
 
+/// How many distinct values of ONE kind will be given a letter before the table stops growing.
+///
+/// This is a memory bound on a table that otherwise lives as long as the server, not a claim about
+/// how many letters are useful — that number is far smaller. Past the cap an unseen value is
+/// spoken as its kind with no letter at all, which is audibly different from a named one: the
+/// listener hears "a large number" and knows this one is not being tracked, instead of hearing a
+/// letter that has quietly stopped meaning one value.
+const NAMES_MAX: usize = 4_096;
+
 /// Every letter handed out so far, and the value it stands for.
 ///
 /// Held by the CALLER, because the useful lifetime of a letter is not the lifetime of a call. A
@@ -67,8 +76,12 @@ const TABLE_KEYS_SPOKEN: usize = 4;
 /// by coincidence of ordering. Carried across the messages of one session, the letter becomes a
 /// name the listener can actually use — which is the whole point of naming it.
 ///
-/// Two readers must not share one of these. A letter is only meaningful beside the transcript that
-/// introduced it, and an id one reader can see is not automatically an id the other may hear.
+/// **How wide the table may be shared is a property of the deployment, not of this type.** A letter
+/// is only meaningful beside the transcript that introduced it, and it must never let one reader
+/// hear an id they could not otherwise see. On this server both hold for a table shared by every
+/// reader — there is one channel allowlist and every reader reads through it, so a named value is
+/// always one already on their screen. A deployment where two readers see different channels would
+/// have to give them different tables.
 #[derive(Debug, Default, Clone)]
 pub struct Names {
     hashes: BTreeMap<String, String>,
@@ -86,6 +99,45 @@ impl Names {
     #[must_use]
     pub fn len(&self) -> usize {
         self.hashes.len() + self.numbers.len()
+    }
+
+    /// Whether nothing has been named yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// One [`Names`] table that every handler on a server names into.
+///
+/// The lock is held only across the rewrite of a single message body, which touches no I/O, so it
+/// is a `std::sync::Mutex` rather than an async one and is never held across an await. A poisoned
+/// lock degrades to naming in a throwaway table: the reader loses letter continuity for that one
+/// message and still hears no digits, which is strictly better than the alternative of a handler
+/// that panics because a different handler did.
+#[derive(Debug, Default)]
+pub struct SharedNames(std::sync::Mutex<Names>);
+
+impl SharedNames {
+    /// An empty shared table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// [`for_speech`], naming into the shared table.
+    #[must_use]
+    pub fn for_speech(&self, content: &str, now_ms: i64, zone: &Zone) -> String {
+        match self.0.lock() {
+            Ok(mut names) => for_speech_with(content, now_ms, zone, &mut names),
+            Err(_) => for_speech(content, now_ms, zone),
+        }
+    }
+
+    /// How many distinct opaque strings have been named, or zero if the lock is poisoned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.lock().map(|names| names.len()).unwrap_or_default()
     }
 
     /// Whether nothing has been named yet.
@@ -585,6 +637,10 @@ fn name_for(value: &str, seen: &mut BTreeMap<String, String>, kind: &str) -> Str
     if let Some(held) = seen.get(value) {
         return held.clone();
     }
+    if seen.len() >= NAMES_MAX {
+        // Unnamed rather than mis-named. See `NAMES_MAX`.
+        return format!("a {kind}");
+    }
     let letter = letter_for(seen.len());
     let said = format!("{kind} {letter}");
     seen.insert(value.to_owned(), said.clone());
@@ -781,6 +837,47 @@ mod tests {
         // Both are the first of their kind, so both are A, and the KIND is what tells them apart.
         assert_eq!(said, "large number A touched hash code A");
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn a_table_that_has_filled_up_stops_naming_rather_than_reusing_a_name() {
+        // A table on the server outlives any one conversation, so it needs a bound. The bound has
+        // to be a bound on the TABLE and not on the meaning of a letter: a full table that started
+        // handing out `A` again would make "large number A" silently ambiguous, and nothing in the
+        // audio would say so. Unnamed is audibly different, which is the property being asserted.
+        let mut names = Names::new();
+        let zone = eastern();
+        for i in 0..NAMES_MAX {
+            let value = format!("9{:018}", i);
+            let _ = for_speech_with(&value, NOW, &zone, &mut names);
+        }
+        assert_eq!(names.len(), NAMES_MAX, "the cap is not where it says it is");
+
+        let overflow = for_speech_with("1234567890123456789", NOW, &zone, &mut names);
+        assert_eq!(overflow, "a large number");
+        assert_eq!(names.len(), NAMES_MAX, "a full table grew anyway");
+
+        // And a value already in the table is still answered from it: filling up must not cost the
+        // letters already handed out, which are the ones a listener has heard.
+        let known = for_speech_with("9000000000000000000", NOW, &zone, &mut names);
+        assert_eq!(known, "large number A");
+    }
+
+    #[test]
+    fn a_shared_table_names_the_same_value_the_same_way_for_every_caller() {
+        // What the server actually holds. Every handler names into this one, so a hash the page
+        // heard about through the live stream is the same letter when the audio route reads the
+        // same message a minute later.
+        let shared = SharedNames::new();
+        let zone = eastern();
+        assert!(shared.is_empty());
+        let first = shared.for_speech("from 1000000000000000009", NOW, &zone);
+        let second = shared.for_speech("still 1000000000000000009", NOW, &zone);
+        let other = shared.for_speech("but 1000000000000000017", NOW, &zone);
+        assert_eq!(first, "from large number A");
+        assert_eq!(second, "still large number A");
+        assert_eq!(other, "but large number B");
+        assert_eq!(shared.len(), 2);
     }
 
     #[test]

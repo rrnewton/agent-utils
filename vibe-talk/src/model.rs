@@ -183,6 +183,28 @@ pub struct Message {
     pub reply_to: Option<MessageId>,
     /// Raw message body. UNTRUSTED: written by whoever is in the channel.
     pub content: String,
+    /// The same body rewritten for speech by [`crate::speakable`]: markdown off, instants said the
+    /// way a listener places them, long ids and hashes named. READ THIS ONE ALOUD.
+    ///
+    /// Two fields for the same reason there are two time fields — they answer different questions.
+    /// `content` is what was written and is what the SCREEN must show, character for character;
+    /// this is what a voice should say, and saying it costs the reader none of the seconds that
+    /// spelling a nineteen-digit snowflake costs. Neither is a substitute for the other, and a
+    /// renderer that picked one for both jobs would be wrong in one of them.
+    ///
+    /// UNTRUSTED, exactly as much as `content` is: rewriting a body for speech is not sanitizing it
+    /// for a prompt, and it still goes through [`crate::untrusted`] on the way to a model.
+    ///
+    /// EMPTY means "the body to say is the raw body". That covers two cases on purpose: nothing has
+    /// prepared this message yet — the chat adapters hold no configuration, so [`crate::ops`] is the
+    /// only filler, the same convention as [`Message::spoken_time`] — and the prepared form came
+    /// back identical, which is the common case for ordinary chat with no markdown and no ids in
+    /// it. One value can mean both because [`Message::spoken_body`] answers them the same way, and
+    /// collapsing them is what keeps a window of a hundred messages from carrying a hundred
+    /// near-copies of itself down a phone's connection. When the field IS set, something was
+    /// genuinely rewritten.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub spoken_content: String,
 }
 
 impl Message {
@@ -190,12 +212,28 @@ impl Message {
     ///
     /// Never blank, and never invented. A message that reached a renderer unstamped is a bug in
     /// the pipeline, but the reader should still learn when it was said.
+    ///
+    /// This one is about the TIME. [`Message::spoken_body`] is the matching accessor for the text.
     #[must_use]
     pub fn spoken(&self) -> &str {
         if self.spoken_time.is_empty() {
             &self.timestamp
         } else {
             &self.spoken_time
+        }
+    }
+
+    /// The body to say out loud: the prepared form when there is one, else the raw body.
+    ///
+    /// Falling back to the raw body means an unprepared message is read badly rather than read as
+    /// nothing. Silence would be the worse failure: a reader who is listening cannot tell it apart
+    /// from a message that never arrived.
+    #[must_use]
+    pub fn spoken_body(&self) -> &str {
+        if self.spoken_content.is_empty() {
+            &self.content
+        } else {
+            &self.spoken_content
         }
     }
 }
@@ -275,6 +313,7 @@ mod tests {
             spoken_time: String::new(),
             reply_to: None,
             content: String::new(),
+            spoken_content: String::new(),
         }
     }
 

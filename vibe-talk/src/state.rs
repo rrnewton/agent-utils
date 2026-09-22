@@ -65,6 +65,17 @@ pub struct AppState {
     /// a ticket. Device speech reads the text already in the browser and uses no tickets.
     /// See [`crate::speech_tickets`] for why server audio uses this authority boundary.
     pub speech_tickets: Arc<crate::speech_tickets::SpeechTickets>,
+    /// The letters standing in for the long ids and hashes in channel text.
+    ///
+    /// Here rather than per request because the point of a letter is that it means the same account
+    /// in the next message as it did in this one, and a table rebuilt per request cannot promise
+    /// that. Here rather than per reader because this server has ONE channel allowlist and every
+    /// reader reads through it, so a letter never names a value some reader could not already see
+    /// on their own screen. [`crate::speakable::Names`] states the rule that makes that sound.
+    ///
+    /// It does not survive a restart, and nothing about it needs to: a letter is only ever
+    /// interpreted from inside a conversation that is also gone.
+    pub spoken_names: Arc<crate::speakable::SharedNames>,
     /// Channels the owner added from inside the app, joined onto the configured allowlist.
     ///
     /// Held in memory as well as in the store because the allowlist is consulted on every

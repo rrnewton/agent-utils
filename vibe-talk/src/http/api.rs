@@ -332,6 +332,7 @@ pub async fn ingest_event(
                 spoken_time: String::new(),
                 reply_to: None,
                 content: String::new(),
+                spoken_content: String::new(),
             };
             (crate::live::LiveKind::Delete, channel_id, tombstone)
         }
@@ -342,10 +343,25 @@ pub async fn ingest_event(
     if state.channel(channel_id.as_str()).is_none() {
         return Err(OpError::UnknownChannel.into());
     }
-    // The configured zone is an application concern, not something every adapter should have to
-    // reproduce. Deletes carry no timestamp and never render this field.
-    if kind != crate::live::LiveKind::Delete {
+    // The configured zone and the spoken forms are application concerns, not something every
+    // adapter should have to reproduce — and an adapter that tried would be choosing how this
+    // server's voice reads, which is not an adapter's call. Whatever arrived in these two fields is
+    // OVERWRITTEN rather than trusted. Deletes carry neither a timestamp nor a body and render
+    // neither field.
+    //
+    // This is the live path, so it is the one `read new` relays from: a message reaches the page
+    // already carrying the body a voice should say, with no second round trip on the leg that is
+    // most latency-sensitive.
+    if kind == crate::live::LiveKind::Delete {
+        message.spoken_time = String::new();
+        message.spoken_content = String::new();
+    } else {
         message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
+        message.spoken_content = ops::prepared_body(
+            &state,
+            &message.content,
+            jiff::Timestamp::now().as_millisecond(),
+        );
     }
     let accepted = state
         .live
@@ -669,14 +685,15 @@ pub async fn speak(
     // noise when spoken — the voice said "asterisk asterisk deploy asterisk asterisk" and spelled
     // out nineteen-digit ids. `speakable::for_speech` is deterministic and costs nothing; see it
     // for why this is code rather than a prompt.
-    let said = crate::speakable::for_speech(
-        &message.content,
-        jiff::Timestamp::now().as_millisecond(),
-        &state.config.timezone,
-    );
+    //
+    // It used to run HERE, on a table of its own. It now reads the body `ops::stamp` already
+    // prepared, which matters for the letters and not for the words: a hash named "hash code A" by
+    // the page a minute ago is still "hash code A" when this route reads the same message aloud,
+    // because both went through the one table on the state.
+    let said = message.spoken_body();
     let characters = said.chars().count();
     let asked = std::time::Instant::now();
-    let spoken = state.speech.speak(&said, query.speed).await?;
+    let spoken = state.speech.speak(said, query.speed).await?;
     let generated_ms = asked.elapsed().as_millis();
     let bytes = spoken.audio.len();
     // At the vendor's default mp3 bitrate this is roughly sixteen kilobytes per second of speech,
@@ -1367,6 +1384,37 @@ mod tests {
         assert!(
             VOICE_JS.contains("message.spoken_time ||"),
             "the channel view must prefer the zone-converted time the server already computed"
+        );
+    }
+
+    #[test]
+    fn the_relay_quotes_the_prepared_body_and_the_row_still_shows_the_raw_one() {
+        // Two claims, and a guard that only made the first would let the fix undo itself. The
+        // relay must say the PREPARED body — quoting `content` there is how `read new` came to
+        // spell nineteen-digit ids out loud, and it happened because that turn is the one built
+        // in the browser rather than on the server. And the row must keep showing the RAW body:
+        // a letter is only recoverable because the id it stands for is on the screen beside it,
+        // so a page that showed the prepared text in both places would have made the
+        // substitution lossy rather than merely quiet.
+        let relay = function_body(VOICE_JS, "function relayLine(");
+        assert!(
+            relay.contains("message.spoken_content ||"),
+            "web/voice.js relays the raw body again, so ids are read aloud digit by digit"
+        );
+        // `combinedContent` is the single place a channel row's text comes from, so it is the
+        // single place this half can be checked. It must read the raw field and nothing else.
+        let row = VOICE_JS
+            .split_once("const combinedContent =")
+            .map(|(_, rest)| rest.split_once(";\n").map_or(rest, |(body, _)| body))
+            .expect("web/voice.js no longer defines `combinedContent`");
+        assert!(
+            row.contains("m.content"),
+            "the channel row must render what was actually written"
+        );
+        assert!(
+            !row.contains("spoken_content"),
+            "the channel row shows the spoken rewrite, so the id a letter stands for is nowhere \
+             on screen and the substitution has become lossy"
         );
     }
 

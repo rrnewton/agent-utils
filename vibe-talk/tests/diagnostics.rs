@@ -411,6 +411,7 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
                 spoken_time: String::new(),
                 reply_to: None,
                 content: String::new(),
+                spoken_content: String::new(),
             }])
         }
         async fn post_message(

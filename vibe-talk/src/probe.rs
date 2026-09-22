@@ -925,6 +925,7 @@ mod tests {
                     spoken_time: String::new(),
                     reply_to: None,
                     content: String::new(),
+                    spoken_content: String::new(),
                 }])
             }
             async fn post_message(

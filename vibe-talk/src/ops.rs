@@ -191,17 +191,50 @@ pub async fn clear_channel_alias(
     Ok(channel)
 }
 
-/// Fill in [`Message::spoken_time`] for a freshly fetched batch.
+/// Fill in the two spoken forms — [`Message::spoken_time`] and [`Message::spoken_content`] — for a
+/// freshly fetched batch.
 ///
 /// THE ONLY PLACE the zone conversion happens. It sits here rather than at the render sites
 /// because there are four of those — [`crate::untrusted::render_for_model`] and three handlers in
 /// [`crate::mcp::protocol`] — and both front doors already funnel through this module. Formatting
 /// per render site would mean writing the conversion four times and having it drift three ways.
 ///
-/// Everything downstream PRINTS this field and must never compute it.
+/// Preparing the BODY for speech joined it here for exactly that reason, one gap later: the browser
+/// was building its own spoken text out of `content`, so the path that reads new messages aloud was
+/// the one path with no preparation at all. Doing it here means every reader of a message — the
+/// page, the model, the audio route — is offered the same prepared body, and no new one has to
+/// remember to ask.
+///
+/// One clock reading for the whole batch, so two messages a millisecond apart are not described
+/// relative to two different "now"s.
+///
+/// Everything downstream PRINTS these fields and must never compute them.
 fn stamp(state: &AppState, messages: &mut [Message]) {
+    let now_ms = jiff::Timestamp::now().as_millisecond();
     for message in messages {
         message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
+        message.spoken_content = prepared_body(state, &message.content, now_ms);
+    }
+}
+
+/// The spoken form of one body, or EMPTY when saying it and reading it are the same thing.
+///
+/// Most chat is a sentence with no markdown, no timestamp and no id in it, and for those the
+/// rewrite is the identity. Sending the result anyway would put a second copy of every message in
+/// every window, down the connection of a phone, to say nothing new. See
+/// [`Message::spoken_content`] for why one empty value can mean both "unprepared" and "unchanged".
+///
+/// Visible to the crate because the live ingest route has to do the same thing to a message that
+/// never passes through [`stamp`] — it arrives already formed, from an adapter, and goes straight
+/// to the page. Two callers, one definition, for exactly the reason `stamp` gives.
+pub(crate) fn prepared_body(state: &AppState, content: &str, now_ms: i64) -> String {
+    let said = state
+        .spoken_names
+        .for_speech(content, now_ms, &state.config.timezone);
+    if said == content {
+        String::new()
+    } else {
+        said
     }
 }
 

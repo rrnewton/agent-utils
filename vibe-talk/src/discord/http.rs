@@ -419,6 +419,10 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        // Empty for the same reason as `spoken_time` above, and one more: how this server's voice
+        // reads a message is an application decision, not something a chat adapter gets a say in.
+        // See `crate::model::Message::spoken_content`.
+        spoken_content: String::new(),
     })
 }
 

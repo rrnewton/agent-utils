@@ -235,6 +235,9 @@ impl FakeDiscord {
             // about the operator's zone. A fake that pre-filled it would let a test pass with
             // `ops::stamp` deleted. See `crate::model::Message::spoken_time`.
             spoken_time: String::new(),
+            // Empty, and for the stronger form of the same reason: a fake that pre-filled the
+            // spoken body would let every test pass with the preparation gone.
+            spoken_content: String::new(),
             // Seeding an ordinary message. `seed_reply` is how a fixture makes one that answers
             // another, and it is a separate call so that "this is a reply" is always something a
             // test said out loud rather than something it inherited.

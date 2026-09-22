@@ -13022,6 +13022,72 @@ test("the three modes differ in WHAT THE AGENT IS ASKED TO DO, and off asks noth
   }
 });
 
+test("WHAT IS RELAYED IS THE PREPARED BODY, not the raw one", async () => {
+  // The reported symptom, in the place it actually happened. `read new` builds its turn HERE, in
+  // the browser, so it was the one path to the agent with no preparation on it at all: a message
+  // mentioning a snowflake got read out as nineteen spoken digits. The server now sends the
+  // prepared body beside the raw one and this quotes that.
+  const page = newPage();
+  await startTalking(page);
+  page.messages = [];
+  await page.el("view-switch").click();
+  await page.settle();
+  const stream = page.stream();
+
+  await setReadNew(page, "full");
+  await deliver(
+    page,
+    stream,
+    sseMessage(
+      message({
+        id: "530",
+        content: "**deploy** by 1000000000000000009 at 2026-08-24T04:31:00Z",
+        spoken_content: "deploy by large number A three hours ago",
+      })
+    )
+  );
+  await speakRelay(page);
+
+  const [turn] = relayed(page);
+  assert.ok(turn, "nothing was relayed at all");
+  assert.match(turn.text, /large number A/, "the prepared body is not what was quoted");
+  assert.doesNotMatch(
+    turn.text,
+    /1000000000000000009/,
+    "a nineteen-digit id reached the agent, which is the whole complaint"
+  );
+  assert.doesNotMatch(turn.text, /\*\*/, "markdown asterisks reached a thing that reads aloud");
+
+  // And the ROW still shows what was written. The letter is only recoverable because the real id
+  // is on screen beside it; a page that showed the prepared body in both places would have made
+  // the substitution lossy instead of merely quiet.
+  await page.el("view-switch").click();
+  await page.settle();
+  const shown = page.el("discord-log").text();
+  assert.match(shown, /1000000000000000009/, "the screen lost the id the letter stands for");
+});
+
+test("a server too old to prepare a body still gets its messages read", async () => {
+  // The fallback, stated as a behaviour rather than as an `||`. `spoken_content` is a new field;
+  // an older server sends none, and the failure mode to avoid is silence — a reader who is
+  // listening cannot tell "nothing arrived" apart from "it arrived and was dropped". Reading it
+  // badly is the right answer, and this is the only place that says so.
+  const page = newPage();
+  await startTalking(page);
+  page.messages = [];
+  await page.el("view-switch").click();
+  await page.settle();
+  const stream = page.stream();
+
+  await setReadNew(page, "full");
+  await deliver(page, stream, sseMessage(message({ id: "531", content: "the tag is cut" })));
+  await speakRelay(page);
+
+  const [turn] = relayed(page);
+  assert.ok(turn, "a message with no prepared body was silently dropped");
+  assert.match(turn.text, /the tag is cut/, "the raw body is the fallback and it was not used");
+});
+
 test("A BURST OF ARRIVALS IS ONE SPOKEN TURN, NOT ONE EACH", async () => {
   // A coding agent posting four lines in two seconds is the ordinary case this feature exists for.
   // One `user_message` each would be four spoken turns in a row, each interrupting the last, with

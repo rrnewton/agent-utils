@@ -35,6 +35,7 @@ fn message(id: &str, content: &str) -> Value {
         "spoken_time": "an adapter must not choose this",
         "reply_to": null,
         "content": content,
+        "spoken_content": "nor this",
     })
 }
 
@@ -191,6 +192,118 @@ async fn accepted_events_are_typed_stamped_and_duplicate_retries_are_no_ops() {
     let deleted = subscription.receiver.try_recv().expect("delete broadcast");
     assert_eq!(deleted.kind, LiveKind::Delete);
     assert_eq!(deleted.message.id.as_str(), "10");
+}
+
+#[tokio::test]
+async fn a_pushed_message_arrives_carrying_the_body_a_voice_should_say() {
+    // The live path is the one `read new` relays from, and the browser builds that turn out of
+    // what arrives here. So this is where the preparation has to already have happened: there is
+    // no later server hop to do it on, and asking the page for one would put a round trip on the
+    // most latency-sensitive leg there is.
+    let (app, live) = enabled();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let mut subscription = live.subscribe(&channel, None);
+
+    let event = create("event-said", "10", false);
+    let mut event = event;
+    event["message"]["content"] =
+        json!("**shipped** 1000000000000000009 at 2026-08-20T07:00:00+00:00");
+    assert_eq!(
+        post(&app, Some(INGEST_TOKEN), event).await.0,
+        StatusCode::ACCEPTED
+    );
+
+    let said = subscription
+        .receiver
+        .try_recv()
+        .expect("create broadcast")
+        .message;
+    assert!(
+        !said.spoken_content.contains("1000000000000000009"),
+        "a nineteen-digit id reached the page's relay: {}",
+        said.spoken_content
+    );
+    assert!(
+        said.spoken_content.contains("large number A"),
+        "the id was removed rather than named, so the listener cannot tell it from another: {}",
+        said.spoken_content
+    );
+    assert!(
+        !said.spoken_content.contains("**"),
+        "markdown survived into the spoken body: {}",
+        said.spoken_content
+    );
+    assert!(
+        said.spoken_content.contains("shipped"),
+        "the words themselves were lost: {}",
+        said.spoken_content
+    );
+    assert!(
+        said.content.contains("**shipped** 1000000000000000009"),
+        "the raw body must survive UNTOUCHED beside the prepared one — it is what the screen \
+         shows, and it is what makes the letter recoverable"
+    );
+
+    // And an ordinary sentence carries NOTHING extra. Most chat has no markdown, no timestamp and
+    // no id in it, so its prepared form is the identity — sending a second copy of every such
+    // message down a phone's connection would buy the listener nothing at all. The field is
+    // present only when something was genuinely rewritten, which is also what makes it readable
+    // in a payload dump.
+    let mut plain = create("event-plain", "12", false);
+    plain["message"]["content"] = json!("the tag is cut");
+    assert_eq!(
+        post(&app, Some(INGEST_TOKEN), plain).await.0,
+        StatusCode::ACCEPTED
+    );
+    let ordinary = subscription.receiver.try_recv().expect("plain").message;
+    assert_eq!(
+        ordinary.spoken_content, "",
+        "an unchanged body was sent twice"
+    );
+    assert_eq!(
+        ordinary.spoken_body(),
+        "the tag is cut",
+        "and an empty field still has to READ as the raw body, or the message is never spoken"
+    );
+    assert_eq!(
+        serde_json::to_value(&ordinary)
+            .expect("serializes")
+            .get("spoken_content"),
+        None,
+        "an empty spoken body must not even appear on the wire"
+    );
+}
+
+#[tokio::test]
+async fn one_letter_means_one_account_across_two_pushed_messages() {
+    // The property the whole substitution exists for. Two arrivals, one server, one table: if the
+    // second message's `A` were assigned from a table built for that message alone, "large number
+    // A" in a conversation would mean the same account only by coincidence of ordering, and the
+    // listener would have no way to hear that it had stopped meaning one thing.
+    let (app, live) = enabled();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let mut subscription = live.subscribe(&channel, None);
+
+    let mut first = create("event-a", "10", false);
+    first["message"]["content"] = json!("1000000000000000009 opened it");
+    assert_eq!(
+        post(&app, Some(INGEST_TOKEN), first).await.0,
+        StatusCode::ACCEPTED
+    );
+    let mut second = create("event-b", "11", false);
+    second["message"]["content"] = json!("1000000000000000017 replied, 1000000000000000009 merged");
+    assert_eq!(
+        post(&app, Some(INGEST_TOKEN), second).await.0,
+        StatusCode::ACCEPTED
+    );
+
+    let one = subscription.receiver.try_recv().expect("first").message;
+    let two = subscription.receiver.try_recv().expect("second").message;
+    assert_eq!(one.spoken_content, "large number A opened it");
+    assert_eq!(
+        two.spoken_content, "large number B replied, large number A merged",
+        "the letter from the first message did not survive into the second"
+    );
 }
 
 #[tokio::test]

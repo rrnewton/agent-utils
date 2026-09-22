@@ -199,6 +199,7 @@ mod tests {
                 spoken_time: format!("08:{i:02}:00 EDT"),
                 reply_to: None,
                 content: (*content).to_owned(),
+                spoken_content: String::new(),
             })
             .collect()
     }

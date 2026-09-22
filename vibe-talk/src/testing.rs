@@ -247,6 +247,7 @@ fn state_pieces_with(
         added_channels: Arc::new(std::sync::RwLock::new(Vec::new())),
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         speech_tickets: Arc::new(crate::speech_tickets::SpeechTickets::new()),
+        spoken_names: Arc::new(crate::speakable::SharedNames::new()),
         live: Arc::new(crate::live::LiveHub::new()),
         summarizer: Arc::clone(&summarizer),
         // Taken from the summariser rather than named here, exactly as `main` takes it, so a test

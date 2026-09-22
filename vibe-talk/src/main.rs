@@ -476,6 +476,7 @@ async fn main() -> anyhow::Result<()> {
         elevenlabs,
         speech,
         store,
+        spoken_names: Arc::new(vibe_talk::speakable::SharedNames::new()),
         added_channels: Arc::new(std::sync::RwLock::new(Vec::new())),
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),

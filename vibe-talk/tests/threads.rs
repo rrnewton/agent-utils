@@ -27,6 +27,7 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
         spoken_time: String::new(),
         reply_to: None,
         content: content.to_owned(),
+        spoken_content: String::new(),
         thread: thread.then(|| MessageThread {
             id: THREAD.to_owned(),
             root_message_id: Some(MessageId("10".to_owned())),

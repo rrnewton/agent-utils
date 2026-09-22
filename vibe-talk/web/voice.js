@@ -8118,9 +8118,27 @@ function channelLabel(channelId) {
   return option ? option.textContent : String(channelId);
 }
 
-/** One quoted line about an arriving message, cut to a budget. NO framing: the turn carries that. */
+/**
+ * One quoted line about an arriving message, cut to a budget. NO framing: the turn carries that.
+ *
+ * `spoken_content` FIRST, and `content` only as the fallback. They are not the same text: the
+ * server has already taken the markdown off the prepared one, said its timestamps the way a
+ * listener places them, and replaced every nineteen-digit snowflake with a letter that means the
+ * same account in the next message as it did in this one. Quoting the raw body instead is how
+ * `read new` came to spell ids out digit by digit — this was the one path to the agent that
+ * prepared nothing, because it is the one built here rather than on the server.
+ *
+ * The fallback is not decoration. A server older than the field sends no `spoken_content`, and
+ * reading such a message badly is much better than the alternative of not reading it at all: a
+ * reader who is listening cannot tell silence apart from a message that never arrived.
+ *
+ * The ROW on screen still shows `content`, untouched. The prepared body is for the voice; the
+ * screen shows what was actually written, and that is also what keeps a letter recoverable — the
+ * id it stands for is on the row the reader is looking at.
+ */
 function relayLine(message) {
-  const body = String(message.content || "").replace(/\s+/g, " ").trim();
+  const said = String(message.spoken_content || message.content || "");
+  const body = said.replace(/\s+/g, " ").trim();
   const text =
     body.length > RELAY_MAX_CHARS ? `${body.slice(0, RELAY_MAX_CHARS - 1)}…` : body;
   return `in ${channelLabel(message.channel_id)}, ${message.author} said: ${text}`;
