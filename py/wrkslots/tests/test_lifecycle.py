@@ -23126,6 +23126,82 @@ def test_audit_reports_deletable_blocked_held_and_the_leak_invariant(
     )
 
 
+def test_audit_blocks_agent_slot_when_submodule_remote_differs_from_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    submodule_remote = tmp_path / "submodule.git"
+    redirected_remote = tmp_path / "redirected.git"
+    submodule_source = tmp_path / "submodule-source"
+    for bare in (submodule_remote, redirected_remote):
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(bare)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    subprocess.run(
+        ["git", "clone", str(submodule_remote), str(submodule_source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(submodule_source, "config", "user.name", "Wrkslots Test")
+    git(submodule_source, "config", "user.email", "wrkslots@example.invalid")
+    (submodule_source / "base.txt").write_text("base\n", encoding="utf-8")
+    git(submodule_source, "add", "base.txt")
+    git(submodule_source, "commit", "-m", "submodule base")
+    git(submodule_source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(submodule_remote),
+        "component",
+    )
+    git(repository, "commit", "-am", "add component")
+    git(repository, "push", "origin", "main")
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init --recursive"
+        ],
+    )
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    nested = checkout(project) / "component"
+    git(nested, "remote", "set-url", "origin", str(redirected_remote))
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    expire_heartbeat(project)
+    monkeypatch.setattr(
+        wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    audit_code = wrkslots.main(
+        ["--project-root", str(project), "audit", "--format", "json"]
+    )
+    captured = capsys.readouterr()
+
+    assert audit_code == 0, captured.err
+    row = json.loads(captured.out)["slots"][0]
+    assert row["verdict"] == "BLOCKED"
+    assert any(
+        "submodule product/component remote origin differs from its configured source"
+        in reason
+        for reason in row["reasons"]
+    )
+
+
 def test_unregistered_validation_reports_preservation_without_inventing_owner(
     tmp_path: Path,
 ) -> None:

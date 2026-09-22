@@ -14884,6 +14884,11 @@ def _audit_record(
                 selected_vcs.assert_ordinary_history(path)
                 selected_vcs.assert_ordinary_index(path)
                 _assert_cache_policy_untracked(config, checkout, selected_vcs)
+                # Removal salvages initialized submodules before deleting an
+                # agent slot.  Audit must therefore establish the same local
+                # remote authority first; otherwise it can advertise
+                # DELETABLE only for remove to refuse before salvage.
+                _submodule_salvage_checkouts(config, checkout, selected_vcs)
             if (
                 selected_vcs.remote_url_sha256(path, checkout.remote)
                 != checkout.remote_url_sha256
