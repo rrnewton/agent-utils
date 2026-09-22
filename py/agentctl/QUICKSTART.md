@@ -64,26 +64,36 @@ and the other subcommand help pages describe every option. Worker, Chat, and
 MCP extensions are installation-dependent; inspect `agentctl capabilities`
 before using their commands.
 
-To launch a coordinator directly in the current Herdr shell pane and bridge it
-for the lifetime of that session, run:
+Chat transports vary by installation. When `agentctl capabilities` lists the
+event-driven subscription service, it targets an already registered interactive
+agent:
+
+```sh
+agentctl chat quickstart
+agentctl --registry /work/project/.agentctl chat init \
+  --config chat.json --bridge-state /home/me/.local/state/agentctl/project-chat
+agentctl --registry /work/project/.agentctl chat run \
+  --bridge-state /home/me/.local/state/agentctl/project-chat
+```
+
+When `agentctl chat --help` lists `launch`, the installed polling transport can
+instead launch a coordinator directly in the current Herdr shell pane for the
+lifetime of that session:
 
 ```sh
 agentctl chat launch --config chat.json --model gpt-6-astra
 ```
 
-The reusable Chat config supplies the space, allowed senders, and transport;
-`launch` supplies the current pane, workspace, and working directory. Subagents
-started by that coordinator inherit the same Herdr workspace. Run
-`agentctl chat quickstart` for the compact configuration and
-`agentctl chat userguide` for authentication, recovery, and the separate-daemon
-alternative.
+Run `agentctl chat quickstart` for the installed edition's compact
+configuration and `agentctl chat userguide` for its authentication, recovery,
+and service model. A subscription-plugin bridge is a separate foreground
+process controlled by `chat run`; it does not use `chat launch`.
 
 The Chat bridge accepts messages from configured senders, acknowledges intake
 with 🤖, and sends the agent's tagged replies back to their originating chat
 thread. One request can receive multiple replies, including progress updates.
 The agent normally needs no reply-file write or reply command. Thread
 replies also include a command hint for reading the nearest ten prior messages.
-The built-in transport polls the public Google Chat API. For prompt intake from
-a persistent event stream, configure an `event_command` adapter as described in
-`agentctl chat userguide`; ACKs, prompt delivery, and recovery scans then run
-independently.
+A polling transport can consume the public Google Chat API or its configured
+`event_command`. A subscription transport blocks on the selected plugin. In
+both cases ACKs, prompt delivery, and recovery scans run independently.

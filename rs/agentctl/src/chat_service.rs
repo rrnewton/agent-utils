@@ -16,11 +16,11 @@ use serde_json::{json, Value};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
-use crate::agent::{AgentError, DrainOptions};
+use crate::agent::{AgentError, AgentRuntime, DrainOptions, QueueMessageState};
 use crate::chat_events::{PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
-    self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CoordinatorDeliveryResult,
-    ReplyRoute,
+    self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
+    CoordinatorDeliveryResult, OutboundCancellation, ReplyRoute,
 };
 use crate::client::HerdrClient;
 use crate::subagents::{ManagedAgents, ManagedApi};
@@ -31,8 +31,12 @@ const MAX_SNAPSHOT_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_KEYS_PER_PASS: usize = 4;
 const MAX_SENDS_PER_PASS: usize = 64;
 const PROVIDER_NOTICE_CAPACITY: usize = 64;
+const MAX_PROVIDER_NOTICES_PER_PASS: usize = 64;
+const MAX_DIRECT_REQUEST_KEYS: usize = 2_048;
 const EVENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_RETRY_MAX: Duration = Duration::from_secs(60);
+const PROVIDER_JOIN_TIMEOUT: Duration = Duration::from_secs(45);
+const SIGNAL_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A service or command failure with its original typed source where available.
 #[derive(Debug)]
@@ -184,7 +188,12 @@ pub fn tick<A: ManagedApi + ?Sized>(
     let snapshot = manager.read(&state.config().agent_name, SNAPSHOT_LINES)?;
     validate_snapshot(&snapshot)?;
     let mut routes = RouteCache::new(state.active_reply_routes()?);
-    let mut report = recover_pass(&state, manager, options.delivery, &mut routes)?;
+    let mut transport = state.outbound_transport()?;
+    let mut control = PassControl {
+        transport: &mut transport,
+        stop: None,
+    };
+    let mut report = recover_pass(&state, manager, options.delivery, &mut routes, &mut control)?;
     report.merge(capture_recovery_snapshot(
         &state,
         manager,
@@ -195,6 +204,7 @@ pub fn tick<A: ManagedApi + ?Sized>(
             truncated: false,
             revision: None,
         },
+        &mut control,
     )?);
     if manager.pane_info(&state.config().agent_name)?.pane_id != info.pane_id {
         return Err(ChatServiceError::Generation(
@@ -213,7 +223,11 @@ pub fn run<A: ManagedApi + ?Sized>(
 ) -> Result<Value, ChatServiceError> {
     let state = BridgeState::open(state_root)?;
     validate_service_outbound(state.config())?;
-    let _outbound = state.outbound_transport()?;
+    let outbound_cancellation = OutboundCancellation::new()?;
+    let mut outbound = state.outbound_transport()?;
+    if let Some(transport) = outbound.as_mut() {
+        transport.set_cancellation(outbound_cancellation.clone());
+    }
     let inventory = crate::plugins::discover();
     let _pinned = chat_runtime::select_plugin(&inventory, state.config())?;
     let _target = manager.pane_info(&state.config().agent_name)?;
@@ -227,6 +241,7 @@ pub fn run<A: ManagedApi + ?Sized>(
         Arc::clone(&stop),
         Arc::clone(&cancellation),
         Arc::clone(&output_wake),
+        outbound_cancellation.clone(),
     )?;
     let (notices, notice_receiver) = mpsc::sync_channel(PROVIDER_NOTICE_CAPACITY);
     let provider = match spawn_provider(
@@ -240,8 +255,9 @@ pub fn run<A: ManagedApi + ?Sized>(
         Ok(provider) => provider,
         Err(error) => {
             stop.stop();
+            outbound_cancellation.cancel();
             signal_handle.close();
-            let _ = signal_thread.join();
+            let _ = join_worker(signal_thread, "chat signal", SIGNAL_JOIN_TIMEOUT);
             return Err(error);
         }
     };
@@ -256,22 +272,54 @@ pub fn run<A: ManagedApi + ?Sized>(
         &output_wake,
         &overflowed,
         &notice_receiver,
+        &mut outbound,
     );
 
     stop.stop();
+    outbound_cancellation.cancel();
     wake_output(&output_wake);
-    cancel_provider(&cancellation);
+    if let Err(error) = cancel_provider(&cancellation) {
+        stop.record_cleanup_error(error.to_string());
+    }
     signal_handle.close();
-    let signal_join = signal_thread
+    if let Err(error) = join_worker(signal_thread, "chat signal", SIGNAL_JOIN_TIMEOUT) {
+        stop.record_cleanup_error(error.to_string());
+    }
+    if let Err(error) = join_worker(provider, "chat provider", PROVIDER_JOIN_TIMEOUT) {
+        stop.record_cleanup_error(error.to_string());
+    }
+    let cleanup_errors = stop.take_cleanup_errors();
+    match (result, cleanup_errors.is_empty()) {
+        (Ok(()), true) => Ok(json!({"stopped": true})),
+        (Err(error), true) => Err(error),
+        (primary, false) => {
+            let cleanup = cleanup_errors.join("; ");
+            Err(ChatServiceError::Worker(match primary {
+                Ok(()) => format!("chat shutdown cleanup is uncertain: {cleanup}"),
+                Err(error) => format!("{error}; chat shutdown cleanup is uncertain: {cleanup}"),
+            }))
+        }
+    }
+}
+
+fn join_worker(
+    worker: thread::JoinHandle<()>,
+    label: &str,
+    timeout: Duration,
+) -> Result<(), ChatServiceError> {
+    let deadline = Instant::now() + timeout;
+    while !worker.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !worker.is_finished() {
+        return Err(ChatServiceError::Worker(format!(
+            "{label} worker did not stop within {}s; cleanup is uncertain",
+            timeout.as_secs_f64()
+        )));
+    }
+    worker
         .join()
-        .map_err(|_| ChatServiceError::Worker("chat signal worker panicked".to_owned()));
-    let provider_join = provider
-        .join()
-        .map_err(|_| ChatServiceError::Worker("chat provider worker panicked".to_owned()));
-    result?;
-    signal_join?;
-    provider_join?;
-    Ok(json!({"stopped": true}))
+        .map_err(|_| ChatServiceError::Worker(format!("{label} worker panicked")))
 }
 
 fn validate_service_outbound(configuration: &BridgeConfiguration) -> Result<(), ChatServiceError> {
@@ -297,13 +345,14 @@ fn recover_pass<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
     delivery: DrainOptions,
     routes: &mut RouteCache,
+    control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
     let mut keys = BTreeSet::new();
     keys.extend(state.pending_request_keys()?);
     keys.extend(state.pending_ack_keys()?);
     keys.extend(state.pending_reply_keys()?);
     let keys = keys.into_iter().collect::<Vec<_>>();
-    let mut report = process_keys(state, manager, delivery, &keys)?;
+    let mut report = process_keys(state, manager, delivery, &keys, control)?;
     if keys.len() > MAX_KEYS_PER_PASS {
         report.more_work = true;
     }
@@ -316,21 +365,29 @@ fn process_keys<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
     delivery: DrainOptions,
     keys: &[String],
+    control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
     if keys.is_empty() {
         return Ok(CycleReport::default());
     }
     let mut report = CycleReport::default();
-    let mut transport = state.outbound_transport()?;
     for key in keys.iter().take(MAX_KEYS_PER_PASS) {
-        if let Some(transport) = transport.as_mut() {
+        if control.stopped() {
+            report.more_work = true;
+            break;
+        }
+        if let Some(transport) = control.transport.as_mut() {
             match state.ensure_ack(key, transport) {
                 Ok(AckResult::Disabled) => {}
                 Ok(AckResult::Acked(_)) => report.acknowledged.push(key.clone()),
                 Err(error) => report.error("acknowledge", key, error),
             }
         }
-        match chat_runtime::deliver_request(state, manager, key, delivery) {
+        if control.stopped() {
+            report.more_work = true;
+            break;
+        }
+        match deliver_request(state, manager, key, delivery, control.stop) {
             Ok(
                 CoordinatorDeliveryResult::Delivered | CoordinatorDeliveryResult::AlreadyDelivered,
             ) => report.delivered.push(key.clone()),
@@ -344,10 +401,14 @@ fn process_keys<A: ManagedApi + ?Sized>(
             Err(error) => report.error("deliver", key, error),
         }
     }
-    if let Some(transport) = transport.as_mut() {
+    if let Some(transport) = control.transport.as_mut() {
         let mut sends = 0_usize;
         for key in keys.iter().take(MAX_KEYS_PER_PASS) {
             while sends < MAX_SENDS_PER_PASS {
+                if control.stop.is_some_and(StopState::is_stopped) {
+                    report.more_work = true;
+                    return Ok(report);
+                }
                 match state.publish_one(key, transport) {
                     Ok(Some(receipt)) => {
                         report.sent.push(receipt);
@@ -375,6 +436,7 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
     delivery: DrainOptions,
     routes: &mut RouteCache,
     snapshot: SnapshotInput<'_>,
+    control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
     validate_snapshot(snapshot.text)?;
     let capture = state.capture_snapshot(snapshot.text)?;
@@ -385,7 +447,7 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
         ..CycleReport::default()
     };
     if !capture.unknown_ids.is_empty() {
-        match chat_runtime::deliver_fence_feedback(state, manager, &capture.unknown_ids, delivery) {
+        match deliver_feedback(state, manager, &capture.unknown_ids, delivery, control.stop) {
             Ok(CoordinatorDeliveryResult::Pending(_)) => report.more_work = true,
             Ok(CoordinatorDeliveryResult::Uncertain(_)) => {}
             Ok(
@@ -399,7 +461,13 @@ fn capture_recovery_snapshot<A: ManagedApi + ?Sized>(
         .into_iter()
         .map(|(key, _)| key)
         .collect::<Vec<_>>();
-    report.merge(process_keys(state, manager, delivery, &captured_keys)?);
+    report.merge(process_keys(
+        state,
+        manager,
+        delivery,
+        &captured_keys,
+        control,
+    )?);
     *routes = RouteCache::new(state.active_reply_routes()?);
     Ok(report)
 }
@@ -411,11 +479,30 @@ fn capture_direct<A: ManagedApi + ?Sized>(
     routes: &mut RouteCache,
     identifier: &str,
     snapshot: SnapshotInput<'_>,
+    control: &mut PassControl<'_>,
 ) -> Result<CycleReport, ChatServiceError> {
     validate_snapshot(snapshot.text)?;
-    let Some(key) = routes.key(identifier).map(str::to_owned) else {
-        return capture_recovery_snapshot(state, manager, delivery, routes, snapshot);
+    let key = match refresh_matched_route(state, routes, identifier)? {
+        MatchedRoute::Unknown => {
+            return capture_recovery_snapshot(state, manager, delivery, routes, snapshot, control);
+        }
+        MatchedRoute::Stale => {
+            return Ok(CycleReport {
+                snapshot_truncated: snapshot.truncated,
+                snapshot_revision: snapshot.revision,
+                ..CycleReport::default()
+            });
+        }
+        MatchedRoute::Current(key) => key,
     };
+    if control.stopped() {
+        return Ok(CycleReport {
+            snapshot_truncated: snapshot.truncated,
+            snapshot_revision: snapshot.revision,
+            more_work: true,
+            ..CycleReport::default()
+        });
+    }
     let capture = state.capture_replies(&key, snapshot.text)?;
     let mut report = CycleReport {
         snapshot_truncated: snapshot.truncated,
@@ -429,10 +516,35 @@ fn capture_direct<A: ManagedApi + ?Sized>(
             manager,
             delivery,
             std::slice::from_ref(&key),
+            control,
         )?);
     }
     routes.replace(&key, state.next_reply_route(&key)?);
     Ok(report)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MatchedRoute {
+    Unknown,
+    Stale,
+    Current(String),
+}
+
+fn refresh_matched_route(
+    state: &BridgeState,
+    routes: &mut RouteCache,
+    identifier: &str,
+) -> Result<MatchedRoute, ChatRuntimeError> {
+    let Some(key) = routes.key(identifier).map(str::to_owned) else {
+        return Ok(MatchedRoute::Unknown);
+    };
+    let current = state.next_reply_route(&key)?;
+    if current.as_ref().map(|route| route.identifier.as_str()) == Some(identifier) {
+        Ok(MatchedRoute::Current(key))
+    } else {
+        routes.replace(&key, current);
+        Ok(MatchedRoute::Stale)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -440,6 +552,17 @@ struct SnapshotInput<'a> {
     text: &'a str,
     truncated: bool,
     revision: Option<u64>,
+}
+
+struct PassControl<'a> {
+    transport: &'a mut Option<CommandOutboundTransport>,
+    stop: Option<&'a StopState>,
+}
+
+impl PassControl<'_> {
+    fn stopped(&self) -> bool {
+        self.stop.is_some_and(StopState::is_stopped)
+    }
 }
 
 #[derive(Debug)]
@@ -477,20 +600,7 @@ impl RouteCache {
     }
 
     fn patterns(&self) -> Vec<String> {
-        if self.by_identifier.is_empty() {
-            return vec![
-                r"^[^\S\r\n]*(?:[•⏺][ \t]+)?</?(?:GCHAT|CHAT)_REPLY_[^<>\s]*>[^\S\r\n]*$"
-                    .to_owned(),
-            ];
-        }
-        self.by_identifier
-            .keys()
-            .map(|identifier| {
-                format!(
-                    r"^[^\S\r\n]*(?:[•⏺][ \t]+)?</(?:GCHAT|CHAT)_REPLY_{identifier}>[^\S\r\n]*$"
-                )
-            })
-            .collect()
+        vec![r"^[^\S\r\n]*(?:[•⏺][ \t]+)?</(?:GCHAT|CHAT)_REPLY_[^<>\s]*>[^\S\r\n]*$".to_owned()]
     }
 }
 
@@ -518,6 +628,7 @@ struct StopState {
     stopped: AtomicBool,
     lock: Mutex<()>,
     changed: Condvar,
+    cleanup_errors: Mutex<Vec<String>>,
 }
 
 impl StopState {
@@ -541,6 +652,139 @@ impl StopState {
                 .wait_timeout(guard, duration)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+    }
+
+    fn record_cleanup_error(&self, error: impl Into<String>) {
+        self.cleanup_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(error.into());
+    }
+
+    fn take_cleanup_errors(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .cleanup_errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+struct StopRuntime<'a> {
+    stop: &'a StopState,
+    origin: Instant,
+}
+
+impl<'a> StopRuntime<'a> {
+    fn new(stop: &'a StopState) -> Self {
+        Self {
+            stop,
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl AgentRuntime for StopRuntime<'_> {
+    fn monotonic(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.stop.wait(duration);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.stop.is_stopped()
+    }
+
+    fn delivery_wait_chunk(&self) -> Option<Duration> {
+        Some(Duration::from_millis(250))
+    }
+}
+
+struct CancellableDelivery<'a, A: ManagedApi + ?Sized> {
+    manager: &'a ManagedAgents<'a, A>,
+    runtime: StopRuntime<'a>,
+}
+
+impl<A: ManagedApi + ?Sized> chat_runtime::CoordinatorDelivery for CancellableDelivery<'_, A> {
+    fn message_state(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+    ) -> std::result::Result<Option<QueueMessageState>, String> {
+        self.manager
+            .message_state(agent_name, message_id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn submit(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        message_id: &str,
+        options: DrainOptions,
+    ) -> std::result::Result<(), String> {
+        if self.runtime.cancelled() {
+            return Err("chat delivery was cancelled before prompt submission".to_owned());
+        }
+        self.manager
+            .send_identified_with_runtime(agent_name, prompt, options, message_id, &self.runtime)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String> {
+        if self.runtime.cancelled() {
+            return Err("chat delivery was cancelled before queue drain".to_owned());
+        }
+        self.manager
+            .drain_with_runtime(agent_name, options, &self.runtime)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn deliver_request<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    key: &str,
+    options: DrainOptions,
+    stop: Option<&StopState>,
+) -> Result<CoordinatorDeliveryResult, ChatRuntimeError> {
+    match stop {
+        Some(stop) => chat_runtime::deliver_request_with(
+            state,
+            &CancellableDelivery {
+                manager,
+                runtime: StopRuntime::new(stop),
+            },
+            key,
+            options,
+        ),
+        None => chat_runtime::deliver_request(state, manager, key, options),
+    }
+}
+
+fn deliver_feedback<A: ManagedApi + ?Sized>(
+    state: &BridgeState,
+    manager: &ManagedAgents<'_, A>,
+    unknown_ids: &[String],
+    options: DrainOptions,
+    stop: Option<&StopState>,
+) -> Result<CoordinatorDeliveryResult, ChatRuntimeError> {
+    match stop {
+        Some(stop) => chat_runtime::deliver_fence_feedback_with(
+            state,
+            &CancellableDelivery {
+                manager,
+                runtime: StopRuntime::new(stop),
+            },
+            unknown_ids,
+            options,
+        ),
+        None => chat_runtime::deliver_fence_feedback(state, manager, unknown_ids, options),
     }
 }
 
@@ -571,6 +815,12 @@ fn spawn_provider(
                     Ok(()) if stop.is_stopped() => break,
                     Ok(()) => {
                         send_notice(&notices, ProviderNotice::End, &output_wake, &overflowed);
+                    }
+                    Err(error) if stop.is_stopped() => {
+                        stop.record_cleanup_error(format!(
+                            "provider shutdown generation failed: {error}"
+                        ));
+                        break;
                     }
                     Err(error) => send_notice(
                         &notices,
@@ -617,7 +867,9 @@ fn provider_generation(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(process_cancellation.clone());
     if stop.is_stopped() {
-        let _ = process_cancellation.cancel();
+        process_cancellation
+            .cancel()
+            .map_err(|error| format!("provider cancellation cleanup failed: {error}"))?;
         return Ok(());
     }
     let request = state
@@ -627,7 +879,9 @@ fn provider_generation(
         ChatSubscription::open(&mut backend, &request).map_err(|error| error.to_string())?;
     loop {
         if stop.is_stopped() {
-            let _ = process_cancellation.cancel();
+            process_cancellation
+                .cancel()
+                .map_err(|error| format!("provider cancellation cleanup failed: {error}"))?;
             return Ok(());
         }
         match chat_runtime::consume_one(&mut subscription, state)
@@ -666,15 +920,18 @@ fn clear_cancellation(cancellation: &SharedCancellation) {
         .take();
 }
 
-fn cancel_provider(cancellation: &SharedCancellation) {
+fn cancel_provider(cancellation: &SharedCancellation) -> Result<(), ChatServiceError> {
     if let Some(cancellation) = cancellation
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .cloned()
     {
-        let _ = cancellation.cancel();
+        cancellation.cancel().map_err(|error| {
+            ChatServiceError::Worker(format!("provider cancellation cleanup failed: {error}"))
+        })?;
     }
+    Ok(())
 }
 
 fn wake_output(output_wake: &SharedWake) {
@@ -691,6 +948,7 @@ fn spawn_signal_worker(
     stop: Arc<StopState>,
     cancellation: SharedCancellation,
     output_wake: SharedWake,
+    outbound_cancellation: OutboundCancellation,
 ) -> Result<(SignalHandle, thread::JoinHandle<()>), ChatServiceError> {
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
     let handle = signals.handle();
@@ -699,8 +957,11 @@ fn spawn_signal_worker(
         .spawn(move || {
             if signals.forever().next().is_some() {
                 stop.stop();
+                outbound_cancellation.cancel();
                 wake_output(&output_wake);
-                cancel_provider(&cancellation);
+                if let Err(error) = cancel_provider(&cancellation) {
+                    stop.record_cleanup_error(error.to_string());
+                }
             }
         })?;
     Ok((handle, worker))
@@ -717,8 +978,13 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     output_wake: &SharedWake,
     overflowed: &AtomicBool,
     notices: &mpsc::Receiver<ProviderNotice>,
+    transport: &mut Option<CommandOutboundTransport>,
 ) -> Result<(), ChatServiceError> {
     let mut routes = RouteCache::new(state.active_reply_routes()?);
+    let mut control = PassControl {
+        transport,
+        stop: Some(stop),
+    };
     let initial = manager.read(&state.config().agent_name, SNAPSHOT_LINES)?;
     let initial_report = capture_recovery_snapshot(
         state,
@@ -730,9 +996,10 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             truncated: false,
             revision: None,
         },
+        &mut control,
     )?;
     log_report(&initial_report);
-    let recovery = recover_pass(state, manager, options.delivery, &mut routes)?;
+    let recovery = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
     log_report(&recovery);
 
     let mut stream: Option<PaneEventStream> = None;
@@ -743,24 +1010,29 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
     let mut direct_keys = VecDeque::new();
 
     while !stop.is_stopped() {
-        while let Ok(notice) = notices.try_recv() {
+        for _ in 0..MAX_PROVIDER_NOTICES_PER_PASS {
+            let Ok(notice) = notices.try_recv() else {
+                break;
+            };
             match notice {
-                ProviderNotice::Batch(keys) => direct_keys.extend(keys),
+                ProviderNotice::Batch(keys) => {
+                    enqueue_direct_keys(&mut direct_keys, keys, overflowed)
+                }
                 ProviderNotice::Error(error) => eprintln!("agentctl: chat provider: {error}"),
                 ProviderNotice::End => {
                     eprintln!("agentctl: chat provider stream ended; reconnecting")
                 }
             }
         }
-        if overflowed.swap(false, Ordering::SeqCst) {
-            let report = recover_pass(state, manager, options.delivery, &mut routes)?;
+        if direct_keys.is_empty() && overflowed.swap(false, Ordering::SeqCst) {
+            let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             log_report(&report);
         }
         if !direct_keys.is_empty() {
             let keys = direct_keys
                 .drain(..direct_keys.len().min(MAX_KEYS_PER_PASS))
                 .collect::<Vec<_>>();
-            let report = process_keys(state, manager, options.delivery, &keys)?;
+            let report = process_keys(state, manager, options.delivery, &keys, &mut control)?;
             log_report(&report);
             for key in &keys {
                 routes.replace(key, state.next_reply_route(key)?);
@@ -781,10 +1053,11 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                         truncated: false,
                         revision: None,
                     },
+                    &mut control,
                 )?;
                 log_report(&report);
             }
-            let report = recover_pass(state, manager, options.delivery, &mut routes)?;
+            let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             log_report(&report);
             next_reconciliation = Instant::now() + options.reconciliation_interval;
         }
@@ -826,7 +1099,11 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
 
         if let Some(active) = stream.as_mut() {
             let subscribed_pane = active.pane_id().to_owned();
-            let timeout = next_reconciliation.saturating_duration_since(Instant::now());
+            let timeout = if direct_keys.is_empty() {
+                next_reconciliation.saturating_duration_since(Instant::now())
+            } else {
+                Duration::ZERO
+            };
             match active.wait(timeout) {
                 Ok(events) => {
                     for event in events {
@@ -856,6 +1133,7 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                         truncated,
                                         revision,
                                     },
+                                    &mut control,
                                 )?;
                                 log_report(&report);
                             }
@@ -875,10 +1153,16 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
                                         truncated: false,
                                         revision: None,
                                     },
+                                    &mut control,
                                 )?;
                                 log_report(&report);
-                                let recovery =
-                                    recover_pass(state, manager, options.delivery, &mut routes)?;
+                                let recovery = recover_pass(
+                                    state,
+                                    manager,
+                                    options.delivery,
+                                    &mut routes,
+                                    &mut control,
+                                )?;
                                 log_report(&recovery);
                             }
                             PaneEvent::Settled { .. } => {}
@@ -898,12 +1182,18 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             }
         } else {
             let wait_until = next_reconciliation.min(output_retry_at.max(Instant::now()));
-            let timeout = wait_until
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_secs(1));
+            let timeout = if direct_keys.is_empty() {
+                wait_until
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(1))
+            } else {
+                Duration::ZERO
+            };
             match notices.recv_timeout(timeout) {
                 Ok(notice) => match notice {
-                    ProviderNotice::Batch(keys) => direct_keys.extend(keys),
+                    ProviderNotice::Batch(keys) => {
+                        enqueue_direct_keys(&mut direct_keys, keys, overflowed)
+                    }
                     ProviderNotice::Error(error) => {
                         eprintln!("agentctl: chat provider: {error}")
                     }
@@ -919,8 +1209,18 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             }
         }
     }
-    cancel_provider(cancellation);
+    cancel_provider(cancellation)?;
     Ok(())
+}
+
+fn enqueue_direct_keys(queued: &mut VecDeque<String>, keys: Vec<String>, overflowed: &AtomicBool) {
+    let available = MAX_DIRECT_REQUEST_KEYS.saturating_sub(queued.len());
+    if keys.len() > available {
+        // Every key is already durable. The bounded queue is only a low-latency hint; the recovery
+        // pass owns anything that does not fit without allowing a fast provider to grow memory.
+        overflowed.store(true, Ordering::SeqCst);
+    }
+    queued.extend(keys.into_iter().take(available));
 }
 
 fn connect_output<A: ManagedApi + ?Sized>(
@@ -955,9 +1255,67 @@ fn log_report(report: &CycleReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use chat_subscription::{
+        ChannelId, CommittableEvent, DeliveryBatch, DeliveryId, EventSequence, InboundMessage,
+        MessageId, ProviderCursor, SenderId, ThreadId,
+    };
+
+    static NEXT_STATE: AtomicU64 = AtomicU64::new(1);
+
+    fn state_with_request() -> (BridgeState, String, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-chat-service-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private fixture");
+        let state = BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                subscription_plugin: "fixture".to_owned(),
+                channel_ids: vec!["spaces/example".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                agent_name: "coordinator".to_owned(),
+                agent_label: "coordinator".to_owned(),
+                outbound_enabled: true,
+                ack_reaction: Some("🤖".to_owned()),
+                backend_configuration: None,
+                outbound_command: None,
+            },
+        )
+        .expect("initialize state");
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new("spaces/example/messages/one").expect("message"),
+            ThreadId::new("spaces/example/threads/one").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "request",
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("inbound message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor").expect("cursor"),
+            DeliveryId::new("delivery").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery batch");
+        let key = state
+            .admit_batch(&batch)
+            .expect("admit request")
+            .new_request_keys
+            .remove(0);
+        (state, key, root)
+    }
 
     #[test]
-    fn route_cache_builds_exact_line_local_patterns_and_updates_one_key() {
+    fn route_cache_uses_one_generic_line_pattern_and_updates_direct_id_index() {
         let first_key = "a".repeat(64);
         let second_key = "b".repeat(64);
         let mut routes = RouteCache::new(vec![
@@ -971,9 +1329,8 @@ mod tests {
             },
         ]);
         let patterns = routes.patterns();
-        assert_eq!(patterns.len(), 2);
-        assert!(patterns[0].contains("AAAAAAAAAAAAAAAAAAAAAA_1"));
-        assert!(patterns[1].contains("BBBBBBBBBBBBBBBBBBBBBB_7"));
+        assert_eq!(patterns.len(), 1);
+        assert!(patterns[0].contains("(?:GCHAT|CHAT)_REPLY_"));
         assert_eq!(
             routes.key("AAAAAAAAAAAAAAAAAAAAAA_1"),
             Some(first_key.as_str())
@@ -1002,5 +1359,121 @@ mod tests {
         );
         assert_eq!(matched_identifier("```"), None);
         assert_eq!(matched_identifier("<CHAT_REPLY_nonce_4>"), None);
+    }
+
+    #[test]
+    fn one_generic_closing_predicate_routes_full_provider_batch_capacity() {
+        let routes = (1..=chat_subscription::MAX_BATCH_EVENTS)
+            .map(|index| ReplyRoute {
+                key: format!("{index:064x}"),
+                identifier: format!("AAAAAAAAAAAAAAAAAAAAAA_{index}"),
+            })
+            .collect::<Vec<_>>();
+        let cache = RouteCache::new(routes);
+        assert_eq!(cache.by_identifier.len(), 256);
+        let patterns = cache.patterns();
+        assert_eq!(patterns.len(), 1);
+        assert!(patterns[0].starts_with("^[^\\S\\r\\n]*"));
+        assert!(patterns[0].contains("</(?:GCHAT|CHAT)_REPLY_"));
+    }
+
+    #[test]
+    fn provider_hint_queue_is_bounded_and_marks_durable_recovery() {
+        let mut queued = VecDeque::new();
+        let overflowed = AtomicBool::new(false);
+        enqueue_direct_keys(
+            &mut queued,
+            (0..=MAX_DIRECT_REQUEST_KEYS)
+                .map(|index| format!("{index:064x}"))
+                .collect(),
+            &overflowed,
+        );
+        assert_eq!(queued.len(), MAX_DIRECT_REQUEST_KEYS);
+        assert!(overflowed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn concurrently_closed_route_is_evicted_without_capture_failure() {
+        let (state, key, root) = state_with_request();
+        let route = state
+            .next_reply_route(&key)
+            .expect("read route")
+            .expect("active route");
+        let mut routes = RouteCache::new(vec![route.clone()]);
+        state
+            .close_replies(&key)
+            .expect("close replies concurrently");
+        let client = HerdrClient::with_executable("direct", Path::new("/missing/herdr"))
+            .expect("construct client");
+        let manager = ManagedAgents::new(&client, &root.join("registry")).expect("manager");
+        let mut transport = None;
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: None,
+        };
+        let report = capture_direct(
+            &state,
+            &manager,
+            DrainOptions::default(),
+            &mut routes,
+            &route.identifier,
+            SnapshotInput {
+                text: &format!("</CHAT_REPLY_{}>", route.identifier),
+                truncated: false,
+                revision: Some(7),
+            },
+            &mut control,
+        )
+        .expect("stale close is a capture no-op");
+        assert!(report.captured.is_empty());
+        assert_eq!(report.snapshot_revision, Some(7));
+        assert_eq!(routes.key(&route.identifier), None);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn stopped_owner_launches_no_further_outbound_helpers() {
+        let (state, key, root) = state_with_request();
+        let helper = root.join("helper");
+        fs::copy(
+            fs::canonicalize("/bin/sh").expect("canonical shell"),
+            &helper,
+        )
+        .expect("copy helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+        let marker = root.join("launched");
+        let mut transport = Some(
+            CommandOutboundTransport::new(
+                helper,
+                vec![
+                    std::ffi::OsString::from("-c"),
+                    std::ffi::OsString::from(format!("touch '{}'; exit 9", marker.display())),
+                ],
+                &[],
+                Duration::from_secs(1),
+                Duration::ZERO,
+            )
+            .expect("pin helper"),
+        );
+        let client = HerdrClient::with_executable("direct", Path::new("/missing/herdr"))
+            .expect("construct client");
+        let manager = ManagedAgents::new(&client, &root.join("registry")).expect("manager");
+        let stop = StopState::default();
+        stop.stop();
+        let mut control = PassControl {
+            transport: &mut transport,
+            stop: Some(&stop),
+        };
+        let report = process_keys(
+            &state,
+            &manager,
+            DrainOptions::default(),
+            &[key],
+            &mut control,
+        )
+        .expect("cancelled pass");
+        assert!(report.more_work);
+        assert!(!marker.exists());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

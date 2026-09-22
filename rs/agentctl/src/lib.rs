@@ -23,3 +23,5 @@ pub const QUICKSTART: &str = include_str!("embedded_quickstart.md");
 pub const AGENT_USER_GUIDE: &str = include_str!("embedded_agent_userguide.md");
 /// Operator reference for the Rust chat subscription service.
 pub const CHAT_USER_GUIDE: &str = include_str!("embedded_chat_userguide.md");
+/// One-screen setup for the Rust chat subscription service.
+pub const CHAT_QUICKSTART: &str = include_str!("embedded_chat_quickstart.md");

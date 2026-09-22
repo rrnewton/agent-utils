@@ -3,19 +3,21 @@
 //! This module deliberately stops at the reviewed process-supervision boundary. It owns operator
 //! configuration, replay cursors, event deduplication, request admission, and subscription commit
 //! ordering. Launching a process plugin is integrated separately so the runtime cannot accidentally
-//! grow a second process-group implementation beside `chat-subscription-plugin`.
+//! grow a second process-group implementation beside the reviewed subscription supervisor.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt as UnixFileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chat_subscription::{
@@ -45,6 +47,9 @@ const MAX_REQUEST_REPLIES: u32 = 4_096;
 const MAX_REQUEST_REPLY_BYTES: u64 = 64 * 1_024 * 1_024;
 const MAX_STATE_REPLIES: u64 = 65_536;
 const MAX_STATE_REPLY_BYTES: u64 = 1_024 * 1_024 * 1_024;
+const MAX_VISIBLE_MARKERS: usize = 4_096;
+const MAX_FEEDBACK_AVAILABLE_IDS: usize = 32;
+const MAX_OUTBOUND_EXECUTABLE_BYTES: u64 = 64 * 1_024 * 1_024;
 
 fn default_ack_reaction() -> Option<String> {
     Some("🤖".to_owned())
@@ -795,19 +800,64 @@ struct PinnedExecutableIdentity {
 
 /// Bounded one-shot NDJSON adapter hosted by the reviewed process supervisor.
 ///
-/// The native executable is opened and identity-pinned at construction. Every operation rechecks
-/// its inode metadata and SHA-256 through the retained descriptor immediately before
-/// [`chat_subscription_plugin::process::ProcessPluginChild::spawn`]. The command receives one
-/// request line followed by EOF and must emit exactly one response line before exiting. Only the
-/// explicitly named environment values are captured; credentials never enter protocol frames.
+/// The native executable is opened, hashed, and copied into a sealed in-memory executable at
+/// construction. Every operation executes that immutable generation image without reopening or
+/// rereading the source path. The command receives one request line followed by EOF and must emit
+/// exactly one response line before exiting. Only the explicitly named environment values are
+/// captured; credentials never enter protocol frames.
 pub struct CommandOutboundTransport {
-    executable: File,
+    executable_image: File,
     executable_path: PathBuf,
-    identity: PinnedExecutableIdentity,
+    _source_identity: PinnedExecutableIdentity,
     arguments: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
     timeout: Duration,
     shutdown_grace: Duration,
+    cancellation: Option<OutboundCancellation>,
+}
+
+/// Cloneable event-driven cancellation for a running one-shot outbound helper.
+#[derive(Clone, Debug)]
+pub struct OutboundCancellation {
+    descriptor: Arc<File>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl OutboundCancellation {
+    /// Create one nonblocking event descriptor shared by a service generation.
+    pub fn new() -> io::Result<Self> {
+        let descriptor = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            descriptor: Arc::new(unsafe { File::from_raw_fd(descriptor) }),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Wake any helper pipe wait and make future launches refuse before spawn.
+    pub fn cancel(&self) {
+        if self.cancelled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let value = 1_u64.to_ne_bytes();
+        let result = unsafe {
+            libc::write(
+                self.descriptor.as_raw_fd(),
+                value.as_ptr().cast(),
+                value.len(),
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            debug_assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
 }
 
 impl CommandOutboundTransport {
@@ -875,11 +925,11 @@ impl CommandOutboundTransport {
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(&executable_path)?;
-        let identity = executable_identity(&executable)?;
+        let (executable_image, source_identity) = pin_executable_image(&executable, None)?;
         Ok(Self {
-            executable,
+            executable_image,
             executable_path,
-            identity,
+            _source_identity: source_identity,
             arguments,
             environment: seen_environment
                 .into_iter()
@@ -887,18 +937,25 @@ impl CommandOutboundTransport {
                 .collect(),
             timeout,
             shutdown_grace,
+            cancellation: None,
         })
     }
 
+    /// Bind service-generation cancellation before processing any operation.
+    pub fn set_cancellation(&mut self, cancellation: OutboundCancellation) {
+        self.cancellation = Some(cancellation);
+    }
+
     fn exchange(&self, request: &[u8]) -> std::result::Result<Vec<u8>, OutboundFailure> {
-        let observed = executable_identity(&self.executable).map_err(|error| {
-            OutboundFailure::not_applied("helper_identity_unavailable", error.to_string(), true)
-        })?;
-        if observed != self.identity {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(OutboundCancellation::is_cancelled)
+        {
             return Err(OutboundFailure::not_applied(
-                "helper_identity_changed",
-                "outbound helper executable changed after it was pinned",
-                false,
+                "helper_cancelled",
+                "outbound helper launch was cancelled before spawn",
+                true,
             ));
         }
         let deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
@@ -908,8 +965,10 @@ impl CommandOutboundTransport {
                 false,
             )
         })?;
-        let descriptor_path =
-            PathBuf::from(format!("/proc/self/fd/{}", self.executable.as_raw_fd()));
+        let descriptor_path = PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            self.executable_image.as_raw_fd()
+        ));
         let mut command = Command::new(descriptor_path);
         command
             .args(&self.arguments)
@@ -923,6 +982,21 @@ impl CommandOutboundTransport {
             .map_err(|error| {
                 OutboundFailure::not_applied("helper_spawn_failed", error.to_string(), true)
             })?;
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(OutboundCancellation::is_cancelled)
+        {
+            let cleanup = child.shutdown(Duration::ZERO);
+            return Err(OutboundFailure::not_applied(
+                "helper_cancelled",
+                cleanup_detail(
+                    "outbound helper was cancelled before request transfer".to_owned(),
+                    cleanup,
+                ),
+                true,
+            ));
+        }
         let (mut reader, mut writer) = match child.take_transport() {
             Ok(transport) => transport,
             Err(error) => {
@@ -936,7 +1010,9 @@ impl CommandOutboundTransport {
         };
         if let Err(error) = set_nonblocking(writer.as_raw_fd())
             .and_then(|()| set_nonblocking(reader.as_raw_fd()))
-            .and_then(|()| write_nonblocking(&mut writer, request, deadline))
+            .and_then(|()| {
+                write_nonblocking(&mut writer, request, deadline, self.cancellation.as_ref())
+            })
         {
             drop(writer);
             drop(reader);
@@ -948,7 +1024,7 @@ impl CommandOutboundTransport {
             ));
         }
         drop(writer);
-        let output = match read_nonblocking(&mut reader, deadline) {
+        let output = match read_nonblocking(&mut reader, deadline, self.cancellation.as_ref()) {
             Ok(output) => output,
             Err(error) => {
                 drop(reader);
@@ -961,7 +1037,16 @@ impl CommandOutboundTransport {
             }
         };
         drop(reader);
-        let status = child.shutdown(self.shutdown_grace).map_err(|error| {
+        let grace = if self
+            .cancellation
+            .as_ref()
+            .is_some_and(OutboundCancellation::is_cancelled)
+        {
+            Duration::ZERO
+        } else {
+            self.shutdown_grace
+        };
+        let status = child.shutdown(grace).map_err(|error| {
             OutboundFailure::unknown("helper_cleanup_unknown", error.to_string(), true)
         })?;
         if !status.success() {
@@ -1299,7 +1384,10 @@ fn not_applied_invalid(detail: impl Into<String>) -> OutboundFailure {
     }
 }
 
-fn executable_identity(file: &File) -> io::Result<PinnedExecutableIdentity> {
+fn pin_executable_image(
+    file: &File,
+    cancellation: Option<&OutboundCancellation>,
+) -> io::Result<(File, PinnedExecutableIdentity)> {
     let before = file.metadata()?;
     let uid = fs::metadata("/proc/self")?.uid();
     let mode = before.permissions().mode();
@@ -1309,20 +1397,38 @@ fn executable_identity(file: &File) -> io::Result<PinnedExecutableIdentity> {
         || mode & 0o100 == 0
         || mode & 0o022 != 0
         || before.len() == 0
+        || before.len() > MAX_OUTBOUND_EXECUTABLE_BYTES
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "outbound helper must be a nonempty, single-linked, owner-executable regular file owned by this UID and not group/world writable",
+            "outbound helper must be a nonempty, single-linked, owner-executable regular file of at most 64 MiB owned by this UID and not group/world writable",
         ));
     }
+    let name = CString::new("agentctl-outbound-helper").expect("static memfd name has no NUL");
+    // SAFETY: name is a live NUL-terminated string and the flags request a private close-on-exec
+    // descriptor whose contents can be sealed after the bounded copy below.
+    let descriptor =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful memfd_create returns one fresh descriptor owned by this function.
+    let mut image = unsafe { File::from_raw_fd(descriptor) };
     let mut hasher = Sha256::new();
     let mut offset = 0_u64;
     let mut buffer = [0_u8; 64 * 1_024];
     loop {
+        if cancellation.is_some_and(OutboundCancellation::is_cancelled) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "outbound helper identity check was cancelled",
+            ));
+        }
         let count = file.read_at(&mut buffer, offset)?;
         if count == 0 {
             break;
         }
+        image.write_all(&buffer[..count])?;
         hasher.update(&buffer[..count]);
         offset = offset.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
         if offset > before.len() {
@@ -1345,13 +1451,36 @@ fn executable_identity(file: &File) -> io::Result<PinnedExecutableIdentity> {
             "outbound helper changed while hashing",
         ));
     }
-    Ok(PinnedExecutableIdentity {
+    // The helper image is executable but immutable for the complete service generation. Sealing
+    // removes source-file I/O and hashing from every reply/reaction operation while retaining the
+    // exact bytes whose identity was validated above.
+    // SAFETY: image owns descriptor and 0500 is a valid regular-file mode.
+    if unsafe { libc::fchmod(image.as_raw_fd(), 0o500) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let required_seals =
+        libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    // SAFETY: F_ADD_SEALS operates on the live private memfd and required_seals is a valid mask.
+    if unsafe { libc::fcntl(image.as_raw_fd(), libc::F_ADD_SEALS, required_seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_GET_SEALS has no third argument and returns the active mask for a memfd.
+    let observed_seals = unsafe { libc::fcntl(image.as_raw_fd(), libc::F_GET_SEALS) };
+    if observed_seals < 0 || observed_seals & required_seals != required_seals {
+        return Err(if observed_seals < 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::other("outbound helper image did not retain all required seals")
+        });
+    }
+    let identity = PinnedExecutableIdentity {
         device: before.dev(),
         inode: before.ino(),
         size: before.len(),
         mode,
         digest: hasher.finalize().into(),
-    })
+    };
+    Ok((image, identity))
 }
 
 fn valid_environment_name(value: &str) -> bool {
@@ -1386,7 +1515,12 @@ fn set_nonblocking(descriptor: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn poll_descriptor(descriptor: libc::c_int, events: i16, deadline: Instant) -> io::Result<()> {
+fn poll_descriptor(
+    descriptor: libc::c_int,
+    events: i16,
+    deadline: Instant,
+    cancellation: Option<&OutboundCancellation>,
+) -> io::Result<()> {
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -1400,20 +1534,41 @@ fn poll_descriptor(descriptor: libc::c_int, events: i16, deadline: Instant) -> i
             .as_millis()
             .saturating_add(u128::from(remaining.subsec_nanos() > 0))
             .clamp(1, i32::MAX as u128) as i32;
-        let mut poll = libc::pollfd {
-            fd: descriptor,
-            events,
-            revents: 0,
+        let mut polls = [
+            libc::pollfd {
+                fd: descriptor,
+                events,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cancellation.map_or(-1, |value| value.descriptor.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let result = unsafe {
+            libc::poll(
+                polls.as_mut_ptr(),
+                polls.len() as libc::nfds_t,
+                milliseconds,
+            )
         };
-        let result = unsafe { libc::poll(&mut poll, 1, milliseconds) };
         if result > 0 {
-            if poll.revents & libc::POLLNVAL != 0 {
+            if polls[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+                || cancellation.is_some_and(OutboundCancellation::is_cancelled)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "outbound helper I/O was cancelled",
+                ));
+            }
+            if polls[0].revents & libc::POLLNVAL != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "outbound helper pipe became invalid",
                 ));
             }
-            if poll.revents & (events | libc::POLLHUP | libc::POLLERR) != 0 {
+            if polls[0].revents & (events | libc::POLLHUP | libc::POLLERR) != 0 {
                 return Ok(());
             }
             continue;
@@ -1431,7 +1586,12 @@ fn poll_descriptor(descriptor: libc::c_int, events: i16, deadline: Instant) -> i
     }
 }
 
-fn write_nonblocking(file: &mut File, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+fn write_nonblocking(
+    file: &mut File,
+    bytes: &[u8],
+    deadline: Instant,
+    cancellation: Option<&OutboundCancellation>,
+) -> io::Result<()> {
     let mut offset = 0;
     while offset < bytes.len() {
         match file.write(&bytes[offset..]) {
@@ -1444,7 +1604,7 @@ fn write_nonblocking(file: &mut File, bytes: &[u8], deadline: Instant) -> io::Re
             Ok(count) => offset += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                poll_descriptor(file.as_raw_fd(), libc::POLLOUT, deadline)?;
+                poll_descriptor(file.as_raw_fd(), libc::POLLOUT, deadline, cancellation)?;
             }
             Err(error) => return Err(error),
         }
@@ -1452,7 +1612,11 @@ fn write_nonblocking(file: &mut File, bytes: &[u8], deadline: Instant) -> io::Re
     Ok(())
 }
 
-fn read_nonblocking(file: &mut File, deadline: Instant) -> io::Result<Vec<u8>> {
+fn read_nonblocking(
+    file: &mut File,
+    deadline: Instant,
+    cancellation: Option<&OutboundCancellation>,
+) -> io::Result<Vec<u8>> {
     let maximum = chat_subscription_plugin::MAX_FRAME_BYTES.saturating_add(1);
     let mut output = Vec::new();
     let mut buffer = [0_u8; 64 * 1_024];
@@ -1470,7 +1634,7 @@ fn read_nonblocking(file: &mut File, deadline: Instant) -> io::Result<Vec<u8>> {
             Ok(count) => output.extend_from_slice(&buffer[..count]),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                poll_descriptor(file.as_raw_fd(), libc::POLLIN, deadline)?;
+                poll_descriptor(file.as_raw_fd(), libc::POLLIN, deadline, cancellation)?;
             }
             Err(error) => return Err(error),
         }
@@ -1566,7 +1730,7 @@ pub enum CoordinatorDeliveryResult {
     AlreadyDelivered,
 }
 
-trait CoordinatorDelivery {
+pub(crate) trait CoordinatorDelivery {
     fn message_state(
         &self,
         agent_name: &str,
@@ -1620,9 +1784,9 @@ pub struct BridgeState {
 
 /// Revalidate and pin the configured provider executable without launching it.
 ///
-/// Process containment and protocol connection belong to
-/// `chat_subscription_plugin::process::ProcessPluginChild`; this function intentionally returns
-/// only the immutable launch plan so the runtime cannot fall back to agentctl's legacy supervisor.
+/// Process containment and protocol connection belong to the reviewed plugin process supervisor;
+/// this function returns only the immutable launch plan so the runtime cannot fall back to a
+/// second supervisor.
 pub fn select_plugin(
     inventory: &crate::plugins::PluginInventory,
     config: &BridgeConfiguration,
@@ -1927,7 +2091,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             .collect())
     }
 
-    /// Return requests whose durable reaction operation is not yet reconciled.
+    /// Return requests whose durable reaction operation awaits reconciliation.
     pub fn pending_ack_keys(&self) -> Result<Vec<String>> {
         Ok(self
             .request_records()?
@@ -1950,7 +2114,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             .collect())
     }
 
-    /// Capture complete blocks for every request referenced in one bounded pane snapshot.
+    /// Capture complete blocks for every request through one bounded pane-snapshot parse.
     pub fn capture_snapshot(&self, rendered: &str) -> Result<SnapshotCapture> {
         if !self.config.outbound_enabled {
             return Ok(SnapshotCapture {
@@ -1958,55 +2122,60 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                 unknown_ids: Vec::new(),
             });
         }
-        let records = self
-            .request_records()?
-            .into_iter()
-            .filter(|(record, _)| !record.reply_closed)
-            .collect::<Vec<_>>();
-        if records.len() > 128 {
-            return Err(ChatRuntimeError::invalid(
-                "more than 128 requests await reply capture; close old requests first",
-            ));
-        }
-        let expected_ids = records
+        let records = self.request_records()?;
+        let known_nonces = records
             .iter()
-            .map(|(record, _)| format!("{}_{}", record.reply_nonce, record.next_reply_ordinal))
-            .collect::<Vec<_>>();
-        let marker_ids = visible_marker_ids(rendered, &expected_ids)?;
-        let mut referenced = Vec::new();
-        for (record, _) in &records {
-            let prefix = format!("{}_", record.reply_nonce);
-            if marker_ids
-                .iter()
-                .any(|identifier| identifier.starts_with(&prefix))
-            {
-                referenced.push(record.key.clone());
-            }
-        }
-        let mut replies = Vec::new();
-        for key in referenced {
-            let capture = self.capture_replies(&key, rendered)?;
-            if !capture.ordinals.is_empty() {
-                replies.push((key, capture.ordinals));
-            }
-        }
-
-        let refreshed = self
-            .request_records()?
-            .into_iter()
+            .map(|(record, _)| record.reply_nonce.clone())
+            .collect::<BTreeSet<_>>();
+        let nonce_to_key = records
+            .iter()
             .filter(|(record, _)| !record.reply_closed)
-            .collect::<Vec<_>>();
-        let mut unknown_ids = Vec::new();
-        for identifier in marker_ids {
-            let mut known = false;
-            for (record, _) in &refreshed {
-                if let Some(ordinal) = sequenced_ordinal(&identifier, &record.reply_nonce) {
-                    known = ordinal < record.next_reply_ordinal;
-                    break;
+            .map(|(record, _)| (record.reply_nonce.clone(), record.key.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut next_by_nonce = records
+            .iter()
+            .filter(|(record, _)| !record.reply_closed)
+            .map(|(record, _)| (record.reply_nonce.clone(), record.next_reply_ordinal))
+            .collect::<BTreeMap<_, _>>();
+        let mut scan = scan_reply_blocks_for_nonces(rendered, &known_nonces)?;
+        let observed_ids = std::mem::take(&mut scan.observed_ids);
+        let mut replies = Vec::new();
+        let mut unknown_ids = std::mem::take(&mut scan.unknown_ids);
+        for (nonce, blocks) in scan.blocks_by_nonce {
+            let Some(key) = nonce_to_key.get(&nonce) else {
+                // Closed retained requests stay recognized so a stale terminal marker is a no-op.
+                continue;
+            };
+            let capture = self.capture_scanned_replies(
+                key,
+                ReplyScan {
+                    blocks,
+                    unknown_ids: Vec::new(),
+                },
+            )?;
+            if let Some(last) = capture.ordinals.last() {
+                next_by_nonce.insert(nonce, last.saturating_add(1));
+            }
+            if !capture.ordinals.is_empty() {
+                replies.push((key.clone(), capture.ordinals));
+            }
+            for identifier in capture.unknown_ids {
+                if unknown_ids.len() < 128 && !unknown_ids.contains(&identifier) {
+                    unknown_ids.push(identifier);
                 }
             }
-            if !known && !unknown_ids.contains(&identifier) {
-                unknown_ids.push(bounded_detail(&identifier, 256));
+        }
+        for identifier in observed_ids {
+            let unavailable = identifier
+                .rsplit_once('_')
+                .and_then(|(nonce, _)| {
+                    next_by_nonce.get(nonce).and_then(|next| {
+                        sequenced_ordinal(&identifier, nonce).map(|ordinal| ordinal >= *next)
+                    })
+                })
+                .unwrap_or(false);
+            if unavailable && unknown_ids.len() < 128 && !unknown_ids.contains(&identifier) {
+                unknown_ids.push(identifier);
             }
         }
         Ok(SnapshotCapture {
@@ -2020,18 +2189,10 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         if !self.config.outbound_enabled {
             return Ok(Vec::new());
         }
-        let records = self
+        Ok(self
             .request_records()?
             .into_iter()
             .filter(|(record, _)| !record.reply_closed)
-            .collect::<Vec<_>>();
-        if records.len() > 128 {
-            return Err(ChatRuntimeError::invalid(
-                "more than 128 requests await reply capture; close old requests first",
-            ));
-        }
-        Ok(records
-            .into_iter()
             .map(|(record, _)| format!("{}_{}", record.reply_nonce, record.next_reply_ordinal))
             .collect())
     }
@@ -2041,18 +2202,10 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         if !self.config.outbound_enabled {
             return Ok(Vec::new());
         }
-        let records = self
+        Ok(self
             .request_records()?
             .into_iter()
             .filter(|(record, _)| !record.reply_closed)
-            .collect::<Vec<_>>();
-        if records.len() > 128 {
-            return Err(ChatRuntimeError::invalid(
-                "more than 128 requests await reply capture; close old requests first",
-            ));
-        }
-        Ok(records
-            .into_iter()
             .map(|(record, _)| ReplyRoute {
                 key: record.key,
                 identifier: format!("{}_{}", record.reply_nonce, record.next_reply_ordinal),
@@ -2184,16 +2337,28 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
     /// Capture every complete, consecutive reply block for one request from one retained snapshot.
     /// No directory scan occurs: only the request and its next direct reply paths are touched.
     pub fn capture_replies(&self, key: &str, rendered: &str) -> Result<ReplyCapture> {
+        let request = self.read_request(key)?;
+        if request.reply_closed {
+            return Ok(ReplyCapture {
+                ordinals: Vec::new(),
+                unknown_ids: Vec::new(),
+            });
+        }
+        let scan = scan_reply_blocks(rendered, &request.reply_nonce)?;
+        self.capture_scanned_replies(key, scan)
+    }
+
+    fn capture_scanned_replies(&self, key: &str, mut scan: ReplyScan) -> Result<ReplyCapture> {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let mut request = self.read_request(key)?;
         if request.reply_closed {
-            return Err(ChatRuntimeError::invalid(
-                "reply capture is closed for this request",
-            ));
+            return Ok(ReplyCapture {
+                ordinals: Vec::new(),
+                unknown_ids: Vec::new(),
+            });
         }
-        let mut scan = scan_reply_blocks(rendered, &request.reply_nonce)?;
         let mut expected = request.next_reply_ordinal;
         let mut captured = Vec::new();
         let mut checkpoint = self.read_checkpoint()?;
@@ -2213,6 +2378,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                     "request reply count limit reached",
                 ));
             }
+            validate_outbound_body(&self.config.agent_label, &block.body)?;
             let reply = ReplyRecord::new(key, expected, block.body.clone())?;
             let path = self.reply_path(key, expected);
             let (bytes, exists) = if fs::symlink_metadata(&path).is_ok() {
@@ -2274,7 +2440,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         for block in &scan.blocks {
             if block.ordinal >= expected {
                 let identifier = format!("{}_{}", request.reply_nonce, block.ordinal);
-                if !scan.unknown_ids.contains(&identifier) {
+                if scan.unknown_ids.len() < 128 && !scan.unknown_ids.contains(&identifier) {
                     scan.unknown_ids.push(identifier);
                 }
             }
@@ -2688,6 +2854,15 @@ pub fn deliver_fence_feedback<A: ManagedApi + ?Sized>(
     unknown_ids: &[String],
     options: DrainOptions,
 ) -> Result<CoordinatorDeliveryResult> {
+    deliver_fence_feedback_with(state, manager, unknown_ids, options)
+}
+
+pub(crate) fn deliver_fence_feedback_with(
+    state: &BridgeState,
+    delivery: &dyn CoordinatorDelivery,
+    unknown_ids: &[String],
+    options: DrainOptions,
+) -> Result<CoordinatorDeliveryResult> {
     if unknown_ids.is_empty() {
         return Ok(CoordinatorDeliveryResult::AlreadyDelivered);
     }
@@ -2713,14 +2888,12 @@ pub fn deliver_fence_feedback<A: ManagedApi + ?Sized>(
         "Chat reply routing error: your output referenced unavailable reply ID(s): {}. \
 The currently available reply ID(s) are: {}. Emit a complete reply block using one exact available ID.",
         unavailable.join(", "),
-        if available.is_empty() {
-            "<none>".to_owned()
-        } else {
-            available.join(", ")
-        }
+        format_available_reply_ids(&available)
     );
     let agent_name = &state.config.agent_name;
-    let initial = manager.message_state(agent_name, &message_id)?;
+    let initial = delivery
+        .message_state(agent_name, &message_id)
+        .map_err(ChatRuntimeError::invalid)?;
     let operation = match initial {
         Some(QueueMessageState::Processed) => {
             return Ok(CoordinatorDeliveryResult::AlreadyDelivered)
@@ -2730,16 +2903,17 @@ The currently available reply ID(s) are: {}. Emit a complete reply block using o
                 "fence feedback may already have reached the coordinator".to_owned(),
             ));
         }
-        Some(QueueMessageState::Pending) => manager.drain(agent_name, options).map(|_| ()),
-        None => manager
-            .send_identified(agent_name, &prompt, options, Some(&message_id))
-            .map(|_| ()),
+        Some(QueueMessageState::Pending) => delivery.drain(agent_name, options),
+        None => delivery.submit(agent_name, &prompt, &message_id, options),
     };
     if operation.is_ok() && initial.is_none() {
         return Ok(CoordinatorDeliveryResult::Delivered);
     }
     let detail = operation.err().map(|error| error.to_string());
-    match manager.message_state(agent_name, &message_id)? {
+    match delivery
+        .message_state(agent_name, &message_id)
+        .map_err(ChatRuntimeError::invalid)?
+    {
         Some(QueueMessageState::Processed) => Ok(CoordinatorDeliveryResult::Delivered),
         Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
             Ok(CoordinatorDeliveryResult::Uncertain(detail.unwrap_or_else(
@@ -2752,7 +2926,26 @@ The currently available reply ID(s) are: {}. Emit a complete reply block using o
     }
 }
 
-fn deliver_request_with(
+fn format_available_reply_ids(available: &[String]) -> String {
+    if available.is_empty() {
+        return "<none>".to_owned();
+    }
+    let mut displayed = available
+        .iter()
+        .take(MAX_FEEDBACK_AVAILABLE_IDS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if available.len() > MAX_FEEDBACK_AVAILABLE_IDS {
+        displayed.push_str(&format!(
+            " (and {} more; inspect chat status for the complete set)",
+            available.len() - MAX_FEEDBACK_AVAILABLE_IDS
+        ));
+    }
+    displayed
+}
+
+pub(crate) fn deliver_request_with(
     state: &BridgeState,
     delivery: &dyn CoordinatorDelivery,
     key: &str,
@@ -2951,65 +3144,40 @@ struct ReplyScan {
     unknown_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MultiReplyScan {
+    blocks_by_nonce: BTreeMap<String, Vec<ScannedReply>>,
+    observed_ids: Vec<String>,
+    unknown_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 struct ActiveReply {
     protocol: &'static str,
     identifier: String,
+    nonce: String,
     ordinal: u32,
     opening_margin: String,
     body: Vec<String>,
 }
 
-fn visible_marker_ids(rendered: &str, expected_ids: &[String]) -> Result<Vec<String>> {
-    if rendered.chars().any(invalid_rendered_character) {
-        return Err(ChatRuntimeError::invalid(
-            "reply capture contains terminal control characters",
-        ));
-    }
-    let normalized = rendered.replace("\r\n", "\n");
-    let mut identifiers = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
-    let mut prompt_margin: Option<usize> = None;
-    for line in normalized.split('\n') {
-        let (undecorated, _, decorated) = undecorate(line);
-        let stripped = line.trim_start_matches([' ', '\t']);
-        if stripped.starts_with("› ") || stripped.starts_with("❯ ") {
-            prompt_margin = Some(line.len() - stripped.len() + 2);
-            continue;
-        }
-        if let Some(expected_margin) = prompt_margin {
-            if stripped.is_empty() || line.len() - stripped.len() >= expected_margin {
-                continue;
-            }
-            prompt_margin = None;
-        }
-        if decorated
-            && parse_marker(&undecorated)
-                .is_some_and(|marker| !marker.closing && expected_ids.contains(&marker.identifier))
-        {
-            fence = None;
-        }
-        if let Some((character, length)) = fence {
-            if closing_fence(&undecorated, character, length) {
-                fence = None;
-            }
-            continue;
-        }
-        if let Some(opened) = opening_fence(&undecorated) {
-            fence = Some(opened);
-            continue;
-        }
-        if let Some(marker) = parse_marker(&undecorated) {
-            if !identifiers.contains(&marker.identifier) {
-                identifiers.push(marker.identifier);
-            }
-        }
-    }
-    Ok(identifiers)
+fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> {
+    let expected_nonces = BTreeSet::from([expected_nonce.to_owned()]);
+    let mut scan = scan_reply_blocks_for_nonces(rendered, &expected_nonces)?;
+    Ok(ReplyScan {
+        blocks: scan
+            .blocks_by_nonce
+            .remove(expected_nonce)
+            .unwrap_or_default(),
+        unknown_ids: scan.unknown_ids,
+    })
 }
 
-fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> {
-    if !valid_nonce(expected_nonce) {
+fn scan_reply_blocks_for_nonces(
+    rendered: &str,
+    expected_nonces: &BTreeSet<String>,
+) -> Result<MultiReplyScan> {
+    if expected_nonces.iter().any(|nonce| !valid_nonce(nonce)) {
         return Err(ChatRuntimeError::invalid(
             "expected reply nonce is not 22-character base64url",
         ));
@@ -3020,8 +3188,11 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
         ));
     }
     let normalized = rendered.replace("\r\n", "\n");
-    let mut replies = Vec::new();
+    let mut blocks_by_nonce = BTreeMap::<String, Vec<ScannedReply>>::new();
+    let mut observed_ids = Vec::new();
     let mut unknown_ids = Vec::new();
+    let mut seen_unknown_ids = BTreeSet::new();
+    let mut seen_identifiers = BTreeSet::new();
     let mut active: Option<ActiveReply> = None;
     let mut fence: Option<(char, usize)> = None;
     let mut prompt_margin: Option<usize> = None;
@@ -3045,7 +3216,8 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
         if active.is_none()
             && decorated
             && parse_marker(&undecorated).is_some_and(|marker| {
-                !marker.closing && sequenced_ordinal(&marker.identifier, expected_nonce).is_some()
+                !marker.closing
+                    && recognized_reply_marker(&marker.identifier, expected_nonces).is_some()
             })
         {
             // Native assistant bullets delimit items. An unrelated unmatched Markdown fence
@@ -3076,17 +3248,30 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
             }
             continue;
         };
-        let expected_ordinal = sequenced_ordinal(&marker.identifier, expected_nonce);
-        if expected_ordinal.is_none() && !unknown_ids.contains(&marker.identifier) {
+        if seen_identifiers.insert(marker.identifier.clone()) {
+            if seen_identifiers.len() > MAX_VISIBLE_MARKERS {
+                return Err(ChatRuntimeError::invalid(format!(
+                    "reply capture exceeds {MAX_VISIBLE_MARKERS} distinct visible markers"
+                )));
+            }
+            observed_ids.push(marker.identifier.clone());
+        }
+        let expected = recognized_reply_marker(&marker.identifier, expected_nonces);
+        if expected.is_none()
+            && unknown_ids.len() < 128
+            && seen_unknown_ids.insert(marker.identifier.clone())
+        {
             unknown_ids.push(bounded_detail(&marker.identifier, 256));
         }
 
         match active.as_mut() {
             None if !marker.closing => {
-                if let Some(ordinal) = expected_ordinal {
+                if let Some((nonce, ordinal)) = expected {
+                    let nonce = nonce.to_owned();
                     active = Some(ActiveReply {
                         protocol: marker.protocol,
                         identifier: marker.identifier,
+                        nonce,
                         ordinal,
                         opening_margin: margin,
                         body: Vec::new(),
@@ -3108,17 +3293,33 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
             }
             Some(_) => {
                 let opened = active.take().expect("matched active reply");
-                replies.push(ScannedReply {
-                    ordinal: opened.ordinal,
-                    body: reply_body(opened.body, &opened.opening_margin, &margin)?,
-                });
+                blocks_by_nonce
+                    .entry(opened.nonce)
+                    .or_default()
+                    .push(ScannedReply {
+                        ordinal: opened.ordinal,
+                        body: reply_body(opened.body, &opened.opening_margin, &margin)?,
+                    });
             }
         }
     }
-    Ok(ReplyScan {
-        blocks: replies,
+    Ok(MultiReplyScan {
+        blocks_by_nonce,
+        observed_ids,
         unknown_ids,
     })
+}
+
+fn recognized_reply_marker<'a>(
+    identifier: &'a str,
+    expected_nonces: &BTreeSet<String>,
+) -> Option<(&'a str, u32)> {
+    let (nonce, _) = identifier.rsplit_once('_')?;
+    expected_nonces
+        .contains(nonce)
+        .then(|| sequenced_ordinal(identifier, nonce))
+        .flatten()
+        .map(|ordinal| (nonce, ordinal))
 }
 
 #[derive(Clone, Debug)]
@@ -3319,6 +3520,16 @@ fn outbound_text(agent_label: &str, body: &str) -> String {
     } else {
         format!("{prefix} {body}")
     }
+}
+
+fn validate_outbound_body(agent_label: &str, body: &str) -> Result<()> {
+    let encoded = outbound_text(agent_label, body);
+    if encoded.len() > MAX_REPLY_BYTES {
+        return Err(ChatRuntimeError::invalid(format!(
+            "agent-labelled chat reply exceeds {MAX_REPLY_BYTES} UTF-8 bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn unix_millis() -> u64 {
@@ -3651,6 +3862,38 @@ mod tests {
         .expect("delivery")
     }
 
+    fn maximum_message_delivery(sequence: u64, cursor: &str, receipt: &str) -> DeliveryBatch {
+        let events = (0..chat_subscription::MAX_BATCH_EVENTS)
+            .map(|index| {
+                let message = InboundMessage::new(
+                    ChannelId::new("spaces/example").expect("channel"),
+                    MessageId::new(format!("spaces/example/messages/{index:03}")).expect("message"),
+                    ThreadId::new("spaces/example/threads/one").expect("thread"),
+                    SenderId::new("users/owner").expect("sender"),
+                    format!("request {index}"),
+                    "2026-09-21T12:00:00Z",
+                    false,
+                )
+                .expect("normalized message")
+                .with_provider_payload(
+                    ProviderPayload::new(
+                        "fixture.message.v1",
+                        Map::from_iter([("index".to_owned(), Value::from(index as u64))]),
+                    )
+                    .expect("provider payload"),
+                );
+                CommittableEvent::message_created(message)
+            })
+            .collect::<Vec<_>>();
+        DeliveryBatch::new(
+            EventSequence::new(sequence).expect("sequence"),
+            ProviderCursor::new(cursor).expect("cursor"),
+            DeliveryId::new(receipt).expect("receipt"),
+            events,
+        )
+        .expect("maximum message delivery")
+    }
+
     #[test]
     fn nonce_encoding_is_canonical_unpadded_base64url() {
         assert_eq!(base64url_nonce([0; 16]), "AAAAAAAAAAAAAAAAAAAAAA");
@@ -3690,6 +3933,100 @@ mod tests {
         let admission = reopened.admit_batch(&replay).expect("deduplicate replay");
         assert!(admission.new_request_keys.is_empty());
         assert_eq!(reopened.status().expect("status")["request_count"], 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn maximum_message_batch_remains_restartable_after_provider_acknowledgement() {
+        let root = temporary("maximum-active-routes");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let checkpoint = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-boundary").expect("cursor"),
+            DeliveryId::new("receipt-boundary").expect("receipt"),
+            vec![CommittableEvent::Checkpoint],
+        )
+        .expect("checkpoint delivery");
+        let maximum = maximum_message_delivery(2, "cursor-maximum", "receipt-maximum");
+        let mut backend = Backend {
+            items: Some(VecDeque::from([
+                SubscriptionItem::Batch(checkpoint),
+                SubscriptionItem::Batch(maximum),
+            ])),
+            acknowledged: Arc::clone(&acknowledged),
+        };
+        let request = state.subscribe_request().expect("request");
+        let mut subscription = ChatSubscription::open(&mut backend, &request).expect("subscribe");
+        assert!(matches!(
+            consume_one(&mut subscription, &state).expect("consume boundary"),
+            ConsumedItem::Batch(_)
+        ));
+        let ConsumedItem::Batch(admission) =
+            consume_one(&mut subscription, &state).expect("consume maximum batch")
+        else {
+            panic!("expected maximum batch");
+        };
+        assert_eq!(admission.new_request_keys.len(), 256);
+        assert_eq!(
+            &*acknowledged.lock().expect("ack lock"),
+            &["receipt-boundary", "receipt-maximum"]
+        );
+        assert_eq!(
+            state.active_reply_routes().expect("active routes").len(),
+            256
+        );
+        drop(subscription);
+
+        let recovered = BridgeState::open(&root).expect("restart state");
+        assert_eq!(
+            recovered
+                .active_reply_routes()
+                .expect("recovered routes")
+                .len(),
+            256
+        );
+        assert_eq!(
+            recovered
+                .available_reply_ids()
+                .expect("available ids")
+                .len(),
+            256
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn recovery_snapshot_routes_across_full_active_batch_without_route_cap() {
+        let root = temporary("maximum-snapshot-routes");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&maximum_message_delivery(
+                1,
+                "cursor-maximum",
+                "receipt-maximum",
+            ))
+            .expect("admit maximum batch");
+        assert_eq!(admission.new_request_keys.len(), 256);
+        let routes = state.active_reply_routes().expect("active routes");
+        let selected = [&routes[0], &routes[255]];
+        let rendered = selected
+            .iter()
+            .enumerate()
+            .map(|(index, route)| {
+                format!(
+                    "<CHAT_REPLY_{}>\nreply {index}\n</CHAT_REPLY_{}>",
+                    route.identifier, route.identifier
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capture = state
+            .capture_snapshot(&rendered)
+            .expect("capture maximum-route snapshot");
+        assert_eq!(capture.replies.len(), 2);
+        assert!(capture.unknown_ids.is_empty());
+        assert_eq!(state.read_checkpoint().expect("checkpoint").reply_count, 2);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -3839,6 +4176,78 @@ mod tests {
         );
         assert_eq!(state.read_checkpoint().expect("checkpoint").reply_count, 2);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn one_snapshot_parse_routes_blocks_for_many_active_nonces() {
+        let first = "AAAAAAAAAAAAAAAAAAAAAA";
+        let second = "BBBBBBBBBBBBBBBBBBBBBB";
+        let expected = BTreeSet::from([first.to_owned(), second.to_owned()]);
+        let rendered = format!(
+            "```text\n<CHAT_REPLY_{first}_1>\nignored\n</CHAT_REPLY_{first}_1>\n```\n\
+<CHAT_REPLY_{first}_1>\nfirst\n</CHAT_REPLY_{first}_1>\n\
+<CHAT_REPLY_{second}_1>\nsecond\n</CHAT_REPLY_{second}_1>\n\
+<CHAT_REPLY_unknown_1>\nunknown\n</CHAT_REPLY_unknown_1>"
+        );
+        let scan = scan_reply_blocks_for_nonces(&rendered, &expected).expect("scan once");
+        assert_eq!(scan.blocks_by_nonce.len(), 2);
+        assert_eq!(scan.blocks_by_nonce[first][0].body, "first");
+        assert_eq!(scan.blocks_by_nonce[second][0].body, "second");
+        assert_eq!(scan.observed_ids.len(), 3);
+        assert_eq!(scan.unknown_ids, vec!["unknown_1"]);
+    }
+
+    #[test]
+    fn capture_reserves_agent_label_bytes_before_durable_outbox_admission() {
+        let root = temporary("labelled-reply-bound");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let nonce = state.read_request(key).expect("request").reply_nonce;
+        let oversized = "x".repeat(MAX_REPLY_BYTES);
+        let error = state
+            .capture_replies(
+                key,
+                &format!("<CHAT_REPLY_{nonce}_1>\n{oversized}\n</CHAT_REPLY_{nonce}_1>"),
+            )
+            .expect_err("label prefix must count toward transport bound");
+        assert!(error.to_string().contains("agent-labelled chat reply"));
+        assert_eq!(
+            state.read_request(key).expect("request").next_reply_ordinal,
+            1
+        );
+
+        let prefix = "[codex coordinator] ";
+        let maximum = "y".repeat(MAX_REPLY_BYTES - prefix.len());
+        assert_eq!(
+            outbound_text("codex coordinator", &maximum).len(),
+            MAX_REPLY_BYTES
+        );
+        assert_eq!(
+            state
+                .capture_replies(
+                    key,
+                    &format!("<CHAT_REPLY_{nonce}_1>\n{maximum}\n</CHAT_REPLY_{nonce}_1>"),
+                )
+                .expect("maximum labelled reply")
+                .ordinals,
+            vec![1]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn fence_feedback_bounds_display_without_changing_full_identity_set() {
+        let available = (0..(MAX_FEEDBACK_AVAILABLE_IDS + 3))
+            .map(|index| format!("reply-{index}"))
+            .collect::<Vec<_>>();
+        let displayed = format_available_reply_ids(&available);
+        assert!(displayed.contains("reply-0"));
+        assert!(displayed.contains("reply-31"));
+        assert!(!displayed.contains("reply-32"));
+        assert!(displayed.contains("and 3 more"));
     }
 
     #[test]
@@ -4102,28 +4511,85 @@ mod tests {
     }
 
     #[test]
-    fn command_outbound_refuses_changed_identity_before_spawn() {
+    fn command_outbound_uses_sealed_generation_image_after_source_removal() {
         let root = temporary("command-identity");
         let helper = copied_shell(&root);
-        let transport = CommandOutboundTransport::new(
+        let response = r#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174000","action":"send","ok":true,"receipt":{"message_id":"spaces/example/messages/pinned"}}"#;
+        let script = format!("IFS= read -r request || exit 2; printf '%s\\n' '{response}'");
+        let mut transport = CommandOutboundTransport::new(
             helper.clone(),
-            vec![OsString::from("-c"), OsString::from("exit 0")],
+            vec![OsString::from("-c"), OsString::from(script)],
+            &[],
+            Duration::from_secs(2),
+            Duration::ZERO,
+        )
+        .expect("pin helper");
+        fs::remove_file(&helper).expect("remove source after generation pin");
+        assert_eq!(
+            transport
+                .send(ReplySubmission {
+                    channel_id: "spaces/example",
+                    thread_id: "spaces/example/threads/one",
+                    body: "hello",
+                    request_id: "123e4567-e89b-42d3-a456-426614174000",
+                })
+                .expect("execute sealed generation image"),
+            "spaces/example/messages/pinned"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn command_outbound_refuses_executable_above_the_hashing_bound() {
+        let root = temporary("command-size");
+        let helper = copied_shell(&root);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&helper)
+            .expect("open helper")
+            .set_len(MAX_OUTBOUND_EXECUTABLE_BYTES + 1)
+            .expect("extend helper fixture");
+        let error = CommandOutboundTransport::new(
+            helper,
+            Vec::new(),
             &[],
             Duration::from_secs(1),
             Duration::ZERO,
         )
+        .err()
+        .expect("oversized helper refused");
+        assert!(error.to_string().contains("at most 64 MiB"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn command_outbound_cancellation_interrupts_blocked_helper_and_descendants() {
+        let root = temporary("command-cancellation");
+        let helper = copied_shell(&root);
+        let mut transport = CommandOutboundTransport::new(
+            helper,
+            vec![
+                OsString::from("-c"),
+                OsString::from("IFS= read -r request; /bin/sleep 30"),
+            ],
+            &[],
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
         .expect("pin helper");
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&helper)
-            .expect("open helper")
-            .write_all(b"x")
-            .expect("change helper");
-        let error = transport
-            .exchange(b"{}\n")
-            .expect_err("identity change refused");
-        assert_eq!(error.outcome, OutboundOutcome::NotApplied);
-        assert_eq!(error.code, "helper_identity_changed");
+        let cancellation = OutboundCancellation::new().expect("create cancellation");
+        transport.set_cancellation(cancellation.clone());
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || transport.exchange(b"{}\n"));
+        std::thread::sleep(Duration::from_millis(50));
+        cancellation.cancel();
+        let error = worker
+            .join()
+            .expect("join helper operation")
+            .expect_err("cancel helper operation");
+        assert_eq!(error.outcome, OutboundOutcome::Unknown);
+        assert!(error.detail.contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(5));
         fs::remove_dir_all(root).expect("cleanup");
     }
 

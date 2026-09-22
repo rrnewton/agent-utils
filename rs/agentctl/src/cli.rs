@@ -301,6 +301,8 @@ struct Chat {
 
 #[derive(Subcommand)]
 enum ChatCommand {
+    /// Print the shortest safe setup for the event-driven chat bridge
+    Quickstart,
     /// Print the chat bridge configuration and operations guide
     Userguide,
     /// Validate plugin, target, helper, and config authority, then create state
@@ -336,10 +338,10 @@ struct ChatOperate {
     #[command(flatten)]
     state: ChatState,
     /// Seconds to wait for coordinator readiness; zero keeps daemon passes nonblocking
-    #[arg(long, default_value = "0", value_parser = seconds)]
+    #[arg(long, default_value = "0", value_parser = chat_delivery_seconds)]
     ready_timeout: f64,
     /// Positive seconds to wait for evidence a delivered prompt started work
-    #[arg(long, default_value = "5", value_parser = positive_seconds)]
+    #[arg(long, default_value = "5", value_parser = positive_chat_delivery_seconds)]
     working_timeout: f64,
     /// Maximum safe terminal-injection attempts for one request
     #[arg(long, default_value = "1", value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
@@ -389,6 +391,20 @@ fn startup_seconds(value: &str) -> Result<f64, String> {
     let value = seconds(value)?;
     if value <= 0.0 || value > 300.0 {
         return Err("startup seconds must be greater than zero and at most 300".to_owned());
+    }
+    Ok(value)
+}
+fn chat_delivery_seconds(value: &str) -> Result<f64, String> {
+    let value = seconds(value)?;
+    if value > 30.0 {
+        return Err("chat delivery seconds must be at most 30".to_owned());
+    }
+    Ok(value)
+}
+fn positive_chat_delivery_seconds(value: &str) -> Result<f64, String> {
+    let value = chat_delivery_seconds(value)?;
+    if value == 0.0 {
+        return Err("chat delivery seconds must be greater than zero".to_owned());
     }
     Ok(value)
 }
@@ -624,6 +640,10 @@ fn run(args: Cli) -> Result<i32, Failure> {
 
 fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Failure> {
     match chat.command {
+        ChatCommand::Quickstart => {
+            print!("{}", crate::CHAT_QUICKSTART);
+            Ok(0)
+        }
         ChatCommand::Userguide => {
             print!("{}", crate::CHAT_USER_GUIDE);
             Ok(0)
@@ -798,6 +818,7 @@ mod tests {
             "/tmp/registry",
         ])
         .is_ok());
+        assert!(Cli::try_parse_from(["agentctl", "chat", "quickstart"]).is_ok());
         let error = Cli::try_parse_from(["agentctl", "chat", "run", "--help"])
             .err()
             .expect("chat run help");
@@ -818,6 +839,18 @@ mod tests {
         }
         assert!(startup_seconds("0").is_err());
         assert!(positive_seconds("0").is_err());
+        for option in ["--ready-timeout", "--working-timeout"] {
+            assert!(Cli::try_parse_from([
+                "agentctl",
+                "chat",
+                "run",
+                "--bridge-state",
+                "/tmp/chat-state",
+                option,
+                "30.000001",
+            ])
+            .is_err());
+        }
         assert!(Cli::try_parse_from([
             "agentctl",
             "goal",

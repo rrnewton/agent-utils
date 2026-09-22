@@ -18,7 +18,7 @@ schema, CLI, output, error, and state-transition drift.
 | `tick-hub` | Evaluate independently cadenced reminders and freshness checks in one deterministic tick. | `tick-hub` | `tick-hub` |
 | `pr-landing-planner` | Produce advisory, conflict- and CI-aware pull-request landing plans. | `pr-landing-planner` | `pr-landing-planner` |
 | `herdr-run` | Run an allowlisted command in a Herdr pane, outside whatever constrains the caller, with audited, byte-preserving results. An agent whose sandbox blocks the network is one such caller. | `herdr-run` | `herdr-run` |
-| `agentctl` | Start named coding agents, delegate follow-up work, inspect goals, and retain direct terminal access. Interactive control requires Herdr. | `agentctl` (also worker, Chat, and MCP extensions) | `agentctl` (interactive core) |
+| `agentctl` | Start named coding agents, delegate follow-up work, inspect goals, and retain direct terminal access. Interactive control requires Herdr. | `agentctl` (also worker, polling Chat, and MCP extensions) | `agentctl` (interactive core and event-driven plugin Chat service) |
 
 Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not
@@ -30,7 +30,7 @@ need this source tree or knowledge of the sibling implementation.
 |---|---|---|
 | `wrkviz` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `wrkviz` |
 | `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps through `dagrun`. | `parallel-experiment-runner` |
-| `agentctl` extensions | Headless workers in Herdr or tmux, Google Chat with configurable reaction ACKs, and an MCP interface over the same sessions. | Included in `agentctl` |
+| `agentctl` extensions | Headless workers in Herdr or tmux, the legacy polling Chat transport and launcher, and an MCP interface over the same sessions. | Included in `agentctl` |
 
 These tools are independently installable and follow the same package
 documentation and artifact checks. They are explicit exceptions to the
@@ -41,22 +41,24 @@ two-language implementation and behavioral-differential contract.
 `agentctl` gives a person or coordinator one interface for long-lived workers:
 
 ```sh
-python3 -m pip install ./py/agentctl
-DAGRUN_ENGINE=python ./bin/agentctl quickstart
-DAGRUN_ENGINE=python ./bin/agentctl capabilities
-DAGRUN_ENGINE=python ./bin/agentctl chat quickstart
+cargo install --path rs/agentctl
+agentctl quickstart
+agentctl capabilities
+agentctl chat quickstart
 ```
 
-The Python package includes interactive and headless workers, Chat, and MCP.
-The Rust crate supplies interactive control. Both provide `agentctl userguide`
-and per-command help; `capabilities` reports the installed adapters. Interactive
-control and the current Chat bridge require Herdr. Headless workers can use
-Herdr or tmux for their transcript view.
+The Python package includes interactive and headless workers, the polling Chat
+transport and launcher, and MCP. The Rust crate supplies interactive control and
+a durable event-driven Chat host for installed subscription plugins and an
+operator-selected outbound helper. Both provide `agentctl userguide` and
+per-command help; `capabilities` reports the installed adapters. Interactive
+control and either Chat bridge require Herdr. Headless workers can use Herdr or
+tmux for their transcript view.
 
 `agentctl` has no dependency on the `herdr-run` shell executor. Both call Herdr
 through their own adapters. The compatibility names `herdr-agent`,
-`herdr-subagents`, and `herdr-chat` belong to the agent-control package; the latter
-two require its Python extensions. Start new integrations with `agentctl`.
+`herdr-subagents`, and `herdr-chat` belong to the Python agent-control package.
+Start new integrations with `agentctl`.
 See [public related work](common/docs/agentctl/RELATED_WORK.md) for comparisons
 with other session-control and chat approaches.
 

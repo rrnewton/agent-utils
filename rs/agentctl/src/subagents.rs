@@ -1237,6 +1237,37 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.send_record(&record, text, options, message_id)
     }
 
+    /// Submit through an injected runtime that can interrupt bounded readiness waits.
+    pub(crate) fn send_identified_with_runtime<R: agent::AgentRuntime + ?Sized>(
+        &self,
+        agent_name: &str,
+        text: &str,
+        options: DrainOptions,
+        message_id: &str,
+        runtime: &R,
+    ) -> Result<QueueResult> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        record.input_allowed()?;
+        let queue = self.queue(&record.name)?;
+        let client = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            goal_objective: Mutex::new(None),
+            queue: Some(&queue),
+            check_prompt: true,
+        };
+        agent::send_identified_with_runtime(
+            &client,
+            &record.target()?,
+            &queue,
+            text,
+            options,
+            runtime,
+            Some(message_id),
+        )
+    }
+
     /// Reconcile one caller-selected durable delivery identifier by exact path lookup.
     pub fn message_state(
         &self,
@@ -1313,6 +1344,32 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &record.target()?,
             &self.queue(agent_name)?,
             options,
+        )
+    }
+
+    /// Drain through an injected runtime that can interrupt bounded readiness waits.
+    pub(crate) fn drain_with_runtime<R: agent::AgentRuntime + ?Sized>(
+        &self,
+        agent_name: &str,
+        options: DrainOptions,
+        runtime: &R,
+    ) -> Result<QueueResult> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        record.input_allowed()?;
+        let queue = self.queue(&record.name)?;
+        agent::drain_with_runtime(
+            &WorkspaceClient {
+                client: self.client,
+                record: &record,
+                goal_objective: Mutex::new(None),
+                queue: Some(&queue),
+                check_prompt: true,
+            },
+            &record.target()?,
+            &queue,
+            options,
+            runtime,
         )
     }
 

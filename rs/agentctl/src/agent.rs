@@ -61,7 +61,7 @@ pub enum QueueOutcome {
 pub enum QueueMessageState {
     /// The message is known not to have crossed the injection barrier.
     Pending,
-    /// The message crossed the barrier and its outcome is not yet settled.
+    /// The message crossed the barrier and its outcome remains unsettled.
     Inflight,
     /// The native working transition confirmed delivery.
     Processed,
@@ -300,6 +300,14 @@ pub trait AgentRuntime {
     fn monotonic(&self) -> Duration;
     /// Pause for at most `duration`.
     fn sleep(&self, duration: Duration);
+    /// Return whether a service owner requested cancellation.
+    fn cancelled(&self) -> bool {
+        false
+    }
+    /// Bound one native working-state wait so cancellation can be observed.
+    fn delivery_wait_chunk(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Production wall-clock runtime for readiness polling.
@@ -591,6 +599,7 @@ pub fn drain_with_runtime<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
             &info,
             &message_text(&document)?,
             options.working_timeout,
+            runtime,
         ) {
             Ok(()) => {
                 document.insert("delivery_state".to_owned(), json!("processed"));
@@ -691,7 +700,7 @@ pub fn send_identified<A: AgentApi + ?Sized>(
     )
 }
 
-fn send_identified_with_runtime<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
+pub(crate) fn send_identified_with_runtime<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
     client: &A,
     target: &Target,
     root: &Path,
@@ -876,6 +885,11 @@ fn wait_ready<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
 ) -> AgentResult<AgentPaneInfo> {
     let deadline = runtime.monotonic().saturating_add(timeout);
     loop {
+        if runtime.cancelled() {
+            return Err(AgentError::delivery(
+                "delivery was cancelled before terminal injection",
+            ));
+        }
         let info = match initial_info.take() {
             Some(info) => info,
             None => resolve_target(client, target)?,
@@ -908,11 +922,12 @@ fn wait_ready<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
     }
 }
 
-fn deliver_one<A: AgentApi + ?Sized>(
+fn deliver_one<A: AgentApi + ?Sized, R: AgentRuntime + ?Sized>(
     client: &A,
     info: &AgentPaneInfo,
     text: &str,
     working_timeout: Duration,
+    runtime: &R,
 ) -> AgentResult<()> {
     client.run(&info.pane_id, text).map_err(|error| {
         AgentError::delivery(format!(
@@ -920,15 +935,41 @@ fn deliver_one<A: AgentApi + ?Sized>(
             info.pane_id
         ))
     })?;
-    let millis = working_timeout.as_millis().clamp(1, u64::MAX.into()) as u64;
-    client
-        .wait_agent_status(&info.pane_id, "working", millis)
-        .map_err(|error| {
-            AgentError::delivery(format!(
-                "pane {} did not confirm idle/done -> working submission: {error}",
+    let Some(chunk) = runtime.delivery_wait_chunk() else {
+        let millis = working_timeout.as_millis().clamp(1, u64::MAX.into()) as u64;
+        return client
+            .wait_agent_status(&info.pane_id, "working", millis)
+            .map_err(|error| {
+                AgentError::delivery(format!(
+                    "pane {} did not confirm idle/done -> working submission: {error}",
+                    info.pane_id
+                ))
+            });
+    };
+    let deadline = runtime.monotonic().saturating_add(working_timeout);
+    let mut last_error = None;
+    loop {
+        if runtime.cancelled() {
+            return Err(AgentError::delivery(format!(
+                "pane {} delivery was cancelled after terminal injection; outcome is unknown",
                 info.pane_id
-            ))
-        })
+            )));
+        }
+        let remaining = deadline.saturating_sub(runtime.monotonic());
+        if remaining.is_zero() {
+            let detail = last_error.unwrap_or_else(|| "working-state deadline elapsed".to_owned());
+            return Err(AgentError::delivery(format!(
+                "pane {} did not confirm idle/done -> working submission: {detail}",
+                info.pane_id
+            )));
+        }
+        let wait = chunk.min(remaining);
+        let millis = wait.as_millis().clamp(1, u64::MAX.into()) as u64;
+        match client.wait_agent_status(&info.pane_id, "working", millis) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1791,6 +1832,36 @@ mod tests {
         }
     }
 
+    struct CancelRuntime {
+        cancel_after_checks: u64,
+        checks: AtomicU64,
+    }
+
+    impl CancelRuntime {
+        fn new(cancel_after_checks: u64) -> Self {
+            Self {
+                cancel_after_checks,
+                checks: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl AgentRuntime for CancelRuntime {
+        fn monotonic(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn sleep(&self, _duration: Duration) {}
+
+        fn cancelled(&self) -> bool {
+            self.checks.fetch_add(1, AtomicOrdering::SeqCst) >= self.cancel_after_checks
+        }
+
+        fn delivery_wait_chunk(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+    }
+
     fn default_info(pane_id: &str, session: &str) -> AgentPaneInfo {
         AgentPaneInfo {
             pane_id: pane_id.to_owned(),
@@ -2007,6 +2078,46 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn cancellation_before_injection_leaves_prompt_safely_pending() {
+        let directory = TestDirectory::new("cancel-before-injection");
+        let fake = FakeAgent::new(&["idle"]);
+        let error = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "do not inject",
+            DrainOptions::default(),
+            &CancelRuntime::new(0),
+        )
+        .expect_err("cancelled delivery remains pending");
+        assert_eq!(error.outcome(), Some(QueueOutcome::Pending));
+        assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn cancellation_after_injection_quarantines_unknown_outcome() {
+        let directory = TestDirectory::new("cancel-after-injection");
+        let fake = FakeAgent::new(&["idle"]);
+        let error = send_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            "inject once",
+            DrainOptions::default(),
+            &CancelRuntime::new(1),
+        )
+        .expect_err("post-injection cancellation is uncertain");
+        assert_eq!(error.outcome(), Some(QueueOutcome::PossiblySubmitted));
+        assert_eq!(fake.runs(), vec!["inject once"]);
+        assert_eq!(
+            json_paths(&directory.path().join("failed"))
+                .expect("failed artifacts")
+                .len(),
+            1
+        );
     }
 
     #[test]

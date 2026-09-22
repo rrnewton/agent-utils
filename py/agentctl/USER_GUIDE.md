@@ -19,27 +19,28 @@ keep alive. The manager is independent of shell-command execution utilities.
 
 Run `agentctl capabilities` to inspect the modes, backends, harnesses, and
 services present in this installation. **The Python distribution includes the
-interactive core, headless workers, Chat, and MCP. The Rust distribution provides the
-interactive core plus a provider-neutral inbound-subscription protocol and safe
-plugin discovery.** It does not ship a provider executable or a Chat bridge
-command. The worker, Chat, and MCP extensions remain bundled capabilities of
-the Python distribution rather than plugin claims.
+interactive core, headless workers, a polling Chat transport and launcher, and
+MCP. The Rust distribution provides the interactive core plus a durable
+event-driven Chat host, a provider-neutral inbound-subscription protocol, and
+safe plugin discovery.** It does not ship a provider executable: an operator
+installs an inbound plugin and separately selects any outbound helper. Headless
+workers and MCP remain bundled capabilities of the Python distribution.
 
 | Mode or service | What it controls | Additional dependency |
 | --- | --- | --- |
 | Interactive | A native Codex or Claude TUI that remains directly accessible | Herdr |
 | Headless worker extension | Resumable Codex or AGY structured turns; a terminal shows the transcript | Herdr or tmux and the chosen harness |
-| Chat extension | One Google Chat space connected to an interactive coordinator | Google Chat access and Herdr |
+| Chat service | Provider messages connected to an interactive coordinator | Herdr and either the Python Google Chat transport or a Rust subscription plugin |
 | MCP extension | The same session operations over local MCP stdio | An MCP client |
 
 ### Rust subscription plugin discovery
 
-The Rust command inspects `~/.agentctl/plugins/` only when `agentctl
-capabilities` runs. Ordinary session-control commands do not scan the plugin
-directory. This installation provides the protocol, safe discovery, and launch
-command builder; it does not provide a durable subscription host command or a
-provider executable. Set `AGENTCTL_HOME` to an absolute directory to use an
-isolated user-level home.
+The Rust command inspects `~/.agentctl/plugins/` when `agentctl capabilities`,
+`chat init`, or `chat run` needs plugin inventory. Ordinary session-control
+commands do not scan the plugin directory. This installation provides the
+protocol, safe discovery, process supervision, and durable subscription host;
+it does not provide a provider executable. Set `AGENTCTL_HOME` to an absolute
+directory to use an isolated user-level home.
 This home is separate from the project-local session registry selected by
 `--registry`; installing a backend cannot change or acquire a project session.
 Manifests are discovered automatically in deterministic filename order; there
@@ -99,7 +100,7 @@ cannot self-authorize access to unrelated API keys. Provider credentials belong
 to an explicit host-controlled mechanism or to the provider's ambient user
 credential service.
 
-A future durable host connects the returned process supervisor with explicit
+The Rust `chat run` host connects the returned process supervisor with explicit
 Hello, Start, Commit, Close, and shutdown-grace deadlines. Blocking protocol I/O
 runs on an owned worker. The separately retained cancellation handle can kill
 the complete private process group while `next_item` is blocked, then joins the
@@ -127,8 +128,9 @@ identity resources plus one admission instead of using numeric `Child::kill` or
 auto-reaper makes status ownership unsafe. The process
 group is a cleanup boundary for trusted same-user plugins, not security
 containment—a malicious plugin can escape it with `setsid`. Untrusted plugins
-need a launcher-owned sandbox or cgroup. The current Rust CLI exposes these
-launch/protocol building blocks but still ships no subscription runtime command.
+need a launcher-owned sandbox or cgroup. The Rust CLI exposes this runtime as
+`chat init`, `chat status`, `chat tick`, `chat run`, and `chat close`; use
+`chat quickstart` and `chat userguide` for its configuration and operations.
 
 A manifest can report only static implementation maturity. Discovery always
 reports `configured`, `connected`, and `live_verified` as false. Those are
@@ -137,7 +139,8 @@ live provider connection. The reference inventory reports Google Workspace
 Events design material with no Rust provider, cloud topic, pull
 subscription, application-default credentials, or live end-to-end verification.
 It reports Discord request/response support separately from the absent Gateway
-subscription. Neither entry is advertised as a working inbound backend.
+subscription. Those reference entries are design inventory, not working inbound
+backends; installed plugin manifests appear separately.
 
 Extension commands are not available in every installation. An interactive
 agent requires Herdr; selecting tmux does not provide interactive agent control.
@@ -148,8 +151,9 @@ A headless transcript view is not a native interactive harness interface.
 Commands use a human-readable session `NAME`, made of lowercase letters, digits,
 and hyphens. State defaults to `.agentctl` in the current directory. Use
 `--registry /absolute/path` to give multiple callers the same registry. The
-`--state` spelling is an alias for the session registry; Chat has a separate
-state directory and separate `--state` option.
+`--state` spelling is an alias for the session registry. Chat has a separate
+state directory: the polling edition names it with `--state`, while the
+subscription-plugin edition uses the unambiguous `--bridge-state`.
 
 A name identifies one generation of a session. The registry also records its
 runtime identity, selected adapter, native conversation when known, and delivery
@@ -375,11 +379,10 @@ ownership and preserve recoverable state on failure.
 ## Chat and MCP extensions
 
 `agentctl chat quickstart` and `agentctl chat userguide` describe the Chat
-extension. It accepts authorized messages into durable state and reacts with
-🤖 by default, before waiting for the coordinator to become ready. A reaction
-means the bridge ingested the message; the final answer arrives separately.
-Configure another emoji with `ack_reaction`, or disable reactions with null or
-an empty string. Reaction failures remain visible and retryable without aborting
+service shipped by the installed edition. Both accept authorized messages into
+durable state before waiting for the coordinator to become ready. A configured
+reaction means the bridge ingested the message; the final answer arrives
+separately. Reaction failures remain visible and retryable without aborting
 prompt delivery or replies.
 
 The Chat bridge is a separate, long-running process. It can target one coordinator
@@ -388,11 +391,12 @@ uses terminal input; a command or socket transport changes Google Chat access, n
 harness connection. By default, the coordinator brackets its final answer with
 unique tags from the prompt. The bridge waits on a Herdr subscription, captures
 that block, and posts it durably; no reply file or CLI call is needed from the
-agent. Explicit file replies remain available with `reply_mode: "file"` and for
-recovery. Retained terminal history is bounded, so capture failures remain
-visible for inspection. The bridge does not supervise the coordinator's process.
+agent. The polling edition also supports explicit file replies with `reply_mode:
+"file"`; the subscription-plugin edition uses only tagged terminal capture.
+Retained terminal history is bounded, so capture failures remain visible for
+inspection. The bridge does not supervise the coordinator's process.
 
-For an operator-created Herdr tab, `agentctl chat launch --config chat.json`
+In the Python edition, for an operator-created Herdr tab, `agentctl chat launch --config chat.json`
 provides the supervised exception to that separate-process model: it discovers
 the current pane and workspace, runs the native coordinator there, and owns a
 bridge child for exactly that coordinator's lifetime. The inherited
@@ -400,7 +404,7 @@ bridge child for exactly that coordinator's lifetime. The inherited
 subagents in the same Herdr workspace. The reusable launch config contains Chat
 authority and transport settings; the command supplies the target identity.
 
-The built-in Chat transport polls the public REST API. An optional
+The Python edition's built-in Chat transport polls the public REST API. An optional
 `event_command` connects an operator-supplied event stream; messages then wake
 the bridge immediately, while ACKs, Herdr prompt delivery, final replies, and
 recovery scans run independently. A durable cursor and message IDs allow safe
@@ -412,13 +416,23 @@ recovery pass remains fixed at five minutes. Without an event adapter,
 than the configured interval and grows toward a one-day ceiling after long-interval
 failures. The Chat user guide documents the adapter protocol.
 
-One `run` or `tick` process owns each Chat state directory. Stop `run` before
-using `tick` for manual recovery. Explicit `chat reply` submissions remain
-available while it runs; a private local notification wakes the streaming
-runner immediately after the submission is durable, and the unconditional
-five-minute recovery pass covers a missed notification or restart.
+The Rust edition instead consumes an installed subscription plugin through its
+event-driven protocol. It uses an independently configured, bounded one-shot
+NDJSON helper for optional reactions and replies. `chat init` validates the
+plugin, named Herdr target, helper, and authority before creating state; `chat
+run` owns the provider and Herdr subscriptions; `chat tick` performs one bounded
+recovery pass; `chat status` is read-only; and `chat close` retires one exact
+reply route. Its dedicated `chat userguide` documents the schemas and service
+manager limits.
 
-Thread replies include a command hint for the nearest ten prior messages:
+One `run` or `tick` process owns each Chat state directory. Stop `run` before
+using `tick` for manual recovery. In the polling edition, explicit `chat reply`
+submissions remain available while `run` owns the state; a private local
+notification wakes that runner after the submission is durable, and its
+unconditional five-minute recovery pass covers a missed notification or
+restart.
+
+The polling edition's thread replies include a command hint for the nearest ten prior messages:
 `agentctl chat context --state DIR --request KEY_OR_UNIQUE_HEX_PREFIX --limit 10`.
 It reads one page from the request's exact thread and time cutoff, prints it
 chronologically, and supplies a cursor for older context. This command needs

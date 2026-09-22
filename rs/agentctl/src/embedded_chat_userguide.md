@@ -50,7 +50,11 @@ must emit exactly one newline-terminated JSON response. It is started inside the
 same reviewed pidfd/private-process-group supervisor used for subscription
 plugins, with a cleared environment plus only the configured names. The host
 sets `AGENTCTL_PROCESS_SUPERVISED=1`. The helper must not create another process
-group. Its operation deadline is positive and at most 30 seconds.
+group. Its operation deadline is positive and at most 30 seconds. At service
+startup the host validates and hashes a native helper of at most 64 MiB, copies
+those exact bytes into a sealed in-memory executable, and retains that image for
+the generation. Reply and reaction operations neither reopen nor rehash the
+source path.
 
 To run intentionally without reactions or replies, set `outbound_enabled` to
 `false`, set `ack_reaction` to `null`, and omit `outbound_command`. The delivered
@@ -75,10 +79,13 @@ agentctl --registry /work/project/.agentctl chat run \
 
 `run` owns an exclusive state lease. Provider intake blocks on the plugin event
 stream; it does not poll a REST listing. Terminal reply capture blocks on
-Herdr's `events.subscribe` socket with one exact line predicate per active reply
-ID. Provider notices and SIGINT/SIGTERM interrupt that wait through a local wake
-descriptor. A disk-backed terminal and delivery reconciliation occurs every 300
-seconds by default and can be changed with `--reconcile-interval`.
+Herdr's `events.subscribe` socket with one bounded generic closing-fence
+predicate, then routes the exact reply ID through the in-memory durable-state
+index. This supports a maximum-sized provider batch without exceeding Herdr's
+predicate limit. Provider notices and SIGINT/SIGTERM interrupt that wait through
+a local wake descriptor. A disk-backed terminal and delivery reconciliation
+occurs every 300 seconds by default and can be changed with
+`--reconcile-interval`.
 
 For a bounded manual recovery while the daemon is stopped:
 
