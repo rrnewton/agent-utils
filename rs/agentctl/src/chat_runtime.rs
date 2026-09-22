@@ -33,6 +33,10 @@ use crate::agent::{self, DrainOptions, QueueMessageState};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
 const STATE_VERSION: u32 = 1;
+// Retirement v1 stored provider receipts inline in one bounded JSON document. Version 2 uses a
+// small header plus bounded digest-verified chunks; keeping this separate prevents the two
+// incompatible wire shapes from silently sharing STATE_VERSION.
+const RETIREMENT_RECORD_VERSION: u32 = 2;
 const MAX_REQUESTS: u64 = 2_048;
 const MAX_REQUEST_BYTES: u64 = 128 * 1_024 * 1_024;
 const MAX_REQUEST_RECORD_BYTES: usize = 512 * 1_024;
@@ -647,6 +651,132 @@ struct RetiredReplyReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyRetirementPhaseV1 {
+    Prepared,
+    Retired,
+}
+
+// Exact retirement document shipped by the parent runtime. It used STATE_VERSION=1 and retained
+// provider receipts inline, so it must be decoded through this closed schema before any v2 header
+// deserialization or destructive recovery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRetirementRecordV1 {
+    version: u32,
+    phase: LegacyRetirementPhaseV1,
+    retirement_sequence: u64,
+    request_key: String,
+    message_fingerprint: String,
+    reply_nonce: String,
+    admitted_cursor: String,
+    request_bytes: u64,
+    reply_bytes: u64,
+    reply_count: u32,
+    delivery_message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_reaction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reaction_already_present: Option<bool>,
+    replies: Vec<RetiredReplyReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evicted_request_key: Option<String>,
+    prepared_at_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retired_at_millis: Option<u64>,
+}
+
+impl LegacyRetirementRecordV1 {
+    fn validate(&self) -> Result<()> {
+        if self.version != STATE_VERSION
+            || self.retirement_sequence == 0
+            || !valid_key(&self.request_key)
+            || !valid_key(&self.message_fingerprint)
+            || !valid_nonce(&self.reply_nonce)
+            || self.reply_count != u32::try_from(self.replies.len()).unwrap_or(u32::MAX)
+            || self.reply_count > MAX_REQUEST_REPLIES
+            || self
+                .evicted_request_key
+                .as_deref()
+                .is_some_and(|key| !valid_key(key))
+            || matches!(self.phase, LegacyRetirementPhaseV1::Prepared)
+                != self.retired_at_millis.is_none()
+        {
+            return Err(ChatRuntimeError::invalid(
+                "legacy v1 retirement journal is inconsistent or outside protocol bounds",
+            ));
+        }
+        match (
+            self.ack_reaction.as_deref(),
+            self.ack_request_id.as_deref(),
+            self.reaction_id.as_deref(),
+            self.reaction_already_present,
+        ) {
+            (None, None, None, None) => {}
+            (Some(reaction), Some(request_id), Some(reaction_id), Some(_))
+                if !reaction.is_empty()
+                    && valid_operation_uuid(request_id)
+                    && !reaction_id.is_empty()
+                    && reaction_id.len() <= chat_subscription::MAX_RESOURCE_ID_BYTES => {}
+            _ => {
+                return Err(ChatRuntimeError::invalid(
+                    "legacy v1 retirement reaction receipt is incomplete",
+                ));
+            }
+        }
+        ProviderCursor::new(self.admitted_cursor.clone())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        if self.replies.iter().enumerate().any(|(index, reply)| {
+            reply.ordinal != u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1)
+                || !valid_operation_uuid(&reply.send_request_id)
+                || reply.provider_message_id.is_empty()
+                || reply.provider_message_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
+        }) {
+            return Err(ChatRuntimeError::invalid(
+                "legacy v1 retirement reply receipts are inconsistent or outside protocol bounds",
+            ));
+        }
+        Ok(())
+    }
+
+    fn upgraded(&self) -> Result<(RetirementRecord, Vec<RetirementReceiptChunk>)> {
+        self.validate()?;
+        let chunks = retirement_receipt_chunks(self.retirement_sequence, &self.replies)?;
+        let upgraded = RetirementRecord {
+            version: RETIREMENT_RECORD_VERSION,
+            phase: match self.phase {
+                LegacyRetirementPhaseV1::Prepared => RetirementPhase::Prepared,
+                LegacyRetirementPhaseV1::Retired => RetirementPhase::Retired,
+            },
+            retirement_sequence: self.retirement_sequence,
+            request_key: self.request_key.clone(),
+            message_fingerprint: self.message_fingerprint.clone(),
+            reply_nonce: self.reply_nonce.clone(),
+            admitted_cursor: self.admitted_cursor.clone(),
+            request_bytes: self.request_bytes,
+            reply_bytes: self.reply_bytes,
+            reply_count: self.reply_count,
+            delivery_message_id: self.delivery_message_id.clone(),
+            ack_reaction: self.ack_reaction.clone(),
+            ack_request_id: self.ack_request_id.clone(),
+            reaction_id: self.reaction_id.clone(),
+            reaction_already_present: self.reaction_already_present,
+            reply_chunk_count: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
+            reply_receipts_digest: retirement_receipts_digest(&self.replies)?,
+            evicted_request_key: self.evicted_request_key.clone(),
+            prepared_at_millis: self.prepared_at_millis,
+            retired_at_millis: self.retired_at_millis,
+        };
+        upgraded.validate()?;
+        Ok((upgraded, chunks))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RetirementReceiptChunk {
     version: u32,
@@ -659,7 +789,7 @@ struct RetirementReceiptChunk {
 
 impl RetirementReceiptChunk {
     fn validate(&self) -> Result<()> {
-        if self.version != STATE_VERSION
+        if self.version != RETIREMENT_RECORD_VERSION
             || self.retirement_sequence == 0
             || self.chunk_count == 0
             || self.chunk_index >= self.chunk_count
@@ -726,9 +856,16 @@ struct RetirementRecord {
     retired_at_millis: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RetirementDocument {
+    Current(RetirementRecord),
+    LegacyV1(LegacyRetirementRecordV1),
+}
+
 impl RetirementRecord {
     fn validate(&self) -> Result<()> {
-        if self.version != STATE_VERSION
+        if self.version != RETIREMENT_RECORD_VERSION
             || self.retirement_sequence == 0
             || !valid_key(&self.request_key)
             || !valid_key(&self.message_fingerprint)
@@ -2288,6 +2425,8 @@ pub struct BridgeState {
     #[cfg(test)]
     admission_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
+    admission_boundary_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
     retirement_fault_after: Arc<std::sync::Mutex<Option<usize>>>,
     #[cfg(test)]
     retirement_boundary_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -2374,6 +2513,8 @@ impl BridgeState {
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
+            admission_boundary_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
             retirement_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             retirement_boundary_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2453,6 +2594,8 @@ impl BridgeState {
             config: envelope.config,
             #[cfg(test)]
             admission_fault_after: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            admission_boundary_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             retirement_fault_after: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -2669,6 +2812,8 @@ impl BridgeState {
     fn admission_boundary(&self) -> Result<()> {
         #[cfg(test)]
         {
+            self.admission_boundary_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut remaining = self
                 .admission_fault_after
                 .lock()
@@ -2818,9 +2963,12 @@ impl BridgeState {
                     });
                     let committed_boundary_authority =
                         match checkpoint.boundary_batch_fingerprint.as_deref() {
+                            // Exact replay authority identifies the inclusive boundary even if
+                            // this delivery's provider callback remains Prepared. The separate
+                            // committed bit gates retirement and positive receipt evidence, not
+                            // whether another exact delivery may be durably admitted and ACKed.
                             Some(fingerprint) => {
-                                checkpoint.boundary_ever_committed
-                                    && fingerprint == batch_fingerprint
+                                fingerprint == batch_fingerprint
                                     && usize::try_from(checkpoint.boundary_event_count).ok()
                                         == Some(batch.events().len())
                             }
@@ -3514,10 +3662,12 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         if !request.reply_closed {
             request.reply_closed = true;
             self.write_request_accounted(&request, &mut checkpoint)?;
+            // Retirement is deliberately the next fallible phase. Persist the exact mutated
+            // record size first so an in-process retry never subtracts from stale accounting.
+            self.persist_checkpoint(&mut checkpoint)?;
         }
         let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
-        checkpoint.updated_at_millis = unix_millis();
-        write_document(&self.root.join("checkpoint.json"), &checkpoint)
+        self.persist_checkpoint(&mut checkpoint)
     }
 
     fn retire_for_capacity_locked(
@@ -3651,7 +3801,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         let prepared_at_millis = unix_millis();
         let reply_chunks = retirement_receipt_chunks(retirement_sequence, &replies)?;
         let mut retirement = RetirementRecord {
-            version: STATE_VERSION,
+            version: RETIREMENT_RECORD_VERSION,
             phase: RetirementPhase::Preparing,
             retirement_sequence,
             request_key: key.to_owned(),
@@ -3866,24 +4016,40 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             let state_lock =
                 agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
             state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
-            let mut request = self.read_request(key)?;
+            let mut checkpoint = self.read_checkpoint()?;
+            self.complete_pending_retirement_locked(&mut checkpoint)?;
+            let mut request = match self.read_request(key) {
+                Ok(request) => request,
+                Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    if let Some(result) = self.retired_ack_result(key)? {
+                        return Ok(result);
+                    }
+                    return Err(ChatRuntimeError::Io(error));
+                }
+                Err(error) => return Err(error),
+            };
             match request.ack_phase {
                 AckPhase::Disabled => return Ok(AckResult::Disabled),
                 AckPhase::Acked => {
-                    return Ok(AckResult::Acked(ReactionReceipt {
+                    let receipt = ReactionReceipt {
                         reaction_id: request
                             .reaction_id
                             .expect("validated acknowledged request has receipt"),
                         already_present: request
                             .reaction_already_present
                             .expect("validated acknowledged request has reconciliation flag"),
-                    }));
+                    };
+                    // A prior terminal ACK may have faulted after its accounting checkpoint but
+                    // inside retirement. Retrying ACK must resume that journal without repeating
+                    // the provider mutation.
+                    let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
+                    self.persist_checkpoint(&mut checkpoint)?;
+                    return Ok(AckResult::Acked(receipt));
                 }
                 AckPhase::Pending | AckPhase::Sending => {}
             }
             request.ack_phase = AckPhase::Sending;
             request.ack_error = None;
-            let mut checkpoint = self.read_checkpoint()?;
             self.write_request_accounted(&request, &mut checkpoint)?;
             checkpoint.updated_at_millis = unix_millis();
             write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
@@ -3940,9 +4106,11 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         request.ack_error = None;
         let mut checkpoint = self.read_checkpoint()?;
         self.write_request_accounted(&request, &mut checkpoint)?;
+        // Make the exact post-mutation byte total durable before retirement can fault. An
+        // immediate same-process retry then subtracts from the same bytes present on disk.
+        self.persist_checkpoint(&mut checkpoint)?;
         let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
-        checkpoint.updated_at_millis = unix_millis();
-        write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        self.persist_checkpoint(&mut checkpoint)?;
         Ok(AckResult::Acked(receipt))
     }
 
@@ -4080,7 +4248,18 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             let state_lock =
                 agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
             state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
-            let mut request = self.read_request(key)?;
+            let mut checkpoint = self.read_checkpoint()?;
+            self.complete_pending_retirement_locked(&mut checkpoint)?;
+            let mut request = match self.read_request(key) {
+                Ok(request) => request,
+                Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    if self.retired_key(key)?.is_some() {
+                        return Ok(None);
+                    }
+                    return Err(ChatRuntimeError::Io(error));
+                }
+                Err(error) => return Err(error),
+            };
             let original_send_ordinal = request.next_send_ordinal;
             while request.next_send_ordinal < request.next_reply_ordinal {
                 let mut reply = self.read_reply(key, request.next_send_ordinal)?;
@@ -4091,14 +4270,19 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                 }
                 request.next_send_ordinal = request.next_send_ordinal.saturating_add(1);
             }
-            if request.next_send_ordinal != original_send_ordinal {
-                let mut checkpoint = self.read_checkpoint()?;
-                self.write_request_accounted(&request, &mut checkpoint)?;
-                checkpoint.updated_at_millis = unix_millis();
-                write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
-            }
-            if request.next_send_ordinal >= request.next_reply_ordinal {
-                return Ok(None);
+            let pointer_changed = request.next_send_ordinal != original_send_ordinal;
+            if pointer_changed || request.next_send_ordinal >= request.next_reply_ordinal {
+                if pointer_changed {
+                    self.write_request_accounted(&request, &mut checkpoint)?;
+                    self.persist_checkpoint(&mut checkpoint)?;
+                }
+                if request.next_send_ordinal >= request.next_reply_ordinal {
+                    // Retry a retirement that faulted after the prior Sent transition without
+                    // issuing another provider send.
+                    let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
+                    self.persist_checkpoint(&mut checkpoint)?;
+                    return Ok(None);
+                }
             }
             let reply = self.read_reply(key, request.next_send_ordinal)?;
             (request, reply)
@@ -4139,9 +4323,9 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             request.validate(key)?;
             let mut checkpoint = self.read_checkpoint()?;
             self.write_request_accounted(&request, &mut checkpoint)?;
+            self.persist_checkpoint(&mut checkpoint)?;
             let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
-            checkpoint.updated_at_millis = unix_millis();
-            write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+            self.persist_checkpoint(&mut checkpoint)?;
         }
         Ok(Some(provider_message_id))
     }
@@ -4204,11 +4388,20 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         let mut checkpoint = self.read_checkpoint()?;
         self.write_request_accounted(&record, &mut checkpoint)?;
         if record.phase == RequestPhase::Delivered {
+            self.persist_checkpoint(&mut checkpoint)?;
             let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
         }
-        checkpoint.updated_at_millis = unix_millis();
-        write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        self.persist_checkpoint(&mut checkpoint)?;
         Ok(record)
+    }
+
+    fn retry_eligible_retirement(&self, key: &str) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let mut checkpoint = self.read_checkpoint()?;
+        let _ = self.retire_if_eligible_locked(&mut checkpoint, key)?;
+        self.persist_checkpoint(&mut checkpoint)
     }
 
     fn write_request_accounted(
@@ -4239,6 +4432,12 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         write_document(&self.request_path(&record.key), record)?;
         checkpoint.request_bytes = next_total;
         Ok(())
+    }
+
+    fn persist_checkpoint(&self, checkpoint: &mut Checkpoint) -> Result<()> {
+        checkpoint.updated_at_millis = unix_millis();
+        validate_checkpoint(checkpoint)?;
+        write_document(&self.root.join("checkpoint.json"), checkpoint)
     }
 
     fn read_checkpoint(&self) -> Result<Checkpoint> {
@@ -4382,6 +4581,41 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         Ok(Some(retired))
     }
 
+    fn retired_ack_result(&self, key: &str) -> Result<Option<AckResult>> {
+        let Some(index) = self.retired_key(key)? else {
+            return Ok(None);
+        };
+        let retirement: RetirementRecord = read_document(
+            &self.retirement_path(index.retirement_sequence),
+            MAX_RETIREMENT_RECORD_BYTES,
+        )?;
+        retirement.validate()?;
+        if retirement.retirement_sequence != index.retirement_sequence
+            || retirement.request_key != key
+            || retirement.phase != RetirementPhase::Retired
+        {
+            return Err(ChatRuntimeError::invalid(
+                "retired acknowledgement audit does not match its key guard",
+            ));
+        }
+        match (
+            retirement.ack_reaction,
+            retirement.reaction_id,
+            retirement.reaction_already_present,
+        ) {
+            (None, None, None) => Ok(Some(AckResult::Disabled)),
+            (Some(_), Some(reaction_id), Some(already_present)) => {
+                Ok(Some(AckResult::Acked(ReactionReceipt {
+                    reaction_id,
+                    already_present,
+                })))
+            }
+            _ => Err(ChatRuntimeError::invalid(
+                "retired acknowledgement audit is incomplete",
+            )),
+        }
+    }
+
     fn retired_routes(&self) -> Result<Vec<RetiredRouteIndex>> {
         let checkpoint = self.read_checkpoint()?;
         let count = checkpoint.retired_route_count.min(RETIRED_ROUTE_SLOTS);
@@ -4486,8 +4720,8 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             .collect()
     }
 
-    fn retirement_records(&self) -> Result<Vec<(PathBuf, RetirementRecord)>> {
-        let mut records = Vec::new();
+    fn retirement_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
         for entry in fs::read_dir(self.root.join("retirements"))? {
             let entry = entry?;
             if agent::is_atomic_json_temporary(&entry.path())? {
@@ -4509,20 +4743,160 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
                     "chat retirement slot name is not canonical",
                 ));
             }
-            let record: RetirementRecord =
-                read_document(&entry.path(), MAX_RETIREMENT_RECORD_BYTES)?;
-            record.validate()?;
-            if self.retirement_path(record.retirement_sequence) != entry.path() {
-                return Err(ChatRuntimeError::invalid(
-                    "retirement journal sequence does not match its ring slot",
-                ));
-            }
-            records.push((entry.path(), record));
-            if records.len() > usize::try_from(RETIREMENT_AUDIT_SLOTS).unwrap_or(usize::MAX) {
+            paths.push(entry.path());
+            if paths.len() > usize::try_from(RETIREMENT_AUDIT_SLOTS).unwrap_or(usize::MAX) {
                 return Err(ChatRuntimeError::invalid(
                     "retirement journal exceeds its bounded slot count",
                 ));
             }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn migrate_legacy_retirements_locked(&self) -> Result<()> {
+        let checkpoint = self.read_checkpoint()?;
+        for path in self.retirement_paths()? {
+            let document: RetirementDocument = read_document(&path, MAX_RETIREMENT_RECORD_BYTES)?;
+            match document {
+                RetirementDocument::Current(record) => {
+                    if self.retirement_path(record.retirement_sequence) != path {
+                        return Err(ChatRuntimeError::invalid(
+                            "retirement journal sequence does not match its ring slot",
+                        ));
+                    }
+                    match record.version {
+                        RETIREMENT_RECORD_VERSION => record.validate()?,
+                        STATE_VERSION => {
+                            let mut upgraded = record.clone();
+                            upgraded.version = RETIREMENT_RECORD_VERSION;
+                            upgraded.validate()?;
+                            if record.phase == RetirementPhase::Preparing {
+                                // 32c writes Preparing before any chunk. Active request/reply
+                                // artifacts remain authoritative, so publish only the v2 header;
+                                // normal preparation recovery rebuilds and verifies all chunks,
+                                // overwriting a partial mixed set idempotently.
+                                write_document(&path, &upgraded)?;
+                                self.retirement_boundary()?;
+                                continue;
+                            }
+                            // Prepared/Retired v1 has a complete chunk set. During an interrupted
+                            // upgrade it may be mixed v1/v2; verify against the v1 digest, rewrite
+                            // every chunk, then publish the v2 header atomically.
+                            let receipts = self.read_v1_or_v2_retirement_receipts(&record)?;
+                            let chunks =
+                                retirement_receipt_chunks(record.retirement_sequence, &receipts)?;
+                            upgraded.reply_chunk_count =
+                                u32::try_from(chunks.len()).unwrap_or(u32::MAX);
+                            upgraded.reply_receipts_digest = retirement_receipts_digest(&receipts)?;
+                            upgraded.validate()?;
+                            self.write_retirement_receipt_chunks(&upgraded, &receipts, &chunks)?;
+                            write_document(&path, &upgraded)?;
+                            self.retirement_boundary()?;
+                        }
+                        version => {
+                            return Err(ChatRuntimeError::invalid(format!(
+                                "retirement journal has unsupported version {version}"
+                            )));
+                        }
+                    }
+                }
+                RetirementDocument::LegacyV1(legacy) => {
+                    legacy.validate()?;
+                    if self.retirement_path(legacy.retirement_sequence) != path {
+                        return Err(ChatRuntimeError::invalid(
+                            "legacy retirement journal sequence does not match its ring slot",
+                        ));
+                    }
+                    let (mut upgraded, chunks) = legacy.upgraded()?;
+                    if matches!(legacy.phase, LegacyRetirementPhaseV1::Retired)
+                        && legacy.retirement_sequence
+                            == checkpoint.retirement_sequence.checked_add(1).unwrap_or(0)
+                    {
+                        self.validate_legacy_retired_ahead(&checkpoint, &legacy)?;
+                        // 5d4 recovery durably deleted the request and wrote Retired before it
+                        // advanced the checkpoint. Re-enter Prepared so the v2 idempotent finish
+                        // applies the exact retained accounting once.
+                        upgraded.phase = RetirementPhase::Prepared;
+                        upgraded.retired_at_millis = None;
+                        upgraded.validate()?;
+                    }
+                    // Chunks become durable while the authoritative v1 document still retains
+                    // every inline receipt. Only after the complete set and digest are verified
+                    // do we atomically replace the header. A crash at any earlier point simply
+                    // repeats the idempotent chunk writes from the still-complete v1 document.
+                    self.write_retirement_receipt_chunks(&upgraded, &legacy.replies, &chunks)?;
+                    write_document(&path, &upgraded)?;
+                    self.retirement_boundary()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_legacy_retired_ahead(
+        &self,
+        checkpoint: &Checkpoint,
+        retirement: &LegacyRetirementRecordV1,
+    ) -> Result<()> {
+        if retirement.retirement_sequence
+            != checkpoint.retirement_sequence.checked_add(1).unwrap_or(0)
+            || checkpoint.request_count == 0
+            || checkpoint.request_bytes < retirement.request_bytes
+            || checkpoint.reply_count < u64::from(retirement.reply_count)
+            || checkpoint.reply_bytes < retirement.reply_bytes
+        {
+            return Err(ChatRuntimeError::invalid(
+                "legacy retired generation ahead of checkpoint lacks exact recovery authority",
+            ));
+        }
+        if !path_is_absent(&self.request_path(&retirement.request_key))? {
+            return Err(ChatRuntimeError::invalid(
+                "legacy retired generation still has an active request",
+            ));
+        }
+        for ordinal in 1..=retirement.reply_count {
+            if !path_is_absent(&self.reply_path(&retirement.request_key, ordinal))? {
+                return Err(ChatRuntimeError::invalid(
+                    "legacy retired generation still has an active reply",
+                ));
+            }
+        }
+        let key_index: RetiredRouteIndex = read_document(
+            &self.retired_key_path(&retirement.request_key),
+            MAX_REQUEST_RECORD_BYTES,
+        )?;
+        let route_index: RetiredRouteIndex = read_document(
+            &self.retired_route_path(retirement.retirement_sequence),
+            MAX_REQUEST_RECORD_BYTES,
+        )?;
+        for index in [&key_index, &route_index] {
+            index.validate()?;
+            if index.retirement_sequence != retirement.retirement_sequence
+                || index.request_key != retirement.request_key
+                || index.message_fingerprint != retirement.message_fingerprint
+                || index.reply_nonce != retirement.reply_nonce
+                || index.admitted_cursor != retirement.admitted_cursor
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "legacy retired generation does not match its durable route authority",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn retirement_records(&self) -> Result<Vec<(PathBuf, RetirementRecord)>> {
+        let mut records = Vec::new();
+        for path in self.retirement_paths()? {
+            let record: RetirementRecord = read_document(&path, MAX_RETIREMENT_RECORD_BYTES)?;
+            record.validate()?;
+            if self.retirement_path(record.retirement_sequence) != path {
+                return Err(ChatRuntimeError::invalid(
+                    "retirement journal sequence does not match its ring slot",
+                ));
+            }
+            records.push((path, record));
         }
         records.sort_by_key(|(_, record)| record.retirement_sequence);
         Ok(records)
@@ -4649,6 +5023,56 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         Ok(receipts)
     }
 
+    fn read_v1_or_v2_retirement_receipts(
+        &self,
+        retirement: &RetirementRecord,
+    ) -> Result<Vec<RetiredReplyReceipt>> {
+        let mut structurally_current = retirement.clone();
+        structurally_current.version = RETIREMENT_RECORD_VERSION;
+        structurally_current.validate()?;
+        if retirement.reply_chunk_count == 0 {
+            return Ok(Vec::new());
+        }
+        let directory = self.retirement_receipt_slot(retirement.retirement_sequence);
+        agent::validate_private_directory(&directory, "chat retirement receipt slot", false)?;
+        let mut receipts =
+            Vec::with_capacity(usize::try_from(retirement.reply_count).unwrap_or(usize::MAX));
+        for index in 0..retirement.reply_chunk_count {
+            let mut chunk: RetirementReceiptChunk = read_document(
+                &self.retirement_receipt_chunk_path(retirement.retirement_sequence, index),
+                MAX_RETIREMENT_CHUNK_BYTES,
+            )?;
+            if !matches!(chunk.version, STATE_VERSION | RETIREMENT_RECORD_VERSION) {
+                return Err(ChatRuntimeError::invalid(
+                    "chunked v1 migration found an unsupported receipt chunk version",
+                ));
+            }
+            chunk.version = RETIREMENT_RECORD_VERSION;
+            chunk.validate()?;
+            if chunk.retirement_sequence != retirement.retirement_sequence
+                || chunk.chunk_index != index
+                || chunk.chunk_count != retirement.reply_chunk_count
+                || chunk.first_ordinal
+                    != u32::try_from(receipts.len())
+                        .unwrap_or(u32::MAX)
+                        .saturating_add(1)
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "chunked v1 receipt does not match its header or path",
+                ));
+            }
+            receipts.extend(chunk.receipts);
+        }
+        if u32::try_from(receipts.len()).unwrap_or(u32::MAX) != retirement.reply_count
+            || retirement_receipts_digest(&receipts)? != retirement.reply_receipts_digest
+        {
+            return Err(ChatRuntimeError::invalid(
+                "chunked v1 receipts fail their exact count or digest",
+            ));
+        }
+        Ok(receipts)
+    }
+
     fn validate_retirement_chunk_presence(&self, retirement: &RetirementRecord) -> Result<()> {
         if retirement.reply_chunk_count == 0 {
             return Ok(());
@@ -4764,6 +5188,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         agent::cleanup_atomic_json_temporaries(&self.root.join("retirements"))?;
+        self.migrate_legacy_retirements_locked()?;
         let mut checkpoint = self.read_checkpoint()?;
         self.complete_all_prepared_retirements_locked(&mut checkpoint)?;
         let records = self.retirement_records()?;
@@ -5063,7 +5488,19 @@ pub(crate) fn deliver_request_with(
     key: &str,
     options: DrainOptions,
 ) -> Result<CoordinatorDeliveryResult> {
-    let mut record = state.read_request(key)?;
+    // Finish any retirement that faulted after a prior terminal delivery mutation. This does not
+    // replay coordinator input and lets an immediate same-process retry observe the exact audit.
+    state.retry_eligible_retirement(key)?;
+    let mut record = match state.read_request(key) {
+        Ok(record) => record,
+        Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            if state.retired_key(key)?.is_some() {
+                return Ok(CoordinatorDeliveryResult::AlreadyDelivered);
+            }
+            return Err(ChatRuntimeError::Io(error));
+        }
+        Err(error) => return Err(error),
+    };
     match record.phase {
         RequestPhase::Delivered => return Ok(CoordinatorDeliveryResult::AlreadyDelivered),
         RequestPhase::DeliveryUncertain => {
@@ -5341,7 +5778,7 @@ fn retirement_receipt_chunks(
         let mut oversized = None;
         for (index, values) in groups.iter().enumerate() {
             let chunk = RetirementReceiptChunk {
-                version: STATE_VERSION,
+                version: RETIREMENT_RECORD_VERSION,
                 retirement_sequence,
                 chunk_index: u32::try_from(index).map_err(|_| {
                     ChatRuntimeError::invalid("retirement chunk index does not fit u32")
@@ -5851,6 +6288,14 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ChatRuntimeError::Io(error)),
+    }
+}
+
+fn path_is_absent(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(ChatRuntimeError::Io(error)),
     }
 }
@@ -6818,70 +7263,97 @@ mod tests {
     }
 
     #[test]
-    fn legacy_prepared_boundary_upgrades_through_guarded_inclusive_replay() {
-        let root = temporary("legacy-prepared-authority-upgrade");
-        let state = BridgeState::initialize(&root, config()).expect("initialize state");
-        state
-            .admit_batch(&boundary_delivery_at(
-                1,
-                9_999,
-                "cursor-current",
-                "current request",
-            ))
-            .expect("prepare current delivery without confirming callback");
-        let mut legacy = state.read_checkpoint().expect("checkpoint");
-        assert_eq!(
+    fn legacy_prepared_boundary_replays_after_every_upgrade_crash_and_preserves_next_guard() {
+        fn exercise(boundary: Option<usize>) -> (bool, usize) {
+            let root = temporary(&format!("legacy-prepared-upgrade-{boundary:?}"));
+            let state = BridgeState::initialize(&root, config()).expect("initialize state");
+            let current_batch = boundary_delivery_at(1, 9_999, "cursor-current", "current request");
             state
-                .current_commit_receipt(&legacy)
-                .expect("read current receipt")
-                .expect("prepared current receipt")
-                .phase,
-            CommitReceiptPhase::Prepared
-        );
-        legacy.boundary_batch_fingerprint = None;
-        legacy.boundary_event_count = 0;
-        legacy.boundary_ever_committed = false;
-        legacy.boundary_messages.clear();
-        write_document(&root.join("checkpoint.json"), &legacy).expect("plant legacy checkpoint");
+                .admit_batch(&current_batch)
+                .expect("prepare current delivery without confirming callback");
+            let mut legacy = state.read_checkpoint().expect("checkpoint");
+            assert_eq!(
+                state
+                    .current_commit_receipt(&legacy)
+                    .expect("read current receipt")
+                    .expect("prepared current receipt")
+                    .phase,
+                CommitReceiptPhase::Prepared
+            );
+            legacy.boundary_batch_fingerprint = None;
+            legacy.boundary_event_count = 0;
+            legacy.boundary_ever_committed = false;
+            legacy.boundary_messages.clear();
+            write_document(&root.join("checkpoint.json"), &legacy)
+                .expect("plant legacy checkpoint");
 
-        *state
-            .admission_fault_after
-            .lock()
-            .expect("admission fault lock") = Some(0);
-        assert!(state
-            .admit_batch(&maximum_message_delivery(
-                2,
-                "cursor-target",
-                "legacy-target-before-crash",
-            ))
-            .is_err());
+            let target_batch =
+                indexed_delivery_at(2, 10_000, "cursor-target", "guarded target request");
+            *state
+                .admission_fault_after
+                .lock()
+                .expect("admission fault lock") = Some(0);
+            assert!(state.admit_batch(&target_batch).is_err());
 
-        let reopened = BridgeState::open(&root).expect("open prepared legacy guarded state");
-        let current_replay = reopened
-            .admit_batch(&boundary_delivery_at(
-                1,
-                9_999,
-                "cursor-current",
-                "current request",
-            ))
-            .expect("upgrade exact prepared legacy current replay");
-        assert!(current_replay.new_request_keys.is_empty());
-        reopened
-            .confirm_batch_commit(&current_replay)
-            .expect("confirm distinct legacy replay delivery");
-        let upgraded = reopened.read_checkpoint().expect("upgraded checkpoint");
-        assert!(upgraded.boundary_batch_fingerprint.is_some());
-        assert!(upgraded.boundary_ever_committed);
-        assert_eq!(upgraded.boundary_messages.len(), 1);
-        let target = reopened
-            .admit_batch(&maximum_message_delivery(
-                2,
-                "cursor-target",
-                "legacy-target-after-crash",
-            ))
-            .expect("admit exact guarded target after prepared legacy replay");
-        assert_eq!(target.new_request_keys.len(), 256);
-        fs::remove_dir_all(root).expect("cleanup");
+            let reopened = BridgeState::open(&root).expect("recover prepared legacy guard");
+            reopened
+                .admission_boundary_count
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            *reopened
+                .admission_fault_after
+                .lock()
+                .expect("admission fault lock") = boundary;
+            let first_replay = reopened.admit_batch(&current_batch);
+            let observed = reopened
+                .admission_boundary_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let interrupted = first_replay.is_err();
+            if let Ok(admission) = first_replay {
+                assert!(admission.new_request_keys.is_empty());
+                assert!(
+                    !reopened
+                        .read_checkpoint()
+                        .expect("prepared upgraded boundary")
+                        .boundary_ever_committed,
+                    "the first distinct replay remains unconfirmed before the simulated crash"
+                );
+            }
+            drop(reopened);
+
+            // Crash before confirming the first distinct replay, including after it installed
+            // modern authority. The next exact C0 delivery must still admit and preserve C1.
+            let restarted = BridgeState::open(&root).expect("restart interrupted legacy upgrade");
+            let second_replay = restarted
+                .admit_batch(&current_batch)
+                .expect("repeat exact prepared current boundary");
+            assert!(second_replay.new_request_keys.is_empty());
+            restarted
+                .confirm_batch_commit(&second_replay)
+                .expect("confirm repeated current delivery");
+            let upgraded = restarted.read_checkpoint().expect("upgraded checkpoint");
+            assert!(upgraded.boundary_batch_fingerprint.is_some());
+            assert!(upgraded.boundary_ever_committed);
+            assert_eq!(upgraded.boundary_messages.len(), 1);
+            let target = restarted
+                .admit_batch(&target_batch)
+                .expect("guarded target survives repeated current delivery");
+            assert_eq!(target.new_request_keys.len(), 1);
+            assert!(!restarted.admission_path().exists());
+            fs::remove_dir_all(root).expect("cleanup");
+            (interrupted, observed)
+        }
+
+        let (interrupted, exact_boundary_count) = exercise(None);
+        assert!(!interrupted);
+        assert!(exact_boundary_count > 0);
+        for boundary in 0..exact_boundary_count {
+            let (interrupted, observed) = exercise(Some(boundary));
+            assert!(interrupted, "upgrade boundary {boundary} was not faulted");
+            assert!(observed > boundary, "upgrade boundary hook was not reached");
+        }
+        let (interrupted, observed) = exercise(Some(exact_boundary_count));
+        assert!(!interrupted, "one-past-final boundary must not fault");
+        assert_eq!(observed, exact_boundary_count);
     }
 
     #[test]
@@ -6914,7 +7386,7 @@ mod tests {
         let state =
             BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
         let retirement = RetirementRecord {
-            version: STATE_VERSION,
+            version: RETIREMENT_RECORD_VERSION,
             phase: RetirementPhase::Preparing,
             retirement_sequence: 1,
             request_key: "a".repeat(64),
@@ -7045,6 +7517,615 @@ mod tests {
             "prepared"
         );
         assert_eq!(status["runtime_evidence"]["durable_batch_verified"], false);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn parent_v1_inline_retirement_migrates_atomically_across_every_boundary() {
+        fn exercise(boundary: Option<usize>) -> (bool, usize) {
+            let (state, key, root) = state_with_old_request(
+                &format!("legacy-retirement-migration-{boundary:?}"),
+                config_without_reaction(),
+            );
+            state
+                .set_delivery_phase(&key, RequestPhase::Delivered, None)
+                .expect("mark delivered");
+            let route = state
+                .next_reply_route(&key)
+                .expect("route")
+                .expect("open route");
+            state
+                .capture_replies(
+                    &key,
+                    &format!(
+                        "<CHAT_REPLY_{}>\nlegacy receipt\n</CHAT_REPLY_{}>",
+                        route.identifier, route.identifier
+                    ),
+                )
+                .expect("capture reply");
+            let mut transport = FakeReplyTransport::default();
+            state
+                .publish_one(&key, &mut transport)
+                .expect("publish reply")
+                .expect("provider receipt");
+            state.close_replies(&key).expect("retire fixture request");
+
+            let modern: RetirementRecord =
+                read_document(&state.retirement_path(1), MAX_RETIREMENT_RECORD_BYTES)
+                    .expect("modern retirement fixture");
+            let receipts = state
+                .read_retirement_receipts(&modern)
+                .expect("modern receipt fixture");
+            let legacy = LegacyRetirementRecordV1 {
+                version: STATE_VERSION,
+                phase: LegacyRetirementPhaseV1::Retired,
+                retirement_sequence: modern.retirement_sequence,
+                request_key: modern.request_key.clone(),
+                message_fingerprint: modern.message_fingerprint.clone(),
+                reply_nonce: modern.reply_nonce.clone(),
+                admitted_cursor: modern.admitted_cursor.clone(),
+                request_bytes: modern.request_bytes,
+                reply_bytes: modern.reply_bytes,
+                reply_count: modern.reply_count,
+                delivery_message_id: modern.delivery_message_id.clone(),
+                ack_reaction: modern.ack_reaction.clone(),
+                ack_request_id: modern.ack_request_id.clone(),
+                reaction_id: modern.reaction_id.clone(),
+                reaction_already_present: modern.reaction_already_present,
+                replies: receipts.clone(),
+                evicted_request_key: modern.evicted_request_key.clone(),
+                prepared_at_millis: modern.prepared_at_millis,
+                retired_at_millis: modern.retired_at_millis,
+            };
+            legacy.validate().expect("exact parent v1 fixture");
+            let legacy_json = serde_json::to_value(&legacy).expect("serialize parent v1 fixture");
+            assert_eq!(legacy_json["version"], Value::from(1));
+            assert!(legacy_json.get("replies").is_some());
+            assert!(legacy_json.get("reply_chunk_count").is_none());
+            write_document(&state.retirement_path(1), &legacy)
+                .expect("install exact parent v1 retirement document");
+            fs::remove_dir_all(state.retirement_receipt_slot(1))
+                .expect("remove post-parent chunk fixture");
+            agent::sync_directory(&root.join("retirement-receipts")).expect("sync parent fixture");
+
+            state
+                .retirement_boundary_count
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            *state
+                .retirement_fault_after
+                .lock()
+                .expect("retirement fault lock") = boundary;
+            let migration = state.complete_retirements();
+            let observed = state
+                .retirement_boundary_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let interrupted = migration.is_err();
+
+            let reopened = BridgeState::open(&root).expect("restart migration idempotently");
+            let upgraded: RetirementRecord =
+                read_document(&reopened.retirement_path(1), MAX_RETIREMENT_RECORD_BYTES)
+                    .expect("upgraded retirement header");
+            assert_eq!(upgraded.version, RETIREMENT_RECORD_VERSION);
+            assert_eq!(upgraded.phase, RetirementPhase::Retired);
+            assert_eq!(
+                reopened
+                    .read_retirement_receipts(&upgraded)
+                    .expect("upgraded exact receipts"),
+                receipts
+            );
+            assert!(!reopened.request_path(&key).exists());
+            assert!(!reopened.reply_path(&key, 1).exists());
+            assert_eq!(
+                reopened
+                    .read_checkpoint()
+                    .expect("migrated checkpoint")
+                    .retirement_sequence,
+                1
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+            (interrupted, observed)
+        }
+
+        let (interrupted, exact_boundary_count) = exercise(None);
+        assert!(!interrupted);
+        assert!(exact_boundary_count > 0);
+        for boundary in 0..exact_boundary_count {
+            let (interrupted, observed) = exercise(Some(boundary));
+            assert!(interrupted, "migration boundary {boundary} was not faulted");
+            assert!(
+                observed > boundary,
+                "migration boundary hook was not reached"
+            );
+        }
+        let (interrupted, observed) = exercise(Some(exact_boundary_count));
+        assert!(
+            !interrupted,
+            "one-past-final migration boundary must complete"
+        );
+        assert_eq!(observed, exact_boundary_count);
+    }
+
+    #[test]
+    fn base_chunked_v1_retirement_migrates_mixed_chunks_across_every_boundary() {
+        fn exercise(boundary: Option<usize>) -> (bool, usize) {
+            let (state, key, root) = state_with_old_request(
+                &format!("base-chunked-v1-migration-{boundary:?}"),
+                config_without_reaction(),
+            );
+            state
+                .set_delivery_phase(&key, RequestPhase::Delivered, None)
+                .expect("mark delivered");
+            let route = state
+                .next_reply_route(&key)
+                .expect("route")
+                .expect("open route");
+            state
+                .capture_replies(
+                    &key,
+                    &format!(
+                        "<CHAT_REPLY_{}>\nbase chunk receipt\n</CHAT_REPLY_{}>",
+                        route.identifier, route.identifier
+                    ),
+                )
+                .expect("capture reply");
+            let mut transport = FakeReplyTransport::default();
+            state
+                .publish_one(&key, &mut transport)
+                .expect("publish reply")
+                .expect("provider receipt");
+            state.close_replies(&key).expect("retire fixture request");
+
+            let mut base_header: RetirementRecord =
+                read_document(&state.retirement_path(1), MAX_RETIREMENT_RECORD_BYTES)
+                    .expect("current header");
+            let receipts = state
+                .read_retirement_receipts(&base_header)
+                .expect("current receipts");
+            base_header.version = STATE_VERSION;
+            write_document(&state.retirement_path(1), &base_header)
+                .expect("install exact base chunked-v1 header");
+            for index in 0..base_header.reply_chunk_count {
+                let path = state.retirement_receipt_chunk_path(1, index);
+                let mut chunk: RetirementReceiptChunk =
+                    read_document(&path, MAX_RETIREMENT_CHUNK_BYTES).expect("current chunk");
+                chunk.version = STATE_VERSION;
+                write_document(&path, &chunk).expect("install exact base chunked-v1 chunk");
+            }
+
+            state
+                .retirement_boundary_count
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            *state
+                .retirement_fault_after
+                .lock()
+                .expect("retirement fault lock") = boundary;
+            let migration = state.complete_retirements();
+            let observed = state
+                .retirement_boundary_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let interrupted = migration.is_err();
+
+            let reopened = BridgeState::open(&root).expect("restart chunked-v1 migration");
+            let upgraded: RetirementRecord =
+                read_document(&reopened.retirement_path(1), MAX_RETIREMENT_RECORD_BYTES)
+                    .expect("upgraded header");
+            assert_eq!(upgraded.version, RETIREMENT_RECORD_VERSION);
+            assert_eq!(
+                reopened
+                    .read_retirement_receipts(&upgraded)
+                    .expect("upgraded receipts"),
+                receipts
+            );
+            for index in 0..upgraded.reply_chunk_count {
+                let chunk: RetirementReceiptChunk = read_document(
+                    &reopened.retirement_receipt_chunk_path(1, index),
+                    MAX_RETIREMENT_CHUNK_BYTES,
+                )
+                .expect("upgraded chunk");
+                assert_eq!(chunk.version, RETIREMENT_RECORD_VERSION);
+            }
+            fs::remove_dir_all(root).expect("cleanup");
+            (interrupted, observed)
+        }
+
+        let (interrupted, exact_boundary_count) = exercise(None);
+        assert!(!interrupted);
+        assert!(exact_boundary_count > 0);
+        for boundary in 0..exact_boundary_count {
+            let (interrupted, observed) = exercise(Some(boundary));
+            assert!(
+                interrupted,
+                "chunked-v1 boundary {boundary} was not faulted"
+            );
+            assert!(
+                observed > boundary,
+                "chunked-v1 boundary hook was not reached"
+            );
+        }
+        let (interrupted, observed) = exercise(Some(exact_boundary_count));
+        assert!(!interrupted, "one-past-final chunked-v1 boundary faulted");
+        assert_eq!(observed, exact_boundary_count);
+    }
+
+    #[test]
+    fn base_chunked_v1_preparing_recovers_with_zero_or_partial_chunks() {
+        for partial_chunks in [false, true] {
+            let (state, key, root) = state_with_old_request(
+                &format!("base-v1-preparing-partial-{partial_chunks}"),
+                config_without_reaction(),
+            );
+            let state_lock =
+                agent::open_private_lock(&root.join(".state.lock"), "fixture state lock")
+                    .expect("open state lock");
+            state_lock.lock_exclusive().expect("lock fixture state");
+            let mut request = state.read_request(&key).expect("active request");
+            let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+            let provider_id = "\\\"".repeat(chat_subscription::MAX_RESOURCE_ID_BYTES / 2);
+            let mut receipts = Vec::new();
+            for ordinal in 1..=96_u32 {
+                let mut reply = ReplyRecord::new(&key, ordinal, format!("reply {ordinal}"))
+                    .expect("reply fixture");
+                reply.phase = ReplyPhase::Sent;
+                reply.provider_message_id = Some(provider_id.clone());
+                reply.validate(&key, ordinal).expect("sent reply fixture");
+                write_document(&state.reply_path(&key, ordinal), &reply)
+                    .expect("persist sent reply fixture");
+                request.reply_count = request.reply_count.saturating_add(1);
+                request.reply_bytes = request.reply_bytes.saturating_add(reply.reserved_bytes);
+                checkpoint.reply_count = checkpoint.reply_count.saturating_add(1);
+                checkpoint.reply_bytes =
+                    checkpoint.reply_bytes.saturating_add(reply.reserved_bytes);
+                receipts.push(RetiredReplyReceipt {
+                    ordinal,
+                    send_request_id: reply.send_request_id,
+                    provider_message_id: provider_id.clone(),
+                });
+            }
+            agent::sync_directory(&root.join("replies")).expect("sync reply fixtures");
+            request.phase = RequestPhase::Delivered;
+            request.reply_closed = true;
+            request.next_reply_ordinal = 97;
+            request.next_send_ordinal = 97;
+            state
+                .write_request_accounted(&request, &mut checkpoint)
+                .expect("persist preparing request");
+            state
+                .persist_checkpoint(&mut checkpoint)
+                .expect("persist preparing accounting");
+            let (_, request_bytes): (RequestRecord, u64) =
+                read_document_sized(&state.request_path(&key), MAX_REQUEST_RECORD_BYTES)
+                    .expect("sized request");
+            let chunks = retirement_receipt_chunks(1, &receipts).expect("pack fixture chunks");
+            assert!(
+                chunks.len() > 1,
+                "fixture must admit a genuinely partial set"
+            );
+            let header = RetirementRecord {
+                version: STATE_VERSION,
+                phase: RetirementPhase::Preparing,
+                retirement_sequence: 1,
+                request_key: key.clone(),
+                message_fingerprint: saved_message_fingerprint(&request.message)
+                    .expect("message fingerprint"),
+                reply_nonce: request.reply_nonce.clone(),
+                admitted_cursor: request.admitted_cursor.clone().expect("admitted cursor"),
+                request_bytes,
+                reply_bytes: request.reply_bytes,
+                reply_count: request.reply_count,
+                delivery_message_id: request.delivery_message_id.clone(),
+                ack_reaction: None,
+                ack_request_id: None,
+                reaction_id: None,
+                reaction_already_present: None,
+                reply_chunk_count: u32::try_from(chunks.len()).expect("chunk count"),
+                reply_receipts_digest: retirement_receipts_digest(&receipts)
+                    .expect("receipt digest"),
+                evicted_request_key: None,
+                prepared_at_millis: unix_millis(),
+                retired_at_millis: None,
+            };
+            let mut structural_header = header.clone();
+            structural_header.version = RETIREMENT_RECORD_VERSION;
+            structural_header.validate().expect("base preparing header");
+            write_document(&state.retirement_path(1), &header)
+                .expect("persist exact base preparing header");
+            if partial_chunks {
+                let directory = state.retirement_receipt_slot(1);
+                agent::create_private_directory(&directory, "partial receipt fixture", false, true)
+                    .expect("create partial chunk directory");
+                agent::sync_directory(&root.join("retirement-receipts"))
+                    .expect("sync partial slot");
+                let mut first = chunks[0].clone();
+                first.version = STATE_VERSION;
+                write_document(&state.retirement_receipt_chunk_path(1, 0), &first)
+                    .expect("persist one partial v1 chunk");
+            }
+            drop(state_lock);
+
+            if !partial_chunks {
+                *state
+                    .retirement_fault_after
+                    .lock()
+                    .expect("retirement fault lock") = Some(0);
+                assert!(
+                    state.complete_retirements().is_err(),
+                    "zero-chunk fixture crashes immediately after v2 header publication"
+                );
+            }
+            let reopened = BridgeState::open(&root).expect("recover base Preparing fixture");
+            let upgraded: RetirementRecord =
+                read_document(&reopened.retirement_path(1), MAX_RETIREMENT_RECORD_BYTES)
+                    .expect("upgraded preparing header");
+            assert_eq!(upgraded.version, RETIREMENT_RECORD_VERSION);
+            assert_eq!(upgraded.phase, RetirementPhase::Retired);
+            assert_eq!(
+                reopened
+                    .read_retirement_receipts(&upgraded)
+                    .expect("reconstructed receipts"),
+                receipts
+            );
+            assert!(!reopened.request_path(&key).exists());
+            assert_eq!(
+                reopened
+                    .read_checkpoint()
+                    .expect("recovered checkpoint")
+                    .retirement_sequence,
+                1
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn parent_v1_prepared_retirement_migration_finishes_destructive_recovery_at_every_boundary() {
+        fn exercise(boundary: Option<usize>) -> (bool, usize) {
+            let (state, key, root) = state_with_old_request(
+                &format!("legacy-prepared-retirement-{boundary:?}"),
+                config_without_reaction(),
+            );
+            let route = state
+                .next_reply_route(&key)
+                .expect("route")
+                .expect("open route");
+            state
+                .capture_replies(
+                    &key,
+                    &format!(
+                        "<CHAT_REPLY_{}>\nprepared legacy receipt\n</CHAT_REPLY_{}>",
+                        route.identifier, route.identifier
+                    ),
+                )
+                .expect("capture reply");
+            let mut transport = FakeReplyTransport::default();
+            state
+                .publish_one(&key, &mut transport)
+                .expect("publish reply")
+                .expect("provider receipt");
+            state
+                .close_replies(&key)
+                .expect("close non-delivered request without retirement");
+
+            let state_lock =
+                agent::open_private_lock(&root.join(".state.lock"), "fixture state lock")
+                    .expect("open state lock");
+            state_lock.lock_exclusive().expect("lock fixture state");
+            let mut request = state.read_request(&key).expect("active request");
+            request.phase = RequestPhase::Delivered;
+            let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+            state
+                .write_request_accounted(&request, &mut checkpoint)
+                .expect("persist delivered fixture");
+            state
+                .persist_checkpoint(&mut checkpoint)
+                .expect("persist fixture accounting");
+            let (_, request_bytes): (RequestRecord, u64) =
+                read_document_sized(&state.request_path(&key), MAX_REQUEST_RECORD_BYTES)
+                    .expect("sized request");
+            let reply = state.read_reply(&key, 1).expect("sent reply");
+            let receipt = RetiredReplyReceipt {
+                ordinal: 1,
+                send_request_id: reply.send_request_id,
+                provider_message_id: reply
+                    .provider_message_id
+                    .expect("sent reply provider receipt"),
+            };
+            let legacy = LegacyRetirementRecordV1 {
+                version: STATE_VERSION,
+                phase: LegacyRetirementPhaseV1::Prepared,
+                retirement_sequence: 1,
+                request_key: key.clone(),
+                message_fingerprint: saved_message_fingerprint(&request.message)
+                    .expect("message fingerprint"),
+                reply_nonce: request.reply_nonce.clone(),
+                admitted_cursor: request.admitted_cursor.clone().expect("admitted cursor"),
+                request_bytes,
+                reply_bytes: request.reply_bytes,
+                reply_count: request.reply_count,
+                delivery_message_id: request.delivery_message_id.clone(),
+                ack_reaction: None,
+                ack_request_id: None,
+                reaction_id: None,
+                reaction_already_present: None,
+                replies: vec![receipt.clone()],
+                evicted_request_key: None,
+                prepared_at_millis: unix_millis(),
+                retired_at_millis: None,
+            };
+            legacy.validate().expect("exact prepared parent v1 fixture");
+            write_document(&state.retirement_path(1), &legacy)
+                .expect("persist prepared parent v1 fixture");
+            drop(state_lock);
+
+            state
+                .retirement_boundary_count
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            *state
+                .retirement_fault_after
+                .lock()
+                .expect("retirement fault lock") = boundary;
+            let migration = state.complete_retirements();
+            let observed = state
+                .retirement_boundary_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let interrupted = migration.is_err();
+
+            let reopened = BridgeState::open(&root).expect("restart prepared v1 migration");
+            let upgraded: RetirementRecord =
+                read_document(&reopened.retirement_path(1), MAX_RETIREMENT_RECORD_BYTES)
+                    .expect("upgraded retirement header");
+            assert_eq!(upgraded.version, RETIREMENT_RECORD_VERSION);
+            assert_eq!(upgraded.phase, RetirementPhase::Retired);
+            assert_eq!(
+                reopened
+                    .read_retirement_receipts(&upgraded)
+                    .expect("upgraded prepared receipt"),
+                vec![receipt]
+            );
+            assert!(!reopened.request_path(&key).exists());
+            assert!(!reopened.reply_path(&key, 1).exists());
+            let checkpoint = reopened.read_checkpoint().expect("recovered checkpoint");
+            assert_eq!(checkpoint.retirement_sequence, 1);
+            assert_eq!(checkpoint.request_count, 1);
+            assert_eq!(checkpoint.reply_count, 0);
+            fs::remove_dir_all(root).expect("cleanup");
+            (interrupted, observed)
+        }
+
+        let (interrupted, exact_boundary_count) = exercise(None);
+        assert!(!interrupted);
+        assert!(exact_boundary_count > 0);
+        for boundary in 0..exact_boundary_count {
+            let (interrupted, observed) = exercise(Some(boundary));
+            assert!(
+                interrupted,
+                "prepared migration boundary {boundary} was not faulted"
+            );
+            assert!(
+                observed > boundary,
+                "prepared migration boundary hook was not reached"
+            );
+        }
+        let (interrupted, observed) = exercise(Some(exact_boundary_count));
+        assert!(
+            !interrupted,
+            "one-past-final prepared migration boundary must complete"
+        );
+        assert_eq!(observed, exact_boundary_count);
+    }
+
+    #[test]
+    fn parent_v1_retired_ahead_of_checkpoint_completes_exact_recovery() {
+        let (state, key, root) = state_with_old_request(
+            "legacy-retired-ahead-of-checkpoint",
+            config_without_reaction(),
+        );
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("open route");
+        state
+            .capture_replies(
+                &key,
+                &format!(
+                    "<CHAT_REPLY_{}>\nrecovery receipt\n</CHAT_REPLY_{}>",
+                    route.identifier, route.identifier
+                ),
+            )
+            .expect("capture reply");
+        let mut transport = FakeReplyTransport::default();
+        state
+            .publish_one(&key, &mut transport)
+            .expect("publish reply")
+            .expect("provider receipt");
+        state
+            .close_replies(&key)
+            .expect("close non-delivered request");
+
+        let state_lock = agent::open_private_lock(&root.join(".state.lock"), "fixture state lock")
+            .expect("open state lock");
+        state_lock.lock_exclusive().expect("lock fixture state");
+        let mut request = state.read_request(&key).expect("active request");
+        request.phase = RequestPhase::Delivered;
+        let mut checkpoint = state.read_checkpoint().expect("stale checkpoint");
+        state
+            .write_request_accounted(&request, &mut checkpoint)
+            .expect("persist delivered fixture");
+        state
+            .persist_checkpoint(&mut checkpoint)
+            .expect("persist pre-recovery accounting");
+        let (_, request_bytes): (RequestRecord, u64) =
+            read_document_sized(&state.request_path(&key), MAX_REQUEST_RECORD_BYTES)
+                .expect("sized request");
+        let reply = state.read_reply(&key, 1).expect("sent reply");
+        let receipt = RetiredReplyReceipt {
+            ordinal: 1,
+            send_request_id: reply.send_request_id,
+            provider_message_id: reply
+                .provider_message_id
+                .expect("sent reply provider receipt"),
+        };
+        let prepared_at_millis = unix_millis();
+        let message_fingerprint =
+            saved_message_fingerprint(&request.message).expect("message fingerprint");
+        let admitted_cursor = request.admitted_cursor.clone().expect("admitted cursor");
+        let index = RetiredRouteIndex {
+            version: STATE_VERSION,
+            retirement_sequence: 1,
+            request_key: key.clone(),
+            message_fingerprint: message_fingerprint.clone(),
+            reply_nonce: request.reply_nonce.clone(),
+            admitted_cursor: admitted_cursor.clone(),
+            retired_at_millis: prepared_at_millis,
+        };
+        write_document(&state.retired_key_path(&key), &index).expect("legacy key tombstone");
+        write_document(&state.retired_route_path(1), &index).expect("legacy route tombstone");
+        remove_if_exists(&state.reply_path(&key, 1)).expect("legacy reply deletion");
+        remove_if_exists(&state.request_path(&key)).expect("legacy request deletion");
+        agent::sync_directory(&root.join("replies")).expect("sync legacy replies");
+        agent::sync_directory(&root.join("requests")).expect("sync legacy requests");
+        let legacy = LegacyRetirementRecordV1 {
+            version: STATE_VERSION,
+            phase: LegacyRetirementPhaseV1::Retired,
+            retirement_sequence: 1,
+            request_key: key.clone(),
+            message_fingerprint,
+            reply_nonce: request.reply_nonce,
+            admitted_cursor,
+            request_bytes,
+            reply_bytes: request.reply_bytes,
+            reply_count: request.reply_count,
+            delivery_message_id: request.delivery_message_id,
+            ack_reaction: None,
+            ack_request_id: None,
+            reaction_id: None,
+            reaction_already_present: None,
+            replies: vec![receipt.clone()],
+            evicted_request_key: None,
+            prepared_at_millis,
+            retired_at_millis: Some(unix_millis()),
+        };
+        legacy.validate().expect("exact retired parent v1 fixture");
+        write_document(&state.retirement_path(1), &legacy)
+            .expect("legacy retired header before checkpoint advancement");
+        drop(state_lock);
+
+        let reopened = BridgeState::open(&root).expect("complete exact legacy recovery crash");
+        let checkpoint = reopened.read_checkpoint().expect("advanced checkpoint");
+        assert_eq!(checkpoint.retirement_sequence, 1);
+        assert_eq!(checkpoint.retired_route_count, 1);
+        assert_eq!(checkpoint.request_count, 1);
+        assert_eq!(checkpoint.reply_count, 0);
+        let upgraded: RetirementRecord =
+            read_document(&reopened.retirement_path(1), MAX_RETIREMENT_RECORD_BYTES)
+                .expect("upgraded recovery header");
+        assert_eq!(upgraded.version, RETIREMENT_RECORD_VERSION);
+        assert_eq!(upgraded.phase, RetirementPhase::Retired);
+        assert_eq!(
+            reopened
+                .read_retirement_receipts(&upgraded)
+                .expect("upgraded recovery receipt"),
+            vec![receipt]
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -7531,6 +8612,180 @@ mod tests {
             .exists());
         assert!(reopened.request_path(&next.new_request_keys[0]).exists());
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn every_terminal_mutation_retries_retirement_with_exact_same_process_accounting() {
+        #[derive(Clone, Copy, Debug)]
+        enum TerminalPath {
+            Close,
+            Acknowledgement,
+            Publish,
+            Delivery,
+        }
+
+        fn assert_exact_population(state: &BridgeState) {
+            let checkpoint = state.read_checkpoint().expect("checkpoint accounting");
+            let requests = state.request_records().expect("request accounting");
+            let replies = state.reply_records().expect("reply accounting");
+            assert_eq!(
+                checkpoint.request_count,
+                u64::try_from(requests.len()).expect("request count")
+            );
+            assert_eq!(
+                checkpoint.request_bytes,
+                requests.iter().map(|(_, bytes)| *bytes).sum::<u64>()
+            );
+            assert_eq!(
+                checkpoint.reply_count,
+                u64::try_from(replies.len()).expect("reply count")
+            );
+            assert_eq!(
+                checkpoint.reply_bytes,
+                replies.iter().map(|(_, bytes)| *bytes).sum::<u64>()
+            );
+        }
+
+        fn exercise(path: TerminalPath, boundary: Option<usize>) -> (bool, usize) {
+            let configuration = if matches!(path, TerminalPath::Acknowledgement) {
+                config()
+            } else {
+                config_without_reaction()
+            };
+            let (state, key, root) = state_with_old_request(
+                &format!("terminal-accounting-{path:?}-{boundary:?}"),
+                configuration,
+            );
+            let delivery = FakeDelivery::default();
+            let mut reaction = FakeReactionTransport::default();
+            let mut reply_transport = FakeReplyTransport::default();
+
+            match path {
+                TerminalPath::Close => {
+                    state
+                        .set_delivery_phase(&key, RequestPhase::Delivered, None)
+                        .expect("prepare delivered close");
+                }
+                TerminalPath::Acknowledgement => {
+                    state
+                        .set_delivery_phase(&key, RequestPhase::Delivered, None)
+                        .expect("prepare delivered acknowledgement");
+                    state
+                        .close_replies(&key)
+                        .expect("close before acknowledgement");
+                }
+                TerminalPath::Publish => {
+                    state
+                        .set_delivery_phase(&key, RequestPhase::Delivered, None)
+                        .expect("prepare delivered reply");
+                    let route = state
+                        .next_reply_route(&key)
+                        .expect("route")
+                        .expect("open route");
+                    state
+                        .capture_replies(
+                            &key,
+                            &format!(
+                                "<CHAT_REPLY_{}>\nterminal reply\n</CHAT_REPLY_{}>",
+                                route.identifier, route.identifier
+                            ),
+                        )
+                        .expect("capture terminal reply");
+                    state
+                        .close_replies(&key)
+                        .expect("close before terminal publish");
+                }
+                TerminalPath::Delivery => {
+                    state
+                        .close_replies(&key)
+                        .expect("close before terminal delivery");
+                }
+            }
+
+            state
+                .retirement_boundary_count
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            *state
+                .retirement_fault_after
+                .lock()
+                .expect("retirement fault lock") = boundary;
+            let (interrupted, observed) = {
+                let mut invoke = || -> Result<()> {
+                    match path {
+                        TerminalPath::Close => state.close_replies(&key),
+                        TerminalPath::Acknowledgement => {
+                            state.ensure_ack(&key, &mut reaction).map(|_| ())
+                        }
+                        TerminalPath::Publish => {
+                            state.publish_one(&key, &mut reply_transport).map(|_| ())
+                        }
+                        TerminalPath::Delivery => {
+                            deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+                                .map(|_| ())
+                        }
+                    }
+                };
+                let first = invoke();
+                let observed = state
+                    .retirement_boundary_count
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let interrupted = first.is_err();
+                if interrupted {
+                    invoke().expect("immediate same-process terminal retry");
+                }
+                (interrupted, observed)
+            };
+
+            // This assertion deliberately precedes BridgeState::open: startup repair must not be
+            // what makes terminal mutation accounting exact.
+            assert_exact_population(&state);
+            assert!(!state.request_path(&key).exists());
+            assert_eq!(
+                state
+                    .read_checkpoint()
+                    .expect("terminal checkpoint")
+                    .retirement_sequence,
+                1
+            );
+            match path {
+                TerminalPath::Acknowledgement => assert_eq!(reaction.submissions.len(), 1),
+                TerminalPath::Publish => assert_eq!(reply_transport.submissions.len(), 1),
+                TerminalPath::Delivery => assert_eq!(
+                    delivery
+                        .submitted_prompts
+                        .lock()
+                        .expect("submitted prompts")
+                        .len(),
+                    1
+                ),
+                TerminalPath::Close => {}
+            }
+            BridgeState::open(&root).expect("terminal state survives restart");
+            fs::remove_dir_all(root).expect("cleanup");
+            (interrupted, observed)
+        }
+
+        for path in [
+            TerminalPath::Close,
+            TerminalPath::Acknowledgement,
+            TerminalPath::Publish,
+            TerminalPath::Delivery,
+        ] {
+            let (interrupted, exact_boundary_count) = exercise(path, None);
+            assert!(!interrupted);
+            assert!(exact_boundary_count > 0);
+            for boundary in 0..exact_boundary_count {
+                let (interrupted, observed) = exercise(path, Some(boundary));
+                assert!(interrupted, "{path:?} boundary {boundary} was not faulted");
+                assert!(
+                    observed > boundary,
+                    "{path:?} boundary hook was not reached"
+                );
+            }
+            let (interrupted, observed) = exercise(path, Some(exact_boundary_count));
+            assert!(!interrupted, "{path:?} one-past-final boundary faulted");
+            assert_eq!(observed, exact_boundary_count);
+        }
     }
 
     #[test]
@@ -8390,12 +9645,14 @@ mod tests {
     fn command_outbound_cancellation_interrupts_blocked_helper_and_descendants() {
         let root = temporary("command-cancellation");
         let helper = copied_shell(&root);
+        let ready = root.join("request-received");
+        let script = format!(
+            "IFS= read -r request; : > '{}'; /bin/sleep 30",
+            ready.display()
+        );
         let mut transport = CommandOutboundTransport::new(
             helper,
-            vec![
-                OsString::from("-c"),
-                OsString::from("IFS= read -r request; /bin/sleep 30"),
-            ],
+            vec![OsString::from("-c"), OsString::from(script)],
             &[],
             Duration::from_secs(30),
             Duration::ZERO,
@@ -8405,7 +9662,13 @@ mod tests {
         transport.set_cancellation(cancellation.clone());
         let started = Instant::now();
         let worker = std::thread::spawn(move || transport.exchange(b"{}\n"));
-        std::thread::sleep(Duration::from_millis(50));
+        while !ready.exists() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ready.exists(),
+            "helper accepted the request before cancellation"
+        );
         cancellation.cancel();
         let error = worker
             .join()

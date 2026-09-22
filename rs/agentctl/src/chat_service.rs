@@ -9,8 +9,12 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chat_subscription::ChatSubscription;
-use chat_subscription_plugin::process::{ProcessPhaseTimeouts, ProcessPluginCancellation};
+use chat_subscription::{
+    BackendCapabilities, BackendFailure, ChatSubscription, ChatSubscriptionBackend,
+    ChatSubscriptionCancellation, ChatSubscriptionDriver, DeliveryId, SubscribeRequest,
+    SubscriptionError, SubscriptionItem,
+};
+use chat_subscription_plugin::process::ProcessPhaseTimeouts;
 use serde::Serialize;
 use serde_json::{json, Value};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -246,7 +250,8 @@ pub fn run<A: ManagedApi + ?Sized>(
     let _lease = state.acquire_runner_lease()?;
 
     let stop = Arc::new(StopState::default());
-    let cancellation: SharedCancellation = Arc::new(Mutex::new(None));
+    let cancellation: SharedCancellation =
+        Arc::new(Mutex::new(ProviderCancellationRegistry::default()));
     let output_wake: SharedWake = Arc::new(Mutex::new(None));
     let overflowed = Arc::new(AtomicBool::new(false));
     let (signal_handle, signal_thread) = spawn_signal_worker(
@@ -290,7 +295,6 @@ pub fn run<A: ManagedApi + ?Sized>(
     stop.stop();
     outbound_cancellation.cancel();
     wake_output(&output_wake);
-    stop.provider_cancel_requested.store(true, Ordering::SeqCst);
     if let Err(error) = cancel_provider(&cancellation) {
         stop.record_cleanup_error(error.to_string());
     }
@@ -723,7 +727,6 @@ enum ProviderGenerationError {
 #[derive(Default)]
 struct StopState {
     stopped: AtomicBool,
-    provider_cancel_requested: AtomicBool,
     lock: Mutex<()>,
     changed: Condvar,
     cleanup_errors: Mutex<Vec<String>>,
@@ -865,8 +868,206 @@ fn deliver_feedback<A: ManagedApi + ?Sized>(
     }
 }
 
-type SharedCancellation = Arc<Mutex<Option<ProcessPluginCancellation>>>;
+const CANCELLED_PROCESS_RECEIVE_CODE: &str = "plugin_worker_stopped";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderReceiveIdentity(u64);
+
+#[derive(Default)]
+struct ReceiveOperationState {
+    last_identity: u64,
+    active: Option<ProviderReceiveIdentity>,
+    failed: Option<ProviderReceiveIdentity>,
+}
+
+#[derive(Default)]
+struct ReceiveOperationTracker {
+    state: Mutex<ReceiveOperationState>,
+}
+
+impl ReceiveOperationTracker {
+    fn begin(&self) -> std::result::Result<ProviderReceiveIdentity, BackendFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active.is_some() {
+            return Err(BackendFailure::new(
+                "host_receive_overlap",
+                "provider host attempted overlapping receive operations",
+                false,
+            )
+            .expect("constant backend failure is valid"));
+        }
+        state.last_identity = state.last_identity.checked_add(1).ok_or_else(|| {
+            BackendFailure::new(
+                "host_receive_identity_exhausted",
+                "provider receive identity space is exhausted",
+                false,
+            )
+            .expect("constant backend failure is valid")
+        })?;
+        let identity = ProviderReceiveIdentity(state.last_identity);
+        state.active = Some(identity);
+        state.failed = None;
+        Ok(identity)
+    }
+
+    fn finish(&self, identity: ProviderReceiveIdentity, failed: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active == Some(identity) {
+            state.active = None;
+            state.failed = failed.then_some(identity);
+        }
+    }
+
+    fn active(&self) -> Option<ProviderReceiveIdentity> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+    }
+
+    fn failed(&self) -> Option<ProviderReceiveIdentity> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failed
+    }
+}
+
+struct ReceiveFailureTrackingBackend<B> {
+    inner: B,
+    receive_tracker: Arc<ReceiveOperationTracker>,
+}
+
+impl<B: ChatSubscriptionBackend> ChatSubscriptionBackend for ReceiveFailureTrackingBackend<B> {
+    fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+        self.inner.cancellation()
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn subscribe(
+        &mut self,
+        request: &SubscribeRequest,
+    ) -> std::result::Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+        self.inner.subscribe(request).map(|inner| {
+            Box::new(ReceiveFailureTrackingDriver {
+                inner,
+                receive_tracker: Arc::clone(&self.receive_tracker),
+            }) as Box<dyn ChatSubscriptionDriver>
+        })
+    }
+}
+
+struct ReceiveFailureTrackingDriver {
+    inner: Box<dyn ChatSubscriptionDriver>,
+    receive_tracker: Arc<ReceiveOperationTracker>,
+}
+
+impl ChatSubscriptionDriver for ReceiveFailureTrackingDriver {
+    fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+        self.inner.cancellation()
+    }
+
+    fn next_item(&mut self) -> std::result::Result<Option<SubscriptionItem>, BackendFailure> {
+        let identity = self.receive_tracker.begin()?;
+        let result = self.inner.next_item();
+        self.receive_tracker.finish(identity, result.is_err());
+        result
+    }
+
+    fn acknowledge(&mut self, delivery_id: &DeliveryId) -> std::result::Result<(), BackendFailure> {
+        self.inner.acknowledge(delivery_id)
+    }
+
+    fn close(&mut self) -> std::result::Result<(), BackendFailure> {
+        self.inner.close()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderGenerationIdentity(u64);
+
+struct ActiveProviderCancellation {
+    identity: ProviderGenerationIdentity,
+    authority: Arc<dyn ChatSubscriptionCancellation>,
+    receive_tracker: Arc<ReceiveOperationTracker>,
+    succeeded: bool,
+    cancelled_receive: Option<ProviderReceiveIdentity>,
+}
+
+#[derive(Default)]
+struct ProviderCancellationRegistry {
+    last_identity: u64,
+    active: Option<ActiveProviderCancellation>,
+}
+
+type SharedCancellation = Arc<Mutex<ProviderCancellationRegistry>>;
 type SharedWake = Arc<Mutex<Option<PaneEventWake>>>;
+
+struct ProviderCancellationRegistration {
+    registry: SharedCancellation,
+    identity: ProviderGenerationIdentity,
+}
+
+impl ProviderCancellationRegistration {
+    fn install(
+        registry: &SharedCancellation,
+        authority: Arc<dyn ChatSubscriptionCancellation>,
+        receive_tracker: Arc<ReceiveOperationTracker>,
+    ) -> std::result::Result<Self, String> {
+        let mut state = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active.is_some() {
+            return Err("a prior provider cancellation authority remains registered".to_owned());
+        }
+        state.last_identity = state
+            .last_identity
+            .checked_add(1)
+            .ok_or_else(|| "provider generation identity space is exhausted".to_owned())?;
+        let identity = ProviderGenerationIdentity(state.last_identity);
+        state.active = Some(ActiveProviderCancellation {
+            identity,
+            authority,
+            receive_tracker,
+            succeeded: false,
+            cancelled_receive: None,
+        });
+        drop(state);
+        Ok(Self {
+            registry: Arc::clone(registry),
+            identity,
+        })
+    }
+
+    fn identity(&self) -> ProviderGenerationIdentity {
+        self.identity
+    }
+}
+
+impl Drop for ProviderCancellationRegistration {
+    fn drop(&mut self) {
+        let mut state = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.identity == self.identity)
+        {
+            state.active = None;
+        }
+    }
+}
 
 fn spawn_provider(
     state: BridgeState,
@@ -924,14 +1125,12 @@ fn spawn_provider(
                         break;
                     }
                 }
-                clear_cancellation(&cancellation);
                 if stop.is_stopped() {
                     break;
                 }
                 stop.wait(delay);
                 delay = (delay * 2).min(Duration::from_secs(60));
             }
-            clear_cancellation(&cancellation);
         })
         .map_err(ChatServiceError::Io)
 }
@@ -955,18 +1154,23 @@ fn provider_generation(
         Duration::from_secs(2),
     )
     .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))?;
-    let (mut backend, process_cancellation) = command
+    let (backend, process_cancellation) = command
         .connect(timeouts)
         .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))?;
-    *cancellation
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(process_cancellation.clone());
+    let receive_tracker = Arc::new(ReceiveOperationTracker::default());
+    let registration = ProviderCancellationRegistration::install(
+        cancellation,
+        Arc::new(process_cancellation),
+        Arc::clone(&receive_tracker),
+    )
+    .map_err(ProviderGenerationError::Cleanup)?;
+    let mut backend = ReceiveFailureTrackingBackend {
+        inner: backend,
+        receive_tracker: Arc::clone(&receive_tracker),
+    };
     if stop.is_stopped() {
-        process_cancellation.cancel().map_err(|error| {
-            ProviderGenerationError::Cleanup(format!(
-                "provider cancellation cleanup failed: {error}"
-            ))
-        })?;
+        cancel_provider(cancellation)
+            .map_err(|error| ProviderGenerationError::Cleanup(error.to_string()))?;
         return Err(ProviderGenerationError::Cancelled);
     }
     let request = state.subscribe_request().map_err(|error| match error {
@@ -977,24 +1181,29 @@ fn provider_generation(
         .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))?;
     loop {
         if stop.is_stopped() {
-            process_cancellation.cancel().map_err(|error| {
-                ProviderGenerationError::Cleanup(format!(
-                    "provider cancellation cleanup failed: {error}"
-                ))
-            })?;
+            cancel_provider(cancellation)
+                .map_err(|error| ProviderGenerationError::Cleanup(error.to_string()))?;
             return Err(ProviderGenerationError::Cancelled);
         }
         let consumed = match chat_runtime::consume_one(&mut subscription, state) {
             Ok(consumed) => consumed,
             Err(ChatRuntimeError::UnresolvedGap(detail)) => {
-                process_cancellation.cancel().map_err(|error| {
+                cancel_provider(cancellation).map_err(|error| {
                     ProviderGenerationError::Fatal(format!(
                         "{detail}; provider cancellation cleanup failed: {error}"
                     ))
                 })?;
                 return Err(ProviderGenerationError::Fatal(detail));
             }
-            Err(error) => return Err(classify_provider_receive_failure(stop, error)),
+            Err(error) => {
+                return Err(classify_provider_receive_failure(
+                    stop,
+                    cancellation,
+                    registration.identity(),
+                    &receive_tracker,
+                    error,
+                ))
+            }
         };
         match consumed {
             chat_runtime::ConsumedItem::Heartbeat => {}
@@ -1013,9 +1222,28 @@ fn provider_generation(
 
 fn classify_provider_receive_failure(
     stop: &StopState,
+    cancellation: &SharedCancellation,
+    identity: ProviderGenerationIdentity,
+    receive_tracker: &ReceiveOperationTracker,
     error: ChatRuntimeError,
 ) -> ProviderGenerationError {
-    if stop.is_stopped() && stop.provider_cancel_requested.load(Ordering::SeqCst) {
+    let cancelled_receive = cancellation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active
+        .as_ref()
+        .filter(|active| active.identity == identity && active.succeeded)
+        .and_then(|active| active.cancelled_receive);
+    let cancellation_receive_failure = matches!(
+        &error,
+        ChatRuntimeError::Subscription(SubscriptionError::Backend(failure))
+            if failure.code() == CANCELLED_PROCESS_RECEIVE_CODE && failure.retryable()
+    );
+    if stop.is_stopped()
+        && cancelled_receive.is_some()
+        && receive_tracker.failed() == cancelled_receive
+        && cancellation_receive_failure
+    {
         ProviderGenerationError::Cancelled
     } else {
         ProviderGenerationError::Retryable(error.to_string())
@@ -1034,24 +1262,22 @@ fn send_notice(
     wake_output(output_wake);
 }
 
-fn clear_cancellation(cancellation: &SharedCancellation) {
-    cancellation
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-}
-
 fn cancel_provider(cancellation: &SharedCancellation) -> Result<(), ChatServiceError> {
-    if let Some(cancellation) = cancellation
+    let mut state = cancellation
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .cloned()
-    {
-        cancellation.cancel().map_err(|error| {
-            ChatServiceError::Worker(format!("provider cancellation cleanup failed: {error}"))
-        })?;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(active) = state.active.as_mut() else {
+        return Ok(());
+    };
+    if active.succeeded {
+        return Ok(());
     }
+    let blocked_receive = active.receive_tracker.active();
+    active.authority.cancel().map_err(|error| {
+        ChatServiceError::Worker(format!("provider cancellation cleanup failed: {error}"))
+    })?;
+    active.succeeded = true;
+    active.cancelled_receive = blocked_receive;
     Ok(())
 }
 
@@ -1080,7 +1306,6 @@ fn spawn_signal_worker(
                 stop.stop();
                 outbound_cancellation.cancel();
                 wake_output(&output_wake);
-                stop.provider_cancel_requested.store(true, Ordering::SeqCst);
                 if let Err(error) = cancel_provider(&cancellation) {
                     stop.record_cleanup_error(error.to_string());
                 }
@@ -1392,7 +1617,6 @@ fn run_owner_loop<A: ManagedApi + ?Sized>(
             }
         }
     }
-    stop.provider_cancel_requested.store(true, Ordering::SeqCst);
     cancel_provider(cancellation)?;
     Ok(())
 }
@@ -1565,24 +1789,34 @@ mod tests {
     struct BlockingFailureBackend {
         gate: Arc<(Mutex<bool>, Condvar)>,
         entered: Arc<(Mutex<bool>, Condvar)>,
+        failure_code: &'static str,
     }
 
     struct BlockingFailureDriver {
         gate: Arc<(Mutex<bool>, Condvar)>,
         entered: Arc<(Mutex<bool>, Condvar)>,
+        failure_code: &'static str,
     }
 
-    struct NoopCancellation;
+    #[derive(Clone)]
+    struct GateCancellation {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
 
-    impl ChatSubscriptionCancellation for NoopCancellation {
+    impl ChatSubscriptionCancellation for GateCancellation {
         fn cancel(&self) -> std::result::Result<(), CancellationError> {
+            let (gate_lock, gate_changed) = &*self.gate;
+            *gate_lock.lock().expect("gate lock") = true;
+            gate_changed.notify_all();
             Ok(())
         }
     }
 
     impl ChatSubscriptionDriver for BlockingFailureDriver {
         fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
-            Arc::new(NoopCancellation)
+            Arc::new(GateCancellation {
+                gate: Arc::clone(&self.gate),
+            })
         }
 
         fn next_item(&mut self) -> std::result::Result<Option<SubscriptionItem>, BackendFailure> {
@@ -1595,8 +1829,8 @@ mod tests {
                 released = gate_changed.wait(released).expect("gate wait");
             }
             Err(BackendFailure::new(
-                "cancelled_read",
-                "blocked provider read was interrupted",
+                self.failure_code,
+                "blocked provider read completed with a failure",
                 true,
             )
             .expect("backend failure"))
@@ -1612,7 +1846,9 @@ mod tests {
 
     impl ChatSubscriptionBackend for BlockingFailureBackend {
         fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
-            Arc::new(NoopCancellation)
+            Arc::new(GateCancellation {
+                gate: Arc::clone(&self.gate),
+            })
         }
 
         fn capabilities(&self) -> BackendCapabilities {
@@ -1638,6 +1874,7 @@ mod tests {
             Ok(Box::new(BlockingFailureDriver {
                 gate: Arc::clone(&self.gate),
                 entered: Arc::clone(&self.entered),
+                failure_code: self.failure_code,
             }))
         }
     }
@@ -2006,23 +2243,47 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
-    #[test]
-    fn owner_stop_interrupting_blocked_next_item_is_expected_cancellation_not_cleanup_failure() {
+    fn blocked_receive_after_owner_stop(failure_code: &'static str) -> ProviderGenerationError {
         let (state, _, root) = state_with_request();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let entered = Arc::new((Mutex::new(false), Condvar::new()));
-        let mut backend = BlockingFailureBackend {
-            gate: Arc::clone(&gate),
-            entered: Arc::clone(&entered),
+        let receive_tracker = Arc::new(ReceiveOperationTracker::default());
+        let mut backend = ReceiveFailureTrackingBackend {
+            inner: BlockingFailureBackend {
+                gate: Arc::clone(&gate),
+                entered: Arc::clone(&entered),
+                failure_code,
+            },
+            receive_tracker: Arc::clone(&receive_tracker),
         };
+        let cancellation: SharedCancellation =
+            Arc::new(Mutex::new(ProviderCancellationRegistry::default()));
+        let registration = ProviderCancellationRegistration::install(
+            &cancellation,
+            Arc::new(GateCancellation {
+                gate: Arc::clone(&gate),
+            }),
+            Arc::clone(&receive_tracker),
+        )
+        .expect("register cancellation authority");
+        let identity = registration.identity();
         let request = state.subscribe_request().expect("subscription request");
         let mut subscription =
             ChatSubscription::open(&mut backend, &request).expect("blocking subscription");
         let stop = Arc::new(StopState::default());
         let worker_stop = Arc::clone(&stop);
+        let worker_cancellation = Arc::clone(&cancellation);
+        let worker_receive_tracker = Arc::clone(&receive_tracker);
         let worker = std::thread::spawn(move || {
-            chat_runtime::consume_one(&mut subscription, &state)
-                .map_err(|error| classify_provider_receive_failure(&worker_stop, error))
+            chat_runtime::consume_one(&mut subscription, &state).map_err(|error| {
+                classify_provider_receive_failure(
+                    &worker_stop,
+                    &worker_cancellation,
+                    identity,
+                    &worker_receive_tracker,
+                    error,
+                )
+            })
         });
         let (entered_lock, entered_changed) = &*entered;
         let mut is_entered = entered_lock.lock().expect("entered lock");
@@ -2031,14 +2292,84 @@ mod tests {
         }
         drop(is_entered);
         stop.stop();
-        stop.provider_cancel_requested.store(true, Ordering::SeqCst);
-        let (gate_lock, gate_changed) = &*gate;
-        *gate_lock.lock().expect("gate lock") = true;
-        gate_changed.notify_all();
+        cancel_provider(&cancellation).expect("successful provider cancellation");
         let result = worker.join().expect("join blocked receive");
-        assert!(matches!(result, Err(ProviderGenerationError::Cancelled)));
         assert!(stop.take_cleanup_errors().is_empty());
+        drop(registration);
         fs::remove_dir_all(root).expect("cleanup");
+        result.expect_err("blocked receive must fail")
+    }
+
+    #[test]
+    fn owner_stop_interrupting_blocked_next_item_is_expected_cancellation_not_cleanup_failure() {
+        assert!(matches!(
+            blocked_receive_after_owner_stop(CANCELLED_PROCESS_RECEIVE_CODE),
+            ProviderGenerationError::Cancelled
+        ));
+    }
+
+    #[test]
+    fn concurrent_unrelated_backend_failure_during_owner_stop_remains_visible() {
+        let error = blocked_receive_after_owner_stop("provider_transport_failed");
+        match error {
+            ProviderGenerationError::Retryable(detail) => {
+                assert!(detail.contains("provider_transport_failed"));
+            }
+            other => panic!("unrelated provider failure was hidden as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn successful_cancel_does_not_hide_invalid_io_or_commit_failures() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancellation: SharedCancellation =
+            Arc::new(Mutex::new(ProviderCancellationRegistry::default()));
+        let receive_tracker = Arc::new(ReceiveOperationTracker::default());
+        let registration = ProviderCancellationRegistration::install(
+            &cancellation,
+            Arc::new(GateCancellation {
+                gate: Arc::clone(&gate),
+            }),
+            Arc::clone(&receive_tracker),
+        )
+        .expect("register cancellation authority");
+        let stop = StopState::default();
+        stop.stop();
+        cancel_provider(&cancellation).expect("successful provider cancellation");
+
+        let invalid = classify_provider_receive_failure(
+            &stop,
+            &cancellation,
+            registration.identity(),
+            &receive_tracker,
+            ChatRuntimeError::Invalid("invalid admitted batch".to_owned()),
+        );
+        assert!(matches!(invalid, ProviderGenerationError::Retryable(_)));
+
+        let io = classify_provider_receive_failure(
+            &stop,
+            &cancellation,
+            registration.identity(),
+            &receive_tracker,
+            ChatRuntimeError::Io(io::Error::other("durable write failed")),
+        );
+        assert!(matches!(io, ProviderGenerationError::Retryable(_)));
+
+        let commit = classify_provider_receive_failure(
+            &stop,
+            &cancellation,
+            registration.identity(),
+            &receive_tracker,
+            ChatRuntimeError::Subscription(SubscriptionError::Backend(
+                BackendFailure::new(
+                    CANCELLED_PROCESS_RECEIVE_CODE,
+                    "commit receipt was not confirmed",
+                    true,
+                )
+                .expect("backend failure"),
+            )),
+        );
+        assert!(matches!(commit, ProviderGenerationError::Retryable(_)));
     }
 
     #[test]
