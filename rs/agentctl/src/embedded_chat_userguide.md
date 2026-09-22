@@ -27,6 +27,7 @@ Create a private owner-only JSON file (normally mode `0600`):
 ```json
 {
   "subscription_plugin": "provider-events",
+  "subscription_environment": ["PROVIDER_CERT", "PROVIDER_KEY"],
   "channel_ids": ["spaces/example"],
   "allowed_senders": ["users/owner"],
   "agent_name": "coordinator",
@@ -50,7 +51,14 @@ Create a private owner-only JSON file (normally mode `0600`):
 The subscription plugin is discovered below `$AGENTCTL_HOME/plugins` (default
 `~/.agentctl/plugins`) using its private manifest. The bridge revalidates and
 pins the manifest directory and executable before every generation. Provider
-credentials do not belong in the manifest or saved bridge state.
+credentials do not belong in the manifest or saved bridge state. When a plugin
+needs credential paths or tokens from the service environment, list only their
+variable names in `subscription_environment`. Names must be unique shell
+identifiers, at most 128 bytes each, with no more than 64 names. Every named
+value must be present before the plugin can be launched. The host clears the
+plugin environment, restores its small documented non-secret baseline, then
+adds exactly these operator-selected names. Values are neither serialized nor
+reported by `chat status`; a plugin manifest has no authority to add names.
 
 The outbound helper receives exactly one newline-terminated JSON request and
 must emit exactly one newline-terminated JSON response. It is started inside the
@@ -117,6 +125,27 @@ writes:
 agentctl chat status \
   --bridge-state /home/me/.local/state/agentctl/project-chat
 ```
+
+An owner or operator can explicitly publish a new root message through the
+configured outbound helper without pretending it is a reply:
+
+```sh
+agentctl chat publish \
+  --bridge-state /home/me/.local/state/agentctl/project-chat \
+  --channel-id spaces/example \
+  --request-id 123e4567-e89b-42d3-a456-426614174000 \
+  'Please reply to this bridge test.'
+```
+
+`publish` accepts `--file PATH` instead of positional text. It requires an
+outbound-enabled state and an exact channel from `channel_ids`, validates a
+nonempty body of at most 30,000 UTF-8 bytes, and sends `thread_id: null`. The
+lowercase RFC 4122 version-4 UUID is caller-owned; an uncertain result may be
+retried only with the identical UUID, channel, and body. The command runs the
+helper only through the reviewed process supervisor, binds the returned message
+resource to the requested channel, and prints the exact v1 success receipt. It
+neither writes bridge state nor creates an event-loop reply route; this is an
+explicit operator action, not automatic subscription behavior.
 
 Explicitly close reply capture for an old request:
 

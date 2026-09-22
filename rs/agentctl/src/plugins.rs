@@ -12,9 +12,10 @@
 //! verification. Those fields therefore remain false until a future runtime probe produces its
 //! own evidence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -37,6 +38,10 @@ pub const MAX_PLUGIN_ENTRIES: usize = 128;
 pub const MAX_MANIFEST_BYTES: u64 = 65_536;
 /// Current manifest schema identity.
 pub const MANIFEST_SCHEMA: &str = "agentctl-plugin-manifest/v1alpha1";
+/// Maximum operator-selected environment names forwarded to one plugin.
+pub const MAX_PLUGIN_ENVIRONMENT_NAMES: usize = 64;
+/// Maximum UTF-8 bytes in one operator-selected environment name.
+pub const MAX_PLUGIN_ENVIRONMENT_NAME_BYTES: usize = 128;
 /// Non-secret process context explicitly retained after `env_clear`.
 pub const PLUGIN_BASELINE_ENV: &[&str] = &[
     "HOME",
@@ -155,15 +160,53 @@ pub struct PluginInventory {
 impl PluginInventory {
     /// Pin and revalidate a command with a cleared environment and minimal non-secret baseline.
     ///
-    /// The manifest cannot request environment variables or arguments. A future host may add an
-    /// explicit operator-controlled credential mechanism, but discovered metadata is never
-    /// authority to inherit arbitrary secrets.
+    /// The manifest cannot request environment variables or arguments. This compatibility method
+    /// selects no extra names; hosts with explicit operator configuration use
+    /// [`Self::launch_command_with_environment`]. Discovered metadata is never authority to
+    /// inherit arbitrary secrets.
     ///
     /// # Errors
     ///
     /// Returns a structured refusal if the plugin was not discovered, is implementation-only
     /// metadata, or its manifest/executable identity changed since discovery.
     pub fn launch_command(&self, name: &str) -> Result<PinnedPluginCommand, RefusedPlugin> {
+        self.launch_command_with_environment(name, &[])
+    }
+
+    /// Pin and revalidate a command with an explicit operator-controlled environment allowlist.
+    ///
+    /// The allowlist contains variable names only. Their values are read from the current process
+    /// for this launch plan and are never retained in a manifest or durable plugin record. Every
+    /// configured value must be available; the launch is refused before spawn otherwise.
+    ///
+    /// The manifest cannot request environment variables or arguments. Only the host's validated
+    /// configuration may supply `environment_names`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured refusal if the allowlist is invalid, a configured value is absent,
+    /// the plugin was not discovered, or its manifest/executable identity changed since discovery.
+    pub fn launch_command_with_environment(
+        &self,
+        name: &str,
+        environment_names: &[String],
+    ) -> Result<PinnedPluginCommand, RefusedPlugin> {
+        validate_plugin_environment_names(environment_names)
+            .map_err(|detail| refused(name, "invalid_environment_allowlist", detail))?;
+        let configured_environment = environment_names
+            .iter()
+            .map(|key| {
+                env::var_os(key)
+                    .map(|value| (key.clone(), value))
+                    .ok_or_else(|| {
+                        refused(
+                            name,
+                            "environment_unavailable",
+                            format!("configured plugin environment value {key:?} is unavailable"),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let plugin = self
             .discovered
             .iter()
@@ -232,12 +275,7 @@ impl PluginInventory {
         }
 
         let mut command = Command::new(descriptor_path(&executable));
-        command.env_clear();
-        for key in PLUGIN_BASELINE_ENV {
-            if let Some(value) = env::var_os(key) {
-                command.env(key, value);
-            }
-        }
+        configure_plugin_environment(&mut command, &configured_environment);
         command.current_dir(pinned_directory);
         Ok(PinnedPluginCommand {
             command,
@@ -247,26 +285,77 @@ impl PluginInventory {
     }
 }
 
+fn configure_plugin_environment(
+    command: &mut Command,
+    configured_environment: &[(String, OsString)],
+) {
+    command.env_clear();
+    for key in PLUGIN_BASELINE_ENV {
+        if let Some(value) = env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in configured_environment {
+        command.env(key, value);
+    }
+}
+
+pub(crate) fn validate_plugin_environment_names(
+    environment_names: &[String],
+) -> Result<(), String> {
+    if environment_names.len() > MAX_PLUGIN_ENVIRONMENT_NAMES {
+        return Err(format!(
+            "plugin environment allowlist exceeds {MAX_PLUGIN_ENVIRONMENT_NAMES} names"
+        ));
+    }
+    let mut seen = HashSet::with_capacity(environment_names.len());
+    for name in environment_names {
+        let mut bytes = name.bytes();
+        let first = bytes.next();
+        if name.len() > MAX_PLUGIN_ENVIRONMENT_NAME_BYTES
+            || !matches!(first, Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+            || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(format!(
+                "plugin environment name must be at most {MAX_PLUGIN_ENVIRONMENT_NAME_BYTES} bytes and match [A-Za-z_][A-Za-z0-9_]*"
+            ));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err("plugin environment names must be unique".to_owned());
+        }
+    }
+    Ok(())
+}
+
 /// A launch plan whose directory and executable are held by open descriptors through `spawn`.
 ///
 /// The executable path names its pinned descriptor through `/proc/self/fd`, so replacing the
 /// installation directory after this value is returned cannot redirect execution. Plugins are
 /// expected to be native executables; a script interpreter may be unable to reopen a descriptor
 /// path after close-on-exec processing.
-#[derive(Debug)]
 pub struct PinnedPluginCommand {
     command: Command,
     _directory: File,
     _executable: File,
 }
 
-impl PinnedPluginCommand {
-    /// Expose immutable command metadata for diagnostics and policy tests.
-    #[must_use]
-    pub fn command(&self) -> &Command {
-        &self.command
+impl fmt::Debug for PinnedPluginCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let environment_names = self
+            .command
+            .get_envs()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("PinnedPluginCommand")
+            .field("program", &self.command.get_program())
+            .field("argument_count", &self.command.get_args().count())
+            .field("environment_names", &environment_names)
+            .finish_non_exhaustive()
     }
+}
 
+impl PinnedPluginCommand {
     /// Spawn in a private process group with piped protocol streams and return its supervisor.
     ///
     /// # Errors
@@ -949,7 +1038,7 @@ mod tests {
         let pinned = inventory
             .launch_command("fixture-chat")
             .expect("safe plugin command");
-        let command = pinned.command();
+        let command = &pinned.command;
         let current_directory = command.get_current_dir().expect("pinned current directory");
         assert_eq!(current_directory.parent(), Some(Path::new("/proc/self/fd")));
         assert_eq!(
@@ -970,6 +1059,89 @@ mod tests {
                 "OPENAI_API_KEY" | "GOOGLE_API_KEY" | "AWS_SECRET_ACCESS_KEY"
             )
         }));
+    }
+
+    #[test]
+    fn operator_environment_is_added_after_a_cleared_baseline() {
+        let secret = OsString::from("not-persisted-provider-secret");
+        let mut command = Command::new("/bin/true");
+        command.env("MUST_BE_CLEARED", "unexpected");
+        configure_plugin_environment(
+            &mut command,
+            &[("PROVIDER_CREDENTIAL".to_owned(), secret.clone())],
+        );
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.expect("configured environment value").to_os_string(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(!environment.contains_key("MUST_BE_CLEARED"));
+        assert_eq!(environment.get("PROVIDER_CREDENTIAL"), Some(&secret));
+        assert!(environment.keys().all(|key| {
+            key == "PROVIDER_CREDENTIAL" || PLUGIN_BASELINE_ENV.contains(&key.as_str())
+        }));
+    }
+
+    #[test]
+    fn pinned_command_debug_reports_environment_names_without_values() {
+        let mut command = Command::new("/bin/true");
+        command
+            .env_clear()
+            .env("PROVIDER_CREDENTIAL", "not-persisted-provider-secret");
+        let directory = File::open("/dev/null").expect("fixture descriptor");
+        let executable = directory.try_clone().expect("fixture clone");
+        let pinned = PinnedPluginCommand {
+            command,
+            _directory: directory,
+            _executable: executable,
+        };
+        let debug = format!("{pinned:?}");
+        assert!(debug.contains("PROVIDER_CREDENTIAL"));
+        assert!(!debug.contains("not-persisted-provider-secret"));
+    }
+
+    #[test]
+    fn invalid_or_unavailable_operator_environment_is_refused_before_spawn() {
+        let fixture = Fixture::new();
+        fixture.plugin("fixture-chat", "chat-subscription.fixture", "");
+        let inventory = discover_at(fixture.path.clone());
+        for names in [
+            vec!["BAD-NAME".to_owned()],
+            vec!["DUPLICATE".to_owned(), "DUPLICATE".to_owned()],
+            vec!["X".repeat(MAX_PLUGIN_ENVIRONMENT_NAME_BYTES + 1)],
+            vec!["X".to_owned(); MAX_PLUGIN_ENVIRONMENT_NAMES + 1],
+        ] {
+            let refusal = inventory
+                .launch_command_with_environment("fixture-chat", &names)
+                .expect_err("invalid environment allowlist must be refused");
+            assert_eq!(refusal.code, "invalid_environment_allowlist");
+        }
+        let refusal = inventory
+            .launch_command_with_environment(
+                "fixture-chat",
+                &["AGENTCTL_TEST_DEFINITELY_UNAVAILABLE_713C".to_owned()],
+            )
+            .expect_err("missing configured value must be refused");
+        assert_eq!(refusal.code, "environment_unavailable");
+    }
+
+    #[test]
+    fn manifest_cannot_select_environment_variables() {
+        let fixture = Fixture::new();
+        fixture.plugin(
+            "environment-chat",
+            "chat-subscription.environment",
+            ",\"environment\":[\"PROVIDER_CREDENTIAL\"]",
+        );
+        let inventory = discover_at(fixture.path.clone());
+        assert!(inventory.discovered.is_empty());
+        assert_eq!(inventory.refused.len(), 1);
+        assert_eq!(inventory.refused[0].code, "invalid_manifest");
+        assert!(inventory.refused[0].detail.contains("unknown field"));
     }
 
     #[test]

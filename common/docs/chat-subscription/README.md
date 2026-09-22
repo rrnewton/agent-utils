@@ -22,4 +22,6 @@ Batch limits count compact JSON encoding and string escaping rather than raw
 UTF-8 alone, so bounded process adapters accept the same domain values.
 The host may also attach a bounded, schema-identified JSON configuration object
 for non-secret resource names. Credentials remain outside the subscription
-contract.
+contract. A process host may inherit credential values through a separate,
+operator-controlled allowlist of environment-variable names; neither this
+request object nor a provider manifest can select or persist those values.

@@ -225,6 +225,9 @@ impl OutboundCommandConfiguration {
 pub struct BridgeConfiguration {
     /// Exact discovered process-plugin name.
     pub subscription_plugin: String,
+    /// Exact inherited subscription-plugin environment names; values are never persisted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscription_environment: Vec<String>,
     /// Provider channel or space authorities.
     pub channel_ids: Vec<String>,
     /// Authenticated provider sender authorities.
@@ -254,6 +257,8 @@ impl BridgeConfiguration {
             "subscription plugin",
             MAX_PLUGIN_NAME_BYTES,
         )?;
+        crate::plugins::validate_plugin_environment_names(&self.subscription_environment)
+            .map_err(ChatRuntimeError::invalid)?;
         validate_slug(&self.agent_name, "agent name", MAX_AGENT_NAME_BYTES)?;
         validate_single_line(&self.agent_label, "agent label", MAX_AGENT_LABEL_BYTES)?;
         if let Some(reaction) = self.ack_reaction.as_deref() {
@@ -1301,6 +1306,26 @@ pub trait ReplyTransport {
     ) -> std::result::Result<String, OutboundFailure>;
 }
 
+/// One explicit operator-authored root message, independent of inbound request threads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootMessageSubmission<'a> {
+    /// Exact provider channel or space resource.
+    pub channel_id: &'a str,
+    /// Validated nonempty message body.
+    pub body: &'a str,
+    /// Caller-selected stable idempotency key.
+    pub request_id: &'a str,
+}
+
+/// Provider-neutral root-message transport, separate from threaded reply delivery.
+pub trait RootMessageTransport {
+    /// Post or reconcile one root message, returning its immutable provider message identifier.
+    fn publish_root(
+        &mut self,
+        submission: RootMessageSubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure>;
+}
+
 /// One idempotent ensure-reaction request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReactionSubmission<'a> {
@@ -1694,6 +1719,17 @@ impl ReplyTransport for CommandOutboundTransport {
     }
 }
 
+impl RootMessageTransport for CommandOutboundTransport {
+    fn publish_root(
+        &mut self,
+        submission: RootMessageSubmission<'_>,
+    ) -> std::result::Result<String, OutboundFailure> {
+        let request = encode_root_message_request(&submission)?;
+        let response = self.exchange(&request)?;
+        decode_root_message_response(&response, &submission)
+    }
+}
+
 impl ReactionTransport for CommandOutboundTransport {
     fn ensure_reaction(
         &mut self,
@@ -1711,7 +1747,7 @@ struct SendWireRequest<'a> {
     id: &'a str,
     action: &'static str,
     channel_id: &'a str,
-    thread_id: &'a str,
+    thread_id: Option<&'a str>,
     text: &'a str,
 }
 
@@ -1791,7 +1827,22 @@ pub fn encode_send_request(
         id: submission.request_id,
         action: "send",
         channel_id: submission.channel_id,
-        thread_id: submission.thread_id,
+        thread_id: Some(submission.thread_id),
+        text: submission.body,
+    })
+}
+
+/// Encode one exact v1 root-message request with a JSON null thread authority.
+pub fn encode_root_message_request(
+    submission: &RootMessageSubmission<'_>,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    validate_root_message_submission(submission)?;
+    encode_wire_request(&SendWireRequest {
+        version: 1,
+        id: submission.request_id,
+        action: "send",
+        channel_id: submission.channel_id,
+        thread_id: None,
         text: submission.body,
     })
 }
@@ -1817,15 +1868,37 @@ pub fn decode_send_response(
     submission: &ReplySubmission<'_>,
 ) -> std::result::Result<String, OutboundFailure> {
     validate_outbound_send(submission)?;
-    match decode_wire_response(payload, submission.request_id, "send")? {
+    decode_bound_send_response(payload, submission.channel_id, submission.request_id)
+}
+
+/// Decode and bind one strict v1 root-message response to its exact requested channel.
+pub fn decode_root_message_response(
+    payload: &[u8],
+    submission: &RootMessageSubmission<'_>,
+) -> std::result::Result<String, OutboundFailure> {
+    validate_root_message_submission(submission)?;
+    decode_bound_send_response(payload, submission.channel_id, submission.request_id)
+}
+
+fn decode_bound_send_response(
+    payload: &[u8],
+    channel_id: &str,
+    request_id: &str,
+) -> std::result::Result<String, OutboundFailure> {
+    match decode_wire_response(payload, request_id, "send")? {
         WireReceipt::Send(receipt) => {
-            let prefix = format!("{}/messages/", submission.channel_id);
-            if !receipt.message_id.starts_with(&prefix)
+            let prefix = format!("{channel_id}/messages/");
+            if validate_single_line(
+                &receipt.message_id,
+                "provider send message id",
+                chat_subscription::MAX_RESOURCE_ID_BYTES,
+            )
+            .is_err()
+                || !receipt.message_id.starts_with(&prefix)
                 || receipt.message_id.len() <= prefix.len()
-                || receipt.message_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
             {
                 return Err(OutboundFailure::protocol(
-                    "send receipt names a message outside the requested channel",
+                    "send receipt names an invalid message or one outside the requested channel",
                 ));
             }
             Ok(receipt.message_id)
@@ -1939,12 +2012,36 @@ fn decode_wire_response(
 fn validate_outbound_send(
     submission: &ReplySubmission<'_>,
 ) -> std::result::Result<(), OutboundFailure> {
-    validate_operation_id(submission.request_id)?;
-    validate_resource(submission.channel_id, "channel")?;
+    validate_outbound_message(
+        submission.channel_id,
+        submission.body,
+        submission.request_id,
+    )?;
     validate_resource(submission.thread_id, "thread")?;
-    if submission.body.trim().is_empty() || submission.body.len() > MAX_REPLY_BYTES {
+    Ok(())
+}
+
+/// Validate one explicit operator-authored root message before any helper launch.
+pub fn validate_root_message_submission(
+    submission: &RootMessageSubmission<'_>,
+) -> std::result::Result<(), OutboundFailure> {
+    validate_outbound_message(
+        submission.channel_id,
+        submission.body,
+        submission.request_id,
+    )
+}
+
+fn validate_outbound_message(
+    channel_id: &str,
+    body: &str,
+    request_id: &str,
+) -> std::result::Result<(), OutboundFailure> {
+    validate_operation_uuid(request_id)?;
+    validate_resource(channel_id, "channel")?;
+    if body.trim().is_empty() || body.len() > MAX_REPLY_BYTES {
         return Err(not_applied_invalid(
-            "reply body is empty or exceeds 30000 bytes",
+            "message body is empty or exceeds 30000 bytes",
         ));
     }
     Ok(())
@@ -1953,7 +2050,7 @@ fn validate_outbound_send(
 fn validate_outbound_reaction(
     submission: &ReactionSubmission<'_>,
 ) -> std::result::Result<(), OutboundFailure> {
-    validate_operation_id(submission.request_id)?;
+    validate_operation_uuid(submission.request_id)?;
     validate_resource(submission.channel_id, "channel")?;
     validate_resource(submission.message_id, "message")?;
     if submission.emoji.is_empty() || submission.emoji.len() > 64 {
@@ -1962,7 +2059,8 @@ fn validate_outbound_reaction(
     Ok(())
 }
 
-fn validate_operation_id(value: &str) -> std::result::Result<(), OutboundFailure> {
+/// Validate a lowercase RFC 4122 version-4 operation UUID.
+pub fn validate_operation_uuid(value: &str) -> std::result::Result<(), OutboundFailure> {
     if valid_operation_uuid(value) {
         Ok(())
     } else {
@@ -2461,7 +2559,10 @@ pub fn select_plugin(
         )));
     }
     inventory
-        .launch_command(&config.subscription_plugin)
+        .launch_command_with_environment(
+            &config.subscription_plugin,
+            &config.subscription_environment,
+        )
         .map_err(|refusal| {
             ChatRuntimeError::invalid(format!(
                 "subscription plugin refused ({}): {}",
@@ -6601,6 +6702,7 @@ mod tests {
     fn config() -> BridgeConfiguration {
         BridgeConfiguration {
             subscription_plugin: "fixture".to_owned(),
+            subscription_environment: Vec::new(),
             channel_ids: vec!["spaces/example".to_owned()],
             allowed_senders: vec!["users/owner".to_owned()],
             agent_name: "coordinator".to_owned(),
@@ -6616,6 +6718,64 @@ mod tests {
         let mut configuration = config();
         configuration.ack_reaction = None;
         configuration
+    }
+
+    #[test]
+    fn subscription_environment_is_strict_bounded_and_backward_compatible() {
+        let legacy = serde_json::json!({
+            "subscription_plugin": "fixture",
+            "channel_ids": ["spaces/example"],
+            "allowed_senders": ["users/owner"],
+            "agent_name": "coordinator",
+            "agent_label": "coordinator",
+            "outbound_enabled": false,
+            "ack_reaction": null
+        });
+        let decoded: BridgeConfiguration =
+            serde_json::from_value(legacy.clone()).expect("legacy configuration defaults");
+        assert!(decoded.subscription_environment.is_empty());
+        let reencoded = serde_json::to_value(&decoded).expect("serialize default configuration");
+        assert!(reencoded.get("subscription_environment").is_none());
+
+        let mut unknown = legacy;
+        unknown
+            .as_object_mut()
+            .expect("configuration object")
+            .insert(
+                "subscription_secret".to_owned(),
+                Value::String("no".to_owned()),
+            );
+        assert!(serde_json::from_value::<BridgeConfiguration>(unknown).is_err());
+
+        for names in [
+            vec!["BAD-NAME".to_owned()],
+            vec!["DUPLICATE".to_owned(), "DUPLICATE".to_owned()],
+            vec!["X".repeat(crate::plugins::MAX_PLUGIN_ENVIRONMENT_NAME_BYTES + 1)],
+            vec!["X".to_owned(); crate::plugins::MAX_PLUGIN_ENVIRONMENT_NAMES + 1],
+        ] {
+            let mut configuration = config();
+            configuration.subscription_environment = names;
+            assert!(configuration.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn subscription_environment_values_never_enter_state_or_status() {
+        let inherited_home = std::env::var("HOME").expect("test process HOME");
+        assert!(inherited_home.len() > 1);
+        let root = temporary("subscription-environment-state");
+        let mut configuration = config();
+        configuration.subscription_environment = vec!["HOME".to_owned()];
+        let state = BridgeState::initialize(&root, configuration).expect("initialize bridge");
+
+        let persisted = fs::read_to_string(root.join("bridge.json")).expect("bridge document");
+        assert!(persisted.contains("subscription_environment"));
+        assert!(persisted.contains("HOME"));
+        assert!(!persisted.contains(&inherited_home));
+        let status = serde_json::to_string(&state.status().expect("status")).expect("status JSON");
+        assert!(!status.contains(&inherited_home));
+        assert!(!status.contains("subscription_environment"));
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     fn state_with_old_request(
@@ -9507,6 +9667,44 @@ mod tests {
         assert_eq!(
             decode_send_response(outside, &send)
                 .expect_err("outside authority")
+                .outcome,
+            OutboundOutcome::Unknown
+        );
+
+        let root = RootMessageSubmission {
+            channel_id: "spaces/example",
+            body: "new root",
+            request_id: "123e4567-e89b-42d3-a456-426614174009",
+        };
+        let encoded = encode_root_message_request(&root).expect("encode root message");
+        let document: Value = serde_json::from_slice(&encoded).expect("root request JSON");
+        assert_eq!(
+            document,
+            serde_json::json!({
+                "version": 1,
+                "id": root.request_id,
+                "action": "send",
+                "channel_id": root.channel_id,
+                "thread_id": null,
+                "text": root.body,
+            })
+        );
+        let root_response = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174009","action":"send","ok":true,"receipt":{"message_id":"spaces/example/messages/root"}}"#;
+        assert_eq!(
+            decode_root_message_response(root_response, &root).expect("decode root send"),
+            "spaces/example/messages/root"
+        );
+        let outside_root = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174009","action":"send","ok":true,"receipt":{"message_id":"spaces/other/messages/root"}}"#;
+        assert_eq!(
+            decode_root_message_response(outside_root, &root)
+                .expect_err("root receipt outside authority")
+                .outcome,
+            OutboundOutcome::Unknown
+        );
+        let multiline_root = br#"{"version":1,"id":"123e4567-e89b-42d3-a456-426614174009","action":"send","ok":true,"receipt":{"message_id":"spaces/example/messages/root\nforged"}}"#;
+        assert_eq!(
+            decode_root_message_response(multiline_root, &root)
+                .expect_err("multiline root receipt")
                 .outcome,
             OutboundOutcome::Unknown
         );

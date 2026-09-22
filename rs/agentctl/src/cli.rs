@@ -1,7 +1,7 @@
 //! Discoverable command-line interface for persistent named agents.
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,6 +12,8 @@ use serde_json::json;
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
 use crate::subagents::{environment_entries, AdoptOptions, ManagedAgents, StartOptions};
+
+const MAX_CHAT_PUBLISH_BYTES: usize = 30_000;
 
 #[derive(Parser)]
 #[command(
@@ -224,6 +226,35 @@ impl Prompt {
         }
         Ok(text)
     }
+
+    fn read_bounded(&self, maximum: usize, label: &str) -> Result<Option<String>, String> {
+        let text = match self.file.as_ref() {
+            Some(path) => {
+                let file = fs::File::open(path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                let limit = u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1);
+                let mut bytes = Vec::with_capacity(maximum.saturating_add(1));
+                file.take(limit)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                if bytes.len() > maximum {
+                    return Err(format!("{label} exceeds {maximum} UTF-8 bytes"));
+                }
+                Some(
+                    String::from_utf8(bytes)
+                        .map_err(|_| format!("{} does not contain valid UTF-8", path.display()))?,
+                )
+            }
+            None => self.text.clone(),
+        };
+        if text.as_deref().is_some_and(|text| text.trim().is_empty()) {
+            return Err(format!("{label} must not be empty"));
+        }
+        if text.as_ref().is_some_and(|text| text.len() > maximum) {
+            return Err(format!("{label} exceeds {maximum} UTF-8 bytes"));
+        }
+        Ok(text)
+    }
 }
 
 #[derive(Args)]
@@ -309,6 +340,8 @@ enum ChatCommand {
     Init(ChatInit),
     /// Inspect durable bridge state without contacting Herdr or a provider
     Status(ChatState),
+    /// Publish one explicit operator root message through the configured helper
+    Publish(ChatPublish),
     /// Run one bounded delivery, terminal-capture, and outbound recovery pass
     Tick(ChatOperate),
     /// Run event-driven provider and Herdr subscriptions until SIGINT or SIGTERM
@@ -331,6 +364,35 @@ struct ChatInit {
     /// Private owner-only JSON bridge configuration (maximum 1 MiB)
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
+}
+
+#[derive(Args)]
+struct ChatPublish {
+    #[command(flatten)]
+    state: ChatState,
+    /// Exact configured provider channel or space authority
+    #[arg(long, value_name = "CHANNEL")]
+    channel_id: String,
+    /// Caller-owned lowercase RFC 4122 version-4 idempotency UUID
+    #[arg(long, value_name = "UUID", value_parser = operation_uuid)]
+    request_id: String,
+    /// Message text; use --file for multiline input
+    #[arg(required_unless_present = "file", conflicts_with = "file")]
+    text: Option<String>,
+    /// UTF-8 file containing the message, read with a 30,000-byte bound
+    #[arg(long, value_name = "PATH", required_unless_present = "text")]
+    file: Option<PathBuf>,
+}
+
+impl ChatPublish {
+    fn read_message(&self) -> Result<String, String> {
+        Prompt {
+            text: self.text.clone(),
+            file: self.file.clone(),
+        }
+        .read_bounded(MAX_CHAT_PUBLISH_BYTES, "chat publish message")?
+        .ok_or_else(|| "chat publish requires message text or --file".to_owned())
+    }
 }
 
 #[derive(Args)]
@@ -411,6 +473,11 @@ fn positive_chat_delivery_seconds(value: &str) -> Result<f64, String> {
 fn environment_value(value: &str) -> Result<String, String> {
     environment_entries(&[value.to_owned()])
         .map(|entries| entries.into_iter().next().expect("one validated entry"))
+        .map_err(|error| error.to_string())
+}
+fn operation_uuid(value: &str) -> Result<String, String> {
+    crate::chat_runtime::validate_operation_uuid(value)
+        .map(|()| value.to_owned())
         .map_err(|error| error.to_string())
 }
 #[derive(Clone, Debug)]
@@ -653,6 +720,18 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::Publish(value) => {
+            let body = value.read_message().map_err(Failure::Usage)?;
+            let result = crate::chat_service::publish(
+                &value.state.bridge_state,
+                &value.channel_id,
+                &value.request_id,
+                &body,
+            )
+            .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Close(value) => {
             let result = crate::chat_service::close(&value.state.bridge_state, &value.request)
                 .map_err(Failure::Chat)?;
@@ -831,6 +910,102 @@ mod tests {
         ] {
             assert!(help.contains(required));
         }
+        let error = Cli::try_parse_from(["agentctl", "chat", "publish", "--help"])
+            .err()
+            .expect("chat publish help");
+        let help = error.to_string();
+        for required in ["--bridge-state", "--channel-id", "--request-id", "--file"] {
+            assert!(help.contains(required));
+        }
+    }
+
+    #[test]
+    fn chat_publish_parses_exactly_one_bounded_input_shape_and_lowercase_uuid() {
+        let uuid = "123e4567-e89b-42d3-a456-426614174000";
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "publish",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--channel-id",
+            "spaces/example",
+            "--request-id",
+            uuid,
+            "hello",
+        ])
+        .expect("positional publish text");
+        let Some(Commands::Chat(Chat {
+            command: ChatCommand::Publish(publish),
+        })) = parsed.command
+        else {
+            panic!("expected publish command");
+        };
+        assert_eq!(publish.channel_id, "spaces/example");
+        assert_eq!(publish.request_id, uuid);
+        assert_eq!(publish.text.as_deref(), Some("hello"));
+        assert!(publish.file.is_none());
+
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "publish",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--channel-id",
+            "spaces/example",
+            "--request-id",
+            uuid,
+            "--file",
+            "message.txt",
+        ])
+        .is_ok());
+        for invalid in [
+            "123E4567-e89b-42d3-a456-426614174000",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "not-a-uuid",
+        ] {
+            assert!(Cli::try_parse_from([
+                "agentctl",
+                "chat",
+                "publish",
+                "--bridge-state",
+                "/tmp/chat-state",
+                "--channel-id",
+                "spaces/example",
+                "--request-id",
+                invalid,
+                "hello",
+            ])
+            .is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "publish",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--channel-id",
+            "spaces/example",
+            "--request-id",
+            uuid,
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "publish",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--channel-id",
+            "spaces/example",
+            "--request-id",
+            uuid,
+            "hello",
+            "--file",
+            "message.txt",
+        ])
+        .is_err());
     }
     #[test]
     fn invalid_timeouts_and_ambiguous_prompts_are_rejected() {

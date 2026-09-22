@@ -24,7 +24,8 @@ use crate::agent::{AgentError, AgentRuntime, DrainOptions, QueueMessageState};
 use crate::chat_events::{PaneEvent, PaneEventStream, PaneEventWake};
 use crate::chat_runtime::{
     self, AckResult, BridgeConfiguration, BridgeState, ChatRuntimeError, CommandOutboundTransport,
-    CoordinatorDeliveryResult, OutboundCancellation, ReplyRoute, ReplyRouteEntry,
+    CoordinatorDeliveryResult, OutboundCancellation, OutboundFailure, ReplyRoute, ReplyRouteEntry,
+    RootMessageSubmission, RootMessageTransport,
 };
 use crate::client::HerdrClient;
 use crate::subagents::{ManagedAgents, ManagedApi};
@@ -54,6 +55,8 @@ pub enum ChatServiceError {
     Io(io::Error),
     /// A bounded provider or event generation failed.
     Generation(String),
+    /// A supervised outbound helper returned bounded provider outcome evidence.
+    Outbound(OutboundFailure),
     /// A service worker panicked.
     Worker(String),
 }
@@ -65,6 +68,7 @@ impl fmt::Display for ChatServiceError {
             Self::Agent(error) => fmt::Display::fmt(error, formatter),
             Self::Io(error) => write!(formatter, "chat service I/O failed: {error}"),
             Self::Generation(detail) | Self::Worker(detail) => formatter.write_str(detail),
+            Self::Outbound(error) => write!(formatter, "chat outbound operation failed: {error}"),
         }
     }
 }
@@ -86,6 +90,12 @@ impl From<AgentError> for ChatServiceError {
 impl From<io::Error> for ChatServiceError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<OutboundFailure> for ChatServiceError {
+    fn from(error: OutboundFailure) -> Self {
+        Self::Outbound(error)
     }
 }
 
@@ -182,6 +192,59 @@ pub fn status(state_root: &Path) -> Result<Value, ChatServiceError> {
     Ok(BridgeState::inspect(state_root)?.status()?)
 }
 
+/// Publish one explicit owner/operator root message without mutating durable bridge state.
+///
+/// The configured channel authority and request are validated before the exact configured helper
+/// is pinned or spawned. The caller owns the UUID across any retry whose provider outcome is
+/// uncertain; this command deliberately does not create an event-loop reply record.
+pub fn publish(
+    state_root: &Path,
+    channel_id: &str,
+    request_id: &str,
+    body: &str,
+) -> Result<Value, ChatServiceError> {
+    let state = BridgeState::inspect(state_root)?;
+    let configuration = state.config();
+    if !configuration.outbound_enabled {
+        return Err(ChatServiceError::Generation(
+            "chat publish requires outbound_enabled=true".to_owned(),
+        ));
+    }
+    if configuration.outbound_command.is_none() {
+        return Err(ChatServiceError::Generation(
+            "chat publish requires an explicit outbound_command helper".to_owned(),
+        ));
+    }
+    if !configuration
+        .channel_ids
+        .iter()
+        .any(|configured| configured == channel_id)
+    {
+        return Err(ChatServiceError::Generation(
+            "chat publish channel is outside the configured channel_ids authority".to_owned(),
+        ));
+    }
+    let submission = RootMessageSubmission {
+        channel_id,
+        body,
+        request_id,
+    };
+    chat_runtime::validate_root_message_submission(&submission)?;
+    let mut transport = state.outbound_transport()?.ok_or_else(|| {
+        ChatServiceError::Generation(
+            "chat publish requires an explicit outbound_command helper".to_owned(),
+        )
+    })?;
+    let message_id = transport.publish_root(submission)?;
+    Ok(json!({
+        "version": 1,
+        "id": request_id,
+        "action": "send",
+        "ok": true,
+        "receipt": {"message_id": message_id},
+    }))
+}
+
 /// Close capture for one exact request and durably retire it when terminal and replay-safe.
 pub fn close(state_root: &Path, key: &str) -> Result<Value, ChatServiceError> {
     let state = BridgeState::open(state_root)?;
@@ -245,7 +308,10 @@ pub fn run<A: ManagedApi + ?Sized>(
         transport.set_cancellation(outbound_cancellation.clone());
     }
     let inventory = crate::plugins::discover();
-    let _pinned = chat_runtime::select_plugin(&inventory, state.config())?;
+    let pinned = chat_runtime::select_plugin(&inventory, state.config())?;
+    // Preflight owns no generation: release its descriptors and captured environment values
+    // before the provider worker independently pins and launches the real generation.
+    drop(pinned);
     let _target = manager.pane_info(&state.config().agent_name)?;
     let _lease = state.acquire_runner_lease()?;
 
@@ -1765,6 +1831,7 @@ fn log_report(report: &CycleReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::num::NonZeroU16;
     use std::os::unix::fs::PermissionsExt;
@@ -1779,6 +1846,38 @@ mod tests {
     };
 
     static NEXT_STATE: AtomicU64 = AtomicU64::new(1);
+
+    fn state_namespace_snapshot(root: &Path) -> BTreeMap<std::path::PathBuf, (bool, u32, Vec<u8>)> {
+        let mut snapshot = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let metadata = fs::symlink_metadata(&path).expect("state namespace metadata");
+            let relative = path
+                .strip_prefix(root)
+                .expect("path below state root")
+                .to_path_buf();
+            if metadata.is_dir() {
+                snapshot.insert(relative, (true, metadata.permissions().mode(), Vec::new()));
+                let entries = fs::read_dir(&path)
+                    .expect("state namespace directory")
+                    .map(|entry| entry.expect("state namespace entry").path())
+                    .collect::<Vec<_>>();
+                pending.extend(entries);
+            } else if metadata.is_file() {
+                snapshot.insert(
+                    relative,
+                    (
+                        false,
+                        metadata.permissions().mode(),
+                        fs::read(&path).expect("state namespace file"),
+                    ),
+                );
+            } else {
+                panic!("unexpected non-file state path {}", path.display());
+            }
+        }
+        snapshot
+    }
 
     #[derive(Default)]
     struct RecordingDelivery {
@@ -1927,6 +2026,7 @@ mod tests {
             &root,
             BridgeConfiguration {
                 subscription_plugin: "fixture".to_owned(),
+                subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
                 agent_name: "coordinator".to_owned(),
@@ -1961,6 +2061,117 @@ mod tests {
             .new_request_keys
             .remove(0);
         (state, key, root)
+    }
+
+    #[test]
+    fn publish_refuses_unconfigured_channel_before_helper_open_and_state_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-chat-publish-authority-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private fixture");
+        BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                subscription_plugin: "fixture".to_owned(),
+                subscription_environment: Vec::new(),
+                channel_ids: vec!["spaces/allowed".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                agent_name: "coordinator".to_owned(),
+                agent_label: "coordinator".to_owned(),
+                outbound_enabled: true,
+                ack_reaction: None,
+                backend_configuration: None,
+                outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                    executable: "/definitely/missing/helper".into(),
+                    arguments: Vec::new(),
+                    environment: Vec::new(),
+                    timeout_millis: 1_000,
+                    shutdown_grace_millis: 0,
+                }),
+            },
+        )
+        .expect("initialize state without opening helper");
+        let state_before = state_namespace_snapshot(&root);
+
+        let error = publish(
+            &root,
+            "spaces/denied",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "operator message",
+        )
+        .expect_err("channel outside configured authority");
+        assert!(error
+            .to_string()
+            .contains("configured channel_ids authority"));
+        assert_eq!(state_namespace_snapshot(&root), state_before);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn publish_uses_supervised_null_thread_transport_and_returns_exact_receipt() {
+        let fixture = std::env::temp_dir().join(format!(
+            "agentctl-chat-publish-success-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&fixture).expect("create fixture");
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).expect("private fixture");
+        let helper = fixture.join("helper");
+        fs::copy(
+            fs::canonicalize("/bin/sh").expect("canonical shell"),
+            &helper,
+        )
+        .expect("copy native helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("private helper");
+        let request_id = "123e4567-e89b-42d3-a456-426614174000";
+        let response = format!(
+            "{{\"version\":1,\"id\":\"{request_id}\",\"action\":\"send\",\"ok\":true,\"receipt\":{{\"message_id\":\"spaces/allowed/messages/root\"}}}}"
+        );
+        let script = format!(
+            "IFS= read -r request || exit 2; case \"$request\" in *'\"thread_id\":null'*) ;; *) exit 3;; esac; printf '%s\\n' '{response}'"
+        );
+        let root = fixture.join("state");
+        BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                subscription_plugin: "fixture".to_owned(),
+                subscription_environment: Vec::new(),
+                channel_ids: vec!["spaces/allowed".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                agent_name: "coordinator".to_owned(),
+                agent_label: "coordinator".to_owned(),
+                outbound_enabled: true,
+                ack_reaction: None,
+                backend_configuration: None,
+                outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                    executable: helper,
+                    arguments: vec!["-c".to_owned(), script],
+                    environment: Vec::new(),
+                    timeout_millis: 2_000,
+                    shutdown_grace_millis: 50,
+                }),
+            },
+        )
+        .expect("initialize state");
+        let state_before = state_namespace_snapshot(&root);
+
+        let receipt = publish(&root, "spaces/allowed", request_id, "operator message")
+            .expect("publish root message");
+        assert_eq!(
+            receipt,
+            json!({
+                "version": 1,
+                "id": request_id,
+                "action": "send",
+                "ok": true,
+                "receipt": {"message_id": "spaces/allowed/messages/root"},
+            })
+        );
+        assert_eq!(state_namespace_snapshot(&root), state_before);
+        fs::remove_dir_all(fixture).expect("remove fixture");
     }
 
     #[test]
@@ -2054,6 +2265,7 @@ mod tests {
             &root,
             BridgeConfiguration {
                 subscription_plugin: "fixture".to_owned(),
+                subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
                 agent_name: "coordinator".to_owned(),

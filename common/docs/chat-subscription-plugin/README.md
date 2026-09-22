@@ -16,7 +16,9 @@ cursor are durable. Heartbeats remain ordered but require no durable commit.
 Incoming JSON rejects duplicate object keys at every depth. Batch, frame, text,
 identifier, payload, and diagnostic sizes are bounded. The protocol contains no
 credentials, and process discovery or credential setup remains the host's
-responsibility.
+responsibility. A host that supplies credentials through the environment must
+clear inherited state first and add only names from its operator-controlled
+configuration. The manifest has no environment-selection field.
 
 ## Version 1 wire contract
 

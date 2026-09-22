@@ -18,6 +18,7 @@ directory.
    ```json
    {
      "subscription_plugin": "provider-events",
+     "subscription_environment": [],
      "channel_ids": ["spaces/example"],
      "allowed_senders": ["users/owner"],
      "agent_name": "coordinator",
@@ -40,7 +41,9 @@ directory.
 
    The helper is independent of the inbound plugin. Omit `outbound_command`,
    set `outbound_enabled` to `false`, and keep `ack_reaction` null for an
-   intentionally inbound-only bridge.
+   intentionally inbound-only bridge. Add only subscription-plugin environment
+   variable names to `subscription_environment`; every named value must exist
+   when the service starts, while its value is never saved in bridge state.
 
 3. Initialize once, then run the foreground service:
 
@@ -58,7 +61,10 @@ directory.
 
 Use `agentctl chat status --bridge-state DIR` for a read-only durable status
 snapshot. Stop `run` before `agentctl chat tick --bridge-state DIR`, which runs
-one bounded recovery pass. `agentctl chat userguide` documents plugin safety,
+one bounded recovery pass. `agentctl chat publish --bridge-state DIR
+--channel-id CHANNEL --request-id UUID TEXT` is the explicit operator-only way
+to send a root message; it does not mutate bridge state or act as an event-loop
+reply. `agentctl chat userguide` documents plugin safety,
 the outbound NDJSON contract, exact local commit receipts, explicit route
 closure and bounded retirement, fail-closed provider gaps, recovery, and
 service-manager limits. A status with `healthy: false` and an unresolved gap is
