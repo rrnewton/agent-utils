@@ -68,23 +68,50 @@ pub(crate) struct PaneEventWake {
 
 impl PaneEventWake {
     pub(crate) fn wake(&self) {
-        let byte = [1_u8];
-        let result = unsafe {
-            libc::send(
-                self.stream.as_raw_fd(),
-                byte.as_ptr().cast(),
-                byte.len(),
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            )
-        };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if !matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::BrokenPipe
-            ) {
-                // Wake is deliberately best-effort. The owning service retains a finite
-                // outer shutdown deadline even if this descriptor has already closed.
+        signal_wake_with(|| {
+            let byte = [1_u8];
+            // SAFETY: `byte` is live for this call and the cloned wake descriptor remains owned
+            // by `self`. Nonblocking send cannot retain the pointer after returning.
+            let result = unsafe {
+                libc::send(
+                    self.stream.as_raw_fd(),
+                    byte.as_ptr().cast(),
+                    byte.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else if result == 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "wake socket accepted zero bytes",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+fn signal_wake_with(mut send: impl FnMut() -> io::Result<()>) {
+    loop {
+        match send() {
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                // A full nonblocking socket already contains a sticky wake. A closed peer no
+                // longer has a waiter to interrupt. Both cases complete this best-effort signal.
+                return;
+            }
+            Err(_) => {
+                // The owning service retains a finite outer shutdown deadline for other errors.
+                return;
             }
         }
     }
@@ -907,6 +934,76 @@ mod tests {
         release.send(()).expect("release fixture connection");
         server.join().expect("join event fixture");
         fs::remove_dir_all(directory).expect("remove event fixture");
+    }
+
+    #[test]
+    fn wake_before_wait_is_sticky() {
+        let (socket, directory) = temporary_socket();
+        let listener = UnixListener::bind(&socket).expect("bind event fixture");
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("accept event client");
+            let mut request = String::new();
+            BufReader::new(connection.try_clone().expect("clone fixture socket"))
+                .read_line(&mut request)
+                .expect("read subscription request");
+            let request: Value = serde_json::from_str(&request).expect("decode request");
+            connection
+                .write_all(&wire(json!({
+                    "id": request["id"],
+                    "result": {"type": "subscription_started"},
+                })))
+                .expect("write acknowledgement");
+            released.recv().expect("release fixture connection");
+        });
+        let mut stream =
+            PaneEventStream::connect(&socket, "w1:p2", Vec::new(), 4_000, Duration::from_secs(2))
+                .expect("connect event stream");
+        let wake = stream.wake_handle().expect("clone wake handle");
+
+        wake.wake();
+        let started = Instant::now();
+        assert!(stream
+            .wait(Duration::from_secs(30))
+            .expect("consume pre-armed wake")
+            .is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "wake queued before wait was not sticky: {:?}",
+            started.elapsed()
+        );
+
+        release.send(()).expect("release fixture connection");
+        server.join().expect("join event fixture");
+        fs::remove_dir_all(directory).expect("remove event fixture");
+    }
+
+    #[test]
+    fn wake_retries_interrupted_send_until_success() {
+        let mut attempts = 0_u8;
+        signal_wake_with(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn wake_retries_interrupted_send_then_accepts_existing_sticky_byte() {
+        let mut attempts = 0_u8;
+        signal_wake_with(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+        });
+        assert_eq!(attempts, 2);
     }
 
     #[test]

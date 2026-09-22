@@ -65,6 +65,29 @@ shapes, ordering, durable Commit semantics, and canonical bounds.
 }
 ```
 
+`process_phase_timeouts` is an optional manifest object for a plugin whose
+bounded provider operations cannot use the default host deadlines. When present,
+all five members are required and their units are seconds:
+
+```json
+{
+  "process_phase_timeouts": {
+    "hello_seconds": 20,
+    "start_seconds": 130,
+    "commit_seconds": 45,
+    "close_seconds": 57,
+    "shutdown_grace_seconds": 0
+  }
+}
+```
+
+Omitting the object preserves the exact default Hello, Start, Commit, Close, and
+shutdown-grace values of 10, 30, 30, 10, and 2 seconds. Required protocol phases
+must be positive and are capped at 30, 180, 60, and 120 seconds respectively;
+shutdown grace may be zero and is capped at 10 seconds. Discovery refuses an
+incomplete object, an unknown member, or a value outside those bounds before it
+spawns the executable.
+
 The home, plugin directory, manifest, and executable must be owned by the
 current account and must not be group/world writable. Symlinks, hard-linked
 files, path traversal, oversized or changing manifests, duplicate capability
@@ -102,12 +125,17 @@ credential service.
 
 The Rust `chat run` host connects the returned process supervisor with explicit
 Hello, Start, Commit, Close, and shutdown-grace deadlines. Blocking protocol I/O
-runs on an owned worker. The separately retained cancellation handle can kill
-the complete private process group while `next_item` is blocked, then joins the
-worker and reaps the leader. Normal shutdown sends Close and waits for the
-chosen grace period before forced termination. Leader exit uses event-driven
-Linux pidfd notification rather than periodic process polling, with a fixed
-two-second post-kill bound. Launch preflights both atomic clone3 pidfd creation
+runs on an owned worker. Before Hello begins, the host publishes the selected
+generation's complete shutdown budget. After Hello, it installs the separately
+retained cancellation handle before Start begins, so a blocked Start is
+interruptible and its full independent phase deadline is not additive during
+shutdown. The handle serializes Close while `next_item` is blocked. Success
+requires that exact read to observe post-Close EOF, semantic backend cleanup to
+finish, and the pidfd-owned child to exit zero. The configured Close deadline is
+followed by the chosen process-exit grace and only then forced process-group
+termination. Leader exit uses event-driven Linux pidfd notification rather than
+periodic process polling, with a fixed two-second post-kill bound. Launch
+preflights both atomic clone3 pidfd creation
 and `waitid(P_PIDFD)`, and the non-execing process-group supervisor closes all
 inherited host descriptors through `close_range` or `/proc/self/fd` before it
 waits. The launch thread masks the complete kernel signal set only across
@@ -129,8 +157,39 @@ auto-reaper makes status ownership unsafe. The process
 group is a cleanup boundary for trusted same-user plugins, not security
 containment—a malicious plugin can escape it with `setsid`. Untrusted plugins
 need a launcher-owned sandbox or cgroup. The Rust CLI exposes this runtime as
-`chat init`, `chat status`, `chat tick`, `chat run`, and `chat close`; use
+`chat init`, `chat status`, `chat inspect`, `chat tick`, `chat run`, and `chat close`; use
 `chat quickstart` and `chat userguide` for its configuration and operations.
+
+Derive the service-manager stop interval from the manifest selected by that
+service; 75 seconds is not a protocol-wide value. The Rust host's worst-case
+provider window before Hello completes is
+`hello_seconds + close_seconds + shutdown_grace_seconds + 7`; after Hello it is
+`close_seconds + shutdown_grace_seconds + 7`. An admitted reaction or reply
+helper independently owns
+`outbound_command.timeout_millis + outbound_command.shutdown_grace_millis +
+7000` milliseconds. The hard service window is the maximum of the applicable
+provider window and that outbound window, plus measured service-manager
+scheduling margin. The final seven seconds reserve two seconds for forced pidfd
+reap and five seconds for host reconciliation and worker joins. At startup the
+service pins the complete selected provider timeout tuple; a later generation
+whose manifest differs is rejected and requires a service restart, so the
+configured outer bound cannot silently become stale. The accepted manifest
+maxima require up to 167 seconds during Hello and 137 seconds afterward; the
+maximum accepted outbound window is 67 seconds. A deployment-local 75-second
+setting with `close_seconds=60` and `shutdown_grace_seconds=2` is safe only if
+its selected `hello_seconds` is at most 6; the default 10-second Hello requires
+at least 79 seconds before additional service-manager scheduling margin.
+
+With systemd `KillMode=control-group`, use the same binary's hidden
+`chat graceful-stop-main --main-pid "$MAINPID" --main-pidfd-id "$MAINPIDFDID"`
+as synchronous `ExecStop`. It opens a fresh pidfd, requires its inode to equal
+systemd's `MAINPIDFDID`, signals only that stable identity, and waits on the
+pidfd. `MAINPIDFDID` in service-manager commands requires systemd 258 or newer.
+Pair the helper with the derived `TimeoutStopSec`, plus
+`TimeoutStopFailureMode=kill`. After its 70-second diagnostic threshold the
+helper deliberately remains blocked: returning would start a second systemd
+stop interval instead of letting the original window kill the complete control
+group.
 
 A manifest can report only static implementation maturity. Discovery always
 reports `configured`, `connected`, and `live_verified` as false. Those are

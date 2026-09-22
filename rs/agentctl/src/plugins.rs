@@ -22,6 +22,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +43,26 @@ pub const MANIFEST_SCHEMA: &str = "agentctl-plugin-manifest/v1alpha1";
 pub const MAX_PLUGIN_ENVIRONMENT_NAMES: usize = 64;
 /// Maximum UTF-8 bytes in one operator-selected environment name.
 pub const MAX_PLUGIN_ENVIRONMENT_NAME_BYTES: usize = 128;
+/// Compatibility Hello deadline used when a manifest does not declare process phase timeouts.
+pub(crate) const DEFAULT_PLUGIN_HELLO_TIMEOUT_SECONDS: u64 = 10;
+/// Compatibility Start deadline used when a manifest does not declare process phase timeouts.
+pub(crate) const DEFAULT_PLUGIN_START_TIMEOUT_SECONDS: u64 = 30;
+/// Compatibility Commit deadline used when a manifest does not declare process phase timeouts.
+pub(crate) const DEFAULT_PLUGIN_COMMIT_TIMEOUT_SECONDS: u64 = 30;
+/// Compatibility Close deadline used when a manifest does not declare process phase timeouts.
+pub(crate) const DEFAULT_PLUGIN_CLOSE_TIMEOUT_SECONDS: u64 = 10;
+/// Compatibility cooperative-exit grace used when a manifest omits process phase timeouts.
+pub(crate) const DEFAULT_PLUGIN_SHUTDOWN_GRACE_SECONDS: u64 = 2;
+/// Largest Hello deadline a plugin manifest may request.
+pub(crate) const MAX_PLUGIN_HELLO_TIMEOUT_SECONDS: u64 = 30;
+/// Largest Start deadline a plugin manifest may request.
+pub(crate) const MAX_PLUGIN_START_TIMEOUT_SECONDS: u64 = 180;
+/// Largest Commit deadline a plugin manifest may request.
+pub(crate) const MAX_PLUGIN_COMMIT_TIMEOUT_SECONDS: u64 = 60;
+/// Largest Close deadline a plugin manifest may request.
+pub(crate) const MAX_PLUGIN_CLOSE_TIMEOUT_SECONDS: u64 = 120;
+/// Largest cooperative-exit grace a plugin manifest may request.
+pub(crate) const MAX_PLUGIN_SHUTDOWN_GRACE_SECONDS: u64 = 10;
 /// Non-secret process context explicitly retained after `env_clear`.
 pub const PLUGIN_BASELINE_ENV: &[&str] = &[
     "HOME",
@@ -130,6 +151,9 @@ pub struct DiscoveredPlugin {
     pub origin: &'static str,
     /// Facts static discovery can establish; runtime facts remain false.
     pub status: MaturityStatus,
+    /// Validated process-protocol phase policy; omitted from capability JSON.
+    #[serde(skip)]
+    pub(crate) process_phase_timeouts: ProcessPhaseTimeouts,
     /// Exact executable accepted during discovery; omitted from capability JSON.
     #[serde(skip)]
     pub(crate) executable_identity: Option<FileIdentity>,
@@ -242,7 +266,8 @@ impl PluginInventory {
 
         let manifest_bytes = read_manifest(&pinned_directory.join("manifest.json"), uid)
             .map_err(|error| refused(name, "invalid_manifest", error.to_string()))?;
-        let (manifest, executable_name) = parse_manifest(&manifest_bytes, name)?;
+        let (manifest, executable_name, process_phase_timeouts) =
+            parse_manifest(&manifest_bytes, name)?;
         if manifest.name != plugin.name
             || manifest.capability != plugin.capability
             || executable_name != plugin.executable
@@ -250,6 +275,7 @@ impl PluginInventory {
             || manifest.protocol.max != plugin.protocol_max
             || (manifest.implementation == ImplementationState::Implemented)
                 != plugin.status.implemented
+            || process_phase_timeouts != plugin.process_phase_timeouts
         {
             return Err(refused(
                 name,
@@ -279,6 +305,7 @@ impl PluginInventory {
         command.current_dir(pinned_directory);
         Ok(PinnedPluginCommand {
             command,
+            process_phase_timeouts,
             _directory: directory,
             _executable: executable,
         })
@@ -335,6 +362,7 @@ pub(crate) fn validate_plugin_environment_names(
 /// path after close-on-exec processing.
 pub struct PinnedPluginCommand {
     command: Command,
+    process_phase_timeouts: ProcessPhaseTimeouts,
     _directory: File,
     _executable: File,
 }
@@ -351,11 +379,18 @@ impl fmt::Debug for PinnedPluginCommand {
             .field("program", &self.command.get_program())
             .field("argument_count", &self.command.get_args().count())
             .field("environment_names", &environment_names)
+            .field("process_phase_timeouts", &self.process_phase_timeouts)
             .finish_non_exhaustive()
     }
 }
 
 impl PinnedPluginCommand {
+    /// Return the validated manifest-owned process-protocol phase policy.
+    #[must_use]
+    pub(crate) fn process_phase_timeouts(&self) -> ProcessPhaseTimeouts {
+        self.process_phase_timeouts
+    }
+
     /// Spawn in a private process group with piped protocol streams and return its supervisor.
     ///
     /// # Errors
@@ -396,6 +431,28 @@ struct ProtocolManifest {
     max: u16,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProcessPhaseTimeoutManifest {
+    hello_seconds: u64,
+    start_seconds: u64,
+    commit_seconds: u64,
+    close_seconds: u64,
+    shutdown_grace_seconds: u64,
+}
+
+impl Default for ProcessPhaseTimeoutManifest {
+    fn default() -> Self {
+        Self {
+            hello_seconds: DEFAULT_PLUGIN_HELLO_TIMEOUT_SECONDS,
+            start_seconds: DEFAULT_PLUGIN_START_TIMEOUT_SECONDS,
+            commit_seconds: DEFAULT_PLUGIN_COMMIT_TIMEOUT_SECONDS,
+            close_seconds: DEFAULT_PLUGIN_CLOSE_TIMEOUT_SECONDS,
+            shutdown_grace_seconds: DEFAULT_PLUGIN_SHUTDOWN_GRACE_SECONDS,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PluginManifest {
@@ -405,6 +462,8 @@ struct PluginManifest {
     executable: String,
     protocol: ProtocolManifest,
     implementation: ImplementationState,
+    #[serde(default)]
+    process_phase_timeouts: ProcessPhaseTimeoutManifest,
 }
 
 fn bounded(value: impl Into<String>) -> String {
@@ -653,7 +712,7 @@ fn inspect_plugin(path: &Path, entry: &str, uid: u32) -> Result<DiscoveredPlugin
     let manifest_path = path.join("manifest.json");
     let manifest_bytes = read_manifest(&manifest_path, uid)
         .map_err(|error| refused(entry, "invalid_manifest", error.to_string()))?;
-    let (manifest, executable) = parse_manifest(&manifest_bytes, entry)?;
+    let (manifest, executable, process_phase_timeouts) = parse_manifest(&manifest_bytes, entry)?;
     let executable_metadata = validate_executable(&path.join(&executable), uid)
         .map_err(|error| refused(entry, "unsafe_executable", error.to_string()))?;
     Ok(DiscoveredPlugin {
@@ -667,11 +726,15 @@ fn inspect_plugin(path: &Path, entry: &str, uid: u32) -> Result<DiscoveredPlugin
         status: MaturityStatus::discovered(
             manifest.implementation == ImplementationState::Implemented,
         ),
+        process_phase_timeouts,
         executable_identity: Some(FileIdentity::from_metadata(&executable_metadata)),
     })
 }
 
-fn parse_manifest(bytes: &[u8], entry: &str) -> Result<(PluginManifest, String), RefusedPlugin> {
+fn parse_manifest(
+    bytes: &[u8],
+    entry: &str,
+) -> Result<(PluginManifest, String, ProcessPhaseTimeouts), RefusedPlugin> {
     let manifest = chat_subscription_plugin::decode_strict_json::<PluginManifest>(bytes)
         .map_err(|error| refused(entry, "invalid_manifest", error.to_string()))?;
     if manifest.schema != MANIFEST_SCHEMA {
@@ -717,6 +780,8 @@ fn parse_manifest(bytes: &[u8], entry: &str) -> Result<(PluginManifest, String),
             ),
         ));
     }
+    let process_phase_timeouts =
+        validate_process_phase_timeouts(entry, manifest.process_phase_timeouts)?;
     let executable = direct_child_name(&manifest.executable).ok_or_else(|| {
         refused(
             entry,
@@ -724,7 +789,60 @@ fn parse_manifest(bytes: &[u8], entry: &str) -> Result<(PluginManifest, String),
             "manifest executable must be one direct-child filename",
         )
     })?;
-    Ok((manifest, executable))
+    Ok((manifest, executable, process_phase_timeouts))
+}
+
+fn validate_process_phase_timeouts(
+    entry: &str,
+    configured: ProcessPhaseTimeoutManifest,
+) -> Result<ProcessPhaseTimeouts, RefusedPlugin> {
+    for (name, value, maximum) in [
+        (
+            "hello_seconds",
+            configured.hello_seconds,
+            MAX_PLUGIN_HELLO_TIMEOUT_SECONDS,
+        ),
+        (
+            "start_seconds",
+            configured.start_seconds,
+            MAX_PLUGIN_START_TIMEOUT_SECONDS,
+        ),
+        (
+            "commit_seconds",
+            configured.commit_seconds,
+            MAX_PLUGIN_COMMIT_TIMEOUT_SECONDS,
+        ),
+        (
+            "close_seconds",
+            configured.close_seconds,
+            MAX_PLUGIN_CLOSE_TIMEOUT_SECONDS,
+        ),
+    ] {
+        if value == 0 || value > maximum {
+            return Err(refused(
+                entry,
+                "invalid_process_phase_timeouts",
+                format!("process_phase_timeouts.{name} must be between 1 and {maximum} seconds"),
+            ));
+        }
+    }
+    if configured.shutdown_grace_seconds > MAX_PLUGIN_SHUTDOWN_GRACE_SECONDS {
+        return Err(refused(
+            entry,
+            "invalid_process_phase_timeouts",
+            format!(
+                "process_phase_timeouts.shutdown_grace_seconds must be between 0 and {MAX_PLUGIN_SHUTDOWN_GRACE_SECONDS} seconds"
+            ),
+        ));
+    }
+    ProcessPhaseTimeouts::new(
+        Duration::from_secs(configured.hello_seconds),
+        Duration::from_secs(configured.start_seconds),
+        Duration::from_secs(configured.commit_seconds),
+        Duration::from_secs(configured.close_seconds),
+        Duration::from_secs(configured.shutdown_grace_seconds),
+    )
+    .map_err(|error| refused(entry, "invalid_process_phase_timeouts", error.to_string()))
 }
 
 fn direct_child_name(value: &str) -> Option<String> {
@@ -889,6 +1007,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn assert_process_phase_timeouts(actual: ProcessPhaseTimeouts, expected_seconds: [u64; 5]) {
+        assert_eq!(actual.hello(), Duration::from_secs(expected_seconds[0]));
+        assert_eq!(actual.start(), Duration::from_secs(expected_seconds[1]));
+        assert_eq!(actual.commit(), Duration::from_secs(expected_seconds[2]));
+        assert_eq!(actual.close(), Duration::from_secs(expected_seconds[3]));
+        assert_eq!(
+            actual.shutdown_grace(),
+            Duration::from_secs(expected_seconds[4])
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1062,6 +1191,116 @@ mod tests {
     }
 
     #[test]
+    fn legacy_manifest_keeps_exact_process_phase_timeout_defaults() {
+        let fixture = Fixture::new();
+        fixture.plugin("legacy-chat", "chat-subscription.legacy", "");
+        let inventory = discover_at(fixture.path.clone());
+        assert_eq!(inventory.refused, []);
+        assert_eq!(inventory.discovered.len(), 1);
+        assert_process_phase_timeouts(
+            inventory.discovered[0].process_phase_timeouts,
+            [10, 30, 30, 10, 2],
+        );
+        let pinned = inventory
+            .launch_command("legacy-chat")
+            .expect("pin legacy plugin");
+        assert_process_phase_timeouts(pinned.process_phase_timeouts(), [10, 30, 30, 10, 2]);
+    }
+
+    #[test]
+    fn bounded_manifest_phase_timeouts_propagate_to_pinned_launch_plan() {
+        let fixture = Fixture::new();
+        fixture.plugin(
+            "bounded-chat",
+            "chat-subscription.bounded",
+            ",\"process_phase_timeouts\":{\"hello_seconds\":20,\"start_seconds\":130,\"commit_seconds\":45,\"close_seconds\":57,\"shutdown_grace_seconds\":0}",
+        );
+        let inventory = discover_at(fixture.path.clone());
+        assert_eq!(inventory.refused, []);
+        assert_eq!(inventory.discovered.len(), 1);
+        assert_process_phase_timeouts(
+            inventory.discovered[0].process_phase_timeouts,
+            [20, 130, 45, 57, 0],
+        );
+        let pinned = inventory
+            .launch_command("bounded-chat")
+            .expect("pin bounded plugin");
+        assert_process_phase_timeouts(pinned.process_phase_timeouts(), [20, 130, 45, 57, 0]);
+    }
+
+    #[test]
+    fn manifest_process_phase_timeout_boundaries_are_accepted() {
+        let fixture = Fixture::new();
+        fixture.plugin(
+            "boundary-chat",
+            "chat-subscription.boundary",
+            ",\"process_phase_timeouts\":{\"hello_seconds\":30,\"start_seconds\":180,\"commit_seconds\":60,\"close_seconds\":120,\"shutdown_grace_seconds\":10}",
+        );
+        let inventory = discover_at(fixture.path.clone());
+        assert_eq!(inventory.refused, []);
+        assert_process_phase_timeouts(
+            inventory.discovered[0].process_phase_timeouts,
+            [30, 180, 60, 120, 10],
+        );
+    }
+
+    #[test]
+    fn manifest_process_phase_timeout_boundaries_are_refused_before_launch() {
+        let violations = [
+            ("zero-hello", "0,\"start_seconds\":30,\"commit_seconds\":30,\"close_seconds\":10,\"shutdown_grace_seconds\":2"),
+            ("large-hello", "31,\"start_seconds\":30,\"commit_seconds\":30,\"close_seconds\":10,\"shutdown_grace_seconds\":2"),
+            ("zero-start", "10,\"start_seconds\":0,\"commit_seconds\":30,\"close_seconds\":10,\"shutdown_grace_seconds\":2"),
+            ("large-start", "10,\"start_seconds\":181,\"commit_seconds\":30,\"close_seconds\":10,\"shutdown_grace_seconds\":2"),
+            ("zero-commit", "10,\"start_seconds\":30,\"commit_seconds\":0,\"close_seconds\":10,\"shutdown_grace_seconds\":2"),
+            ("large-commit", "10,\"start_seconds\":30,\"commit_seconds\":61,\"close_seconds\":10,\"shutdown_grace_seconds\":2"),
+            ("zero-close", "10,\"start_seconds\":30,\"commit_seconds\":30,\"close_seconds\":0,\"shutdown_grace_seconds\":2"),
+            ("large-close", "10,\"start_seconds\":30,\"commit_seconds\":30,\"close_seconds\":121,\"shutdown_grace_seconds\":2"),
+            ("large-grace", "10,\"start_seconds\":30,\"commit_seconds\":30,\"close_seconds\":10,\"shutdown_grace_seconds\":11"),
+        ];
+        for (name, fields) in violations {
+            let fixture = Fixture::new();
+            fixture.plugin(
+                name,
+                &format!("chat-subscription.{name}"),
+                &format!(",\"process_phase_timeouts\":{{\"hello_seconds\":{fields}}}"),
+            );
+            let inventory = discover_at(fixture.path.clone());
+            assert!(inventory.discovered.is_empty(), "{name} was discovered");
+            assert_eq!(inventory.refused.len(), 1, "{name} refusal count");
+            assert_eq!(
+                inventory.refused[0].code, "invalid_process_phase_timeouts",
+                "{name} refusal: {:?}",
+                inventory.refused[0]
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_process_phase_timeout_object_is_strict_and_complete() {
+        for (name, fields) in [
+            (
+                "missing-close",
+                "\"hello_seconds\":10,\"start_seconds\":30,\"commit_seconds\":30,\"shutdown_grace_seconds\":2",
+            ),
+            (
+                "unknown-unit",
+                "\"hello_seconds\":10,\"start_seconds\":30,\"commit_seconds\":30,\"close_seconds\":10,\"shutdown_grace_seconds\":2,\"close_millis\":10000",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.plugin(
+                name,
+                &format!("chat-subscription.{name}"),
+                &format!(",\"process_phase_timeouts\":{{{fields}}}"),
+            );
+            let inventory = discover_at(fixture.path.clone());
+            assert!(inventory.discovered.is_empty(), "{name} was discovered");
+            assert_eq!(inventory.refused.len(), 1, "{name} refusal count");
+            assert_eq!(inventory.refused[0].code, "invalid_manifest", "{name}");
+        }
+    }
+
+    #[test]
     fn operator_environment_is_added_after_a_cleared_baseline() {
         let secret = OsString::from("not-persisted-provider-secret");
         let mut command = Command::new("/bin/true");
@@ -1096,6 +1335,11 @@ mod tests {
         let executable = directory.try_clone().expect("fixture clone");
         let pinned = PinnedPluginCommand {
             command,
+            process_phase_timeouts: validate_process_phase_timeouts(
+                "fixture",
+                ProcessPhaseTimeoutManifest::default(),
+            )
+            .expect("default phase timeouts"),
             _directory: directory,
             _executable: executable,
         };
@@ -1364,6 +1608,29 @@ mod tests {
             .launch_command("changed-chat")
             .expect_err("launch must revalidate executable mode");
         assert_eq!(error.code, "unsafe_executable");
+    }
+
+    #[test]
+    fn launch_refuses_phase_timeout_change_after_discovery() {
+        let fixture = Fixture::new();
+        fixture.plugin("changed-chat", "chat-subscription.fixture.changed", "");
+        let inventory = discover_at(fixture.path.clone());
+        assert_eq!(inventory.discovered.len(), 1);
+        let manifest = fixture.path.join("plugins/changed-chat/manifest.json");
+        let text = fs::read_to_string(&manifest)
+            .expect("fixture manifest")
+            .replace(
+                "\"implementation\":\"implemented\"",
+                "\"implementation\":\"implemented\",\"process_phase_timeouts\":{\"hello_seconds\":20,\"start_seconds\":130,\"commit_seconds\":45,\"close_seconds\":57,\"shutdown_grace_seconds\":0}",
+            );
+        fs::write(&manifest, text).expect("rewrite phase timeout manifest");
+        fs::set_permissions(&manifest, Permissions::from_mode(0o600))
+            .expect("private phase timeout manifest");
+
+        let error = inventory
+            .launch_command("changed-chat")
+            .expect_err("phase timeout replacement after discovery must be refused");
+        assert_eq!(error.code, "plugin_identity_changed");
     }
 
     #[test]

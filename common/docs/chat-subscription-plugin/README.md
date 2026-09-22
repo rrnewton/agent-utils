@@ -192,17 +192,47 @@ With `resume_from:null`, the first batch must begin with Checkpoint or Gap so
 the current head is durable before message delivery. A non-null cursor is
 replayed inclusively; the durable host deduplicates by event identity.
 
-Close is cooperative. A plugin blocked inside provider `next_item` cannot read
-it, so Linux process hosts use `process::ProcessPluginChild::connect` with
-explicit `ProcessPhaseTimeouts`. The returned backend runs blocking pipe I/O on
-an owned worker. Hello, Start, Commit, and Close have separate deadlines;
-exceeding one kills the complete private process group, closes the remote pipe
-ends, joins the worker, and reaps the leader. An eventfd also wakes the worker's
-nonblocking host pipe adapters, so even a descendant retaining a pipe cannot
-strand the worker. `next_item` remains a genuinely blocking receive, while the
-clean backend and driver traits expose an independent cancellation handle that
-can interrupt blocked Start or receive work from another thread. If the caller's
-single absolute cleanup deadline expires, the same terminal timeout is cached.
+Close is cooperative and remains reachable while provider `next_item` blocks
+when a plugin opts into `serve_interruptible`. That API owns a dedicated,
+independently cancellable framed-input reader: a Close received during a blocked
+receive invokes the backend's terminal, sticky cancellation authority, then the
+main server path calls ordinary `subscription.close()`. Close received during a
+Commit is queued until that Commit finishes and is consumed before another
+receive starts. Natural End cancels and joins the reader actor even if the host
+keeps its write half open. The original generic `serve<R: Read, W: Write>` API
+remains sequential and accepts readers that are neither cancellable nor Send;
+it has no background reader to strand, but can observe Close only when it is
+already reading a protocol control frame. Linux `serve_stdio` uses the
+interruptible path; non-Linux `serve_stdio` retains the generic sequential path.
+The host side uses a separately accessible, frame-serialized writer only while
+its worker is provably blocked reading the next provider frame. Success for
+that path requires the complete Close write, EOF observed by that exact
+post-Close read, and status zero from the exact pidfd-owned child; natural End,
+unsolicited EOF, or nonzero exit cannot be relabelled as graceful cancellation.
+
+Linux process hosts use `process::ProcessPluginChild::connect` with explicit
+`ProcessPhaseTimeouts`. The returned backend runs blocking pipe I/O on an owned
+worker. Hello, Start, Commit, and Close have separate deadlines; exceeding one
+kills the complete private process group, closes the remote pipe ends, joins the
+worker, and reaps the leader. An eventfd wakes forced-cleanup I/O, so even a
+descendant retaining a pipe cannot strand the worker. If the caller's single
+absolute cleanup deadline expires, the same terminal timeout is cached.
+The supervising chat host publishes its selected Hello-inclusive join budget
+before `connect` can block, then installs the cancellation authority before
+Start. Consequently a stop during Hello retains `Hello + Close + grace + 7`
+seconds, while a connected generation retains `Close + grace + 7`; Start is
+interruptible rather than additive. The final seven seconds comprise the
+process supervisor's two-second forced-reap bound and five seconds for host
+reconciliation and worker joins. An admitted outbound operation separately
+retains its configured operation timeout, configured shutdown grace, and the
+same seven-second reap/join margin. The service hard bound is the maximum of
+the applicable provider window and that outbound window, plus service-manager
+scheduling margin. At startup the host pins the complete selected provider
+timeout tuple and refuses a later generation whose manifest differs until the
+service restarts; the outer bound cannot silently expand. At the accepted
+provider maxima the windows are 167 and 137 seconds, while the accepted
+outbound maximum is 67 seconds, so a fixed 75-second bound is not generally
+valid.
 Before any supervisor is cloned, the host reserves one of 32 global cleanup
 admissions. That admission follows the live child into a tracked cleanup thread
 until the process is reaped and the protocol worker is joined. A stuck cleanup
@@ -225,9 +255,10 @@ cleanup and supervision mechanism, not a security-containment boundary: a
 malicious plugin can call `setsid` and escape process-group signalling. Hosts
 that run untrusted plugins must add an appropriate sandbox or cgroup boundary.
 
-Normal shutdown sends Close, waits for the configured cooperative grace, kills
-the process group before reaping the leader, and then waits through a fixed
-two-second post-kill bound. Linux pidfds and `ppoll` provide event-driven exit
+Normal shutdown gives semantic Close its configured deadline, then waits the
+configured cooperative process-exit grace, kills the process group before
+reaping the leader, and finally waits through a fixed two-second post-kill
+bound. Linux pidfds and `ppoll` provide event-driven exit
 notification without periodic wakeups. `clone3(CLONE_PIDFD)` atomically creates
 a minimal supervisor that becomes and remains the private process-group leader;
 the ordinary plugin process joins that group. Because this raw supervisor never

@@ -2,8 +2,9 @@
 //!
 //! The domain traits remain synchronous and process-agnostic. This module owns the child, pipes,
 //! protocol worker, control-phase deadlines, independent cancellation handle, process group, and
-//! leader reaping. `next_item` is deliberately allowed to block until an event; cancellation can
-//! still interrupt it from another thread by terminating the private process group.
+//! leader reaping. `next_item` is deliberately allowed to block until an event. Cancellation first
+//! serializes semantic Close beside that read and requires post-Close EOF plus exact status zero;
+//! only a bounded failure falls back to process-group termination.
 //!
 //! Plugins are trusted same-user code. A private process group is a cleanup and supervision
 //! boundary, not a security containment boundary: a plugin can deliberately escape it with
@@ -12,7 +13,7 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write as _};
 use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -28,7 +29,7 @@ use chat_subscription::{
     SubscriptionItem,
 };
 
-use crate::{PluginBackend, PluginError};
+use crate::{ClientFrame, PluginBackend, PluginError};
 
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const EXEC_READY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1794,6 +1795,15 @@ impl CancellationSignal {
     }
 
     fn wait_io(&self, descriptor: i32, events: i16) -> io::Result<()> {
+        self.wait_io_until(descriptor, events, None)
+    }
+
+    fn wait_io_until(
+        &self,
+        descriptor: i32,
+        events: i16,
+        deadline: Option<Instant>,
+    ) -> io::Result<()> {
         if self.cancelled.load(Ordering::SeqCst) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -1813,9 +1823,23 @@ impl CancellationSignal {
             },
         ];
         loop {
+            let timeout = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "plugin process I/O exceeded its deadline",
+                        ));
+                    }
+                    i32::try_from(remaining.as_millis().max(1).min(i32::MAX as u128))
+                        .expect("bounded poll timeout fits i32")
+                }
+                None => -1,
+            };
             // SAFETY: descriptors is an initialized two-element pollfd array that remains live for
             // the call. A timeout of -1 blocks until pipe progress or explicit cancellation.
-            let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+            let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
             if result > 0 {
                 if descriptors[1].revents != 0 || self.cancelled.load(Ordering::SeqCst) {
                     return Err(io::Error::new(
@@ -1828,6 +1852,12 @@ impl CancellationSignal {
                 }
                 continue;
             }
+            if result == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "plugin process I/O exceeded its deadline",
+                ));
+            }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error);
@@ -1839,6 +1869,7 @@ impl CancellationSignal {
 struct CancellableReader {
     reader: File,
     cancellation: Arc<CancellationSignal>,
+    activity: Arc<ProtocolActivity>,
 }
 
 impl io::Read for CancellableReader {
@@ -1849,32 +1880,303 @@ impl io::Read for CancellableReader {
                     .cancellation
                     .wait_io(self.reader.as_raw_fd(), libc::POLLIN)?,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                result => return result,
+                result => {
+                    if matches!(result, Ok(0)) {
+                        self.activity.transport_eof();
+                    }
+                    return result;
+                }
             }
         }
     }
 }
 
 struct CancellableWriter {
-    writer: File,
+    writer: Arc<Mutex<File>>,
     cancellation: Arc<CancellationSignal>,
+    deadline: Option<Instant>,
+}
+
+impl CancellableWriter {
+    fn lock_writer(&self) -> io::Result<MutexGuard<'_, File>> {
+        match self.deadline {
+            None => Ok(self
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)),
+            Some(deadline) => loop {
+                match self.writer.try_lock() {
+                    Ok(writer) => return Ok(writer),
+                    Err(std::sync::TryLockError::Poisoned(error)) => {
+                        return Ok(error.into_inner());
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        if Instant::now() >= deadline {
+                            self.cancellation.cancel();
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "plugin Close could not acquire the frame writer before its deadline",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            },
+        }
+    }
+
+    fn write_locked(&self, writer: &mut File, bytes: &[u8]) -> io::Result<()> {
+        let mut written = 0_usize;
+        while written < bytes.len() {
+            match writer.write(&bytes[written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "plugin process pipe accepted no frame bytes",
+                    ));
+                }
+                Ok(count) => written = written.saturating_add(count),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => self
+                    .cancellation
+                    .wait_io_until(writer.as_raw_fd(), libc::POLLOUT, self.deadline)?,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Write and flush one complete frame while retaining the same deadline-aware reservation.
+    fn write_frame(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut writer = self.lock_writer()?;
+        self.write_locked(&mut writer, bytes)?;
+        writer.flush()
+    }
 }
 
 impl io::Write for CancellableWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        loop {
-            match self.writer.write(bytes) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => self
-                    .cancellation
-                    .wait_io(self.writer.as_raw_fd(), libc::POLLOUT)?,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                result => return result,
+        let mut writer = self.lock_writer()?;
+        self.write_locked(&mut writer, bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtocolWorkerPhase {
+    Control,
+    Idle,
+    Next,
+    NextResultReady,
+    CloseWriting,
+    CloseWritingEof,
+    CloseSent,
+    CloseFailed,
+    CloseEof,
+    CloseOther,
+    Stopped,
+}
+
+struct ProtocolActivity {
+    phase: Mutex<ProtocolWorkerPhase>,
+    changed: Condvar,
+}
+
+impl ProtocolActivity {
+    fn new() -> Self {
+        Self {
+            phase: Mutex::new(ProtocolWorkerPhase::Control),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn set(&self, phase: ProtocolWorkerPhase) {
+        *self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = phase;
+        self.changed.notify_all();
+    }
+
+    fn get(&self) -> ProtocolWorkerPhase {
+        *self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn claim_next_for_close(&self) -> bool {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *phase != ProtocolWorkerPhase::Next {
+            return false;
+        }
+        *phase = ProtocolWorkerPhase::CloseWriting;
+        self.changed.notify_all();
+        true
+    }
+
+    fn transport_eof(&self) {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *phase = match *phase {
+            ProtocolWorkerPhase::Next => ProtocolWorkerPhase::NextResultReady,
+            ProtocolWorkerPhase::CloseWriting => ProtocolWorkerPhase::CloseWritingEof,
+            ProtocolWorkerPhase::CloseSent => ProtocolWorkerPhase::CloseEof,
+            other => other,
+        };
+        self.changed.notify_all();
+    }
+
+    fn finish_close_write(&self, success: bool) {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *phase = match (*phase, success) {
+            (ProtocolWorkerPhase::CloseWriting, true) => ProtocolWorkerPhase::CloseSent,
+            (ProtocolWorkerPhase::CloseWritingEof, true) => ProtocolWorkerPhase::CloseEof,
+            (ProtocolWorkerPhase::CloseWriting, false)
+            | (ProtocolWorkerPhase::CloseWritingEof, false) => ProtocolWorkerPhase::CloseFailed,
+            (other, _) => other,
+        };
+        self.changed.notify_all();
+    }
+
+    fn finish_next(&self, observed_eof: bool) -> bool {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while matches!(
+            *phase,
+            ProtocolWorkerPhase::CloseWriting | ProtocolWorkerPhase::CloseWritingEof
+        ) {
+            phase = self
+                .changed
+                .wait(phase)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        match *phase {
+            ProtocolWorkerPhase::CloseSent => {
+                *phase = if observed_eof {
+                    ProtocolWorkerPhase::CloseEof
+                } else {
+                    ProtocolWorkerPhase::CloseOther
+                };
+                self.changed.notify_all();
+                true
+            }
+            ProtocolWorkerPhase::CloseEof => {
+                if !observed_eof {
+                    *phase = ProtocolWorkerPhase::CloseOther;
+                    self.changed.notify_all();
+                }
+                true
+            }
+            ProtocolWorkerPhase::CloseFailed => false,
+            ProtocolWorkerPhase::Next | ProtocolWorkerPhase::NextResultReady => {
+                *phase = ProtocolWorkerPhase::NextResultReady;
+                self.changed.notify_all();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn wait_until_changed(&self, observed: ProtocolWorkerPhase, deadline: Instant) {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *phase == observed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let waited = self.changed.wait_timeout(phase, remaining);
+            let (next, timed) = waited.unwrap_or_else(std::sync::PoisonError::into_inner);
+            phase = next;
+            if timed.timed_out() {
+                return;
             }
         }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+    fn stop(&self) {
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(
+            *phase,
+            ProtocolWorkerPhase::CloseEof | ProtocolWorkerPhase::CloseOther
+        ) {
+            *phase = ProtocolWorkerPhase::Stopped;
+        }
+        self.changed.notify_all();
+    }
+}
+
+struct ClosePort {
+    writer: Mutex<Option<CancellableWriter>>,
+}
+
+impl ClosePort {
+    fn new(writer: CancellableWriter) -> Self {
+        Self {
+            writer: Mutex::new(Some(writer)),
+        }
+    }
+
+    fn send(&self, deadline: Instant) -> io::Result<()> {
+        let mut slot = loop {
+            match self.writer.try_lock() {
+                Ok(writer) => break writer,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "plugin Close port remained busy through its deadline",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        let mut writer = slot
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "Close port is stopped"))?;
+        drop(slot);
+        writer.deadline = Some(deadline);
+        let payload = serde_json::to_vec(&ClientFrame::Close)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let length = u32::try_from(payload.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Close frame length exceeds u32")
+        })?;
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        writer.write_frame(&frame)
+    }
+
+    fn stop(&self) {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -2032,21 +2334,37 @@ impl ProcessPluginChild {
         set_nonblocking(writer.as_raw_fd()).map_err(|error| ProcessPluginError::io(&error))?;
         let cancellation =
             Arc::new(CancellationSignal::new().map_err(|error| ProcessPluginError::io(&error))?);
+        let activity = Arc::new(ProtocolActivity::new());
         let reader = CancellableReader {
             reader,
             cancellation: Arc::clone(&cancellation),
+            activity: Arc::clone(&activity),
         };
+        let shared_writer = Arc::new(Mutex::new(writer));
         let writer = CancellableWriter {
-            writer,
+            writer: Arc::clone(&shared_writer),
             cancellation: Arc::clone(&cancellation),
+            deadline: None,
         };
+        let close_port = ClosePort::new(CancellableWriter {
+            writer: shared_writer,
+            cancellation: Arc::clone(&cancellation),
+            deadline: None,
+        });
+        let worker_activity = Arc::clone(&activity);
         let (commands, command_receiver) = mpsc::channel();
         let (hello_sender, hello_receiver) = mpsc::channel();
         let (worker_done_sender, worker_done_receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(format!("chat-plugin-{process_id}"))
             .spawn(move || {
-                protocol_worker(reader, writer, command_receiver, hello_sender);
+                protocol_worker(
+                    reader,
+                    writer,
+                    command_receiver,
+                    hello_sender,
+                    worker_activity,
+                );
                 let _ = worker_done_sender.send(());
             })
             .map_err(|error| ProcessPluginError::io(&error))?;
@@ -2056,6 +2374,8 @@ impl ProcessPluginChild {
             worker_done_receiver,
             commands,
             cancellation,
+            close_port,
+            activity,
         ));
         let capabilities = match hello_receiver.recv_timeout(timeouts.hello()) {
             Ok(Ok(capabilities)) => capabilities,
@@ -2079,7 +2399,7 @@ impl ProcessPluginChild {
         let runtime = ProcessRuntime {
             core: Arc::clone(&core),
         };
-        let cancellation = ProcessPluginCancellation { core };
+        let cancellation = ProcessPluginCancellation { core, timeouts };
         Ok((
             ProcessPluginBackend {
                 capabilities,
@@ -2483,7 +2803,17 @@ fn protocol_worker(
     writer: CancellableWriter,
     commands: mpsc::Receiver<WorkerCommand>,
     hello: mpsc::Sender<Result<BackendCapabilities, PluginError>>,
+    activity: Arc<ProtocolActivity>,
 ) {
+    struct StopActivity(Arc<ProtocolActivity>);
+
+    impl Drop for StopActivity {
+        fn drop(&mut self) {
+            self.0.stop();
+        }
+    }
+
+    let _stop_activity = StopActivity(Arc::clone(&activity));
     let mut backend = match PluginBackend::connect(reader, writer) {
         Ok(backend) => backend,
         Err(error) => {
@@ -2494,21 +2824,35 @@ fn protocol_worker(
     if hello.send(Ok(backend.capabilities())).is_err() {
         return;
     }
+    activity.set(ProtocolWorkerPhase::Idle);
     let mut driver = match commands.recv() {
-        Ok(WorkerCommand::Subscribe(request, response)) => match backend.subscribe(&request) {
-            Ok(driver) => {
-                if response.send(Ok(())).is_err() {
+        Ok(WorkerCommand::Subscribe(request, response)) => {
+            activity.set(ProtocolWorkerPhase::Control);
+            match backend.subscribe(&request) {
+                Ok(driver) => {
+                    if response.send(Ok(())).is_err() {
+                        return;
+                    }
+                    activity.set(ProtocolWorkerPhase::Idle);
+                    driver
+                }
+                Err(error) => {
+                    let _ = response.send(Err(error));
                     return;
                 }
-                driver
             }
-            Err(error) => {
-                let _ = response.send(Err(error));
-                return;
-            }
-        },
+        }
         Ok(WorkerCommand::CloseBackend(response)) => {
+            activity.set(ProtocolWorkerPhase::Control);
             let _ = response.send(backend.close());
+            return;
+        }
+        Ok(WorkerCommand::CloseDriver(response)) => {
+            activity.set(ProtocolWorkerPhase::Control);
+            let result = backend
+                .close()
+                .map_err(|error| backend_failure(error.code(), error.detail().to_owned(), false));
+            let _ = response.send(result);
             return;
         }
         Ok(_) | Err(_) => return,
@@ -2516,22 +2860,39 @@ fn protocol_worker(
     loop {
         match commands.recv() {
             Ok(WorkerCommand::Next(response)) => {
-                let result = driver.next_item();
-                let terminal = !matches!(result, Ok(Some(_)));
+                activity.set(ProtocolWorkerPhase::Next);
+                let mut result = driver.next_item();
+                let observed_eof = matches!(
+                    &result,
+                    Err(error) if error.code() == "unexpected_eof"
+                );
+                let close_in_flight = activity.finish_next(observed_eof);
+                if close_in_flight && observed_eof {
+                    result = Err(backend_failure(
+                        "plugin_receive_cancelled",
+                        "plugin stdout reached EOF after the host wrote Close",
+                        true,
+                    ));
+                }
+                let terminal = close_in_flight || !matches!(result, Ok(Some(_)));
                 let _ = response.send(result);
                 if terminal {
                     return;
                 }
+                activity.set(ProtocolWorkerPhase::Idle);
             }
             Ok(WorkerCommand::Acknowledge(delivery_id, response)) => {
+                activity.set(ProtocolWorkerPhase::Control);
                 let result = driver.acknowledge(&delivery_id);
                 let terminal = result.is_err();
                 let _ = response.send(result);
                 if terminal {
                     return;
                 }
+                activity.set(ProtocolWorkerPhase::Idle);
             }
             Ok(WorkerCommand::CloseDriver(response)) => {
+                activity.set(ProtocolWorkerPhase::Control);
                 let _ = response.send(driver.close());
                 return;
             }
@@ -2571,8 +2932,20 @@ impl StoredShutdown {
 
 enum ShutdownState {
     Running(ShutdownResources),
-    Stopping { deadline: Instant, timed_out: bool },
-    Done(StoredShutdown),
+    Graceful {
+        resources: ShutdownResources,
+        cooperative_deadline: Instant,
+        final_deadline: Instant,
+    },
+    Stopping {
+        deadline: Instant,
+        timed_out: bool,
+        graceful: bool,
+    },
+    Done {
+        result: StoredShutdown,
+        graceful: bool,
+    },
 }
 
 struct ShutdownCoordinator {
@@ -2608,6 +2981,21 @@ impl CommandPort {
         sender.send(command).map_err(|error| error.0)
     }
 
+    fn dispatch_terminal_with_hook(
+        &self,
+        command: WorkerCommand,
+        before_send: impl FnOnce(),
+    ) -> Result<(), WorkerCommand> {
+        let mut sender = ProcessCore::lock(&self.sender);
+        let Some(active) = sender.as_ref() else {
+            return Err(command);
+        };
+        before_send();
+        let result = active.send(command).map_err(|error| error.0);
+        sender.take();
+        result
+    }
+
     fn stop(&self) {
         self.stop_with_hook(|| {});
     }
@@ -2622,6 +3010,8 @@ struct ProcessCore {
     process_id: u32,
     commands: CommandPort,
     cancellation: Arc<CancellationSignal>,
+    close_port: ClosePort,
+    activity: Arc<ProtocolActivity>,
     shutdown: Arc<ShutdownCoordinator>,
 }
 
@@ -2632,11 +3022,15 @@ impl ProcessCore {
         worker_done: mpsc::Receiver<()>,
         commands: mpsc::Sender<WorkerCommand>,
         cancellation: Arc<CancellationSignal>,
+        close_port: ClosePort,
+        activity: Arc<ProtocolActivity>,
     ) -> Self {
         Self {
             process_id: child.id(),
             commands: CommandPort::new(commands),
             cancellation,
+            close_port,
+            activity,
             shutdown: Arc::new(ShutdownCoordinator {
                 state: Mutex::new(ShutdownState::Running(ShutdownResources {
                     child,
@@ -2658,14 +3052,159 @@ impl ProcessCore {
         self.commands.dispatch(command)
     }
 
+    fn graceful_finish(
+        &self,
+        close_timeout: Duration,
+        shutdown_grace: Duration,
+    ) -> io::Result<ExitStatus> {
+        self.graceful_finish_with_hook(close_timeout, shutdown_grace, || {})
+    }
+
+    fn graceful_finish_with_hook(
+        &self,
+        close_timeout: Duration,
+        shutdown_grace: Duration,
+        after_admit: impl FnOnce(),
+    ) -> io::Result<ExitStatus> {
+        let started = Instant::now();
+        let close_deadline = started.checked_add(close_timeout).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plugin Close deadline is too large",
+            )
+        })?;
+        let cooperative_deadline = close_deadline.checked_add(shutdown_grace).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plugin graceful shutdown deadline is too large",
+            )
+        })?;
+        let final_deadline = cooperative_deadline
+            .checked_add(KILL_REAP_TIMEOUT)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "plugin final shutdown deadline is too large",
+                )
+            })?;
+
+        let owner = {
+            let mut state = Self::lock(&self.shutdown.state);
+            match &*state {
+                ShutdownState::Running(_) => {
+                    let ShutdownState::Running(resources) = std::mem::replace(
+                        &mut *state,
+                        ShutdownState::Stopping {
+                            deadline: final_deadline,
+                            timed_out: false,
+                            graceful: true,
+                        },
+                    ) else {
+                        unreachable!("running shutdown state was just matched")
+                    };
+                    *state = ShutdownState::Graceful {
+                        resources,
+                        cooperative_deadline,
+                        final_deadline,
+                    };
+                    self.shutdown.complete.notify_all();
+                    true
+                }
+                ShutdownState::Graceful { .. } | ShutdownState::Stopping { .. } => false,
+                ShutdownState::Done { result, .. } => return result.result(),
+            }
+        };
+        if !owner {
+            return self.finish(Duration::ZERO);
+        }
+        after_admit();
+
+        let (response, receiver) = mpsc::channel();
+        if self
+            .commands
+            .dispatch_terminal_with_hook(WorkerCommand::CloseDriver(response), || {})
+            .is_err()
+        {
+            return self.finish_graceful_transaction(CleanupRequirement::Failure(
+                io::ErrorKind::BrokenPipe,
+                "plugin worker stopped before graceful Close admission".to_owned(),
+            ));
+        }
+
+        loop {
+            let observed_phase = self.activity.get();
+            if self.activity.claim_next_for_close() {
+                let close_result = self.close_port.send(close_deadline);
+                self.activity.finish_close_write(close_result.is_ok());
+                if let Err(error) = close_result {
+                    return self.finish_graceful_transaction(CleanupRequirement::Failure(
+                        error.kind(),
+                        format!("cannot write Close during blocked receive: {error}"),
+                    ));
+                }
+                return self.finish_graceful_transaction(CleanupRequirement::GracefulDirect(
+                    Arc::clone(&self.activity),
+                ));
+            }
+
+            match receiver.try_recv() {
+                Ok(Ok(())) => {
+                    return self.finish_graceful_transaction(CleanupRequirement::GracefulQueued);
+                }
+                Ok(Err(error)) => {
+                    return self.finish_graceful_transaction(CleanupRequirement::Failure(
+                        io::ErrorKind::BrokenPipe,
+                        format!("plugin Close failed: {error}"),
+                    ));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return self.finish_graceful_transaction(CleanupRequirement::Failure(
+                        io::ErrorKind::BrokenPipe,
+                        "plugin worker stopped without confirming graceful Close".to_owned(),
+                    ));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+
+            let remaining = close_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.finish_graceful_transaction(CleanupRequirement::Failure(
+                    io::ErrorKind::TimedOut,
+                    format!("plugin Close exceeded {close_timeout:?}"),
+                ));
+            }
+            self.activity
+                .wait_until_changed(observed_phase, close_deadline);
+        }
+    }
+
     fn finish(&self, grace: Duration) -> io::Result<ExitStatus> {
         self.finish_with_reap_timeout_and_hook(grace, KILL_REAP_TIMEOUT, || {})
+    }
+
+    fn graceful_finish_admitted(&self) -> bool {
+        matches!(
+            &*Self::lock(&self.shutdown.state),
+            ShutdownState::Graceful { .. }
+                | ShutdownState::Stopping { graceful: true, .. }
+                | ShutdownState::Done { graceful: true, .. }
+        )
     }
 
     fn finish_with_reap_timeout_and_hook(
         &self,
         grace: Duration,
         reap_timeout: Duration,
+        after_start: impl FnOnce(),
+    ) -> io::Result<ExitStatus> {
+        self.finish_with_mode(grace, reap_timeout, true, after_start)
+    }
+
+    fn finish_with_mode(
+        &self,
+        grace: Duration,
+        reap_timeout: Duration,
+        interrupt_protocol_io: bool,
         after_start: impl FnOnce(),
     ) -> io::Result<ExitStatus> {
         let started = Instant::now();
@@ -2684,16 +3223,15 @@ impl ProcessCore {
                         "plugin shutdown deadline is too large",
                     )
                 })?;
-        self.commands.stop();
-        self.cancellation.cancel();
-        let mut resources = {
+        let (resources, cooperative_deadline, requirement, interrupt) = {
             let mut state = Self::lock(&self.shutdown.state);
             loop {
                 match &mut *state {
-                    ShutdownState::Done(result) => return result.result(),
+                    ShutdownState::Done { result, .. } => return result.result(),
                     ShutdownState::Stopping {
                         deadline,
                         timed_out,
+                        ..
                     } => {
                         if *timed_out {
                             return shutdown_deadline_error();
@@ -2714,21 +3252,141 @@ impl ProcessCore {
                             }
                         }
                     }
+                    ShutdownState::Graceful {
+                        cooperative_deadline,
+                        final_deadline,
+                        ..
+                    } => {
+                        let fallback_at = *cooperative_deadline;
+                        let final_at = *final_deadline;
+                        let remaining = fallback_at.saturating_duration_since(Instant::now());
+                        if !remaining.is_zero() {
+                            let waited = self.shutdown.complete.wait_timeout(state, remaining);
+                            state = waited.unwrap_or_else(std::sync::PoisonError::into_inner).0;
+                            continue;
+                        }
+                        let ShutdownState::Graceful { resources, .. } = std::mem::replace(
+                            &mut *state,
+                            ShutdownState::Stopping {
+                                deadline: final_at,
+                                timed_out: false,
+                                graceful: true,
+                            },
+                        ) else {
+                            unreachable!("graceful shutdown state was just matched")
+                        };
+                        break (
+                            resources,
+                            Instant::now(),
+                            CleanupRequirement::Failure(
+                                io::ErrorKind::TimedOut,
+                                "plugin graceful Close exceeded its shared absolute deadline"
+                                    .to_owned(),
+                            ),
+                            true,
+                        );
+                    }
                     ShutdownState::Running(_) => {
                         let ShutdownState::Running(resources) = std::mem::replace(
                             &mut *state,
                             ShutdownState::Stopping {
                                 deadline: requested_deadline,
                                 timed_out: false,
+                                graceful: false,
                             },
                         ) else {
                             unreachable!("running state was just matched")
                         };
-                        break resources;
+                        break (
+                            resources,
+                            cooperative_deadline,
+                            CleanupRequirement::Raw,
+                            interrupt_protocol_io,
+                        );
                     }
                 }
             }
         };
+        self.finish_owned(
+            resources,
+            cooperative_deadline,
+            requirement,
+            interrupt,
+            after_start,
+        )
+    }
+
+    fn finish_graceful_transaction(
+        &self,
+        requirement: CleanupRequirement,
+    ) -> io::Result<ExitStatus> {
+        let (resources, cooperative_deadline) = {
+            let mut state = Self::lock(&self.shutdown.state);
+            loop {
+                match &mut *state {
+                    ShutdownState::Done { result, .. } => return result.result(),
+                    ShutdownState::Stopping {
+                        deadline,
+                        timed_out,
+                        ..
+                    } => {
+                        if *timed_out {
+                            return shutdown_deadline_error();
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            *timed_out = true;
+                            return shutdown_deadline_error();
+                        }
+                        let waited = self.shutdown.complete.wait_timeout(state, remaining);
+                        state = waited.unwrap_or_else(std::sync::PoisonError::into_inner).0;
+                    }
+                    ShutdownState::Graceful {
+                        cooperative_deadline,
+                        final_deadline,
+                        ..
+                    } => {
+                        let cooperative = if matches!(requirement, CleanupRequirement::Failure(..))
+                        {
+                            Instant::now()
+                        } else {
+                            *cooperative_deadline
+                        };
+                        let final_at = *final_deadline;
+                        let ShutdownState::Graceful { resources, .. } = std::mem::replace(
+                            &mut *state,
+                            ShutdownState::Stopping {
+                                deadline: final_at,
+                                timed_out: false,
+                                graceful: true,
+                            },
+                        ) else {
+                            unreachable!("graceful shutdown state was just matched")
+                        };
+                        break (resources, cooperative);
+                    }
+                    ShutdownState::Running(_) => {
+                        unreachable!("graceful completion requires an admitted transaction")
+                    }
+                }
+            }
+        };
+        self.finish_owned(resources, cooperative_deadline, requirement, false, || {})
+    }
+
+    fn finish_owned(
+        &self,
+        mut resources: ShutdownResources,
+        cooperative_deadline: Instant,
+        requirement: CleanupRequirement,
+        interrupt_protocol_io: bool,
+        after_start: impl FnOnce(),
+    ) -> io::Result<ExitStatus> {
+        self.commands.stop();
+        self.close_port.stop();
+        if interrupt_protocol_io {
+            self.cancellation.cancel();
+        }
         after_start();
         let shutdown = Arc::clone(&self.shutdown);
         let cleanup_permit = resources
@@ -2738,12 +3396,13 @@ impl ProcessCore {
             .expect("a running plugin child owns one cleanup admission");
         let registry = cleanup_permit.registry();
         let cleanup_task = Box::new(move || {
-            let result = cleanup_resources(resources, cooperative_deadline);
+            let result = cleanup_resources(resources, cooperative_deadline, requirement);
             let mut state = ProcessCore::lock(&shutdown.state);
-            if matches!(&*state, ShutdownState::Done(_)) {
+            if matches!(&*state, ShutdownState::Done { .. }) {
                 shutdown.complete.notify_all();
                 return;
             }
+            let graceful = matches!(&*state, ShutdownState::Stopping { graceful: true, .. });
             let result = if matches!(
                 &*state,
                 ShutdownState::Stopping {
@@ -2758,7 +3417,7 @@ impl ProcessCore {
             } else {
                 result
             };
-            *state = ShutdownState::Done(result);
+            *state = ShutdownState::Done { result, graceful };
             shutdown.complete.notify_all();
         });
         if let Err(error) = registry.submit(cleanup_task, cleanup_permit) {
@@ -2770,7 +3429,8 @@ impl ProcessCore {
             );
             let returned = result.result();
             let mut state = Self::lock(&self.shutdown.state);
-            *state = ShutdownState::Done(result);
+            let graceful = matches!(&*state, ShutdownState::Stopping { graceful: true, .. });
+            *state = ShutdownState::Done { result, graceful };
             self.shutdown.complete.notify_all();
             return returned;
         }
@@ -2778,10 +3438,11 @@ impl ProcessCore {
         let mut state = Self::lock(&self.shutdown.state);
         loop {
             match &mut *state {
-                ShutdownState::Done(result) => return result.result(),
+                ShutdownState::Done { result, .. } => return result.result(),
                 ShutdownState::Stopping {
                     deadline,
                     timed_out,
+                    ..
                 } => {
                     if *timed_out {
                         return shutdown_deadline_error();
@@ -2805,6 +3466,9 @@ impl ProcessCore {
                 ShutdownState::Running(_) => {
                     unreachable!("cleanup resources were transferred before waiting")
                 }
+                ShutdownState::Graceful { .. } => {
+                    unreachable!("graceful resources were transferred before waiting")
+                }
             }
         }
     }
@@ -2817,9 +3481,17 @@ fn shutdown_deadline_error() -> io::Result<ExitStatus> {
     ))
 }
 
+enum CleanupRequirement {
+    Raw,
+    GracefulQueued,
+    GracefulDirect(Arc<ProtocolActivity>),
+    Failure(io::ErrorKind, String),
+}
+
 fn cleanup_resources(
     resources: ShutdownResources,
     cooperative_deadline: Instant,
+    requirement: CleanupRequirement,
 ) -> StoredShutdown {
     let ShutdownResources {
         mut child,
@@ -2831,10 +3503,55 @@ fn cleanup_resources(
     let worker_result = worker
         .join()
         .map_err(|_| io::Error::other("plugin protocol worker panicked"));
-    match (child_result, worker_result) {
+    let cleanup = match (child_result, worker_result) {
         (Err(error), _) => StoredShutdown::Failure(error.kind(), error.to_string()),
         (Ok(_), Err(error)) => StoredShutdown::Failure(error.kind(), error.to_string()),
         (Ok(status), Ok(())) => StoredShutdown::Success(status),
+    };
+    match (cleanup, requirement) {
+        (StoredShutdown::Failure(kind, cleanup), CleanupRequirement::Failure(_, protocol)) => {
+            StoredShutdown::Failure(
+                kind,
+                format!("{protocol}; process cleanup also failed: {cleanup}"),
+            )
+        }
+        (failure @ StoredShutdown::Failure(..), _) => failure,
+        (StoredShutdown::Success(status), CleanupRequirement::Raw) => {
+            StoredShutdown::Success(status)
+        }
+        (StoredShutdown::Success(status), CleanupRequirement::Failure(kind, detail)) => {
+            let detail = if status.success() {
+                detail
+            } else {
+                format!("{detail}; forced cleanup exited with {status}")
+            };
+            StoredShutdown::Failure(kind, detail)
+        }
+        (StoredShutdown::Success(status), CleanupRequirement::GracefulQueued) => {
+            if status.success() {
+                StoredShutdown::Success(status)
+            } else {
+                StoredShutdown::Failure(
+                    io::ErrorKind::Other,
+                    format!("plugin required forced shutdown after Close and exited with {status}"),
+                )
+            }
+        }
+        (StoredShutdown::Success(status), CleanupRequirement::GracefulDirect(activity)) => {
+            if !status.success() {
+                StoredShutdown::Failure(
+                    io::ErrorKind::Other,
+                    format!("plugin required forced shutdown after Close and exited with {status}"),
+                )
+            } else if activity.get() != ProtocolWorkerPhase::CloseEof {
+                StoredShutdown::Failure(
+                    io::ErrorKind::InvalidData,
+                    "plugin exited without the blocked receive observing post-Close EOF".to_owned(),
+                )
+            } else {
+                StoredShutdown::Success(status)
+            }
+        }
     }
 }
 
@@ -2856,9 +3573,22 @@ impl ProcessRuntime {
             .is_err()
         {
             let cleanup = self.core.finish(Duration::ZERO);
+            let graceful = self.core.graceful_finish_admitted();
             return Err(backend_failure(
-                "plugin_worker_stopped",
-                cleanup_detail("plugin worker stopped before Start".to_owned(), cleanup),
+                if graceful {
+                    "plugin_start_cancelled"
+                } else {
+                    "plugin_worker_stopped"
+                },
+                cleanup_detail(
+                    if graceful {
+                        "plugin graceful Close retired the generation before Start admission"
+                            .to_owned()
+                    } else {
+                        "plugin worker stopped before Start".to_owned()
+                    },
+                    cleanup,
+                ),
                 true,
             ));
         }
@@ -2895,10 +3625,19 @@ impl ProcessRuntime {
         let (response, receiver) = mpsc::channel();
         if self.core.dispatch(WorkerCommand::Next(response)).is_err() {
             let cleanup = self.core.finish(Duration::ZERO);
+            let graceful = self.core.graceful_finish_admitted();
             return Err(backend_failure(
-                "plugin_worker_stopped",
+                if graceful {
+                    "plugin_receive_cancelled"
+                } else {
+                    "plugin_worker_stopped"
+                },
                 cleanup_detail(
-                    "plugin worker stopped before receiving an item".to_owned(),
+                    if graceful {
+                        "plugin graceful Close retired the receive before it started".to_owned()
+                    } else {
+                        "plugin worker stopped before receiving an item".to_owned()
+                    },
                     cleanup,
                 ),
                 true,
@@ -2936,6 +3675,9 @@ impl ProcessRuntime {
                 }
             }
             Err(error) => {
+                if error.code() == "plugin_receive_cancelled" {
+                    return Err(error);
+                }
                 let cleanup = self.core.finish(Duration::ZERO);
                 if let Err(cleanup) = cleanup {
                     Err(backend_failure(
@@ -3247,6 +3989,7 @@ impl Drop for ProcessPluginDriver {
 #[derive(Clone)]
 pub struct ProcessPluginCancellation {
     core: Arc<ProcessCore>,
+    timeouts: ProcessPhaseTimeouts,
 }
 
 impl ProcessPluginCancellation {
@@ -3256,14 +3999,33 @@ impl ProcessPluginCancellation {
         self.core.process_id
     }
 
-    /// Interrupt any blocked `next_item`, terminate the complete process group, join the protocol
-    /// worker, and reap the leader.
+    /// Report whether the framed worker is currently waiting for the next provider frame.
+    ///
+    /// This is an observation for diagnostics and deterministic lifecycle tests, not admission
+    /// authority: the phase may change immediately after this method returns.
+    #[must_use]
+    pub fn receive_in_progress(&self) -> bool {
+        self.core.activity.get() == ProtocolWorkerPhase::Next
+    }
+
+    /// Report whether a graceful shutdown transaction owns this process generation.
+    ///
+    /// This is an observation for diagnostics and deterministic lifecycle tests, not admission
+    /// authority: the transaction may complete immediately after this method returns.
+    #[must_use]
+    pub fn graceful_shutdown_in_progress(&self) -> bool {
+        self.core.graceful_finish_admitted()
+    }
+
+    /// Interrupt any blocked `next_item` through semantic Close, join the protocol worker, and
+    /// reap the leader. A bounded semantic failure falls back to process-group termination.
     ///
     /// # Errors
     ///
     /// Returns [`std::io::Error`] if process termination or bounded reaping fails.
     pub fn cancel(&self) -> io::Result<ExitStatus> {
-        self.core.finish(Duration::ZERO)
+        self.core
+            .graceful_finish(self.timeouts.close(), self.timeouts.shutdown_grace())
     }
 }
 
@@ -3287,6 +4049,8 @@ mod tests {
     use std::ffi::CString;
     use std::fs;
     use std::io::Read as _;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU32;
     use std::sync::Barrier;
@@ -3326,20 +4090,46 @@ mod tests {
         1_u64 << u32::try_from(signal - 1).expect("positive Linux signal number")
     }
 
+    fn inert_protocol_controls(
+        cancellation: &Arc<CancellationSignal>,
+    ) -> (ClosePort, Arc<ProtocolActivity>) {
+        let writer = File::options()
+            .write(true)
+            .open("/dev/null")
+            .expect("open inert Close sink");
+        (
+            ClosePort::new(CancellableWriter {
+                writer: Arc::new(Mutex::new(writer)),
+                cancellation: Arc::clone(cancellation),
+                deadline: None,
+            }),
+            Arc::new(ProtocolActivity::new()),
+        )
+    }
+
     fn sleeping_core(
         worker: impl FnOnce(mpsc::Receiver<WorkerCommand>) + Send + 'static,
     ) -> (Arc<ProcessCore>, u32) {
         let mut command = Command::new("/bin/sleep");
         command.arg("60");
+        test_core(command, move |commands, _activity| worker(commands))
+    }
+
+    fn test_core(
+        command: Command,
+        worker: impl FnOnce(mpsc::Receiver<WorkerCommand>, Arc<ProtocolActivity>) + Send + 'static,
+    ) -> (Arc<ProcessCore>, u32) {
         let child = ProcessPluginChild::spawn(command).expect("spawn supervised fixture");
         let process_id = child.id();
         let (sender, receiver) = mpsc::channel();
         let (worker_done_sender, worker_done_receiver) = mpsc::sync_channel(1);
+        let cancellation = Arc::new(CancellationSignal::new().expect("create cancellation event"));
+        let (close_port, activity) = inert_protocol_controls(&cancellation);
+        let worker_activity = Arc::clone(&activity);
         let worker = thread::spawn(move || {
-            worker(receiver);
+            worker(receiver, worker_activity);
             let _ = worker_done_sender.send(());
         });
-        let cancellation = Arc::new(CancellationSignal::new().expect("create cancellation event"));
         (
             Arc::new(ProcessCore::new(
                 child,
@@ -3347,9 +4137,35 @@ mod tests {
                 worker_done_receiver,
                 sender,
                 cancellation,
+                close_port,
+                activity,
             )),
             process_id,
         )
+    }
+
+    fn responsive_close_core() -> (Arc<ProcessCore>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, entered_receiver) = mpsc::sync_channel(1);
+        let (release, release_receiver) = mpsc::channel();
+        let (core, _process_id) =
+            test_core(Command::new("/bin/true"), move |commands, activity| {
+                activity.set(ProtocolWorkerPhase::Idle);
+                let WorkerCommand::CloseDriver(response) = commands
+                    .recv()
+                    .expect("graceful transaction sends one terminal Close")
+                else {
+                    panic!("graceful transaction sent a non-Close command")
+                };
+                entered.send(()).expect("announce Close admission");
+                release_receiver.recv().expect("release semantic Close");
+                activity.set(ProtocolWorkerPhase::Control);
+                response.send(Ok(())).expect("confirm semantic Close");
+                assert!(
+                    commands.recv().is_err(),
+                    "terminal admission closes commands"
+                );
+            });
+        (core, entered_receiver, release)
     }
 
     #[test]
@@ -3360,6 +4176,223 @@ mod tests {
                 .expect_err("zero Hello deadline must be refused");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("hello"));
+    }
+
+    #[test]
+    fn pre_close_eof_is_not_relabelled_as_post_close_cancellation() {
+        let activity = ProtocolActivity::new();
+        activity.set(ProtocolWorkerPhase::Next);
+        activity.transport_eof();
+
+        assert!(!activity.claim_next_for_close());
+        assert!(!activity.finish_next(true));
+        assert_eq!(activity.get(), ProtocolWorkerPhase::NextResultReady);
+    }
+
+    #[test]
+    fn eof_during_close_write_waits_for_the_exact_write_outcome() {
+        let activity = Arc::new(ProtocolActivity::new());
+        activity.set(ProtocolWorkerPhase::Next);
+        assert!(activity.claim_next_for_close());
+        activity.transport_eof();
+        assert_eq!(activity.get(), ProtocolWorkerPhase::CloseWritingEof);
+
+        let worker_activity = Arc::clone(&activity);
+        let (finished, finished_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            finished
+                .send(worker_activity.finish_next(true))
+                .expect("publish receive classification");
+        });
+        assert!(matches!(
+            finished_receiver.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        activity.finish_close_write(true);
+        assert!(finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("write outcome releases receive classification"));
+        worker.join().expect("classification worker joins");
+        assert_eq!(activity.get(), ProtocolWorkerPhase::CloseEof);
+    }
+
+    #[test]
+    fn failed_close_write_cannot_turn_eof_into_success() {
+        let activity = ProtocolActivity::new();
+        activity.set(ProtocolWorkerPhase::Next);
+        assert!(activity.claim_next_for_close());
+        activity.transport_eof();
+        activity.finish_close_write(false);
+
+        assert!(!activity.finish_next(true));
+        assert_eq!(activity.get(), ProtocolWorkerPhase::CloseFailed);
+    }
+
+    #[test]
+    fn close_port_serializes_exactly_one_complete_frame() {
+        let (writer, mut reader) = UnixStream::pair().expect("create Close transport");
+        let writer = unsafe { File::from_raw_fd(writer.into_raw_fd()) };
+        let cancellation = Arc::new(CancellationSignal::new().expect("create cancellation event"));
+        let port = ClosePort::new(CancellableWriter {
+            writer: Arc::new(Mutex::new(writer)),
+            cancellation,
+            deadline: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        port.send(deadline).expect("first Close frame is complete");
+        assert_eq!(
+            port.send(deadline)
+                .expect_err("terminal Close port is single-use")
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+
+        let mut length = [0_u8; 4];
+        reader.read_exact(&mut length).expect("read Close length");
+        let mut payload = vec![0_u8; u32::from_be_bytes(length) as usize];
+        reader.read_exact(&mut payload).expect("read Close payload");
+        assert!(matches!(
+            serde_json::from_slice::<ClientFrame>(&payload).expect("decode Close frame"),
+            ClientFrame::Close
+        ));
+        let mut trailing = Vec::new();
+        reader
+            .read_to_end(&mut trailing)
+            .expect("read terminal Close EOF");
+        assert!(trailing.is_empty(), "no second frame was serialized");
+    }
+
+    #[test]
+    fn concurrent_graceful_callers_share_the_first_transaction() {
+        let (core, close_entered, close_release) = responsive_close_core();
+        let (admitted, admitted_receiver) = mpsc::sync_channel(1);
+        let (admit_release, admit_release_receiver) = mpsc::channel();
+        let owner_core = Arc::clone(&core);
+        let owner = thread::spawn(move || {
+            owner_core.graceful_finish_with_hook(Duration::from_secs(1), Duration::ZERO, || {
+                admitted.send(()).expect("announce graceful owner");
+                admit_release_receiver
+                    .recv()
+                    .expect("release graceful owner");
+            })
+        });
+        admitted_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first graceful transaction is published");
+
+        let waiter_core = Arc::clone(&core);
+        let (waiter_result, waiter_result_receiver) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            waiter_result
+                .send(waiter_core.graceful_finish(Duration::from_millis(1), Duration::ZERO))
+                .expect("publish shared graceful result");
+        });
+        assert!(matches!(
+            waiter_result_receiver.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        admit_release.send(()).expect("release graceful admission");
+        close_entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker receives one Close");
+        assert!(matches!(
+            waiter_result_receiver.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        close_release.send(()).expect("complete semantic Close");
+
+        assert!(owner
+            .join()
+            .expect("graceful owner joins")
+            .unwrap()
+            .success());
+        assert!(waiter_result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter receives shared result")
+            .unwrap()
+            .success());
+        waiter.join().expect("graceful waiter joins");
+    }
+
+    #[test]
+    fn retired_next_keeps_graceful_provenance_after_cleanup_completes() {
+        let (core, close_entered, close_release) = responsive_close_core();
+        let owner_core = Arc::clone(&core);
+        let owner = thread::spawn(move || {
+            owner_core.graceful_finish(Duration::from_secs(1), Duration::ZERO)
+        });
+        close_entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker receives terminal Close");
+        close_release.send(()).expect("complete semantic Close");
+        assert!(owner
+            .join()
+            .expect("graceful owner joins")
+            .unwrap()
+            .success());
+        assert!(core.graceful_finish_admitted());
+
+        let runtime = ProcessRuntime { core };
+        let error = runtime
+            .next_item(Duration::ZERO)
+            .expect_err("closed command admission retires the pending receive");
+        assert_eq!(error.code(), "plugin_receive_cancelled");
+        assert!(error.detail().contains("graceful Close"), "{error}");
+    }
+
+    #[test]
+    fn drop_waits_for_an_already_admitted_graceful_transaction() {
+        let (core, close_entered, close_release) = responsive_close_core();
+        let runtime = ProcessRuntime {
+            core: Arc::clone(&core),
+        };
+        let (admitted, admitted_receiver) = mpsc::sync_channel(1);
+        let (admit_release, admit_release_receiver) = mpsc::channel();
+        let owner_core = Arc::clone(&core);
+        let owner = thread::spawn(move || {
+            owner_core.graceful_finish_with_hook(Duration::from_secs(1), Duration::ZERO, || {
+                admitted.send(()).expect("announce graceful owner");
+                admit_release_receiver
+                    .recv()
+                    .expect("release graceful owner");
+            })
+        });
+        admitted_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("graceful transaction is published before Drop");
+
+        let (dropped, dropped_receiver) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(runtime);
+            dropped.send(()).expect("announce completed Drop");
+        });
+        assert!(matches!(
+            dropped_receiver.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        admit_release.send(()).expect("release graceful admission");
+        close_entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker receives one Close");
+        assert!(matches!(
+            dropped_receiver.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        close_release.send(()).expect("complete semantic Close");
+
+        assert!(owner
+            .join()
+            .expect("graceful owner joins")
+            .unwrap()
+            .success());
+        dropped_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Drop observes shared completion");
+        dropper.join().expect("Drop thread joins");
     }
 
     #[test]
@@ -4585,12 +5618,15 @@ mod tests {
             let _ = worker_done_sender.send(());
         });
         let cancellation = Arc::new(CancellationSignal::new().expect("create cancellation event"));
+        let (close_port, activity) = inert_protocol_controls(&cancellation);
         let core = Arc::new(ProcessCore::new(
             child,
             worker,
             worker_done_receiver,
             commands,
             cancellation,
+            close_port,
+            activity,
         ));
 
         let error = core
@@ -4610,7 +5646,7 @@ mod tests {
 
         let mut state = ProcessCore::lock(&core.shutdown.state);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !matches!(&*state, ShutdownState::Done(_)) {
+        while !matches!(&*state, ShutdownState::Done { .. }) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero(), "eventual cleanup did not finish");
             let waited = core.shutdown.complete.wait_timeout(state, remaining);

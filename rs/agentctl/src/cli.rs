@@ -340,6 +340,8 @@ enum ChatCommand {
     Init(ChatInit),
     /// Inspect durable bridge state without contacting Herdr or a provider
     Status(ChatState),
+    /// Inspect one exact active retained request without writes or external access
+    Inspect(ChatInspect),
     /// Publish one explicit operator root message through the configured helper
     Publish(ChatPublish),
     /// Run one bounded delivery, terminal-capture, and outbound recovery pass
@@ -348,6 +350,9 @@ enum ChatCommand {
     Run(ChatOperate),
     /// Stop accepting fenced replies for one exact retained request
     Close(ChatClose),
+    /// Internal systemd ExecStop helper for one inode-bound main-process pidfd
+    #[command(hide = true)]
+    GracefulStopMain(ChatGracefulStopMain),
 }
 
 #[derive(Args)]
@@ -364,6 +369,15 @@ struct ChatInit {
     /// Private owner-only JSON bridge configuration (maximum 1 MiB)
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
+}
+
+#[derive(Args)]
+struct ChatInspect {
+    #[command(flatten)]
+    state: ChatState,
+    /// Exact 64-character lowercase hexadecimal request key
+    #[arg(long)]
+    request: String,
 }
 
 #[derive(Args)]
@@ -433,6 +447,16 @@ struct ChatClose {
     /// Exact 64-character lowercase hexadecimal request key
     #[arg(long)]
     request: String,
+}
+
+#[derive(Args)]
+struct ChatGracefulStopMain {
+    /// Exact systemd MAINPID value
+    #[arg(long)]
+    main_pid: u32,
+    /// Exact systemd MAINPIDFDID inode value
+    #[arg(long)]
+    main_pidfd_id: u64,
 }
 
 fn seconds(value: &str) -> Result<f64, String> {
@@ -720,6 +744,13 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::Inspect(value) => {
+            let result =
+                crate::chat_service::inspect_request(&value.state.bridge_state, &value.request)
+                    .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Publish(value) => {
             let body = value.read_message().map_err(Failure::Usage)?;
             let result = crate::chat_service::publish(
@@ -768,6 +799,11 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 crate::chat_service::run(&value.state.bridge_state, &client, &manager, options)
                     .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::GracefulStopMain(value) => {
+            crate::chat_service::graceful_stop_main(value.main_pid, value.main_pidfd_id)
+                .map_err(Failure::Chat)?;
             Ok(0)
         }
     }
@@ -917,6 +953,77 @@ mod tests {
         for required in ["--bridge-state", "--channel-id", "--request-id", "--file"] {
             assert!(help.contains(required));
         }
+        let inspect = Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "inspect",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--request",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .expect("parse read-only request inspection");
+        assert!(matches!(
+            inspect.command,
+            Some(Commands::Chat(Chat {
+                command: ChatCommand::Inspect(ChatInspect { .. })
+            }))
+        ));
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "graceful-stop-main",
+            "--main-pid",
+            "123",
+            "--main-pidfd-id",
+            "456",
+        ])
+        .expect("parse internal systemd stop helper");
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Chat(Chat {
+                command: ChatCommand::GracefulStopMain(ChatGracefulStopMain {
+                    main_pid: 123,
+                    main_pidfd_id: 456,
+                })
+            }))
+        ));
+    }
+
+    #[test]
+    fn embedded_chat_guide_requires_derived_stop_and_measured_resource_bounds() {
+        for required in [
+            "hello_seconds + close_seconds + shutdown_grace_seconds + 7",
+            "outbound_command.timeout_millis +",
+            "maximum of the applicable provider window",
+            "complete selected provider timeout tuple",
+            "agentctl-chat-request-inspection/v1",
+            "ack_completed_at_millis",
+            "outcome-unknown operations",
+            "systemd 258 or newer",
+            "ExecStop=/absolute/path/agentctl chat graceful-stop-main",
+            "TimeoutStopSec=<DERIVED_SECONDS_WITH_MARGIN>",
+            "TimeoutStopFailureMode=kill",
+            "TasksMax=<MEASURED_TASKS_WITH_HEADROOM>",
+            "MemoryMax=<MEASURED_HARD_LIMIT>",
+        ] {
+            assert!(
+                crate::CHAT_USER_GUIDE.contains(required),
+                "embedded Chat guide omitted {required:?}"
+            );
+        }
+        for stale in [
+            "TimeoutStopSec=60",
+            "TimeoutStopSec=75",
+            "TimeoutStopSec=85",
+            "TasksMax=2048",
+            "MemoryMax=4G",
+        ] {
+            assert!(
+                !crate::CHAT_USER_GUIDE.contains(stale),
+                "embedded Chat guide retained stale prescription {stale:?}"
+            );
+        }
     }
 
     #[test]
@@ -1053,6 +1160,15 @@ mod tests {
                 protocol_max: 1,
                 origin: "discovered",
                 status: crate::plugins::MaturityStatus::discovered(true),
+                process_phase_timeouts:
+                    chat_subscription_plugin::process::ProcessPhaseTimeouts::new(
+                        std::time::Duration::from_secs(10),
+                        std::time::Duration::from_secs(30),
+                        std::time::Duration::from_secs(30),
+                        std::time::Duration::from_secs(10),
+                        std::time::Duration::from_secs(2),
+                    )
+                    .expect("fixture process phase timeouts"),
                 executable_identity: None,
             }],
             refused: vec![crate::plugins::RefusedPlugin {

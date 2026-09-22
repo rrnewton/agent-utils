@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chat_subscription::{
-    BackendConfiguration, ChannelId, ChatSubscription, CommittableEvent, DeliveryBatch,
+    BackendConfiguration, ChannelId, ChatSubscription, CommittableEvent, DeliveryBatch, DeliveryId,
     ProviderCursor, SenderId, SubscribeRequest, SubscriptionError, SubscriptionItem,
 };
 use fs2::FileExt;
@@ -62,6 +62,8 @@ const MAX_RETIREMENT_CHUNK_BYTES: usize = 256 * 1_024;
 const MAX_COMMIT_RECEIPT_BYTES: usize = 64 * 1_024;
 const MAX_GAP_DIAGNOSTIC_BYTES: usize = 64 * 1_024;
 const MAX_ADMISSION_INTENT_BYTES: usize = 1_024 * 1_024;
+/// Stable read-only JSON schema emitted by `agentctl chat inspect`.
+pub const REQUEST_INSPECTION_SCHEMA: &str = "agentctl-chat-request-inspection/v1";
 
 fn default_ack_reaction() -> Option<String> {
     Some("🤖".to_owned())
@@ -1010,7 +1012,21 @@ struct RequestRecord {
     ack_error: Option<String>,
     admitted_at_millis: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    admitted_host_batch_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admitted_provider_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admitted_delivery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     admitted_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_started_at_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivered_at_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_started_at_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_completed_at_millis: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivery_error: Option<String>,
 }
@@ -1058,7 +1074,14 @@ impl RequestRecord {
             reaction_already_present: None,
             ack_error: None,
             admitted_at_millis: unix_millis(),
+            admitted_host_batch_sequence: None,
+            admitted_provider_sequence: None,
+            admitted_delivery_id: None,
             admitted_cursor: None,
+            delivery_started_at_millis: None,
+            delivered_at_millis: None,
+            ack_started_at_millis: None,
+            ack_completed_at_millis: None,
             delivery_error: None,
             key,
             message: source,
@@ -1103,6 +1126,56 @@ impl RequestRecord {
         if let Some(cursor) = self.admitted_cursor.as_deref() {
             ProviderCursor::new(cursor.to_owned())
                 .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        }
+        match (
+            self.admitted_host_batch_sequence,
+            self.admitted_provider_sequence,
+            self.admitted_delivery_id.as_deref(),
+        ) {
+            (Some(host), Some(provider), Some(delivery)) if host > 0 && provider > 0 => {
+                DeliveryId::new(delivery.to_owned())
+                    .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(ChatRuntimeError::invalid(
+                    "saved request admission provenance is incomplete",
+                ));
+            }
+        }
+        for (label, timestamp) in [
+            ("delivery_started", self.delivery_started_at_millis),
+            ("delivered", self.delivered_at_millis),
+            ("ack_started", self.ack_started_at_millis),
+            ("ack_completed", self.ack_completed_at_millis),
+        ] {
+            if timestamp.is_some_and(|value| value < self.admitted_at_millis) {
+                return Err(ChatRuntimeError::invalid(format!(
+                    "saved request {label} timestamp precedes admission"
+                )));
+            }
+        }
+        if let Some(delivered) = self.delivered_at_millis {
+            if self.phase != RequestPhase::Delivered
+                || self
+                    .delivery_started_at_millis
+                    .is_none_or(|started| delivered < started)
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "saved request delivery completion is inconsistent",
+                ));
+            }
+        }
+        if let Some(completed) = self.ack_completed_at_millis {
+            if self.ack_phase != AckPhase::Acked
+                || self
+                    .ack_started_at_millis
+                    .is_none_or(|started| completed < started)
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "saved request acknowledgement completion is inconsistent",
+                ));
+            }
         }
         if let Some(error) = self.delivery_error.as_deref() {
             validate_optional_single_line_or_multiline(error, "delivery error", 2_000)?;
@@ -1198,6 +1271,32 @@ enum ReplyPhase {
     Sent,
 }
 
+fn request_phase_name(phase: &RequestPhase) -> &'static str {
+    match phase {
+        RequestPhase::Pending => "pending",
+        RequestPhase::Submitting => "submitting",
+        RequestPhase::Delivered => "delivered",
+        RequestPhase::DeliveryUncertain => "delivery_uncertain",
+    }
+}
+
+fn ack_phase_name(phase: &AckPhase) -> &'static str {
+    match phase {
+        AckPhase::Disabled => "disabled",
+        AckPhase::Pending => "pending",
+        AckPhase::Sending => "sending",
+        AckPhase::Acked => "acked",
+    }
+}
+
+fn reply_phase_name(phase: &ReplyPhase) -> &'static str {
+    match phase {
+        ReplyPhase::Pending => "pending",
+        ReplyPhase::Sending => "sending",
+        ReplyPhase::Sent => "sent",
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplyRecord {
@@ -1211,6 +1310,8 @@ struct ReplyRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_message_id: Option<String>,
     captured_at_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sent_at_millis: Option<u64>,
 }
 
 impl ReplyRecord {
@@ -1232,6 +1333,7 @@ impl ReplyRecord {
             phase: ReplyPhase::Pending,
             provider_message_id: None,
             captured_at_millis: unix_millis(),
+            sent_at_millis: None,
         };
         let initial = encoded_document_bytes(&record)?;
         let receipt_reservation = chat_subscription::MAX_RESOURCE_ID_BYTES
@@ -1271,6 +1373,14 @@ impl ReplyRecord {
         if matches!(self.phase, ReplyPhase::Sent) && self.provider_message_id.is_none() {
             return Err(ChatRuntimeError::invalid(
                 "sent reply is missing its provider message receipt",
+            ));
+        }
+        if self
+            .sent_at_millis
+            .is_some_and(|sent| self.phase != ReplyPhase::Sent || sent < self.captured_at_millis)
+        {
+            return Err(ChatRuntimeError::invalid(
+                "saved reply send completion is inconsistent",
             ));
         }
         if let Some(message_id) = self.provider_message_id.as_deref() {
@@ -2515,6 +2625,25 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
     }
 }
 
+/// Generation-wide runtime ownership that explicitly releases its open-file-description lock.
+///
+/// A provider child may inherit a duplicate of the lock descriptor before `exec`. Closing only
+/// the parent's descriptor would then leave the `flock` held until that duplicate closes. Normal
+/// graceful shutdown instead unlocks the shared open file description first; a crash retains the
+/// conservative kernel lifetime because `Drop` does not run.
+#[derive(Debug)]
+pub struct RunnerLease {
+    file: File,
+}
+
+impl Drop for RunnerLease {
+    fn drop(&mut self) {
+        // An unlock failure must not be converted into an early-release claim. Closing this
+        // descriptor still preserves the conservative inherited-descriptor behavior.
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
 /// Private, restartable durable state for one coordinator bridge.
 #[derive(Clone, Debug)]
 pub struct BridgeState {
@@ -2820,7 +2949,21 @@ impl BridgeState {
                     "rolled-back admission request key was recreated before exact replay",
                 ));
             }
-            if record.admitted_cursor.as_deref() != Some(intent.target_cursor.as_str())
+            let admission_provenance_matches = match (
+                record.admitted_host_batch_sequence,
+                record.admitted_provider_sequence,
+                record.admitted_delivery_id.as_deref(),
+            ) {
+                (Some(host), Some(provider), Some(delivery)) => {
+                    host == intent.host_batch_sequence
+                        && provider == intent.provider_sequence
+                        && delivery == intent.delivery_id
+                }
+                (None, None, None) => true,
+                _ => false,
+            };
+            if !admission_provenance_matches
+                || record.admitted_cursor.as_deref() != Some(intent.target_cursor.as_str())
                 || saved_message_fingerprint(&record.message)? != request.message_fingerprint
             {
                 return Err(ChatRuntimeError::invalid(
@@ -2985,13 +3128,13 @@ impl BridgeState {
         self.config.subscribe_request(checkpoint.cursor.as_deref())
     }
 
-    /// Acquire the generation-wide owner lease. The descriptor must remain live until shutdown.
-    pub fn acquire_runner_lease(&self) -> Result<File> {
+    /// Acquire the generation-wide owner lease. The wrapper must remain live until shutdown.
+    pub fn acquire_runner_lease(&self) -> Result<RunnerLease> {
         let lock = agent::open_private_lock(&self.root.join(".run.lock"), "chat runner lock")?;
         lock.try_lock_exclusive().map_err(|error| {
             ChatRuntimeError::invalid(format!("another chat runtime owns this state: {error}"))
         })?;
-        Ok(lock)
+        Ok(RunnerLease { file: lock })
     }
 
     /// Persist every child event and the cursor without acknowledging the provider.
@@ -3112,6 +3255,10 @@ impl BridgeState {
                 ));
             }
         }
+        let host_batch_sequence = checkpoint
+            .host_batch_sequence
+            .checked_add(1)
+            .ok_or_else(|| ChatRuntimeError::invalid("chat host batch sequence is exhausted"))?;
         let mut candidate_records = Vec::new();
         let mut candidate_messages = BTreeMap::new();
         let mut request_bytes = 0_u64;
@@ -3121,6 +3268,9 @@ impl BridgeState {
                 CommittableEvent::MessageCreated(message) => {
                     let mut record =
                         RequestRecord::from_message(message, self.config.ack_reaction.as_deref())?;
+                    record.admitted_host_batch_sequence = Some(host_batch_sequence);
+                    record.admitted_provider_sequence = Some(batch.sequence().get());
+                    record.admitted_delivery_id = Some(batch.delivery_id().as_str().to_owned());
                     record.admitted_cursor = Some(batch.cursor().as_str().to_owned());
                     if let Some(existing) = candidate_messages.get(&record.key) {
                         if existing != &record.message {
@@ -3229,10 +3379,6 @@ impl BridgeState {
             .iter()
             .map(|record| record.key.clone())
             .collect::<Vec<_>>();
-        let host_batch_sequence = checkpoint
-            .host_batch_sequence
-            .checked_add(1)
-            .ok_or_else(|| ChatRuntimeError::invalid("chat host batch sequence is exhausted"))?;
         let event_count = u32::try_from(batch.events().len())
             .map_err(|_| ChatRuntimeError::invalid("batch event count does not fit u32"))?;
         let prior_boundary_committed =
@@ -3461,6 +3607,74 @@ impl BridgeState {
             "retirement_sequence": checkpoint.retirement_sequence,
             "phases": phases,
             "acknowledgements": acknowledgements,
+        }))
+    }
+
+    /// Inspect one exact active retained request without provider, helper, or coordinator access.
+    ///
+    /// The returned schema is bounded by [`MAX_REQUEST_REPLIES`]. Callers that need evidence after
+    /// explicit request closure must copy and fsync this document before closing the request.
+    pub fn inspect_request(&self, key: &str) -> Result<Value> {
+        if !valid_key(key) {
+            return Err(ChatRuntimeError::invalid(
+                "chat request key must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        let state_lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
+        FileExt::lock_shared(&state_lock).map_err(ChatRuntimeError::Io)?;
+        let request = self.read_request(key)?;
+        let mut replies = Vec::with_capacity(
+            usize::try_from(request.reply_count).unwrap_or(MAX_REQUEST_REPLIES as usize),
+        );
+        for ordinal in 1..=request.reply_count {
+            let reply = self.read_reply(key, ordinal)?;
+            replies.push(serde_json::json!({
+                "ordinal": reply.ordinal,
+                "phase": reply_phase_name(&reply.phase),
+                "send_request_id": reply.send_request_id,
+                "provider_message_id": reply.provider_message_id,
+                "captured_at_millis": reply.captured_at_millis,
+                "sent_at_millis": reply.sent_at_millis,
+            }));
+        }
+        Ok(serde_json::json!({
+            "schema": REQUEST_INSPECTION_SCHEMA,
+            "request_key": request.key,
+            "phase": request_phase_name(&request.phase),
+            "source": {
+                "channel_id": request.message.channel_id,
+                "message_id": request.message.message_id,
+                "thread_id": request.message.thread_id,
+                "sender_id": request.message.sender_id,
+                "created_at": request.message.created_at,
+            },
+            "provenance": {
+                "host_batch_sequence": request.admitted_host_batch_sequence,
+                "provider_sequence": request.admitted_provider_sequence,
+                "delivery_id": request.admitted_delivery_id,
+                "cursor": request.admitted_cursor,
+            },
+            "timestamps": {
+                "admitted_at_millis": request.admitted_at_millis,
+                "delivery_started_at_millis": request.delivery_started_at_millis,
+                "delivered_at_millis": request.delivered_at_millis,
+                "ack_started_at_millis": request.ack_started_at_millis,
+                "ack_completed_at_millis": request.ack_completed_at_millis,
+            },
+            "delivery": {
+                "message_id": request.delivery_message_id,
+                "error": request.delivery_error,
+            },
+            "acknowledgement": {
+                "phase": ack_phase_name(&request.ack_phase),
+                "reaction": request.ack_reaction,
+                "request_id": request.ack_request_id,
+                "reaction_id": request.reaction_id,
+                "already_present": request.reaction_already_present,
+                "error": request.ack_error,
+            },
+            "reply_closed": request.reply_closed,
+            "replies": replies,
         }))
     }
 
@@ -4151,6 +4365,10 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             }
             request.ack_phase = AckPhase::Sending;
             request.ack_error = None;
+            if request.ack_started_at_millis.is_none() {
+                request.ack_started_at_millis =
+                    Some(causal_wall_millis(request.admitted_at_millis));
+            }
             self.write_request_accounted(&request, &mut checkpoint)?;
             checkpoint.updated_at_millis = unix_millis();
             write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
@@ -4205,6 +4423,9 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         request.reaction_id = Some(receipt.reaction_id.clone());
         request.reaction_already_present = Some(receipt.already_present);
         request.ack_error = None;
+        let completed = causal_wall_millis(request.admitted_at_millis);
+        let started = *request.ack_started_at_millis.get_or_insert(completed);
+        request.ack_completed_at_millis = Some(causal_wall_millis(started));
         let mut checkpoint = self.read_checkpoint()?;
         self.write_request_accounted(&request, &mut checkpoint)?;
         // Make the exact post-mutation byte total durable before retirement can fault. An
@@ -4416,6 +4637,7 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
         }
         current.phase = ReplyPhase::Sent;
         current.provider_message_id = Some(provider_message_id.clone());
+        current.sent_at_millis = Some(causal_wall_millis(current.captured_at_millis));
         write_document(&self.reply_path(key, current.ordinal), &current)?;
         reply = current;
         let mut request = self.read_request(key)?;
@@ -4484,7 +4706,17 @@ Increment the numeric suffix for every later reply. Each consecutive complete bl
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
         let mut record = self.read_request(key)?;
+        let submitting = phase == RequestPhase::Submitting;
+        let delivered = phase == RequestPhase::Delivered;
         record.phase = phase;
+        if submitting && record.delivery_started_at_millis.is_none() {
+            record.delivery_started_at_millis = Some(causal_wall_millis(record.admitted_at_millis));
+        }
+        if delivered && record.delivered_at_millis.is_none() {
+            let completed = causal_wall_millis(record.admitted_at_millis);
+            let started = *record.delivery_started_at_millis.get_or_insert(completed);
+            record.delivered_at_millis = Some(causal_wall_millis(started));
+        }
         record.delivery_error = detail.map(|value| bounded_detail(value, 2_000));
         let mut checkpoint = self.read_checkpoint()?;
         self.write_request_accounted(&record, &mut checkpoint)?;
@@ -6380,6 +6612,29 @@ fn unix_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn causal_wall_millis(floor: u64) -> u64 {
+    unix_millis().max(floor)
+}
+
+fn open_existing_private_state_lock(path: &Path) -> Result<File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(ChatRuntimeError::invalid(format!(
+            "chat state lock is not a private owner-only regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
 fn write_document<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     agent::atomic_json(path, &serde_json::to_value(value)?)?;
     Ok(())
@@ -7110,6 +7365,67 @@ mod tests {
         );
         assert!(!reopened.admission_path().exists());
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn admission_recovery_rejects_request_provenance_outside_its_exact_intent() {
+        let root = temporary("admission-provenance-mismatch");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        *state
+            .admission_fault_after
+            .lock()
+            .expect("admission fault lock") = Some(1);
+        assert!(state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .is_err());
+        let intent: AdmissionIntent =
+            read_document(&state.admission_path(), MAX_ADMISSION_INTENT_BYTES)
+                .expect("interrupted admission intent");
+        let request_key = &intent.requests[0].request_key;
+        let request_path = state.request_path(request_key);
+        let mut request: RequestRecord = read_document(&request_path, MAX_REQUEST_RECORD_BYTES)
+            .expect("interrupted request artifact");
+        request.admitted_host_batch_sequence = request
+            .admitted_host_batch_sequence
+            .and_then(|value| value.checked_add(1));
+        request.validate(request_key).expect("locally valid tamper");
+        write_document(&request_path, &request).expect("write mismatched provenance");
+
+        let error = BridgeState::open(&root).expect_err("mismatched provenance must fail closed");
+        assert!(error
+            .to_string()
+            .contains("admission intent request identity"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn audit_completion_and_provenance_fields_fail_closed_when_inconsistent() {
+        let batch = delivery(1, "cursor-1", "receipt-1");
+        let CommittableEvent::MessageCreated(message) = &batch.events()[1] else {
+            panic!("message fixture");
+        };
+        let record = RequestRecord::from_message(message, Some("🤖")).expect("request record");
+
+        let mut partial_provenance = record.clone();
+        partial_provenance.admitted_host_batch_sequence = Some(1);
+        assert!(partial_provenance
+            .validate(&partial_provenance.key)
+            .is_err());
+
+        let mut false_delivery = record.clone();
+        false_delivery.delivery_started_at_millis = Some(record.admitted_at_millis);
+        false_delivery.delivered_at_millis = Some(record.admitted_at_millis);
+        assert!(false_delivery.validate(&false_delivery.key).is_err());
+
+        let mut false_ack = record.clone();
+        false_ack.ack_started_at_millis = Some(record.admitted_at_millis);
+        false_ack.ack_completed_at_millis = Some(record.admitted_at_millis);
+        assert!(false_ack.validate(&false_ack.key).is_err());
+
+        let mut false_reply =
+            ReplyRecord::new(&record.key, 1, "reply".to_owned()).expect("reply record");
+        false_reply.sent_at_millis = Some(false_reply.captured_at_millis);
+        assert!(false_reply.validate(&record.key, 1).is_err());
     }
 
     #[test]
@@ -9238,6 +9554,34 @@ mod tests {
     }
 
     #[test]
+    fn runner_lease_drop_unlocks_while_a_duplicated_descriptor_remains_open() {
+        let root = temporary("lease-duplicated-descriptor");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let lease = state.acquire_runner_lease().expect("first lease");
+        let inherited_duplicate = lease
+            .file
+            .try_clone()
+            .expect("duplicate the inherited lease descriptor");
+        state
+            .acquire_runner_lease()
+            .expect_err("duplicate descriptor keeps the first lease exclusive");
+
+        drop(lease);
+        inherited_duplicate
+            .metadata()
+            .expect("the inherited duplicate remains open after wrapper drop");
+        let reacquired = state
+            .acquire_runner_lease()
+            .expect("explicit unlock permits immediate reacquire");
+        inherited_duplicate
+            .metadata()
+            .expect("reacquire must not close the inherited duplicate");
+        drop(reacquired);
+        drop(inherited_duplicate);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn delivery_uses_stable_id_and_generic_multi_reply_fence() {
         let root = temporary("deliver");
         let state = BridgeState::initialize(&root, config()).expect("initialize state");
@@ -9245,6 +9589,13 @@ mod tests {
             .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
             .expect("admit request");
         let key = &admission.new_request_keys[0];
+        let admitted = state.read_request(key).expect("admitted request");
+        assert_eq!(admitted.admitted_host_batch_sequence, Some(1));
+        assert_eq!(admitted.admitted_provider_sequence, Some(1));
+        assert_eq!(admitted.admitted_delivery_id.as_deref(), Some("receipt-1"));
+        assert_eq!(admitted.admitted_cursor.as_deref(), Some("cursor-1"));
+        assert!(admitted.delivery_started_at_millis.is_none());
+        assert!(admitted.delivered_at_millis.is_none());
         let target = FakeDelivery::default();
         assert_eq!(
             deliver_request_with(&state, &target, key, DrainOptions::default())
@@ -9256,9 +9607,61 @@ mod tests {
         assert!(prompts[0].contains("one or multiple replies"));
         assert!(prompts[0].contains("<CHAT_REPLY_"));
         assert!(!prompts[0].contains("GCHAT_REPLY"));
+        drop(prompts);
+        let delivered = state.read_request(key).expect("request");
+        assert_eq!(delivered.phase, RequestPhase::Delivered);
+        assert!(delivered.delivery_started_at_millis.is_some());
+        assert!(delivered.delivered_at_millis.is_some());
+        let inspection = state.inspect_request(key).expect("inspect request");
+        assert_eq!(inspection["schema"], REQUEST_INSPECTION_SCHEMA);
+        assert_eq!(inspection["provenance"]["host_batch_sequence"], 1);
+        assert_eq!(inspection["provenance"]["provider_sequence"], 1);
+        assert_eq!(inspection["provenance"]["delivery_id"], "receipt-1");
         assert_eq!(
-            state.read_request(key).expect("request").phase,
-            RequestPhase::Delivered
+            inspection["timestamps"]["admitted_at_millis"],
+            admitted.admitted_at_millis
+        );
+        assert!(inspection["timestamps"]["delivery_started_at_millis"].is_u64());
+        assert!(inspection["timestamps"]["delivered_at_millis"].is_u64());
+        drop(state);
+        let reopened = BridgeState::inspect(&root).expect("reopen read-only state");
+        assert_eq!(
+            reopened.inspect_request(key).expect("inspect after reopen"),
+            inspection
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn request_inspection_is_exact_key_read_only_and_never_creates_its_lock() {
+        let root = temporary("inspect-read-only");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        assert!(state.inspect_request("not-a-request-key").is_err());
+
+        let request_path = state.request_path(key);
+        let request_before = fs::read(&request_path).expect("read request before inspection");
+        let checkpoint_before =
+            fs::read(root.join("checkpoint.json")).expect("read checkpoint before inspection");
+        state.inspect_request(key).expect("read-only inspection");
+        assert_eq!(
+            fs::read(&request_path).expect("read request after inspection"),
+            request_before
+        );
+        assert_eq!(
+            fs::read(root.join("checkpoint.json")).expect("read checkpoint after inspection"),
+            checkpoint_before
+        );
+
+        let lock = root.join(".state.lock");
+        fs::remove_file(&lock).expect("remove fixture lock");
+        assert!(state.inspect_request(key).is_err());
+        assert!(
+            !lock.exists(),
+            "read-only inspection recreated a missing state lock"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -9271,9 +9674,13 @@ mod tests {
             .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
             .expect("admit request");
         let key = &admission.new_request_keys[0];
-        state
+        let submitting = state
             .set_delivery_phase(key, RequestPhase::Submitting, None)
             .expect("record intent");
+        let delivery_started = submitting
+            .delivery_started_at_millis
+            .expect("first delivery attempt timestamp");
+        assert!(submitting.delivered_at_millis.is_none());
         let target = FakeDelivery::default();
         *target.queue_state.lock().expect("queue state lock") = Some(QueueMessageState::Failed);
         assert!(matches!(
@@ -9286,10 +9693,46 @@ mod tests {
             .lock()
             .expect("prompt lock")
             .is_empty());
-        assert_eq!(
-            state.read_request(key).expect("request").phase,
-            RequestPhase::DeliveryUncertain
-        );
+        let uncertain = state.read_request(key).expect("request");
+        assert_eq!(uncertain.phase, RequestPhase::DeliveryUncertain);
+        assert_eq!(uncertain.delivery_started_at_millis, Some(delivery_started));
+        assert!(uncertain.delivered_at_millis.is_none());
+        drop(state);
+        let reopened = BridgeState::open(&root).expect("reopen uncertain delivery");
+        let persisted = reopened.read_request(key).expect("persisted request");
+        assert_eq!(persisted.delivery_started_at_millis, Some(delivery_started));
+        assert!(persisted.delivered_at_millis.is_none());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_delivery_records_only_the_first_attempt_timestamp() {
+        let root = temporary("delivery-failure-timestamp");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let target = FakeDelivery::default();
+        *target.submit_error.lock().expect("submit error") = Some("fixture refused".to_owned());
+        assert!(matches!(
+            deliver_request_with(&state, &target, key, DrainOptions::default())
+                .expect("safe failed delivery"),
+            CoordinatorDeliveryResult::Pending(_)
+        ));
+        let failed = state.read_request(key).expect("failed delivery record");
+        assert_eq!(failed.phase, RequestPhase::Pending);
+        let started = failed
+            .delivery_started_at_millis
+            .expect("first attempt timestamp");
+        assert!(failed.delivered_at_millis.is_none());
+        drop(state);
+        let reopened = BridgeState::open(&root).expect("reopen failed delivery");
+        let persisted = reopened
+            .read_request(key)
+            .expect("persisted failed delivery");
+        assert_eq!(persisted.delivery_started_at_millis, Some(started));
+        assert!(persisted.delivered_at_millis.is_none());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -9508,10 +9951,21 @@ mod tests {
             ..FakeReplyTransport::default()
         };
         assert!(state.publish_one(key, &mut transport).is_err());
+        let failed = state.read_reply(key, 1).expect("sending reply");
+        assert_eq!(failed.phase, ReplyPhase::Sending);
+        assert!(failed.sent_at_millis.is_none());
+        let captured_at = failed.captured_at_millis;
+        let failed_inspection = state.inspect_request(key).expect("inspect failed send");
         assert_eq!(
-            state.read_reply(key, 1).expect("sending reply").phase,
-            ReplyPhase::Sending
+            failed_inspection["replies"][0]["captured_at_millis"],
+            captured_at
         );
+        assert!(failed_inspection["replies"][0]["sent_at_millis"].is_null());
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen failed reply send");
+        let reopened_failed = state.read_reply(key, 1).expect("reopened reply");
+        assert_eq!(reopened_failed.captured_at_millis, captured_at);
+        assert!(reopened_failed.sent_at_millis.is_none());
         assert_eq!(
             state
                 .publish_one(key, &mut transport)
@@ -9522,6 +9976,11 @@ mod tests {
         assert_eq!(transport.submissions.len(), 2);
         assert_eq!(transport.submissions[0].3, transport.submissions[1].3);
         assert_eq!(transport.submissions[0].2, "[codex coordinator] answer");
+        let sent = state.read_reply(key, 1).expect("sent reply");
+        assert_eq!(sent.phase, ReplyPhase::Sent);
+        assert!(sent
+            .sent_at_millis
+            .is_some_and(|value| value >= captured_at));
         assert_eq!(
             state
                 .publish_one(key, &mut transport)
@@ -9607,10 +10066,20 @@ mod tests {
             ..FakeReactionTransport::default()
         };
         assert!(state.ensure_ack(key, &mut transport).is_err());
-        assert_eq!(
-            state.read_request(key).expect("request").ack_phase,
-            AckPhase::Sending
-        );
+        let failed = state.read_request(key).expect("request");
+        assert_eq!(failed.ack_phase, AckPhase::Sending);
+        let ack_started = failed
+            .ack_started_at_millis
+            .expect("first acknowledgement attempt timestamp");
+        assert!(failed.ack_completed_at_millis.is_none());
+        let failed_inspection = state.inspect_request(key).expect("inspect failed ACK");
+        assert!(failed_inspection["timestamps"]["ack_started_at_millis"].is_u64());
+        assert!(failed_inspection["timestamps"]["ack_completed_at_millis"].is_null());
+        drop(state);
+        let state = BridgeState::open(&root).expect("reopen failed ACK");
+        let reopened_failed = state.read_request(key).expect("reopened request");
+        assert_eq!(reopened_failed.ack_started_at_millis, Some(ack_started));
+        assert!(reopened_failed.ack_completed_at_millis.is_none());
         assert_eq!(
             state
                 .ensure_ack(key, &mut transport)
@@ -9623,6 +10092,11 @@ mod tests {
         assert_eq!(transport.submissions.len(), 2);
         assert_eq!(transport.submissions[0].3, transport.submissions[1].3);
         assert!(valid_operation_uuid(&transport.submissions[0].3));
+        let acknowledged = state.read_request(key).expect("acknowledged request");
+        assert_eq!(acknowledged.ack_started_at_millis, Some(ack_started));
+        assert!(acknowledged
+            .ack_completed_at_millis
+            .is_some_and(|completed| completed >= ack_started));
         assert_eq!(
             state
                 .ensure_ack(key, &mut transport)

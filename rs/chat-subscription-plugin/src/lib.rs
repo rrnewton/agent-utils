@@ -28,18 +28,227 @@ pub mod process_unsupported_compile_test;
 
 use std::collections::HashSet;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::num::NonZeroU16;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+use std::thread;
 
 use chat_subscription::{
-    BackendCapabilities, BackendConfiguration, BackendFailure, ChannelId, ChatSubscription,
-    ChatSubscriptionBackend, CommittableEvent, DeliveryBatch, DeliveryId, EventKind, EventSequence,
-    Heartbeat, InboundMessage, MessageId, ProviderCursor, ProviderPayload, ReconciliationGap,
-    ReplaySupport, SenderId, SubscribeRequest, SubscriptionError, SubscriptionItem, ThreadId,
+    BackendCapabilities, BackendConfiguration, BackendFailure, CancellationError, ChannelId,
+    ChatSubscription, ChatSubscriptionBackend, ChatSubscriptionCancellation, CommittableEvent,
+    DeliveryBatch, DeliveryId, EventKind, EventSequence, Heartbeat, InboundMessage, MessageId,
+    ProviderCursor, ProviderPayload, ReconciliationGap, ReplaySupport, SenderId, SubscribeRequest,
+    SubscriptionError, SubscriptionItem, ThreadId,
 };
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
+
+/// Independent, sticky authority that interrupts one host-frame input actor.
+#[derive(Clone)]
+pub struct HostFrameInputCancellation {
+    cancelled: Arc<AtomicBool>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl HostFrameInputCancellation {
+    /// Build an authority whose callback makes an in-progress [`Read::read`] return promptly.
+    ///
+    /// The callback may run more than once and must remain nonblocking. The sticky cancellation
+    /// bit is published before it runs, so the reader can distinguish an internal shutdown wake
+    /// from peer EOF or malformed input.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(wake),
+        }
+    }
+
+    fn passive() -> Self {
+        Self::new(|| {})
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        (self.wake)();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// A host-frame reader with independent termination for the concurrent protocol input actor.
+///
+/// `input_cancellation` must make an in-progress read return promptly. This transport contract is
+/// separate from provider cancellation and keeps [`ChatSubscriptionBackend`] process-agnostic.
+pub trait HostFrameInput: Read + Send {
+    /// Return sticky authority for this exact reader generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::Error`] if an independent wake handle cannot be created.
+    fn input_cancellation(&self) -> io::Result<HostFrameInputCancellation>;
+}
+
+impl<T: AsRef<[u8]> + Send> HostFrameInput for Cursor<T> {
+    fn input_cancellation(&self) -> io::Result<HostFrameInputCancellation> {
+        // Cursor reads never block, so the actor observes EOF without an external wake.
+        Ok(HostFrameInputCancellation::passive())
+    }
+}
+
+#[cfg(unix)]
+impl HostFrameInput for std::os::unix::net::UnixStream {
+    fn input_cancellation(&self) -> io::Result<HostFrameInputCancellation> {
+        use std::net::Shutdown;
+
+        let stream = self.try_clone()?;
+        Ok(HostFrameInputCancellation::new(move || {
+            let _ = stream.shutdown(Shutdown::Read);
+        }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod interruptible_fd_input {
+    use super::{HostFrameInput, HostFrameInputCancellation};
+    use std::fs::File;
+    use std::io::{self, Read};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::Arc;
+
+    pub(super) struct InterruptibleFdInput<R> {
+        reader: R,
+        wake_descriptor: Arc<OwnedFd>,
+        cancellation: HostFrameInputCancellation,
+    }
+
+    pub(super) fn signal_eventfd_with(mut write_once: impl FnMut() -> io::Result<()>) {
+        loop {
+            match write_once() {
+                Ok(()) => return,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                // A saturated eventfd is already readable, so EAGAIN proves that the sole wake
+                // cannot be lost. The separate sticky bit covers cancellation before polling.
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(error) => {
+                    debug_assert!(false, "cannot wake host-frame input actor: {error}");
+                    return;
+                }
+            }
+        }
+    }
+
+    impl<R: AsRawFd> InterruptibleFdInput<R> {
+        pub(super) fn new(reader: R) -> io::Result<Self> {
+            // SAFETY: eventfd takes scalar flags and returns a fresh descriptor on success.
+            let descriptor = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful eventfd returned one fresh descriptor now owned here.
+            let wake_descriptor = Arc::new(unsafe { OwnedFd::from_raw_fd(descriptor) });
+            let wake = Arc::clone(&wake_descriptor);
+            let cancellation = HostFrameInputCancellation::new(move || {
+                signal_eventfd_with(|| {
+                    let value = 1_u64.to_ne_bytes();
+                    // SAFETY: wake owns a live eventfd and value is initialized for this call.
+                    let result = unsafe {
+                        libc::write(wake.as_raw_fd(), value.as_ptr().cast(), value.len())
+                    };
+                    if result < 0 {
+                        Err(io::Error::last_os_error())
+                    } else if usize::try_from(result).ok() == Some(value.len()) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "eventfd accepted a partial cancellation wake",
+                        ))
+                    }
+                });
+            });
+            Ok(Self {
+                reader,
+                wake_descriptor,
+                cancellation,
+            })
+        }
+    }
+
+    impl InterruptibleFdInput<File> {
+        pub(super) fn stdin() -> io::Result<Self> {
+            // Do not wrap `std::io::Stdin`: its internal buffer can read a later frame before this
+            // wrapper polls fd 0, leaving the bytes invisible to poll and the actor stuck. A dup
+            // shares the pipe stream without sharing that userspace buffer and is independently
+            // owned for the duration of the server.
+            // SAFETY: fcntl receives the live process stdin descriptor and returns a fresh
+            // close-on-exec descriptor on success.
+            let descriptor = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful F_DUPFD_CLOEXEC returned one fresh descriptor now owned here.
+            let input = File::from(unsafe { OwnedFd::from_raw_fd(descriptor) });
+            Self::new(input)
+        }
+    }
+
+    impl<R: Read + AsRawFd> Read for InterruptibleFdInput<R> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            loop {
+                if self.cancellation.is_cancelled() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "host-frame input actor was cancelled",
+                    ));
+                }
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: self.reader.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: self.wake_descriptor.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: descriptors is an initialized two-element array retained for the call.
+                let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+                if result > 0 {
+                    if descriptors[1].revents != 0 || self.cancellation.is_cancelled() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "host-frame input actor was cancelled",
+                        ));
+                    }
+                    if descriptors[0].revents != 0 {
+                        return self.reader.read(bytes);
+                    }
+                    continue;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    impl<R: Read + AsRawFd + Send> HostFrameInput for InterruptibleFdInput<R> {
+        fn input_cancellation(&self) -> io::Result<HostFrameInputCancellation> {
+            Ok(self.cancellation.clone())
+        }
+    }
+}
 
 /// The only currently supported process-protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -264,8 +473,12 @@ impl<R: Read, W: Write> FramedIo<R, W> {
         let length = u32::try_from(payload.len()).map_err(|_| {
             PluginError::new("frame_limit_exceeded", "plugin frame length exceeds u32")
         })?;
-        self.writer.write_all(&length.to_be_bytes())?;
-        self.writer.write_all(&payload)?;
+        // One write_all call lets process adapters serialize an entire frame under one writer
+        // lock. Header and payload must never interleave with an independently requested Close.
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        self.writer.write_all(&frame)?;
         self.writer.flush()?;
         Ok(())
     }
@@ -999,20 +1212,11 @@ fn subscription_failure(error: SubscriptionError) -> BackendFailure {
     }
 }
 
-/// Host one object-safe backend on a bounded framed connection.
-///
-/// The function performs no filesystem operations. It reads the next provider item only after the
-/// previous delivery has been committed, so pipe/socket backpressure and core backpressure agree.
-/// Every exit after opening a subscription invokes its cooperative close hook; an outstanding
-/// delivery is never acknowledged by cancellation or transport EOF.
-///
-/// # Errors
-///
-/// Returns [`PluginError`] for malformed frames, incompatible versions, or connection failures.
-pub fn serve<R: Read, W: Write>(
+fn serve_with<R: Read, W: Write>(
     backend: &mut dyn ChatSubscriptionBackend,
     reader: R,
     writer: W,
+    run_subscription: impl FnOnce(&mut ChatSubscription, FramedIo<R, W>) -> Result<(), PluginError>,
 ) -> Result<(), PluginError> {
     let mut io = FramedIo::new(reader, writer);
     let hello = io.receive::<ClientFrame>()?.ok_or_else(|| {
@@ -1107,7 +1311,7 @@ pub fn serve<R: Read, W: Write>(
     };
     let result = io
         .send(&ServerFrame::Subscribed)
-        .and_then(|()| serve_subscription(&mut subscription, &mut io));
+        .and_then(|()| run_subscription(&mut subscription, io));
     let close_result = subscription
         .close()
         .map_err(|error| PluginError::new("backend_close", error.to_string()));
@@ -1117,7 +1321,48 @@ pub fn serve<R: Read, W: Write>(
     }
 }
 
-fn serve_subscription<R: Read, W: Write>(
+/// Host one object-safe backend on a bounded framed connection.
+///
+/// This compatibility entry point accepts every [`Read`] implementation and retains the original
+/// sequential protocol behavior. It cannot observe a host Close while the backend is blocked in
+/// `next_item`; process plugins and other hosts that require concurrent semantic Close should use
+/// [`serve_interruptible`] with an independently cancellable input.
+///
+/// # Errors
+///
+/// Returns [`PluginError`] for malformed frames, incompatible versions, or connection failures.
+pub fn serve<R: Read, W: Write>(
+    backend: &mut dyn ChatSubscriptionBackend,
+    reader: R,
+    writer: W,
+) -> Result<(), PluginError> {
+    serve_with(backend, reader, writer, |subscription, mut io| {
+        serve_subscription_legacy(subscription, &mut io)
+    })
+}
+
+/// Host one backend with a concurrent, independently cancellable host-frame reader.
+///
+/// This variant makes semantic Close reachable while provider `next_item` blocks and also retires
+/// its reader actor after natural provider End. The input's cancellation contract is stronger than
+/// ordinary [`Read`], so callers must opt in explicitly instead of changing [`serve`]'s public API.
+///
+/// # Errors
+///
+/// Returns [`PluginError`] for malformed frames, incompatible versions, cancellation failures, or
+/// connection failures.
+pub fn serve_interruptible<R: HostFrameInput, W: Write>(
+    backend: &mut dyn ChatSubscriptionBackend,
+    reader: R,
+    writer: W,
+) -> Result<(), PluginError> {
+    serve_with(backend, reader, writer, |subscription, io| {
+        let FramedIo { reader, writer } = io;
+        serve_subscription_interruptible(subscription, reader, writer)
+    })
+}
+
+fn serve_subscription_legacy<R: Read, W: Write>(
     subscription: &mut ChatSubscription,
     io: &mut FramedIo<R, W>,
 ) -> Result<(), PluginError> {
@@ -1175,13 +1420,339 @@ fn serve_subscription<R: Read, W: Write>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadPhase {
+    WaitingNext,
+    NextActive,
+    ExpectCommit,
+    CommitReceived,
+    CommitActive,
+    Terminal,
+}
+
+struct HostReadState {
+    phase: ReadPhase,
+    terminal_intent: bool,
+}
+
+struct HostReadSynchronization {
+    state: Mutex<HostReadState>,
+    changed: Condvar,
+}
+
+impl HostReadSynchronization {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(HostReadState {
+                phase: ReadPhase::WaitingNext,
+                terminal_intent: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HostReadState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn admit_commit(&self) -> bool {
+        let mut state = self.lock();
+        if state.terminal_intent || state.phase != ReadPhase::ExpectCommit {
+            return false;
+        }
+        state.phase = ReadPhase::CommitReceived;
+        self.changed.notify_all();
+        true
+    }
+
+    fn register_terminal_intent(&self) -> bool {
+        let mut state = self.lock();
+        state.terminal_intent = true;
+        let cancel = matches!(state.phase, ReadPhase::WaitingNext | ReadPhase::NextActive);
+        self.changed.notify_all();
+        cancel
+    }
+
+    fn begin_next(&self) -> bool {
+        let mut state = self.lock();
+        if state.terminal_intent {
+            return false;
+        }
+        debug_assert_eq!(state.phase, ReadPhase::WaitingNext);
+        state.phase = ReadPhase::NextActive;
+        self.changed.notify_all();
+        true
+    }
+
+    fn finish_next(&self, next_phase: ReadPhase) -> bool {
+        let mut state = self.lock();
+        debug_assert_eq!(state.phase, ReadPhase::NextActive);
+        if state.terminal_intent {
+            return false;
+        }
+        state.phase = next_phase;
+        self.changed.notify_all();
+        true
+    }
+
+    fn set_phase(&self, phase: ReadPhase) {
+        let mut state = self.lock();
+        state.phase = phase;
+        self.changed.notify_all();
+    }
+}
+
+enum HostControl {
+    Commit { sequence: u64, delivery_id: String },
+    Close(Result<(), CancellationError>),
+    Eof(Result<(), CancellationError>),
+    Invalid(PluginError, Result<(), CancellationError>),
+}
+
+fn cancel_for_host_control(
+    cancellation: &Arc<dyn ChatSubscriptionCancellation>,
+) -> Result<(), CancellationError> {
+    cancellation.cancel()
+}
+
+fn register_terminal_intent(
+    synchronization: &HostReadSynchronization,
+    cancellation: &Arc<dyn ChatSubscriptionCancellation>,
+) -> Result<(), CancellationError> {
+    if synchronization.register_terminal_intent() {
+        cancel_for_host_control(cancellation)
+    } else {
+        Ok(())
+    }
+}
+
+fn pump_host_frames<R: Read>(
+    mut io: FramedIo<R, io::Sink>,
+    synchronization: &HostReadSynchronization,
+    cancellation: Arc<dyn ChatSubscriptionCancellation>,
+    input_cancellation: HostFrameInputCancellation,
+    controls: mpsc::Sender<HostControl>,
+) {
+    loop {
+        let frame = io.receive::<ClientFrame>();
+        if input_cancellation.is_cancelled() {
+            return;
+        }
+        let control = match frame {
+            Ok(Some(ClientFrame::Commit {
+                sequence,
+                delivery_id,
+            })) if synchronization.admit_commit() => HostControl::Commit {
+                sequence,
+                delivery_id,
+            },
+            Ok(Some(ClientFrame::Close)) => {
+                HostControl::Close(register_terminal_intent(synchronization, &cancellation))
+            }
+            Ok(None) => HostControl::Eof(register_terminal_intent(synchronization, &cancellation)),
+            Ok(Some(frame)) => HostControl::Invalid(
+                PluginError::new(
+                    "unexpected_frame",
+                    format!("host sent {frame:?} outside the commit phase"),
+                ),
+                register_terminal_intent(synchronization, &cancellation),
+            ),
+            Err(error) => HostControl::Invalid(
+                error,
+                register_terminal_intent(synchronization, &cancellation),
+            ),
+        };
+        let terminal = !matches!(control, HostControl::Commit { .. });
+        if controls.send(control).is_err() || terminal {
+            return;
+        }
+    }
+}
+
+fn cancellation_control_result(result: Result<(), CancellationError>) -> Result<(), PluginError> {
+    result.map_err(|error| PluginError::new("backend_cancel", error.to_string()))
+}
+
+fn terminal_host_control(control: HostControl) -> Result<(), PluginError> {
+    match control {
+        HostControl::Close(result) | HostControl::Eof(result) => {
+            cancellation_control_result(result)
+        }
+        HostControl::Invalid(error, cancellation) => {
+            cancellation_control_result(cancellation)?;
+            Err(error)
+        }
+        HostControl::Commit { .. } => Err(PluginError::new(
+            "unexpected_frame",
+            "host sent Commit while no delivery was outstanding",
+        )),
+    }
+}
+
+fn serve_subscription_interruptible<R: HostFrameInput, W: Write>(
+    subscription: &mut ChatSubscription,
+    reader: R,
+    writer: W,
+) -> Result<(), PluginError> {
+    serve_subscription_synchronized(
+        subscription,
+        reader,
+        writer,
+        Arc::new(HostReadSynchronization::new()),
+    )
+}
+
+fn serve_subscription_synchronized<R: HostFrameInput, W: Write>(
+    subscription: &mut ChatSubscription,
+    reader: R,
+    writer: W,
+    synchronization: Arc<HostReadSynchronization>,
+) -> Result<(), PluginError> {
+    let cancellation = subscription.cancellation();
+    let input_cancellation = reader.input_cancellation()?;
+    let (control_sender, control_receiver) = mpsc::channel();
+    let mut output = FramedIo::new(io::empty(), writer);
+    thread::scope(|scope| {
+        let input = FramedIo::new(reader, io::sink());
+        let reader_cancellation = input_cancellation.clone();
+        let reader = scope.spawn(|| {
+            pump_host_frames(
+                input,
+                &synchronization,
+                cancellation,
+                reader_cancellation,
+                control_sender,
+            );
+        });
+        let result = loop {
+            if !synchronization.begin_next() {
+                let control = control_receiver.recv().map_err(|_| {
+                    PluginError::new(
+                        "host_control_stopped",
+                        "host control reader stopped before the next receive",
+                    )
+                })?;
+                break terminal_host_control(control);
+            }
+            let item = subscription.next_item();
+            let item = match item {
+                Ok(Some(item)) => {
+                    let next_phase = if matches!(item, SubscriptionItem::Batch(_)) {
+                        ReadPhase::ExpectCommit
+                    } else {
+                        ReadPhase::WaitingNext
+                    };
+                    if !synchronization.finish_next(next_phase) {
+                        let control = control_receiver.recv().map_err(|_| {
+                            PluginError::new(
+                                "host_control_stopped",
+                                "host control reader stopped during cancellation",
+                            )
+                        })?;
+                        break terminal_host_control(control);
+                    }
+                    item
+                }
+                Ok(None) => {
+                    if !synchronization.finish_next(ReadPhase::Terminal) {
+                        let control = control_receiver.recv().map_err(|_| {
+                            PluginError::new(
+                                "host_control_stopped",
+                                "host control reader stopped as the subscription ended",
+                            )
+                        })?;
+                        break terminal_host_control(control);
+                    }
+                    output.send(&ServerFrame::End)?;
+                    break Ok(());
+                }
+                Err(error) => {
+                    if !synchronization.finish_next(ReadPhase::Terminal) {
+                        let control = control_receiver.recv().map_err(|_| {
+                            PluginError::new(
+                                "host_control_stopped",
+                                "host control reader stopped during cancellation",
+                            )
+                        })?;
+                        break terminal_host_control(control);
+                    }
+                    let error = subscription_failure(error);
+                    send_backend_error(&mut output, &error, true)?;
+                    break Ok(());
+                }
+            };
+            output.send(&BorrowedServerFrame::Item {
+                item: BorrowedWireItem::from(&item),
+            })?;
+            let SubscriptionItem::Batch(delivery) = item else {
+                continue;
+            };
+            match control_receiver.recv().map_err(|_| {
+                PluginError::new(
+                    "host_control_stopped",
+                    "host control reader stopped while a delivery was outstanding",
+                )
+            })? {
+                HostControl::Commit {
+                    sequence,
+                    delivery_id,
+                } if sequence == delivery.sequence().get()
+                    && delivery_id == delivery.delivery_id().as_str() =>
+                {
+                    synchronization.set_phase(ReadPhase::CommitActive);
+                    if let Err(error) = subscription.commit_durable(&delivery) {
+                        synchronization.set_phase(ReadPhase::Terminal);
+                        let error = subscription_failure(error);
+                        send_backend_error(&mut output, &error, true)?;
+                        break Ok(());
+                    }
+                    output.send(&ServerFrame::Committed { sequence })?;
+                    synchronization.set_phase(ReadPhase::WaitingNext);
+                }
+                HostControl::Commit { .. } => {
+                    synchronization.set_phase(ReadPhase::Terminal);
+                    let error = BackendFailure::new(
+                        "commit_mismatch",
+                        "host commit does not match the outstanding delivery",
+                        false,
+                    )
+                    .expect("constant backend failure is valid");
+                    send_backend_error(&mut output, &error, true)?;
+                    break Ok(());
+                }
+                control => break terminal_host_control(control),
+            }
+        };
+        synchronization.set_phase(ReadPhase::Terminal);
+        input_cancellation.cancel();
+        let reader_result = reader
+            .join()
+            .map_err(|_| PluginError::new("host_control_panicked", "host control reader panicked"));
+        match (result, reader_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    })
+}
+
 /// Host a backend on this process's standard input and output.
 ///
 /// # Errors
 ///
-/// Returns [`PluginError`] as [`serve`].
+/// Returns [`PluginError`] as [`serve_interruptible`] on Linux and [`serve`] elsewhere.
 pub fn serve_stdio(backend: &mut dyn ChatSubscriptionBackend) -> Result<(), PluginError> {
-    serve(backend, io::stdin().lock(), io::stdout().lock())
+    #[cfg(target_os = "linux")]
+    {
+        let input = interruptible_fd_input::InterruptibleFdInput::stdin()?;
+        serve_interruptible(backend, input, io::stdout().lock())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        serve(backend, io::stdin().lock(), io::stdout().lock())
+    }
 }
 
 #[cfg(test)]
@@ -1191,11 +1762,26 @@ mod tests {
         CancellationError, ChatSubscriptionCancellation, ChatSubscriptionDriver,
     };
     use std::io::Cursor;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     struct ProtocolBackend {
         input: Option<Vec<u8>>,
+    }
+
+    struct LegacyReadOnlyInput {
+        inner: Cursor<Vec<u8>>,
+        _not_send: Rc<()>,
+    }
+
+    impl Read for LegacyReadOnlyInput {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(bytes)
+        }
     }
 
     struct NoopCancellation;
@@ -1323,6 +1909,461 @@ mod tests {
         closes: Arc<AtomicUsize>,
         acknowledgements: Arc<AtomicUsize>,
         emitted: bool,
+    }
+
+    struct NaturalEndBackend {
+        closes: Arc<AtomicUsize>,
+    }
+
+    struct NaturalEndDriver {
+        closes: Arc<AtomicUsize>,
+        ended: bool,
+    }
+
+    impl ChatSubscriptionBackend for NaturalEndBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::new(
+                "natural-end-fixture",
+                ReplaySupport::Cursor,
+                false,
+                NonZeroU16::new(1).expect("one is nonzero"),
+                vec![EventKind::Heartbeat],
+            )
+            .expect("fixture capabilities")
+        }
+
+        fn subscribe(
+            &mut self,
+            _request: &SubscribeRequest,
+        ) -> Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+            Ok(Box::new(NaturalEndDriver {
+                closes: Arc::clone(&self.closes),
+                ended: false,
+            }))
+        }
+    }
+
+    impl ChatSubscriptionDriver for NaturalEndDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
+        fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+            assert!(!self.ended, "natural End is terminal");
+            self.ended = true;
+            Ok(None)
+        }
+
+        fn acknowledge(&mut self, _delivery_id: &DeliveryId) -> Result<(), BackendFailure> {
+            panic!("natural End has no delivery to acknowledge")
+        }
+
+        fn close(&mut self) -> Result<(), BackendFailure> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingCloseState {
+        entered: bool,
+        cancelled: bool,
+        closed: bool,
+    }
+
+    struct BlockingCloseBackend {
+        state: Arc<(Mutex<BlockingCloseState>, Condvar)>,
+    }
+
+    #[derive(Clone)]
+    struct BlockingCloseCancellation {
+        state: Arc<(Mutex<BlockingCloseState>, Condvar)>,
+    }
+
+    struct BlockingCloseDriver {
+        state: Arc<(Mutex<BlockingCloseState>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct CommitCloseState {
+        next_calls: usize,
+        commit_entered: bool,
+        release_commit: bool,
+        cancellations: usize,
+        closes: usize,
+    }
+
+    struct CommitCloseBackend {
+        state: Arc<(Mutex<CommitCloseState>, Condvar)>,
+    }
+
+    #[derive(Clone)]
+    struct CommitCloseCancellation {
+        state: Arc<(Mutex<CommitCloseState>, Condvar)>,
+    }
+
+    struct CommitCloseDriver {
+        state: Arc<(Mutex<CommitCloseState>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct WaitingBoundaryState {
+        next_calls: usize,
+        cancellations: usize,
+        closes: usize,
+    }
+
+    struct WaitingBoundaryBackend {
+        state: Arc<(Mutex<WaitingBoundaryState>, Condvar)>,
+    }
+
+    #[derive(Clone)]
+    struct WaitingBoundaryCancellation {
+        state: Arc<(Mutex<WaitingBoundaryState>, Condvar)>,
+    }
+
+    struct WaitingBoundaryDriver {
+        state: Arc<(Mutex<WaitingBoundaryState>, Condvar)>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TerminalInput {
+        Close,
+        Eof,
+        Invalid,
+    }
+
+    #[derive(Default)]
+    struct FrameWriteBarrierState {
+        frames: usize,
+        reached: bool,
+        released: bool,
+    }
+
+    struct FrameWriteBarrier {
+        writer: UnixStream,
+        target_frame: usize,
+        state: Arc<(Mutex<FrameWriteBarrierState>, Condvar)>,
+    }
+
+    impl ChatSubscriptionCancellation for BlockingCloseCancellation {
+        fn cancel(&self) -> Result<(), CancellationError> {
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().expect("blocking close state");
+            state.cancelled = true;
+            changed.notify_all();
+            Ok(())
+        }
+    }
+
+    impl ChatSubscriptionBackend for BlockingCloseBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(BlockingCloseCancellation {
+                state: Arc::clone(&self.state),
+            })
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::new(
+                "blocking-close-fixture",
+                ReplaySupport::Cursor,
+                false,
+                NonZeroU16::new(1).expect("one is nonzero"),
+                vec![EventKind::Heartbeat],
+            )
+            .expect("fixture capabilities")
+        }
+
+        fn subscribe(
+            &mut self,
+            _request: &SubscribeRequest,
+        ) -> Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+            Ok(Box::new(BlockingCloseDriver {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    impl ChatSubscriptionDriver for BlockingCloseDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(BlockingCloseCancellation {
+                state: Arc::clone(&self.state),
+            })
+        }
+
+        fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().expect("blocking close state");
+            state.entered = true;
+            changed.notify_all();
+            while !state.cancelled {
+                state = changed.wait(state).expect("blocking close wait");
+            }
+            Err(BackendFailure::new(
+                "fixture_cancelled",
+                "fixture receive was interrupted by Close",
+                true,
+            )
+            .expect("fixture cancellation failure"))
+        }
+
+        fn acknowledge(&mut self, _delivery_id: &DeliveryId) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), BackendFailure> {
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().expect("blocking close state");
+            assert!(state.cancelled, "Close must follow receive cancellation");
+            state.closed = true;
+            changed.notify_all();
+            Ok(())
+        }
+    }
+
+    impl ChatSubscriptionCancellation for CommitCloseCancellation {
+        fn cancel(&self) -> Result<(), CancellationError> {
+            let (state, changed) = &*self.state;
+            state.lock().expect("commit-close state").cancellations += 1;
+            changed.notify_all();
+            Ok(())
+        }
+    }
+
+    impl ChatSubscriptionBackend for CommitCloseBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(CommitCloseCancellation {
+                state: Arc::clone(&self.state),
+            })
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::new(
+                "commit-close-fixture",
+                ReplaySupport::Cursor,
+                false,
+                NonZeroU16::new(1).expect("one is nonzero"),
+                vec![EventKind::Checkpoint, EventKind::Heartbeat],
+            )
+            .expect("fixture capabilities")
+        }
+
+        fn subscribe(
+            &mut self,
+            _request: &SubscribeRequest,
+        ) -> Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+            Ok(Box::new(CommitCloseDriver {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    impl ChatSubscriptionDriver for CommitCloseDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(CommitCloseCancellation {
+                state: Arc::clone(&self.state),
+            })
+        }
+
+        fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+            let (state, _) = &*self.state;
+            let mut state = state.lock().expect("commit-close state");
+            state.next_calls += 1;
+            assert_eq!(
+                state.next_calls, 1,
+                "Close must be consumed before another Next"
+            );
+            drop(state);
+            DeliveryBatch::new(
+                EventSequence::new(1).expect("sequence"),
+                ProviderCursor::new("cursor-one").expect("cursor"),
+                DeliveryId::new("delivery-one").expect("delivery"),
+                vec![CommittableEvent::Checkpoint],
+            )
+            .map(SubscriptionItem::Batch)
+            .map(Some)
+            .map_err(|error| {
+                BackendFailure::new("fixture", error.to_string(), false)
+                    .expect("fixture diagnostic")
+            })
+        }
+
+        fn acknowledge(&mut self, delivery_id: &DeliveryId) -> Result<(), BackendFailure> {
+            assert_eq!(delivery_id.as_str(), "delivery-one");
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().expect("commit-close state");
+            state.commit_entered = true;
+            changed.notify_all();
+            while !state.release_commit {
+                state = changed.wait(state).expect("commit-close wait");
+            }
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), BackendFailure> {
+            self.state.0.lock().expect("commit-close state").closes += 1;
+            Ok(())
+        }
+    }
+
+    impl ChatSubscriptionCancellation for WaitingBoundaryCancellation {
+        fn cancel(&self) -> Result<(), CancellationError> {
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().expect("waiting-boundary state");
+            state.cancellations += 1;
+            changed.notify_all();
+            Ok(())
+        }
+    }
+
+    impl ChatSubscriptionBackend for WaitingBoundaryBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(WaitingBoundaryCancellation {
+                state: Arc::clone(&self.state),
+            })
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::new(
+                "waiting-boundary-fixture",
+                ReplaySupport::Cursor,
+                false,
+                NonZeroU16::new(1).expect("one is nonzero"),
+                vec![EventKind::Heartbeat],
+            )
+            .expect("fixture capabilities")
+        }
+
+        fn subscribe(
+            &mut self,
+            _request: &SubscribeRequest,
+        ) -> Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+            Ok(Box::new(WaitingBoundaryDriver {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    impl ChatSubscriptionDriver for WaitingBoundaryDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(WaitingBoundaryCancellation {
+                state: Arc::clone(&self.state),
+            })
+        }
+
+        fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().expect("waiting-boundary state");
+            state.next_calls += 1;
+            assert_eq!(
+                state.next_calls, 1,
+                "terminal intent must be consumed before another Next"
+            );
+            changed.notify_all();
+            Ok(Some(SubscriptionItem::Heartbeat(Heartbeat::new(
+                EventSequence::new(1).expect("sequence"),
+            ))))
+        }
+
+        fn acknowledge(&mut self, _delivery_id: &DeliveryId) -> Result<(), BackendFailure> {
+            panic!("heartbeat fixture cannot be acknowledged")
+        }
+
+        fn close(&mut self) -> Result<(), BackendFailure> {
+            let (state, changed) = &*self.state;
+            state.lock().expect("waiting-boundary state").closes += 1;
+            changed.notify_all();
+            Ok(())
+        }
+    }
+
+    impl Write for FrameWriteBarrier {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writer.write_all(bytes)?;
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().expect("frame-write barrier state");
+            state.frames += 1;
+            if state.frames == self.target_frame {
+                state.reached = true;
+                changed.notify_all();
+                while !state.released {
+                    state = changed.wait(state).expect("frame-write barrier wait");
+                }
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.writer.flush()
+        }
+    }
+
+    fn wait_for_write_barrier(state: &Arc<(Mutex<FrameWriteBarrierState>, Condvar)>) {
+        let (state, changed) = &**state;
+        let state = state.lock().expect("frame-write barrier state");
+        let (state, timeout) = changed
+            .wait_timeout_while(state, Duration::from_secs(2), |state| !state.reached)
+            .expect("frame-write barrier wait");
+        assert!(!timeout.timed_out(), "server did not reach write barrier");
+        assert!(state.reached);
+    }
+
+    fn release_write_barrier(state: &Arc<(Mutex<FrameWriteBarrierState>, Condvar)>) {
+        let (state, changed) = &**state;
+        state.lock().expect("frame-write barrier state").released = true;
+        changed.notify_all();
+    }
+
+    fn wait_for_terminal_intent(
+        synchronization: &HostReadSynchronization,
+        expected_phase: ReadPhase,
+    ) {
+        let state = synchronization.lock();
+        let (state, timeout) = synchronization
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(2), |state| {
+                !state.terminal_intent || state.phase != expected_phase
+            })
+            .expect("host-read synchronization wait");
+        assert!(
+            !timeout.timed_out(),
+            "terminal intent was not registered in {expected_phase:?}; observed {:?}",
+            state.phase
+        );
+        assert!(state.terminal_intent);
+        assert_eq!(state.phase, expected_phase);
+    }
+
+    fn send_terminal_input(input: TerminalInput, client: &mut FramedIo<UnixStream, UnixStream>) {
+        match input {
+            TerminalInput::Close => client.send(&ClientFrame::Close).expect("send Close"),
+            TerminalInput::Eof => client
+                .writer
+                .shutdown(Shutdown::Write)
+                .expect("close client write half"),
+            TerminalInput::Invalid => client
+                .send(&ClientFrame::Hello {
+                    min_version: PROTOCOL_VERSION,
+                    max_version: PROTOCOL_VERSION,
+                })
+                .expect("send invalid control frame"),
+        }
+    }
+
+    fn assert_terminal_result(input: TerminalInput, result: Result<(), PluginError>) {
+        match input {
+            TerminalInput::Close | TerminalInput::Eof => {
+                result.expect("Close and EOF are clean terminal controls")
+            }
+            TerminalInput::Invalid => {
+                let error = result.expect_err("invalid control must fail the protocol");
+                assert_eq!(error.code(), "unexpected_frame");
+            }
+        }
     }
 
     struct FailAfterFirstFrame {
@@ -1454,6 +2495,131 @@ mod tests {
     }
 
     #[test]
+    fn legacy_serve_accepts_a_read_only_non_send_input() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        let mut backend = CloseCountingBackend {
+            closes: Arc::clone(&closes),
+            acknowledgements: Arc::clone(&acknowledgements),
+        };
+        let mut input = Vec::new();
+        append_frame(
+            &mut input,
+            &ClientFrame::Hello {
+                min_version: PROTOCOL_VERSION,
+                max_version: PROTOCOL_VERSION,
+            },
+        );
+        append_frame(
+            &mut input,
+            &ClientFrame::Start {
+                channel_ids: vec!["channels/one".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                max_uncommitted: 1,
+                resume_from: Some("cursor-zero".to_owned()),
+                backend_configuration: None,
+            },
+        );
+        append_frame(&mut input, &ClientFrame::Close);
+        serve(
+            &mut backend,
+            LegacyReadOnlyInput {
+                inner: Cursor::new(input),
+                _not_send: Rc::new(()),
+            },
+            Vec::<u8>::new(),
+        )
+        .expect("legacy generic serve remains compatible");
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eventfd_cancellation_wake_retries_eintr_then_succeeds() {
+        let mut attempts = 0_u8;
+        interruptible_fd_input::signal_eventfd_with(|| {
+            attempts = attempts.saturating_add(1);
+            if attempts == 1 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(attempts, 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn eventfd_cancellation_wake_retries_eintr_then_accepts_saturation() {
+        let mut attempts = 0_u8;
+        interruptible_fd_input::signal_eventfd_with(|| {
+            attempts = attempts.saturating_add(1);
+            if attempts == 1 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+        });
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn natural_end_interrupts_and_joins_host_input_actor_with_peer_open() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let (client, server) = UnixStream::pair().expect("create protocol socket pair");
+        let server_reader = server.try_clone().expect("clone server reader");
+        let server_closes = Arc::clone(&closes);
+        let (completed, completed_receiver) = mpsc::sync_channel(1);
+        let server_thread = thread::spawn(move || {
+            let mut backend = NaturalEndBackend {
+                closes: server_closes,
+            };
+            let result = serve_interruptible(&mut backend, server_reader, server);
+            completed
+                .send(result)
+                .expect("publish natural-End server result");
+        });
+        let client_reader = client.try_clone().expect("clone client reader");
+        let mut client = FramedIo::new(client_reader, client);
+        client
+            .send(&ClientFrame::Hello {
+                min_version: PROTOCOL_VERSION,
+                max_version: PROTOCOL_VERSION,
+            })
+            .expect("send Hello");
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive Hello"),
+            Some(ServerFrame::Hello { .. })
+        ));
+        client
+            .send(&ClientFrame::Start {
+                channel_ids: vec!["channels/one".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                max_uncommitted: 1,
+                resume_from: Some("cursor-zero".to_owned()),
+                backend_configuration: None,
+            })
+            .expect("send Start");
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive Subscribed"),
+            Some(ServerFrame::Subscribed)
+        ));
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive End"),
+            Some(ServerFrame::End)
+        ));
+
+        completed_receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("server joins its input actor without peer EOF")
+            .expect("natural End is clean");
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        drop(client);
+        server_thread.join().expect("server thread joins");
+    }
+
+    #[test]
     fn server_close_frame_reaches_provider_without_acknowledging() {
         assert_eq!(run_server_cancellation(true), (1, 0));
     }
@@ -1461,6 +2627,380 @@ mod tests {
     #[test]
     fn server_eof_reaches_provider_without_acknowledging() {
         assert_eq!(run_server_cancellation(false), (1, 0));
+    }
+
+    #[test]
+    fn close_interrupts_blocked_next_and_runs_semantic_driver_cleanup() {
+        let state = Arc::new((Mutex::new(BlockingCloseState::default()), Condvar::new()));
+        let server_state = Arc::clone(&state);
+        let (client, server) = UnixStream::pair().expect("create protocol socket pair");
+        let server_reader = server.try_clone().expect("clone server reader");
+        let server_thread = thread::spawn(move || {
+            let mut backend = BlockingCloseBackend {
+                state: server_state,
+            };
+            serve_interruptible(&mut backend, server_reader, server)
+        });
+        let client_reader = client.try_clone().expect("clone client reader");
+        let mut client = FramedIo::new(client_reader, client);
+        client
+            .send(&ClientFrame::Hello {
+                min_version: PROTOCOL_VERSION,
+                max_version: PROTOCOL_VERSION,
+            })
+            .expect("send Hello");
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive Hello"),
+            Some(ServerFrame::Hello { .. })
+        ));
+        client
+            .send(&ClientFrame::Start {
+                channel_ids: vec!["channels/one".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                max_uncommitted: 1,
+                resume_from: Some("cursor-zero".to_owned()),
+                backend_configuration: None,
+            })
+            .expect("send Start");
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive Subscribed"),
+            Some(ServerFrame::Subscribed)
+        ));
+        let (state_lock, changed) = &*state;
+        let mut observed = state_lock.lock().expect("blocking close state");
+        while !observed.entered {
+            observed = changed.wait(observed).expect("wait for blocked Next");
+        }
+        drop(observed);
+
+        client.send(&ClientFrame::Close).expect("send Close");
+        server_thread
+            .join()
+            .expect("server thread joins")
+            .expect("Close is clean");
+        let observed = state_lock.lock().expect("blocking close state");
+        assert!(
+            observed.cancelled,
+            "Close must interrupt the blocked receive"
+        );
+        assert!(
+            observed.closed,
+            "semantic driver cleanup must complete before serve returns"
+        );
+    }
+
+    #[test]
+    fn close_during_commit_queues_without_cancelling_and_prevents_another_next() {
+        let state = Arc::new((Mutex::new(CommitCloseState::default()), Condvar::new()));
+        let server_state = Arc::clone(&state);
+        let (client, server) = UnixStream::pair().expect("create protocol socket pair");
+        let server_reader = server.try_clone().expect("clone server reader");
+        let server_thread = thread::spawn(move || {
+            let mut backend = CommitCloseBackend {
+                state: server_state,
+            };
+            serve_interruptible(&mut backend, server_reader, server)
+        });
+        let client_reader = client.try_clone().expect("clone client reader");
+        let mut client = FramedIo::new(client_reader, client);
+        client
+            .send(&ClientFrame::Hello {
+                min_version: PROTOCOL_VERSION,
+                max_version: PROTOCOL_VERSION,
+            })
+            .expect("send Hello");
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive Hello"),
+            Some(ServerFrame::Hello { .. })
+        ));
+        client
+            .send(&ClientFrame::Start {
+                channel_ids: vec!["channels/one".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                max_uncommitted: 1,
+                resume_from: Some("cursor-zero".to_owned()),
+                backend_configuration: None,
+            })
+            .expect("send Start");
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive Subscribed"),
+            Some(ServerFrame::Subscribed)
+        ));
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive delivery"),
+            Some(ServerFrame::Item { .. })
+        ));
+        client
+            .send(&ClientFrame::Commit {
+                sequence: 1,
+                delivery_id: "delivery-one".to_owned(),
+            })
+            .expect("send Commit");
+        let (state_lock, changed) = &*state;
+        let mut observed = state_lock.lock().expect("commit-close state");
+        while !observed.commit_entered {
+            observed = changed.wait(observed).expect("wait for Commit");
+        }
+        drop(observed);
+        client
+            .send(&ClientFrame::Close)
+            .expect("queue Close during Commit");
+        thread::sleep(Duration::from_millis(20));
+        let mut observed = state_lock.lock().expect("commit-close state");
+        assert_eq!(observed.cancellations, 0, "Close cannot cancel Commit");
+        assert_eq!(observed.closes, 0, "semantic Close waits for Commit");
+        assert_eq!(observed.next_calls, 1);
+        observed.release_commit = true;
+        changed.notify_all();
+        drop(observed);
+
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive Committed"),
+            Some(ServerFrame::Committed { sequence: 1 })
+        ));
+        server_thread
+            .join()
+            .expect("server thread joins")
+            .expect("queued Close is clean");
+        let observed = state_lock.lock().expect("commit-close state");
+        assert_eq!(observed.cancellations, 0);
+        assert_eq!(observed.closes, 1);
+        assert_eq!(observed.next_calls, 1);
+    }
+
+    #[test]
+    fn every_terminal_control_at_commit_tail_is_consumed_before_another_next() {
+        for input in [
+            TerminalInput::Close,
+            TerminalInput::Eof,
+            TerminalInput::Invalid,
+        ] {
+            let state = Arc::new((
+                Mutex::new(CommitCloseState {
+                    release_commit: true,
+                    ..CommitCloseState::default()
+                }),
+                Condvar::new(),
+            ));
+            let synchronization = Arc::new(HostReadSynchronization::new());
+            let write_barrier = Arc::new((
+                Mutex::new(FrameWriteBarrierState::default()),
+                Condvar::new(),
+            ));
+            let server_state = Arc::clone(&state);
+            let server_synchronization = Arc::clone(&synchronization);
+            let server_write_barrier = Arc::clone(&write_barrier);
+            let (client, server) = UnixStream::pair().expect("create protocol socket pair");
+            let server_reader = server.try_clone().expect("clone server reader");
+            let server_thread = thread::spawn(move || {
+                let mut backend = CommitCloseBackend {
+                    state: server_state,
+                };
+                let mut subscription =
+                    ChatSubscription::open(&mut backend, &fixture_request()).expect("subscribe");
+                let result = serve_subscription_synchronized(
+                    &mut subscription,
+                    server_reader,
+                    FrameWriteBarrier {
+                        writer: server,
+                        target_frame: 2,
+                        state: server_write_barrier,
+                    },
+                    server_synchronization,
+                );
+                subscription.close().expect("semantic Close");
+                result
+            });
+            let client_reader = client.try_clone().expect("clone client reader");
+            let mut client = FramedIo::new(client_reader, client);
+            assert!(matches!(
+                client.receive::<ServerFrame>().expect("receive delivery"),
+                Some(ServerFrame::Item { .. })
+            ));
+            client
+                .send(&ClientFrame::Commit {
+                    sequence: 1,
+                    delivery_id: "delivery-one".to_owned(),
+                })
+                .expect("send Commit");
+            wait_for_write_barrier(&write_barrier);
+
+            send_terminal_input(input, &mut client);
+            wait_for_terminal_intent(&synchronization, ReadPhase::CommitActive);
+            assert_eq!(
+                state.0.lock().expect("commit-tail state").cancellations,
+                0,
+                "{input:?} must not cancel an active Commit"
+            );
+            release_write_barrier(&write_barrier);
+
+            assert!(matches!(
+                client.receive::<ServerFrame>().expect("receive Committed"),
+                Some(ServerFrame::Committed { sequence: 1 })
+            ));
+            let result = server_thread.join().expect("server thread joins");
+            assert_terminal_result(input, result);
+            let observed = state.0.lock().expect("commit-tail state");
+            assert!(observed.commit_entered);
+            assert_eq!(observed.cancellations, 0);
+            assert_eq!(observed.closes, 1);
+            assert_eq!(observed.next_calls, 1);
+        }
+    }
+
+    #[test]
+    fn every_terminal_control_at_waiting_next_arms_sticky_cancellation() {
+        for input in [
+            TerminalInput::Close,
+            TerminalInput::Eof,
+            TerminalInput::Invalid,
+        ] {
+            let state = Arc::new((Mutex::new(WaitingBoundaryState::default()), Condvar::new()));
+            let synchronization = Arc::new(HostReadSynchronization::new());
+            let write_barrier = Arc::new((
+                Mutex::new(FrameWriteBarrierState::default()),
+                Condvar::new(),
+            ));
+            let server_state = Arc::clone(&state);
+            let server_synchronization = Arc::clone(&synchronization);
+            let server_write_barrier = Arc::clone(&write_barrier);
+            let (client, server) = UnixStream::pair().expect("create protocol socket pair");
+            let server_reader = server.try_clone().expect("clone server reader");
+            let server_thread = thread::spawn(move || {
+                let mut backend = WaitingBoundaryBackend {
+                    state: server_state,
+                };
+                let mut subscription =
+                    ChatSubscription::open(&mut backend, &fixture_request()).expect("subscribe");
+                let result = serve_subscription_synchronized(
+                    &mut subscription,
+                    server_reader,
+                    FrameWriteBarrier {
+                        writer: server,
+                        target_frame: 1,
+                        state: server_write_barrier,
+                    },
+                    server_synchronization,
+                );
+                subscription.close().expect("semantic Close");
+                result
+            });
+            let client_reader = client.try_clone().expect("clone client reader");
+            let mut client = FramedIo::new(client_reader, client);
+            wait_for_write_barrier(&write_barrier);
+            {
+                let observed = synchronization.lock();
+                assert_eq!(observed.phase, ReadPhase::WaitingNext);
+                assert!(!observed.terminal_intent);
+            }
+
+            send_terminal_input(input, &mut client);
+            wait_for_terminal_intent(&synchronization, ReadPhase::WaitingNext);
+            {
+                let (state_lock, changed) = &*state;
+                let observed = state_lock.lock().expect("waiting-boundary state");
+                let (observed, timeout) = changed
+                    .wait_timeout_while(observed, Duration::from_secs(2), |state| {
+                        state.cancellations == 0
+                    })
+                    .expect("wait for sticky cancellation");
+                assert!(
+                    !timeout.timed_out(),
+                    "{input:?} did not arm sticky cancellation"
+                );
+                assert_eq!(observed.cancellations, 1);
+            }
+            release_write_barrier(&write_barrier);
+
+            assert!(matches!(
+                client.receive::<ServerFrame>().expect("receive heartbeat"),
+                Some(ServerFrame::Item {
+                    item: WireItem::Heartbeat { sequence: 1 }
+                })
+            ));
+            let result = server_thread.join().expect("server thread joins");
+            assert_terminal_result(input, result);
+            let observed = state.0.lock().expect("waiting-boundary state");
+            assert_eq!(observed.cancellations, 1);
+            assert_eq!(observed.closes, 1);
+            assert_eq!(observed.next_calls, 1);
+        }
+    }
+
+    #[test]
+    fn duplicate_commit_is_rejected_without_overlapping_commit_or_starting_next() {
+        let state = Arc::new((Mutex::new(CommitCloseState::default()), Condvar::new()));
+        let server_state = Arc::clone(&state);
+        let (client, server) = UnixStream::pair().expect("create protocol socket pair");
+        let server_reader = server.try_clone().expect("clone server reader");
+        let server_thread = thread::spawn(move || {
+            let mut backend = CommitCloseBackend {
+                state: server_state,
+            };
+            serve_interruptible(&mut backend, server_reader, server)
+        });
+        let client_reader = client.try_clone().expect("clone client reader");
+        let mut client = FramedIo::new(client_reader, client);
+        client
+            .send(&ClientFrame::Hello {
+                min_version: PROTOCOL_VERSION,
+                max_version: PROTOCOL_VERSION,
+            })
+            .expect("send Hello");
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive Hello"),
+            Some(ServerFrame::Hello { .. })
+        ));
+        client
+            .send(&ClientFrame::Start {
+                channel_ids: vec!["channels/one".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                max_uncommitted: 1,
+                resume_from: Some("cursor-zero".to_owned()),
+                backend_configuration: None,
+            })
+            .expect("send Start");
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive Subscribed"),
+            Some(ServerFrame::Subscribed)
+        ));
+        assert!(matches!(
+            client.receive::<ServerFrame>().expect("receive delivery"),
+            Some(ServerFrame::Item { .. })
+        ));
+        let commit = ClientFrame::Commit {
+            sequence: 1,
+            delivery_id: "delivery-one".to_owned(),
+        };
+        client.send(&commit).expect("send first Commit");
+        let (state_lock, changed) = &*state;
+        let mut observed = state_lock.lock().expect("commit-close state");
+        while !observed.commit_entered {
+            observed = changed.wait(observed).expect("wait for Commit");
+        }
+        drop(observed);
+        client.send(&commit).expect("send duplicate Commit");
+        thread::sleep(Duration::from_millis(20));
+        let mut observed = state_lock.lock().expect("commit-close state");
+        assert_eq!(observed.next_calls, 1);
+        observed.release_commit = true;
+        changed.notify_all();
+        drop(observed);
+        assert!(matches!(
+            client
+                .receive::<ServerFrame>()
+                .expect("receive first Committed"),
+            Some(ServerFrame::Committed { sequence: 1 })
+        ));
+        let error = server_thread
+            .join()
+            .expect("server thread joins")
+            .expect_err("duplicate Commit is a protocol failure");
+        assert_eq!(error.code(), "unexpected_frame");
+        let observed = state_lock.lock().expect("commit-close state");
+        assert_eq!(observed.cancellations, 0);
+        assert_eq!(observed.closes, 1);
+        assert_eq!(observed.next_calls, 1);
     }
 
     #[test]

@@ -1124,11 +1124,15 @@ impl std::error::Error for CancellationError {}
 
 /// Independent, bounded cancellation authority for establishment and blocked receive operations.
 ///
-/// Implementations must return within their documented bound. `Ok(())` proves that the operation
-/// was interrupted and all backend-owned work was cleaned up. If that proof is unavailable, they
-/// return [`CancellationError::CleanupUncertain`] rather than claiming success.
+/// Cancellation is terminal and sticky for one backend generation. Implementations must return
+/// within their documented bound, and a receive racing immediately after cancellation starts must
+/// also return promptly rather than missing a one-shot wakeup. `Ok(())` proves that the operation
+/// was interrupted (or prevented from starting) and all backend-owned work was cleaned up. If that
+/// proof is unavailable, they return [`CancellationError::CleanupUncertain`] rather than claiming
+/// success.
 pub trait ChatSubscriptionCancellation: Send + Sync {
-    /// Interrupt any in-progress establishment or receive and complete bounded cleanup.
+    /// Permanently interrupt any in-progress or racing establishment/receive and complete bounded
+    /// cleanup. A cancelled generation must not admit later blocking work.
     fn cancel(&self) -> Result<(), CancellationError>;
 }
 
@@ -1149,8 +1153,9 @@ pub trait ChatSubscriptionDriver: Send {
     /// Cooperatively stop this live generation without acknowledging an outstanding delivery.
     ///
     /// Static backends that need no explicit cancellation may use this default. Process adapters
-    /// should send their protocol's close frame. A host must still supervise and bound the process
-    /// lifetime because a provider blocked inside `next_item` may not observe cooperative close.
+    /// should send their protocol's close frame. A concurrent protocol reader can use the sticky
+    /// cancellation authority to retire a blocked `next_item`, but the host must still supervise
+    /// and bound the process lifetime for an implementation that ignores cancellation.
     fn close(&mut self) -> Result<(), BackendFailure> {
         Ok(())
     }
@@ -1379,9 +1384,9 @@ impl ChatSubscription {
     /// Cooperatively close this live generation.
     ///
     /// An outstanding delivery is deliberately left unacknowledged and may replay after the owner
-    /// reconnects from its last durable cursor. Process-plugin hosts must also retain a bounded
-    /// child supervisor: cooperative close cannot interrupt a provider implementation blocked in
-    /// its own `next_item` call.
+    /// reconnects from its last durable cursor. A protocol host may pair Close with this
+    /// generation's sticky cancellation authority to interrupt a blocked `next_item`; it must
+    /// still retain a bounded child supervisor for an implementation that ignores cancellation.
     ///
     /// # Errors
     ///
@@ -2485,5 +2490,34 @@ mod tests {
             SubscriptionError::Backend(ref failure) if failure.code() == "fixture_cancelled"
         ));
         receiver.join().expect("receive thread joins");
+    }
+
+    #[test]
+    fn cancellation_is_sticky_across_a_receive_start_race() {
+        let state = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancellation = BlockingCancellation {
+            state: Arc::clone(&state),
+        };
+        let (entered, entered_receiver) = mpsc::sync_channel(1);
+        let mut backend = BlockingReceiveBackend {
+            cancellation,
+            entered: Some(entered),
+        };
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &request()).expect("subscription opens");
+        subscription
+            .cancellation()
+            .cancel()
+            .expect("pre-receive cancellation cleanup is certain");
+        let error = subscription
+            .next_item()
+            .expect_err("a receive admitted after terminal cancellation cannot block");
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the racing receive was entered and observed sticky cancellation");
+        assert!(matches!(
+            error,
+            SubscriptionError::Backend(ref failure) if failure.code() == "fixture_cancelled"
+        ));
     }
 }

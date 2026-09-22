@@ -126,6 +126,28 @@ agentctl chat status \
   --bridge-state /home/me/.local/state/agentctl/project-chat
 ```
 
+Inspect one exact active retained request for latency/audit evidence without a
+provider, outbound helper, Herdr call, or state write:
+
+```sh
+agentctl chat inspect \
+  --bridge-state /home/me/.local/state/agentctl/project-chat \
+  --request 64_LOWERCASE_HEX_CHARACTERS
+```
+
+The stable output schema is `agentctl-chat-request-inspection/v1`. It contains
+the request phase and source IDs; `provenance.host_batch_sequence`,
+`provider_sequence`, `delivery_id`, and cursor; `timestamps.admitted_at_millis`,
+`delivery_started_at_millis`, `delivered_at_millis`, `ack_started_at_millis`,
+and `ack_completed_at_millis`; delivery and acknowledgement receipts; and a
+bounded `replies` array with each ordinal, phase, operation ID, provider message
+ID, `captured_at_millis`, and `sent_at_millis`. Start timestamps record the first
+durable attempt. Delivery, ACK, and reply completion timestamps remain null
+after failed or outcome-unknown operations and are written only with positive
+Herdr/provider evidence. The command accepts one exact key and reports only an
+active retained request. An acceptance harness that later calls `chat close`
+must copy and fsync this inspection document first.
+
 An owner or operator can explicitly publish a new root message through the
 configured outbound helper without pretending it is a reply:
 
@@ -182,6 +204,31 @@ costs are outside the provider-neutral host and can differ substantially between
 plugins. Disable swap for a latency-sensitive bridge only after giving the
 provider enough physical-memory headroom.
 
+Derive the hard stop interval from the selected plugin manifest rather than
+copying a universal number. Before Hello completes, the host may need
+`hello_seconds + close_seconds + shutdown_grace_seconds + 7` seconds. After
+Hello, it may need `close_seconds + shutdown_grace_seconds + 7`. The final seven
+seconds reserve the process supervisor's two-second forced-reap bound and five
+seconds for host reconciliation and worker joins. Start is interruptible after
+Hello, so its independent phase timeout is not additive. An admitted reaction
+or reply helper separately owns `outbound_command.timeout_millis +
+outbound_command.shutdown_grace_millis + 7000` milliseconds. Set
+`TimeoutStopSec` to at least the maximum of the applicable provider window and
+that outbound window, plus measured service-manager scheduling margin. The
+maximum accepted outbound window is 67 seconds. At startup the host pins the
+complete selected provider timeout tuple. A later generation whose manifest
+differs is rejected until the service restarts, so the configured outer bound
+cannot silently become stale.
+
+With systemd 258 or newer, a synchronous same-binary `ExecStop` can address only
+the exact main-process identity. `graceful-stop-main` opens a pidfd for
+systemd's `MAINPID`, requires its inode to equal `MAINPIDFDID`, sends SIGTERM
+through that pidfd, and waits for exact process exit. It does not return at its
+70-second diagnostic threshold, because returning would begin a second stop
+phase. Pair it with `TimeoutStopFailureMode=kill`: at the one service-manager
+deadline, systemd kills the complete control group rather than starting another
+grace interval.
+
 For example, a user service can run the same foreground command (replace every
 absolute placeholder and tune the resource ceilings from a measured provider
 probe):
@@ -195,14 +242,19 @@ After=herdr.service
 Type=exec
 Environment=AGENTCTL_HOME=/home/USER/.agentctl
 ExecStart=/absolute/path/agentctl --registry /work/project/.agentctl chat run --bridge-state /home/USER/.local/state/agentctl/project-chat
+ExecStop=/absolute/path/agentctl chat graceful-stop-main --main-pid ${MAINPID} --main-pidfd-id ${MAINPIDFDID}
 Restart=on-failure
 RestartSec=2
 KillMode=control-group
 OOMPolicy=kill
-TimeoutStopSec=60
-TasksMax=2048
-MemoryMax=4G
+# Replace every value below with a measured deployment-specific value.
+TimeoutStopSec=<DERIVED_SECONDS_WITH_MARGIN>
+TimeoutStopFailureMode=kill
+TasksMax=<MEASURED_TASKS_WITH_HEADROOM>
+MemoryHigh=<MEASURED_RECLAIM_THRESHOLD>
+MemoryMax=<MEASURED_HARD_LIMIT>
 MemorySwapMax=0
+CPUQuota=<MEASURED_CPU_LIMIT>
 
 [Install]
 WantedBy=default.target
@@ -221,12 +273,19 @@ systemctl --user is-active agentctl-chat.service
 `enable --now` survives a user-manager restart; operation while the user is
 logged out additionally requires lingering to be enabled for that account.
 `Type=exec` makes an `active` transition contingent on successful executable
-startup. `KillMode=control-group` and the bounded stop deadline keep plugin and
-helper descendants inside the unit's cleanup boundary.
+startup. `KillMode=control-group` and the one derived stop deadline keep plugin
+and helper descendants inside the unit's cleanup boundary. Use the same pinned
+`agentctl` executable in `ExecStart` and `ExecStop`; a mutable symlink can make
+the control helper disagree with the running generation.
 
-The example ceilings are not minimum requirements or evidence about an
-unmeasured plugin. A provider that needs more than 2,048 tasks or 4 GiB must be
-given a measured larger bound; a smaller provider should use a smaller one.
+The resource tokens in the example are intentionally invalid placeholders, not
+defaults, minimums, or evidence about an unmeasured plugin. Measure the whole
+service cgroup—including every plugin and helper descendant—under bounded
+end-to-end load. Choose limits with explicit headroom, verify their parsed
+systemd values after reload, and then prove the selected envelope still meets
+the deployment's latency target. A `TasksMax` below a plugin's startup fan-out
+will prevent that generation from launching; an excessively loose limit does
+not provide useful containment.
 
 The host bounds retained requests, replies, retirement records, commit receipts, per-frame data, event drains,
 mailboxes, process cleanup admissions, and helper deadlines. Ordinary provider

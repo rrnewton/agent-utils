@@ -145,6 +145,18 @@ impl ProcessPluginCancellation {
         0
     }
 
+    /// No framed receive can run on an unsupported platform.
+    #[must_use]
+    pub fn receive_in_progress(&self) -> bool {
+        false
+    }
+
+    /// No graceful process shutdown can run on an unsupported platform.
+    #[must_use]
+    pub fn graceful_shutdown_in_progress(&self) -> bool {
+        false
+    }
+
     /// Refuse process cancellation on this unsupported platform.
     pub fn cancel(&self) -> io::Result<ExitStatus> {
         Err(unsupported())
@@ -257,5 +269,12 @@ mod tests {
         let error = ProcessPluginChild::spawn(Command::new("must-not-run"))
             .expect_err("non-Linux process plugins are unsupported");
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn cancellation_diagnostics_match_the_linux_public_surface() {
+        let cancellation = ProcessPluginCancellation { _private: () };
+        assert!(!cancellation.receive_in_progress());
+        assert!(!cancellation.graceful_shutdown_in_progress());
     }
 }
