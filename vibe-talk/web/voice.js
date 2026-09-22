@@ -1879,6 +1879,31 @@ function renderCannedPrompts() {
   }
 }
 
+/**
+ * Whether the tray of canned prompts is open.
+ *
+ * ONE BUTTON FOR ALL OF THEM, and the reason is arithmetic rather than tidiness. The bar is a
+ * single row on a 375px phone and its width is priced to the edge by the page suite; each canned
+ * prompt used to cost it a member, and the list is meant to GROW — custom prompts are the next
+ * thing asked for. A tray costs one slot however many prompts are in it.
+ *
+ * Not persisted, deliberately: it is where a menu happens to be standing, not a preference. It
+ * comes back shut on every load, and every render of the bar that takes the button away shuts it.
+ */
+let promptsOpen = false;
+
+/**
+ * Open or shut the tray, and say so on the button.
+ *
+ * `aria-expanded` on the opener and `hidden` on the tray are the same fact stated to two readers,
+ * and both are set here so they cannot come apart.
+ */
+function setPromptsOpen(open) {
+  promptsOpen = open === true;
+  el("prompts-tray").hidden = !promptsOpen;
+  el("prompts-open").setAttribute("aria-expanded", promptsOpen ? "true" : "false");
+}
+
 // --- the server ------------------------------------------------------------------------------
 
 /**
@@ -2394,11 +2419,11 @@ function placementChanged() {
 const PACK_VIEWS = {
   "discord-channel": ["discord"],
   "text-entry": ["voice"],
-  // Derived from the canned list rather than restated, and for the reason `#60
-  // canned-prompt-buttons` made that list in the first place: a third canned button is one entry
-  // there and must not need a second one here. They are all the same answer anyway — every one of
-  // them goes out through `sendUserMessage`.
-  ...Object.fromEntries(CANNED_PROMPTS.map((entry) => [entry.button, ["voice"]])),
+  // ONE LINE FOR ALL THE CANNED PROMPTS, which is the point of the tray: they used to be derived
+  // into this table one entry each, and every prompt added took another slot off a strip already
+  // priced to the edge of a 375px phone. The answer is the same for all of them anyway — every
+  // one goes out through `sendUserMessage`, which draws into the transcript and needs a live call.
+  "prompts-open": ["voice"],
 };
 
 /**
@@ -2437,6 +2462,12 @@ function renderControlBar() {
   el("text-entry").setAttribute("aria-pressed", typing ? "true" : "false");
   el("compose-text").hidden = !typing;
   el("send-text").hidden = !typing;
+  // A menu whose button has gone must go with it. Leaving Voice, leaving the main screen, or
+  // entering text mode all take the opener off the strip, and a tray left standing under a button
+  // that is no longer there is an orphan floating over the channel — and, worse, still clickable.
+  if (el("prompts-open").hidden && promptsOpen) {
+    setPromptsOpen(false);
+  }
   const members = [
     el("open-settings"),
     el("view-switch"),
@@ -8659,6 +8690,10 @@ for (const entry of CANNED_PROMPTS) {
   el(entry.field).value = storedPrompts()[entry.key];
   el(entry.field).addEventListener("change", promptsChanged);
   el(entry.button).addEventListener("click", () => {
+    // Shut FIRST, and whether or not the send goes. Choosing from a menu closes it — and when the
+    // send is refused the reason appears on the status line at the far end of the screen, which an
+    // open tray would be standing in front of.
+    setPromptsOpen(false);
     if (sendUserMessage(promptFor(entry))) {
       // AFTER the send, and only if it went: `sendUserMessage` says "Sent.", which is true of any
       // message. This says WHICH question was asked, because the button carries five letters.
@@ -8666,6 +8701,14 @@ for (const entry of CANNED_PROMPTS) {
     }
   });
 }
+// The opener. A plain toggle: the button that shows the tray is the button that hides it again,
+// which is the same interaction model `#text-entry` uses and the only one that needs no second
+// control and no tap-outside handler to escape from.
+el("prompts-open").addEventListener("click", () => setPromptsOpen(!promptsOpen));
+// ...and stated once at load, rather than left to the first tap. The markup ships shut, but shut is
+// a state the opener has to be ASSERTING for a screen reader to hear it — an `aria-expanded` that
+// only appears after somebody has already opened the tray is no use to the reader who needs it.
+setPromptsOpen(false);
 el("compose-text").addEventListener("keydown", (event) => {
   if (!event || event.key !== "Enter") {
     return;

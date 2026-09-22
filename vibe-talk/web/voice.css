@@ -1855,6 +1855,10 @@ body {
   align-items: center;
   gap: 0.4rem;
   min-width: 0;
+  /* What the prompts tray is positioned against. On the bar itself rather than on either mount,
+     because the bar is the element that moves between them — anchoring to a mount would mean the
+     tray knew which home the bar was in, which is the one thing nothing here may assume. */
+  position: relative;
 }
 
 /* THE property that makes the bar a container rather than a row of two things: it takes the space
@@ -1937,6 +1941,86 @@ body {
 .bar-button[aria-disabled="true"] {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/*
+ * The tray of canned prompts, hanging off the bar.
+ *
+ * OUT OF FLOW, and that is the property the whole arrangement rests on: the bar is one row whose
+ * width is priced to the edge of a 375px phone, and a tray that took part in that row would cost
+ * exactly what the buttons it replaced cost. Absolutely positioned, it costs nothing, and the
+ * number of prompts in it stops being a question the strip has an opinion about.
+ *
+ * IT OPENS AWAY FROM THE BAR'S EDGE. With the bar in the dock it opens upward, over the
+ * transcript; in the header it opens downward. Two rules rather than one, because the bar has two
+ * homes and a tray that always opened upward would open off the top of the screen in the header.
+ *
+ * It WRAPS. The list is meant to grow — custom prompts are the next thing — and a row of icons
+ * that scrolled sideways would have the reachability problem the bar has, in a smaller box.
+ */
+#prompts-tray {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding: 0.45rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.85rem;
+  /* Lifted off what it covers. The bar's own members sit ON the background; this one sits over a
+     transcript, and without a shadow the two read as one surface. */
+  box-shadow: 0 0.4rem 1.2rem rgb(0 0 0 / 35%);
+}
+
+#control-bar[data-placement="bottom"] #prompts-tray {
+  bottom: calc(100% + 0.35rem);
+}
+
+#control-bar[data-placement="top"] #prompts-tray {
+  top: calc(100% + 0.35rem);
+}
+
+/* A prompt inside the tray. Bigger than a bar button, because it is not competing for a row's
+   width any more and a menu item is a thing you read before you tap it. */
+.tray-button {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2.4rem;
+  padding: 0 0.7rem;
+  background: var(--bg);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 0.85rem;
+  font: inherit;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* The same argument as `.bar-button[aria-disabled="true"]` above, and deliberately the same
+   treatment: greyed, still hoverable, and the tooltip is what says why. The tray OPENS at idle so
+   that this state can be seen at all — a menu that refuses to open cannot explain itself. */
+.tray-button[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.tray-icon {
+  width: 1.15rem;
+  height: 1.15rem;
+  flex: 0 0 auto;
+}
+
+/* Beside the icon and at reading size, not the 0.55rem caption a bar button wears: the bar's
+   labels are squeezed under an icon in a 2.4rem strip, and nothing here is squeezed. */
+.tray-label {
+  font-size: 0.85rem;
 }
 
 /* `#83 channel-selector-in-bar`. The channel picker, sized to live in the bar rather than in a row

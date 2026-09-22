@@ -2103,14 +2103,20 @@ def _act_text_entry_open(driver: Driver) -> None:
 
 
 def _act_canned_prompts(driver: Driver) -> None:
-    """`#60 canned-prompt-buttons`: the bar packed with every button it has.
+    """`#60 canned-prompt-buttons`: the bar packed, with the tray of prompts open above it.
 
     Leaves text entry first, because the scene before this one is in it. The subject is PACKING —
-    gear, Type, Sumry, Blockers and the switch on one strip — and the iphone-se profile is the
-    frame that answers whether that survives a short, narrow phone.
+    gear, Type, Prompts and the switch on one strip, and the tray hanging above it — and the
+    iphone-se profile is the frame that answers whether that survives a short, narrow phone.
+
+    The tray is opened here rather than left shut because it is the half no fake DOM can check: it
+    is absolutely positioned, and whether an out-of-flow panel lands over the transcript or off the
+    side of a 375px screen is a question only a layout engine has an answer to.
     """
     driver.click("text-entry")
     driver.page.wait_for_function("() => window.__visible('view-switch')", timeout=5_000)
+    driver.click("prompts-open")
+    driver.page.wait_for_function("() => window.__visible('canned-blockers')", timeout=5_000)
     driver.settle(300)
 
 
@@ -2890,15 +2896,19 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="27-canned-prompts",
-        what="the control bar packed: gear, Type, Sumry, Blockers and the view switch",
+        what="the control bar packed: gear, Type, Prompts and the view switch, tray open above it",
         act=_act_canned_prompts,
         expect=(
             (
                 "every button the bar has is on it at once",
-                "['open-settings', 'text-entry', 'canned-summary', 'canned-blockers', "
+                "['open-settings', 'text-entry', 'prompts-open', "
                 "'view-switch'].every((id) => window.__visible(id))",
             ),
-            # THE packing claim, and the only place it can be answered: on a 375px phone five
+            (
+                "and the tray it opens really holds both prompts",
+                "['canned-summary', 'canned-blockers'].every((id) => window.__visible(id))",
+            ),
+            # THE packing claim, and the only place it can be answered: on a 375px phone four
             # controls have to fit a strip that also carries a switch with a 3.6rem word in it.
             # Nothing may hang past the bar's own right edge, because that is where the switch is.
             (
@@ -2914,10 +2924,26 @@ SCENES: tuple[Scene, ...] = (
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "
                 "return b.height < 70 && b.bottom <= p.top + 1; })()",
             ),
+            # The tray costs the strip NOTHING, which is the entire argument for replacing two
+            # members with one. Out of flow, so opening it must not make the bar taller — the
+            # assertion above already pins the height, and this one pins that the panel really is
+            # elsewhere: above the bar, inside the screen, and over something rather than beside it.
             (
-                "the heavier of the two canned buttons is drawn differently",
-                "getComputedStyle(document.getElementById('canned-blockers')).color !== "
-                "getComputedStyle(document.getElementById('canned-summary')).color",
+                "the tray hangs ABOVE the bar and stays on the screen",
+                "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
+                "const t = document.getElementById('prompts-tray').getBoundingClientRect(); "
+                "return t.bottom <= b.top + 1 && t.left >= -1 && "
+                "t.right <= document.documentElement.clientWidth + 1 && t.top >= -1 && "
+                "t.height > 20; })()",
+            ),
+            # ...and it is legible where it lands. An out-of-flow panel over a transcript with no
+            # background of its own is text on text, which is the failure a picture shows and an
+            # assertion about `hidden` never would.
+            (
+                "it is an opaque panel, not text floating over the transcript",
+                "(() => { const bg = getComputedStyle("
+                "document.getElementById('prompts-tray')).backgroundColor; "
+                "return bg !== 'transparent' && !/rgba\\(0, 0, 0, 0\\)/.test(bg); })()",
             ),
         ),
     ),
@@ -3724,9 +3750,10 @@ def check_state_controls() -> list[str]:
         # `#59 text-entry-button`. `view-switch` is the conversion -- the rest of the bar getting
         # out of the way -- and `send-text` is the geometry: the composer inside the bar's own box.
         "26-text-entry-open": ("view-switch", "send-text"),
-        # `#60 canned-prompt-buttons`. `canned-blockers` is the pack, `control-bar` is the geometry
-        # -- nothing clipped past the edge, and still one strip rather than two rows.
-        "27-canned-prompts": ("canned-blockers", "control-bar"),
+        # `#60 canned-prompt-buttons`. `prompts-tray` is the tray really being open, `control-bar`
+        # is the geometry -- nothing clipped past the edge, still one strip rather than two rows,
+        # and the panel above it rather than in it.
+        "27-canned-prompts": ("prompts-tray", "control-bar"),
         # `#44 live-push`. Pinned to the ABSENCE of a refresh as well as to the row, because "the
         # list has one more message in it" is satisfied by the 45-second background re-read this
         # feature exists to replace.

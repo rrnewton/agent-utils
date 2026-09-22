@@ -315,12 +315,21 @@ const FIXTURE_TREE = {
   // used to sit inside #scroll-area above the log, where reading anything scrolled it away and
   // scrolling back toward it loaded more history. `assertMarkupContains` below is what stops this
   // list from describing a page that put it back.
-  "bar-pack": ["discord-channel", "text-entry", "canned-summary", "canned-blockers"],
+  //
+  // The canned buttons USED to be here, one member each. They are in `#prompts-tray` now: the bar
+  // is one 375px row, each prompt cost it a slot, and the list is meant to grow. One opener costs
+  // one slot however many prompts it holds.
+  "bar-pack": ["discord-channel", "text-entry", "prompts-open"],
+  // The tray of canned prompts. A child of the BAR and not of the pack, and both halves of that
+  // matter: of the bar because the bar is what moves between the two mounts, and not of the pack
+  // because the pack scrolls sideways and a menu that can scroll out from under its own opener is
+  // not a menu. It costs the strip no width — see `barCostPx`, which skips it for that reason.
+  "prompts-tray": ["canned-summary", "canned-blockers"],
   // ...and the bar itself, in markup order, because "the toggle is the leftmost thing on the bar
   // once the gear has gone" is an ordering claim and a fixture that held the members in a flat
   // list could not check it. It is also what `setPlacement` re-parents, so the move has something
   // real to move.
-  "control-bar": ["open-settings", "bar-pack", "compose-text", "send-text", "view-switch"],
+  "control-bar": ["open-settings", "bar-pack", "prompts-tray", "compose-text", "send-text", "view-switch"],
 };
 
 /** Where web/voice.html defines an id: which line, and how deeply indented. */
@@ -2979,6 +2988,18 @@ function memberPx(id) {
   return minBoxPx(`#${id}`);
 }
 
+/**
+ * Children of the bar that take NO width from it, because they are not in its flow.
+ *
+ * Read out of the stylesheet rather than listed by hand: a member that stops being absolutely
+ * positioned starts costing the strip real width, and the budget below has to notice that on the
+ * same edit rather than on whichever later one happens to look.
+ */
+function outOfFlow(id) {
+  const declared = cssRules(CSS, `#${id}`).join("\n");
+  return /^(absolute|fixed)$/.test((cssValue(declared, "position") || "").trim());
+}
+
 /** What the bar costs as it is CURRENTLY drawn: the visible members, plus the gaps between them. */
 function barCostPx(page) {
   const gap = lengthPx(cssValue(cssBlock("#control-bar"), "gap"));
@@ -2986,6 +3007,9 @@ function barCostPx(page) {
   const shown = [];
   let cost = 0;
   for (const member of page.el("control-bar").children) {
+    if (outOfFlow(member.id)) {
+      continue;
+    }
     if (member.id === "bar-pack") {
       const inside = member.children.filter((kid) => !kid.hidden);
       if (!inside.length) {
@@ -3003,7 +3027,10 @@ function barCostPx(page) {
     cost += memberPx(member.id);
   }
   const boxes = page.el("control-bar").children.filter(
-    (member) => !member.hidden && (member.id !== "bar-pack" || member.children.some((k) => !k.hidden))
+    (member) =>
+      !member.hidden &&
+      !outOfFlow(member.id) &&
+      (member.id !== "bar-pack" || member.children.some((k) => !k.hidden))
   ).length;
   return { cost: cost + gap * Math.max(0, boxes - 1), shown };
 }
@@ -3054,7 +3081,7 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW AND IN BOTH MODES",
 
   // The call view: the gear, the three controls that speak to the agent, and the switch.
   const call = barCostPx(page);
-  assert.ok(call.shown.includes("canned-blockers"), "this is not the call view's full bar");
+  assert.ok(call.shown.includes("prompts-open"), "this is not the call view's full bar");
   assert.ok(call.cost <= budget, report("the call view", call));
 
   // The channel view: the same strip with the picker instead, which is the widest single member of
@@ -3073,20 +3100,24 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW AND IN BOTH MODES",
   assert.ok(typing.shown.includes("send-text"), "text entry is not open");
   assert.ok(typing.cost <= budget, report("text entry", typing));
 
-  // ...and the arithmetic is not vacuous: putting the whole pack on one view — which is what the
-  // page did before `PACK_VIEWS` decided per member — really does overflow.
-  const everything =
+  // ...and the arithmetic is not vacuous: the bar as it stood BEFORE the tray — the picker, the
+  // toggle, and every canned prompt a member in its own right, all on one view — really does
+  // overflow. That is the measurement the tray was built for, and stating it here is what stops a
+  // later prompt from being put back on the strip on the grounds that one more cannot hurt.
+  const packGap = lengthPx(cssValue(cssBlock("#bar-pack"), "gap"));
+  const eachOnTheStrip =
     memberPx("open-settings") +
     memberPx("discord-channel") +
     memberPx("text-entry") +
-    CANNED.reduce((total, entry) => total + memberPx(entry.button), 0) +
+    CANNED.length * minBoxPx(".bar-button") +
     memberPx("view-switch") +
-    lengthPx(cssValue(cssBlock("#bar-pack"), "gap")) * 3 +
+    packGap * (1 + CANNED.length) +
     lengthPx(cssValue(cssBlock("#control-bar"), "gap")) * 2;
   assert.ok(
-    everything > budget,
-    `all six members together need only ${everything}px of ${budget}px, so this test would pass ` +
-      "with every control on every view and is measuring nothing"
+    eachOnTheStrip > budget,
+    `the picker, the toggle and ${CANNED.length} canned prompts need only ${eachOnTheStrip}px of ` +
+      `${budget}px between them, so this test would pass with every control on every view and is ` +
+      "measuring nothing"
   );
 });
 
@@ -11759,7 +11790,7 @@ test("THE CANNED BUTTONS ARE A LIST, SO A THIRD ONE IS AN ENTRY AND NOT A CODE P
   for (const entry of CANNED) {
     assert.ok(PAGE_IDS.has(entry.button), `#${entry.button} is in the list but not in the page`);
     assert.ok(PAGE_IDS.has(entry.field), `#${entry.button} has no field to edit its prompt in`);
-    assertMarkupContains("bar-pack", entry.button);
+    assertMarkupContains("prompts-tray", entry.button);
     // SHIPPED EMPTY, and this is a trap rather than a preference: text typed between the tags of a
     // <textarea> is its child text, not its `.value`, so a default written into web/voice.html
     // would be invisible to everything that reads the field — and the tests would certify a
@@ -11888,15 +11919,17 @@ test("NEITHER canned button is drawn as a warning, because neither is reporting 
   const blockers = bar.slice(bar.indexOf('id="canned-blockers"'));
   assert.match(
     blockers.slice(0, 200),
-    /class="bar-button"/,
-    "Blockers is not drawn as an ordinary bar button"
+    /class="tray-button"/,
+    "Blockers is not drawn as an ordinary entry in the tray"
   );
-  assert.equal(
-    cssRules(CSS, ".bar-button.heavy").length,
-    0,
-    "the warning treatment is still in the stylesheet"
-  );
-  assert.doesNotMatch(HTML, /class="bar-button heavy"/, "something is still marked heavy");
+  for (const heavy of [".bar-button.heavy", ".tray-button.heavy"]) {
+    assert.equal(
+      cssRules(CSS, heavy).length,
+      0,
+      `the warning treatment is still in the stylesheet, as ${heavy}`
+    );
+  }
+  assert.doesNotMatch(HTML, /class="(bar|tray)-button heavy"/, "something is still marked heavy");
   // What DOES still distinguish it: the sentence saying what it costs. That lives in the script
   // now, with the prompt text, because `renderCannedPrompts` swaps the title and back.
   assert.match(SCRIPT_CODE, /CODING AGENT/, "nothing says what the heavier button spends");
@@ -11921,10 +11954,15 @@ test("with no call, the canned buttons are visibly dead and say why on hover", a
     );
   }
 
+  // ...and the tray OPENS at idle so that state can be seen at all. A menu that refused to open
+  // until there was a call would leave the reader with a dead opener and no way to find out why.
+  await page.el("prompts-open").click();
+  assert.equal(page.el("prompts-tray").hidden, false, "the tray will not open without a call");
+
   // `aria-disabled`, NOT `disabled`, and that is load-bearing rather than incidental: a genuinely
   // disabled button is not a reliable hover target, and the hover tooltip is the whole requirement.
   assert.notEqual(page.el("canned-summary").disabled, true, "a real disable took the tooltip away");
-  const dead = cssBlock('.bar-button[aria-disabled="true"]');
+  const dead = cssBlock('.tray-button[aria-disabled="true"]');
   assert.match(dead, /opacity/, "the dead state is not actually drawn");
   assert.doesNotMatch(dead, /pointer-events\s*:\s*none/, "pointer-events:none kills the tooltip");
 });
@@ -11950,22 +11988,101 @@ test("starting a call brings the canned buttons back to life, tooltip and all", 
   assert.equal(page.el("canned-summary").getAttribute("aria-disabled"), "true");
 });
 
-test("the canned buttons get out of the way of the text field, like everything else in the pack", async () => {
+test("the prompts opener gets out of the way of the text field, like everything else in the pack", async () => {
   // `#59 text-entry-button` hides pack members by ITERATING the pack rather than by name, which is
   // the whole reason this behaviour came for free. It is only checkable now that the pack has a
   // member the loop's one exception does not cover.
   const page = newPage();
   await startTalking(page);
-  assert.equal(page.el("canned-summary").hidden, false);
+  assert.equal(page.el("prompts-open").hidden, false);
 
   await page.el("text-entry").click();
 
-  assert.equal(page.el("canned-summary").hidden, true, "a canned button crowded the text field");
-  assert.equal(page.el("canned-blockers").hidden, true);
+  assert.equal(page.el("prompts-open").hidden, true, "the prompts opener crowded the text field");
   assert.equal(page.el("text-entry").hidden, false, "the way back out of the mode went away");
 
   await page.el("text-entry").click();
-  assert.equal(page.el("canned-summary").hidden, false, "leaving text entry did not bring them back");
+  assert.equal(page.el("prompts-open").hidden, false, "leaving text entry did not bring it back");
+});
+
+test("A TRAY LEFT OPEN CANNOT OUTLIVE THE BUTTON THAT OPENED IT", async () => {
+  // The failure a hidden opener would otherwise leave behind: the tray is a SIBLING of the pack, so
+  // hiding members of the pack does nothing to it, and an open menu would be left hanging over the
+  // transcript with nothing on the strip to shut it again.
+  const page = newPage();
+  await startTalking(page);
+  await page.el("prompts-open").click();
+  assert.equal(page.el("prompts-tray").hidden, false, "the tray did not open");
+
+  // Text entry takes the opener off the strip...
+  await page.el("text-entry").click();
+  assert.equal(page.el("prompts-open").hidden, true, "the opener is still on the strip");
+  assert.equal(page.el("prompts-tray").hidden, true, "an orphaned tray is hanging over the page");
+
+  // ...and so does the channel view, which is a different route to the same hiding.
+  await page.el("text-entry").click();
+  await page.el("prompts-open").click();
+  assert.equal(page.el("prompts-tray").hidden, false);
+  await page.el("view-switch").click();
+  assert.equal(page.el("prompts-open").hidden, true, "the opener belongs to the call view");
+  assert.equal(page.el("prompts-tray").hidden, true, "the tray followed the opener onto a view it is not on");
+});
+
+test("the tray opens on a tap, closes on the next one, and closes when a prompt is chosen", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  assert.equal(page.el("prompts-tray").hidden, true, "the tray is open before anything asked for it");
+  assert.equal(page.el("prompts-open").getAttribute("aria-expanded"), "false");
+
+  await page.el("prompts-open").click();
+  assert.equal(page.el("prompts-tray").hidden, false);
+  assert.equal(
+    page.el("prompts-open").getAttribute("aria-expanded"),
+    "true",
+    "the opener does not tell a screen reader it opened anything"
+  );
+
+  // Tapping the opener again is the way back out — the same control both opens and closes it, which
+  // is the model `#text-entry` already uses on this strip.
+  await page.el("prompts-open").click();
+  assert.equal(page.el("prompts-tray").hidden, true, "the opener does not close what it opened");
+  assert.equal(page.el("prompts-open").getAttribute("aria-expanded"), "false");
+
+  // Choosing a prompt sends it AND puts the menu away: a tray still standing over the transcript
+  // after the question has been asked is covering the answer.
+  await page.el("prompts-open").click();
+  await page.el("canned-summary").click();
+  assert.equal(page.el("prompts-tray").hidden, true, "the tray stayed open over the answer");
+  assert.equal(
+    socket.sent.filter((s) => s.includes('"user_message"')).length,
+    1,
+    "closing the tray swallowed the prompt"
+  );
+});
+
+test("the tray hangs off whichever edge the bar is resting against", () => {
+  // Two rules rather than one, and that is the bar having two homes: in the dock it must open
+  // UPWARD over the transcript, and in the header — where there is nothing above it but the top of
+  // the screen — it must open downward.
+  assert.match(
+    cssBlock('#control-bar[data-placement="bottom"] #prompts-tray'),
+    /bottom:/,
+    "in the dock the tray does not open upward"
+  );
+  assert.match(
+    cssBlock('#control-bar[data-placement="top"] #prompts-tray'),
+    /top:/,
+    "in the header the tray opens off the top of the screen"
+  );
+  // It is positioned against the BAR, not against either mount: the bar is the element that moves,
+  // and a tray anchored to a mount would have to know which home the bar was in.
+  assert.match(cssBlock("#control-bar"), /position:\s*relative/, "the tray has nothing to hang from");
+  // ...and it is out of the strip's flow, which is the whole arithmetic of replacing two members
+  // with one. `barCostPx` reads this same declaration, so the budget and the layout cannot disagree.
+  assert.match(cssBlock("#prompts-tray"), /position:\s*absolute/, "the tray is taking width from the bar");
+  // It WRAPS rather than scrolling sideways: the list is meant to grow, and a row of prompts that
+  // scrolled would reproduce, in a smaller box, the reachability defect the tray was made to fix.
+  assert.match(cssBlock("#prompts-tray"), /flex-wrap:\s*wrap/, "a growing tray will scroll out of reach");
 });
 
 test("a canned prompt with no call open reports itself, like every other send", async () => {

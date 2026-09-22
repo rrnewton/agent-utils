@@ -863,10 +863,12 @@
             <article id="help-canned-prompts" class="help-entry">
               <h2>Canned prompts</h2>
               <p class="hint">
-                What the two prompt buttons in the control bar say. They send exactly this text into
-                the live conversation, as though you had typed it. Emptying a field puts its default
-                back rather than leaving a button that does nothing. Both are greyed out when there
-                is no call, because there is nothing for the sentence to reach.
+                What the prompt buttons say. <strong>Prompts</strong> in the control bar opens a
+                tray of them above the bar; tapping one sends exactly this text into the live
+                conversation, as though you had typed it, and puts the tray away. Emptying a field
+                puts its default back rather than leaving a button that does nothing. All of them
+                are greyed out when there is no call, because there is nothing for the sentence to
+                reach — the tray still opens then, so you can see what they are.
               </p>
               <p class="hint">
                 <strong>Sumry</strong> deliberately says <strong>recent messages</strong> and not
@@ -1212,44 +1214,81 @@
             </button>
 
             <!--
-              `#60 canned-prompt-buttons`. Two questions worth a button because they are the ones
-              actually asked, every time. They send the same `user_message` a typed one does, so
-              nothing here is a second way of talking to the agent — only a shorter way of saying
-              the same sentence.
+              `#60 canned-prompt-buttons` put the canned questions ON the strip, one button each.
+              ONE button now opens all of them, and the reason is arithmetic: the bar is a single
+              375px row, each canned prompt cost it a member, and the list is meant to GROW — the
+              custom prompts the owner wants next would each have taken another slot off a strip
+              that was already priced to the edge. A tray costs one slot however many it holds.
 
-              They differ in WEIGHT — Sumry asks the voice agent to read and summarize, while
-              Blockers spends CODING-AGENT work on one tap — and that difference used to be drawn,
-              in the warm colour an armed Clear uses. IT NO LONGER IS, at the owner's request: on a
-              desktop screen the warm outline did not read as "this one is expensive", it read as a
-              WARNING SYMBOL — as though the button were reporting a fault rather than offering an
-              action. A control that looks broken is worse than one whose cost is only in its
-              tooltip, so both are drawn as ordinary bar buttons and the weight difference lives in
-              the `title` and in the Settings text.
-
-              What they DO carry visually is whether they can be pressed at all: with no call open
-              there is nothing for either sentence to reach, so both grey out and say why. See
-              `renderCannedPrompts` in web/voice.js.
-
-              What each one says is EDITABLE, in Settings, and the defaults are filled in from
-              script rather than typed into the markup — see `CANNED_PROMPTS` in web/voice.js. The
-              TOOLTIPS live there too, and for the same reason: `renderCannedPrompts` swaps them for
-              the disabled sentence and back, so a copy here would go stale on the first swap.
+              The buttons themselves are still declared here, in the markup, one per entry in
+              `CANNED_PROMPTS` — the page suite derives its element set from this file and refuses
+              an id invented at runtime, which is the rule that keeps "a third prompt is an entry
+              and not a code path" honest rather than merely intended.
             -->
             <button
-              id="canned-summary"
+              id="prompts-open"
               class="bar-button"
               type="button"
+              aria-expanded="false"
+              aria-controls="prompts-tray"
+              title="Canned questions for the agent. Editable in Settings."
             >
+              <!-- A stack of lines with a chevron ABOVE it: a list, and the direction it opens.
+                   The chevron is the half that says this is a menu rather than an action, which
+                   matters on a strip where every other member does something immediately. -->
               <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="m8 7.5 4-3.5 4 3.5" />
+                <path d="M5.5 12h13M5.5 16h13M5.5 20h8" />
+              </svg>
+              <span id="prompts-open-label" class="mini-label">Prompts</span>
+            </button>
+          </div>
+
+          <!--
+            The tray, and the two prompts in it.
+
+            A SIBLING OF THE PACK AND INSIDE THE BAR. Inside, because the bar is one element that
+            moves between the header mount and the dock mount, and a tray parented anywhere else
+            would have to be taught to follow it. Out of the pack, because the pack is the part
+            that scrolls sideways and a menu that can scroll out from under the button that opened
+            it is not a menu. It takes no width from the strip at all — see `#prompts-tray` in
+            web/voice.css, which takes it out of flow and hangs it off whichever edge the bar is
+            resting against.
+
+            The two entries differ in WEIGHT — Sumry asks the voice agent to read and summarize,
+            while Blockers spends CODING-AGENT work on one tap — and that difference used to be
+            drawn, in the warm colour an armed Clear uses. IT NO LONGER IS, at the owner's request:
+            on a desktop screen the warm outline did not read as "this one is expensive", it read
+            as a WARNING SYMBOL, as though the button were reporting a fault. A control that looks
+            broken is worse than one whose cost is only in its tooltip, so the weight difference
+            lives in the `title` and in the Settings text.
+
+            What they DO carry visually is whether they can be pressed at all: with no call open
+            there is nothing for either sentence to reach, so both grey out and say why. See
+            `renderCannedPrompts` in web/voice.js. The tray still opens at idle, deliberately — a
+            reader has to be able to SEE what the prompts are in order to learn why they are dead.
+
+            What each one says is EDITABLE, in Settings, and the defaults are filled in from script
+            rather than typed into the markup — see `CANNED_PROMPTS` in web/voice.js. The TOOLTIPS
+            live there too, and for the same reason: `renderCannedPrompts` swaps them for the
+            disabled sentence and back, so a copy here would go stale on the first swap.
+          -->
+          <div id="prompts-tray" role="group" aria-label="Canned prompts" hidden>
+            <button
+              id="canned-summary"
+              class="tray-button"
+              type="button"
+            >
+              <svg class="tray-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M5.5 4.5h13v15h-13z" />
                 <path d="M8.5 9h7M8.5 12h7M8.5 15h4" />
               </svg>
-              <span id="canned-summary-label" class="mini-label">Sumry</span>
+              <span id="canned-summary-label" class="tray-label">Sumry</span>
             </button>
 
             <button
               id="canned-blockers"
-              class="bar-button"
+              class="tray-button"
               type="button"
             >
               <!-- A CLIPBOARD, not a warning triangle, and the change is the point. The triangle
@@ -1258,13 +1297,13 @@
                    action — the owner read it exactly that way. What this button actually asks for
                    is a STATUS REPORT from the coding agent, which is what a clipboard says. It
                    stays visibly distinct from Sumry's plain document. -->
-              <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <svg class="tray-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M9.5 4.5h5a1 1 0 0 1 1 1v1h-7v-1a1 1 0 0 1 1-1z" />
                 <path d="M8.5 6h-2v13.5h11V6h-2" />
                 <path d="m9.5 11.5 1.5 1.5 3-3" />
                 <path d="M9.5 16.5h5" />
               </svg>
-              <span id="canned-blockers-label" class="mini-label">Blockers</span>
+              <span id="canned-blockers-label" class="tray-label">Blockers</span>
             </button>
           </div>
 
