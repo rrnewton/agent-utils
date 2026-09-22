@@ -79,11 +79,25 @@ jobs:
       # install` below fetches a BROWSER for node, which is a different thing from the Python
       # bindings mypy is looking for.
       #
-      # `cross-dagrun.yml` already learned this and already says so in its own install step. This
-      # line is now the same line, which is the point -- two jobs running the same strict gate
-      # should not be installing two different sets of things for it.
+      # `cross-dagrun.yml` already learned this and already says so in its own install step.
+      #
+      # AND A THIRD TIME, because the first attempt at this fix copied that line and dropped one
+      # package from it. Past the typecheck, `make validate-all` ran for fifty minutes and then
+      # failed at the last gate of all:
+      #
+      #   check_python_packages: FAIL: setuptools.build_meta is unavailable; install
+      #     setuptools>=77 in the interpreter running this offline package check
+      #   validate: FAILED at packages (make check-packages)
+      #
+      # `setuptools>=77` was right there in the line being copied. Python 3.12 no longer ships
+      # setuptools in a fresh venv, and the offline package check needs its PEP 517 backend.
+      #
+      # So this line is now LITERALLY the same line, character for character, and that is the
+      # point: two jobs running the same strict gate should not be installing two different sets
+      # of things for it, and "the same, roughly" is how this job stayed red for three weeks. If
+      # one of them gains a dependency, both do.
       - name: install the tooling the contract runs on
-        run: python -m pip install --upgrade mypy 'playwright>=1.40' pytest pyyaml types-PyYAML 'websockets>=12'
+        run: python -m pip install --upgrade 'setuptools>=77' mypy 'playwright>=1.40' pytest pyyaml types-PyYAML 'websockets>=12'
 
       # The timeline's browser checks drive a real Chromium, so the runner needs the browser and
       # the suite's dependencies before `validate-all` reaches them. Named as its own step so a
