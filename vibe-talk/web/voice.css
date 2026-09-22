@@ -746,23 +746,43 @@ body {
    this file, beside the transcript's own pair — there is one such block, deliberately, and adding
    a second would split the composition across two places that can drift apart. */
 
-/* The Settings panel that assigns them. A grid rather than a flex row so the selects line up down
-   the column instead of each one starting wherever its neighbour's name ended. */
+/* The Settings panel that assigns them.
+ *
+ * ONE COLUMN ON A PHONE, and this is the fix for a real defect rather than a preference. The row
+ * was `1fr auto`: the name took the flexible track and the `select` the intrinsic one. A `select`
+ * is as wide as the option it is SHOWING, "Me (including my voice bot)" is by some way the longest
+ * of the four, and so the one row that mattered most — the owner's own voice bot — sized its
+ * intrinsic track to nearly the whole panel. The flexible track can be squeezed to its automatic
+ * minimum, `overflow-wrap: anywhere` below put that minimum at ONE CHARACTER, and the name came out
+ * as a tall vertical column one letter wide. Photographed on the owner's iPhone, with the other
+ * four rows beside it looking perfectly ordinary — which is exactly what made it look like a
+ * mystery rather than arithmetic.
+ *
+ * Two tracks cannot be made to fit: 27 characters of option text and a display name do not share
+ * 375px however the minimums are written. So on a phone they do not share a line at all. The name
+ * is one row, the `select` is the next and spans the full width — which is a better tap target
+ * besides — and the snowflake is the third. The desktop block at the foot of this file puts them
+ * back on one line, where there genuinely is room. */
 .identity-row {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
   gap: 0.35rem 0.6rem;
   padding: 0.45rem 0;
   border-bottom: 1px solid var(--edge);
 }
 
+/* `break-word`, NOT `anywhere`, and the difference is the whole of the defect above: both break a
+   word that cannot fit, but `anywhere` ALSO drops the element's min-content to a single character,
+   which is what let a neighbouring track take the line. This keeps the wrapping and gives the name
+   back a minimum that means something. */
 .identity-name {
   display: flex;
   align-items: center;
   gap: 0.35rem;
+  min-width: 0;
   font-size: 0.9rem;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .identity-tag {
@@ -775,9 +795,9 @@ body {
   letter-spacing: 0.02em;
 }
 
-/* The snowflake, under the name and spanning both columns: it is the thing that actually IDENTIFIES
-   the account, and the only way to tell two accounts with the same display name apart. Small,
-   because it is evidence rather than a label. */
+/* The snowflake, last in the row and spanning whatever columns there are: it is the thing that
+   actually IDENTIFIES the account, and the only way to tell two accounts with the same display
+   name apart. Small, because it is evidence rather than a label. */
 .identity-id {
   grid-column: 1 / -1;
   color: var(--muted);
@@ -2427,6 +2447,15 @@ textarea {
   #discord-log li.discord-message[data-who="human"],
   #discord-log li.discord-message[data-who="bot"] {
     margin-inline: min(7%, 3rem);
+  }
+
+  /* The identity rows go back to two tracks. The phone stacks them because 27 characters of option
+     text and a display name cannot share 375px; a desk has the room, and a name beside the thing
+     it is being called is easier to read down a list of five than a name above it. The name track
+     keeps `minmax(0, ...)` so that a very long one still cannot squeeze itself — the defect the
+     phone rule exists for is a narrower screen away, not gone. */
+  .identity-row {
+    grid-template-columns: minmax(6rem, 1fr) auto;
   }
 
   /* The handle, on the right edge of the column and the height of the body. Absolutely positioned

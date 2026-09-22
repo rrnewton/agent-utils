@@ -440,18 +440,6 @@
               <p id="prompt-state" class="hint" aria-live="polite"></p>
             </section>
 
-            <section class="settings-group">
-              <div class="group-head">
-                <h2>Who is who in the channel</h2>
-                <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About channel identities" title="How these are guessed">?</button>
-              </div>
-              <p class="hint">Everyone who has spoken in a channel you have opened. Italic means guessed.</p>
-              <!-- Rows are built by `renderIdentityRows` in web/voice.js. Empty until a channel has
-                   been read, and it says so rather than showing a blank panel. -->
-              <div id="identity-list"></div>
-              <p id="identity-state" class="hint" aria-live="polite"></p>
-            </section>
-
             <!--
               `#39 channel-alias`. A name of the OWNER's own for a channel, so that addressing one
               out loud is possible at all: a snowflake is unsayable and a configured label like
@@ -562,6 +550,38 @@
                 </div>
                 <p id="add-channel-state" class="hint" aria-live="polite"></p>
               </div>
+
+              <!--
+                WHO IS WHO, and it is IN HERE because it was always a fact about one channel and
+                was drawn as a fact about the app.
+
+                It used to be its own group, above this one, listing every account seen in every
+                channel the reader had ever opened — so the answer to "who is in this channel" was
+                a list that grew as OTHER channels were read, and the sole-other-bot guess was a
+                census of the whole deployment rather than of the conversation being drawn. A
+                second bot in a channel the reader had glanced at once could stop the coding agent
+                being recognised in the channel they were actually reading. The heading said "in
+                the channel" throughout, which is the tell: the copy already described the thing
+                the code was not doing.
+
+                It is subordinate to the picker above, like everything else in this box: change
+                the channel and this list changes with it. A CHOICE made here is still about the
+                ACCOUNT rather than about the channel — see `renderIdentityRows` in web/voice.js,
+                and the sentence under the list, which says so on screen.
+              -->
+              <hr class="settings-rule" />
+              <div class="group-head">
+                <h3>Who is who in this channel</h3>
+                <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About channel identities" title="How these are guessed">?</button>
+              </div>
+              <p class="hint">
+                Everyone who has spoken in the channel above. Italic means guessed. A choice
+                follows the account into every channel.
+              </p>
+              <!-- Rows are built by `renderIdentityRows` in web/voice.js. Empty until this channel
+                   has been read, and it says so rather than showing a blank panel. -->
+              <div id="identity-list"></div>
+              <p id="identity-state" class="hint" aria-live="polite"></p>
             </section>
 
             <section class="settings-group">
@@ -836,13 +856,14 @@
             </article>
 
             <article id="help-identities" class="help-entry">
-              <h2>Who is who in the channel</h2>
+              <h2>Who is who in this channel</h2>
               <p class="hint">
                 The call transcript tells its two speakers apart by side, colour and corner. The
                 channel can do the same, but only once it knows which account is which. A display
-                name alone cannot reliably distinguish you, the bridge and the coding agent.
-                Everyone who has spoken in a channel you have opened is listed, with what this page
-                guessed shown in italics; change any of them and the channel is redrawn.
+                name alone cannot reliably distinguish you, the bridge and the coding agent. The
+                list sits inside <strong>Channels</strong>, under the channel picker, and shows
+                everyone who has spoken in <em>that</em> channel, with what this page guessed shown
+                in italics; change any of them and the channel is redrawn.
               </p>
               <p class="hint">
                 The guesses, in the order they are tried: the account this bridge posts as is
@@ -850,8 +871,15 @@
                 through it, so they are your words even though a bot delivered them; a lone bot that
                 is not this bridge is the <strong>coding agent</strong>; everyone else is another
                 person or another bot. With two candidate bots the guess refuses rather than picking
-                one. Nothing here is sent anywhere: it is stored in this browser and affects only
-                how the channel is drawn.
+                one. The guess is made per channel, so a bot that only ever speaks somewhere else
+                cannot spoil the guess here.
+              </p>
+              <p class="hint">
+                A <em>choice</em>, though, is about the account rather than the room: an account is
+                the same account wherever it speaks, so choosing here applies in every channel it
+                appears in, and you do not have to name your coding agent once per channel. Nothing
+                here is sent anywhere: it is stored in this browser and affects only how the channel
+                is drawn.
               </p>
             </article>
 

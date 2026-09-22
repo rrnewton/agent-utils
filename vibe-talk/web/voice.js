@@ -3631,7 +3631,8 @@ function applyTimelinePage(payload, older = false) {
   if (payload.thread) selectedThread = payload.thread;
   noteArchived(payload, !older && merged.length <= incoming.length);
   const shown = timelineMessages.filter((message) => !todoMode ||
-    (!archivedIds.has(String(message.id)) && (!markOwnRead || bucketFor(message.author_id, message.author_is_bot) !== "me")));
+    (!archivedIds.has(String(message.id)) && (!markOwnRead ||
+      bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) !== "me")));
   if (older) {
     // Keep existing elements attached to the same messages: scroll restoration holds one of
     // those elements as its anchor, and recreating it would throw away the reader's position.
@@ -4226,8 +4227,16 @@ function renderMarkdownInto(parent, raw) {
 // once described messages that did not exist — a mapping that a rename silently redirects is the
 // same class of defect.
 
+// PER CHANNEL, and the key is new because the shape is. The census used to be one flat map of
+// every account seen anywhere, which made both halves of this section wrong about the word
+// "channel" that was already in its heading: Settings listed accounts from channels the reader was
+// not looking at, and the sole-other-bot guess below counted bots from them too — so a second bot
+// glimpsed once in another channel could stop the coding agent being recognised here. The old key
+// is not migrated and is deliberately removed: nothing in it says which channel anything was seen
+// in, so there is no honest way to split it, and the census costs one channel read to rebuild.
 const IDENTITY_KEY = "vibe-talk.voice.identities";
-const AUTHORS_KEY = "vibe-talk.voice.authors";
+const AUTHORS_KEY = "vibe-talk.voice.channel-authors";
+const LEGACY_AUTHORS_KEY = "vibe-talk.voice.authors";
 const SELF_ID_KEY = "vibe-talk.voice.self-id";
 
 const BUCKETS = ["me", "coder", "human", "bot"];
@@ -4239,11 +4248,21 @@ const BUCKET_LABELS = {
   bot: "Another bot",
 };
 
-/** Explicit choices the reader has made, `{ [authorId]: bucket }`. Beats every guess below. */
+/**
+ * Explicit choices the reader has made, `{ [authorId]: bucket }`. Beats every guess below.
+ *
+ * KEYED ON THE ACCOUNT AND NOT ON THE CHANNEL, unlike the census beneath it, and the two are
+ * deliberately different: what an account IS does not change because it spoke somewhere else, so
+ * saying once that a bot is the coding agent must not have to be said again in the next channel
+ * it appears in. The census is per channel because "who is in this conversation" genuinely is a
+ * question about one conversation. The sentence under the list on the Settings screen says this
+ * out loud, because a reader who has just changed channel is entitled to know which of the two
+ * they are looking at.
+ */
 let identities = {};
 
-/** Everyone seen in a channel, `{ [authorId]: { name, bot } }`, so Settings has rows to offer
- *  before the reader has opened the channel in this session. */
+/** Everyone seen in each channel, `{ [channelId]: { [authorId]: { name, bot } } }`, so Settings
+ *  has rows to offer before the reader has opened that channel in this session. */
 let authorsSeen = {};
 
 /**
@@ -4282,6 +4301,20 @@ function loadIdentities() {
   };
   identities = read(IDENTITY_KEY, {});
   authorsSeen = read(AUTHORS_KEY, {});
+  // Shed the flat census rather than leaving it to rot in the reader's storage under a key nothing
+  // reads any more. Losing it costs one channel read; keeping it would cost an explanation.
+  try {
+    localStorage.removeItem(LEGACY_AUTHORS_KEY);
+  } catch (_error) {
+    // A browser that refuses to remove it is one that refused to store it. Nothing reads it.
+  }
+  // A channel whose entry is not an object is a corrupt entry, and it would otherwise surface as
+  // `Object.keys(undefined)` at the first render rather than as an empty list.
+  for (const [channel, seen] of Object.entries(authorsSeen)) {
+    if (!seen || typeof seen !== "object" || Array.isArray(seen)) {
+      delete authorsSeen[channel];
+    }
+  }
   // A bucket that is not one of ours would otherwise become a `data-who` nobody styles, which reads
   // as "this row is special" rather than as "this entry is corrupt".
   for (const [id, bucket] of Object.entries(identities)) {
@@ -4318,14 +4351,36 @@ function noteSelfAuthor(id) {
   renderIdentityRows();
 }
 
+/** Everyone seen in one channel, as a plain map, whether or not that channel has been read yet. */
+function seenIn(channelId) {
+  return authorsSeen[String(channelId || "")] || {};
+}
+
+/**
+ * Which channel a message is from, preferring what the message itself says.
+ *
+ * The to-do queue is the reason this is not simply the picker's value: it is served by its own
+ * route and is free to carry rows from more than one channel, so asking the picker would price a
+ * row against a census it was never part of. A message with no `channel_id` falls back to what is
+ * being viewed, which is where it must have come from.
+ */
+function messageChannel(message) {
+  return String((message && message.channel_id) || el("discord-channel").value || "");
+}
+
 /**
  * What bucket this author falls in, and why, in priority order.
  *
  * The guesses are exactly the ones the owner described, and they are GUESSES — every one of them
  * is overridden by an explicit choice, and Settings shows what was guessed so a wrong one is
  * visible rather than merely wrong.
+ *
+ * WHICH CHANNEL is an argument because the last guess is a census, and a census is only meaningful
+ * about one conversation. Callers pass the channel they are drawing: the message list passes the
+ * one it is showing, Settings passes the one its picker is on. They can legitimately differ, and
+ * when they do each is right about its own screen.
  */
-function bucketFor(authorId, isBot) {
+function bucketFor(authorId, isBot, channelId) {
   const id = String(authorId || "");
   // 1. The reader said so.
   if (identities[id]) {
@@ -4343,10 +4398,13 @@ function bucketFor(authorId, isBot) {
     // 3. Not a bot, so a person. Which person is not something this page can know.
     return "human";
   }
-  // 4. A bot, and if it is the ONLY bot that is not us then it is the coding agent — the owner's
-  //    own heuristic, and true of every channel this bridge is pointed at so far. With two or more
-  //    it is a coin toss, so it stays "another bot" and Settings is where it gets decided.
-  const otherBots = Object.entries(authorsSeen).filter(
+  // 4. A bot, and if it is the ONLY bot IN THIS CHANNEL that is not us then it is the coding agent
+  //    — the owner's own heuristic, and true of every channel this bridge is pointed at so far.
+  //    With two or more it is a coin toss, so it stays "another bot" and Settings is where it gets
+  //    decided. Scoped to the channel: a bot that has never spoken here says nothing about who the
+  //    reader is talking to here, and counting it was how the guess went quiet in a channel that
+  //    had exactly one candidate in it.
+  const otherBots = Object.entries(seenIn(channelId)).filter(
     ([seen, who]) => who.bot && seen !== selfAuthorId
   );
   if (otherBots.length === 1 && otherBots[0][0] === id) {
@@ -4356,18 +4414,27 @@ function bucketFor(authorId, isBot) {
 }
 
 /**
- * The Settings panel: one row per account seen, saying what it is and letting that be changed.
+ * The Settings panel: one row per account seen IN THE CHANNEL ITS PICKER IS ON, saying what it is
+ * and letting that be changed.
  *
- * Rebuilt wholesale rather than patched, because the set of accounts grows as channels are read
+ * Rebuilt wholesale rather than patched, because the set of accounts grows as the channel is read
  * and the guesses for accounts ALREADY listed can change when a new one arrives — the sole-other-
  * bot rule is a statement about the whole census. A partial update would leave a stale "coding
  * agent" beside the second bot that has just disqualified it.
+ *
+ * The channel comes from `#settings-channel`, the picker at the head of the box this list now sits
+ * in, and NOT from `#discord-channel`, which is what the reader is looking at. They are separate on
+ * purpose everywhere else in that box — pointing the rename editor at another channel does not
+ * navigate — and this list follows the same rule, so the whole box is about one channel and says
+ * which at the top.
  */
 function renderIdentityRows() {
   const host = el("identity-list");
-  const ids = Object.keys(authorsSeen).sort((a, b) => {
-    const left = authorsSeen[a];
-    const right = authorsSeen[b];
+  const channelId = el("settings-channel").value;
+  const seen = seenIn(channelId);
+  const ids = Object.keys(seen).sort((a, b) => {
+    const left = seen[a];
+    const right = seen[b];
     // People first, then bots, then by name: the reader is looking for a name, and grouping the
     // two kinds keeps the bridge and the coding agent beside each other.
     if (left.bot !== right.bot) {
@@ -4378,14 +4445,17 @@ function renderIdentityRows() {
   if (ids.length === 0) {
     const empty = document.createElement("p");
     empty.className = "hint";
+    // Names the channel it is empty ABOUT, through the one rule that names channels — so this
+    // says whatever the picker above it says. The list changes when that picker does, and "nobody
+    // yet" without a name reads as a broken panel rather than as an unread channel.
     empty.textContent =
-      "Nobody yet. Open the channel view, and everyone who has spoken in it " +
-      "appears here.";
+      `Nobody yet in ${channelName(knownChannel(channelId))}. Read that channel, and everyone ` +
+      "who has spoken in it appears here.";
     host.replaceChildren(empty);
     return;
   }
   const rows = ids.map((id) => {
-    const who = authorsSeen[id];
+    const who = seen[id];
     // A <label> WRAPPING its control, rather than a <div> plus `for="identity-<id>"`.
     //
     // The id would have to be minted from the author's snowflake at runtime, and this page's test
@@ -4426,7 +4496,7 @@ function renderIdentityRows() {
       option.textContent = BUCKET_LABELS[bucket];
       select.append(option);
     }
-    select.value = bucketFor(id, who.bot);
+    select.value = bucketFor(id, who.bot, channelId);
     // Whether the value on screen is a CHOICE or a GUESS, which is the difference between "this is
     // wrong" and "nobody has said". Without it a wrong guess is indistinguishable from a decision.
     // Always set, both ways, rather than present-or-absent: "false" and "missing" are the same
@@ -4437,8 +4507,14 @@ function renderIdentityRows() {
       identities[id] = select.value;
       persistJson(IDENTITY_KEY, identities);
       select.setAttribute("data-guessed", "false");
-      el("identity-state").textContent = "Saved. The channel is drawn this way from now on.";
+      el("identity-state").textContent =
+        "Saved. This account is drawn this way from now on, in every channel it speaks in.";
       renderChannelRows();
+      // The row just changed can change the GUESS on its neighbours: naming one of two bots as the
+      // coding agent leaves the other as the only unnamed candidate. Only this channel's list is
+      // on screen, so only this channel's list is rebuilt — but rebuilt it must be, or the panel
+      // shows a stale guess beside the choice that invalidated it.
+      renderIdentityRows();
     });
 
     const id_ = document.createElement("span");
@@ -4451,17 +4527,19 @@ function renderIdentityRows() {
   host.replaceChildren(...rows);
 }
 
-/** Remember an author so Settings can offer a row for them later. */
-function noteAuthor(id, name, isBot) {
+/** Remember an author, in the channel they spoke in, so Settings can offer a row for them later. */
+function noteAuthor(channelId, id, name, isBot) {
+  const channel = String(channelId || "");
   const key = String(id || "");
-  if (!key) {
+  if (!channel || !key) {
     return false;
   }
-  const held = authorsSeen[key];
+  const seen = authorsSeen[channel] || (authorsSeen[channel] = {});
+  const held = seen[key];
   if (held && held.name === name && held.bot === isBot) {
     return false;
   }
-  authorsSeen[key] = { name: String(name || ""), bot: Boolean(isBot) };
+  seen[key] = { name: String(name || ""), bot: Boolean(isBot) };
   return true;
 }
 
@@ -4552,12 +4630,15 @@ function authorLabel(row) {
 function renderChannelRows() {
   const list = el("discord-log");
   const rows = [...list.children];
+  // The channel these rows belong to, read once. Every author learned on this pass was seen HERE,
+  // and every bucket drawn on it is a statement about who is in THIS conversation.
+  const viewing = el("discord-channel").value;
   // Every message some LOADED message answers.
   const answered = new Set();
   // A positive acknowledgement is already evidence of a reply, even while a slower history read
   // has not returned its provider ID. Pending or wholly unconfirmed sends are not that evidence.
   for (const entry of outgoingMessages.values()) {
-    if (entry.channel === el("discord-channel").value && entry.replyTo &&
+    if (entry.channel === viewing && entry.replyTo &&
         (entry.state === "sent" || entry.postedCount > 0)) answered.add(entry.replyTo);
   }
   // The author census FIRST and in full, because `bucketFor` asks how many other bots there are —
@@ -4574,6 +4655,7 @@ function renderChannelRows() {
     }
     learned =
       noteAuthor(
+        viewing,
         row.getAttribute("data-author-id"),
         row.getAttribute("data-author"),
         row.getAttribute("data-author-bot") === "true"
@@ -4581,7 +4663,9 @@ function renderChannelRows() {
   }
   if (learned) {
     persistJson(AUTHORS_KEY, authorsSeen);
-    renderIdentityRows();
+    // Only if Settings is pointed at the channel that just learned something. Otherwise the panel
+    // is showing a different channel's list and rebuilding it would draw the same rows again.
+    if (el("settings-channel").value === viewing) renderIdentityRows();
   }
   // The kept place follows the reader down the backlog. Done BEFORE the rows are marked, so the
   // row that ends up carrying the marker is the one this pass draws it on rather than the one the
@@ -4600,7 +4684,8 @@ function renderChannelRows() {
       "data-who",
       bucketFor(
         row.getAttribute("data-author-id"),
-        row.getAttribute("data-author-bot") === "true"
+        row.getAttribute("data-author-bot") === "true",
+        viewing
       )
     );
     // GREYS, never hides, and that is the whole distinction between this and the To do filter.
@@ -4770,7 +4855,8 @@ function advanceMarkerPastRead() {
   const dealtWith = (li) => {
     const who = bucketFor(
       li.getAttribute("data-author-id"),
-      li.getAttribute("data-author-bot") === "true"
+      li.getAttribute("data-author-bot") === "true",
+      el("discord-channel").value
     );
     const ids = idsOf(li);
     return ids.length > 0 && ids.every((one) => readAlready(one, who));
@@ -6747,7 +6833,7 @@ async function loadTodo(options) {
     const served = payload.messages || [];
     observeOutgoingMessages(served);
     const messages = markOwnRead
-      ? served.filter((m) => bucketFor(m.author_id, m.author_is_bot) !== "me")
+      ? served.filter((m) => bucketFor(m.author_id, m.author_is_bot, messageChannel(m)) !== "me")
       : served;
     const list = el("discord-log");
     list.replaceChildren(...glom(messages).map(discordNode));
@@ -8013,7 +8099,7 @@ async function addChannel() {
   fillChannelSelect("settings-channel");
   const addedId = String((payload.channel && payload.channel.id) || id);
   el("settings-channel").value = addedId;
-  renderAliasEditor();
+  renderChannelBox();
   el("new-channel-id").value = "";
   el("new-channel-label").value = "";
   el("new-channel-writable").checked = false;
@@ -8040,9 +8126,22 @@ async function removeChannel() {
   knownChannels = payload.channels || [];
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
-  renderAliasEditor();
+  renderChannelBox();
   said.textContent = "Removed. It is no longer in the picker.";
   if (el("discord-channel").value !== previousChannel) await changeSelectedChannel();
+}
+
+/**
+ * Redraw everything in the channel box for the channel its picker is on.
+ *
+ * ONE CALL, because the box now holds two things scoped by that picker — what this channel is
+ * called, and who is in it — and every caller needs both. When the identity list moved in here it
+ * was added beside each `renderAliasEditor()` by hand, and the third such site is where a list
+ * belonging to the previously selected channel gets left on screen.
+ */
+function renderChannelBox() {
+  renderAliasEditor();
+  renderIdentityRows();
 }
 
 /** What the editor says about the channel it is pointed at, including the label underneath. */
@@ -8130,7 +8229,7 @@ function adoptChannel(payload) {
   el("alias-note").textContent = (payload && payload.alias_notice) || "";
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
-  renderAliasEditor();
+  renderChannelBox();
   restateChannelSeam();
 }
 
@@ -8222,7 +8321,9 @@ function applyClientConfig(config) {
   }
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
-  renderAliasEditor();
+  // The picker has only just been given a value, and both halves of the box are scoped by it —
+  // the render at load ran against an empty picker and listed nothing whatever was stored.
+  renderChannelBox();
   restoreChannelComposer();
   // `#44 live-push`. The server says whether it is watching the channel at all, and how often.
   // Without it the page would have to infer "live" from a stream that is attached and silent —
@@ -8671,7 +8772,13 @@ el("discord-channel").addEventListener("change", guardQuietly(changeSelectedChan
 // losing it.
 el("settings-channel").addEventListener("change", () => {
   showChannelPanel(null);
-  renderAliasEditor();
+  // Everything in this box is about the channel the picker is on, and the identity list is now one
+  // of those things: pointing it somewhere else must change WHO is listed, not only what the
+  // rename field says.
+  renderChannelBox();
+  // The saved-sentence belongs to a choice made about the previous channel's list. Left standing
+  // it reads as a report about the list now on screen.
+  el("identity-state").textContent = "";
 });
 el("rename-channel").addEventListener("click", () => {
   showChannelPanel("rename-fields");

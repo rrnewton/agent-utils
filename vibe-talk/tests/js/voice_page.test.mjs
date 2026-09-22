@@ -10627,6 +10627,204 @@ test("an author label is never treated as markup, even in Settings", async () =>
   assert.match(name.text(), /<img src=x/, "the name was not rendered as the text it is");
 });
 
+// --- ...and who is who is a fact about ONE channel -----------------------------------------------
+//
+// The panel was a top-level group of its own, above Channels, listing every account the page had
+// ever seen anywhere. Two things were wrong with that at once: the reader could not tell which
+// conversation a row was about, and the sole-other-bot guess was priced against a census spanning
+// channels — so a bot that had spoken once somewhere else went on disqualifying the one candidate
+// in the channel actually being read. Both are fixed by scoping the census to a channel and moving
+// the list under the picker that names it.
+
+/** A second channel to have a different cast in. */
+const OTHER_CHANNEL = { id: "2220000000000000002", label: "build noise", writable: true };
+
+/** Serve a different set of messages per channel, the way a server with two channels does. */
+function serveByChannel(page, byChannel) {
+  page.channelPage = async (path) => {
+    const which = Object.keys(byChannel).find((id) => String(path).includes(id));
+    assert.ok(which, `the page read a channel this fixture has no cast for: ${path}`);
+    return json(200, {
+      channel: page.channels.find((c) => String(c.id) === which),
+      messages: byChannel[which],
+    });
+  };
+}
+
+/** Point the channel VIEW at a channel and let it read. */
+async function readChannel(page, id) {
+  page.el("discord-channel").value = String(id);
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+}
+
+/** Point the SETTINGS picker at a channel, which is a redraw and not a navigation. */
+async function settingsChannel(page, id) {
+  page.el("settings-channel").value = String(id);
+  await page.el("settings-channel").dispatch("change");
+  await page.settle();
+}
+
+/** The display names the identity panel is currently listing, in the order it lists them. */
+const listedNames = (page) =>
+  page
+    .el("identity-list")
+    .descendants()
+    .filter((node) => node.className === "identity-name")
+    .map((node) => node.text());
+
+test("WHO IS WHO SITS INSIDE CHANNELS, UNDER THE PICKER THAT DECIDES WHAT IS IN IT", () => {
+  // Placement is the claim, not decoration: a list of accounts scoped by a channel and drawn in a
+  // group of its own is a list the reader cannot attribute to anything.
+  const from = HTML.indexOf('id="channel-settings"');
+  const box = HTML.slice(from, from + HTML.slice(from).indexOf("</section>"));
+  assert.ok(box.includes('id="identity-list"'), "the identity list is not inside the channel box");
+  assert.ok(
+    box.indexOf('id="settings-channel"') < box.indexOf('id="identity-list"'),
+    "the list is drawn above the picker that scopes it"
+  );
+  assert.equal(
+    (HTML.match(/id="identity-list"/g) || []).length,
+    1,
+    "a second copy of the list exists, and one of them is scoped by nothing"
+  );
+});
+
+test("the list follows the SETTINGS picker, not the channel being read", async () => {
+  const page = newPage();
+  page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  serveByChannel(page, {
+    [CHANNEL.id]: [
+      message({ id: "3000000000000000001", channel_id: CHANNEL.id, author: "alice", author_id: "10", author_is_bot: false }),
+    ],
+    [OTHER_CHANNEL.id]: [
+      message({ id: "3000000000000000002", channel_id: OTHER_CHANNEL.id, author: "mallory", author_id: "30", author_is_bot: false }),
+    ],
+  });
+  await signIn(page);
+  await showDiscord(page, []);
+  await readChannel(page, OTHER_CHANNEL.id);
+  await readChannel(page, CHANNEL.id);
+  await page.el("open-settings").click();
+
+  assert.deepStrictEqual(listedNames(page), ["alice"], "the list is not scoped to one channel");
+  await settingsChannel(page, OTHER_CHANNEL.id);
+  assert.deepStrictEqual(
+    listedNames(page),
+    ["mallory"],
+    "moving the picker renamed the channel but left the previous channel's cast on screen"
+  );
+  // ...and the view did not follow it. The whole box is a redraw of a channel, not a trip to one.
+  assert.equal(page.el("discord-channel").value, CHANNEL.id, "a Settings redraw navigated");
+});
+
+test("an unread channel says WHICH channel is empty rather than showing a blank panel", async () => {
+  const page = newPage();
+  page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  await signIn(page);
+  await page.el("open-settings").click();
+  await settingsChannel(page, OTHER_CHANNEL.id);
+  assert.match(page.el("identity-list").text(), /build noise/, "it does not say what is empty");
+});
+
+test("A BOT THAT ONLY SPEAKS SOMEWHERE ELSE CANNOT SPOIL THE GUESS HERE", async () => {
+  // The bug the scoping fixes, stated as the owner would hit it: one coding agent in the channel
+  // he is reading, some unrelated bot in a channel he opened once, and the guess goes quiet.
+  const page = newPage();
+  page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  serveByChannel(page, {
+    [CHANNEL.id]: [
+      message({ id: "3000000000000000011", channel_id: CHANNEL.id, author: "alice", author_id: "10", author_is_bot: false }),
+      message({ id: "3000000000000000012", channel_id: CHANNEL.id, author: "MyDiscordBot", author_id: "20", author_is_bot: true }),
+    ],
+    [OTHER_CHANNEL.id]: [
+      message({ id: "3000000000000000013", channel_id: OTHER_CHANNEL.id, author: "some-other-bot", author_id: "30", author_is_bot: true }),
+    ],
+  });
+  await signIn(page);
+  await showDiscord(page, []);
+  await readChannel(page, OTHER_CHANNEL.id);
+  assert.equal(whoOf(page, 0), "coder", "the lone bot of the channel being read is not the agent");
+  await readChannel(page, CHANNEL.id);
+
+  assert.equal(
+    whoOf(page, 1),
+    "coder",
+    "a bot from another channel was counted against this channel's only candidate"
+  );
+});
+
+test("...but a CHOICE is about the account, so it holds in every channel that account speaks in", async () => {
+  // The deliberate asymmetry. A census is about a room; an account is the same account wherever it
+  // speaks, and making the owner name his coding agent once per channel would be the worse failure.
+  const page = newPage();
+  page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  const bot = { author: "MyDiscordBot", author_id: "20", author_is_bot: true };
+  serveByChannel(page, {
+    [CHANNEL.id]: [message({ id: "3000000000000000021", channel_id: CHANNEL.id, ...bot })],
+    [OTHER_CHANNEL.id]: [message({ id: "3000000000000000022", channel_id: OTHER_CHANNEL.id, ...bot })],
+  });
+  await signIn(page);
+  await showDiscord(page, []);
+  await readChannel(page, OTHER_CHANNEL.id);
+  await readChannel(page, CHANNEL.id);
+  assert.equal(whoOf(page, 0), "coder", "the guess under test never happened");
+
+  await page.el("open-settings").click();
+  const select = page
+    .el("identity-list")
+    .descendants()
+    .find((node) => node.getAttribute("data-author-id") === "20");
+  select.value = "bot";
+  await select.dispatch("change");
+  assert.match(
+    page.el("identity-state").textContent,
+    /every channel/,
+    "the panel does not say how far the choice it just saved reaches"
+  );
+
+  await page.el("close-settings").click();
+  await readChannel(page, OTHER_CHANNEL.id);
+  assert.equal(whoOf(page, 0), "bot", "the choice stopped at the channel it was made in");
+});
+
+test("A LONG OPTION CANNOT SQUEEZE A NAME INTO A ONE-CHARACTER COLUMN", () => {
+  // Photographed on the owner's iPhone: four identity rows looking perfectly ordinary and a fifth
+  // whose display name ran down the screen one letter wide. Not a mystery — arithmetic. The row was
+  // `1fr auto`, a <select> is as wide as the option it is SHOWING, and only that fifth row was
+  // showing the longest of the four labels. Its intrinsic track took the panel, the flexible track
+  // fell to its automatic minimum, and `overflow-wrap: anywhere` had put that minimum at one
+  // character. Both halves are asserted, because either one alone brings the column back.
+  assert.match(
+    SCRIPT_CODE,
+    /Me \(including my voice bot\)/,
+    "the option whose width provoked this is gone; check the arithmetic below still holds"
+  );
+
+  const row = cssRules(CSS_UNCONDITIONAL, ".identity-row").join("\n");
+  const tracks = /grid-template-columns:\s*([^;]+)/.exec(row);
+  assert.ok(tracks, "the identity row is no longer a grid and this test cannot speak");
+  assert.doesNotMatch(
+    tracks[1],
+    /auto/,
+    "on a phone the select still gets a track sized to its own text"
+  );
+  const name = cssRules(CSS_UNCONDITIONAL, ".identity-name").join("\n");
+  assert.doesNotMatch(
+    name,
+    /overflow-wrap:\s*anywhere/,
+    "`anywhere` drops the name's min-content to one character, which is the defect"
+  );
+  assert.match(name, /overflow-wrap:\s*break-word/, "a long name has to wrap somehow");
+
+  // ...and the two-track layout is back where there is room for it, and only there.
+  assert.match(
+    cssBlockIn(DESKTOP_QUERY, ".identity-row"),
+    /grid-template-columns:\s*minmax\(6rem,\s*1fr\)\s+auto/,
+    "the desk does not get the name beside the thing it is being called"
+  );
+});
+
 test("with every toggle untouched, the page asks for EXACTLY what it asked for before the menu existed", async () => {
   const page = newPage();
 
