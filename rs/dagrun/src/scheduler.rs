@@ -481,7 +481,11 @@ struct Shared {
     run_cpu_timed_out: bool,
     /// Exact whole-run CPU accounting became unreadable after the run started.
     run_cpu_accounting_failed: bool,
-    /// Child processes currently alive, and the largest count observed during this run.
+    /// Successfully spawned children whose exit observation remains pending, and the largest such
+    /// count.
+    /// Spawn/count and exit-observation/uncount are ordered by this structure's lock. A kernel
+    /// exit remains counted until its supervisor observes it; the number is an observation-order
+    /// high-water mark, not a claim to know an unobserved kernel timestamp.
     active_processes: usize,
     max_concurrent_steps: usize,
     /// Tags whose child lifetime is counted into `active_processes` and still awaiting its
@@ -734,32 +738,50 @@ fn kill_by_nonce(nonce: &str) -> usize {
     killed.len()
 }
 
-/// Wait for an already-reaped child to exit, giving up after `limit`.
+/// Wait for an already-signalled child to exit, giving up after `limit`.
 ///
 /// Returns the real exit status when the child dies in time, and a fabricated killed status when it
 /// does not. Reporting a killed status for a process that is still alive is deliberate and is the
 /// lesser evil: the alternative is the scheduler blocking indefinitely, which reports NOTHING and
 /// loses the whole run's measurements along with it. The survivor is named so the leak is visible
 /// rather than inferred.
-fn wait_bounded(child: &mut std::process::Child, tag: &str, limit: Duration) -> ExitStatus {
+fn wait_bounded(
+    child: &mut std::process::Child,
+    shared: &Mutex<Shared>,
+    tag: &str,
+    limit: Duration,
+) -> ExitStatus {
+    wait_bounded_after(tag, limit, || {
+        try_wait_and_uncount_with(shared, tag, || child.try_wait())
+    })
+}
+
+/// Bounded retry loop behind [`wait_bounded`], separated so repeated observation errors can be
+/// covered without depending on a kernel-injected `waitpid` failure.
+fn wait_bounded_after<F>(tag: &str, limit: Duration, mut observe: F) -> ExitStatus
+where
+    F: FnMut() -> std::io::Result<Option<ExitStatus>>,
+{
     let deadline = Instant::now() + limit;
     loop {
-        match child.try_wait() {
+        let observation_error = match observe() {
             Ok(Some(st)) => return st,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    eprintln!(
-                        "[scheduler] WARNING: step {tag} did not exit within {}s of being killed; \
-                         abandoning the wait and reporting it as killed. Its process tree may \
-                         still be running.",
-                        limit.as_secs()
-                    );
-                    return ExitStatus::from_raw(9);
-                }
-                thread::sleep(POLL_INTERVAL);
-            }
-            Err(_) => return ExitStatus::from_raw(9),
+            Ok(None) => None,
+            Err(error) => Some(error.to_string()),
+        };
+        if Instant::now() >= deadline {
+            let detail = observation_error.map_or_else(String::new, |error| {
+                format!(" Exit observation kept failing; last error: {error}.")
+            });
+            eprintln!(
+                "[scheduler] WARNING: step {tag} did not produce an observable exit within {}s \
+                 of being killed; abandoning the bounded wait and reporting it as killed.{detail} \
+                 Its direct child may still be running or unreaped.",
+                limit.as_secs()
+            );
+            return ExitStatus::from_raw(9);
         }
+        thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -1059,6 +1081,55 @@ fn uncount_process(sh: &mut Shared, tag: &str) {
     if sh.counted_processes.remove(tag) {
         sh.active_processes = sh.active_processes.saturating_sub(1);
     }
+}
+
+/// Invoke one spawn operation and publish its lifecycle start as one ordered state transition.
+///
+/// The shared lock spans the injected operation and the count. Therefore an older child's exit
+/// observation cannot uncount between this child's successful spawn and its count, which was the
+/// undercount window behind a reported peak of one for two overlapping children. Injecting the
+/// operation makes the lock boundary directly testable without moving `Command::spawn` outside it.
+fn spawn_and_register_with<F>(
+    shared: &Mutex<Shared>,
+    tag: &str,
+    nonce: &str,
+    spawn: F,
+) -> std::io::Result<(std::process::Child, bool)>
+where
+    F: FnOnce() -> std::io::Result<std::process::Child>,
+{
+    let mut sh = lock_shared(shared);
+    let child = spawn()?;
+    let pid = child.id();
+    sh.running_pids.insert(tag.to_string(), pid);
+    sh.running_nonces.insert(tag.to_string(), nonce.to_string());
+    sh.active_processes += 1;
+    sh.counted_processes.insert(tag.to_string());
+    sh.max_concurrent_steps = sh.max_concurrent_steps.max(sh.active_processes);
+    let aborted = sh.aborted.contains_key(tag);
+    Ok((child, aborted))
+}
+
+/// Observe one child exit and publish its lifecycle end as one ordered state transition.
+///
+/// Invoking the observation operation while holding the same lock used by
+/// [`spawn_and_register_with`] closes the mirror-image overcount window: a newer child cannot be
+/// spawned and counted after this supervisor has observed the older exit but before it uncounts
+/// it. Injection makes the syscall boundary directly testable.
+fn try_wait_and_uncount_with<F>(
+    shared: &Mutex<Shared>,
+    tag: &str,
+    observe: F,
+) -> std::io::Result<Option<ExitStatus>>
+where
+    F: FnOnce() -> std::io::Result<Option<ExitStatus>>,
+{
+    let mut sh = lock_shared(shared);
+    let status = observe()?;
+    if status.is_some() {
+        uncount_process(&mut sh, tag);
+    }
+    Ok(status)
 }
 
 /// Hand back everything `step`'s admission took, EXACTLY ONCE. Returns whether this call did it.
@@ -3401,46 +3472,47 @@ fn run_step(ctx: StepCtx) {
     if let Some(started_ns) = monotonic_now_ns() {
         cmd.env(STEP_STARTED_MONOTONIC_NS_ENV, started_ns.to_string());
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            // Spawn failure: record a failed outcome so the run does not hang.
-            let elapsed = start.elapsed().as_secs_f64();
-            if let Some(cg) = &cgroups {
-                if cg.enabled() {
-                    cg.cleanup(&tag);
+    let (mut child, abort_after_spawn) =
+        match spawn_and_register_with(&shared, &tag, &nonce, || cmd.spawn()) {
+            Ok(registered) => registered,
+            Err(e) => {
+                // Spawn failure: record a failed outcome so the run does not hang.
+                let elapsed = start.elapsed().as_secs_f64();
+                if let Some(cg) = &cgroups {
+                    if cg.enabled() {
+                        cg.cleanup(&tag);
+                    }
                 }
+                let mut sh = lock_shared(&shared);
+                retire(&mut sh, &step);
+                let outcome = StepOutcome::failed(
+                    tag.clone(),
+                    elapsed,
+                    format!("spawn failed: {e}"),
+                    None,
+                    false,
+                    0,
+                    false,
+                    wall_budget,
+                    false,
+                    cpu_budget,
+                    cpu_canonical,
+                    cpu_timeout_multiplier,
+                    &cpu_timeout_platform,
+                    false,
+                    None,
+                    None,
+                );
+                sh.done.insert(tag.clone(), outcome);
+                trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
+                drop(sh);
+                emit(&format!(
+                    "[{tag}] \u{2717} FAIL   {} (spawn failed: {e})",
+                    step.desc
+                ));
+                return;
             }
-            let mut sh = lock_shared(&shared);
-            retire(&mut sh, &step);
-            let outcome = StepOutcome::failed(
-                tag.clone(),
-                elapsed,
-                format!("spawn failed: {e}"),
-                None,
-                false,
-                0,
-                false,
-                wall_budget,
-                false,
-                cpu_budget,
-                cpu_canonical,
-                cpu_timeout_multiplier,
-                &cpu_timeout_platform,
-                false,
-                None,
-                None,
-            );
-            sh.done.insert(tag.clone(), outcome);
-            trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
-            drop(sh);
-            emit(&format!(
-                "[{tag}] \u{2717} FAIL   {} (spawn failed: {e})",
-                step.desc
-            ));
-            return;
-        }
-    };
+        };
     let pid = child.id();
     // Bind the invocation before monitor startup; never reauthenticate a recycled PGID.
     let (process_cpu, process_cpu_registration_error) = if !boxed && cpu_budget > 0 {
@@ -3456,15 +3528,6 @@ fn run_step(ctx: StepCtx) {
         }
     } else {
         (None, None)
-    };
-    let abort_after_spawn = {
-        let mut sh = lock_shared(&shared);
-        sh.running_pids.insert(tag.clone(), pid);
-        sh.running_nonces.insert(tag.clone(), nonce.clone());
-        sh.active_processes += 1;
-        sh.counted_processes.insert(tag.clone());
-        sh.max_concurrent_steps = sh.max_concurrent_steps.max(sh.active_processes);
-        sh.aborted.contains_key(&tag)
     };
     if abort_after_spawn {
         // A peer can fail after this tag was admitted but before its Popen registered. The
@@ -3796,7 +3859,7 @@ fn run_step(ctx: StepCtx) {
     // Wait for the child, enforcing the per-step timeout by polling.
     let mut timed_out = false;
     let status = loop {
-        match child.try_wait() {
+        match try_wait_and_uncount_with(&shared, &tag, || child.try_wait()) {
             Ok(Some(st)) => break st,
             Ok(None) => {
                 // `wall_timeout` likewise: the deadline is not even compared when the
@@ -3827,24 +3890,28 @@ fn run_step(ctx: StepCtx) {
                         *slot = Some(c);
                     }
                     reap(&cgroups, &tag, pid, Some(&nonce));
-                    break wait_bounded(&mut child, &tag, POST_REAP_WAIT);
+                    break wait_bounded(&mut child, &shared, &tag, POST_REAP_WAIT);
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => {
-                break child
-                    .wait()
-                    .unwrap_or_else(|_| std::process::ExitStatus::from_raw(9))
+            Err(error) => {
+                // `try_wait` did not establish an exit. Kill the complete tree first, then keep
+                // retrying the SAME atomic exit-observation/uncount operation for a bounded
+                // interval. Returning a fabricated status immediately would drop `Child` without
+                // another reap attempt and can strand the direct child as a zombie.
+                eprintln!(
+                    "[scheduler] WARNING: step {tag}: initial child-exit observation failed \
+                     ({error}); killing the process tree and retrying for {}s",
+                    POST_REAP_WAIT.as_secs()
+                );
+                reap(&cgroups, &tag, pid, Some(&nonce));
+                break wait_bounded(&mut child, &shared, &tag, POST_REAP_WAIT);
             }
         }
     };
 
-    // The child has exited. Stop counting it before teardown and reader joins, which can outlive
-    // the child when a grandchild keeps an output pipe open.
-    {
-        let mut sh = lock_shared(&shared);
-        uncount_process(&mut sh, &tag);
-    }
+    // A real exit was uncounted atomically with its observation above. A fabricated killed status
+    // deliberately stays counted until `retire`, because no exit was observed.
 
     // Reap the whole tree (cgroup.kill + killpg) so orphan grandchildren die now and the readers
     // see EOF; then stop the monitor and join the reader threads.
@@ -6444,21 +6511,41 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         // failing step is dependency-SKIPPED and never reaches the abort arm at all -- an earlier
         // draft used one, and a mutation that marked aborts still passed, because the assertion
         // could not fail for the reason it named. An abort needs an INDEPENDENT step in flight
-        // when the failure trips eager-exit: several jobs, and a sleeper slow enough to still be
-        // running.
+        // when the failure trips eager-exit. Make both prerequisites causal: `boom` depends on the
+        // passing control, and then waits for the independent sleeper's arrival marker before it
+        // fails. No wall-clock delay stands in for either state transition.
+        let barrier = std::env::temp_dir().join(format!(
+            "dagrun_step_error_marker_barrier_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&barrier);
+        std::fs::create_dir_all(&barrier).unwrap();
+        let mut boom = step(
+            "mark",
+            "boom",
+            "while [ ! -d \"$DAGRUN_TEST_MARKER_BARRIER/sleeper\" ]; do sleep 0.01; done; \
+             echo doomed; exit 1",
+            &["mark.fine"],
+            0.0,
+            &[],
+        );
+        let mut sleeper = step(
+            "mark",
+            "sleeper",
+            "mkdir -p \"$DAGRUN_TEST_MARKER_BARRIER/sleeper\"; \
+             while :; do sleep 1; done",
+            &[],
+            0.0,
+            &[],
+        );
+        for item in [&mut boom, &mut sleeper] {
+            item.env.insert(
+                "DAGRUN_TEST_MARKER_BARRIER".to_string(),
+                barrier.to_string_lossy().into_owned(),
+            );
+        }
         let cfg = DagConfig {
-            steps: vec![
-                step(
-                    "mark",
-                    "boom",
-                    "sleep 0.2; echo doomed; exit 1",
-                    &[],
-                    0.0,
-                    &[],
-                ),
-                step("mark", "fine", "true", &[], 0.0, &[]),
-                step("mark", "sleeper", "sleep 30", &[], 0.0, &[]),
-            ],
+            steps: vec![boom, step("mark", "fine", "true", &[], 0.0, &[]), sleeper],
             ..Default::default()
         };
         let res = run_dag(&cfg, 3, false, 1);
@@ -6504,6 +6591,8 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             !mine[0].contains("mark.sleeper"),
             "an eager-exit aborted step must not be marked: {mine:?}"
         );
+        std::fs::remove_dir(barrier.join("sleeper")).unwrap();
+        std::fs::remove_dir(&barrier).unwrap();
     }
 
     /// Colour is off when stdout is not a terminal, so the marker stays greppable in a captured
@@ -6954,12 +7043,43 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
 
     #[test]
     fn max_steps_governs_overlap_while_max_cpus_caps_each_step() {
-        let make_cfg = || {
+        let barrier_root =
+            std::env::temp_dir().join(format!("dagrun_max_steps_barrier_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&barrier_root);
+
+        let make_cfg = |run: &str, expected_overlap: usize| {
+            let barrier = barrier_root.join(run);
             let mut steps = Vec::new();
             for index in 0..4 {
-                let mut item = step("g", &format!("step{index}"), "sleep 0.15", &[], 0.0, &[]);
+                // Each child publishes its arrival and remains alive until the expected number of
+                // peers has arrived. A short sleep is not concurrency evidence under load: a
+                // supervisor can be descheduled long enough for the first child to exit before
+                // the second spawn is registered even though both steps were admitted together.
+                // This barrier makes the asserted peak causal and retains the exact equality.
+                let mut item = step(
+                    "g",
+                    &format!("step{index}"),
+                    "mkdir -p \"$DAGRUN_TEST_BARRIER/$DAGRUN_STEP\"; \
+                     while :; do \
+                       set -- \"$DAGRUN_TEST_BARRIER\"/*; \
+                       [ \"$#\" -ge \"$DAGRUN_TEST_EXPECTED_OVERLAP\" ] && break; \
+                       sleep 0.01; \
+                     done",
+                    &[],
+                    0.0,
+                    &[],
+                );
+                item.env.insert(
+                    "DAGRUN_TEST_BARRIER".to_string(),
+                    barrier.to_string_lossy().into_owned(),
+                );
+                item.env.insert(
+                    "DAGRUN_TEST_EXPECTED_OVERLAP".to_string(),
+                    expected_overlap.to_string(),
+                );
                 item.hint.preferred_inner_jobs = Some(1);
                 item.jobs_flag = Some(String::new());
+                item.timeout = 10;
                 steps.push(item);
             }
             DagConfig {
@@ -6968,15 +7088,15 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             }
         };
 
-        let step_limited = run_dag_limited(&make_cfg(), 2, 4, false, 0);
+        let step_limited = run_dag_limited(&make_cfg("step-limited", 2), 2, 4, false, 0);
         assert!(step_limited.ok);
         assert_eq!(step_limited.max_concurrent_steps, 2);
 
-        let cpu_limited = run_dag_limited(&make_cfg(), 4, 2, false, 0);
+        let cpu_limited = run_dag_limited(&make_cfg("cpu-limited", 4), 4, 2, false, 0);
         assert!(cpu_limited.ok);
         assert_eq!(cpu_limited.max_concurrent_steps, 4);
 
-        let mut overcommitted_width_cfg = make_cfg();
+        let mut overcommitted_width_cfg = make_cfg("overcommitted-width", 4);
         for step in &mut overcommitted_width_cfg.steps {
             step.hint.preferred_inner_jobs = Some(2);
         }
@@ -6984,7 +7104,7 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         assert!(overcommitted_widths.ok);
         assert_eq!(overcommitted_widths.max_concurrent_steps, 4);
 
-        let mut default_width_cfg = make_cfg();
+        let mut default_width_cfg = make_cfg("default-width", 2);
         for step in &mut default_width_cfg.steps {
             step.hint.preferred_inner_jobs = Some(0);
         }
@@ -6992,6 +7112,8 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         let default_width_limited = run_dag_limited(&default_width_cfg, 2, 4, false, 0);
         assert!(default_width_limited.ok);
         assert_eq!(default_width_limited.max_concurrent_steps, 2);
+
+        let _ = std::fs::remove_dir_all(&barrier_root);
     }
 
     #[derive(Default)]
@@ -8729,6 +8851,225 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             "a finished thread that DID publish must be left alone"
         );
         assert!(!sh.failed);
+    }
+
+    #[test]
+    fn spawn_and_exit_transitions_preserve_a_real_overlap_during_registration() {
+        let first = step("g", "first", "true", &[], 0.0, &[]);
+        let second = step("g", "second", "true", &[], 0.0, &[]);
+        let runner = crash_test_runner(vec![first.clone(), second.clone()], &[]);
+        let release_dir = std::env::temp_dir().join(format!(
+            "dagrun_spawn_registration_overlap_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&release_dir);
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let release = release_dir.join("release-first");
+
+        let mut first_command = Command::new("bash");
+        first_command
+            .arg("-c")
+            .arg("while [ ! -e \"$DAGRUN_TEST_RELEASE\" ]; do sleep 0.01; done")
+            .env("DAGRUN_TEST_RELEASE", &release);
+        let (mut first_child, first_aborted) =
+            spawn_and_register_with(&runner.shared, &first.tag(), "first-nonce", || {
+                first_command.spawn()
+            })
+            .unwrap();
+        assert!(!first_aborted);
+
+        let (exited_tx, exited_rx) = std::sync::mpsc::sync_channel(0);
+        let (uncount_blocked_tx, uncount_blocked_rx) = std::sync::mpsc::sync_channel(0);
+        let first_shared = Arc::clone(&runner.shared);
+        let first_tag = first.tag();
+        let first_waiter = thread::spawn(move || {
+            assert!(first_child.wait().unwrap().success());
+            exited_tx.send(()).unwrap();
+            let blocked = match first_shared.try_lock() {
+                Ok(mut sh) => {
+                    uncount_process(&mut sh, &first_tag);
+                    false
+                }
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    let mut sh = poisoned.into_inner();
+                    uncount_process(&mut sh, &first_tag);
+                    false
+                }
+            };
+            uncount_blocked_tx.send(blocked).unwrap();
+            if blocked {
+                let mut sh = lock_shared(&first_shared);
+                uncount_process(&mut sh, &first_tag);
+            }
+        });
+
+        let mut second_command = Command::new("true");
+        let (mut second_child, second_aborted) =
+            spawn_and_register_with(&runner.shared, &second.tag(), "second-nonce", || {
+                let child = second_command.spawn()?;
+                assert!(
+                    matches!(
+                        runner.shared.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "the actual spawn operation ran outside the lifecycle lock"
+                );
+                // The second child now exists under the registration lock. Release the first
+                // child and wait until its supervisor has observed exit and is about to uncount.
+                // The lock must keep that uncount behind the second child's count; without it the
+                // real overlap is reported as one.
+                std::fs::write(&release, b"release\n").unwrap();
+                exited_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    uncount_blocked_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap(),
+                    "the exit-side uncount was not excluded from the spawn/count boundary"
+                );
+                Ok(child)
+            })
+            .unwrap();
+        assert!(!second_aborted);
+        first_waiter.join().unwrap();
+        assert!(
+            try_wait_and_uncount_with(&runner.shared, &second.tag(), || {
+                second_child.wait().map(Some)
+            })
+            .unwrap()
+            .is_some()
+        );
+
+        let sh = lock_shared(&runner.shared);
+        assert_eq!(sh.max_concurrent_steps, 2);
+        assert_eq!(sh.active_processes, 0);
+        drop(sh);
+        std::fs::remove_file(&release).unwrap();
+        std::fs::remove_dir(&release_dir).unwrap();
+    }
+
+    #[test]
+    fn observed_exit_is_uncounted_before_a_nonoverlapping_spawn() {
+        let first = step("g", "first", "true", &[], 0.0, &[]);
+        let second = step("g", "second", "true", &[], 0.0, &[]);
+        let runner = crash_test_runner(vec![first.clone(), second.clone()], &[]);
+
+        let mut first_command = Command::new("true");
+        let (mut first_child, first_aborted) =
+            spawn_and_register_with(&runner.shared, &first.tag(), "first-nonce", || {
+                first_command.spawn()
+            })
+            .unwrap();
+        assert!(!first_aborted);
+
+        let (spawn_tx, spawn_rx) = std::sync::mpsc::sync_channel(0);
+        let (spawn_blocked_tx, spawn_blocked_rx) = std::sync::mpsc::sync_channel(0);
+        let second_shared = Arc::clone(&runner.shared);
+        let second_tag = second.tag();
+        let second_spawner = thread::spawn(move || {
+            spawn_rx.recv().unwrap();
+            let blocked = match second_shared.try_lock() {
+                Ok(sh) => {
+                    drop(sh);
+                    false
+                }
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    drop(poisoned.into_inner());
+                    false
+                }
+            };
+            spawn_blocked_tx.send(blocked).unwrap();
+            let mut command = Command::new("true");
+            spawn_and_register_with(&second_shared, &second_tag, "second-nonce", || {
+                assert!(
+                    matches!(
+                        second_shared.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "the actual spawn operation ran outside the lifecycle lock"
+                );
+                command.spawn()
+            })
+            .unwrap()
+        });
+
+        let observed = try_wait_and_uncount_with(&runner.shared, &first.tag(), || {
+            assert!(
+                matches!(
+                    runner.shared.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "the actual exit-observation operation ran outside the lifecycle lock"
+            );
+            // Arrange for the second supervisor to wait on the lifecycle lock while this exact
+            // injected operation observes the first exit. It may only spawn after the helper
+            // atomically uncounts the observed exit and releases the lock.
+            spawn_tx.send(()).unwrap();
+            assert!(
+                spawn_blocked_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap(),
+                "the spawn side was not excluded from the exit-observation/uncount boundary"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = first_child.try_wait()? {
+                    break Ok(Some(status));
+                }
+                if Instant::now() >= deadline {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "first child did not exit inside controlled observation",
+                    ));
+                }
+                thread::yield_now();
+            }
+        })
+        .unwrap();
+        assert!(observed.is_some());
+
+        let (mut second_child, second_aborted) = second_spawner.join().unwrap();
+        assert!(!second_aborted);
+        assert!(
+            try_wait_and_uncount_with(&runner.shared, &second.tag(), || {
+                second_child.wait().map(Some)
+            })
+            .unwrap()
+            .is_some()
+        );
+
+        let sh = lock_shared(&runner.shared);
+        assert_eq!(sh.max_concurrent_steps, 1);
+        assert_eq!(sh.active_processes, 0);
+    }
+
+    #[test]
+    fn bounded_wait_retries_observation_errors_until_a_real_exit() {
+        let mut observations = 0;
+        let status = wait_bounded_after("g.retry", Duration::from_secs(1), || {
+            observations += 1;
+            match observations {
+                1 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                2 => Err(std::io::Error::other("planted wait observation failure")),
+                _ => Ok(Some(ExitStatus::from_raw(0))),
+            }
+        });
+
+        assert!(status.success());
+        assert_eq!(observations, 3);
+    }
+
+    #[test]
+    fn bounded_wait_fails_closed_only_at_the_deadline_when_observation_keeps_failing() {
+        let mut observations = 0;
+        let status = wait_bounded_after("g.retry", Duration::ZERO, || {
+            observations += 1;
+            Err(std::io::Error::other("planted persistent wait failure"))
+        });
+
+        assert_eq!(status.signal(), Some(9));
+        assert_eq!(observations, 1);
     }
 
     #[test]

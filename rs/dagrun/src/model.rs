@@ -1991,8 +1991,10 @@ pub struct RunResult {
     /// This is fail-closed and also sets `run_timed_out`, because continuing would turn a named
     /// CPU cap into an unenforced claim.
     pub run_cpu_accounting_failed: bool,
-    /// Largest number of step child processes observed alive at the same time. Measured from
-    /// successful spawn until wait observes exit, not inferred from jobs or scheduler admission.
+    /// Largest number of successfully spawned step children whose exit observation remains
+    /// pending. Spawn/count and exit-observation/uncount are serialized, so neither boundary can
+    /// be reordered around the other. A kernel exit remains counted until its supervisor observes
+    /// it; this is an observation-order high-water mark, not an inferred scheduler-admission count.
     pub max_concurrent_steps: usize,
 }
 
