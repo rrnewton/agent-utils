@@ -1749,18 +1749,20 @@ def _act_summary_mode(driver: Driver) -> None:
             "const text = row.querySelector('.summary-text'); "
             "return JSON.stringify({note: Math.round(note.getBoundingClientRect().height), "
             "chars: (text.textContent || '').length, "
-            "markIsOwnLine: getComputedStyle(row.querySelector('.summary-mark')).display}); })()"
+            "markDisplay: getComputedStyle(row.querySelector('.summary-mark')).display}); })()"
         )
         raise Unreachable(
             "32-channel-summarised",
             "the summarised row really is shorter than the clamped one it replaced",
             f"clamped {folded:.0f}px, summarised {summarised:.0f}px, note {lines}. This is the "
             "claim the whole mode rests on, and it is the page that is failing it, not the walk: "
-            "the SUMMARY mark takes a line of its own above the text, so a summary that wraps to "
-            "two lines already costs three, which is what the clamp gives the message itself. "
-            "Widen the row's budget, put the mark back on the line with the text, or lower "
-            "summaries.target_chars -- but do not relax this check, because it is the only thing "
-            "in the repository that can see the difference.",
+            "the reader paid a round trip to a vendor for a row no shorter than the one they had. "
+            "Check `markDisplay` above first -- the label was on a line of its own once, which "
+            "cost a summary that wraps to two lines a third line, exactly what the clamp already "
+            "gives the message itself; `inline` is what fixed that and a regression to `block` "
+            "would bring it straight back. If the label is already inline, the levers left are "
+            "the clamp's line budget and summaries.target_chars. Do not relax this check: it is "
+            "the only thing in the repository that can see the difference.",
         )
 
 
@@ -1795,8 +1797,18 @@ def _act_summary_failed(driver: Driver) -> None:
     # Through the DOM for the same reason as the state above: a real click scrolls the floating
     # chip into view and moves the list being photographed.
     driver.js("(() => { document.getElementById('summarise').click(); })()")
+    # THE PROBE ROW, not whichever row loses the race.
+    #
+    # Turning the mode on asks about every long row on screen, and each ask is a separate round
+    # trip that the server gives three seconds before it gives up. Waiting for `any row failed`
+    # therefore returns as soon as the FIRST of them expires, which is usually not the row this
+    # state photographs and asserts on -- so the picture was taken while the probe's own request
+    # was still in flight, and the expectation that the probe is marked failed then failed on a
+    # page that was about to be right. It went red on whichever profile happened to lose, which is
+    # what made it look intermittent rather than wrong.
     driver.page.wait_for_function(
-        "() => !!document.querySelector('#discord-log li[data-summary-failed=\"true\"]')",
+        "() => document.getElementById('summary-failed-probe')"
+        ".getAttribute('data-summary-failed') === 'true'",
         timeout=20_000,
     )
     driver.settle(300)

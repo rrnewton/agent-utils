@@ -7585,6 +7585,15 @@ test("...and a row showing a summary is DRAWN differently from one showing the m
   const mark = cssBlock(".summary-mark");
   assert.doesNotMatch(mark, /color:\s*var\(--muted\)/, "the summary label is still muted");
   assert.match(mark, /color:\s*var\(--summary-ink\)/, "the summary label has no colour of its own");
+
+  // ...and it does not cost a LINE. A two-line summary under a label line is three lines, which is
+  // exactly what the clamp already gives the message itself, so a mark on its own line makes the
+  // summarised row TALLER than the row it replaces and the mode buys the reader nothing for a paid
+  // round trip. Inline is what keeps the label out of the height while still keeping it out of the
+  // flex column that put it there. Only a browser can measure the resulting row — that is
+  // `32-channel-summarised` in the screenshot walk — so this asserts the declaration behind it.
+  assert.match(mark, /display:\s*inline/, "the summary label is not on the line with the text");
+  assert.doesNotMatch(mark, /display:\s*block/, "the summary label takes a line of its own again");
 });
 
 test("A GLOMMED ROW IS SUMMARISED AS ONE PIECE OF WRITING, NOT AS ITS FIRST HALF", async () => {

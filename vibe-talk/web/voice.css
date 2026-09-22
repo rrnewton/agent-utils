@@ -1766,19 +1766,30 @@ body {
 }
 
 /*
- * The summary's label used to take a COLUMN.
+ * The summary's label took a COLUMN, and then it took a LINE. It should take neither.
  *
- * `.summary` is a flex row and `.summary-mark` is `flex: 0 0 auto`, so on a phone the word
- * SUMMARY held a fixed strip at the left and the summary itself was squeezed into whatever was
- * left -- a few characters per line. The mark belongs ABOVE the text, not beside it.
+ * `.summary` began as a flex row with `.summary-mark` at `flex: 0 0 auto`, so on a phone the word
+ * SUMMARY held a fixed strip down the left and the summary itself was squeezed into whatever was
+ * left -- a few characters per line. Moving the mark onto its own line fixed that, and broke the
+ * one claim the mode rests on: a summarised row measured TALLER than the three-line clamp it
+ * replaces, because a two-line summary under a label line is three lines, which is exactly what
+ * the clamp already gives the message itself. Summarising cost a round trip to a vendor and
+ * bought the reader nothing.
+ *
+ * Inline answers both. The mark leads the first line and the text wraps UNDER it at full width,
+ * so there is no column to squeeze into and no line spent on a label.
+ *
+ * The screenshot walk measures this and nothing else does -- see `32-channel-summarised`, which
+ * compares the row against its own clamped height on a 375px phone. A page suite can assert this
+ * declaration; only a browser can say whether the row actually got shorter.
  */
 .summary {
   display: block;
 }
 
 .summary-mark {
-  display: block;
-  margin-bottom: 0.1rem;
+  display: inline;
+  margin-right: 0.4rem;
 }
 
 /* ---------------------------------------------------------------------------- the dock ----- */
