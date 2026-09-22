@@ -29354,11 +29354,13 @@ usage or audit gate unknown, 3 fail-closed refusal.
     create.add_argument(
         "--slot-type",
         choices=SLOT_TYPES,
+        required=True,
         help="agent preserves authored work before reclaim; validate never salvages",
     )
     create.add_argument(
         "--coordinator-authorized",
         action="store_true",
+        required=True,
         help=(
             "confirm that the coordinator assigned this slot; an assigned agent may "
             "create it with its own --owner-pid"

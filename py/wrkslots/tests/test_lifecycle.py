@@ -795,6 +795,11 @@ def make_project(
     )
     git(repository, "config", "user.name", "Wrkslots Test")
     git(repository, "config", "user.email", "wrkslots@example.invalid")
+    # A host Git wrapper may start auto-maintenance after its foreground
+    # process exits. Keep fixture-owned maintenance synchronous so a later
+    # removal census cannot correctly mistake that child for an external user.
+    git(repository, "config", "gc.autoDetach", "false")
+    git(repository, "config", "maintenance.autoDetach", "false")
     (repository / "seed.txt").write_text("seed\n", encoding="utf-8")
     git(repository, "add", "seed.txt")
     git(repository, "commit", "-m", "seed")
@@ -3132,7 +3137,7 @@ def test_default_layout_separates_agent_and_validate_slots_under_worktrees(
     )
 
 
-def test_create_without_coordinator_authorization_names_boundary_and_remedy(
+def test_create_without_coordinator_authorization_is_rejected_by_parser(
     tmp_path: Path,
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
@@ -3161,12 +3166,11 @@ def test_create_without_coordinator_authorization_names_boundary_and_remedy(
         "product=codex/task",
     )
 
-    assert refused.returncode == 3
-    assert "worktree creation requires a coordinator assignment" in refused.stderr
-    assert "no worktree or lifecycle record was changed" in refused.stderr
-    assert "ask the coordinator" in refused.stderr
-    assert "an assigned agent may rerun" in refused.stderr
-    assert "its own --owner-pid" in refused.stderr
+    assert refused.returncode == 2
+    assert (
+        "the following arguments are required: --coordinator-authorized"
+        in refused.stderr
+    )
     assert refused.stdout == ""
     assert not checkout(project).exists()
     assert active_slots(project) == []
@@ -9309,7 +9313,7 @@ def test_ownerless_recovery_keeps_unrelated_drift_visible_in_status(
     assert "target=validate/validate-cargo-target" not in after.stdout
 
 
-def test_create_without_slot_type_names_both_choices_and_changes_nothing(
+def test_create_without_slot_type_is_rejected_by_parser(
     tmp_path: Path,
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
@@ -9337,15 +9341,25 @@ def test_create_without_slot_type_names_both_choices_and_changes_nothing(
         "product=codex/task",
     )
 
-    assert refused.returncode == 3
-    assert "whether this is an agent or validate slot" in refused.stderr
-    assert "--slot-type agent" in refused.stderr
-    assert "--slot-type validate" in refused.stderr
-    assert "no worktree or lifecycle record was changed" in refused.stderr
+    assert refused.returncode == 2
+    assert "the following arguments are required: --slot-type" in refused.stderr
     assert refused.stdout == ""
     assert not checkout(project).exists()
     assert active_slots(project) == []
     assert sorted(path.read_bytes() for path in events.glob("*.json")) == before
+
+
+def test_create_help_marks_runtime_mandatory_options_required(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+
+    helped = raw_command(project, "create", "--help")
+
+    assert helped.returncode == 0
+    usage = " ".join(helped.stdout.partition("\n\n")[0].split())
+    assert "--slot-type {agent,validate}" in usage
+    assert "[--slot-type {agent,validate}]" not in usage
+    assert "--coordinator-authorized" in usage
+    assert "[--coordinator-authorized]" not in usage
 
 
 def test_existing_unregistered_flag_retains_and_warns_without_treating_path_free(
