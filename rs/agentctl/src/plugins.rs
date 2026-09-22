@@ -19,13 +19,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+
+pub use chat_subscription_plugin::process::{
+    ProcessPhaseTimeouts, ProcessPluginBackend, ProcessPluginCancellation,
+    ProcessPluginChild as SupervisedPluginChild, ProcessPluginError,
+};
 
 /// Environment override for the user-level plugin and control home.
 pub const AGENTCTL_HOME_ENV: &str = "AGENTCTL_HOME";
@@ -46,9 +48,6 @@ pub const PLUGIN_BASELINE_ENV: &[&str] = &[
     "TMPDIR",
     "XDG_RUNTIME_DIR",
 ];
-
-const REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileIdentity {
@@ -273,139 +272,23 @@ impl PinnedPluginCommand {
     /// # Errors
     ///
     /// Returns [`std::io::Error`] when the pinned executable cannot be started.
-    pub fn spawn(mut self) -> io::Result<SupervisedPluginChild> {
-        self.command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let mut child = self.command.spawn()?;
-        let process_group = match libc::pid_t::try_from(child.id()) {
-            Ok(process_group) => process_group,
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "plugin child id cannot identify its process group",
-                ));
-            }
-        };
-        Ok(SupervisedPluginChild {
-            child,
-            process_group,
-            process_group_terminated: false,
-        })
+    pub fn spawn(self) -> io::Result<SupervisedPluginChild> {
+        chat_subscription_plugin::process::ProcessPluginChild::spawn(self.command)
     }
-}
 
-/// Ownership guard for a process plugin group and its protocol pipes.
-///
-/// A host takes the streams, connects `PluginBackend`, and retains this supervisor for the entire
-/// subscription. Shutdown first sends cooperative Close through `ChatSubscription::close`, drops
-/// the streams, then calls [`Self::shutdown`]. Drop is a bounded kill/reap backstop for every error
-/// and panic path.
-#[derive(Debug)]
-pub struct SupervisedPluginChild {
-    child: Child,
-    process_group: libc::pid_t,
-    process_group_terminated: bool,
-}
-
-impl SupervisedPluginChild {
-    /// Move the child's stdout reader and stdin writer into the framed protocol backend.
+    /// Spawn and negotiate this pinned executable with bounded process-protocol phases.
+    ///
+    /// The returned cancellation handle independently interrupts a blocked event receive. Keep it
+    /// for the complete subscription lifetime.
     ///
     /// # Errors
     ///
-    /// Returns [`std::io::Error`] if either stream was already taken.
-    pub fn take_transport(&mut self) -> io::Result<(ChildStdout, ChildStdin)> {
-        let reader = self.child.stdout.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "plugin stdout was already taken")
-        })?;
-        let writer = self.child.stdin.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "plugin stdin was already taken")
-        })?;
-        Ok((reader, writer))
-    }
-
-    /// Wait cooperatively for `timeout`, kill the complete private process group, and reap its
-    /// leader within a fixed two-second bound.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`std::io::Error`] for process-control failures or if the child cannot be reaped
-    /// within the bounded kill window.
-    pub fn shutdown(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
-        let cooperative_status = wait_for_child(&mut self.child, timeout)?;
-        let termination_result = self.terminate_processes();
-        let status = match cooperative_status {
-            Some(status) => Some(status),
-            None => wait_for_child(&mut self.child, KILL_REAP_TIMEOUT)?,
-        };
-        termination_result?;
-        status.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "plugin process-group leader did not exit after bounded kill",
-            )
-        })
-    }
-
-    fn terminate_processes(&mut self) -> io::Result<()> {
-        let group_result = self.terminate_process_group();
-        let leader_result = match self.child.kill() {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
-            Err(error) => Err(error),
-        };
-        group_result.and(leader_result)
-    }
-
-    fn terminate_process_group(&mut self) -> io::Result<()> {
-        if self.process_group_terminated {
-            return Ok(());
-        }
-        // `process_group` is the positive child PID captured immediately after spawning the child
-        // with `process_group(0)`. Negating it therefore targets only that private process group.
-        let result = unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
-        if result == 0 {
-            self.process_group_terminated = true;
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            self.process_group_terminated = true;
-            Ok(())
-        } else {
-            Err(error)
-        }
-    }
-}
-
-impl Drop for SupervisedPluginChild {
-    fn drop(&mut self) {
-        let _ = self.terminate_processes();
-        let _ = wait_for_child(&mut self.child, KILL_REAP_TIMEOUT);
-    }
-}
-
-fn wait_for_child(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
-    let start = Instant::now();
-    let deadline = start.checked_add(timeout).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "plugin wait timeout is too large",
-        )
-    })?;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(None);
-        }
-        thread::sleep(REAP_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    /// Returns [`ProcessPluginError`] after bounded process cleanup if spawn or Hello fails.
+    pub fn connect(
+        self,
+        timeouts: ProcessPhaseTimeouts,
+    ) -> Result<(ProcessPluginBackend, ProcessPluginCancellation), ProcessPluginError> {
+        self.spawn()?.connect(timeouts)
     }
 }
 
@@ -859,8 +742,12 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    const TEST_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+    const TEST_OBSERVE_INTERVAL: Duration = Duration::from_millis(10);
 
     struct Fixture {
         path: PathBuf,
@@ -915,6 +802,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn process_is_running(pid: u32) -> bool {
         let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
             return false;
@@ -924,10 +812,11 @@ mod tests {
             .is_some_and(|state| !matches!(state, "Z" | "X"))
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_descendant_holding_protocol_output(
         fixture: &Fixture,
         name: &str,
-    ) -> (SupervisedPluginChild, BufReader<ChildStdout>, u32) {
+    ) -> (SupervisedPluginChild, BufReader<File>, u32) {
         fixture.native_plugin(
             name,
             &format!("chat-subscription.fixture.{name}"),
@@ -954,19 +843,37 @@ mod tests {
             .trim()
             .parse::<u32>()
             .expect("fixture reports a numeric descendant pid");
-        let leader_status = wait_for_child(&mut child.child, Duration::from_secs(1))
-            .expect("wait for fixture leader")
-            .expect("fixture leader exits promptly");
-        assert!(leader_status.success());
+        let executable_id = child.executable_id();
+        let executable_deadline = Instant::now() + Duration::from_secs(1);
+        while process_is_running(executable_id) && Instant::now() < executable_deadline {
+            thread::sleep(TEST_OBSERVE_INTERVAL);
+        }
+        assert!(
+            !process_is_running(executable_id),
+            "fixture executable must exit before descendant cleanup"
+        );
+        let executable_status = child
+            .executable_status()
+            .expect("observe fixture executable without reaping")
+            .expect("fixture executable has exited");
+        assert!(
+            executable_status.success(),
+            "fixture executable exited unsuccessfully: {executable_status}"
+        );
+        assert!(
+            process_is_running(child.id()),
+            "atomic supervisor must remain live to pin the private process-group identity"
+        );
         assert!(
             process_is_running(descendant_pid),
-            "fixture descendant must outlive its process-group leader"
+            "fixture descendant must outlive its executable plugin"
         );
         (child, reader, descendant_pid)
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_descendant_died_and_protocol_output_closed(
-        mut reader: BufReader<ChildStdout>,
+        mut reader: BufReader<File>,
         descendant_pid: u32,
     ) {
         let (sender, receiver) = mpsc::channel();
@@ -978,12 +885,12 @@ mod tests {
             let _ = sender.send(result);
         });
 
-        let deadline = Instant::now() + KILL_REAP_TIMEOUT;
+        let deadline = Instant::now() + TEST_REAP_TIMEOUT;
         while process_is_running(descendant_pid) && Instant::now() < deadline {
-            thread::sleep(REAP_POLL_INTERVAL);
+            thread::sleep(TEST_OBSERVE_INTERVAL);
         }
         let descendant_died = !process_is_running(descendant_pid);
-        let pipe_result = receiver.recv_timeout(KILL_REAP_TIMEOUT);
+        let pipe_result = receiver.recv_timeout(TEST_REAP_TIMEOUT);
         let pipe_closed = matches!(&pipe_result, Ok(Ok(_)));
         if !descendant_died || !pipe_closed {
             let _ = Command::new("/bin/kill")
@@ -991,7 +898,7 @@ mod tests {
                 .status();
         }
         if pipe_result.is_err() {
-            let _ = receiver.recv_timeout(KILL_REAP_TIMEOUT);
+            let _ = receiver.recv_timeout(TEST_REAP_TIMEOUT);
         }
         let _ = reader_thread.join();
 
@@ -1316,6 +1223,7 @@ mod tests {
         assert_eq!(error.code, "plugin_identity_changed");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn pinned_command_survives_atomic_entry_replacement_after_return() {
         let fixture = Fixture::new();
@@ -1351,6 +1259,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn supervisor_kills_and_reaps_a_blocked_plugin_within_its_fixed_bound() {
         let fixture = Fixture::new();
@@ -1371,8 +1280,9 @@ mod tests {
         assert!(!status.success());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn shutdown_kills_descendant_and_closes_pipe_after_leader_exits() {
+    fn shutdown_kills_descendant_after_plugin_exits_while_supervisor_pins_group() {
         let fixture = Fixture::new();
         let (mut child, reader, descendant_pid) =
             spawn_descendant_holding_protocol_output(&fixture, "shutdown-tree");
@@ -1387,8 +1297,9 @@ mod tests {
         assert_descendant_died_and_protocol_output_closed(reader, descendant_pid);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn drop_kills_descendant_and_closes_pipe_after_leader_exits() {
+    fn drop_kills_descendant_after_plugin_exits_while_supervisor_pins_group() {
         let fixture = Fixture::new();
         let (child, reader, descendant_pid) =
             spawn_descendant_holding_protocol_output(&fixture, "drop-tree");

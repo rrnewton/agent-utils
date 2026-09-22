@@ -191,8 +191,69 @@ the current head is durable before message delivery. A non-null cursor is
 replayed inclusively; the durable host deduplicates by event identity.
 
 Close is cooperative. A plugin blocked inside provider `next_item` cannot read
-it, so a process host must retain the launcher's child supervisor for the whole
-subscription. The shutdown sequence is: send Close with the public subscription
-method, drop both protocol pipes, wait for an operator-selected grace period,
-then let the supervisor kill the plugin's complete private process group and
-reap its leader within the fixed two-second backstop.
+it, so Linux process hosts use `process::ProcessPluginChild::connect` with
+explicit `ProcessPhaseTimeouts`. The returned backend runs blocking pipe I/O on
+an owned worker. Hello, Start, Commit, and Close have separate deadlines;
+exceeding one kills the complete private process group, closes the remote pipe
+ends, joins the worker, and reaps the leader. An eventfd also wakes the worker's
+nonblocking host pipe adapters, so even a descendant retaining a pipe cannot
+strand the worker. `next_item` remains a genuinely blocking receive, while the
+clean backend and driver traits expose an independent cancellation handle that
+can interrupt blocked Start or receive work from another thread. If the caller's
+single absolute cleanup deadline expires, the same terminal timeout is cached.
+Before any supervisor is cloned, the host reserves one of 32 global cleanup
+admissions. That admission follows the live child into a tracked cleanup thread
+until the process is reaped and the protocol worker is joined. A stuck cleanup
+therefore consumes one bounded slot, and saturation refuses later launches
+before creating another process or worker. If a cleanup thread cannot be
+created, its complete task and admission remain retained instead of panicking
+or detaching resources, and later launch attempts retry that tracked task before
+seeking a new admission. Drop does not start another untracked wait.
+An unexpected post-preflight pidfd-reap failure likewise leaves the pidfd,
+cleanup thread, JoinHandle, and admission owned. A later launch attempt is an
+explicit retry event; there is no timer polling and no release of capacity while
+zombie ownership remains uncertain. If the plugin cannot transfer its self-opened
+pidfd, the host first kills the still-pinned process group and then permanently
+retains the plugin `Child`, supervisor pidfd, and one admission. It makes no
+identity-unsafe numeric `Child::kill` or `Child::wait` call; repeated failures
+therefore fail closed at the same global bound without accumulating threads.
+
+Process plugins are trusted same-user code. The private process group is a
+cleanup and supervision mechanism, not a security-containment boundary: a
+malicious plugin can call `setsid` and escape process-group signalling. Hosts
+that run untrusted plugins must add an appropriate sandbox or cgroup boundary.
+
+Normal shutdown sends Close, waits for the configured cooperative grace, kills
+the process group before reaping the leader, and then waits through a fixed
+two-second post-kill bound. Linux pidfds and `ppoll` provide event-driven exit
+notification without periodic wakeups. `clone3(CLONE_PIDFD)` atomically creates
+a minimal supervisor that becomes and remains the private process-group leader;
+the ordinary plugin process joins that group. Because this raw supervisor never
+execs, it closes every inherited descriptor except its one-byte readiness pipe
+and one-byte parent-release socket before the handshake, then closes the release
+socket before its long-lived wait. It uses `close_range` when available and an
+async-signal-safe `/proc/self/fd` enumeration fallback otherwise; if neither
+works, launch is refused before the plugin executable starts. Around `clone3`,
+the launch thread uses raw `rt_sigprocmask` to block the complete Linux kernel
+signal set and then restores its exact prior mask. The sentinel keeps every
+blockable signal masked forever, so inherited handlers and group-directed signals
+cannot run during raw post-clone setup or terminate it; cleanup uses SIGKILL.
+Until the parent has restored its exact mask and wrapped the atomic pidfd in
+tracked cleanup ownership, the sentinel also arms `PR_SET_PDEATHSIG(SIGKILL)` and
+waits for a one-byte release handshake. Fatal restoration failure therefore
+cannot orphan the raw child even if an external policy denies the parent's
+best-effort pidfd signal. The supervisor pins the PGID until the host has signalled
+the complete group, so a concurrent disposition change or external reaper cannot
+redirect cleanup through PID/PGID reuse. Before exec, the plugin child opens a
+pidfd for itself and transfers it to the host with `SCM_RIGHTS`; even a fast exit
+or concurrent reaper therefore cannot make the host look up a reused numeric PID. The host preflights
+`waitid(P_PIDFD)` as well as exercising the live clone3 pidfd before starting the
+executable, so kernels that implement only the earlier clone3 primitive are
+refused safely. There is deliberately no numeric-PID wait fallback: reap is
+exclusively `waitid(P_PIDFD)`, interrupted calls retry, and no wait error alone is
+treated as success. A signal-zero operation on the stable pidfd must return
+`ESRCH` before an external status consumption is accepted; a consumed plugin
+status is reported as unavailable rather than fabricated. Launch also refuses
+an already-incompatible SIGCHLD disposition.
+Non-Linux builds expose the same configuration types but refuse process launch
+as unsupported before executing a command.

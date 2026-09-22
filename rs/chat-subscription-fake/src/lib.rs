@@ -11,11 +11,24 @@ use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chat_subscription::{
-    BackendCapabilities, BackendConfiguration, BackendFailure, ChannelId, ChatSubscriptionBackend,
-    ChatSubscriptionDriver, CommittableEvent, DeliveryBatch, DeliveryId, EventKind, EventSequence,
-    Heartbeat, InboundMessage, MessageId, ProviderCursor, ProviderPayload, ReconciliationGap,
-    ReplaySupport, SenderId, SubscribeRequest, SubscriptionItem, ThreadId,
+    BackendCapabilities, BackendConfiguration, BackendFailure, CancellationError, ChannelId,
+    ChatSubscriptionBackend, ChatSubscriptionCancellation, ChatSubscriptionDriver,
+    CommittableEvent, DeliveryBatch, DeliveryId, EventKind, EventSequence, Heartbeat,
+    InboundMessage, MessageId, ProviderCursor, ProviderPayload, ReconciliationGap, ReplaySupport,
+    SenderId, SubscribeRequest, SubscriptionItem, ThreadId,
 };
+
+struct FakeCancellation;
+
+impl ChatSubscriptionCancellation for FakeCancellation {
+    fn cancel(&self) -> Result<(), CancellationError> {
+        Ok(())
+    }
+}
+
+fn fake_cancellation() -> Arc<dyn ChatSubscriptionCancellation> {
+    Arc::new(FakeCancellation)
+}
 
 /// Observable fake hot-loop activity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -160,6 +173,10 @@ fn fixture_delivery(sequence: u64, event: CommittableEvent) -> DeliveryBatch {
 }
 
 impl ChatSubscriptionBackend for FakeBackend {
+    fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+        fake_cancellation()
+    }
+
     fn capabilities(&self) -> BackendCapabilities {
         self.capabilities.clone()
     }
@@ -218,6 +235,10 @@ struct FakeDriver {
 }
 
 impl ChatSubscriptionDriver for FakeDriver {
+    fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+        fake_cancellation()
+    }
+
     fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
         if self.pending.is_some() {
             return Err(BackendFailure::new(

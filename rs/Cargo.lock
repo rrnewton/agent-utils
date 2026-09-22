@@ -116,6 +116,7 @@ name = "chat-subscription-plugin"
 version = "0.1.0"
 dependencies = [
  "chat-subscription",
+ "libc",
  "serde",
  "serde_json",
 ]

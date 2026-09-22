@@ -99,12 +99,35 @@ cannot self-authorize access to unrelated API keys. Provider credentials belong
 to an explicit host-controlled mechanism or to the provider's ambient user
 credential service.
 
-A future durable host must retain the returned process supervisor for the
-entire subscription. Normal shutdown sends the protocol Close frame through the
-public subscription cancellation method, drops both pipes, and waits for a
-chosen grace period. The supervisor then kills and reaps within a fixed
-two-second backstop; cooperative Close alone cannot interrupt provider code
-blocked while obtaining its next event. The current Rust CLI exposes these
+A future durable host connects the returned process supervisor with explicit
+Hello, Start, Commit, Close, and shutdown-grace deadlines. Blocking protocol I/O
+runs on an owned worker. The separately retained cancellation handle can kill
+the complete private process group while `next_item` is blocked, then joins the
+worker and reaps the leader. Normal shutdown sends Close and waits for the
+chosen grace period before forced termination. Leader exit uses event-driven
+Linux pidfd notification rather than periodic process polling, with a fixed
+two-second post-kill bound. Launch preflights both atomic clone3 pidfd creation
+and `waitid(P_PIDFD)`, and the non-execing process-group supervisor closes all
+inherited host descriptors through `close_range` or `/proc/self/fd` before it
+waits. The launch thread masks the complete kernel signal set only across
+`clone3` and restores its exact prior mask; the sentinel permanently retains
+that mask so inherited handlers and blockable group signals cannot terminate
+it. A parent-death signal and one-byte release handshake keep the raw sentinel
+from surviving a fatal parent mask-restoration failure before tracked pidfd
+ownership is established. Reaping uses only the pidfd identity, never a
+numeric-PID wait fallback. A host without those supervision primitives refuses
+before spawning the plugin executable. Cleanup ownership is globally capped at
+32 admissions, so a stuck reap or join makes later launches fail closed instead
+of growing threads or processes without bound. Unexpected pidfd-reap errors
+retain that admission and tracked cleanup thread until an explicit later retry
+succeeds. If the plugin
+pidfd transfer fails, the host kills the pinned group and permanently retains the
+identity resources plus one admission instead of using numeric `Child::kill` or
+`Child::wait`. Launch also requires the default `SIGCHLD` disposition because an
+auto-reaper makes status ownership unsafe. The process
+group is a cleanup boundary for trusted same-user plugins, not security
+containment—a malicious plugin can escape it with `setsid`. Untrusted plugins
+need a launcher-owned sandbox or cgroup. The current Rust CLI exposes these
 launch/protocol building blocks but still ships no subscription runtime command.
 
 A manifest can report only static implementation maturity. Discovery always

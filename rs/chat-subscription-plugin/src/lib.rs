@@ -10,7 +10,21 @@
 //! discovery, containment, credential setup, and lifecycle supervision belong to the caller.
 
 #![doc = include_str!("../README.md")]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+/// Linux process hosting with bounded control phases and event-driven supervision.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub mod process;
+/// Explicit refusal surface on targets without Linux pidfd/clone3 supervision.
+#[cfg(not(target_os = "linux"))]
+#[path = "process_unsupported.rs"]
+pub mod process;
+// Linux CI also type-checks and exercises the non-Linux refusal surface because cross standard
+// libraries are not guaranteed to be installed on every development host.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "process_unsupported.rs"]
+pub mod process_unsupported_compile_test;
 
 use std::collections::HashSet;
 use std::fmt;
@@ -19,12 +33,12 @@ use std::num::NonZeroU16;
 
 use chat_subscription::{
     BackendCapabilities, BackendConfiguration, BackendFailure, ChannelId, ChatSubscription,
-    ChatSubscriptionBackend, ChatSubscriptionDriver, CommittableEvent, DeliveryBatch, DeliveryId,
-    EventKind, EventSequence, Heartbeat, InboundMessage, MessageId, ProviderCursor,
-    ProviderPayload, ReconciliationGap, ReplaySupport, SenderId, SubscribeRequest,
-    SubscriptionError, SubscriptionItem, ThreadId,
+    ChatSubscriptionBackend, CommittableEvent, DeliveryBatch, DeliveryId, EventKind, EventSequence,
+    Heartbeat, InboundMessage, MessageId, ProviderCursor, ProviderPayload, ReconciliationGap,
+    ReplaySupport, SenderId, SubscribeRequest, SubscriptionError, SubscriptionItem, ThreadId,
 };
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 
 /// The only currently supported process-protocol version.
@@ -410,6 +424,111 @@ struct WireBackendConfiguration {
     data: serde_json::Map<String, serde_json::Value>,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BorrowedServerFrame<'a> {
+    Item { item: BorrowedWireItem<'a> },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BorrowedWireItem<'a> {
+    Batch {
+        sequence: u64,
+        provider_cursor: &'a str,
+        delivery_id: &'a str,
+        events: BorrowedWireEvents<'a>,
+    },
+    Heartbeat {
+        sequence: u64,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BorrowedWireEvent<'a> {
+    MessageCreated(BorrowedWireMessageCreated<'a>),
+    Checkpoint,
+    Gap { reason: Option<&'a str> },
+}
+
+#[derive(Serialize)]
+struct BorrowedWireMessageCreated<'a> {
+    channel_id: &'a str,
+    message_id: &'a str,
+    thread_id: &'a str,
+    sender_id: &'a str,
+    text: &'a str,
+    created_at: &'a str,
+    thread_reply: bool,
+    provider_payload: Option<BorrowedWireProviderPayload<'a>>,
+}
+
+#[derive(Serialize)]
+struct BorrowedWireProviderPayload<'a> {
+    schema: &'a str,
+    data: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+struct BorrowedWireEvents<'a>(&'a [CommittableEvent]);
+
+impl Serialize for BorrowedWireEvents<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for event in self.0 {
+            sequence.serialize_element(&BorrowedWireEvent::from(event))?;
+        }
+        sequence.end()
+    }
+}
+
+impl<'a> From<&'a SubscriptionItem> for BorrowedWireItem<'a> {
+    fn from(value: &'a SubscriptionItem) -> Self {
+        match value {
+            SubscriptionItem::Heartbeat(heartbeat) => Self::Heartbeat {
+                sequence: heartbeat.sequence().get(),
+            },
+            SubscriptionItem::Batch(batch) => Self::Batch {
+                sequence: batch.sequence().get(),
+                provider_cursor: batch.cursor().as_str(),
+                delivery_id: batch.delivery_id().as_str(),
+                events: BorrowedWireEvents(batch.events()),
+            },
+        }
+    }
+}
+
+impl<'a> From<&'a CommittableEvent> for BorrowedWireEvent<'a> {
+    fn from(value: &'a CommittableEvent) -> Self {
+        match value {
+            CommittableEvent::MessageCreated(message) => {
+                Self::MessageCreated(BorrowedWireMessageCreated {
+                    channel_id: message.channel_id().as_str(),
+                    message_id: message.message_id().as_str(),
+                    thread_id: message.thread_id().as_str(),
+                    sender_id: message.sender_id().as_str(),
+                    text: message.text(),
+                    created_at: message.created_at(),
+                    thread_reply: message.is_thread_reply(),
+                    provider_payload: message.provider_payload().map(|payload| {
+                        BorrowedWireProviderPayload {
+                            schema: payload.schema(),
+                            data: payload.data(),
+                        }
+                    }),
+                })
+            }
+            CommittableEvent::Checkpoint => Self::Checkpoint,
+            CommittableEvent::Gap(gap) => Self::Gap {
+                reason: gap.reason(),
+            },
+        }
+    }
+}
+
 impl From<&BackendCapabilities> for WireCapabilities {
     fn from(value: &BackendCapabilities) -> Self {
         Self {
@@ -678,17 +797,15 @@ impl<R: Read + Send + 'static, W: Write + Send + 'static> PluginBackend<R, W> {
     }
 }
 
-impl<R: Read + Send + 'static, W: Write + Send + 'static> ChatSubscriptionBackend
-    for PluginBackend<R, W>
-{
-    fn capabilities(&self) -> BackendCapabilities {
+impl<R: Read + Send + 'static, W: Write + Send + 'static> PluginBackend<R, W> {
+    pub(crate) fn capabilities(&self) -> BackendCapabilities {
         self.capabilities.clone()
     }
 
-    fn subscribe(
+    pub(crate) fn subscribe(
         &mut self,
         request: &SubscribeRequest,
-    ) -> Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+    ) -> Result<PluginDriver<R, W>, BackendFailure> {
         let mut io = self.io.take().ok_or_else(|| {
             BackendFailure::new(
                 "plugin_already_subscribed",
@@ -721,11 +838,11 @@ impl<R: Read + Send + 'static, W: Write + Send + 'static> ChatSubscriptionBacken
         })
         .map_err(backend_failure)?;
         match io.receive::<ServerFrame>().map_err(backend_failure)? {
-            Some(ServerFrame::Subscribed) => Ok(Box::new(PluginDriver {
+            Some(ServerFrame::Subscribed) => Ok(PluginDriver {
                 io,
                 pending: None,
                 terminal: false,
-            })),
+            }),
             Some(ServerFrame::Error {
                 code,
                 detail,
@@ -744,14 +861,14 @@ impl<R: Read + Send + 'static, W: Write + Send + 'static> ChatSubscriptionBacken
     }
 }
 
-struct PluginDriver<R, W> {
+pub(crate) struct PluginDriver<R, W> {
     io: FramedIo<R, W>,
     pending: Option<(EventSequence, DeliveryId)>,
     terminal: bool,
 }
 
-impl<R: Read + Send, W: Write + Send> ChatSubscriptionDriver for PluginDriver<R, W> {
-    fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+impl<R: Read + Send, W: Write + Send> PluginDriver<R, W> {
+    pub(crate) fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
         if self.pending.is_some() {
             return Err(BackendFailure::new(
                 "plugin_backpressure_violation",
@@ -793,7 +910,7 @@ impl<R: Read + Send, W: Write + Send> ChatSubscriptionDriver for PluginDriver<R,
         }
     }
 
-    fn acknowledge(&mut self, delivery_id: &DeliveryId) -> Result<(), BackendFailure> {
+    pub(crate) fn acknowledge(&mut self, delivery_id: &DeliveryId) -> Result<(), BackendFailure> {
         let (sequence, expected_delivery_id) = self.pending.as_ref().ok_or_else(|| {
             BackendFailure::new(
                 "plugin_no_pending_delivery",
@@ -811,13 +928,17 @@ impl<R: Read + Send, W: Write + Send> ChatSubscriptionDriver for PluginDriver<R,
             .expect("constant backend failure is valid"));
         }
         let sequence = *sequence;
-        self.io
-            .send(&ClientFrame::Commit {
-                sequence: sequence.get(),
-                delivery_id: delivery_id.as_str().to_owned(),
-            })
-            .map_err(backend_failure)?;
-        match self.io.receive::<ServerFrame>().map_err(backend_failure)? {
+        if let Err(error) = self.io.send(&ClientFrame::Commit {
+            sequence: sequence.get(),
+            delivery_id: delivery_id.as_str().to_owned(),
+        }) {
+            return Err(commit_outcome_unknown(error));
+        }
+        let confirmation = self
+            .io
+            .receive::<ServerFrame>()
+            .map_err(commit_outcome_unknown)?;
+        match confirmation {
             Some(ServerFrame::Committed { sequence: observed }) if observed == sequence.get() => {
                 self.pending = None;
                 Ok(())
@@ -827,19 +948,19 @@ impl<R: Read + Send, W: Write + Send> ChatSubscriptionDriver for PluginDriver<R,
                 detail,
                 retryable,
                 ..
-            }) => Err(remote_failure(code, detail, retryable)),
-            Some(_) => Err(backend_failure(PluginError::new(
-                "unexpected_frame",
-                "plugin did not confirm the exact commit sequence",
+            }) => Err(commit_outcome_unknown(format!(
+                "plugin returned error {code} (retryable={retryable}): {detail}"
             ))),
-            None => Err(backend_failure(PluginError::new(
-                "commit_outcome_unknown",
+            Some(frame) => Err(commit_outcome_unknown(format!(
+                "plugin returned non-matching commit confirmation: {frame:?}"
+            ))),
+            None => Err(commit_outcome_unknown(
                 "plugin exited before confirming the commit",
-            ))),
+            )),
         }
     }
 
-    fn close(&mut self) -> Result<(), BackendFailure> {
+    pub(crate) fn close(&mut self) -> Result<(), BackendFailure> {
         if self.terminal {
             return Ok(());
         }
@@ -848,6 +969,13 @@ impl<R: Read + Send, W: Write + Send> ChatSubscriptionDriver for PluginDriver<R,
         self.terminal = true;
         Ok(())
     }
+}
+
+fn commit_outcome_unknown(cause: impl fmt::Display) -> BackendFailure {
+    backend_failure(PluginError::new(
+        "commit_outcome_unknown",
+        format!("commit may have been applied but confirmation failed: {cause}"),
+    ))
 }
 
 fn send_backend_error<R: Read, W: Write>(
@@ -1006,8 +1134,8 @@ fn serve_subscription<R: Read, W: Write>(
                 return Ok(());
             }
         };
-        io.send(&ServerFrame::Item {
-            item: WireItem::from(&item),
+        io.send(&BorrowedServerFrame::Item {
+            item: BorrowedWireItem::from(&item),
         })?;
         let SubscriptionItem::Batch(delivery) = item else {
             continue;
@@ -1059,6 +1187,9 @@ pub fn serve_stdio(backend: &mut dyn ChatSubscriptionBackend) -> Result<(), Plug
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chat_subscription::{
+        CancellationError, ChatSubscriptionCancellation, ChatSubscriptionDriver,
+    };
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1067,7 +1198,43 @@ mod tests {
         input: Option<Vec<u8>>,
     }
 
+    struct NoopCancellation;
+
+    impl ChatSubscriptionCancellation for NoopCancellation {
+        fn cancel(&self) -> Result<(), CancellationError> {
+            Ok(())
+        }
+    }
+
+    fn noop_cancellation() -> Arc<dyn ChatSubscriptionCancellation> {
+        Arc::new(NoopCancellation)
+    }
+
+    struct ProtocolDriver(PluginDriver<Cursor<Vec<u8>>, Vec<u8>>);
+
+    impl ChatSubscriptionDriver for ProtocolDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
+        fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+            self.0.next_item()
+        }
+
+        fn acknowledge(&mut self, delivery_id: &DeliveryId) -> Result<(), BackendFailure> {
+            self.0.acknowledge(delivery_id)
+        }
+
+        fn close(&mut self) -> Result<(), BackendFailure> {
+            self.0.close()
+        }
+    }
+
     impl ChatSubscriptionBackend for ProtocolBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
         fn capabilities(&self) -> BackendCapabilities {
             BackendCapabilities::new(
                 "protocol-fixture",
@@ -1083,14 +1250,14 @@ mod tests {
             &mut self,
             _request: &SubscribeRequest,
         ) -> Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
-            Ok(Box::new(PluginDriver {
+            Ok(Box::new(ProtocolDriver(PluginDriver {
                 io: FramedIo::new(
                     Cursor::new(self.input.take().expect("one subscription")),
                     Vec::<u8>::new(),
                 ),
                 pending: None,
                 terminal: false,
-            }))
+            })))
         }
     }
 
@@ -1125,6 +1292,10 @@ mod tests {
     }
 
     impl ChatSubscriptionBackend for CloseCountingBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
         fn capabilities(&self) -> BackendCapabilities {
             BackendCapabilities::new(
                 "close-counting-fixture",
@@ -1158,6 +1329,39 @@ mod tests {
         first_frame_flushed: bool,
     }
 
+    struct AlwaysReadError;
+
+    impl Read for AlwaysReadError {
+        fn read(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "fixture confirmation read failed",
+            ))
+        }
+    }
+
+    struct PartialCommitWriter {
+        remaining: usize,
+    }
+
+    impl Write for PartialCommitWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fixture partial commit write failed",
+                ));
+            }
+            let written = self.remaining.min(bytes.len());
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     impl Write for FailAfterFirstFrame {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if self.first_frame_flushed {
@@ -1177,6 +1381,10 @@ mod tests {
     }
 
     impl ChatSubscriptionDriver for CloseCountingDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
         fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
             assert!(
                 !self.emitted,
@@ -1402,9 +1610,9 @@ mod tests {
             )),
             terminal: false,
         };
-        ChatSubscriptionDriver::close(&mut driver).expect("close frame is written");
+        driver.close().expect("close frame is written");
         let written_after_first = driver.io.writer.len();
-        ChatSubscriptionDriver::close(&mut driver).expect("repeated close is idempotent");
+        driver.close().expect("repeated close is idempotent");
         assert_eq!(driver.io.writer.len(), written_after_first);
         assert!(driver.pending.is_none());
         assert!(driver.terminal);
@@ -1418,6 +1626,98 @@ mod tests {
             .receive::<ClientFrame>()
             .expect("no duplicate close")
             .is_none());
+    }
+
+    fn pending_commit() -> (EventSequence, DeliveryId) {
+        (
+            EventSequence::new(7).expect("sequence"),
+            DeliveryId::new("delivery-seven").expect("delivery"),
+        )
+    }
+
+    #[test]
+    fn every_non_exact_commit_confirmation_preserves_pending_and_is_unknown() {
+        let delivery_id = pending_commit().1;
+
+        let mut partial_write = PluginDriver {
+            io: FramedIo::new(
+                Cursor::new(Vec::<u8>::new()),
+                PartialCommitWriter { remaining: 2 },
+            ),
+            pending: Some(pending_commit()),
+            terminal: false,
+        };
+        let error = partial_write
+            .acknowledge(&delivery_id)
+            .expect_err("partial Commit write is ambiguous");
+        assert_eq!(error.code(), "commit_outcome_unknown");
+        assert!(error.detail().contains("partial commit write failed"));
+        assert_eq!(partial_write.pending.as_ref(), Some(&pending_commit()));
+
+        let mut read_error = PluginDriver {
+            io: FramedIo::new(AlwaysReadError, Vec::<u8>::new()),
+            pending: Some(pending_commit()),
+            terminal: false,
+        };
+        let error = read_error
+            .acknowledge(&delivery_id)
+            .expect_err("Commit confirmation I/O failure is ambiguous");
+        assert_eq!(error.code(), "commit_outcome_unknown");
+        assert!(error.detail().contains("confirmation read failed"));
+        assert_eq!(read_error.pending.as_ref(), Some(&pending_commit()));
+
+        let mut eof = PluginDriver {
+            io: FramedIo::new(Cursor::new(Vec::<u8>::new()), Vec::<u8>::new()),
+            pending: Some(pending_commit()),
+            terminal: false,
+        };
+        let error = eof
+            .acknowledge(&delivery_id)
+            .expect_err("EOF after Commit is ambiguous");
+        assert_eq!(error.code(), "commit_outcome_unknown");
+        assert!(error.detail().contains("before confirming"));
+        assert_eq!(eof.pending.as_ref(), Some(&pending_commit()));
+
+        let cases = [
+            (
+                ServerFrame::Error {
+                    code: "provider_failed".to_owned(),
+                    detail: "remote diagnostic".to_owned(),
+                    retryable: false,
+                    fatal: true,
+                },
+                "remote diagnostic",
+            ),
+            (ServerFrame::Committed { sequence: 8 }, "non-matching"),
+            (ServerFrame::End, "non-matching"),
+        ];
+        for (confirmation, expected_detail) in cases {
+            let mut input = Vec::new();
+            append_frame(&mut input, &confirmation);
+            let mut driver = PluginDriver {
+                io: FramedIo::new(Cursor::new(input), Vec::<u8>::new()),
+                pending: Some(pending_commit()),
+                terminal: false,
+            };
+            let error = driver
+                .acknowledge(&delivery_id)
+                .expect_err("non-exact Commit response is ambiguous");
+            assert_eq!(error.code(), "commit_outcome_unknown");
+            assert!(error.detail().contains(expected_detail), "{error}");
+            assert_eq!(driver.pending.as_ref(), Some(&pending_commit()));
+        }
+
+        let mut input = Vec::new();
+        append_frame(&mut input, &ServerFrame::Committed { sequence: 7 });
+        let mut exact = PluginDriver {
+            io: FramedIo::new(Cursor::new(input), Vec::<u8>::new()),
+            pending: Some(pending_commit()),
+            terminal: false,
+        };
+        exact
+            .acknowledge(&delivery_id)
+            .expect("only exact Committed confirmation succeeds");
+        assert!(exact.pending.is_none());
     }
 
     #[test]
@@ -1666,10 +1966,16 @@ mod tests {
             events,
         )
         .expect("encoded variable payload remains inside the core batch bound");
-        let payload = serde_json::to_vec(&ServerFrame::Item {
-            item: WireItem::from(&SubscriptionItem::Batch(batch)),
+        let item = SubscriptionItem::Batch(batch);
+        let owned_payload = serde_json::to_vec(&ServerFrame::Item {
+            item: WireItem::from(&item),
         })
         .expect("serialize worst-case valid item");
+        let payload = serde_json::to_vec(&BorrowedServerFrame::Item {
+            item: BorrowedWireItem::from(&item),
+        })
+        .expect("serialize borrowed worst-case valid item");
+        assert_eq!(payload, owned_payload);
         assert!(
             payload.len() <= MAX_CORE_BATCH_FRAME_BYTES,
             "{}",

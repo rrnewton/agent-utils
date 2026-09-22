@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Write};
 use std::num::NonZeroU16;
+use std::sync::Arc;
 
 /// Maximum UTF-8 size of a replay cursor or live delivery receipt.
 pub const MAX_TOKEN_BYTES: usize = 8_192;
@@ -57,6 +58,8 @@ pub const MAX_PROVIDER_PAYLOAD_DEPTH: usize = 64;
 pub const MAX_BACKEND_CONFIGURATION_BYTES: usize = 64 * 1_024;
 /// Maximum nesting accepted inside backend configuration.
 pub const MAX_BACKEND_CONFIGURATION_DEPTH: usize = 64;
+/// Number of distinct event categories representable by [`EventKind`].
+pub const MAX_EVENT_KINDS: usize = 4;
 
 fn validate_text(value: &str, label: &str, maximum: usize) -> Result<(), ValidationError> {
     let bytes = value.len();
@@ -875,17 +878,27 @@ impl BackendCapabilities {
     ) -> Result<Self, ValidationError> {
         let backend_name = backend_name.into();
         validate_text(&backend_name, "backend name", MAX_LABEL_BYTES)?;
-        if !event_kinds.contains(&EventKind::Heartbeat) {
+        if event_kinds.len() > MAX_EVENT_KINDS {
+            return Err(ValidationError::new(format!(
+                "backend capabilities contain {} event kinds; maximum is {MAX_EVENT_KINDS}",
+                event_kinds.len()
+            )));
+        }
+        let mut seen = 0_u8;
+        let mut has_heartbeat = false;
+        for kind in &event_kinds {
+            let bit = 1_u8 << (*kind as u8);
+            if seen & bit != 0 {
+                return Err(ValidationError::new(
+                    "backend capabilities contain duplicate event kinds".to_owned(),
+                ));
+            }
+            seen |= bit;
+            has_heartbeat |= *kind == EventKind::Heartbeat;
+        }
+        if !has_heartbeat {
             return Err(ValidationError::new(
                 "backend capabilities must include heartbeat".to_owned(),
-            ));
-        }
-        let mut deduplicated = event_kinds.clone();
-        deduplicated.sort_by_key(|kind| *kind as u8);
-        deduplicated.dedup();
-        if deduplicated.len() != event_kinds.len() {
-            return Err(ValidationError::new(
-                "backend capabilities contain duplicate event kinds".to_owned(),
             ));
         }
         Ok(Self {
@@ -1090,11 +1103,43 @@ impl fmt::Display for BackendFailure {
 
 impl std::error::Error for BackendFailure {}
 
+/// Failure to prove that independent cancellation completed all backend cleanup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CancellationError {
+    /// Cancellation returned promptly, but the backend cannot prove that all owned work stopped.
+    CleanupUncertain(BackendFailure),
+}
+
+impl fmt::Display for CancellationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CleanupUncertain(error) => {
+                write!(formatter, "cancellation cleanup is uncertain: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CancellationError {}
+
+/// Independent, bounded cancellation authority for establishment and blocked receive operations.
+///
+/// Implementations must return within their documented bound. `Ok(())` proves that the operation
+/// was interrupted and all backend-owned work was cleaned up. If that proof is unavailable, they
+/// return [`CancellationError::CleanupUncertain`] rather than claiming success.
+pub trait ChatSubscriptionCancellation: Send + Sync {
+    /// Interrupt any in-progress establishment or receive and complete bounded cleanup.
+    fn cancel(&self) -> Result<(), CancellationError>;
+}
+
 /// The provider-side operations behind one live ordered stream.
 ///
 /// Implementations must not persist consumer state. [`ChatSubscription`] serializes calls so
 /// `next_item` is never invoked with an uncommitted delivery outstanding.
 pub trait ChatSubscriptionDriver: Send {
+    /// Return cancellation authority usable concurrently with a blocked [`Self::next_item`].
+    fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation>;
+
     /// Block until one ordered item is available, or return `None` after a clean terminal EOF.
     fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure>;
 
@@ -1116,6 +1161,9 @@ pub trait ChatSubscriptionDriver: Send {
 /// The trait is object-safe. Provider crates implement it directly; plugin adapters implement the
 /// same trait while translating calls into a versioned process protocol.
 pub trait ChatSubscriptionBackend: Send {
+    /// Return cancellation authority before potentially blocking subscription establishment.
+    fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation>;
+
     /// Return a bounded report without opening an event stream.
     fn capabilities(&self) -> BackendCapabilities;
 
@@ -1130,17 +1178,23 @@ pub trait ChatSubscriptionBackend: Send {
 pub struct ChatSubscription {
     capabilities: BackendCapabilities,
     driver: Box<dyn ChatSubscriptionDriver>,
+    cancellation: Arc<dyn ChatSubscriptionCancellation>,
     channel_membership: HashSet<ChannelId>,
     sender_membership: HashSet<SenderId>,
     last_sequence: Option<EventSequence>,
     outstanding: Option<DeliveryBatch>,
     needs_initial_boundary: bool,
+    driver_close_attempted: bool,
     terminal: bool,
     poisoned: bool,
 }
 
 impl ChatSubscription {
     /// Open a subscription through an object-safe backend.
+    ///
+    /// If establishment may block, obtain [`ChatSubscriptionBackend::cancellation`] before this
+    /// call and retain that clone on an independent supervisor thread. Once open returns, use
+    /// [`Self::cancellation`] the same way around a potentially blocked receive.
     ///
     /// # Errors
     ///
@@ -1156,14 +1210,17 @@ impl ChatSubscription {
         let driver = backend
             .subscribe(request)
             .map_err(SubscriptionError::Backend)?;
+        let cancellation = driver.cancellation();
         Ok(Self {
             capabilities,
             driver,
+            cancellation,
             channel_membership: request.channel_membership.clone(),
             sender_membership: request.sender_membership.clone(),
             last_sequence: None,
             outstanding: None,
             needs_initial_boundary: request.resume_from().is_none(),
+            driver_close_attempted: false,
             terminal: false,
             poisoned: false,
         })
@@ -1173,6 +1230,12 @@ impl ChatSubscription {
     #[must_use]
     pub fn capabilities(&self) -> &BackendCapabilities {
         &self.capabilities
+    }
+
+    /// Return authority that can interrupt a concurrently blocked receive.
+    #[must_use]
+    pub fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+        Arc::clone(&self.cancellation)
     }
 
     /// Receive one ordered item.
@@ -1210,6 +1273,12 @@ impl ChatSubscription {
         let item = match self.driver.next_item() {
             Ok(Some(item)) => item,
             Ok(None) => {
+                self.driver_close_attempted = true;
+                if let Err(error) = self.driver.close() {
+                    self.poisoned = true;
+                    return Err(SubscriptionError::Backend(error));
+                }
+                self.outstanding = None;
                 self.terminal = true;
                 return Ok(None);
             }
@@ -1226,7 +1295,7 @@ impl ChatSubscription {
                 observed: sequence.get(),
             });
         }
-        let kinds: Vec<EventKind> = match &item {
+        match &item {
             SubscriptionItem::Batch(batch) => {
                 if self.needs_initial_boundary
                     && !matches!(
@@ -1238,6 +1307,11 @@ impl ChatSubscription {
                     return Err(SubscriptionError::MissingInitialBoundary);
                 }
                 for event in batch.events() {
+                    let kind = event.kind();
+                    if !self.capabilities.supports(kind) {
+                        self.poisoned = true;
+                        return Err(SubscriptionError::UnadvertisedEvent { kind });
+                    }
                     if let CommittableEvent::MessageCreated(message) = event {
                         if self.capabilities.full_message_data()
                             && message.provider_payload().is_none()
@@ -1255,14 +1329,14 @@ impl ChatSubscription {
                         }
                     }
                 }
-                batch.events().iter().map(CommittableEvent::kind).collect()
             }
-            SubscriptionItem::Heartbeat(_) => vec![EventKind::Heartbeat],
-        };
-        for kind in kinds {
-            if !self.capabilities.supports(kind) {
-                self.poisoned = true;
-                return Err(SubscriptionError::UnadvertisedEvent { kind });
+            SubscriptionItem::Heartbeat(_) => {
+                if !self.capabilities.supports(EventKind::Heartbeat) {
+                    self.poisoned = true;
+                    return Err(SubscriptionError::UnadvertisedEvent {
+                        kind: EventKind::Heartbeat,
+                    });
+                }
             }
         }
         self.last_sequence = Some(sequence);
@@ -1317,6 +1391,11 @@ impl ChatSubscription {
         if self.terminal {
             return Ok(());
         }
+        if self.driver_close_attempted {
+            self.poisoned = true;
+            return Err(SubscriptionError::GenerationPoisoned);
+        }
+        self.driver_close_attempted = true;
         if let Err(error) = self.driver.close() {
             self.poisoned = true;
             return Err(SubscriptionError::Backend(error));
@@ -1450,7 +1529,124 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    struct NoopCancellation;
+
+    impl ChatSubscriptionCancellation for NoopCancellation {
+        fn cancel(&self) -> Result<(), CancellationError> {
+            Ok(())
+        }
+    }
+
+    fn noop_cancellation() -> Arc<dyn ChatSubscriptionCancellation> {
+        Arc::new(NoopCancellation)
+    }
+
+    #[derive(Clone)]
+    struct BlockingCancellation {
+        state: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl ChatSubscriptionCancellation for BlockingCancellation {
+        fn cancel(&self) -> Result<(), CancellationError> {
+            let (cancelled, wake) = &*self.state;
+            *cancelled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+            Ok(())
+        }
+    }
+
+    fn wait_for_cancellation(state: &Arc<(Mutex<bool>, Condvar)>) {
+        let (cancelled, wake) = &**state;
+        let mut cancelled = cancelled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*cancelled {
+            cancelled = wake
+                .wait(cancelled)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn cancelled_failure() -> BackendFailure {
+        BackendFailure::new("fixture_cancelled", "fixture operation was cancelled", true)
+            .expect("constant failure is valid")
+    }
+
+    struct BlockingSubscribeBackend {
+        cancellation: BlockingCancellation,
+        entered: mpsc::SyncSender<()>,
+    }
+
+    impl ChatSubscriptionBackend for BlockingSubscribeBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(self.cancellation.clone())
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            capabilities()
+        }
+
+        fn subscribe(
+            &mut self,
+            _request: &SubscribeRequest,
+        ) -> Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+            self.entered.send(()).expect("announce blocked subscribe");
+            wait_for_cancellation(&self.cancellation.state);
+            Err(cancelled_failure())
+        }
+    }
+
+    struct BlockingReceiveBackend {
+        cancellation: BlockingCancellation,
+        entered: Option<mpsc::SyncSender<()>>,
+    }
+
+    impl ChatSubscriptionBackend for BlockingReceiveBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(self.cancellation.clone())
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            capabilities()
+        }
+
+        fn subscribe(
+            &mut self,
+            _request: &SubscribeRequest,
+        ) -> Result<Box<dyn ChatSubscriptionDriver>, BackendFailure> {
+            Ok(Box::new(BlockingReceiveDriver {
+                cancellation: self.cancellation.clone(),
+                entered: self.entered.take().expect("one receive driver"),
+            }))
+        }
+    }
+
+    struct BlockingReceiveDriver {
+        cancellation: BlockingCancellation,
+        entered: mpsc::SyncSender<()>,
+    }
+
+    impl ChatSubscriptionDriver for BlockingReceiveDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            Arc::new(self.cancellation.clone())
+        }
+
+        fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+            self.entered.send(()).expect("announce blocked receive");
+            wait_for_cancellation(&self.cancellation.state);
+            Err(cancelled_failure())
+        }
+
+        fn acknowledge(&mut self, _delivery_id: &DeliveryId) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+    }
 
     fn provider_payload(value: serde_json::Value) -> ProviderPayload {
         ProviderPayload::new(
@@ -1498,6 +1694,35 @@ mod tests {
         .expect("valid fixture capabilities")
     }
 
+    #[test]
+    fn capabilities_refuse_impossible_cardinality_before_duplicate_work() {
+        let error = BackendCapabilities::new(
+            "fixture",
+            ReplaySupport::Cursor,
+            false,
+            NonZeroU16::new(1).expect("one is nonzero"),
+            vec![EventKind::Heartbeat; MAX_EVENT_KINDS + 1],
+        )
+        .expect_err("more kinds than the enum can represent must fail immediately");
+        assert_eq!(
+            error.detail(),
+            "backend capabilities contain 5 event kinds; maximum is 4"
+        );
+
+        let duplicate = BackendCapabilities::new(
+            "fixture",
+            ReplaySupport::Cursor,
+            false,
+            NonZeroU16::new(1).expect("one is nonzero"),
+            vec![EventKind::Heartbeat, EventKind::Heartbeat],
+        )
+        .expect_err("a duplicate inside the fixed bound must still fail");
+        assert_eq!(
+            duplicate.detail(),
+            "backend capabilities contain duplicate event kinds"
+        );
+    }
+
     fn delivery(sequence: u64, receipt: &str) -> DeliveryBatch {
         DeliveryBatch::new(
             EventSequence::new(sequence).expect("nonzero sequence"),
@@ -1514,6 +1739,10 @@ mod tests {
     }
 
     impl ChatSubscriptionDriver for Driver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
         fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
             Ok(self.items.pop_front())
         }
@@ -1530,6 +1759,10 @@ mod tests {
     }
 
     impl ChatSubscriptionBackend for Backend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
         fn capabilities(&self) -> BackendCapabilities {
             self.capabilities.clone()
         }
@@ -1551,6 +1784,10 @@ mod tests {
     }
 
     impl ChatSubscriptionDriver for CountingDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
         fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
             self.receive_calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.item.take())
@@ -1567,6 +1804,10 @@ mod tests {
     }
 
     impl ChatSubscriptionBackend for CountingBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
         fn capabilities(&self) -> BackendCapabilities {
             capabilities()
         }
@@ -1585,9 +1826,14 @@ mod tests {
     struct ClosingDriver {
         item: Option<SubscriptionItem>,
         close_calls: Arc<AtomicUsize>,
+        fail_close: bool,
     }
 
     impl ChatSubscriptionDriver for ClosingDriver {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
         fn next_item(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
             Ok(self.item.take())
         }
@@ -1598,16 +1844,28 @@ mod tests {
 
         fn close(&mut self) -> Result<(), BackendFailure> {
             self.close_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            if self.fail_close {
+                Err(
+                    BackendFailure::new("close_failed", "fixture close failed", false)
+                        .expect("fixture error is bounded"),
+                )
+            } else {
+                Ok(())
+            }
         }
     }
 
     struct ClosingBackend {
         item: Option<SubscriptionItem>,
         close_calls: Arc<AtomicUsize>,
+        fail_close: bool,
     }
 
     impl ChatSubscriptionBackend for ClosingBackend {
+        fn cancellation(&self) -> Arc<dyn ChatSubscriptionCancellation> {
+            noop_cancellation()
+        }
+
         fn capabilities(&self) -> BackendCapabilities {
             capabilities()
         }
@@ -1619,6 +1877,7 @@ mod tests {
             Ok(Box::new(ClosingDriver {
                 item: self.item.take(),
                 close_calls: Arc::clone(&self.close_calls),
+                fail_close: self.fail_close,
             }))
         }
     }
@@ -1671,6 +1930,7 @@ mod tests {
         let mut backend = ClosingBackend {
             item: Some(SubscriptionItem::Batch(batch.clone())),
             close_calls: Arc::clone(&close_calls),
+            fail_close: false,
         };
         let mut subscription =
             ChatSubscription::open(&mut backend, &request()).expect("subscription opens");
@@ -1687,6 +1947,89 @@ mod tests {
         );
         subscription.close().expect("repeated close is idempotent");
         assert_eq!(close_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn clean_end_closes_provider_exactly_once() {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let mut backend = ClosingBackend {
+            item: None,
+            close_calls: Arc::clone(&close_calls),
+            fail_close: false,
+        };
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &request()).expect("subscription opens");
+
+        assert_eq!(subscription.next_item().expect("clean end"), None);
+        assert_eq!(close_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            subscription.next_item().expect("end remains terminal"),
+            None
+        );
+        subscription.close().expect("close after end is idempotent");
+        assert_eq!(close_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn clean_end_close_failure_is_reported_once_and_poisons_generation() {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let mut backend = ClosingBackend {
+            item: None,
+            close_calls: Arc::clone(&close_calls),
+            fail_close: true,
+        };
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &request()).expect("subscription opens");
+
+        let error = subscription
+            .next_item()
+            .expect_err("clean end must report close-hook failure");
+        assert!(matches!(error, SubscriptionError::Backend(_)));
+        assert_eq!(close_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            subscription.close(),
+            Err(SubscriptionError::GenerationPoisoned)
+        );
+        assert_eq!(close_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn commit_requires_the_exact_full_delivery_batch() {
+        let delivered = delivery(1, "receipt-one");
+        let forged_cursor = DeliveryBatch::new(
+            delivered.sequence(),
+            ProviderCursor::new("a separately retained durable cursor").expect("bounded cursor"),
+            delivered.delivery_id().clone(),
+            delivered.events().to_vec(),
+        )
+        .expect("alternate cursor remains bounded");
+        let forged_events = DeliveryBatch::new(
+            delivered.sequence(),
+            delivered.cursor().clone(),
+            delivered.delivery_id().clone(),
+            vec![CommittableEvent::Gap(
+                ReconciliationGap::new(Some("different payload".to_owned())).expect("bounded gap"),
+            )],
+        )
+        .expect("alternate payload remains bounded");
+        let mut backend = Backend {
+            capabilities: capabilities(),
+            items: Some(VecDeque::from([SubscriptionItem::Batch(delivered.clone())])),
+        };
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &request()).expect("subscription opens");
+        let _ = subscription.next_item().expect("delivery is accepted");
+
+        for forgery in [&forged_cursor, &forged_events] {
+            assert_eq!(
+                subscription.commit_durable(forgery),
+                Err(SubscriptionError::CommitMismatch {
+                    expected: delivered.sequence(),
+                    observed: forgery.sequence(),
+                })
+            );
+            assert_eq!(subscription.outstanding(), Some(&delivered));
+        }
     }
 
     #[test]
@@ -2074,5 +2417,73 @@ mod tests {
             subscription.next_item(),
             Err(SubscriptionError::MissingInitialBoundary)
         );
+    }
+
+    #[test]
+    fn independent_handle_cancels_blocked_subscription_establishment() {
+        let state = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancellation = BlockingCancellation {
+            state: Arc::clone(&state),
+        };
+        let (entered, entered_receiver) = mpsc::sync_channel(1);
+        let mut backend = BlockingSubscribeBackend {
+            cancellation,
+            entered,
+        };
+        let handle = backend.cancellation();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let opener = thread::spawn(move || {
+            result_sender
+                .send(ChatSubscription::open(&mut backend, &request()).map(|_| ()))
+                .expect("publish establishment result");
+        });
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("subscription establishment blocks");
+        handle.cancel().expect("cancellation cleanup is certain");
+        let error = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked establishment is interrupted")
+            .expect_err("cancelled establishment fails");
+        assert!(matches!(
+            error,
+            SubscriptionError::Backend(ref failure) if failure.code() == "fixture_cancelled"
+        ));
+        opener.join().expect("establishment thread joins");
+    }
+
+    #[test]
+    fn independent_handle_cancels_blocked_receive() {
+        let state = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancellation = BlockingCancellation {
+            state: Arc::clone(&state),
+        };
+        let (entered, entered_receiver) = mpsc::sync_channel(1);
+        let mut backend = BlockingReceiveBackend {
+            cancellation,
+            entered: Some(entered),
+        };
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &request()).expect("subscription opens");
+        let handle = subscription.cancellation();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let receiver = thread::spawn(move || {
+            result_sender
+                .send(subscription.next_item())
+                .expect("publish receive result");
+        });
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive blocks");
+        handle.cancel().expect("cancellation cleanup is certain");
+        let error = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked receive is interrupted")
+            .expect_err("cancelled receive fails");
+        assert!(matches!(
+            error,
+            SubscriptionError::Backend(ref failure) if failure.code() == "fixture_cancelled"
+        ));
+        receiver.join().expect("receive thread joins");
     }
 }
