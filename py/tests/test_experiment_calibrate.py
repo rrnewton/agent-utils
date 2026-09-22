@@ -3,9 +3,12 @@ resource-slot width resolution that makes concurrency DECLARED + ENFORCED rather
 
 from __future__ import annotations
 
+import pytest
+
 from parallel_experiment_runner.calibrate import (
     LiveCapacity,
     PerInstance,
+    affinity_cpu_count,
     initial_width,
     measured_per_instance,
     ramp_next_width,
@@ -69,10 +72,79 @@ def test_resolve_width_memory_limited() -> None:
     assert fit.mem_slots == 4
 
 
+def test_live_memory_reserve_is_subtracted_before_sizing() -> None:
+    slice_ = ResourceSlice(
+        revision=0,
+        cpu_cores=64,
+        memory_bytes=64 * _GIB,
+        disk_bytes=500 * _GIB,
+        memory_reserve_bytes=16 * _GIB,
+    )
+    fit = resolve_width(
+        slice_, _live(cpu=64, mem=64 * _GIB), PerInstance(1, 8 * _GIB, None), ceiling=64
+    )
+    assert fit.width == 6
+    assert fit.mem_slots == 6
+    assert fit.limiting_dimension == "memory"
+
+
+def test_memory_reserve_can_refuse_the_first_worker() -> None:
+    slice_ = ResourceSlice(
+        revision=0,
+        cpu_cores=64,
+        memory_bytes=64 * _GIB,
+        disk_bytes=500 * _GIB,
+        memory_reserve_bytes=64 * _GIB,
+    )
+    fit = resolve_width(
+        slice_, _live(cpu=64, mem=64 * _GIB), PerInstance(1, _GIB, None), ceiling=64
+    )
+    assert fit.width == 0
+    assert initial_width(fit) == 0
+
+
+def test_negative_memory_reserve_is_rejected() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        ResourceSlice(
+            revision=0,
+            cpu_cores=1,
+            memory_bytes=_GIB,
+            disk_bytes=_GIB,
+            memory_reserve_bytes=-1,
+        )
+
+
 def test_resolve_width_ceiling_limited() -> None:
     fit = resolve_width(_slice(), _live(cpu=64), PerInstance(1, None, None), ceiling=5)
     assert fit.width == 5
     assert fit.limiting_dimension == "ceiling"
+
+
+def test_machine_hard_cap_is_316() -> None:
+    fit = resolve_width(
+        _slice(), _live(cpu=1000, available=1000), PerInstance(1, None, None), ceiling=1000
+    )
+    assert fit.width == 316
+    assert fit.ceiling == 316
+    assert fit.limiting_dimension == "ceiling"
+
+
+def test_affinity_count_wins_over_host_cpu_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "parallel_experiment_runner.calibrate.os.sched_getaffinity",
+        lambda _pid: {2, 4, 9},
+    )
+    monkeypatch.setattr("parallel_experiment_runner.calibrate.os.cpu_count", lambda: 316)
+    assert affinity_cpu_count() == 3
+
+
+def test_affinity_count_falls_back_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable(_pid: int) -> set[int]:
+        raise OSError("not supported")
+
+    monkeypatch.setattr("parallel_experiment_runner.calibrate.os.sched_getaffinity", unavailable)
+    monkeypatch.setattr("parallel_experiment_runner.calibrate.os.cpu_count", lambda: 8)
+    assert affinity_cpu_count() == 8
 
 
 def test_resolve_width_lane_shrinks_below_live() -> None:

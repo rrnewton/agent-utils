@@ -117,10 +117,10 @@ def generate_round_dag(plan: RoundPlan) -> DagConfig:
 def classify_workload(hit: HitCondition, returncode: int | None, log_text: str) -> str:
     """Classify a NON-BREACHED worker as HIT / MISS / COMMAND-ERROR (design §8).
 
-    A breach (timeout / CPU-timeout / OOM / cancel) is decided by the caller FIRST and never
-    reaches here, so a worker the runner had to kill can never be mistaken for a hit. Among clean
-    exits: a regex match or a declared hit exit code is a HIT; a clean zero exit with no hit is a
-    MISS; any other nonzero exit is a COMMAND-ERROR (workload failed for an unrelated reason).
+    Any infrastructure breach is decided by the caller FIRST and never reaches here, so a worker
+    the runner had to kill can never be mistaken for a hit. Among clean exits: a regex match or a
+    declared hit exit code is a HIT; a clean zero exit with no hit is a MISS; any other nonzero
+    exit is a COMMAND-ERROR (workload failed for an unrelated reason).
     """
     matched_regex = bool(hit.regex) and re.search(hit.regex or "", log_text) is not None
     matched_exit = returncode is not None and returncode in hit.hit_exit_codes

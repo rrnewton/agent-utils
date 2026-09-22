@@ -5,12 +5,19 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from dagrun import StepOutcome
 
-from parallel_experiment_runner.cli import _spec_from_args, build_parser, main, parse_seeds
+from parallel_experiment_runner.cli import (
+    _default_slice,
+    _spec_from_args,
+    build_parser,
+    main,
+    parse_seeds,
+)
 from parallel_experiment_runner.execute import _classify_outcome
 from parallel_experiment_runner.model import (
     STATUS_CANCELLED,
@@ -21,6 +28,7 @@ from parallel_experiment_runner.model import (
     STATUS_TIMEOUT,
     ExperimentSpec,
     HitCondition,
+    ResourceSlice,
     WorkerLimits,
 )
 
@@ -190,6 +198,40 @@ def test_wall_timeout_explicit_is_honoured() -> None:
     limits = _parsed_spec("--cpu-timeout", "10", "--wall-timeout", "200").worker_limits
     assert limits.wall_timeout_s == 200
     assert limits.resolved_wall_timeout_s() == 200
+
+
+def test_memory_reserve_reaches_live_slice(tmp_path: Path) -> None:
+    ns = build_parser().parse_args(
+        [
+            "plan-round",
+            "--memory-reserve",
+            "2G",
+            "--slice-memory",
+            "8G",
+            "--",
+            "run",
+            "{seed}",
+        ]
+    )
+    slice_ = cast(ResourceSlice, _default_slice(tmp_path, ns))
+    assert slice_.memory_reserve_bytes == 2 * 1024**3
+
+
+def test_detached_report_flags_reach_spec() -> None:
+    spec = _parsed_spec(
+        "--memory",
+        "1G",
+        "--cpu-timeout",
+        "5",
+        "--pids",
+        "10",
+        "--detached-resource-report",
+        "/tmp/worker-{seed}.txt",
+        "--detached-unit-prefix",
+        "worker-",
+    )
+    assert spec.resource_report_path(7) == "/tmp/worker-7.txt"
+    assert spec.detached_unit_prefix == "worker-"
 
 
 def test_quickstart_and_version() -> None:

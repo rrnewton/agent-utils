@@ -16,7 +16,7 @@ from pathlib import Path
 
 from dagrun import mem_available_bytes
 
-from parallel_experiment_runner.model import ResourceSlice, WorkerLimits
+from parallel_experiment_runner.model import MAX_CONCURRENCY, ResourceSlice, WorkerLimits
 
 #: Multiplier applied to a MEASURED per-instance peak before it bounds concurrency — leaves
 #: headroom so a worker slightly hotter than its sample does not blow the budget.
@@ -24,6 +24,16 @@ MEM_HEADROOM = 1.25
 
 #: Wall interval over which busy-CPU is sampled from ``/proc/stat`` to derive idle headroom.
 _IDLE_SAMPLE_S = 0.1
+
+
+def affinity_cpu_count() -> int:
+    """CPUs this process may actually schedule on, with a portable fallback."""
+
+    try:
+        affinity = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+    return max(1, len(affinity))
 
 
 @dataclass(frozen=True)
@@ -117,8 +127,8 @@ def _measured_available_cores(total_cores: int, *, sample_s: float = _IDLE_SAMPL
 
 
 def live_capacity(work_dir: Path) -> LiveCapacity:
-    """Sample physical cores, MEASURED idle-core headroom, allocatable memory, and free disk."""
-    cores = os.cpu_count() or 1
+    """Sample schedulable CPUs, measured idle headroom, allocatable memory, and free disk."""
+    cores = affinity_cpu_count()
     available = _measured_available_cores(cores)
     mem = mem_available_bytes() or 0
     try:
@@ -149,15 +159,18 @@ def resolve_width(
 ) -> WidthDecision:
     """Max width that fits EVERY budget: ``usable = min(lane, live)`` per dimension.
 
-    ``width = min(cpu_slots, mem_slots, disk_slots, ceiling)``. Live capacity can only ever
+    ``width = min(cpu_slots, mem_slots, disk_slots, ceiling, 316)``. Live capacity can only ever
     REDUCE the lane (never raise it), so a busy host shrinks the round even when the coordinator
     granted more. The CPU budget uses ``available_cpu_cores`` — MEASURED idle headroom, not the
-    total core count — so an idle box scales up generously and a genuinely busy one steps back,
-    both from real CPU demand rather than a phantom-saturation proxy. The returned slot counts
-    make the binding constraint auditable.
+    total core count — so an idle box scales up generously and a genuinely busy one steps back.
+    The explicit reserve is subtracted from live memory before the lane/live minimum. The returned
+    slot counts make the binding constraint auditable.
     """
     usable_cpu = min(slice_.cpu_cores, live.available_cpu_cores)
-    usable_mem = min(slice_.memory_bytes, live.mem_available_bytes)
+    live_mem_after_reserve = max(
+        0, live.mem_available_bytes - slice_.memory_reserve_bytes
+    )
+    usable_mem = min(slice_.memory_bytes, live_mem_after_reserve)
     usable_disk = min(slice_.disk_bytes, live.disk_free_bytes)
 
     per_mem = None if per_instance.memory_bytes is None else int(per_instance.memory_bytes)
@@ -165,11 +178,12 @@ def resolve_width(
     mem_slots = _slots(usable_mem, per_mem)
     disk_slots = _slots(usable_disk, per_instance.disk_bytes)
 
+    effective_ceiling = min(max(0, ceiling), MAX_CONCURRENCY)
     candidates = {
         "cpu": cpu_slots,
         "memory": mem_slots,
         "disk": disk_slots,
-        "ceiling": max(0, ceiling),
+        "ceiling": effective_ceiling,
     }
     limiting = min(candidates, key=lambda k: candidates[k])
     width = candidates[limiting]
@@ -179,7 +193,7 @@ def resolve_width(
         cpu_slots=cpu_slots,
         mem_slots=mem_slots,
         disk_slots=disk_slots,
-        ceiling=max(0, ceiling),
+        ceiling=effective_ceiling,
     )
 
 

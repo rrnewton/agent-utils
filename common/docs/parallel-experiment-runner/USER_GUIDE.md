@@ -94,7 +94,8 @@ hang-guard follows. Pass `--wall-timeout` only to override that derivation.
 * Per-worker logs are written to `<work-dir>/ignored/logs/seed-<n>.log`; the run prints only an
   aggregate summary, so a wide round does not interleave hundreds of streams.
 * The runner ramps width `1 → 2 → 4 → …`, measuring the real per-worker footprint at width 1
-  before scaling, and downshifts immediately if the lane shrinks or the host gets busy.
+  before scaling, and downshifts immediately if the lane shrinks or the host gets busy. Width is
+  always capped at 316, even if `--max-concurrency` requests more.
 
 `plan-round` shows the resolved width and the lowered DAG without running anything (and needs no
 cgroups) — use it to check how wide a round *would* go:
@@ -118,7 +119,9 @@ had to kill is never miscounted as a discovered hit:
 | `memory-cap` | hit `memory.max` → OOM-killed inside its own cgroup |
 | `pids-cap` | hit `pids.max` → fork/clone denied (fork-bomb / PID-exhaustion containment) |
 | `timeout` | exceeded the wall backstop (a hang burning no CPU) |
+| `log-cap` | detached producer killed the worker at its output byte cap |
 | `cancelled` | never ran / eager-cancelled |
+| `resource-report-error` | configured detached-unit report was missing or malformed |
 
 A `pids-cap` breach is special: `pids.max` **contains** the fork (`EAGAIN`) rather than killing
 the worker, so the worker is reaped by the cpu/wall guard. The classifier still reports it as
@@ -203,7 +206,49 @@ Run `parallel-experiment-runner run --help` for the full list. The important one
 | `--disk` | per-worker disk reserve used to bound width (cgroup-v2 has no space controller) |
 | `--hit-regex` / `--hit-exit-codes` | what marks a worker a HIT |
 | `--identity K=V` | apples-to-apples fields hashed into the profile key |
-| `--max-concurrency` | hard ceiling on concurrent workers |
+| `--max-concurrency` | requested ceiling on concurrent workers; machine hard cap is 316 |
 | `--slice-cpu/-memory/-disk` | the coordinator lane envelope (default: whole machine) |
+| `--memory-reserve` | bytes kept outside the lane, subtracted from live `MemAvailable` every round |
+| `--detached-resource-report` | per-seed report path containing `{seed}` for a child outside the worker cgroup |
+| `--detached-unit-prefix` | ownership prefix required before a reported unit may be cleaned up |
 | `--work-dir` / `--log-dir` / `--profile-store` | where logs + samples live |
 | `--format` | `human` (default) or `json` |
+
+## Detached child resource reports
+
+A workload wrapper can move its expensive child into a transient service outside the runner's
+per-worker cgroup. Without an explicit report, the wrapper's cgroup peak is not the child's peak
+and calibration would fan out from a false low measurement.
+
+Use both `--detached-resource-report PATH/{seed}.txt` and
+`--detached-unit-prefix PREFIX`. Detached mode also requires explicit `--memory`,
+`--cpu-timeout`, and `--pids` limits. The producer must apply matching memory, task-count,
+CPU-quota, CPU-time, and wall-time controls to the detached unit before it starts the payload.
+The append-friendly UTF-8 report accepts arbitrary text prefixes ending in `: ` and requires
+exactly one value for each of these fields:
+
+```text
+wrapper: unit=worker-123
+wrapper: memory_peak_bytes=1073741824
+wrapper: cpu_usage_nsec=2500000000
+wrapper: tasks_peak=42
+wrapper: limit_memory_bytes=1073741824
+wrapper: limit_swap_bytes=0
+wrapper: limit_tasks=128
+wrapper: limit_cpu_cores_micros=1000000
+wrapper: limit_cpu_time_nsec=30000000000
+wrapper: limit_wall_time_usec=90000000
+wrapper: cpu_time_limit_hit=0
+wrapper: wall_time_limit_hit=0
+wrapper: log_cap_hit=0
+wrapper: memory_oom_kills=0
+wrapper: tasks_limit_hits=0
+```
+
+The runner verifies every reported limit against its declared `WorkerLimits`, folds the detached
+breach counters into outcome classification, adds detached memory and CPU to the ordinary
+worker-cgroup measurements, and exposes task peak in JSON output. A missing, malformed, or
+mismatched report is an infrastructure breach and never a clean sample. On normal completion and
+contained signal teardown it attempts to kill, stop, and reset only syntax-valid unit names
+beginning with the declared prefix. This is an ownership boundary: never use a broad prefix shared
+with unrelated units.

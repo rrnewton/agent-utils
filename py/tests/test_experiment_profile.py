@@ -45,7 +45,9 @@ def test_seed_free_command_hashes_equal() -> None:
 
 def test_mandatory_dim_splits_even_a_manual_key() -> None:
     # A manual label cannot merge two runs that differ on a MANDATORY hard dimension.
-    ptrace = profile_identity(_spec(profile_key="mylabel", identity={"backend": "ptrace"}))
+    ptrace = profile_identity(
+        _spec(profile_key="mylabel", identity={"backend": "ptrace"})
+    )
     kvm = profile_identity(_spec(profile_key="mylabel", identity={"backend": "kvm"}))
     assert ptrace.key != kvm.key
     assert ptrace.key.startswith("mylabel.")
@@ -53,9 +55,38 @@ def test_mandatory_dim_splits_even_a_manual_key() -> None:
 
 
 def test_hit_semantics_change_the_key() -> None:
-    a = profile_identity(_spec(identity={"backend": "x"}, hit=HitCondition(regex="panic")))
-    b = profile_identity(_spec(identity={"backend": "x"}, hit=HitCondition(regex="DIVERGENCE")))
+    a = profile_identity(
+        _spec(identity={"backend": "x"}, hit=HitCondition(regex="panic"))
+    )
+    b = profile_identity(
+        _spec(identity={"backend": "x"}, hit=HitCondition(regex="DIVERGENCE"))
+    )
     assert a.key != b.key
+
+
+def test_detached_resource_accounting_splits_profile_history() -> None:
+    plain = _spec(identity={"backend": "ptrace"})
+    detached = _spec(
+        identity={"backend": "ptrace"},
+        worker_limits=WorkerLimits(memory_bytes=1024, cpu_timeout_s=5, pids_max=10),
+        detached_resource_report="/tmp/resource-{seed}.txt",
+        detached_unit_prefix="worker-",
+    )
+    assert profile_identity(plain).key != profile_identity(detached).key
+    assert (
+        profile_identity(_spec(profile_key="same", identity={"backend": "ptrace"})).key
+        != profile_identity(
+            _spec(
+                profile_key="same",
+                identity={"backend": "ptrace"},
+                worker_limits=WorkerLimits(
+                    memory_bytes=1024, cpu_timeout_s=5, pids_max=10
+                ),
+                detached_resource_report="/tmp/resource-{seed}.txt",
+                detached_unit_prefix="worker-",
+            )
+        ).key
+    )
 
 
 def test_estimate_unset_with_no_samples(tmp_path: Path) -> None:
@@ -72,9 +103,15 @@ def test_estimate_derived_after_record(tmp_path: Path) -> None:
     store.record(
         key,
         [
-            Sample(wall_s=10.0, cpu_s=5.0, peak_bytes=100, disk_bytes=None),
-            Sample(wall_s=20.0, cpu_s=9.0, peak_bytes=200, disk_bytes=None),
-            Sample(wall_s=30.0, cpu_s=15.0, peak_bytes=300, disk_bytes=None),
+            Sample(
+                wall_s=10.0, cpu_s=5.0, peak_bytes=100, disk_bytes=None, tasks_peak=3
+            ),
+            Sample(
+                wall_s=20.0, cpu_s=9.0, peak_bytes=200, disk_bytes=None, tasks_peak=5
+            ),
+            Sample(
+                wall_s=30.0, cpu_s=15.0, peak_bytes=300, disk_bytes=None, tasks_peak=7
+            ),
         ],
     )
     est = store.estimate(key)
@@ -86,6 +123,7 @@ def test_estimate_derived_after_record(tmp_path: Path) -> None:
     assert CONSERVATIVE_PCTL == 90
     assert est.cpu_s == 15.0
     assert est.peak_mem_bytes == 300
+    assert est.peak_tasks == 7
 
 
 def test_estimate_survives_a_fresh_store_instance(tmp_path: Path) -> None:
@@ -101,8 +139,10 @@ def test_store_bounds_sample_count(tmp_path: Path) -> None:
     store = ProfileStore(tmp_path / "p.json")
     store.record(
         "auto.k",
-        [Sample(wall_s=float(i), cpu_s=None, peak_bytes=None, disk_bytes=None)
-         for i in range(MAX_SAMPLES_PER_KEY + 50)],
+        [
+            Sample(wall_s=float(i), cpu_s=None, peak_bytes=None, disk_bytes=None)
+            for i in range(MAX_SAMPLES_PER_KEY + 50)
+        ],
     )
     assert store.estimate("auto.k").samples == MAX_SAMPLES_PER_KEY
 
