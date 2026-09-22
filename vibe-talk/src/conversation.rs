@@ -11,6 +11,19 @@ use serde::Serialize;
 use crate::config::{ConversationBackend, ConversationConfig, ElevenLabsConfig};
 use crate::elevenlabs::{SignedUrlError, SignedUrlProvider};
 
+/// Stable provider details that can be shown before a session is opened.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct VoiceDescription {
+    /// Human-readable provider name.
+    pub name: String,
+    /// Provider console for the configured agent, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_url: Option<String>,
+    /// Provider instance identifier, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+}
+
 /// A browser-ready conversational voice session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VoiceSession {
@@ -54,6 +67,9 @@ impl VoiceSessionError {
 /// Opens browser-ready sessions without exposing a provider-specific call site.
 #[async_trait]
 pub trait ConversationalVoiceProvider: Send + Sync {
+    /// Describe the selected provider without opening a conversation.
+    fn describe(&self) -> VoiceDescription;
+
     /// Open one conversational voice session.
     ///
     /// # Errors
@@ -78,12 +94,35 @@ impl ElevenLabsConversationProvider {
 
 #[async_trait]
 impl ConversationalVoiceProvider for ElevenLabsConversationProvider {
+    fn describe(&self) -> VoiceDescription {
+        let instance_id = self
+            .config
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| {
+                !id.is_empty()
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+            .map(str::to_owned);
+        VoiceDescription {
+            name: "ElevenLabs".to_owned(),
+            settings_url: instance_id
+                .as_ref()
+                .map(|id| format!("https://elevenlabs.io/app/agents/{id}")),
+            instance_id,
+        }
+    }
+
     async fn open_session(&self) -> Result<VoiceSession, VoiceSessionError> {
         let signed = self.provider.signed_url(&self.config).await?;
+        let description = self.describe();
         Ok(VoiceSession {
             websocket_url: signed.signed_url,
             protocol: "elevenlabs",
-            provider: format!("ElevenLabs agent {}", signed.agent_id),
+            provider: description.name,
             valid_for_seconds: Some(signed.valid_for_seconds),
             input_sample_rate: 16_000,
             output_sample_rate: 16_000,
@@ -110,6 +149,14 @@ impl WebSocketConversationProvider {
 
 #[async_trait]
 impl ConversationalVoiceProvider for WebSocketConversationProvider {
+    fn describe(&self) -> VoiceDescription {
+        VoiceDescription {
+            name: self.label.clone(),
+            settings_url: None,
+            instance_id: None,
+        }
+    }
+
     async fn open_session(&self) -> Result<VoiceSession, VoiceSessionError> {
         let url = self
             .url
@@ -122,7 +169,7 @@ impl ConversationalVoiceProvider for WebSocketConversationProvider {
         Ok(VoiceSession {
             websocket_url: url.to_owned(),
             protocol: "vibe-talk-v1",
-            provider: self.label.clone(),
+            provider: self.describe().name,
             valid_for_seconds: None,
             input_sample_rate: 24_000,
             output_sample_rate: 24_000,

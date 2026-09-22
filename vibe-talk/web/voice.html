@@ -143,17 +143,17 @@
           <h1>vibe-talk</h1>
           <p class="hint">
             Signing in is between this browser and <strong>this vibe-talk server</strong>. The page
-            asks this server — with the token below — for a short-lived signed URL, and then talks
-            to the ElevenLabs agent directly with it. The ElevenLabs key and the chat provider's
-            bot token stay on the server and are never pasted into this page. No vendor script, no
-            CDN, nothing bundled.
+            asks this server — with the token below — to open a voice session, and then talks to
+            the configured voice provider. Provider credentials and the chat provider's bot token
+            stay on the server and are never pasted into this page. No vendor script, no CDN,
+            nothing bundled.
           </p>
 
           <label for="api-token">vibe-talk API token</label>
           <p class="hint">
             <strong>This deployment's own token</strong> — <code>VIBE_TALK_WRITE_TOKEN</code> from
-            the configuration it was started with. It is not your ElevenLabs key and not your chat
-            provider's bot token; neither of those is ever entered here. Write scope is what is
+            the configuration it was started with. It is not a voice-provider credential or your
+            chat provider's bot token; neither of those is ever entered here. Write scope is what is
             asked for, because starting a conversation lets the agent post to your channels. The
             read-scope token will sign in and will read, digest and speak — but it fails on replies
             and on starting a conversation. Stored per browser <em>and per hostname</em>, so
@@ -166,8 +166,7 @@
           <p id="token-state" class="hint" aria-live="polite">no token saved in this browser</p>
           <p class="hint">
             After signing in you land on the call screen. Tap the microphone, then allow the
-            microphone once. A signed URL is good for about fifteen minutes, so this page mints a
-            fresh one every time a call starts.
+            microphone once. This page asks for a fresh provider session every time a call starts.
           </p>
         </section>
 
@@ -830,9 +829,9 @@
                 Its prompt, voice and tools are configured at the vendor, not here.
               </p>
               <p class="hint">
-                <a id="agent-console-link" class="external-link" href="#" target="_blank" rel="noopener noreferrer">Open this agent's configuration</a>
+                <a id="agent-console-link" class="external-link" href="#" target="_blank" rel="noopener noreferrer">Open voice provider configuration</a>
               </p>
-              <p class="hint">Agent id: <code id="agent-id" class="agent-id"></code></p>
+              <p class="hint">Provider id: <code id="agent-id" class="agent-id"></code></p>
             </section>
 
             <!--

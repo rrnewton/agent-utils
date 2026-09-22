@@ -163,7 +163,8 @@ const session = {
   source: null,
   playAt: 0, // next start time on the audio clock
   playing: [], // scheduled AudioBufferSourceNodes, so an interruption can cancel them
-  protocol: "elevenlabs",
+  protocol: "unknown",
+  providerName: "voice provider",
   inputRate: 16000,
   outputRate: 16000,
   lastTranscriptKey: null,
@@ -2575,7 +2576,7 @@ async function forgetConversations() {
   }
 }
 
-async function mintSignedUrl() {
+async function openVoiceSession() {
   if (!token()) {
     throw new Error("no API token saved on this phone yet");
   }
@@ -2643,7 +2644,7 @@ function outputRateFrom(format) {
   if (!match) {
     throw new Error(
       `the agent negotiated audio format "${format}", which this page cannot decode. ` +
-        "Set the agent's output format to PCM (pcm_16000) in the ElevenLabs dashboard."
+        `Set ${session.providerName}'s output format to PCM (for example pcm_16000).`
     );
   }
   return Number(match[1]);
@@ -3200,9 +3201,8 @@ function onGripKey(event) {
 //
 // NOTHING AUTO-RECONNECTS. Coming back to a phone that has quietly reopened the microphone and
 // started a conversation nobody asked for is a worse outcome than the banner this replaces, and
-// the issue rules it out. Resume is a tap, and it runs the ordinary `start()` — which mints a
-// FRESH signed URL every time, so the "expired credential" case the issue worries about cannot
-// arise: the page has never reused one.
+// the issue rules it out. Resume is a tap, and it runs the ordinary `start()` — which asks the
+// provider for a FRESH voice session every time, so an expired session endpoint is never reused.
 
 // How long after the page comes back a close still counts as part of the suspension. iOS commonly
 // delivers the close on the way BACK rather than while hidden, so a window with no grace at all
@@ -3243,8 +3243,8 @@ function wasSuspended() {
 function reportFailure() {
   failureTimer = null;
   showError(
-    "The connection to the voice agent failed. The signed URL was minted, so vibe-talk and " +
-      "your token are fine; the failure is between this browser and ElevenLabs."
+    `The connection to ${session.providerName} failed. vibe-talk accepted your token and ` +
+      "returned a voice session, but this browser could not open its WebSocket."
   );
   setStatus("The connection to the voice agent failed.");
 }
@@ -3269,13 +3269,15 @@ async function start(options) {
   // set would keep the large control reading "Resume" during and after the call it started.
   session.failed = false;
   session.chat = chat;
+  session.providerName = conversationalVoice.name;
   session.vendorSentAudioInChat = false;
   hiddenDuringCall = false;
   hasSuspended = false;
   setState("working");
   setStatus("Asking vibe-talk for a voice session…");
-  const minted = await mintSignedUrl();
-  session.protocol = minted.protocol || "elevenlabs";
+  const minted = await openVoiceSession();
+  session.protocol = minted.protocol || "unknown";
+  session.providerName = String(minted.provider || conversationalVoice.name);
   session.inputRate = minted.input_sample_rate || 16000;
   session.outputRate = minted.output_sample_rate || 16000;
   session.lastTranscriptKey = null;
@@ -3284,7 +3286,7 @@ async function start(options) {
   // "here is what we said" delivered into the middle of a sentence.
   const resume = await fetchResume();
   const validity = minted.valid_for_seconds
-    ? `; URL valid for about ${Math.round(minted.valid_for_seconds / 60)} minutes`
+    ? `; session valid for about ${Math.round(minted.valid_for_seconds / 60)} minutes`
     : "";
   showDetail(`${minted.provider || "voice provider"} · ${session.protocol}${validity}`);
 
@@ -3432,7 +3434,7 @@ async function start(options) {
     // THE one classifier. Three outcomes, and they are three different things to say:
     //
     //   suspended  the page was in the background — recoverable, and no failure happened
-    //   failed     something really went wrong between this browser and ElevenLabs
+    //   failed     something really went wrong between this browser and the selected provider
     //   ended      the call is over, either because it was hung up or because it ran out
     //
     // The old code had two of these and reported the first as the second.
@@ -3445,7 +3447,7 @@ async function start(options) {
       reportFailure();
     } else {
       setState(cause);
-      // A signed-URL failure also shows up here, as an immediate close, so the page has to say
+      // A session-endpoint failure also shows up here as an immediate close, so the page has to say
       // something — but "code 1005" is not something. It says what happened in words; the number
       // goes where numbers belong, in the connection details on the settings screen.
       setStatus(cause === "suspended" ? SUSPENDED_STATUS : closeReason(event.code));
@@ -3657,7 +3659,8 @@ function teardown() {
   session.audio = null;
   session.socket = null;
   session.connected = false;
-  session.protocol = "elevenlabs";
+  session.protocol = "unknown";
+  session.providerName = conversationalVoice.name;
   session.inputRate = 16000;
   session.outputRate = 16000;
   session.lastTranscriptKey = null;
@@ -5637,7 +5640,7 @@ let readingMode = false;
 // Playback is a capability declared by the backend. Older servers use the audio route. A device
 // voice is explicitly selected; it never falls back to a remote speech service.
 let readAloudPlayback = "audio";
-let readAloudLabel = "ElevenLabs";
+let readAloudLabel = "Voice provider";
 let browserVoicesListening = false;
 let waitingForBrowserVoice = false;
 let browserVoiceProblem = "";
@@ -9119,22 +9122,14 @@ const noTokenSentence = () => (signedOutByRename() ? NO_TOKEN_AFTER_RENAME : NO_
 
 // --- the way out to the agent's own configuration -----------------------------------------------
 //
-// Everything about HOW THE AGENT BEHAVES — the system prompt above all, but also the voice, the
-// tools and the first thing it says — is configured in the vendor's console and none of it is
-// editable from this page. This deployment is handed an agent id and connects to whatever that
-// agent already is. So every "why did it say that" ends on that page, and from a phone the trip
-// there was: find the console, sign in, then pick the right agent out of a list by an id nobody
-// has memorised. This makes it one tap.
-//
-// The URL is built here rather than served, because it is a fact about the VENDOR and not about
-// this deployment — the server would only be repeating a constant back. The id is also printed
-// beside the link, which is the part that survives the console reorganising its own URLs: when the
-// deep link stops landing, the id is still what finds the agent by hand.
-
-const AGENT_CONSOLE_BASE = "https://elevenlabs.io/app/agents";
-
-/** The agent this server is configured for, as the server reads it out of its own config. */
-let elevenLabsAgentId = null;
+// Everything about HOW THE AGENT BEHAVES is owned by the selected provider. The provider trait
+// supplies the human name and, where applicable, a direct settings URL and instance id. The page
+// neither recognizes vendor names nor constructs vendor URLs.
+let conversationalVoice = {
+  name: "voice provider",
+  settings_url: null,
+  instance_id: null,
+};
 
 /**
  * Show the link when there is an agent to link to, and hide the whole group when there is not.
@@ -9144,22 +9139,21 @@ let elevenLabsAgentId = null;
  * present, looks live, and goes somewhere wrong.
  */
 function renderAgentLink() {
-  const id = elevenLabsAgentId;
-  el("agent-settings").hidden = !id;
-  if (!id) {
+  const url = conversationalVoice.settings_url;
+  const id = conversationalVoice.instance_id;
+  el("agent-settings").hidden = !url;
+  if (!url) {
     return;
   }
-  el("agent-id").textContent = id;
-  // `encodeURIComponent`, even though an agent id is vendor-minted and alphanumeric in practice:
-  // it arrives from a config file somebody edits by hand, and this is the one place on the page
-  // where a value from there is spliced into a URL.
-  el("agent-console-link").setAttribute("href", `${AGENT_CONSOLE_BASE}/${encodeURIComponent(id)}`);
+  el("agent-id").textContent = id || conversationalVoice.name;
+  el("agent-console-link").textContent = `Open ${conversationalVoice.name} configuration`;
+  el("agent-console-link").setAttribute("href", url);
 }
 
 function applyClientConfig(config) {
   const speech = config.read_aloud;
   readAloudPlayback = speech ? String(speech.playback || "unsupported") : "audio";
-  readAloudLabel = speech && speech.label ? String(speech.label) : "ElevenLabs";
+  readAloudLabel = speech && speech.label ? String(speech.label) : "Voice provider";
   if (readAloudPlayback === "browser") prepareBrowserSpeech();
   applyReadSpeed(readSpeed);
   threadingSupported = config.threading_supported === true;
@@ -9184,10 +9178,22 @@ function applyClientConfig(config) {
   // The reader's own Discord account, if the operator has said what it is. Not derivable; see
   // `ownerAuthorId`.
   ownerAuthorId = (config && config.owner_author_id) || null;
-  elevenLabsAgentId =
-    typeof config.elevenlabs_agent_id === "string" && config.elevenlabs_agent_id.trim() !== ""
-      ? config.elevenlabs_agent_id.trim()
-      : null;
+  const describedVoice = config && config.conversational_voice;
+  conversationalVoice = {
+    name:
+      describedVoice && typeof describedVoice.name === "string" && describedVoice.name.trim()
+        ? describedVoice.name.trim()
+        : "voice provider",
+    settings_url:
+      describedVoice && typeof describedVoice.settings_url === "string"
+        ? describedVoice.settings_url
+        : null,
+    instance_id:
+      describedVoice && typeof describedVoice.instance_id === "string"
+        ? describedVoice.instance_id
+        : null,
+  };
+  session.providerName = conversationalVoice.name;
   renderAgentLink();
   const select = el("discord-channel");
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming

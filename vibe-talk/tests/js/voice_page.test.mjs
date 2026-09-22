@@ -784,11 +784,11 @@ function errorResponse(status, error, detail) {
 }
 
 /**
- * A successful mint, exactly as `/api/v1/voice-session` serializes one.
+ * A successful session, exactly as `/api/v1/voice-session` serializes one.
  *
- * The signature is DIFFERENT every time, because a signed URL is a single-use short-lived
- * credential and the real endpoint mints a fresh one per request. A constant here would make
- * "resuming really re-minted rather than reusing the dead URL" — the assertion `#54
+ * The endpoint is DIFFERENT every time, because a provider may issue a single-use short-lived
+ * session and the real endpoint opens a fresh one per request. A constant here would make
+ * "resuming really reopened rather than reusing the dead endpoint" — the assertion `#54
  * resume-recovery` turns on — impossible to state at all.
  */
 let mints = 0;
@@ -797,7 +797,7 @@ const MINTED = async () => {
   return json(200, {
     websocket_url: `wss://example.invalid/convai?sig=test-${mints}`,
     protocol: "elevenlabs",
-    provider: "ElevenLabs agent agent_test",
+    provider: "Example voice provider",
     input_sample_rate: 16000,
     output_sample_rate: 16000,
     valid_for_seconds: 900,
@@ -960,6 +960,11 @@ function newPage(store = new Map(), script = SCRIPT) {
         chat_provider_name: page.chatProviderName,
         channels: page.channels,
         elevenlabs_agent_id: page.agentId,
+        conversational_voice: {
+          name: page.voiceProviderName,
+          settings_url: page.agentSettingsUrl,
+          instance_id: page.agentId,
+        },
         read_aloud: page.readAloud,
         live_poll_seconds: page.livePollSeconds,
         live_delivery: page.liveDelivery,
@@ -1075,6 +1080,9 @@ function newPage(store = new Map(), script = SCRIPT) {
      * behaviour as "a configured one does".
      */
     agentId: "agent_test",
+    /** The conversational provider description comes from the backend trait. */
+    voiceProviderName: "Example voice provider",
+    agentSettingsUrl: "https://provider.example/agents/agent_test",
     /** The account this bridge posts as, as the server reads it out of its own bot token. */
     selfAuthorId: "1000000000000000009",
     /** The reader's OWN Discord account. Not derivable; configured or chosen in Settings. */
@@ -2499,15 +2507,15 @@ test("connection details appear once in a dismissable banner, and stay in settin
 
   const banner = page.el("connection-banner");
   assert.equal(banner.hidden, false, "the connection details never appeared");
-  assert.match(page.el("connection-detail").textContent, /agent_test/);
-  assert.match(page.el("settings-detail").textContent, /agent_test/);
+  assert.match(page.el("connection-detail").textContent, /Example voice provider/);
+  assert.match(page.el("settings-detail").textContent, /Example voice provider/);
 
   await page.el("dismiss-banner").click();
 
   assert.equal(banner.hidden, true, "Dismiss did not dismiss");
   // Dismissing loses nothing: the same text is still in settings, which is the whole reason the
   // banner is allowed to go away by itself.
-  assert.match(page.el("settings-detail").textContent, /agent_test/);
+  assert.match(page.el("settings-detail").textContent, /Example voice provider/);
 });
 
 // --- the frame: what makes it an app rather than a page -----------------------------------------
@@ -2609,12 +2617,11 @@ test("the page LOADS nothing from anywhere but this server", () => {
   for (const how of [/fetch\(\s*["'`]https?:/, /new Worker\(\s*["'`]https?:/, /import\(\s*["'`]https?:/]) {
     assert.doesNotMatch(SCRIPT_CODE, how, "web/voice.js goes and gets something off-origin");
   }
-  // And the only off-origin URL it knows at all is the one destination, so "it is only ever a
-  // link" stays a fact about the file rather than a promise about this one line.
+  // Provider destinations arrive as data from the backend trait; this file knows no vendor URL.
   assert.deepStrictEqual(
     [...new Set([...SCRIPT_CODE.matchAll(/https?:\/\/[^"'`\s]+/g)].map((m) => m[0]))],
-    ["https://elevenlabs.io/app/agents"],
-    "web/voice.js names an off-origin URL that is not the agent console"
+    [],
+    "web/voice.js hardcodes an off-origin destination instead of using backend data"
   );
 });
 
@@ -4500,7 +4507,7 @@ test("the same drop while the page is VISIBLE is still a failure, and still says
   page.sockets[0].onclose({ code: 1006, reason: "" });
 
   assert.equal(page.el("error").hidden, false, "a real failure was swallowed");
-  assert.match(page.el("error").textContent, /connection to the voice agent failed/i);
+  assert.match(page.el("error").textContent, /connection to Example voice provider failed/i);
   assert.equal(state(page), "error");
   assert.doesNotMatch(
     page.el("status").textContent,
@@ -4565,9 +4572,9 @@ test("coming back does NOT silently reconnect — nothing reopens the microphone
   assert.equal(page.tracks[0].stops, 1, "the suspended call did not release the microphone");
 });
 
-test("RESUMING MINTS A FRESH SIGNED URL, and the reader never sees an error doing it", async () => {
-  // The "expired credential" case the issue worries about, closed by construction rather than by
-  // handling: `start()` mints on every call, so there is no path on which a stale URL is reused.
+test("RESUMING OPENS A FRESH VOICE SESSION, and the reader never sees an error doing it", async () => {
+  // The expired-session case is closed by construction: `start()` asks the provider for a new
+  // descriptor on every call, so there is no path on which a stale endpoint is reused.
   const page = newPage();
   await startTalking(page);
   await suspendAndReturn(page);
@@ -4579,7 +4586,7 @@ test("RESUMING MINTS A FRESH SIGNED URL, and the reader never sees an error doin
   assert.notEqual(
     page.sockets[1].url,
     page.sockets[0].url,
-    "Resume reused the signed URL of the conversation that died"
+    "Resume reused the endpoint of the conversation that died"
   );
   assert.equal(page.micRequests.length, 2, "Resume did not reopen the microphone");
   assert.equal(page.el("error").hidden, true, "the whole round trip must show no error at all");
@@ -4661,7 +4668,8 @@ test("an error with NO close following still reaches the screen", async () => {
 
   assert.equal(page.expireTimers(250), 1, "no timer was armed to report the unaccompanied error");
   assert.equal(page.el("error").hidden, false, "an error with no close was never reported at all");
-  assert.match(page.el("error").textContent, /between this browser and ElevenLabs/);
+  assert.match(page.el("error").textContent, /connection to Example voice provider failed/);
+  assert.doesNotMatch(page.el("error").textContent, /ElevenLabs|signed URL/i);
 });
 
 // --- clearing the view ----------------------------------------------------------------------------
@@ -11065,19 +11073,20 @@ test("A LONG OPTION CANNOT SQUEEZE A NAME INTO A ONE-CHARACTER COLUMN", () => {
 
 // --- the way out to the agent's own configuration -----------------------------------------------
 
-test("SETTINGS LINKS STRAIGHT TO THIS AGENT'S CONFIGURATION, BY ID", async () => {
+test("SETTINGS USES THE PROVIDER-SUPPLIED CONFIGURATION LINK AND ID", async () => {
   // The owner's problem, stated as a trip rather than a feature: the system prompt is the thing he
   // needs to read, it lives in the vendor's console, and from a phone getting there meant finding
   // the console and then picking the right agent out of a list by an id nobody has memorised.
   const page = newPage();
   page.agentId = "agent_9f3c";
+  page.agentSettingsUrl = "https://provider.example/configure/agent_9f3c";
   await signIn(page);
   await page.el("open-settings").click();
 
   assert.equal(page.el("agent-settings").hidden, false, "a configured agent offers no way to it");
   assert.equal(
     page.el("agent-console-link").getAttribute("href"),
-    "https://elevenlabs.io/app/agents/agent_9f3c",
+    "https://provider.example/configure/agent_9f3c",
     "the link does not land on THIS agent"
   );
   // The id is printed as well as linked. That is the half that survives the vendor reorganising
@@ -11091,6 +11100,7 @@ test("...and a server that does not say which agent offers no link at all", asyn
   // somewhere wrong, which is worse than the absence.
   const page = newPage();
   page.agentId = null;
+  page.agentSettingsUrl = null;
   await signIn(page);
   await page.el("open-settings").click();
 

@@ -284,9 +284,39 @@ async fn the_provider_neutral_route_preserves_auth_and_describes_the_wire() {
         .to_bytes();
     let payload: Value = serde_json::from_slice(&body).expect("JSON");
     assert_eq!(payload["protocol"], "elevenlabs");
+    assert_eq!(payload["provider"], "ElevenLabs");
     assert_eq!(payload["input_sample_rate"], 16_000);
     assert_eq!(payload["output_sample_rate"], 16_000);
     assert!(payload["websocket_url"].as_str().is_some());
+
+    let response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/client-config")
+                .header("authorization", format!("Bearer {READ_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("responds");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let config: Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(config["conversational_voice"]["name"], "ElevenLabs");
+    assert_eq!(
+        config["conversational_voice"]["instance_id"],
+        KNOWN_AGENT_ID
+    );
+    assert_eq!(
+        config["conversational_voice"]["settings_url"],
+        format!("https://elevenlabs.io/app/agents/{KNOWN_AGENT_ID}")
+    );
 }
 
 #[tokio::test]

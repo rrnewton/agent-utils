@@ -527,6 +527,8 @@ pub struct ClientConfigResponse {
     /// ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public
     /// widget. The API key never leaves the server.
     pub elevenlabs_agent_id: Option<String>,
+    /// Selected conversational voice provider, named by its implementation.
+    pub conversational_voice: crate::conversation::VoiceDescription,
     /// Selected read-aloud backend and the playback interface the browser should use.
     pub read_aloud: crate::speech::Description,
     /// Server version, so a stale cached page is visible.
@@ -590,6 +592,7 @@ pub async fn client_config(
         chat_provider_name: state.chat.provider_name().to_owned(),
         channels: ops::channels(&state).await,
         elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
+        conversational_voice: state.conversation.describe(),
         read_aloud: state.speech.describe(),
         version: env!("CARGO_PKG_VERSION"),
         live_poll_seconds: state.config.discord.live_poll_seconds,
