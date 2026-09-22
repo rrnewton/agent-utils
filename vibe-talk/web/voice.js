@@ -163,7 +163,10 @@ const session = {
   source: null,
   playAt: 0, // next start time on the audio clock
   playing: [], // scheduled AudioBufferSourceNodes, so an interruption can cancel them
+  protocol: "elevenlabs",
+  inputRate: 16000,
   outputRate: 16000,
+  lastTranscriptKey: null,
   // `#48 transcript-storage`. The id the durable record is filed under. Taken from the vendor's
   // `conversation_id` when it arrives, so a transcript can be lined up against the vendor's own
   // record of the same call; invented locally otherwise, because a call that the vendor never
@@ -1638,6 +1641,14 @@ function sendClientEvent(event) {
   if (!canSendText()) {
     return false;
   }
+  if (session.protocol === "vibe-talk-v1") {
+    if (event.type === "user_message") {
+      session.socket.send(JSON.stringify({ type: "prompt", text: event.text }));
+    }
+    // This protocol has no presence or contextual-update frame. Those events are advisory, so a
+    // provider that cannot represent them still accepts the local action.
+    return true;
+  }
   session.socket.send(JSON.stringify(event));
   return true;
 }
@@ -2379,9 +2390,9 @@ async function mintSignedUrl() {
   if (!token()) {
     throw new Error("no API token saved on this phone yet");
   }
-  const payload = await api("/api/v1/signed-url");
-  if (!payload || !payload.signed_url) {
-    throw new Error("vibe-talk answered without a signed URL");
+  const payload = await api("/api/v1/voice-session");
+  if (!payload || !payload.websocket_url) {
+    throw new Error("vibe-talk answered without a voice WebSocket URL");
   }
   return payload;
 }
@@ -2409,11 +2420,11 @@ function bytesToBase64(bytes) {
 // Linear resample to 16 kHz, which is the input format the agent expects. Doing this explicitly
 // beats asking for an AudioContext at 16 kHz and hoping: a browser is allowed to give you a
 // different rate, and the failure is silent and sounds like a chipmunk.
-function downsampleTo16k(input, inputRate) {
-  if (inputRate === 16000) {
+function downsampleTo(input, inputRate, outputRate) {
+  if (inputRate === outputRate) {
     return input;
   }
-  const ratio = inputRate / 16000;
+  const ratio = inputRate / outputRate;
   const out = new Float32Array(Math.floor(input.length / ratio));
   for (let i = 0; i < out.length; i += 1) {
     const at = i * ratio;
@@ -2450,7 +2461,10 @@ function outputRateFrom(format) {
 }
 
 function playPcm(b64) {
-  const bytes = base64ToBytes(b64);
+  playPcmBytes(base64ToBytes(b64));
+}
+
+function playPcmBytes(bytes) {
   const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
   const buffer = session.audio.createBuffer(1, pcm.length, session.outputRate);
   const channel = buffer.getChannelData(0);
@@ -3051,17 +3065,20 @@ async function start(options) {
   hiddenDuringCall = false;
   hasSuspended = false;
   setState("working");
-  setStatus("Asking vibe-talk for a signed URL…");
+  setStatus("Asking vibe-talk for a voice session…");
   const minted = await mintSignedUrl();
+  session.protocol = minted.protocol || "elevenlabs";
+  session.inputRate = minted.input_sample_rate || 16000;
+  session.outputRate = minted.output_sample_rate || 16000;
+  session.lastTranscriptKey = null;
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
   // racing `onopen` — a payload that arrived after the agent had already spoken would be a
   // "here is what we said" delivered into the middle of a sentence.
   const resume = await fetchResume();
-  showDetail(
-    `agent ${minted.agent_id}; signed URL valid for about ${Math.round(
-      (minted.valid_for_seconds || 900) / 60
-    )} minutes`
-  );
+  const validity = minted.valid_for_seconds
+    ? `; URL valid for about ${Math.round(minted.valid_for_seconds / 60)} minutes`
+    : "";
+  showDetail(`${minted.provider || "voice provider"} · ${session.protocol}${validity}`);
 
   // CHAT MODE: THE MICROPHONE IS NOT OPENED, AND THAT IS THE WHOLE FEATURE.
   //
@@ -3085,12 +3102,28 @@ async function start(options) {
   }
 
   setState("working");
-  const socket = new WebSocket(minted.signed_url);
+  const socket = new WebSocket(minted.websocket_url);
+  socket.binaryType = "arraybuffer";
   session.socket = socket;
   session.muted = false;
   renderControls();
 
   socket.onopen = () => {
+    if (session.protocol === "vibe-talk-v1") {
+      session.connected = true;
+      conversationOpen = true;
+      session.conversationId = conversationIdFrom(null);
+      if (!chat) {
+        socket.send(JSON.stringify({ type: "audio_start" }));
+      }
+      setState("live");
+      setStatus(chat ? "Connected — type a message." : "Connected — say something.");
+      renderControls();
+      if (!chat) {
+        startCapture(socket);
+      }
+      return;
+    }
     // The initiation frame is UNCHANGED on the default path. `contextual_update` is the default
     // transport because the alternative — carrying the text on this frame under
     // `dynamic_variables` — depends on the agent's dashboard security settings permitting
@@ -3145,6 +3178,12 @@ async function start(options) {
   };
 
   socket.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      if (session.protocol === "vibe-talk-v1" && !session.chat && !session.speakerOff) {
+        playPcmBytes(new Uint8Array(event.data));
+      }
+      return;
+    }
     let message = null;
     try {
       message = JSON.parse(event.data);
@@ -3157,7 +3196,11 @@ async function start(options) {
     // in-page wire fake that could not happen; against a real socket it is one negotiated setting
     // away.
     try {
-      handle(socket, message);
+      if (session.protocol === "vibe-talk-v1") {
+        handleVibeTalk(message);
+      } else {
+        handle(socket, message);
+      }
     } catch (error) {
       showError(error.message);
       setStatus("the agent sent something this page cannot handle");
@@ -3300,6 +3343,34 @@ function handle(socket, message) {
   }
 }
 
+function handleVibeTalk(message) {
+  switch (message.type) {
+    case "session_started":
+      addDetail(`voice session ${message.session_id || "started"}`);
+      break;
+    case "transcript": {
+      const who = message.role === "user" ? "you" : "assistant";
+      const said = message.text || "";
+      const key = `${message.turn || ""}:${who}:${said}`;
+      if (!said || key === session.lastTranscriptKey) {
+        break;
+      }
+      session.lastTranscriptKey = key;
+      if (who === "you" && isEchoOfTyped(said)) {
+        break;
+      }
+      line(who, said);
+      recordTurn(who, said);
+      break;
+    }
+    case "error":
+      showError(message.message || message.detail || "the voice provider reported an error");
+      break;
+    default:
+      break;
+  }
+}
+
 function startCapture(socket) {
   const rate = session.audio.sampleRate;
   // ScriptProcessorNode is deprecated in favour of AudioWorklet, and is still the only capture
@@ -3331,7 +3402,11 @@ function startCapture(socket) {
       return;
     }
     const mono = event.inputBuffer.getChannelData(0);
-    const pcm = floatToPcm16(downsampleTo16k(mono, rate));
+    const pcm = floatToPcm16(downsampleTo(mono, rate, session.inputRate));
+    if (session.protocol === "vibe-talk-v1") {
+      socket.send(pcm.buffer);
+      return;
+    }
     socket.send(
       JSON.stringify({
         user_audio_chunk: bytesToBase64(new Uint8Array(pcm.buffer)),
@@ -3374,6 +3449,10 @@ function teardown() {
   session.audio = null;
   session.socket = null;
   session.connected = false;
+  session.protocol = "elevenlabs";
+  session.inputRate = 16000;
+  session.outputRate = 16000;
+  session.lastTranscriptKey = null;
   session.muted = false;
   // Chat is a property of ONE conversation, decided when its socket opened. Carrying it into the
   // next one would mean the big control silently started a typed conversation because the previous
@@ -3393,6 +3472,10 @@ function stop() {
   // it stays as a guard rather than as a second way to end something that is already over.
   if (!session.socket) {
     return;
+  }
+  if (session.protocol === "vibe-talk-v1" && session.socket.readyState === WebSocket.OPEN) {
+    session.socket.send(JSON.stringify({ type: "audio_end" }));
+    session.socket.send(JSON.stringify({ type: "quit" }));
   }
   session.socket.close();
   setStatus("Call ended.");

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::agent_backend::AgentBackend;
 use crate::chat::ChatClient;
 use crate::config::Config;
+use crate::conversation::ConversationalVoiceProvider;
 use crate::elevenlabs::SignedUrlProvider;
 use crate::live::LiveHub;
 use crate::model::{ChannelId, ChannelInfo};
@@ -24,6 +25,8 @@ pub struct AppState {
     pub ranker: Arc<dyn Ranker>,
     /// Mints short-lived signed conversation URLs for the configured ElevenLabs agent.
     pub elevenlabs: Arc<dyn SignedUrlProvider>,
+    /// Opens a browser-ready conversational voice session through the selected provider.
+    pub conversation: Arc<dyn ConversationalVoiceProvider>,
     /// Reads messages using the configured speech backend and advertises its playback interface.
     ///
     /// Separate from minting a conversation URL: device speech needs no account, and a server

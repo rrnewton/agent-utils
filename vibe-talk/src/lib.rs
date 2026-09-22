@@ -39,6 +39,7 @@ pub mod auth;
 pub mod chat;
 pub mod clock;
 pub mod config;
+pub mod conversation;
 pub mod diagnostics;
 pub mod discord;
 pub mod elevenlabs;

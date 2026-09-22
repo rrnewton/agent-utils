@@ -190,6 +190,15 @@ enabled = true
 # Environment: VIBE_TALK_ELEVENLABS_API_BASE
 # api_base = "https://api.elevenlabs.io/v1"
 
+[conversation]
+# The live voice provider used by /voice. `elevenlabs` is the default and keeps the existing
+# signed-URL flow. `websocket` selects a deployment-managed endpoint that speaks the public
+# vibe-talk-v1 protocol: JSON prompt/transcript control frames and 16-bit little-endian mono PCM
+# binary frames. Provider endpoints belong in deployment configuration, never in source.
+# backend = "elevenlabs"
+# websocket_url = "wss://voice-provider.example/ws"
+# label = "WebSocket voice provider"
+
 [storage]
 # Durable state: the /voice conversation transcript, how far you have read in each channel,
 # and the cached summaries below. Everything else this server does is stateless — a channel is

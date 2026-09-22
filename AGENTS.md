@@ -19,14 +19,12 @@ working: `git pull --rebase` and push again. Never force-push, never rewind,
 never amend shared history, and never reach for `--no-verify` to get past a
 refusal.
 
-**If `git` or `gh` cannot reach the network**, that is a restriction on your own
-process, not a repository problem. You are authorized to run them through
-`herdr-run`, which executes in a pane outside it — `git` and `gh` are already
-allowlisted:
+**Agents are authorized to use networked `git` and `gh` through Herdr.** If the
+current process cannot reach GitHub, run them in a Herdr command pane:
 
 ```bash
-herdr-run run 'git pull --rebase origin main'
-herdr-run run 'gh pr list'
+herdr pane run <pane-id> "with-proxy git pull --rebase origin main"
+herdr pane run <pane-id> "with-proxy gh pr list"
 ```
 
 **Keep `main` linear.** Rebase; do not merge. `git pull --rebase` (not a bare

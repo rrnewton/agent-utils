@@ -784,7 +784,7 @@ function errorResponse(status, error, detail) {
 }
 
 /**
- * A successful mint, exactly as `/api/v1/signed-url` serializes one.
+ * A successful mint, exactly as `/api/v1/voice-session` serializes one.
  *
  * The signature is DIFFERENT every time, because a signed URL is a single-use short-lived
  * credential and the real endpoint mints a fresh one per request. A constant here would make
@@ -795,8 +795,11 @@ let mints = 0;
 const MINTED = async () => {
   mints += 1;
   return json(200, {
-    signed_url: `wss://example.invalid/convai?sig=test-${mints}`,
-    agent_id: "agent_test",
+    websocket_url: `wss://example.invalid/convai?sig=test-${mints}`,
+    protocol: "elevenlabs",
+    provider: "ElevenLabs agent agent_test",
+    input_sample_rate: 16000,
+    output_sample_rate: 16000,
     valid_for_seconds: 900,
   });
 };
@@ -1398,7 +1401,7 @@ function newPage(store = new Map(), script = SCRIPT) {
     TextEncoder,
     WebSocket: FakeWebSocket,
     fetch: async (path, options) => {
-      if (String(path).startsWith("/api/v1/signed-url")) {
+      if (String(path).startsWith("/api/v1/voice-session")) {
         return page.mint(path, options);
       }
       if (String(path).startsWith("/api/v1/client-config")) {
@@ -11441,6 +11444,56 @@ async function compose(page, text) {
 /** Just the typed client events, so a `user_audio_chunk` cannot be mistaken for one. */
 const typedFrames = (socket) => socket.sent.filter((s) => s.includes('"user_message"'));
 const activityFrames = (socket) => socket.sent.filter((s) => s.includes('"user_activity"'));
+
+test("the neutral WebSocket provider carries typed text, PCM, and deduplicated transcripts", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(async () =>
+    json(200, {
+      websocket_url: "wss://example.invalid/private-voice",
+      protocol: "vibe-talk-v1",
+      provider: "Internal voice preview",
+      input_sample_rate: 24000,
+      output_sample_rate: 24000,
+    })
+  );
+
+  await page.el("talk").click();
+  const socket = page.sockets[0];
+  socket.onopen();
+
+  assert.deepStrictEqual(JSON.parse(socket.sent[0]), { type: "audio_start" });
+  speakInto(page);
+  assert.ok(
+    socket.sent.some((frame) => typeof frame !== "string" && frame.byteLength > 0),
+    "microphone PCM was not sent as a binary frame"
+  );
+
+  await compose(page, "is the bridge alive");
+  await page.el("send-text").click();
+  assert.ok(
+    socket.sent.some(
+      (frame) =>
+        typeof frame === "string" &&
+        frame === JSON.stringify({ type: "prompt", text: "is the bridge alive" })
+    ),
+    "typed text did not use the neutral prompt frame"
+  );
+
+  const transcript = JSON.stringify({
+    type: "transcript",
+    role: "assistant",
+    text: "the bridge is alive",
+    turn: 1,
+  });
+  socket.onmessage({ data: transcript });
+  socket.onmessage({ data: transcript });
+  assert.equal(
+    session_lines(page).filter((row) => row.text().includes("the bridge is alive")).length,
+    1,
+    "a repeated final transcript was rendered twice"
+  );
+});
 
 test("TYPING A MESSAGE SENDS user_message, AND NOTHING ELSE", async () => {
   const page = newPage();

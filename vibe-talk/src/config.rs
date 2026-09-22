@@ -157,6 +157,8 @@ pub struct Config {
     pub speakable: SpeakableConfig,
     /// ElevenLabs wiring, when configured.
     pub elevenlabs: ElevenLabsConfig,
+    /// Provider used for live conversational voice sessions.
+    pub conversation: ConversationConfig,
     /// Durable state: where it lives, and how much of it is kept.
     pub storage: StorageConfig,
     /// Summarisation policy. Every field is part of the cache key; see
@@ -446,6 +448,45 @@ impl Default for ElevenLabsConfig {
     }
 }
 
+/// Conversational voice backend selected by this deployment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConversationBackend {
+    /// Mint a short-lived URL using the existing ElevenLabs integration.
+    #[default]
+    ElevenLabs,
+    /// Connect the browser to a deployment-managed `vibe-talk-v1` WebSocket.
+    WebSocket,
+}
+
+/// Provider-neutral live conversation configuration.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationConfig {
+    /// Which provider opens live voice sessions.
+    #[serde(default)]
+    pub backend: ConversationBackend,
+    /// Stable WebSocket endpoint used by [`ConversationBackend::WebSocket`].
+    pub websocket_url: Option<String>,
+    /// Human-readable label shown in connection details.
+    #[serde(default = "default_conversation_label")]
+    pub label: String,
+}
+
+fn default_conversation_label() -> String {
+    "WebSocket voice provider".to_owned()
+}
+
+impl Default for ConversationConfig {
+    fn default() -> Self {
+        Self {
+            backend: ConversationBackend::ElevenLabs,
+            websocket_url: None,
+            label: default_conversation_label(),
+        }
+    }
+}
+
 /// Configuration could not be assembled.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -488,6 +529,8 @@ struct FileConfig {
     channels: Vec<FileChannel>,
     #[serde(default)]
     elevenlabs: FileElevenLabs,
+    #[serde(default)]
+    conversation: ConversationConfig,
     #[serde(default)]
     read_aloud: ReadAloudConfig,
     #[serde(default)]
@@ -910,6 +953,7 @@ impl Config {
                     .map(str::to_owned)
                     .or(file.elevenlabs.voice_id),
             },
+            conversation: file.conversation,
             storage,
             summaries,
             replay,
@@ -1785,6 +1829,21 @@ writable = true
             Some("key-from-env")
         );
         assert_eq!(cfg.elevenlabs.api_base, "https://proxy.test/v1");
+    }
+
+    #[test]
+    fn a_conversation_provider_can_be_selected_without_naming_it_in_source() {
+        let text = format!(
+            "{FULL}\n[conversation]\nbackend = \"websocket\"\nwebsocket_url = \
+             \"wss://voice-provider.example/ws\"\nlabel = \"Private preview\"\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.conversation.backend, ConversationBackend::WebSocket);
+        assert_eq!(
+            cfg.conversation.websocket_url.as_deref(),
+            Some("wss://voice-provider.example/ws")
+        );
+        assert_eq!(cfg.conversation.label, "Private preview");
     }
 
     #[test]

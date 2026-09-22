@@ -467,6 +467,11 @@ async fn main() -> anyhow::Result<()> {
         "message read-aloud configured independently of conversational voice mode"
     );
     let elevenlabs: Arc<dyn SignedUrlProvider> = elevenlabs_client;
+    let conversation = vibe_talk::conversation::provider(
+        &config.conversation,
+        Arc::clone(&elevenlabs),
+        config.elevenlabs.clone(),
+    );
     let live_limit = config.discord.default_fetch_limit;
     let state = AppState {
         config: Arc::new(config),
@@ -474,6 +479,7 @@ async fn main() -> anyhow::Result<()> {
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs,
+        conversation,
         speech,
         store,
         spoken_names: Arc::new(vibe_talk::speakable::SharedNames::new()),

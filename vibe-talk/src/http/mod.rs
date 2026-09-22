@@ -58,6 +58,7 @@ pub fn router(state: AppState) -> Router {
         // not an HTTP failure. See `api::diagnostics`.
         .route("/api/v1/diagnostics", get(api::diagnostics))
         .route("/api/v1/signed-url", get(api::signed_url))
+        .route("/api/v1/voice-session", get(api::voice_session))
         .route("/api/v1/channels/{channel_id}/messages", get(api::messages))
         .route(
             "/api/v1/channels/{channel_id}/messages/{message_id}",

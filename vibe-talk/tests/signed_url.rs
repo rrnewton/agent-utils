@@ -260,11 +260,41 @@ async fn a_minted_url_is_never_cached() {
 }
 
 #[tokio::test]
+async fn the_provider_neutral_route_preserves_auth_and_describes_the_wire() {
+    let harness = harness();
+    let response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/voice-session")
+                .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let payload: Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(payload["protocol"], "elevenlabs");
+    assert_eq!(payload["input_sample_rate"], 16_000);
+    assert_eq!(payload["output_sample_rate"], 16_000);
+    assert!(payload["websocket_url"].as_str().is_some());
+}
+
+#[tokio::test]
 async fn the_voice_page_is_public_code_and_carries_no_credential() {
     let harness = harness();
     for (path, needle) in [
         ("/voice", "<title>vibe-talk — voice</title>"),
-        ("/voice.js", "/api/v1/signed-url"),
+        ("/voice.js", "/api/v1/voice-session"),
         // The page LINKS this file. A missing route would not error anywhere — it would serve a
         // 404 into a <link> and render the app frame as a plain scrolling document, which is
         // exactly the regression the frame exists to remove, and it would look like a CSS bug.

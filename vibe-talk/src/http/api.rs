@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, Scope};
 use crate::chat::ChatError;
+use crate::conversation::{VoiceSession, VoiceSessionError};
 use crate::elevenlabs::{SignedUrl, SignedUrlError};
 use crate::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
 use crate::ops::{self, OpError};
@@ -114,6 +115,20 @@ impl From<SignedUrlError> for ApiError {
         };
         // `Display` for every variant is already redacted at construction; see
         // `SignedUrlError::from_response`.
+        Self::new(status, code, value.to_string())
+    }
+}
+
+impl From<VoiceSessionError> for ApiError {
+    fn from(value: VoiceSessionError) -> Self {
+        let code = value.code();
+        let status = match &value {
+            VoiceSessionError::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
+            VoiceSessionError::Provider(SignedUrlError::NotConfigured(_)) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            VoiceSessionError::Provider(_) => StatusCode::BAD_GATEWAY,
+        };
         Self::new(status, code, value.to_string())
     }
 }
@@ -649,6 +664,20 @@ pub async fn signed_url(
         .signed_url(&state.config.elevenlabs)
         .await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(minted)).into_response())
+}
+
+/// `GET /api/v1/voice-session` — open a session through the configured voice provider.
+///
+/// Like the compatibility signed-URL endpoint, this requires WRITE scope because a conversation
+/// may hold tools with that authority. The descriptor is never cached: some providers return a
+/// short-lived bearer URL, and a generic route must honor the strictest provider it can select.
+pub async fn voice_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let session: VoiceSession = state.conversation.open_session().await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(session)).into_response())
 }
 
 /// `POST /api/v1/channels/{channel_id}/messages/{message_id}/speak`

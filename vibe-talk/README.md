@@ -1033,7 +1033,8 @@ its own adapter-only token; every other route uses the read/write tokens describ
 | POST | `/api/v1/live/events` | ingest | accept one normalized create/update/delete event from an external provider adapter |
 | GET | `/api/v1/diagnostics` | read | re-run the startup checks now, structured, with a remedy on every failure — see above |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |
-| GET | `/api/v1/signed-url` | **write** | mint a short-lived signed conversation URL — see below |
+| GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider |
+| GET | `/api/v1/signed-url` | **write** | compatibility endpoint that mints an ElevenLabs signed URL |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first |
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
