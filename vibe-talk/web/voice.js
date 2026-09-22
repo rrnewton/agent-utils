@@ -1317,6 +1317,10 @@ function renderScrollTools() {
     currentView !== "discord" || !folds.some((entry) => entry.id !== null);
   // The way back. Only where a marker can mean something, and only when one is set.
   el("jump-marker").hidden = currentView !== "discord" || placeMarker === null;
+  // `#129 message-search`. Re-derived from the lists, exactly like everything above it: whatever
+  // just changed a list has to leave the filter true of it. See `applySearch` for why this hangs
+  // off the one function every mutation already ends with rather than off its own call sites.
+  applySearch();
 }
 
 /**
@@ -1334,6 +1338,182 @@ function setAllFolded(folded) {
     }
   });
   renderScrollTools();
+}
+
+// --- searching what is on screen --------------------------------------------------------------
+//
+// `#129 message-search`. A magnifying glass in the corner of the header, and a field that hides
+// every row it does not match — in BOTH lists, because they sit one switch apart and a reader
+// moves between them without thinking about which one they are in.
+//
+// IT FILTERS, IT DOES NOT FETCH, and that distinction got sharper the moment `#128
+// transcript-history` landed: what is on screen is now a bounded suffix of a much longer record,
+// so "no matches" and "not said" are different answers and the control has to be able to tell
+// them apart out loud. That is what the count is for, and why it names its denominator.
+//
+// The matching is deliberately the least clever thing that answers the request: terms split on
+// whitespace, a double-quoted run kept whole, every term required, case-insensitive substring. No
+// regular expressions from the field and no fuzzy matching — a reader who types `read new` is
+// looking for a row with both words in it, and anything smarter is a second thing to learn.
+
+/** Whether the field is open. Closing it takes the filter off; it is not a separate switch. */
+let searchOpen = false;
+
+/** What is in the field. Read from here rather than from the input, so the filter has one source. */
+let searchQuery = "";
+
+/**
+ * The lists a filter may touch, in document order.
+ *
+ * Every list of MESSAGES, including the ones that are not on screen at the moment. Filtering all
+ * of them rather than only the visible one is what makes the view switch honest: a reader who
+ * searches on the call view and then switches to the channel is looking at the same query, not at
+ * an unfiltered list that will re-filter on the next unrelated redraw.
+ */
+const SEARCH_LISTS = ["transcript", "thread-list", "discord-log", "outgoing-log"];
+
+/** The grouping character, written as an escape so no line here holds an odd number of them. */
+const SEARCH_QUOTE = "\"";
+
+/**
+ * One term per word, and a double-quoted run is one term however many words are in it.
+ *
+ * AN UNTERMINATED QUOTE GROUPS TO THE END of what has been typed, rather than being ignored until
+ * its partner arrives. A reader types the opening quote several keystrokes before the closing
+ * one, and treating `"read new` as two words for that whole time means the list flickers through
+ * matches for a query nobody asked for and then settles somewhere else. Reading it as the phrase
+ * it is about to become is both steadier and what the reader already means.
+ *
+ * Scanned rather than matched by a pattern: the closing quote is optional, quotes may open mid
+ * word, and expressing both in one regular expression costs more to read than the loop does.
+ */
+function searchTerms(query) {
+  const terms = [];
+  let current = "";
+  let quoting = false;
+  const finish = () => {
+    if (current) {
+      terms.push(current);
+    }
+    current = "";
+  };
+  for (const character of String(query).toLowerCase()) {
+    if (character === SEARCH_QUOTE) {
+      // A quote always ends whatever run it touches, opening or closing. Otherwise `a"b c"` would
+      // put `a` and `b c` in one term, which is not what either half of it looks like.
+      finish();
+      quoting = !quoting;
+    } else if (!quoting && /\s/.test(character)) {
+      finish();
+    } else {
+      current += character;
+    }
+  }
+  finish();
+  return terms;
+}
+
+/**
+ * Declare what a row is findable by.
+ *
+ * ON THE ROW, as an attribute, rather than in a map beside it. Every one of these lists is rebuilt
+ * from scratch by something — the channel poll, the outgoing render, a step back through the
+ * record — and a structure keyed by row identity would have to be pruned by whichever of them ran
+ * last. An attribute is born and dies with the node that carries it.
+ *
+ * Lower-cased once here rather than on every keystroke, and it holds the AUTHOR as well as the
+ * words: "everything by the bot" is a search a reader actually performs, and the name is on the
+ * row in front of them.
+ */
+function searchable(row, ...parts) {
+  row.setAttribute("data-search", parts.filter(Boolean).join(" ").toLowerCase());
+}
+
+/**
+ * Add or remove ONE class word, leaving whatever else the element is wearing alone.
+ *
+ * The page's idiom everywhere else is to assign `className` outright, which is fine for an element
+ * whose classes are all decided in one place. These rows are not that: a transcript row is `mine`
+ * or `theirs`, a channel row carries `discord-message`, and the filter has an opinion about
+ * neither.
+ */
+function setClassWord(element, word, on) {
+  const words = element.className.split(/\s+/).filter((one) => one && one !== word);
+  if (on) {
+    words.push(word);
+  }
+  element.className = words.join(" ");
+}
+
+/** The lists the reader can actually see right now, which is what a count may speak for. */
+function searchScope() {
+  return SEARCH_LISTS.filter(
+    (id) => !el(id).hidden && (id === "transcript") === (currentView === "voice")
+  );
+}
+
+/**
+ * Hide every row that does not match, and say how many are left.
+ *
+ * Called from `renderScrollTools` — the function every bulk render of either list already ends
+ * with — and from the two places that put ONE row on the end of the live transcript without going
+ * through it. That is deliberately as few call sites as the page allows: a filter re-applied from
+ * its own scattered set of them is a filter that misses the one somebody adds next, and the
+ * failure mode — a row arriving unfiltered into a filtered list — reads as a search that quietly
+ * stopped working.
+ */
+function applySearch() {
+  const terms = searchOpen ? searchTerms(searchQuery) : [];
+  const scope = searchScope();
+  let matched = 0;
+  let loaded = 0;
+  for (const id of SEARCH_LISTS) {
+    const list = el(id);
+    const counts = scope.includes(id);
+    for (const row of list.children) {
+      const text = row.getAttribute("data-search");
+      // A row with nothing declared is not a message — a seam, a date rule, the notice at the head
+      // of the channel. It goes away while a filter is on, because it explains a neighbour that is
+      // no longer beside it, and it is never counted either way.
+      const hit = terms.length === 0 || (text !== null && terms.every((term) => text.includes(term)));
+      setClassWord(row, "search-hidden", !hit);
+      if (counts && text !== null) {
+        loaded += 1;
+        if (hit) {
+          matched += 1;
+        }
+      }
+    }
+  }
+  // "of N loaded", never "of N". The denominator is what this page has, not what the server has,
+  // and after `#128 transcript-history` those are routinely different numbers.
+  el("search-count").textContent = terms.length === 0 ? "" : `${matched} of ${loaded} loaded`;
+  // Nothing matched is a RESULT, and it has to be stated where the messages were. Every row is
+  // still in the list, so neither pane's own empty state fires, and without this the reader gets
+  // a blank screen whose only explanation is a 0.75rem count in the far corner of the header.
+  // Not raised over a list that was empty to begin with: there the pane already says why.
+  el("search-empty").hidden = terms.length === 0 || matched > 0 || loaded === 0;
+}
+
+/**
+ * Open or close the field.
+ *
+ * Closing CLEARS, rather than leaving a query parked behind a closed control. A filter still in
+ * force with nothing on screen saying so is the worst state this feature can be in: the reader
+ * concludes the messages are gone.
+ */
+function setSearchOpen(open) {
+  searchOpen = open;
+  if (!open) {
+    searchQuery = "";
+    el("search-field").value = "";
+  }
+  el("search-toggle").setAttribute("aria-pressed", open ? "true" : "false");
+  renderControlBar();
+  renderScrollTools();
+  if (open) {
+    el("search-field").focus();
+  }
 }
 
 /**
@@ -1369,6 +1549,9 @@ function turnNode(who, text, atMs) {
   body.textContent = text; // untrusted text: never innerHTML.
   li.append(meta, body);
   foldable(li, meta, body, text);
+  // Who said it as well as what was said: on the transcript "assistant" is a real thing to look
+  // for, and it is the word printed on the row.
+  searchable(li, who, text);
   return li;
 }
 
@@ -1379,6 +1562,9 @@ function line(who, text, atMs) {
   const li = turnNode(who, text, atMs);
   el("transcript").append(li);
   renderEmptyState();
+  // A row arriving into a filtered list is filtered too. Without this, a live turn spoken while
+  // the reader is searching lands on screen among the matches whether or not it is one.
+  applySearch();
   followIfPinned(pinned);
   return li;
 }
@@ -1446,6 +1632,9 @@ function transcriptSeam(label, detail, into = null) {
   const pinned = atBottom(el("scroll-area"));
   el("transcript").append(li);
   renderEmptyState();
+  // A seam explains the rows beside it, so while a filter is on it goes away with them. It
+  // declares nothing to `searchable`, which is exactly how `applySearch` knows that.
+  applySearch();
   followIfPinned(pinned);
   return li;
 }
@@ -2744,15 +2933,34 @@ function renderControlBar() {
     el("send-text"),
     ...el("bar-pack").children,
   ];
-  el("control-bar").hidden = members.every((member) => member.hidden);
-  // The header collapses when it holds nothing. With the bar at the bottom that is the ordinary
+  // `#129 message-search`. On the main screen and nowhere else: there is nothing to filter on
+  // Settings, Help or the reply screen, and on the sign-in screen there is nothing at all. Not
+  // suppressed by text mode — the glass is in the header and the field is in the bar, so they are
+  // not competing for the same width unless the reader has also moved the bar up here.
+  el("search-toggle").hidden = currentScreen !== "main";
+  el("search-field").hidden = el("search-toggle").hidden || !searchOpen;
+  el("search-count").hidden = el("search-field").hidden;
+  el("control-bar").hidden =
+    members.every((member) => member.hidden) ||
+    // ...and while the field is open the header row belongs to IT. Two elastic items on a 375px
+    // phone is a search field the width of a word. The bar is one tap away — closing the search
+    // brings it straight back — and this only ever fires for a reader who has moved the bar up
+    // here, which is not the default.
+    (searchOpen && placement === "top");
+  // The header collapses when it holds nothing. With the bar at the bottom that WAS the ordinary
   // case on the main screen, and an empty 2.4rem strip across the top of a phone is exactly the
   // real estate `#58 control-bar` exists to reclaim. It is a hide of the whole grid row, so the
   // body grows into it rather than leaving a band of empty panel.
+  //
+  // `#129 message-search` put something in it, which is why the main screen now keeps the row.
+  // That is not a reversal of `#58`: the complaint there was an EMPTY strip, priced at 2.4rem and
+  // buying nothing. The strip now carries the one control that works on both lists, and the test
+  // that used to say the header costs no row says instead that it never stands empty.
   el("topbar").hidden =
     el("close-settings").hidden &&
     el("close-reply").hidden &&
     el("topbar-title").hidden &&
+    el("search-toggle").hidden &&
     (placement !== "top" || el("control-bar").hidden);
 }
 
@@ -3934,6 +4142,10 @@ function threadCard(summary) {
   button.append(title, meta, preview);
   button.addEventListener("click", () => guardQuietly(() => openThread(summary.id, summary))());
   row.append(button);
+  // `#129 message-search`. A thread card is what stands in this list where messages stand in the
+  // others, so the filter has to reach it or searching on the threads tab silently does nothing.
+  // Title and preview, which is everything the card shows.
+  searchable(row, title.textContent, preview.textContent);
   return row;
 }
 
@@ -4266,6 +4478,10 @@ function renderOutgoingMessages() {
       actions.append(retry, dismiss);
       row.append(actions);
     }
+    // `#129 message-search`. What the reader WROTE, under the word the row prints for them: a
+    // message you sent is a message you look for, and it is sitting in the same list as the ones
+    // you received.
+    searchable(row, "You", text);
     rows.push(row);
   }
   if (retired) persistOutgoingMessages();
@@ -6462,6 +6678,12 @@ function discordNode(messages) {
   // by gesture OR by a control a keyboard can get to. That ordering was `#50`'s condition for the
   // gesture layer and it still holds — the gesture is a second way in, never the only one.
   swipeable(li, messages);
+  // `#129 message-search`. THE COMBINED TEXT, for the same reason the fold is measured on it: a
+  // glommed row is one row to the reader, and a filter that matched only its first constituent
+  // would hide a row that visibly contains the word they typed. The author name goes in because
+  // "everything the bot said" is a search a reader performs, and the id does not, because it is
+  // not on the row — see the note above about where the snowflake lives.
+  searchable(li, message.author, content);
   return li;
 }
 
@@ -9504,6 +9726,20 @@ el("clear-backlog").addEventListener("click", guardQuietly(clearBacklog));
 el("undo-dismiss").addEventListener("click", guardQuietly(undoDismissal));
 el("summarise").addEventListener("click", () => setSummaryMode(!summaryMode));
 el("jump-newest").addEventListener("click", scrollToNewest);
+// `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
+// only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
+el("search-toggle").addEventListener("click", () => setSearchOpen(!searchOpen));
+el("search-field").addEventListener("input", () => {
+  searchQuery = el("search-field").value;
+  renderScrollTools();
+});
+// Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a
+// desktop reader reaches for without being told, and the only one a keyboard has.
+el("search-field").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    setSearchOpen(false);
+  }
+});
 // The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
 // has nothing left to say, so it takes itself away rather than waiting to be tapped.
 el("scroll-area").addEventListener("scroll", () => {

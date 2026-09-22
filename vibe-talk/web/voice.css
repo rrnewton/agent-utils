@@ -141,11 +141,14 @@ body {
  * hidden — every remaining child slides up one row, and the one that was meant to be elastic is not
  * the one that gets `1fr` any more.
  *
- * That is the defect this block fixes, and it was visible: web/voice.js hides #topbar outright when
- * the control bar is in its default bottom placement (`#58 control-bar` — an empty 2.4rem strip at
- * the top of a phone is rent nobody is paying). With the header gone, #frame-body took the `auto`
- * row and THE DOCK TOOK `1fr` — so the dock stretched to whatever space the content left over, and
- * the controls sat at the TOP of that stretched box. The owner saw the effect exactly as it is:
+ * That is the defect this block fixes, and it was visible: web/voice.js hides #topbar outright
+ * whenever it holds nothing. Until `#129 message-search` put a magnifying glass up there that was
+ * the ORDINARY main-screen state with the control bar in its default bottom placement (`#58
+ * control-bar` — an empty 2.4rem strip at the top of a phone is rent nobody is paying); it is now
+ * the sign-in screen's, which is still enough to spring the trap. With the header gone,
+ * #frame-body took the `auto` row and THE DOCK TOOK `1fr` — so the dock stretched to whatever
+ * space the content left over, and the controls sat at the TOP of that stretched box. The owner
+ * saw the effect exactly as it is:
  * switching from a long channel to an empty transcript walked the button bar up the screen, because
  * the bar's position was tracking the height of the content above it. Measured before the fix, on a
  * 900px-tall desktop window: the bar sat at y=752 on the channel and y=675 on the empty transcript.
@@ -194,11 +197,12 @@ body {
 
 /* ---------------------------------------------------------------------------- the top bar --- */
 
-/* A title bar and a way back, and — only when the reader has asked for it there — the control bar.
-   `#58 control-bar` moved the gear and the view switch out of here into a strip of their own, so
-   on the main screen with the default placement this header holds NOTHING and web/voice.js hides
-   it outright. An empty 2.4rem row at the top of a phone is exactly the rent that issue exists to
-   stop paying. */
+/* A title bar and a way back, the search glass, and — only when the reader has asked for it there
+   — the control bar. `#58 control-bar` moved the gear and the view switch out of here into a strip
+   of their own, because on the main screen with the default placement this header then held
+   NOTHING, and an empty 2.4rem row at the top of a phone is exactly the rent that issue exists to
+   stop paying. web/voice.js still hides the header outright when it is empty; since `#129
+   message-search` the main screen is no longer one of the times it is. */
 #topbar {
   display: block;
   padding: 0.45rem calc(0.7rem + env(safe-area-inset-right)) 0.45rem
@@ -219,6 +223,68 @@ body {
   font-size: 1rem;
   font-weight: 600;
   letter-spacing: 0.01em;
+}
+
+/* `#129 message-search`. The glass sits in the CORNER whatever else is in the row: with the bar in
+   the dock it is the only thing here, and a flex row would otherwise put it on the left, which is
+   not where a hand goes looking for it. */
+#search-toggle {
+  margin-left: auto;
+}
+
+/* Pressed is the open state, and it has to be legible at a glance — the field beside it is the
+   other half of the signal, but the icon is what the eye returns to. */
+#search-toggle[aria-pressed="true"] {
+  color: var(--ink);
+}
+
+/* Elastic, so the field takes the row when it opens. `min-width: 0` because a flex item's default
+   minimum is its content width, and without it a long query pushes the glass off the edge of a
+   375px phone instead of scrolling inside the field. */
+.search-field {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.3rem 0.6rem;
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--ink);
+  font: inherit;
+  /* 16px, not a rem, and the same rule #compose-text states: iOS Safari zooms the whole frame when
+     an input smaller than that takes focus, and this page is a fixed 100dvh grid that cannot
+     scroll back. A search field is a field you focus every single time you use it. */
+  font-size: 16px;
+}
+
+.search-count {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+/* The statement a reader gets instead of a blank list. Centred and given room, because it is the
+   only thing on screen when it is on screen at all — not a footnote under something else. */
+.search-empty {
+  margin: 1.6rem 0.5rem;
+  color: var(--muted);
+  text-align: center;
+  line-height: 1.45;
+}
+
+/* What the filter does to a row it does not match.
+ *
+ * A CLASS AND NOT THE `hidden` ATTRIBUTE, and that is the whole reason this rule exists rather
+ * than a line of script setting `row.hidden`. A row already carries state that decides whether it
+ * belongs on screen — to-do mode, archived, which channel view is up — and `hidden` is where that
+ * state is written. A filter that borrowed it would turn every row it hid into a row the next
+ * render believes was hidden for a different reason, and unfiltering would then show rows the
+ * reader had archived.
+ *
+ * `!important` for the same reason `[hidden]` has it: the layout modes below set `display` on
+ * these rows, and a filter that loses to the thing it is filtering is not a filter. */
+.search-hidden {
+  display: none !important;
 }
 
 /* The view switch: ONE control with two positions, carrying the word for the position it is in.

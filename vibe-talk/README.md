@@ -1727,6 +1727,55 @@ The throwaway server the screenshot harness starts sets `discord.max_fetch_limit
 `--fake-discord` seeds about a dozen messages, so at the default ceiling the channel arrives in one
 read and none of this is exercised by any picture.
 
+### The transcript walks back the same way the channel does
+
+`#48 transcript-storage` made the record of a call **durable**, and `#128 transcript-history` is
+what finally lets you read it. Before it, reopening the page restored the last conversation and
+stopped there: everything older was on the server, in SQLite, and unreachable from the only
+interface that has it.
+
+The restore is now a **bounded suffix of the whole record**, oldest-first within each call, and
+**Earlier turns** above the list takes the next step — the same control, the same automatic step
+on reaching the top, and the same anchored prepend as the channel. There was no reason for two
+mechanisms, and two would have drifted.
+
+The cursor is a **row value** over `(at_ms, conversation_id, seq)`, not a timestamp. Two calls can
+have turns at the same millisecond — a restored one and a live one, or two devices — and a cursor
+that compares only the clock either loses a turn at the boundary or repeats one. The server asks
+for one more row than it means to return, which is how `has_more` is answered without a second
+count query.
+
+Where a call ends and the next begins is drawn as a **seam**, because an unbroken list of turns is
+itself a claim that it is all one conversation, and across a walk back through weeks of calls that
+claim is false more often than it is true.
+
+### Finding something in what is on screen
+
+A magnifying glass in the corner of the header opens a field, and the field filters **the messages
+already loaded** — the channel and the voice transcript alike, because they are one switch apart
+and a filter that came off when you looked at the other list would be worse than none.
+
+**Every term has to match**, and matching is substring rather than whole-word: a second word is
+typed to narrow, and "runner" has to find "runners". **Double quotes group words into one term**,
+so `"mac runner"` finds the phrase and not the two words scattered through a paragraph; an
+unterminated quote groups to the end of what has been typed, which is the state the field is in
+for every keystroke between the two quotes.
+
+The count beside the field says **"2 of 13 loaded"**, and the last word is load-bearing. Since the
+section above, what is on screen is a bounded suffix of a longer record, so "no matches" and
+"nobody ever said that" are different answers and a bare number would let you conclude the second.
+For the same reason, a search that matches nothing says so **where the messages were** rather than
+only in the corner: every row is still in the list, hidden by a class of its own, so neither pane's
+empty state fires and the reader would otherwise get a blank screen.
+
+A class of its own, and not the `hidden` attribute, because `hidden` is where this page already
+records the *other* reasons a row is off screen — To do mode, dismissed, which view is up. A filter
+that borrowed it would put archived rows back on screen when the search was cleared.
+
+Rules the page drew itself — the seam between two calls, the date rules — **go away with the rows
+they were explaining**. A seam says the agent below it never heard the words above it, and left
+standing over a filtered list it says that about two rows that are no longer adjacent.
+
 ### Choosing the channel is a control, not a line of the scrollback
 
 The picker used to be a row at the **top of the scrolling region**, above the log. That is the
@@ -2733,7 +2782,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the thirty-five states that look different — signed out, idle, live
+Photographs the `/voice` page in the thirty-six states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -2748,7 +2797,8 @@ SERVER pushed it rather than because the page asked, a resumed call whose recons
 only partial and says so, the channel picker on the bar with the history walked back several
 pages, the channel pulled down past the point where letting go refreshes it, the channel with its
 collapsed rows summarised instead of clipped, the channel filtered to what has not been dealt
-with, the bulk clear saying how many it is about to take, and the same summary mode when the
+with, the bulk clear saying how many it is about to take, the channel filtered by a quoted phrase
+typed into the search glass, and the same summary mode when the
 summariser FAILS — the row red, saying so in words, with the message still under it — at four
 viewports: a tall phone, a
 short phone, a small laptop window and a maximised desktop. It prints the absolute path of every

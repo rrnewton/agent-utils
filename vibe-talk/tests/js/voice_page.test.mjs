@@ -2773,7 +2773,12 @@ test("the header shows two things at a time, and which two depends on the screen
   // the two go to different places, and scripts/screenshots.py drives #close-settings by name.
   // `#85 voice-desktop-review` added a THIRD for the same reason: Settings returns to the call, Reply
   // returns to the channel, and Help returns to Settings.
-  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help"]);
+  //
+  // `#129 message-search` added the fourth, and it is not a way back — it is the one control the
+  // header holds in its own right. LAST, because it lives in the corner: the ways back are at the
+  // leading edge where a thumb reaches for them, and the glass is at the trailing edge where a
+  // phone application puts it.
+  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help", "search-toggle"]);
 
   const page = newPage();
   const showing = () =>
@@ -5169,22 +5174,34 @@ test("the header spends one row, because the transcript is what deserves the hei
   assert.match(cssBlock("#control-bar-top"), /flex:\s*1 1 auto/);
 });
 
-test("AT THE BOTTOM THE HEADER COSTS NO ROW AT ALL", async () => {
-  // The point of the move, and the thing that makes it worth doing rather than merely different:
-  // with the bar in the dock the header on the main screen holds NOTHING, and an empty 2.4rem
-  // strip across the top of a phone is exactly the real estate `#58 control-bar` is about. It is
-  // hidden outright — a grid row that collapses — not merely emptied.
+test("THE HEADER NEVER STANDS EMPTY, WHICH IS WHAT COSTING A ROW HAS TO BUY", async () => {
+  // AMENDED BY `#129 message-search`, and the amendment is to the wording, not to the rule. This
+  // used to say the header costs NO ROW at the bottom placement, which was true while the header
+  // held nothing: an empty 2.4rem strip across the top of a phone is exactly the real estate
+  // `#58 control-bar` reclaimed, and it is hidden outright — a grid row that collapses — rather
+  // than merely emptied.
+  //
+  // The search control lives up there now, so on the main screen the row is bought and paid for.
+  // What has to keep holding is the principle underneath: the strip is never standing there with
+  // nothing in it. Before sign-in there is nothing to search and the header is still gone.
   const page = newPage();
   assert.equal(page.el("topbar").hidden, true, "an empty header stands on the sign-in screen");
   await signIn(page);
-  assert.equal(page.el("topbar").hidden, true, "an empty header stands on the main screen");
+  assert.equal(page.el("topbar").hidden, false, "the search control has nowhere to be");
+  assert.deepStrictEqual(
+    ["close-settings", "close-reply", "close-help", "topbar-title", "search-toggle"].filter(
+      (id) => !page.el(id).hidden
+    ),
+    ["search-toggle"],
+    "the header holds something other than the one control it is up there for"
+  );
 
-  // ...but never when it has something to say. Settings turns it back into a title bar.
+  // ...and it is still a title bar where it has something to say. Settings turns it back into one
   await page.el("open-settings").click();
   assert.equal(page.el("topbar").hidden, false, "the way back out of Settings was hidden");
   assert.equal(page.el("topbar-title").textContent, "Settings");
   await page.el("close-settings").click();
-  assert.equal(page.el("topbar").hidden, true);
+  assert.equal(page.el("topbar").hidden, false, "coming back from Settings took the glass with it");
 
   // ...and never when the reader has asked for the bar to be up there.
   page.el("bar-placement").value = "top";
@@ -12885,6 +12902,329 @@ test("browsing the record neither writes to it nor sends any of it to the voice 
     page.storeCalls.filter((call) => !call.startsWith("GET ")),
     [],
     `reading the record wrote to it: ${page.storeCalls.join(", ")}`
+  );
+});
+
+// --- searching what is on screen -----------------------------------------------------------------
+//
+// `#129 message-search`. The owner asked for a magnifying glass in the upper right that filters
+// the messages on screen, with double quotes grouping words into one term, working over the raw
+// channel messages AND the voice transcript. Everything below is one of those clauses.
+//
+// What makes this worth a suite rather than an eyeball is that the filter is a SECOND opinion
+// about whether a row belongs on screen, laid over the ones the page already had — to-do mode,
+// archived, which channel view is up. The ways two such opinions get confused with each other are
+// exactly the ways that do not show up in a screenshot.
+
+/**
+ * The rows of a list that are MESSAGES — the ones the filter has an opinion about.
+ *
+ * A list also holds rows the page drew itself: the seam between two calls, the notice at the head
+ * of the channel. They declare nothing to search and are never counted, so a test that counted
+ * them would be measuring the fixture rather than the filter.
+ */
+const messageRows = (page, id) =>
+  page.el(id).children.filter((row) => row.getAttribute("data-search") !== null);
+
+/** The rows of a list the filter is letting through. */
+const unfiltered = (page, id) =>
+  messageRows(page, id).filter((row) => !row.hasClass("search-hidden"));
+
+/** Everything the record holds for one call, in the order it was said. */
+function recorded(page, id, texts) {
+  page.storedTurns.set(
+    id,
+    texts.map((text, i) => ({
+      speaker: i % 2 === 0 ? "you" : "agent",
+      text,
+      at_ms: RECORD_EPOCH + i * 60_000,
+    }))
+  );
+}
+
+/** Open the glass if it is shut, and type. */
+async function search(page, query) {
+  if (page.el("search-field").hidden) {
+    await page.el("search-toggle").click();
+  }
+  await page.el("search-field").setValue(query);
+}
+
+const TALKED_ABOUT = [
+  "the mac runner stalled",
+  "which runner do you mean",
+  "the mac one, again",
+  "a runner on the mac",
+];
+
+test("EVERY TERM HAS TO MATCH, WHICH IS WHAT MAKES A SECOND WORD WORTH TYPING", async () => {
+  // AND, not OR. A reader types a second word to narrow, and a filter that widened on it would be
+  // actively worse than no filter: the more they said about what they wanted, the more they would
+  // get. Substring rather than whole-word, because "runner" has to find "runners".
+  const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
+  await signIn(page);
+  await page.settle();
+  assert.equal(unfiltered(page, "transcript").length, 4, "the record did not come back");
+
+  await search(page, "runner");
+  assert.deepStrictEqual(unfiltered(page, "transcript").map(said), [
+    "the mac runner stalled",
+    "which runner do you mean",
+    "a runner on the mac",
+  ]);
+
+  await search(page, "runner mac");
+  assert.deepStrictEqual(
+    unfiltered(page, "transcript").map(said),
+    ["the mac runner stalled", "a runner on the mac"],
+    "a second term widened the search instead of narrowing it"
+  );
+});
+
+test("A QUOTED PHRASE IS ONE TERM, AND HAS TO BE FOUND WHOLE", async () => {
+  // The clause the owner spelled out — "allowing double quoting to group them into one string" —
+  // and the fixture is built so that the two readings really do differ: `a runner on the mac`
+  // contains both words and not the phrase, so a quoted search that still matched it would be a
+  // search where the quotes changed nothing.
+  const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
+  await signIn(page);
+  await page.settle();
+
+  await search(page, `"mac runner"`);
+  assert.deepStrictEqual(unfiltered(page, "transcript").map(said), ["the mac runner stalled"]);
+
+  // ...and an UNTERMINATED quote groups to the end of what has been typed, rather than waiting for
+  // its partner. This is the state the field is in for every keystroke between the two quotes, and
+  // treating it as two loose words there makes the list flicker through a query nobody asked for.
+  await search(page, `"mac runner`);
+  assert.deepStrictEqual(
+    unfiltered(page, "transcript").map(said),
+    ["the mac runner stalled"],
+    "a half-typed phrase was read as two separate words"
+  );
+});
+
+test("THE COUNT NAMES ITS DENOMINATOR, BECAUSE THE SCREEN IS ONLY A SUFFIX OF THE RECORD", async () => {
+  // The honesty clause, and `#128 transcript-history` is what made it necessary: the transcript on
+  // screen is a bounded window onto a much longer record, so "no matches" and "never said" are
+  // different answers. A bare "1" would let a reader conclude the second when the page only knows
+  // the first.
+  const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
+  await signIn(page);
+  await page.settle();
+  assert.equal(page.el("search-count").textContent, "", "a count stands with nothing to count");
+
+  await search(page, "runner mac");
+  assert.equal(page.el("search-count").textContent, "2 of 4 loaded");
+  assert.equal(page.el("search-count").hidden, false, "the count is not on screen to be read");
+
+  // An empty field is not a filter, and must not read as "0 of 4".
+  await search(page, "   ");
+  assert.equal(page.el("search-count").textContent, "");
+  assert.equal(unfiltered(page, "transcript").length, 4, "whitespace hid the whole record");
+});
+
+test("a rule the PAGE drew goes away with the rows it was explaining", async () => {
+  // A seam says "the agent below this never heard the words above it". Left standing over a
+  // filtered list it says that about two rows that are no longer adjacent, which is a claim about
+  // the record that is simply false. It declares nothing searchable, which is how the filter knows.
+  const page = newPage();
+  recorded(page, "older", ["the mac runner stalled"]);
+  recorded(page, "newer", ["and again this morning"]);
+  await signIn(page);
+  await page.settle();
+  assert.ok(ruledRows(page).length > 0, "the fixture drew no seam to hide");
+
+  await search(page, "runner");
+  assert.deepStrictEqual(unfiltered(page, "transcript").map(said), ["the mac runner stalled"]);
+  assert.equal(
+    ruledRows(page).filter((li) => !li.hasClass("search-hidden")).length,
+    0,
+    "a boundary between two calls is still drawn between rows that are not beside each other"
+  );
+});
+
+test("ONE QUERY FILTERS BOTH LISTS, BECAUSE A READER SWITCHES VIEWS WITHOUT SWITCHING SEARCH", async () => {
+  // "It should work both for raw discord messages and for a transcript of the voice agent
+  // discussion" — and they are one switch apart. A filter that applied to whichever list happened
+  // to be up when it was typed would come off the moment the reader looked at the other one.
+  const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
+  await signIn(page);
+  await page.settle();
+  await search(page, "runner");
+
+  await showDiscord(page, [
+    message({ id: "1", content: "the runner is back" }),
+    message({ id: "2", content: "deploy finished" }),
+  ]);
+  assert.equal(
+    unfiltered(page, "discord-log").length,
+    1,
+    "the channel arrived unfiltered under a search that was already on"
+  );
+  // ...and the count now speaks for the list the reader is actually looking at.
+  assert.equal(page.el("search-count").textContent, "1 of 2 loaded");
+
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.el("search-count").textContent, "3 of 4 loaded", "the count stayed behind");
+});
+
+test("A TURN ARRIVING DURING A SEARCH ARRIVES FILTERED", async () => {
+  // The failure this closes is quiet and total: a row appended by a path that does not re-apply
+  // the filter lands among the matches, and the reader — who is reading a filtered list — takes
+  // it for one. It reads as a search that silently stopped working.
+  const page = newPage();
+  await signIn(page);
+  await startTalking(page);
+  assistantSays(page, "the mac runner stalled");
+  await page.settle();
+
+  await search(page, "runner");
+  assistantSays(page, "the deploy finished");
+  assistantSays(page, "the other runner is fine");
+  await page.settle();
+
+  assert.deepStrictEqual(unfiltered(page, "transcript").map(said), [
+    "the mac runner stalled",
+    "the other runner is fine",
+  ]);
+});
+
+test("THE FILTER HIDES WITH A CLASS OF ITS OWN, NEVER WITH THE ATTRIBUTE", async () => {
+  // Load-bearing, and not a style preference. `hidden` is where the page records the OTHER reasons
+  // a row is off screen — to-do mode, archived, which channel view is up. A filter that borrowed
+  // it would leave every row it hid looking like a row hidden for one of those reasons, and
+  // clearing the search would then put back rows the reader had archived.
+  const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
+  await signIn(page);
+  await page.settle();
+
+  await search(page, "stalled");
+  const missing = messageRows(page, "transcript").filter((row) => row.hasClass("search-hidden"));
+  assert.equal(missing.length, 3, "nothing was filtered, so this proves nothing");
+  for (const row of missing) {
+    assert.equal(row.hidden, false, "the filter wrote the attribute that means something else");
+  }
+  // ...and the row keeps whatever else it was wearing, which is what says who said it.
+  assert.ok(
+    missing.every((row) => row.hasClass("mine") || row.hasClass("theirs")),
+    "filtering a row forgot which side of the transcript it is on"
+  );
+});
+
+test("CLOSING THE GLASS PUTS EVERY ROW BACK, BECAUSE A FILTER NOBODY CAN SEE IS THE WORST STATE", async () => {
+  // A query parked behind a shut control is the one outcome worse than no search at all: the
+  // messages are gone and nothing on the screen says why. Closing clears; it is not a second
+  // switch. Escape does the same thing, because on a desktop that is the key a hand reaches for
+  // and on a phone keyboard it is the only one there is.
+  const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
+  await signIn(page);
+  await page.settle();
+
+  await search(page, "stalled");
+  assert.equal(unfiltered(page, "transcript").length, 1);
+  assert.equal(page.el("search-toggle").getAttribute("aria-pressed"), "true");
+
+  await page.el("search-toggle").click();
+  assert.equal(unfiltered(page, "transcript").length, 4, "closing the glass left the filter on");
+  assert.equal(page.el("search-field").value, "", "the query is parked behind a shut control");
+  assert.equal(page.el("search-field").hidden, true);
+  assert.equal(page.el("search-toggle").getAttribute("aria-pressed"), "false");
+
+  await search(page, "stalled");
+  assert.equal(unfiltered(page, "transcript").length, 1);
+  await page.el("search-field").dispatch("keydown", { key: "Escape" });
+  assert.equal(unfiltered(page, "transcript").length, 4, "Escape left the filter on");
+  assert.equal(page.el("search-field").hidden, true, "Escape left the field open");
+});
+
+test("NOTHING MATCHED IS SAID WHERE THE MESSAGES WERE, NOT ONLY IN THE CORNER", async () => {
+  // The state this closes is a blank screen. Every row is still IN the list — hidden by a class,
+  // which is the whole design — so neither pane's own empty state fires, and the only thing
+  // reporting what happened would be "0 of 4 loaded" in 0.75rem grey type in the far corner of
+  // the header. A reader who does not find that concludes the page broke.
+  const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
+  await signIn(page);
+  await page.settle();
+  assert.equal(page.el("search-empty").hidden, true, "it is standing with nothing to explain");
+
+  await search(page, "kubernetes");
+  assert.equal(unfiltered(page, "transcript").length, 0, "the fixture matched something after all");
+  assert.equal(page.el("search-empty").hidden, false, "a blank list and no word about why");
+  assert.equal(page.el("search-count").textContent, "0 of 4 loaded");
+
+  // ...and it goes the moment there is anything to look at again, because a "nothing matched"
+  // standing over matches is worse than no notice at all.
+  await search(page, "runner");
+  assert.equal(page.el("search-empty").hidden, true, "it stayed up over a list with rows in it");
+});
+
+test("a list that was empty BEFORE the search says why in its own words, not the filter's", async () => {
+  // The notice claims the search emptied the list. Over a transcript that never had a turn in it
+  // that is simply false, and it would also be covering the page's own invitation to start one.
+  const page = newPage();
+  await signIn(page);
+  await page.settle();
+  assert.equal(page.el("transcript").children.length, 0, "the fixture arrived with a record");
+
+  await search(page, "kubernetes");
+  assert.equal(page.el("search-empty").hidden, true, "the filter took the blame for an empty page");
+  assert.equal(page.el("empty-state").hidden, false, "the invitation to start talking went away");
+});
+
+test("WITH THE BAR IN THE HEADER TOO, THE FIELD GETS THE ROW RATHER THAN HALF OF IT", async () => {
+  // The one collision `#129 message-search` has with `#58 control-bar`, and the only placement it
+  // can happen in. Two elastic things in a 375px header is a search field about a word wide, which
+  // is a field nobody can read what they typed in. The bar yields for the duration and comes back
+  // the moment the glass shuts — it is one tap away throughout, so nothing is actually lost.
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  page.el("bar-placement").value = "top";
+  await page.el("bar-placement").dispatch("change");
+  await page.el("close-settings").click();
+  assert.equal(page.el("control-bar").hidden, false, "the fixture never got the bar up there");
+
+  await search(page, "runner");
+  assert.equal(page.el("control-bar").hidden, true, "the field and the bar are splitting the row");
+  assert.equal(page.el("topbar").hidden, false, "yielding the bar took the header with it");
+
+  await page.el("search-toggle").click();
+  assert.equal(page.el("control-bar").hidden, false, "shutting the glass did not give the bar back");
+});
+
+test("every list of messages is a list the filter reaches", () => {
+  // The completeness rule, and the reason it is a test rather than a comment: the lists are
+  // declared in the markup and the filter's set of them is declared in the script, so a fifth one
+  // added to the page is unsearchable until somebody remembers this file. A reader who searches
+  // and sees a list unchanged concludes the feature is broken, which — for that list — it is.
+  const declared = /const SEARCH_LISTS = \[([^\]]*)\]/.exec(SCRIPT_CODE);
+  assert.ok(declared, "web/voice.js no longer declares SEARCH_LISTS");
+  const filtered = [...declared[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  // `#channel-summary` is built in the same idiom and holds no messages: it is the one-row seam
+  // naming the channel, which `#63 status-line-placement` moved to the head of its own list so it
+  // would scroll with what it describes. There is nothing in it for a query to match, and hiding
+  // the channel's own name because it does not contain the search terms would read as a bug.
+  //
+  // It is EXCLUDED BY NAME rather than by a rule about what it contains, so that a fifth list
+  // added to the page still fails here until somebody says which of the two kinds it is.
+  const NOT_MESSAGES = ["channel-summary"];
+  const inMarkup = [...HTML.matchAll(/<ol id="([^"]+)" class="messages"/g)]
+    .map((m) => m[1])
+    .filter((id) => !NOT_MESSAGES.includes(id));
+  assert.ok(inMarkup.length >= 4, "the markup scan stopped finding the lists it is about");
+  assert.deepStrictEqual(
+    [...filtered].sort(),
+    [...inMarkup].sort(),
+    "a list of messages on the page is one the search cannot touch"
   );
 });
 

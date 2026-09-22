@@ -1753,7 +1753,7 @@ def _act_summary_mode(driver: Driver) -> None:
         )
 
 
-SUMMARY_FAILED_STATE = "35-channel-summary-failed"
+SUMMARY_FAILED_STATE = "36-channel-summary-failed"
 
 
 def _act_summary_failed(driver: Driver) -> None:
@@ -1842,6 +1842,33 @@ def _act_bankruptcy_armed(driver: Driver) -> None:
     # Promptly: the arming lapses after a few seconds, and a picture taken after that would be of
     # a control at rest filed under a name that says armed.
     driver.settle(150)
+
+
+def _act_message_search(driver: Driver) -> None:
+    """`#129 message-search`: the glass open over the channel, with a quoted phrase in it.
+
+    Driven over the CHANNEL rather than the transcript because that is where the layout risk is:
+    the seeded backlog is long-winded on purpose, so the list really has rows to remove, and the
+    header really has a field, a count and a glass competing for a 375px row. Whether those three
+    fit — or whether a long query pushes the glass off the edge — is a flex question only a layout
+    engine answers, and it is the reason `.search-field` carries `min-width: 0` at all.
+
+    A QUOTED phrase, because that is the clause of the request that is invisible in any other
+    frame: the seeded messages say "runner" several times over and "mac runner" exactly once, so
+    the picture is of quoting having narrowed something rather than of quotes being accepted.
+    """
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { window.__beforeSearch = "
+        "document.querySelectorAll('#discord-log li').length; return window.__beforeSearch; })()"
+    )
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
+    driver.page.fill("#search-field", '"mac runner"')
+    driver.page.wait_for_function(
+        "() => (window.__text('search-count') || '').length > 0", timeout=5_000
+    )
+    driver.settle(300)
 
 
 def _act_reply_view(driver: Driver) -> None:
@@ -2845,11 +2872,16 @@ SCENES: tuple[Scene, ...] = (
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "
                 "return b.height > 0 && b.top >= s.bottom - 1 && b.bottom <= p.top + 1; })()",
             ),
-            # ...and the payoff. With nothing left in the header it is not merely empty, it is gone,
-            # and the body has grown into the row it used to hold.
+            # ...and the payoff, restated by `#129 message-search`. It used to be that with
+            # nothing left in the header the header was gone, and the body had grown into the row.
+            # The magnifying glass now lives up there on every main screen, so the row is back --
+            # but what `#58` was actually about was a strip standing EMPTY above the transcript,
+            # and this is not that. The claim the picture still has to carry is the narrower one:
+            # the bar really left the header, rather than being drawn in both places at once.
             (
-                "the header costs no row at all",
-                "!window.__visible('topbar')",
+                "the header holds the search glass and no trace of the bar",
+                "window.__visible('topbar') && window.__visible('search-toggle') "
+                "&& document.getElementById('control-bar-top').children.length === 0",
             ),
             (
                 "the switch is still reachable down there",
@@ -3202,6 +3234,64 @@ SCENES: tuple[Scene, ...] = (
             (
                 "and it is drawn as armed rather than merely relabelled",
                 "document.getElementById('clear-backlog').className.includes('armed')",
+            ),
+        ),
+    ),
+    Scene(
+        name="35-message-search",
+        what="the search glass open over the channel, a quoted phrase typed, the list filtered down",
+        act=_act_message_search,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the glass reads as open and the phrase is in the field",
+                "document.getElementById('search-toggle').getAttribute('aria-pressed') === 'true' "
+                "&& document.getElementById('search-field').value.includes('mac runner')",
+            ),
+            (
+                # THE browser-only half. The page suite can assert that a filtered row carries the
+                # class; whether the class reaches the pixels -- past the row's own display mode,
+                # past a later declaration, past a stylesheet that simply does not declare it --
+                # is a rendering fact, and this is the only thing in the repository that sees it.
+                # A state pinned to the class alone would be green with the rule deleted, which is
+                # a search that visibly does nothing.
+                "a filtered row is really not drawn, not merely marked",
+                "(() => { const gone = document.querySelector('#discord-log li.search-hidden'); "
+                "return gone !== null && gone.offsetParent === null; })()",
+            ),
+            (
+                # Quoting is the clause of the request that no other frame shows. The seeded
+                # backlog says "runner" several times and "mac runner" once, so a picture where
+                # the quotes changed nothing would be visibly a different picture.
+                "what is left is fewer than arrived, and every row of it holds the PHRASE",
+                "(() => { const left = [...document.querySelectorAll("
+                "'#discord-log li:not(.search-hidden)')]; "
+                "return left.length > 0 && left.length < window.__beforeSearch "
+                "&& left.every((n) => /mac runner/i.test(n.textContent)); })()",
+            ),
+            (
+                # `#128 transcript-history` is why the denominator is on screen at all: what is
+                # loaded is a suffix of a longer record, so "no matches" and "never said" are
+                # different answers and a bare number would let a reader conclude the second.
+                "the count is on screen and names what it counted out of",
+                "window.__visible('search-count') && "
+                "/\\bof \\d+ loaded\\b/.test(window.__text('search-count') || '')",
+            ),
+            (
+                # The layout claim, and the reason this scene runs on iphone-se as well. Field,
+                # count and glass, left to right, sharing ONE band inside the header -- not two,
+                # and nothing pushed past the right edge. `.search-field` carries `min-width: 0`
+                # for exactly this, because a flex item's default minimum is its content width and
+                # a long query would otherwise shove the glass off a 375px screen.
+                "field, count and glass are one row, in that order, inside the header",
+                "(() => { const f = document.getElementById('search-field').getBoundingClientRect(); "
+                "const c = document.getElementById('search-count').getBoundingClientRect(); "
+                "const g = document.getElementById('search-toggle').getBoundingClientRect(); "
+                "const bar = document.getElementById('topbar').getBoundingClientRect(); "
+                "return f.width > 80 && c.width > 0 && g.width > 0 "
+                "&& f.right <= c.left + 1 && c.right <= g.left + 1 && g.right <= bar.right + 1 "
+                "&& f.top < c.bottom && c.top < f.bottom "
+                "&& f.top < g.bottom && g.top < f.bottom; })()",
             ),
         ),
     ),
@@ -3798,6 +3888,17 @@ def check_state_controls() -> list[str]:
         # relabels itself and still does not say how much it is about to take.
         "33-todo-view": ("__dealtWith", "inbox-note"),
         "34-bankruptcy-armed": ("__backlog", "armed"),
+        # `#129 message-search`. Pinned to THREE things, because each is separately deletable and
+        # each on its own is satisfied by a search that does not work:
+        #   `search-hidden`   — a filtered row is really gone from the layout. A state pinned to
+        #     the count alone would be green with the stylesheet rule deleted, which is a page
+        #     that reports "1 of 12" above twelve visible rows.
+        #   `mac runner`      — the QUOTES did the narrowing. Pinning it to the list being shorter
+        #     would be satisfied by reading the phrase as two loose words, which is the exact
+        #     defect the double-quote clause of the request exists to rule out.
+        #   `getBoundingClientRect` — field, count and glass fit one row on a 375px phone. That is
+        #     the only part of this feature no page suite can reach.
+        "35-message-search": ("search-hidden", "mac runner", "getBoundingClientRect"),
         # `#49 cached-summaries`, the other half. Pinned to THREE independent things, because each
         # is separately deletable and each on its own is satisfiable by a defect:
         #   `backgroundColor` — the row is really drawn differently. Pinning this state to
