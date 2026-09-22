@@ -130,10 +130,23 @@ steps:
       # telling the scheduler otherwise makes it reserve cores it will not use. Confirmed by the
       # same run -- 0.60 effective cores over 284 seconds.
       classification: latency-bound
-      # 1GiB against a 682MB observed peak. This is what the scheduler RESERVES, so the old 4GiB
-      # held back six times what the step takes and cost concurrency the machine did have.
+      # 1GiB against a 682MB observed peak.
+      #
+      # This is NOT what the planner reserves for this step, and a previous version of this
+      # comment said it was. `sizing.step_mem_cap_bytes` is "an explicit hard cap wins; otherwise
+      # factor x the RSS baseline" -- so while `hard_mem_max_bytes` below is set, the baseline is
+      # never consulted for the footprint sum. It is still worth being true: the visualiser reads
+      # it, and `--refine-memory` compares profile-derived peaks against it.
       rss_baseline_bytes: 1073741824
-      # The cap is a different question from the reservation and stays generous: a browser is the
-      # one thing here that can genuinely run away, and the point of a backstop is to be nowhere
-      # near the normal peak. Cap it rather than discover the ceiling by watching the machine swap.
-      hard_mem_max_bytes: 6442450944
+      # THE CAP IS THE RESERVATION. That is the part worth knowing before making this number
+      # comfortable: because an explicit cap wins outright, whatever is written here is what
+      # `schedulable_peak_mem_bytes` adds up when it decides how many steps may run at once. A cap
+      # set high "just to be safe" is not free -- it is spent against the run's memory budget for
+      # the step's whole duration, which is the serialization #113 dagrun-memory-admission is
+      # about, and this step is held for 284 seconds at a time.
+      #
+      # So: a backstop sized from the measurement rather than from imagination. 3GiB is 4.4x the
+      # observed 682MB peak, which still catches a browser that genuinely runs away -- the thing
+      # this cap exists for -- while reserving half of what 6GiB did. Re-measure before lowering
+      # it further; `peak_bytes` in the profile CSV is the column.
+      hard_mem_max_bytes: 3221225472
