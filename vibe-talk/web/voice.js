@@ -8271,6 +8271,45 @@ function setTokenState(text) {
 // asking. `#63 status-line-placement`.
 const NO_TOKEN_YET = "no token saved in this browser — paste your write-scope token above.";
 
+// --- the way out to the agent's own configuration -----------------------------------------------
+//
+// Everything about HOW THE AGENT BEHAVES — the system prompt above all, but also the voice, the
+// tools and the first thing it says — is configured in the vendor's console and none of it is
+// editable from this page. This deployment is handed an agent id and connects to whatever that
+// agent already is. So every "why did it say that" ends on that page, and from a phone the trip
+// there was: find the console, sign in, then pick the right agent out of a list by an id nobody
+// has memorised. This makes it one tap.
+//
+// The URL is built here rather than served, because it is a fact about the VENDOR and not about
+// this deployment — the server would only be repeating a constant back. The id is also printed
+// beside the link, which is the part that survives the console reorganising its own URLs: when the
+// deep link stops landing, the id is still what finds the agent by hand.
+
+const AGENT_CONSOLE_BASE = "https://elevenlabs.io/app/agents";
+
+/** The agent this server is configured for, as the server reads it out of its own config. */
+let elevenLabsAgentId = null;
+
+/**
+ * Show the link when there is an agent to link to, and hide the whole group when there is not.
+ *
+ * Hidden rather than greyed: an older server does not report the id at all, and a dead link
+ * labelled "open this agent's configuration" is worse than no link — it is a control that is
+ * present, looks live, and goes somewhere wrong.
+ */
+function renderAgentLink() {
+  const id = elevenLabsAgentId;
+  el("agent-settings").hidden = !id;
+  if (!id) {
+    return;
+  }
+  el("agent-id").textContent = id;
+  // `encodeURIComponent`, even though an agent id is vendor-minted and alphanumeric in practice:
+  // it arrives from a config file somebody edits by hand, and this is the one place on the page
+  // where a value from there is spliced into a URL.
+  el("agent-console-link").setAttribute("href", `${AGENT_CONSOLE_BASE}/${encodeURIComponent(id)}`);
+}
+
 function applyClientConfig(config) {
   const speech = config.read_aloud;
   readAloudPlayback = speech ? String(speech.playback || "unsupported") : "audio";
@@ -8299,6 +8338,11 @@ function applyClientConfig(config) {
   // The reader's own Discord account, if the operator has said what it is. Not derivable; see
   // `ownerAuthorId`.
   ownerAuthorId = (config && config.owner_author_id) || null;
+  elevenLabsAgentId =
+    typeof config.elevenlabs_agent_id === "string" && config.elevenlabs_agent_id.trim() !== ""
+      ? config.elevenlabs_agent_id.trim()
+      : null;
+  renderAgentLink();
   const select = el("discord-channel");
   // `#39 channel-alias`. Both pickers are drawn from the same list and through the same naming
   // rule, so the name in the bar and the name in Settings are one answer rather than two.

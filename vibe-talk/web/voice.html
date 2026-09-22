@@ -714,6 +714,33 @@
             </section>
 
             <!--
+              The way OUT of this page to the thing that decides how the agent behaves.
+
+              The system prompt, the voice, the tools and the first message all live in the
+              vendor's own console, and none of them is editable here — this deployment supplies an
+              agent id and connects to whatever that agent already is. Debugging "why did it say
+              that" therefore always ends on that page, and on a phone getting there meant finding
+              the console, signing in, and picking the right agent out of a list by an id nobody
+              remembers. One tap instead.
+
+              The id is printed BESIDE the link rather than only inside it. It is the durable half:
+              a console reorganises its own URLs whenever it likes, and when the deep link stops
+              landing the id is still what is needed to find the agent by hand.
+            -->
+            <section class="settings-group" id="agent-settings" hidden>
+              <div class="group-head">
+                <h2>The voice agent</h2>
+              </div>
+              <p class="hint">
+                Its prompt, voice and tools are configured at the vendor, not here.
+              </p>
+              <p class="hint">
+                <a id="agent-console-link" class="external-link" href="#" target="_blank" rel="noopener noreferrer">Open this agent's configuration</a>
+              </p>
+              <p class="hint">Agent id: <code id="agent-id" class="agent-id"></code></p>
+            </section>
+
+            <!--
               LAST, and that is the change. This is a READOUT, not a setting — it says what the
               current conversation is and what the last close code was — and it was occupying the
               first thing a reader sees on a screen they came to in order to change something.

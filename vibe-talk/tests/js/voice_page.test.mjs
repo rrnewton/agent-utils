@@ -943,7 +943,7 @@ function newPage(store = new Map(), script = SCRIPT) {
         version: "test",
         chat_provider_name: page.chatProviderName,
         channels: page.channels,
-        elevenlabs_agent_id: "agent_test",
+        elevenlabs_agent_id: page.agentId,
         read_aloud: page.readAloud,
         live_poll_seconds: page.livePollSeconds,
         live_delivery: page.liveDelivery,
@@ -1043,6 +1043,14 @@ function newPage(store = new Map(), script = SCRIPT) {
     /** `#46 conversation-replay`: every replay fetch, and the knobs that shape the answer. */
     replayCalls: [],
     replayEnabled: true,
+    /**
+     * The agent this server is configured for. `null` is an older server that does not say.
+     *
+     * A knob rather than a constant because the Settings link to the vendor's own configuration
+     * page is built from it, and "an older server offers no link" is exactly as much of the
+     * behaviour as "a configured one does".
+     */
+    agentId: "agent_test",
     /** The account this bridge posts as, as the server reads it out of its own bot token. */
     selfAuthorId: "1000000000000000009",
     /** The reader's OWN Discord account. Not derivable; configured or chosen in Settings. */
@@ -2419,11 +2427,36 @@ test("no function in the page is declared twice, because the second one wins in 
   );
 });
 
-test("the page fetches nothing from anywhere but this server", () => {
+test("the page LOADS nothing from anywhere but this server", () => {
   // No framework, no CDN, no build step: the whole reason the frame is CSS.
-  assert.doesNotMatch(HTML_CODE, /https?:\/\//, "web/voice.html reaches off-origin");
-  assert.doesNotMatch(SCRIPT_CODE, /https?:\/\//, "web/voice.js reaches off-origin");
+  //
+  // "LOADS", and the word is the change. The rule used to be that no off-origin URL appeared in
+  // these files at all, which is a proxy for the real one and stopped being an accurate proxy the
+  // moment the page grew its first LINK — a destination the reader taps, which pulls in nothing
+  // and executes nothing here. So the invariant is stated directly instead: an off-origin URL may
+  // be somewhere to GO, and may never be something this page brings in.
   assert.doesNotMatch(CSS, /@import|url\(\s*["']?https?:/, "web/voice.css reaches off-origin");
+  // In the markup, that means it sits on an `<a>` and on nothing else. A `src`, a `<link href>`,
+  // a form `action` or an `<iframe>` all fail here, whatever the tag is called.
+  const carried = [...HTML_CODE.matchAll(/<([\w-]+)\b[^>]*?(https?:\/\/[^"'\s>]+)/g)];
+  assert.deepStrictEqual(
+    carried.filter((m) => m[1] !== "a").map((m) => `<${m[1]}> ${m[2]}`),
+    [],
+    "web/voice.html pulls something in from off-origin"
+  );
+  // ...and in the script, that it is never handed to anything that goes and gets it. Named
+  // explicitly rather than by a blanket ban, so the next off-origin destination is a link and the
+  // next off-origin FETCH is still a failure.
+  for (const how of [/fetch\(\s*["'`]https?:/, /new Worker\(\s*["'`]https?:/, /import\(\s*["'`]https?:/]) {
+    assert.doesNotMatch(SCRIPT_CODE, how, "web/voice.js goes and gets something off-origin");
+  }
+  // And the only off-origin URL it knows at all is the one destination, so "it is only ever a
+  // link" stays a fact about the file rather than a promise about this one line.
+  assert.deepStrictEqual(
+    [...new Set([...SCRIPT_CODE.matchAll(/https?:\/\/[^"'`\s]+/g)].map((m) => m[0]))],
+    ["https://elevenlabs.io/app/agents"],
+    "web/voice.js names an off-origin URL that is not the agent console"
+  );
 });
 
 test("the control pane is one dense tile, and the two small controls stack to the height of the big ones", () => {
@@ -10823,6 +10856,40 @@ test("A LONG OPTION CANNOT SQUEEZE A NAME INTO A ONE-CHARACTER COLUMN", () => {
     /grid-template-columns:\s*minmax\(6rem,\s*1fr\)\s+auto/,
     "the desk does not get the name beside the thing it is being called"
   );
+});
+
+// --- the way out to the agent's own configuration -----------------------------------------------
+
+test("SETTINGS LINKS STRAIGHT TO THIS AGENT'S CONFIGURATION, BY ID", async () => {
+  // The owner's problem, stated as a trip rather than a feature: the system prompt is the thing he
+  // needs to read, it lives in the vendor's console, and from a phone getting there meant finding
+  // the console and then picking the right agent out of a list by an id nobody has memorised.
+  const page = newPage();
+  page.agentId = "agent_9f3c";
+  await signIn(page);
+  await page.el("open-settings").click();
+
+  assert.equal(page.el("agent-settings").hidden, false, "a configured agent offers no way to it");
+  assert.equal(
+    page.el("agent-console-link").getAttribute("href"),
+    "https://elevenlabs.io/app/agents/agent_9f3c",
+    "the link does not land on THIS agent"
+  );
+  // The id is printed as well as linked. That is the half that survives the vendor reorganising
+  // its own URLs: when the deep link stops landing, this is still what finds the agent by hand.
+  assert.equal(page.el("agent-id").textContent, "agent_9f3c");
+});
+
+test("...and a server that does not say which agent offers no link at all", async () => {
+  // Hidden rather than greyed or pointed at the console's front door. A link labelled "open this
+  // agent's configuration" that opens somebody's agent list is a control that looks live and goes
+  // somewhere wrong, which is worse than the absence.
+  const page = newPage();
+  page.agentId = null;
+  await signIn(page);
+  await page.el("open-settings").click();
+
+  assert.equal(page.el("agent-settings").hidden, true, "an unknown agent still got a link");
 });
 
 test("with every toggle untouched, the page asks for EXACTLY what it asked for before the menu existed", async () => {

@@ -2515,6 +2515,29 @@ textarea {
   margin: 0.2rem 0 0;
 }
 
+/* The one link on this page that LEAVES it, and the only anchor in the document.
+ *
+ * Sized and spaced as a tap target rather than as a word in a sentence: it stands alone in its own
+ * paragraph on a phone, where a 0.9rem underlined phrase is a thing you miss twice before hitting.
+ * Underlined as well as coloured, because colour alone is not a signal to a reader who cannot see
+ * this one. */
+.external-link {
+  display: inline-block;
+  padding: 0.25rem 0;
+  color: var(--accent);
+  font-size: 0.95rem;
+  text-underline-offset: 0.2em;
+}
+
+/* An identifier, so it is monospaced and selectable — the point of printing it is that it can be
+   copied when the link stops landing where the vendor used to keep the page. */
+.agent-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  overflow-wrap: break-word;
+  user-select: all;
+}
+
 /* The verbs in the channel box, on one line while they fit. They are the resting state of that
    group: the fields each belongs to appear underneath only when one is pressed. */
 .channel-actions {
