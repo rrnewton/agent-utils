@@ -13,22 +13,41 @@
 //! inspect those values; the Python writer always emits the stricter form.
 //!
 //! Replay validates the complete intrinsic active/archive record schema, nested
-//! identities, checkout identities, historical imports, revisions, and recovery
-//! evidence. It deliberately has no configuration input, so checks that compare
-//! checkout paths, repository paths, layout defaults, or landed refs with the
-//! originating registry configuration remain the Python authority's job. This
-//! is the path-independent portion of its `require_repository = false` replay,
-//! not a replacement for configuration-coupled policy validation.
+//! identities, checkout identities, historical imports, revisions, recovery
+//! evidence, and hold transitions. An optional, versioned configuration and
+//! captured evidence census can materialize three-valued diagnostic decisions.
+//! Every decision is bound to the machine, event tip, and the canonical JSON
+//! values of its configuration and evidence. Active-row decisions are also
+//! bound to the slot generation and active record; pending-only decisions
+//! expose null active-row fields and remain blocked until the operation closes.
+//! Insignificant input whitespace and object-key order therefore do not change
+//! those digests. Scope, cgroup, and checkout identities in the evidence are
+//! claims, not independently observed facts. This slice has neither a read-time
+//! `/proc`/boot/systemd/cgroup verifier nor fresh repository/task/owner/attempt-
+//! bound TaskGraph claim evidence, so an otherwise unblocked row remains
+//! `UNKNOWN` and cannot become actionable.
+//! The shadow-policy JSON is not the originating `.wrkslots.yml` registry
+//! configuration. Configuration-coupled checkout/repository paths, layout
+//! defaults, landed refs, Git registrations, and nested-repository discovery
+//! remain the Python authority's job; captured evidence cannot fill those gaps.
 //!
-//! `wrkslotsd` is an unpublished migration component with only `rebuild` and
-//! `status`; operators should continue to use the parent `wrkslots quickstart`
-//! and `wrkslots --userguide` documentation until it becomes a public command.
+//! `wrkslotsd` is an unpublished migration component. `explain` and `plan`
+//! reconstruct and cross-check decisions from the indexed inputs, then reject
+//! evidence that has aged out; they cannot authenticate a same-UID rewrite of
+//! the whole disposable database, rediscover repositories absent from the
+//! captured inputs, or execute decisions. There is no cleanup, rescue,
+//! deletion, repository mutation, daemon, or socket surface; operators should
+//! continue to use the parent `wrkslots quickstart` and `wrkslots --userguide`.
 
 #![forbid(unsafe_code)]
 
 mod canonical;
 pub mod cli;
+mod config;
+mod evidence;
 mod index;
+mod plan;
+mod policy;
 mod replay;
 mod schema;
 

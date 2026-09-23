@@ -5,6 +5,7 @@ use chrono::{Datelike, NaiveDate, Weekday};
 use serde_json::{Map, Value};
 
 use crate::canonical::canonical_sha256;
+use crate::evidence::ScopeIdentity;
 use crate::ObserverError;
 
 const ACTIVE_STATUSES: &[&str] = &[
@@ -23,6 +24,10 @@ pub(crate) struct ActiveRecordMeta {
     pub(crate) slot_type: String,
     pub(crate) generation: u64,
     pub(crate) imported: bool,
+    pub(crate) heartbeat_at: String,
+    pub(crate) heartbeat_ttl_seconds: u64,
+    pub(crate) task_scope: Option<ScopeIdentity>,
+    pub(crate) checkouts: Vec<(String, String)>,
 }
 
 pub(crate) struct ValidatedActiveRecord {
@@ -40,6 +45,7 @@ impl ActiveRecordMeta {
 pub(crate) struct ArchiveRecordMeta {
     pub(crate) archive_id: String,
     pub(crate) slot: String,
+    pub(crate) generation: u64,
     pub(crate) slot_type: String,
     pub(crate) physical_storage: String,
 }
@@ -87,7 +93,7 @@ pub(crate) fn validate_active_record(
             "handoff",
             "checkouts",
         ],
-        &["slot_type", "layout", "import_source"],
+        &["slot_type", "layout", "import_source", "task_scope"],
         label,
     )?;
     let slot = named_string(&record["slot"], &format!("{label}.slot"))?;
@@ -102,11 +108,9 @@ pub(crate) fn validate_active_record(
         string(&record["created_at"], &format!("{label}.created_at"))?,
         &format!("{label}.created_at"),
     )?;
-    parse_timestamp(
-        string(&record["heartbeat_at"], &format!("{label}.heartbeat_at"))?,
-        &format!("{label}.heartbeat_at"),
-    )?;
-    positive(
+    let heartbeat_at = string(&record["heartbeat_at"], &format!("{label}.heartbeat_at"))?;
+    parse_timestamp(heartbeat_at, &format!("{label}.heartbeat_at"))?;
+    let heartbeat_ttl_seconds = positive(
         &record["heartbeat_ttl_seconds"],
         &format!("{label}.heartbeat_ttl_seconds"),
     )?;
@@ -143,6 +147,30 @@ pub(crate) fn validate_active_record(
     }
     let layout = optional_layout(record, label)?;
     let import_source = validate_import_source(record.get("import_source"), label)?;
+    let task_scope = record
+        .get("task_scope")
+        .map(|value| {
+            serde_json::from_value::<ScopeIdentity>(value.clone())
+                .map_err(|error| invalid(format!("{label}.task_scope is invalid: {error}")))
+                .and_then(|identity| {
+                    identity.validate(&format!("{label}.task_scope"))?;
+                    Ok(identity)
+                })
+        })
+        .transpose()?;
+    if let Some(scope) = &task_scope {
+        let owner = owner
+            .as_ref()
+            .ok_or_else(|| invalid(format!("{label}.task_scope has no bound owner process")))?;
+        if (scope.leader_pid, scope.leader_start_ticks) != (owner.pid, owner.start_ticks)
+            || scope.boot_id != owner.boot_id
+            || scope.cgroup_path != owner.cgroup_path
+        {
+            return Err(invalid(format!(
+                "{label}.task_scope does not match its bound owner process"
+            )));
+        }
+    }
     if checkouts.is_empty() && import_source.is_none() {
         return Err(invalid(format!("{label} has no checkouts")));
     }
@@ -183,6 +211,13 @@ pub(crate) fn validate_active_record(
             slot_type: slot_type.to_owned(),
             generation,
             imported: import_source.is_some(),
+            heartbeat_at: heartbeat_at.to_owned(),
+            heartbeat_ttl_seconds,
+            task_scope,
+            checkouts: checkouts
+                .iter()
+                .map(|checkout| (checkout.name.clone(), checkout.path.clone()))
+                .collect(),
         },
         normalized: Value::Object(normalized),
     })
@@ -290,6 +325,7 @@ pub(crate) fn validate_archive_record(
     Ok(ArchiveRecordMeta {
         archive_id: archive_id.to_owned(),
         slot,
+        generation,
         slot_type: slot_type.to_owned(),
         physical_storage: physical_storage.to_owned(),
     })
