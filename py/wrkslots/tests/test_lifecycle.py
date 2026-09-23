@@ -23061,6 +23061,172 @@ def test_failed_post_provision_hook_can_be_explicitly_aborted(
     ).returncode == 1
 
 
+def test_abort_create_removes_clean_partially_initialized_submodules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component",
+            "exit 9",
+        ],
+    )
+
+    refused = create(project)
+
+    assert refused.returncode == 3
+    tree = checkout(project)
+    assert (tree / "component" / ".git").is_file()
+    assert not (tree / "component" / "leaf" / ".git").exists()
+    ordinary_remove = git(
+        repository,
+        "worktree",
+        "remove",
+        "--",
+        str(tree),
+        check=False,
+    )
+    assert ordinary_remove.returncode != 0
+    assert "submodules" in ordinary_remove.stderr
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 0, output.err
+    assert not tree.exists()
+    assert not create_journal_path(project).exists()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 1
+    assert git(repository / "component", "status", "--porcelain").stdout == ""
+
+
+def test_abort_create_refuses_source_hidden_inside_submodule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component",
+            "exit 9",
+        ],
+    )
+    refused = create(project)
+    assert refused.returncode == 3
+    tree = checkout(project)
+    source = tree / "component" / "important-source.txt"
+    source.write_text("preserve me\n", encoding="utf-8")
+    git(tree, "config", "submodule.component.ignore", "all")
+    assert git(tree, "status", "--porcelain").stdout == ""
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 3
+    assert "submodule component source state is dirty" in output.err
+    assert source.read_text(encoding="utf-8") == "preserve me\n"
+    assert create_journal_path(project).is_file()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 0
+
+
+def test_abort_create_refuses_live_clean_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    refused = create(project)
+    assert refused.returncode == 3
+    tree = checkout(project)
+    journal = create_journal_path(project)
+
+    def refuse_live(path: Path, *_args: object, **_kwargs: object) -> None:
+        assert path == tree
+        raise wrkslots.Refusal(f"live process 123 uses slot {path}")
+
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", refuse_live)
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 3
+    assert "live process" in output.err
+    assert tree.is_dir()
+    assert journal.is_file()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 0
+
+
 def test_audit_associates_recovery_journals_from_other_machine_shards(
     tmp_path: Path,
 ) -> None:
