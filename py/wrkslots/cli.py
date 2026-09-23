@@ -21753,12 +21753,99 @@ def _assert_abort_create_submodules_pristine(
                     f"{child_name} source state is dirty ({status.splitlines()[0]}); "
                     "preserve it for inspection"
                 )
+            _assert_abort_create_submodule_repository_pristine(
+                child, child_name, checkout_name, vcs
+            )
             remaining.discard(child_name)
             repositories.append((child_relative, child))
     if remaining:
         raise Refusal(
             f"cannot abort changed checkout {checkout_name}: initialized submodule "
             f"{sorted(remaining)[0]} has no committed gitlink; preserve it for inspection"
+        )
+
+
+def _assert_abort_create_submodule_repository_pristine(
+    repository: Path, submodule_name: str, checkout_name: str, vcs: _GitVcs
+) -> None:
+    """Refuse repository-only submodule state that force removal would discard."""
+
+    worktrees = vcs.listed_worktrees(repository)
+    if len(worktrees) != 1:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} has an external linked worktree; preserve it for inspection"
+        )
+    raw_refs = vcs._run(
+        repository,
+        ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"],
+    ).stdout
+    refs: dict[str, tuple[str, str]] = {}
+    for line in raw_refs.splitlines():
+        fields = line.split("\x00")
+        if len(fields) != 3 or not SHA_RE.fullmatch(fields[1]):
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} returned an invalid ref inventory"
+            )
+        ref, sha, symref = fields
+        for value, label in ((ref, "ref"), (symref, "symbolic ref")):
+            if not value:
+                if label == "symbolic ref":
+                    continue
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{submodule_name} returned an empty ref"
+                )
+            valid = vcs._run(
+                repository, ["check-ref-format", value], check=False
+            )
+            if valid.returncode != 0:
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{submodule_name} returned an invalid {label}"
+                )
+        if ref in refs:
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} returned a duplicate ref"
+            )
+        refs[ref] = (sha, symref)
+    allowed_local_heads: set[str] = set()
+    for ref, (sha, symref) in refs.items():
+        if not ref.startswith("refs/remotes/") or not ref.endswith("/HEAD"):
+            continue
+        remote_prefix = ref.removesuffix("HEAD")
+        if not symref.startswith(remote_prefix):
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} has an invalid remote HEAD"
+            )
+        local = f"refs/heads/{symref.removeprefix(remote_prefix)}"
+        remote = refs.get(symref)
+        if refs.get(local) == (sha, "") and remote == (sha, ""):
+            allowed_local_heads.add(local)
+    authored_refs = sorted(
+        ref
+        for ref in refs
+        if not ref.startswith("refs/remotes/") and ref not in allowed_local_heads
+    )
+    if authored_refs:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} has repository-local ref {authored_refs[0]}; "
+            "preserve it for inspection"
+        )
+    unreachable = vcs._run(
+        repository,
+        ["fsck", "--unreachable", "--no-reflogs", "--no-progress"],
+    )
+    evidence = (unreachable.stdout + unreachable.stderr).strip()
+    if evidence:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} has unreachable repository state "
+            f"({evidence.splitlines()[0]}); preserve it for inspection"
         )
 
 

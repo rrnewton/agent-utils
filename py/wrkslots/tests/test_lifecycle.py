@@ -23192,6 +23192,116 @@ def test_abort_create_refuses_source_hidden_inside_submodule(
     ).returncode == 0
 
 
+@pytest.mark.parametrize(
+    ("repository_state", "message"),
+    (
+        ("local-branch", "repository-local ref refs/heads/preserve-local"),
+        ("stash", "repository-local ref refs/stash"),
+        ("external-worktree", "external linked worktree"),
+        ("unreachable-commit", "unreachable repository state"),
+    ),
+)
+def test_abort_create_refuses_submodule_repository_only_authored_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    repository_state: str,
+    message: str,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component",
+            "exit 9",
+        ],
+    )
+    refused = create(project)
+    assert refused.returncode == 3
+    tree = checkout(project)
+    component = tree / "component"
+    git(component, "config", "user.name", "Wrkslots Test")
+    git(component, "config", "user.email", "wrkslots@example.invalid")
+    original_head = git(component, "rev-parse", "HEAD").stdout.strip()
+    external = tmp_path / "external-component-worktree"
+    if repository_state == "local-branch":
+        git(component, "branch", "preserve-local")
+    elif repository_state == "stash":
+        (component / "component.txt").write_text(
+            "locally stashed source\n", encoding="utf-8"
+        )
+        git(component, "stash", "push", "-m", "preserve-local")
+    elif repository_state == "external-worktree":
+        git(component, "worktree", "add", "--detach", str(external), "HEAD")
+    elif repository_state == "unreachable-commit":
+        (component / "component.txt").write_text(
+            "unreachable authored source\n", encoding="utf-8"
+        )
+        git(component, "add", "component.txt")
+        git(component, "commit", "-m", "preserve unreachable source")
+        git(component, "reset", "--hard", original_head)
+    else:
+        raise AssertionError(repository_state)
+    assert git(component, "status", "--porcelain").stdout == ""
+    assert git(component, "rev-parse", "HEAD").stdout.strip() == original_head
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 3
+    assert message in output.err
+    assert tree.is_dir()
+    assert create_journal_path(project).is_file()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 0
+    if repository_state == "local-branch":
+        assert git(
+            component,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/preserve-local",
+            check=False,
+        ).returncode == 0
+    elif repository_state == "stash":
+        assert git(component, "stash", "list").stdout.startswith(
+            "stash@{0}: On (no branch): preserve-local"
+        )
+    elif repository_state == "external-worktree":
+        assert external.is_dir()
+        assert external.absolute() in {
+            Path(line.removeprefix("worktree ")).absolute()
+            for line in git(component, "worktree", "list", "--porcelain").stdout.splitlines()
+            if line.startswith("worktree ")
+        }
+    else:
+        assert "unreachable commit" in git(
+            component, "fsck", "--unreachable", "--no-reflogs", "--no-progress"
+        ).stdout
+
+
 def test_abort_create_refuses_live_clean_worktree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
