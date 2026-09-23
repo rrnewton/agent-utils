@@ -10,7 +10,8 @@ import selectors
 import signal
 import subprocess
 import sys
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Literal, TextIO
 
@@ -244,6 +245,705 @@ def test_lsof_guard_refuses_a_real_live_user_with_attributed_evidence(
     assert len(rendered) < 1024
 
 
+def scripted_lsof(
+    monkeypatch: pytest.MonkeyPatch,
+    slot: Path,
+    responses: list[subprocess.CompletedProcess[str]],
+    *,
+    events: list[str] | None = None,
+) -> list[list[str]]:
+    pending = iter(responses)
+    calls: list[list[str]] = []
+
+    def run(
+        args: list[str], *, text: bool, capture_output: bool, check: bool
+    ) -> subprocess.CompletedProcess[str]:
+        assert args == ["/usr/bin/lsof", "-nP", "-Fpcfn", "+D", str(slot)]
+        assert text is True and capture_output is True and check is False
+        calls.append(args)
+        if events is not None:
+            events.append("lsof")
+        return next(pending)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def lsof_holder(
+    pid: int, slot: Path, *, returncode: int = 0
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        ["lsof"],
+        returncode,
+        f"p{pid}\ncpython\nfcwd\nn{slot}\n",
+        "",
+    )
+
+
+def lsof_unused() -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(["lsof"], 1, "", "")
+
+
+def test_reclaim_restarts_lsof_and_proc_after_exact_lsof_generation_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    empty_proc = tmp_path / "empty-proc"
+    empty_proc.mkdir()
+    with waiting_child(cwd=slot) as child:
+        events: list[str] = []
+        calls = scripted_lsof(
+            monkeypatch,
+            slot,
+            [
+                lsof_holder(child.pid, slot),
+                lsof_holder(child.pid, slot),
+                lsof_unused(),
+            ],
+            events=events,
+        )
+        real_read_process_stat = cli._read_process_stat
+        real_pidfd_open = os.pidfd_open
+        generation_reads = 0
+
+        def release_after_pidfd_generation_check(
+            path: Path,
+        ) -> cli._ProcessStat | None:
+            nonlocal generation_reads
+            observed = real_read_process_stat(path)
+            if path == Path("/proc") / str(child.pid):
+                events.append("stat")
+                generation_reads += 1
+                if generation_reads == 2:
+                    assert child.stdin is not None
+                    child.stdin.close()
+            return observed
+
+        monkeypatch.setattr(
+            cli, "_read_process_stat", release_after_pidfd_generation_check
+        )
+
+        def record_pidfd_open(pid: int) -> int:
+            assert pid == child.pid
+            events.append("pidfd")
+            return real_pidfd_open(pid)
+
+        monkeypatch.setattr(os, "pidfd_open", record_pidfd_open)
+        budget = cli._LiveUseRecheckBudget()
+
+        cli._assert_slot_unused(
+            slot,
+            proc_root=empty_proc,
+            live_use_recheck=budget,
+        )
+
+        assert child.wait(timeout=1) == 0
+        assert len(calls) == 3
+        assert generation_reads == 2
+        assert events == ["lsof", "stat", "pidfd", "lsof", "stat", "lsof"]
+        assert budget.remaining_seconds < cli._RECLAIM_LIVE_USE_RECHECK_SECONDS
+
+
+def test_reclaim_restarts_proc_after_exact_proc_generation_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    proc_root = tmp_path / "proc"
+    with waiting_child(cwd=slot) as child:
+        pid_dir = proc_root / str(child.pid)
+        pid_dir.mkdir(parents=True)
+        uid = os.getuid()
+        (pid_dir / "status").write_text(
+            f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n", encoding="ascii"
+        )
+        real_generation = cli._read_process_stat(Path("/proc") / str(child.pid))
+        assert real_generation is not None
+        generation_reads = 0
+        use_reads = 0
+
+        def stable_generation(path: Path) -> cli._ProcessStat | None:
+            nonlocal generation_reads
+            assert path == pid_dir
+            generation_reads += 1
+            if generation_reads == 2:
+                assert child.stdin is not None
+                child.stdin.close()
+            return real_generation
+
+        def transient_use(_pid_dir: Path, _slot: Path) -> list[str]:
+            nonlocal use_reads
+            use_reads += 1
+            return [f"cwd={slot}"] if use_reads == 1 else []
+
+        monkeypatch.setattr(cli, "_read_process_stat", stable_generation)
+        monkeypatch.setattr(cli, "_process_uses_slot", transient_use)
+        budget = cli._LiveUseRecheckBudget()
+
+        cli._assert_slot_unused(
+            slot,
+            use_lsof=False,
+            proc_root=proc_root,
+            live_use_recheck=budget,
+        )
+
+        assert child.wait(timeout=1) == 0
+        assert generation_reads == 3
+        assert use_reads == 2
+        assert budget.remaining_seconds < cli._RECLAIM_LIVE_USE_RECHECK_SECONDS
+
+
+def test_reclaim_recheck_catches_replacement_without_signaling_any_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    empty_proc = tmp_path / "empty-proc"
+    empty_proc.mkdir()
+    with (
+        waiting_child(cwd=slot) as first,
+        waiting_child(cwd=slot) as replacement,
+        waiting_child() as unrelated,
+    ):
+        calls = scripted_lsof(
+            monkeypatch,
+            slot,
+            [
+                lsof_holder(first.pid, slot),
+                lsof_holder(first.pid, slot),
+                lsof_holder(replacement.pid, slot),
+                lsof_holder(replacement.pid, slot),
+            ],
+        )
+        real_read_process_stat = cli._read_process_stat
+        first_reads = 0
+
+        def release_first_after_generation_check(
+            path: Path,
+        ) -> cli._ProcessStat | None:
+            nonlocal first_reads
+            observed = real_read_process_stat(path)
+            if path == Path("/proc") / str(first.pid):
+                first_reads += 1
+                if first_reads == 2:
+                    assert first.stdin is not None
+                    first.stdin.close()
+            return observed
+
+        monkeypatch.setattr(
+            cli, "_read_process_stat", release_first_after_generation_check
+        )
+        budget = cli._LiveUseRecheckBudget(0.05)
+
+        with pytest.raises(cli.Refusal) as refused:
+            cli._assert_slot_unused(
+                slot,
+                proc_root=empty_proc,
+                live_use_recheck=budget,
+            )
+
+        assert f"live process {replacement.pid} uses slot {slot}" in str(refused.value)
+        assert len(calls) == 4
+        assert budget.remaining_seconds == 0
+        assert first.poll() == 0
+        assert replacement.poll() is None
+        assert unrelated.poll() is None
+
+
+def test_reclaim_recheck_persistent_holder_exhausts_one_deadline(
+    tmp_path: Path,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    with waiting_child(cwd=slot) as child:
+        generation = cli._read_process_stat(Path("/proc") / str(child.pid))
+        assert generation is not None
+        budget = cli._LiveUseRecheckBudget(0.02)
+
+        assert budget.wait_for_exit(
+            child.pid,
+            start_ticks=generation.start_ticks,
+        ) is False
+
+        assert budget.remaining_seconds == 0
+        assert child.poll() is None
+
+
+def test_reclaim_recheck_deadline_is_shared_across_later_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    samples = iter((10.0, 10.01, 10.06))
+    opened: list[int] = []
+
+    def process_exited(pid: int) -> int:
+        opened.append(pid)
+        raise ProcessLookupError(errno.ESRCH, "fixture generation exited")
+
+    monkeypatch.setattr(time, "monotonic", lambda: next(samples))
+    monkeypatch.setattr(os, "pidfd_open", process_exited)
+    budget = cli._LiveUseRecheckBudget(0.05)
+
+    assert budget.wait_for_exit(111, start_ticks=17) is True
+    assert budget.wait_for_exit(222, start_ticks=23) is False
+    assert opened == [111]
+    assert budget.remaining_seconds == 0
+
+
+@pytest.mark.parametrize("failure", ["pid-reuse", "pidfd-failure", "incomplete"])
+def test_reclaim_never_retries_unbound_process_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    empty_proc = tmp_path / "empty-proc"
+    empty_proc.mkdir()
+    calls = scripted_lsof(
+        monkeypatch,
+        slot,
+        [
+            lsof_holder(123, slot),
+            *(
+                [lsof_holder(123, slot)]
+                if failure == "pid-reuse"
+                else []
+            ),
+        ],
+    )
+    opened: list[int] = []
+    read_fd, write_fd = os.pipe()
+    generations = iter(
+        (
+            (None,)
+            if failure == "incomplete"
+            else (cli._ProcessStat(17, 0), cli._ProcessStat(18, 0))
+        )
+    )
+
+    def generation(_path: Path) -> cli._ProcessStat | None:
+        return next(generations)
+
+    def pidfd_open(pid: int) -> int:
+        opened.append(pid)
+        if failure == "pidfd-failure":
+            raise PermissionError(errno.EPERM, "fixture pidfd denial")
+        return os.dup(read_fd)
+
+    monkeypatch.setattr(cli, "_read_process_stat", generation)
+    monkeypatch.setattr(os, "pidfd_open", pidfd_open)
+    try:
+        with pytest.raises(cli.Refusal, match="live process 123 uses slot"):
+            cli._assert_slot_unused(
+                slot,
+                proc_root=empty_proc,
+                live_use_recheck=cli._LiveUseRecheckBudget(0.25),
+            )
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert len(calls) == (2 if failure == "pid-reuse" else 1)
+    assert opened == ([] if failure == "incomplete" else [123])
+
+
+def test_reclaim_never_retries_lsof_pid_reused_before_generation_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    empty_proc = tmp_path / "empty-proc"
+    empty_proc.mkdir()
+    events: list[str] = []
+    calls = scripted_lsof(
+        monkeypatch,
+        slot,
+        [lsof_holder(123, slot), lsof_unused()],
+        events=events,
+    )
+
+    def replacement_generation(_path: Path) -> cli._ProcessStat:
+        events.append("stat")
+        return cli._ProcessStat(18, 0)
+
+    monkeypatch.setattr(cli, "_read_process_stat", replacement_generation)
+    opened: list[int] = []
+    read_fd, write_fd = os.pipe()
+
+    def pidfd_open(pid: int) -> int:
+        opened.append(pid)
+        events.append("pidfd")
+        return os.dup(read_fd)
+
+    monkeypatch.setattr(os, "pidfd_open", pidfd_open)
+    try:
+        with pytest.raises(cli.Refusal, match="live process 123 uses slot"):
+            cli._assert_slot_unused(
+                slot,
+                proc_root=empty_proc,
+                live_use_recheck=cli._LiveUseRecheckBudget(0.25),
+            )
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert len(calls) == 2
+    assert opened == [123]
+    assert events == ["lsof", "stat", "pidfd", "lsof"]
+
+
+def test_reclaim_never_retries_lsof_holder_gone_before_pidfd_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    empty_proc = tmp_path / "empty-proc"
+    empty_proc.mkdir()
+    calls = scripted_lsof(monkeypatch, slot, [lsof_holder(123, slot)])
+    monkeypatch.setattr(
+        cli, "_read_process_stat", lambda _path: cli._ProcessStat(17, 0)
+    )
+    opened: list[int] = []
+
+    def exited_before_pidfd(pid: int) -> int:
+        opened.append(pid)
+        raise ProcessLookupError(errno.ESRCH, "fixture lsof holder exited")
+
+    monkeypatch.setattr(os, "pidfd_open", exited_before_pidfd)
+
+    with pytest.raises(cli.Refusal, match="live process 123 uses slot"):
+        cli._assert_slot_unused(
+            slot,
+            proc_root=empty_proc,
+            live_use_recheck=cli._LiveUseRecheckBudget(0.25),
+        )
+
+    assert len(calls) == 1
+    assert opened == [123]
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (
+            subprocess.CompletedProcess(["lsof"], 0, "", "fatal lsof error\n"),
+            "lsof reported",
+        ),
+        (
+            subprocess.CompletedProcess(["lsof"], 2, "", ""),
+            "lsof exited 2",
+        ),
+        (
+            subprocess.CompletedProcess(["lsof"], 0, "unexpected\n", ""),
+            "malformed field output",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["lsof"], 2, "p123\ncgit\nfcwd\nn/slot\n", ""
+            ),
+            "live process 123 uses slot",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["lsof"], 0, "p123\ncgit\nxunknown\nfcwd\nn/slot\n", ""
+            ),
+            "live process 123 uses slot",
+        ),
+        (
+            subprocess.CompletedProcess(["lsof"], 0, "p123\n", ""),
+            "live process 123 uses slot",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["lsof"], 0, "p123\ncgit\nfcwd\n", ""
+            ),
+            "live process 123 uses slot",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["lsof"], 0, "p123\nfcwd\nn/slot\n", ""
+            ),
+            "live process 123 uses slot",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["lsof"],
+                0,
+                "p123\ncgit\nfcwd\nn/slot\np124\n",
+                "",
+            ),
+            "live process 123 uses slot",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["lsof"], 0, "p123\nfcwd\ncgit\nn/slot\n", ""
+            ),
+            "live process 123 uses slot",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["lsof"], 0, "p123\nfcwd\nn/slot\ncgit\n", ""
+            ),
+            "live process 123 uses slot",
+        ),
+        (
+            subprocess.CompletedProcess(
+                ["lsof"],
+                0,
+                (
+                    "p123\ncgit\nfcwd\nn/slot\n"
+                    "p123\ncgit\nfcwd\nn/slot\n"
+                ),
+                "",
+            ),
+            "live process 123 uses slot",
+        ),
+    ],
+)
+def test_reclaim_never_retries_indeterminate_lsof_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response: subprocess.CompletedProcess[str],
+    message: str,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    empty_proc = tmp_path / "empty-proc"
+    empty_proc.mkdir()
+    if "n/slot\n" in response.stdout:
+        response = subprocess.CompletedProcess(
+            response.args,
+            response.returncode,
+            response.stdout.replace("/slot", str(slot)),
+            response.stderr,
+        )
+    calls = scripted_lsof(monkeypatch, slot, [response])
+    budget = cli._LiveUseRecheckBudget(0.25)
+    opened: list[int] = []
+
+    def unexpected_pidfd_open(pid: int) -> int:
+        opened.append(pid)
+        raise AssertionError("indeterminate lsof evidence must not reach pidfd")
+
+    monkeypatch.setattr(os, "pidfd_open", unexpected_pidfd_open)
+
+    with pytest.raises(cli.Refusal, match=message):
+        cli._assert_slot_unused(
+            slot,
+            proc_root=empty_proc,
+            live_use_recheck=budget,
+        )
+
+    assert len(calls) == 1
+    assert opened == []
+    assert budget.remaining_seconds == 0.25
+
+
+def test_reclaim_never_retries_incomplete_proc_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    proc_root = tmp_path / "proc"
+    fixture_pid = os.getpid() + 1_000
+    pid_dir = proc_root / str(fixture_pid)
+    pid_dir.mkdir(parents=True)
+    uid = os.getuid()
+    (pid_dir / "status").write_text(
+        f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n", encoding="ascii"
+    )
+    monkeypatch.setattr(
+        cli, "_read_process_stat", lambda _path: cli._ProcessStat(17, 0)
+    )
+    monkeypatch.setattr(
+        cli,
+        "_process_uses_slot",
+        lambda _pid, _slot: (_ for _ in ()).throw(
+            cli.Refusal("fixture proc evidence is incomplete")
+        ),
+    )
+    waits: list[int] = []
+
+    def unexpected_wait(
+        _budget: cli._LiveUseRecheckBudget,
+        pid: int,
+        *,
+        start_ticks: int | None,
+        proc_root: Path = Path("/proc"),
+        revalidate: Callable[[], bool] | None = None,
+    ) -> bool:
+        del start_ticks, proc_root, revalidate
+        waits.append(pid)
+        return True
+
+    monkeypatch.setattr(cli._LiveUseRecheckBudget, "wait_for_exit", unexpected_wait)
+
+    with pytest.raises(cli.Refusal, match="fixture proc evidence is incomplete"):
+        cli._assert_slot_unused(
+            slot,
+            use_lsof=False,
+            fallback_census=cli._ProcessPathCensus((), ()),
+            proc_root=proc_root,
+            live_use_recheck=cli._LiveUseRecheckBudget(),
+        )
+
+    assert waits == []
+
+
+def test_reclaim_keeps_first_proc_holder_refusal_when_later_evidence_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    proc_root = tmp_path / "proc"
+    holder_pid = os.getpid() + 1_000
+    incomplete_pid = holder_pid + 1
+    for pid in (holder_pid, incomplete_pid):
+        (proc_root / str(pid)).mkdir(parents=True)
+    monkeypatch.setattr(
+        cli, "_read_process_stat", lambda _path: cli._ProcessStat(17, 0)
+    )
+
+    def process_uids(pid_dir: Path) -> tuple[int, int, int, int]:
+        if int(pid_dir.name) == incomplete_pid:
+            raise cli.Refusal("later fixture ownership is incomplete")
+        uid = os.getuid()
+        return uid, uid, uid, uid
+
+    monkeypatch.setattr(cli, "_process_uids", process_uids)
+    monkeypatch.setattr(
+        cli,
+        "_process_uses_slot",
+        lambda pid_dir, _slot: (
+            [f"cwd={slot}"] if int(pid_dir.name) == holder_pid else []
+        ),
+    )
+    opened: list[int] = []
+
+    def unexpected_pidfd_open(pid: int) -> int:
+        opened.append(pid)
+        raise AssertionError("incomplete census must suppress the pidfd wait")
+
+    monkeypatch.setattr(os, "pidfd_open", unexpected_pidfd_open)
+
+    with pytest.raises(
+        cli.Refusal,
+        match=rf"live process {holder_pid} uses slot",
+    ):
+        cli._assert_slot_unused(
+            slot,
+            use_lsof=False,
+            proc_root=proc_root,
+            live_use_recheck=cli._LiveUseRecheckBudget(),
+        )
+
+    assert opened == []
+
+
+def test_reclaim_never_retries_before_an_unbound_second_proc_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    proc_root = tmp_path / "proc"
+    first_pid = os.getpid() + 1_000
+    unbound_pid = first_pid + 1
+    for pid in (first_pid, unbound_pid):
+        (proc_root / str(pid)).mkdir(parents=True)
+
+    def generation(pid_dir: Path) -> cli._ProcessStat | None:
+        return (
+            cli._ProcessStat(17, 0)
+            if int(pid_dir.name) == first_pid
+            else None
+        )
+
+    uid = os.getuid()
+    monkeypatch.setattr(cli, "_read_process_stat", generation)
+    monkeypatch.setattr(
+        cli, "_process_uids", lambda _path: (uid, uid, uid, uid)
+    )
+    monkeypatch.setattr(
+        cli, "_process_uses_slot", lambda _pid, _slot: [f"cwd={slot}"]
+    )
+    opened: list[int] = []
+
+    def unexpected_pidfd_open(pid: int) -> int:
+        opened.append(pid)
+        raise AssertionError("an unbound holder must suppress the pidfd wait")
+
+    monkeypatch.setattr(os, "pidfd_open", unexpected_pidfd_open)
+
+    with pytest.raises(cli.Refusal, match=rf"live process {first_pid} uses slot"):
+        cli._assert_slot_unused(
+            slot,
+            use_lsof=False,
+            proc_root=proc_root,
+            live_use_recheck=cli._LiveUseRecheckBudget(),
+        )
+
+    assert opened == []
+
+
+def test_reclaim_fallback_exit_restarts_the_original_proc_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    proc_root = tmp_path / "proc"
+    fixture_pid_dir = proc_root / str(os.getpid() + 1_000)
+    fixture_pid_dir.mkdir(parents=True)
+    with waiting_child(cwd=slot) as child:
+        lsof_calls = scripted_lsof(
+            monkeypatch,
+            slot,
+            [lsof_holder(child.pid, slot), lsof_holder(child.pid, slot)],
+        )
+        real_read_process_stat = cli._read_process_stat
+        generation_reads = 0
+        proc_reads = 0
+
+        def generations(path: Path) -> cli._ProcessStat | None:
+            nonlocal generation_reads
+            if path == fixture_pid_dir:
+                return cli._ProcessStat(17, 0)
+            observed = real_read_process_stat(path)
+            if path == Path("/proc") / str(child.pid):
+                generation_reads += 1
+                if generation_reads == 2:
+                    assert child.stdin is not None
+                    child.stdin.close()
+            return observed
+
+        def process_uids(_pid_dir: Path) -> tuple[int, int, int, int]:
+            uid = os.getuid()
+            return uid, uid, uid, uid
+
+        def indeterminate_then_clear(_pid_dir: Path, _slot: Path) -> list[str]:
+            nonlocal proc_reads
+            proc_reads += 1
+            if proc_reads == 1:
+                raise cli.Refusal("fixture direct proc evidence is incomplete")
+            return []
+
+        monkeypatch.setattr(cli, "_read_process_stat", generations)
+        monkeypatch.setattr(cli, "_process_uids", process_uids)
+        monkeypatch.setattr(cli, "_process_uses_slot", indeterminate_then_clear)
+
+        cli._assert_slot_unused(
+            slot,
+            use_lsof=False,
+            proc_root=proc_root,
+            live_use_recheck=cli._LiveUseRecheckBudget(),
+        )
+
+        assert child.wait(timeout=1) == 0
+        assert len(lsof_calls) == 2
+        assert generation_reads == 2
+        assert proc_reads == 2
+
+
 def test_lsof_diagnostic_associates_process_command_and_first_file_record() -> None:
     evidence, malformed = cli._parse_lsof_use_diagnostic(
         "\n".join(
@@ -280,7 +980,7 @@ def test_lsof_diagnostic_associates_process_command_and_first_file_record() -> N
 def test_lsof_diagnostic_is_bounded_terminal_safe_and_malformed_safe() -> None:
     long_command = "x" * 10_000 + "\x1b[31m"
     long_descriptor = "9" * 10_000
-    long_name = "/slot/" + "y" * 10_000 + "\nforged refusal"
+    long_name = "/slot/" + "y" * 10_000
     evidence, malformed = cli._parse_lsof_use_diagnostic(
         f"p123\nc{long_command}\nf{long_descriptor}\nn{long_name}\n"
     )
@@ -291,6 +991,19 @@ def test_lsof_diagnostic_is_bounded_terminal_safe_and_malformed_safe() -> None:
     assert rendered.count(cli._LSOF_DIAGNOSTIC_TRUNCATION) == 3
     assert "\x1b" not in rendered
     assert "\n" not in rendered
+
+    forged, forged_malformed = cli._parse_lsof_use_diagnostic(
+        f"p123\nc{long_command}\nf{long_descriptor}\nn{long_name}\nforged refusal\n"
+    )
+    assert forged is not None
+    assert forged_malformed is True
+    forged_rendered = cli._format_lsof_use_diagnostic(
+        forged, malformed=forged_malformed
+    )
+    assert "malformed lsof fields omitted" in forged_rendered
+    assert len(forged_rendered) < 600
+    assert "\x1b" not in forged_rendered
+    assert "\n" not in forged_rendered
 
     for broken in (
         "corphan\nfcwd\nn/slot\n",

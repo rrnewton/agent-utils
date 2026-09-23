@@ -3466,6 +3466,7 @@ def test_ownerless_validate_batch_shares_one_census_and_preserves_checkouts(
     second.chmod(0o700)
     shared_calls: list[tuple[Path, ...]] = []
     fresh_calls: list[tuple[Path, ...]] = []
+    recheck_budgets: list[wrkslots._LiveUseRecheckBudget] = []
 
     def shared(
         paths: Sequence[Path], **_kwargs: object
@@ -3487,6 +3488,35 @@ def test_ownerless_validate_batch_shares_one_census_and_preserves_checkouts(
 
     monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
     monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+    ownerless_journal = wrkslots._ownerless_validation_journal
+
+    def journal_with_budget_evidence(
+        config: wrkslots.Config,
+        args: argparse.Namespace,
+        coordinator: wrkslots.ProcessIdentity,
+        states: Sequence[wrkslots.ActiveState],
+        batch_cleanup: wrkslots._OwnerlessValidationBatchContext | None = None,
+        *,
+        require_remote_containment: bool = True,
+        live_use_recheck: wrkslots._LiveUseRecheckBudget | None = None,
+    ) -> tuple[dict[str, object], tuple[str, str] | None]:
+        batch = batch_cleanup
+        assert isinstance(batch, wrkslots._OwnerlessValidationBatchContext)
+        assert live_use_recheck is batch.live_use_recheck
+        recheck_budgets.append(batch.live_use_recheck)
+        return ownerless_journal(
+            config,
+            args,
+            coordinator,
+            states,
+            batch_cleanup=batch,
+            require_remote_containment=require_remote_containment,
+            live_use_recheck=live_use_recheck,
+        )
+
+    monkeypatch.setattr(
+        wrkslots, "_ownerless_validation_journal", journal_with_budget_evidence
+    )
 
     rc = wrkslots.main(
         [
@@ -3529,6 +3559,8 @@ def test_ownerless_validate_batch_shares_one_census_and_preserves_checkouts(
     )
     assert shared_calls == [(first, second)]
     assert fresh_calls == []
+    assert len(recheck_budgets) == 2
+    assert recheck_budgets[0] is recheck_budgets[1]
     assert first.is_dir()
     assert second.is_dir()
 
@@ -7325,6 +7357,7 @@ def test_ownerless_linked_checkout_preserves_post_check_replacement(
         standalone: bool = False,
         remote_observation_repository: Path | None = None,
         require_remote_containment: bool = True,
+        live_use_recheck: wrkslots._LiveUseRecheckBudget | None = None,
     ) -> tuple[str, str]:
         result = original_facts(
             config,
@@ -7337,6 +7370,7 @@ def test_ownerless_linked_checkout_preserves_post_check_replacement(
             standalone=standalone,
             remote_observation_repository=remote_observation_repository,
             require_remote_containment=require_remote_containment,
+            live_use_recheck=live_use_recheck,
         )
         target.rename(displaced)
         target.mkdir()
@@ -7703,6 +7737,175 @@ def test_ownerless_validation_proof_route_preserves_without_journaling(
     assert target.is_dir()
     assert stat.S_IMODE(target.stat().st_mode) != 0o700
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
+@contextlib.contextmanager
+def adopted_cwd_holder(
+    cwd: Path,
+) -> Iterator[tuple[subprocess.Popen[str], int, int]]:
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            textwrap.dedent(
+                """
+                import os
+                import sys
+
+                ready_read, ready_write = os.pipe()
+                child = os.fork()
+                if child:
+                    os.close(ready_write)
+                    ready = os.read(ready_read, 64)
+                    os.close(ready_read)
+                    print(ready.decode("ascii"), flush=True)
+                    os._exit(0)
+                os.close(ready_read)
+                os.setsid()
+                os.chdir(sys.argv[1])
+                os.write(ready_write, str(os.getpid()).encode("ascii"))
+                os.close(ready_write)
+                sys.stdin.buffer.read()
+                os._exit(0)
+                """
+            ),
+            str(cwd),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    adopted_pidfd: int | None = None
+    try:
+        assert holder.stdout is not None
+        with selectors.DefaultSelector() as ready:
+            ready.register(holder.stdout, selectors.EVENT_READ)
+            assert ready.select(5), "adopted holder did not report readiness"
+        raw_pid = holder.stdout.readline().strip()
+        assert raw_pid.isascii() and raw_pid.isdecimal()
+        adopted_pid = int(raw_pid)
+        assert holder.wait(timeout=3) == 0
+        adopted_pidfd = os.pidfd_open(adopted_pid)
+        yield holder, adopted_pid, adopted_pidfd
+    finally:
+        assert holder.stdin is not None
+        if not holder.stdin.closed:
+            holder.stdin.close()
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=3)
+        if adopted_pidfd is not None:
+            if not select.select([adopted_pidfd], [], [], 1)[0]:
+                signal.pidfd_send_signal(adopted_pidfd, signal.SIGKILL)
+                assert select.select([adopted_pidfd], [], [], 2)[0] == [adopted_pidfd]
+            os.close(adopted_pidfd)
+        if holder.stdout is not None:
+            holder.stdout.close()
+        if holder.stderr is not None:
+            holder.stderr.close()
+
+
+def test_ownerless_validation_rechecks_an_adopted_transient_holder_before_policy_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    commit_validation_removal_schema(repository)
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+    manifest, _artifacts = prepare_validation_removal_proof(
+        project,
+        target.name,
+        checkout_path=target,
+        run_record=record,
+    )
+    with adopted_cwd_holder(target) as (holder, adopted_pid, adopted_pidfd):
+        status = (Path("/proc") / str(adopted_pid) / "status").read_text(
+            encoding="ascii"
+        )
+        parent_rows = [
+            line for line in status.splitlines() if line.startswith("PPid:")
+        ]
+        assert len(parent_rows) == 1
+        assert int(parent_rows[0].split()[1]) != holder.pid
+        lsof_calls = 0
+        generation_reads = 0
+        real_read_process_stat = wrkslots._read_process_stat
+
+        def scripted_holder_then_unused(
+            _executable: Path, slot_path: Path
+        ) -> tuple[wrkslots._LsofUseDiagnostic | None, bool, int]:
+            nonlocal lsof_calls
+            assert slot_path == target
+            lsof_calls += 1
+            if lsof_calls <= 2:
+                return (
+                    wrkslots._LsofUseDiagnostic(
+                        adopted_pid, '"python"', '"cwd"', f'"{target}"'
+                    ),
+                    False,
+                    0,
+                )
+            return None, False, 1
+
+        def release_after_pidfd_generation_check(
+            path: Path,
+        ) -> wrkslots._ProcessStat | None:
+            nonlocal generation_reads
+            observed = real_read_process_stat(path)
+            if path == Path("/proc") / str(adopted_pid):
+                generation_reads += 1
+                if generation_reads == 2:
+                    assert holder.stdin is not None
+                    holder.stdin.close()
+            return observed
+
+        monkeypatch.setattr(
+            wrkslots, "_lsof_slot_use", scripted_holder_then_unused
+        )
+        monkeypatch.setattr(
+            wrkslots, "_read_process_stat", release_after_pidfd_generation_check
+        )
+        rc = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--ownerless-validate-checkout",
+                target.relative_to(project).as_posix(),
+                "--completed-record",
+                record.relative_to(project).as_posix(),
+                "--repository",
+                repository.relative_to(project).as_posix(),
+                "--validation-proof-manifest",
+                manifest.relative_to(project).as_posix(),
+            ]
+        )
+        stderr = capsys.readouterr().err
+
+        assert rc == 3
+        assert "ownerless linked validation checkout recovery is disabled" in stderr
+        assert "live process" not in stderr
+        assert lsof_calls == 3
+        # A namespace init may retain the exited child as a zombie for the
+        # restarted /proc pass; the host init can reap it before enumeration.
+        assert generation_reads in {2, 3}
+        assert holder.stdin is not None and holder.stdin.closed
+        assert select.select([adopted_pidfd], [], [], 1)[0] == [adopted_pidfd]
+        assert target.is_dir()
+        assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
 def test_ownerless_validation_blocking_status_ignores_only_explicit_safe_roots() -> None:
@@ -10857,6 +11060,9 @@ def test_process_entering_after_final_scan_before_path_move_is_not_deleted(
         ignore_invoking_ancestry: bool = False,
         census: wrkslots._ProcessPathCensus | None = None,
         fallback_census: wrkslots._ProcessPathCensus | None = None,
+        proc_root: Path = Path("/proc"),
+        ignore_current_process: bool = True,
+        live_use_recheck: wrkslots._LiveUseRecheckBudget | None = None,
     ) -> None:
         nonlocal calls, entrant
         original_assert(
@@ -10866,6 +11072,9 @@ def test_process_entering_after_final_scan_before_path_move_is_not_deleted(
             ignore_invoking_ancestry=ignore_invoking_ancestry,
             census=census,
             fallback_census=fallback_census,
+            proc_root=proc_root,
+            ignore_current_process=ignore_current_process,
+            live_use_recheck=live_use_recheck,
         )
         calls += 1
         if calls == 2:
@@ -14358,8 +14567,26 @@ def test_validate_batch_rechecks_later_slot_use_after_shared_census(
         lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
     )
     real_rename = os.rename
+    real_remove = wrkslots._cmd_remove
     late_user: subprocess.Popen[str] | None = None
     fenced_scans = 0
+    recheck_budgets: list[wrkslots._LiveUseRecheckBudget] = []
+
+    def record_remove_budget(
+        args: argparse.Namespace,
+        *,
+        private_cleanup: wrkslots._PrivateCleanupContext | None = None,
+        validation_removal_proof: wrkslots._ValidationRemovalProof | None = None,
+        emit: bool = True,
+    ) -> int:
+        assert private_cleanup is not None
+        recheck_budgets.append(private_cleanup.live_use_recheck)
+        return real_remove(
+            args,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=validation_removal_proof,
+            emit=emit,
+        )
 
     def record_slot_scan(
         slot_paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
@@ -14388,6 +14615,7 @@ def test_validate_batch_rechecks_later_slot_use_after_shared_census(
         wrkslots, "_capture_same_uid_process_path_census", record_slot_scan
     )
     monkeypatch.setattr("wrkslots.cli.os.rename", enter_at_final_path_fence)
+    monkeypatch.setattr(wrkslots, "_cmd_remove", record_remove_budget)
     try:
         rc = wrkslots.main(
             [
@@ -14416,6 +14644,8 @@ def test_validate_batch_rechecks_later_slot_use_after_shared_census(
     assert len(report["retained"]) == 1
     assert "live process" in report["retained"][0]["reason"]
     assert fenced_scans == 2
+    assert len(recheck_budgets) == 2
+    assert recheck_budgets[0] is recheck_budgets[1]
     assert not paths["first"].exists()
     assert tree.is_dir()
 
@@ -18913,6 +19143,55 @@ def test_validate_complete_cannot_bypass_agent_reclaim(tmp_path: Path) -> None:
     assert checkout(project).is_dir()
     assert active_slots(project)
     assert git(remote, "for-each-ref", "--format=%(refname)", "refs/heads/salvage").stdout == ""
+
+
+def test_reclaim_shares_live_use_recheck_across_pre_and_post_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_original_coordinator_dead(project)
+    set_liveness(project, "dead")
+    canonical = checkout(project).parent
+    observed: list[tuple[Path, wrkslots._LiveUseRecheckBudget]] = []
+
+    def record_reclaim_check(
+        slot_path: Path,
+        _record: wrkslots.ActiveRecord | None = None,
+        **kwargs: object,
+    ) -> None:
+        budget = kwargs.get("live_use_recheck")
+        assert isinstance(budget, wrkslots._LiveUseRecheckBudget)
+        observed.append((slot_path, budget))
+
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", record_reclaim_check)
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--coordinator-authorized",
+        ]
+    )
+
+    assert rc == 0, capsys.readouterr().err
+    assert len(observed) == 4
+    assert [path for path, _budget in observed[:3]] == [canonical] * 3
+    assert observed[3][0].parent == canonical.parent
+    assert observed[3][0].name.startswith(".slot01.fenced.1.")
+    assert all(budget is observed[0][1] for _path, budget in observed)
 
 
 def test_later_coordinator_can_complete_reclaim_from_the_record(tmp_path: Path) -> None:

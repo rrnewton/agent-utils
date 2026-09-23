@@ -375,6 +375,7 @@ _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # durable state restoration. The parent batch caller still needs end-to-end timing.
 _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 22.0
 _READ_ONLY_COMMAND_REAP_SECONDS = 1.0
+_RECLAIM_LIVE_USE_RECHECK_SECONDS = 0.25
 
 
 class Refusal(RuntimeError):
@@ -9934,6 +9935,70 @@ class _LsofUseDiagnostic:
     name_excerpt: str | None
 
 
+@dataclasses.dataclass
+class _LiveUseRecheckBudget:
+    """One transaction-wide allowance for an exact process generation to exit."""
+
+    remaining_seconds: float = _RECLAIM_LIVE_USE_RECHECK_SECONDS
+    _deadline: float | None = dataclasses.field(init=False, default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.remaining_seconds < 0 or not self.remaining_seconds < float("inf"):
+            raise ValueError("live-use recheck allowance must be finite and nonnegative")
+
+    def wait_for_exit(
+        self,
+        pid: int,
+        *,
+        start_ticks: int | None,
+        proc_root: Path = Path("/proc"),
+        revalidate: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Wait for only the reported generation; uncertainty never permits retry."""
+
+        now = time.monotonic()
+        if self._deadline is None:
+            self._deadline = now + self.remaining_seconds
+        deadline = self._deadline
+        self.remaining_seconds = max(0.0, deadline - now)
+        if self.remaining_seconds <= 0 or start_ticks is None:
+            return False
+        descriptor = -1
+        try:
+            try:
+                descriptor = os.pidfd_open(pid)
+            except ProcessLookupError:
+                # A direct /proc observation already read the generation
+                # before inspecting its paths.  An lsof report has no such
+                # pre-observation binding, so it must survive the bracketed
+                # recheck below before disappearance can permit a retry.
+                return revalidate is None
+            except OSError:
+                return False
+            if revalidate is not None and not revalidate():
+                return False
+            try:
+                current = _read_process_stat(proc_root / str(pid))
+            except Refusal:
+                return False
+            if current is None or current.start_ticks != start_ticks:
+                return False
+            with selectors.DefaultSelector() as watcher:
+                watcher.register(descriptor, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    if watcher.select(remaining):
+                        return True
+        except OSError:
+            return False
+        finally:
+            self.remaining_seconds = max(0.0, deadline - time.monotonic())
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
 def _lsof_diagnostic_excerpt(value: str) -> str:
     """Render one lsof field as bounded, terminal-safe JSON string text."""
 
@@ -9968,8 +10033,10 @@ def _parse_lsof_use_diagnostic(
     ``lsof -Fpcfn`` is a stateful stream: ``c`` belongs to the preceding
     process, while ``n`` belongs to the preceding file descriptor.  Keeping
     that association here avoids presenting a command from one process beside
-    a path from another.  Only bounded, escaped excerpts survive this parser.
-    Malformed records never become evidence of absence.
+    a path from another.  Each unique ``p`` set must contain its requested
+    ``c`` before one or more complete ``f``/``n`` pairs.  Only bounded, escaped
+    excerpts survive this parser.  Malformed records never become evidence of
+    absence or eligibility for a transient-holder retry.
     """
 
     selected_pid: int | None = None
@@ -9979,7 +10046,21 @@ def _parse_lsof_use_diagnostic(
     current_pid: int | None = None
     current_descriptor: str | None = None
     current_is_selected_record = False
+    current_has_command = False
+    current_has_complete_file = False
+    current_file_needs_name = False
+    current_files_started = False
+    seen_pids: set[int] = set()
     malformed = False
+
+    def finish_process_record() -> None:
+        nonlocal malformed
+        if current_pid is not None and (
+            not current_has_command
+            or not current_has_complete_file
+            or current_file_needs_name
+        ):
+            malformed = True
 
     for line in output.splitlines():
         if not line:
@@ -9989,8 +10070,13 @@ def _parse_lsof_use_diagnostic(
             continue
         field, value = line[0], line[1:]
         if field == "p":
+            finish_process_record()
             current_descriptor = None
             current_is_selected_record = False
+            current_has_command = False
+            current_has_complete_file = False
+            current_file_needs_name = False
+            current_files_started = False
             if not re.fullmatch(r"[0-9]{1,20}", value):
                 malformed = True
                 current_pid = None
@@ -10001,6 +10087,9 @@ def _parse_lsof_use_diagnostic(
                 malformed = True
                 current_pid = None
                 continue
+            if pid in seen_pids:
+                malformed = True
+            seen_pids.add(pid)
             current_pid = pid
             if selected_pid is None or pid < selected_pid:
                 selected_pid = pid
@@ -10009,34 +10098,58 @@ def _parse_lsof_use_diagnostic(
                 selected_name = None
             continue
         if field == "c":
-            if current_pid is None or not value:
+            if (
+                current_pid is None
+                or not value
+                or current_has_command
+                or current_files_started
+            ):
                 malformed = True
                 continue
+            current_has_command = True
             if current_pid == selected_pid and selected_command is None:
                 selected_command = _lsof_diagnostic_excerpt(value)
             continue
         if field == "f":
+            if current_file_needs_name:
+                malformed = True
             current_is_selected_record = False
             if current_pid is None or not value:
                 malformed = True
                 current_descriptor = None
+                current_file_needs_name = False
                 continue
+            if not current_has_command:
+                malformed = True
+            current_files_started = True
             current_descriptor = value
+            current_file_needs_name = True
             if current_pid == selected_pid and selected_descriptor is None:
                 selected_descriptor = _lsof_diagnostic_excerpt(value)
                 current_is_selected_record = True
             continue
         if field == "n":
-            if current_pid is None or current_descriptor is None or not value:
+            if (
+                current_pid is None
+                or current_descriptor is None
+                or not current_file_needs_name
+                or not value
+            ):
                 malformed = True
                 continue
             if current_is_selected_record and selected_name is None:
                 selected_name = _lsof_diagnostic_excerpt(value)
+            current_descriptor = None
+            current_is_selected_record = False
+            current_file_needs_name = False
+            current_has_complete_file = True
             continue
         malformed = True
         current_descriptor = None
         current_is_selected_record = False
+        current_file_needs_name = False
 
+    finish_process_record()
     if selected_pid is None:
         return None, malformed
     return (
@@ -10065,6 +10178,62 @@ def _format_lsof_use_diagnostic(
     return f"; lsof {', '.join(details)}" if details else ""
 
 
+@dataclasses.dataclass(frozen=True)
+class _LiveUseObservation:
+    pid: int
+    start_ticks: int | None
+    proc_root: Path
+    refusal: Refusal
+    revalidate: Callable[[], bool] | None = None
+
+
+def _lsof_slot_use(
+    executable: Path, slot_path: Path
+) -> tuple[_LsofUseDiagnostic | None, bool, int]:
+    try:
+        completed = subprocess.run(
+            [str(executable), "-nP", "-Fpcfn", "+D", str(slot_path)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise Refusal(
+            f"process use is indeterminate because lsof failed: {exc}"
+        ) from exc
+    if not _unrelated_lsof_warnings(completed.stderr, slot_path):
+        raise Refusal(
+            "process use is indeterminate because lsof reported: "
+            f"{completed.stderr.strip().splitlines()[0]}"
+        )
+    evidence, malformed = _parse_lsof_use_diagnostic(completed.stdout)
+    if evidence is None:
+        if malformed:
+            raise Refusal(
+                "process use is indeterminate because lsof returned malformed field output"
+            )
+        if completed.returncode not in (0, 1):
+            raise Refusal(
+                f"process use is indeterminate because lsof exited {completed.returncode}"
+            )
+    return evidence, malformed, completed.returncode
+
+
+def _lsof_use_is_recheckable(
+    evidence: _LsofUseDiagnostic,
+    *,
+    malformed: bool,
+    returncode: int,
+) -> bool:
+    return (
+        not malformed
+        and returncode in (0, 1)
+        and evidence.command_excerpt is not None
+        and evidence.descriptor_excerpt is not None
+        and evidence.name_excerpt is not None
+    )
+
+
 def _assert_slot_unused(
     slot_path: Path,
     record: ActiveRecord | None = None,
@@ -10075,7 +10244,44 @@ def _assert_slot_unused(
     fallback_census: _ProcessPathCensus | None = None,
     proc_root: Path = Path("/proc"),
     ignore_current_process: bool = True,
+    live_use_recheck: _LiveUseRecheckBudget | None = None,
 ) -> None:
+    while True:
+        observation = _observe_slot_use_once(
+            slot_path,
+            record,
+            use_lsof=use_lsof,
+            ignore_invoking_ancestry=ignore_invoking_ancestry,
+            census=census,
+            fallback_census=fallback_census,
+            proc_root=proc_root,
+            ignore_current_process=ignore_current_process,
+            capture_generation=live_use_recheck is not None,
+        )
+        if observation is None:
+            return
+        if live_use_recheck is not None and live_use_recheck.wait_for_exit(
+            observation.pid,
+            start_ticks=observation.start_ticks,
+            proc_root=observation.proc_root,
+            revalidate=observation.revalidate,
+        ):
+            continue
+        raise observation.refusal
+
+
+def _observe_slot_use_once(
+    slot_path: Path,
+    record: ActiveRecord | None = None,
+    *,
+    use_lsof: bool = True,
+    ignore_invoking_ancestry: bool = False,
+    census: _ProcessPathCensus | None = None,
+    fallback_census: _ProcessPathCensus | None = None,
+    proc_root: Path = Path("/proc"),
+    ignore_current_process: bool = True,
+    capture_generation: bool = False,
+) -> _LiveUseObservation | None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
     except OSError as exc:
@@ -10091,7 +10297,7 @@ def _assert_slot_unused(
             ignore_invoking_ancestry=ignore_invoking_ancestry,
             ignore_current_process=ignore_current_process,
         )
-        return
+        return None
     lsof = next(
         (
             candidate
@@ -10102,36 +10308,55 @@ def _assert_slot_unused(
     )
     direct_use_proven_absent = False
     if lsof is not None and use_lsof:
-        try:
-            completed = subprocess.run(
-                [str(lsof), "-nP", "-Fpcfn", "+D", str(slot_path)],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-        except OSError as exc:
-            raise Refusal(
-                f"process use is indeterminate because lsof failed: {exc}"
-            ) from exc
-        if not _unrelated_lsof_warnings(completed.stderr, slot_path):
-            raise Refusal(
-                "process use is indeterminate because lsof reported: "
-                f"{completed.stderr.strip().splitlines()[0]}"
-            )
-        evidence, malformed_lsof = _parse_lsof_use_diagnostic(completed.stdout)
+        evidence, malformed_lsof, lsof_returncode = _lsof_slot_use(lsof, slot_path)
         if evidence is not None:
-            raise Refusal(
+            refusal = Refusal(
                 f"live process {evidence.pid} uses slot {slot_path}"
                 f"{_format_lsof_use_diagnostic(evidence, malformed=malformed_lsof)}; "
                 "stop it and retry"
             )
-        if malformed_lsof:
-            raise Refusal(
-                "process use is indeterminate because lsof returned malformed field output"
-            )
-        if completed.returncode not in (0, 1):
-            raise Refusal(
-                f"process use is indeterminate because lsof exited {completed.returncode}"
+            if not _lsof_use_is_recheckable(
+                evidence,
+                malformed=malformed_lsof,
+                returncode=lsof_returncode,
+            ):
+                raise refusal
+            lsof_start_ticks: int | None = None
+            lsof_revalidate: Callable[[], bool] | None = None
+            if capture_generation:
+                try:
+                    generation = _read_process_stat(Path("/proc") / str(evidence.pid))
+                except Refusal:
+                    generation = None
+                lsof_start_ticks = (
+                    None if generation is None else generation.start_ticks
+                )
+                evidence_pid = evidence.pid
+
+                def revalidate_lsof_use() -> bool:
+                    try:
+                        rechecked, rechecked_malformed, rechecked_returncode = (
+                            _lsof_slot_use(lsof, slot_path)
+                        )
+                    except Refusal:
+                        return False
+                    return (
+                        rechecked is not None
+                        and rechecked.pid == evidence_pid
+                        and _lsof_use_is_recheckable(
+                            rechecked,
+                            malformed=rechecked_malformed,
+                            returncode=rechecked_returncode,
+                        )
+                    )
+
+                lsof_revalidate = revalidate_lsof_use
+            return _LiveUseObservation(
+                evidence.pid,
+                lsof_start_ticks,
+                Path("/proc"),
+                refusal,
+                lsof_revalidate,
             )
         direct_use_proven_absent = True
     try:
@@ -10149,6 +10374,8 @@ def _assert_slot_unused(
             ancestor = _read_process_parent(ancestor)
     inspected_mount_namespaces: set[str] = set()
     indeterminate_use: Refusal | None = None
+    reported_use: _LiveUseObservation | None = None
+    reported_use_recheckable = True
     # Resolved once: it describes the record, not the process being inspected,
     # and asking per PID would read the owner's /proc entry thousands of times.
     owner_cgroup_is_evidence = _owner_cgroup_is_evidence(record)
@@ -10156,20 +10383,41 @@ def _assert_slot_unused(
         pid = int(pid_dir.name)
         if pid == current_pid or pid in invoking_ancestry:
             continue
-        uids = _process_uids(pid_dir)
+        start_ticks: int | None = None
+        if capture_generation:
+            try:
+                generation = _read_process_stat(pid_dir)
+            except Refusal:
+                generation = None
+            start_ticks = None if generation is None else generation.start_ticks
+        try:
+            uids = _process_uids(pid_dir)
+        except Refusal:
+            if reported_use is None:
+                raise
+            reported_use_recheckable = False
+            continue
         if uids is None:
             continue
         if owner_cgroup_is_evidence and record is not None and record.owner is not None:
             try:
                 cgroup = _read_process_cgroup(pid_dir)
             except Refusal as exc:
-                raise Refusal(
+                cgroup_refusal = Refusal(
                     f"recorded cgroup use is indeterminate for PID {pid}: {exc}"
-                ) from exc
+                )
+                if reported_use is None:
+                    raise cgroup_refusal from exc
+                reported_use_recheckable = False
+                continue
             if cgroup == record.owner.cgroup_path:
-                raise Refusal(
+                cgroup_refusal = Refusal(
                     f"live process {pid} remains in recorded owner cgroup {cgroup}"
                 )
+                if reported_use is None:
+                    raise cgroup_refusal
+                reported_use_recheckable = False
+                continue
         filesystem_uid = uids[3]
         if (
             not use_lsof
@@ -10192,22 +10440,39 @@ def _assert_slot_unused(
                 indeterminate_use = exc
             continue
         if uses:
-            raise Refusal(
+            refusal = Refusal(
                 f"live process {pid} uses slot {slot_path}: {uses[0]}; stop it and retry"
             )
+            if not capture_generation:
+                raise refusal
+            if start_ticks is None:
+                reported_use_recheckable = False
+            if reported_use is None:
+                reported_use = _LiveUseObservation(
+                    pid,
+                    start_ticks,
+                    proc_root,
+                    refusal,
+                )
+    if reported_use is not None:
+        if indeterminate_use is not None or not reported_use_recheckable:
+            return dataclasses.replace(reported_use, start_ticks=None)
+        return reported_use
     if indeterminate_use is not None:
         if not use_lsof and fallback_census is not None:
             raise indeterminate_use
         if not use_lsof:
-            _assert_slot_unused(
+            return _observe_slot_use_once(
                 slot_path,
                 record,
                 use_lsof=True,
                 ignore_invoking_ancestry=ignore_invoking_ancestry,
                 proc_root=proc_root,
+                ignore_current_process=ignore_current_process,
+                capture_generation=capture_generation,
             )
-            return
         raise indeterminate_use
+    return None
 
 
 def _parse_timestamp(value: str, label: str) -> dt.datetime:
@@ -11585,7 +11850,11 @@ def _handoff_preconditions(
 
 
 def _remove_preconditions(
-    config: Config, record: ActiveRecord, vcs: _GitVcs
+    config: Config,
+    record: ActiveRecord,
+    vcs: _GitVcs,
+    *,
+    live_use_recheck: _LiveUseRecheckBudget | None = None,
 ) -> tuple[Path, tuple[Checkout, ...]]:
     if record.handoff is None:
         raise Refusal(
@@ -11596,7 +11865,9 @@ def _remove_preconditions(
         raise Refusal(
             f"slot {record.slot} changed after its handoff was recorded; preserve it for inspection"
         )
-    _assert_slot_unused(slot_path, record)
+    _assert_slot_unused(
+        slot_path, record, live_use_recheck=live_use_recheck
+    )
     return slot_path, final_checkouts
 
 
@@ -11635,6 +11906,7 @@ def _reclaim_preconditions(
             ignore_invoking_ancestry=(
                 finish.allow_live_validate_owner and record.slot_type == "validate"
             ),
+            live_use_recheck=finish.live_use_recheck,
         )
     final: list[Checkout] = []
     for checkout in record.checkouts:
@@ -11668,7 +11940,12 @@ def _reclaim_preconditions(
     elif finish.salvage:
         _assert_salvage_still_matches(config, record, finish.salvage, vcs)
     elif record.handoff is not None:
-        return _remove_preconditions(config, record, vcs)
+        return _remove_preconditions(
+            config,
+            record,
+            vcs,
+            live_use_recheck=finish.live_use_recheck,
+        )
     else:
         raise StateError("agent slot reclaim has neither salvage nor an owner handoff")
     return slot_path, tuple(final)
@@ -17398,6 +17675,7 @@ def _finish_remove_paths(
                         finish.allow_live_validate_owner
                         and record.slot_type == "validate"
                     ),
+                    live_use_recheck=finish.live_use_recheck,
                 )
             else:
                 if (
@@ -17861,6 +18139,11 @@ def _cmd_remove(
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
+    live_use_recheck = (
+        private_cleanup.live_use_recheck
+        if private_cleanup is not None
+        else _LiveUseRecheckBudget()
+    )
     scoped_validation_finish = bool(args.validate_complete) and private_cleanup is None
     wait_deadline = getattr(args, "_wait_deadline", None)
     lock_scope = (
@@ -18006,6 +18289,7 @@ def _cmd_remove(
             use_lsof=not live_validate_owner,
             ignore_invoking_ancestry=live_validate_owner,
             census=None if private_cleanup is None else private_cleanup.shared_census,
+            live_use_recheck=live_use_recheck,
         )
         if scoped_validation_finish:
             boundary_states, boundary_archives = _validate_global_state(
@@ -18130,6 +18414,7 @@ def _cmd_remove(
                 allow_live_validate_owner=live_validate_owner,
                 private_cleanup=private_cleanup,
                 validation_removal_proof=validation_removal_proof,
+                live_use_recheck=live_use_recheck,
             ),
             journal_path=(
                 _finish_journal_path(config, record.slot)
@@ -18354,6 +18639,7 @@ def _remove_validate_batch(args: argparse.Namespace) -> dict[str, object]:
     removal_proofs: dict[str, _ValidationRemovalProof] = {}
     removed: list[dict[str, object]] = []
     same_uid_census_count = 0
+    live_use_recheck = _LiveUseRecheckBudget()
     census_budget = _ReadOnlyCommandBudget.start(
         timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
         stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
@@ -18429,7 +18715,10 @@ def _remove_validate_batch(args: argparse.Namespace) -> dict[str, object]:
             item_args.validation_proof_manifest = None
             item_args.completed_record = None
             private_cleanup = _PrivateCleanupContext(
-                target, privileged_census, census_budget
+                target,
+                privileged_census,
+                census_budget,
+                live_use_recheck=live_use_recheck,
             )
             try:
                 privileged_census.assert_slot_unused(target.path, None)
@@ -19406,6 +19695,7 @@ def _recover_finish(
     coordinator: ProcessIdentity,
     *,
     processes: _RecoveryProcesses | None = None,
+    live_use_recheck: _LiveUseRecheckBudget | None = None,
 ) -> None:
     _exact_keys(
         raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
@@ -19557,6 +19847,7 @@ def _recover_finish(
         raise Refusal(f"recorded owner is {owner_state}: {detail}")
     journal = dict(raw)
     phase = _as_str(journal["phase"], "finish journal.phase")
+    selected_live_use_recheck = live_use_recheck or _LiveUseRecheckBudget()
     if phase not in ("prepared", "fenced", "removed"):
         raise StateError(f"unknown finish journal phase {phase!r}")
     if phase in ("prepared", "fenced"):
@@ -19624,6 +19915,7 @@ def _recover_finish(
                     ),
                     recovery_census,
                     recovery_budget,
+                    live_use_recheck=selected_live_use_recheck,
                 )
         journal = _finish_remove_paths(
             config,
@@ -19638,6 +19930,7 @@ def _recover_finish(
                 allow_live_validate_owner=live_validate_owner,
                 private_cleanup=private_cleanup,
                 validation_removal_proof=removal_proof,
+                live_use_recheck=selected_live_use_recheck,
             ),
             journal_path=path,
         )
@@ -21428,7 +21721,17 @@ def _validation_checkout_facts(
     standalone: bool = False,
     remote_observation_repository: Path | None = None,
     require_remote_containment: bool = True,
+    live_use_recheck: _LiveUseRecheckBudget | None = None,
 ) -> tuple[str, str]:
+    selected_live_use_recheck = (
+        live_use_recheck
+        if live_use_recheck is not None
+        else (
+            batch_cleanup.live_use_recheck
+            if batch_cleanup is not None
+            else None
+        )
+    )
     if repository == checkout or _path_is_within(repository, checkout):
         raise Refusal("repository must survive removal and cannot be inside the checkout")
     if checkout.is_symlink() or not checkout.is_dir():
@@ -21559,7 +21862,9 @@ def _validation_checkout_facts(
                 ignore_current_process=False,
             )
         else:
-            _assert_slot_unused(checkout)
+            _assert_slot_unused(
+                checkout, live_use_recheck=selected_live_use_recheck
+            )
     else:
         batch_cleanup.assert_unused(
             config, checkout, fresh_same_uid=fresh_same_uid
@@ -21567,7 +21872,11 @@ def _validation_checkout_facts(
     return head, remote_digest
 
 
-def _validation_cargo_facts(path: Path) -> tuple[int, int, int]:
+def _validation_cargo_facts(
+    path: Path,
+    *,
+    live_use_recheck: _LiveUseRecheckBudget | None = None,
+) -> tuple[int, int, int]:
     if path.is_symlink() or not path.is_dir():
         raise Refusal(f"validation Cargo home is absent or unsafe: {path}")
     _ensure_no_mount_components(path.parent, path, "validation Cargo home")
@@ -21580,7 +21889,7 @@ def _validation_cargo_facts(path: Path) -> tuple[int, int, int]:
             "validation Cargo home contains HANDOFF.md or another HANDOFF* artifact; "
             f"preserve it: {handoff}"
         )
-    _assert_slot_unused(path)
+    _assert_slot_unused(path, live_use_recheck=live_use_recheck)
     return _open_directory_identity(path.parent, "validation Cargo-home parent")
 
 
@@ -21719,6 +22028,7 @@ def _ownerless_validation_journal(
     batch_cleanup: _OwnerlessValidationBatchContext | None = None,
     *,
     require_remote_containment: bool = True,
+    live_use_recheck: _LiveUseRecheckBudget | None = None,
 ) -> tuple[dict[str, object], tuple[str, str] | None]:
     frozen_checkout = getattr(args, "frozen_validate_checkout", None)
     target_kind = (
@@ -21814,11 +22124,14 @@ def _ownerless_validation_journal(
             batch_cleanup=batch_cleanup,
             standalone=target_kind == "frozen-checkout",
             require_remote_containment=require_remote_containment,
+            live_use_recheck=live_use_recheck,
         )
     else:
         if args.repository is not None:
             raise Refusal("--repository applies only to validation checkouts")
-        parent_identity = _validation_cargo_facts(target)
+        parent_identity = _validation_cargo_facts(
+            target, live_use_recheck=live_use_recheck
+        )
     removal_proof: _ValidationRemovalProof | None = None
     if proof_manifest is not None:
         if target_kind == "cargo-home":
@@ -21935,6 +22248,7 @@ def _ownerless_validation_inputs(
     recheck: bool,
     batch_cleanup: _OwnerlessValidationBatchContext | None = None,
     fresh_same_uid: bool = False,
+    live_use_recheck: _LiveUseRecheckBudget | None = None,
 ) -> tuple[
     ValidationRecoveryAuthorization,
     Path,
@@ -22168,10 +22482,13 @@ def _ownerless_validation_inputs(
                 batch_cleanup=batch_cleanup,
                 fresh_same_uid=fresh_same_uid,
                 standalone=authorization.target_kind == "frozen-checkout",
+                live_use_recheck=live_use_recheck,
             )
         else:
             assert authorization.parent_identity is not None
-            if _validation_cargo_facts(active) != authorization.parent_identity:
+            if _validation_cargo_facts(
+                active, live_use_recheck=live_use_recheck
+            ) != authorization.parent_identity:
                 raise Refusal("validation Cargo-home parent identity changed")
         if removal_proof is not None and fresh_same_uid:
             assert authorization.head is not None
@@ -23306,10 +23623,20 @@ def _recover_ownerless_validation(
     *,
     batch_cleanup: _OwnerlessValidationBatchContext | None = None,
     emit: bool = True,
+    live_use_recheck: _LiveUseRecheckBudget | None = None,
 ) -> None:
     if path != _journal_path(config):
         raise StateError("ownerless validation journal filename is invalid")
     _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
+    selected_live_use_recheck = (
+        live_use_recheck
+        if live_use_recheck is not None
+        else (
+            batch_cleanup.live_use_recheck
+            if batch_cleanup is not None
+            else _LiveUseRecheckBudget()
+        )
+    )
     initial_authorization, _target, _fenced, initial_phase = _ownerless_validation_paths(
         config, raw
     )
@@ -23321,7 +23648,11 @@ def _recover_ownerless_validation(
     if initial_authorization.target_kind != "checkout":
         raw = _restore_ownerless_validation_exclusion(config, raw)
     authorization, target, fenced, active, repository = _ownerless_validation_inputs(
-        config, raw, recheck=False, batch_cleanup=batch_cleanup
+        config,
+        raw,
+        recheck=False,
+        batch_cleanup=batch_cleanup,
+        live_use_recheck=selected_live_use_recheck,
     )
     journal = dict(raw)
     if active is not None:
@@ -23332,6 +23663,7 @@ def _recover_ownerless_validation(
                     journal,
                     recheck=True,
                     batch_cleanup=batch_cleanup,
+                    live_use_recheck=selected_live_use_recheck,
                 )
             )
         except Refusal:
@@ -23419,6 +23751,7 @@ def _recover_ownerless_validation(
                     recheck=True,
                     batch_cleanup=batch_cleanup,
                     fresh_same_uid=(authorization.target_kind == "checkout"),
+                    live_use_recheck=selected_live_use_recheck,
                 )
             )
         except Refusal as exc:
@@ -26905,6 +27238,9 @@ class _PrivateCleanupContext:
     shared_census: _ProcessPathCensus
     census_budget: _ReadOnlyCommandBudget
     same_uid_census_performed: bool = False
+    live_use_recheck: _LiveUseRecheckBudget = dataclasses.field(
+        default_factory=_LiveUseRecheckBudget
+    )
 
 
 @dataclasses.dataclass
@@ -26915,6 +27251,9 @@ class _OwnerlessValidationBatchContext:
     shared_census: _ProcessPathCensus
     census_budget: _ReadOnlyCommandBudget
     same_uid_census_count: int = 0
+    live_use_recheck: _LiveUseRecheckBudget = dataclasses.field(
+        default_factory=_LiveUseRecheckBudget
+    )
 
     def assert_unused(
         self, config: Config, active: Path, *, fresh_same_uid: bool
@@ -26993,6 +27332,7 @@ class _FinishContext:
     allow_live_validate_owner: bool = False
     private_cleanup: _PrivateCleanupContext | None = None
     validation_removal_proof: _ValidationRemovalProof | None = None
+    live_use_recheck: _LiveUseRecheckBudget | None = None
 
 
 def _capture_process_path_census(
@@ -28621,6 +28961,11 @@ def _cmd_recover(
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
     )
+    live_use_recheck = (
+        ownerless_batch_cleanup.live_use_recheck
+        if ownerless_batch_cleanup is not None
+        else _LiveUseRecheckBudget()
+    )
     processes = _RecoveryProcesses(coordinator, runner, handoff_writer, proof_fd)
     with _mutation_locks(config, args.wait_lock):
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
@@ -28740,6 +29085,7 @@ def _cmd_recover(
                 coordinator,
                 states,
                 batch_cleanup=ownerless_batch_cleanup,
+                live_use_recheck=live_use_recheck,
             )
             _write_journal(config, journal)
             if legacy_requested:
@@ -28881,7 +29227,13 @@ def _cmd_recover(
                 )
             try:
                 _recover_finish(
-                    config, path, raw, state, coordinator, processes=processes
+                    config,
+                    path,
+                    raw,
+                    state,
+                    coordinator,
+                    processes=processes,
+                    live_use_recheck=live_use_recheck,
                 )
             except Refusal as exc:
                 _restore_interrupted_private_finish_after_refusal(
@@ -28915,6 +29267,7 @@ def _cmd_recover(
                 proof_fd,
                 batch_cleanup=ownerless_batch_cleanup,
                 emit=emit,
+                live_use_recheck=live_use_recheck,
             )
         elif kind == "ownerless-agent-remove":
             if args.retry_running_hook or args.abort_create:
