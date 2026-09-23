@@ -18825,6 +18825,109 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
     return True
 
 
+def _assert_abort_create_submodules_pristine(
+    checkout: Path, checkout_name: str, vcs: _GitVcs
+) -> None:
+    """Prove force-removable submodules contain no authored state."""
+
+    initialized = tuple(sorted(vcs.initialized_submodules(checkout)))
+    declared = tuple(
+        sorted(
+            path.relative_to(checkout).as_posix()
+            for path in _declared_initialized_submodules(checkout)
+        )
+    )
+    if initialized != declared:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: initialized submodule "
+            "declarations disagree; preserve it for inspection"
+        )
+    remaining = set(initialized)
+    repositories: list[tuple[Path, Path]] = [(Path(), checkout)]
+    for prefix, repository in repositories:
+        entries = vcs._run(repository, ["ls-tree", "-r", "-z", "HEAD"]).stdout
+        for entry in entries.split("\x00"):
+            if not entry.startswith("160000 "):
+                continue
+            metadata, separator, raw_path = entry.partition("\t")
+            fields = metadata.split()
+            relative = Path(raw_path)
+            if (
+                not separator
+                or len(fields) != 3
+                or fields[1] != "commit"
+                or not SHA_RE.fullmatch(fields[2])
+                or relative.is_absolute()
+                or not relative.parts
+                or ".." in relative.parts
+            ):
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: unsafe committed gitlink"
+                )
+            child_relative = prefix / relative
+            child = checkout / child_relative
+            _ensure_no_symlink_components(checkout, child, "create-abort submodule")
+            _ensure_no_mount_components(checkout, child, "create-abort submodule")
+            child_name = child_relative.as_posix()
+            if child_name not in initialized:
+                if child.exists() and (
+                    not child.is_dir() or any(child.iterdir())
+                ):
+                    raise Refusal(
+                        f"cannot abort changed checkout {checkout_name}: uninitialized "
+                        f"submodule {child_name} contains files; preserve it for inspection"
+                    )
+                continue
+            if vcs.repository_root(child) != child.absolute():
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{child_name} is not its exact Git root"
+                )
+            operations = vcs.operation_paths(child)
+            if operations:
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{child_name} has an unfinished Git operation: {operations[0]}"
+                )
+            vcs.assert_ordinary_history(child)
+            vcs.assert_ordinary_index(child)
+            if vcs.head(child) != fields[2]:
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{child_name} HEAD differs from its committed gitlink"
+                )
+            status = vcs._run(
+                child,
+                [
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.untrackedCache=false",
+                    "status",
+                    "--porcelain=v2",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                    "--ignore-submodules=none",
+                    "--",
+                    ".",
+                ],
+                env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+            ).stdout
+            if status:
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{child_name} source state is dirty ({status.splitlines()[0]}); "
+                    "preserve it for inspection"
+                )
+            remaining.discard(child_name)
+            repositories.append((child_relative, child))
+    if remaining:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: initialized submodule "
+            f"{sorted(remaining)[0]} has no committed gitlink; preserve it for inspection"
+        )
+
+
 def _abort_create(
     config: Config,
     journal_path: Path,
@@ -18903,6 +19006,7 @@ def _abort_create(
                     f"cannot abort changed checkout {item.name}: source state is dirty "
                     f"({first}); preserve it for inspection"
                 )
+            _assert_abort_create_submodules_pristine(destination, item.name, vcs)
             present = True
             caches = _cache_directories_for_checkout(config, checkout)
         elif destination.absolute() in vcs.listed_worktrees(repository):
@@ -18953,9 +19057,15 @@ def _abort_create(
                     f"cannot abort changed checkout {item.name}: source state is dirty "
                     f"({first}); preserve it for inspection"
                 )
+            _assert_abort_create_submodules_pristine(destination, item.name, vcs)
             for cache in caches:
                 _remove_cache_directory(config, cache)
-            vcs.remove_worktree(repository, destination)
+            # Git requires --force even for a clean linked worktree when any
+            # submodule is initialized.  This does not relax the abort policy:
+            # the exact worktree, branch, HEAD, ordinary index/history, clean
+            # source state, and unused slot were all checked above and then
+            # rechecked immediately before this removal.
+            vcs.remove_worktree(repository, destination, force=True)
             _fsync_directory(slot_path.parent)
     for item, repository, _destination, expected_head, _present, _checkout, _caches in preflight:
         vcs.delete_branch_at(repository, item.branch, expected_head)
