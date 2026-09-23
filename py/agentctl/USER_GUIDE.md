@@ -398,8 +398,18 @@ the same interface as a started interactive session. The registry owns those
 control artifacts, not the adopted process. Consequently, `agentctl stop NAME`
 revalidates the target, saves a final terminal snapshot, unregisters it, and
 archives its queue without closing the pane, tab, or process. Stop the foreign
-runtime through the authority that created it. If the recorded live identity can
-no longer be verified, `stop` refuses and leaves the registration in place.
+runtime through the authority that created it. Adoption accepts Herdr's pane
+shell only when kernel process inspection identifies a supported shell image,
+then records its boot ID, PID, process start ticks, and executable device/inode.
+Every `stop` requires that exact shell generation both before and after the
+snapshot, including while the foreign agent is still live. If Herdr no longer
+reports the agent or its native session, `stop` additionally proves the same
+recorded pane and tab contain that exact idle shell generation. An adopted
+record without the shell identity refuses automatic retirement. A still-live
+agent may move between tabs inside the recorded workspace because its pane,
+harness, working directory, native session (when reported), and original shell
+generation remain independently pinned. Any other missing or changed identity
+refuses and leaves the registration in place.
 
 `send` accepts literal text or `--file`. In interactive mode, the instruction is
 persisted before submission. The manager waits for native readiness, records an
@@ -492,9 +502,15 @@ agentctl stop reviewer
 
 Stopping closes only a runtime created and owned by the session manager, then
 archives its state. For an adopted `herdr-foreign` record, stopping means safe
-unregistration: the manager verifies the recorded identity, saves a terminal
-snapshot, archives its record and queue, and leaves the pane, tab, and process
-running.
+unregistration: the manager verifies the supported shell's exact recorded
+generation, verifies the live agent or proves the same pane and tab contain
+that shell at an idle prompt, saves a terminal snapshot, repeats those proofs,
+archives its record and queue, and leaves the pane, tab, and process untouched.
+A live pane may have moved to another tab in the same workspace; its process,
+session, and original shell identity must still match the record. An adopted
+record without the shell's boot ID, PID, start ticks, and executable
+device/inode cannot be retired automatically, whether the agent looks live or
+absent.
 An unavailable terminal server is not proof that an agent died. A lost terminal
 view is not proof that a headless runner stopped. Preserve the registry and
 inspect `status` when ownership checks refuse an operation.

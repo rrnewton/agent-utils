@@ -38,6 +38,10 @@ class FakeManagedClient:
             version=1, boot_id="00000000-0000-0000-0000-000000000000",
             pid=200, starttime_ticks=200, executable_device=1, executable_inode=2,
         )
+        self.foreign_shell_identity = CustomProcessIdentity(
+            version=1, boot_id="11111111-2222-3333-4444-555555555555",
+            pid=100, starttime_ticks=100, executable_device=3, executable_inode=4,
+        )
 
     def workspace_id_for_label(self, label: str) -> str | None:
         assert label == "subagents"
@@ -117,6 +121,16 @@ class FakeManagedClient:
     def pane_is_idle_shell(self, pane_id: str) -> bool:
         assert pane_id in self.infos
         return self.custom_at_idle_shell
+
+    def pane_shell_identity(self, pane_id: str) -> CustomProcessIdentity:
+        assert pane_id in self.infos
+        return self.foreign_shell_identity
+
+    def pane_is_same_idle_shell(
+        self, pane_id: str, expected: CustomProcessIdentity,
+    ) -> bool:
+        assert pane_id in self.infos
+        return self.custom_at_idle_shell and expected == self.foreign_shell_identity
 
     def agent_pane(self, name: str) -> str:
         matches = [entry[2] for entry in self.launched if entry[0] == name]

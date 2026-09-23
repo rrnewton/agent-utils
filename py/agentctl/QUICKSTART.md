@@ -70,7 +70,12 @@ while keeping their terminals available for direct inspection.
 5. Finish with `agentctl stop reviewer`. This stops a runtime created by
    `agentctl` and archives its session state. For an adopted agent it only
    unregisters and archives the control state; the foreign pane and process keep
-   running. Exiting the CLI or closing its caller does not stop the worker.
+   running. Adoption accepts only a supported shell process and records its
+   exact generation. Unregistration requires that same shell generation before
+   and after the final snapshot whether the foreign agent is live or has
+   exited; the exited path additionally requires the recorded idle shell.
+   Records without that process identity refuse automatic retirement.
+   Exiting the CLI or closing its caller does not stop the worker.
 
 State defaults to `.agentctl` in the current directory. Use the same
 `--registry /absolute/path` across callers. Workers share the working directory

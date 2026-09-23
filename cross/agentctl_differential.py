@@ -25,6 +25,10 @@ _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
 _GOAL_COMMAND = ("--goal-command-json", '["<HERDR>","goal-rpc"]')
 _CAPABILITIES = ["send", "status", "read", "wait", "stop", "attach", "pause", "resume",
                  "terminal-snapshot", "drain", "goal", "bind-session"]
+_SHELL_IDENTITY_FIELDS = {
+    "version", "boot_id", "pid", "starttime_ticks",
+    "executable_device", "executable_inode",
+}
 
 
 def _normalize(value: object) -> object:
@@ -39,6 +43,27 @@ def _normalize(value: object) -> object:
                           if key == "probe_error" and isinstance(item, str) else _normalize(item))
                 for key, item in value.items()}
     return value
+
+
+def _valid_foreign_shell_identity(value: object) -> bool:
+    """Require the complete cross-edition six-field shell identity schema."""
+    if not isinstance(value, dict) or set(value) != _SHELL_IDENTITY_FIELDS:
+        return False
+    boot_id = value.get("boot_id")
+    positive_fields = (
+        value.get("pid"), value.get("starttime_ticks"),
+        value.get("executable_device"), value.get("executable_inode"),
+    )
+    return (
+        value.get("version") == 1
+        and isinstance(boot_id, str)
+        and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            boot_id,
+        ) is not None
+        and all(isinstance(item, int) and not isinstance(item, bool) and item > 0
+                for item in positive_fields)
+    )
 
 
 def _json(outcome: Outcome) -> object:
@@ -1156,6 +1181,25 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
         and processed.get("tui_delivery_attempts") == 0,
         f"pre-profile pending artifact diverged or was lost: {snapshots!r}",
     )
+    _change(case, {"empty_shell": True})
+    _pair(
+        harness,
+        report,
+        case,
+        "primary/legacy-adopted/dead-stop-refusal",
+        ("stop", "foreign", *_COMMON),
+        75,
+    )
+    report.require(
+        "primary/legacy-adopted/dead-stop-preserved",
+        all(
+            (root / "registry/foreign/agent.json").is_file()
+            and not _state(root).get("closed")
+            and not _state(root).get("closed_panes")
+            for root in (case.python_root, case.rust_root)
+        ),
+        "legacy adopted record without shell identity was retired or mutated",
+    )
 
 
 def _ownership(harness: Harness, report: Report) -> None:
@@ -1196,6 +1240,12 @@ def _adoption(harness: Harness, report: Report) -> None:
                        "workspace_id": "w1", "session_agent": "codex",
                        "session_value": "session-1", "capabilities": _CAPABILITIES,
                    }.items()), f"adoption lost exact live identity: {adopted!r}")
+    report.require(
+        "primary/adopt/shell-identity-schema",
+        isinstance(adopted, dict)
+        and _valid_foreign_shell_identity(adopted.get("foreign_shell_identity")),
+        f"adoption did not retain the exact six-field shell identity: {adopted!r}",
+    )
     for command in (("status", "foreign"), ("list",),
                     ("wait", "foreign", "--timeout", "0")):
         _pair(harness, report, case, f"primary/adopt/{command[0]}", (*command, *common))
@@ -1222,6 +1272,110 @@ def _adoption(harness: Harness, report: Report) -> None:
                                "*/queue/processed/adopted-1.json"))) == 1
                            for root in (case.python_root, case.rust_root)),
                    f"unregister mutated a foreign runtime or lost durable state: {stopped!r}")
+
+    retirement_cases: tuple[tuple[str, Mapping[str, object], int], ...] = (
+        ("absent-idle", {"empty_shell": True}, 0),
+        (
+            "absent-restart-during-capture",
+            {"empty_shell": True, "restart_agent_on_read": True},
+            75,
+        ),
+        (
+            "absent-leaves-idle-during-capture",
+            {"empty_shell": True, "leave_idle_shell_on_read": True},
+            75,
+        ),
+        ("live-moved-tab", {"tab_id": "w1:moved"}, 0),
+        ("absent-moved-tab", {"empty_shell": True, "tab_id": "w1:moved"}, 75),
+    )
+    for label, changed_state, expected in retirement_cases:
+        retirement = harness.case(f"primary-adoption-retire-{label}")
+        _pair(harness, report, retirement, f"primary/adopt/{label}/register", (
+            "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+            "--cwd", "<ROOT>", "--harness", "codex", "--session", "session-1",
+            *common,
+        ))
+        _change(retirement, changed_state)
+        _pair(
+            harness,
+            report,
+            retirement,
+            f"primary/adopt/{label}/stop",
+            ("stop", "foreign", *common),
+            expected,
+        )
+        report.require(
+            f"primary/adopt/{label}/state",
+            all(
+                not _state(root).get("closed")
+                and not _state(root).get("closed_panes")
+                and (root / "registry/foreign").exists() == (expected != 0)
+                for root in (retirement.python_root, retirement.rust_root)
+            ),
+            f"foreign runtime mutation or registry outcome diverged for {label}",
+        )
+
+    replacement_shell = {
+        "fixture_shell_pid": harness.replacement_shell.pid,
+        "fixture_shell_executable": harness.fixture_shell_executable,
+    }
+    for label, initial_state, session_arguments in (
+        ("live-replaced-shell", {}, ("--session", "session-1")),
+        ("sessionless-live-replaced-shell", {"sessionless": True}, ()),
+    ):
+        replacement_case = harness.case(f"primary-adoption-retire-{label}", initial_state)
+        _pair(harness, report, replacement_case, f"primary/adopt/{label}/register", (
+            "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+            "--cwd", "<ROOT>", "--harness", "codex", *session_arguments, *common,
+        ))
+        _change(replacement_case, replacement_shell)
+        _pair(
+            harness,
+            report,
+            replacement_case,
+            f"primary/adopt/{label}/stop",
+            ("stop", "foreign", *common),
+            75,
+        )
+        report.require(
+            f"primary/adopt/{label}/preserved",
+            all(
+                (root / "registry/foreign/agent.json").is_file()
+                and not _state(root).get("closed")
+                and not _state(root).get("closed_panes")
+                for root in (replacement_case.python_root, replacement_case.rust_root)
+            ),
+            f"live replacement was archived or its runtime was mutated for {label}",
+        )
+
+    legacy_live = harness.case("primary-adoption-retire-live-legacy")
+    _pair(harness, report, legacy_live, "primary/adopt/live-legacy/register", (
+        "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+        "--cwd", "<ROOT>", "--harness", "codex", "--session", "session-1", *common,
+    ))
+    for root in (legacy_live.python_root, legacy_live.rust_root):
+        path = root / "registry/foreign/agent.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        del document["foreign_shell_identity"]
+        path.write_text(json.dumps(document), encoding="utf-8")
+    _pair(
+        harness,
+        report,
+        legacy_live,
+        "primary/adopt/live-legacy/stop",
+        ("stop", "foreign", *common),
+        75,
+    )
+    report.require(
+        "primary/adopt/live-legacy/preserved",
+        all(
+            (root / "registry/foreign/agent.json").is_file()
+            and not _state(root).get("closed")
+            and not _state(root).get("closed_panes")
+            for root in (legacy_live.python_root, legacy_live.rust_root)
+        ),
+        "live legacy record was automatically retired or its runtime was mutated",
+    )
 
     mismatch_cases: tuple[tuple[str, Mapping[str, object], tuple[str, ...]], ...] = (
         ("non-agent", {"harness": None}, ()),
@@ -1264,6 +1418,7 @@ def _adoption(harness: Harness, report: Report) -> None:
         sent = harness._invoke_one(consumer, root, (
             "send", "foreign", "cross-engine adopted request", *common,
         ))
+        _change(interop, {"empty_shell": True})
         stopped = harness._invoke_one(consumer, root, ("stop", "foreign", *common))
         report.require(f"primary/adopt/interop-{label}", all(
             outcome.returncode == 0 for outcome in (adopted, status, sent, stopped)
@@ -1308,17 +1463,20 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
     report = Report()
     with tempfile.TemporaryDirectory(prefix="agentctl-cross-") as temporary:
         harness = Harness(Path(temporary), python_command, rust_command)
-        _orientation(harness, report)
-        _lifecycle(harness, report)
-        _profiles(harness, report)
-        _skill_install(harness, report)
-        _profile_refusals(harness, report)
-        _handoff_and_pending(harness, report)
-        _registry_and_interop(harness, report)
-        _legacy_adopted_registry_and_queue(harness, report)
-        _ownership(harness, report)
-        _adoption(harness, report)
-        _invalid_cli(harness, report)
+        try:
+            _orientation(harness, report)
+            _lifecycle(harness, report)
+            _profiles(harness, report)
+            _skill_install(harness, report)
+            _profile_refusals(harness, report)
+            _handoff_and_pending(harness, report)
+            _registry_and_interop(harness, report)
+            _legacy_adopted_registry_and_queue(harness, report)
+            _ownership(harness, report)
+            _adoption(harness, report)
+            _invalid_cli(harness, report)
+        finally:
+            harness.close()
     return report
 
 

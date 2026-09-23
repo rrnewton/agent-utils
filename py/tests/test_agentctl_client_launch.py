@@ -231,6 +231,84 @@ def test_custom_harness_rejects_matching_report_when_kernel_executable_differs(
         client.verify_custom_harness("p1", "muse")
 
 
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_recorded_pane_shell_identity_rejects_every_generation_change() -> None:
+    executable = os.path.realpath("/bin/bash")
+    shell = subprocess.Popen(
+        [executable, "--noprofile", "--norc"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        foreground: dict[str, object] = {
+            "pid": shell.pid,
+            "name": "bash",
+            "cmdline": executable,
+            "argv": [executable],
+            "executable": executable,
+        }
+        process_info: dict[str, object] = {
+            "pane_id": "p1",
+            "shell_pid": shell.pid,
+            "foreground_process_group_id": shell.pid,
+            "foreground_processes": [foreground],
+        }
+        runner = Runner({"process_info": process_info})
+        client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
+        identity = client.pane_shell_identity("p1")
+
+        assert client.pane_is_same_idle_shell("p1", identity)
+        mismatches = (
+            replace(identity, boot_id="ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            replace(identity, pid=identity.pid + 1),
+            replace(identity, starttime_ticks=identity.starttime_ticks + 1),
+            replace(identity, executable_device=identity.executable_device + 1),
+            replace(identity, executable_inode=identity.executable_inode + 1),
+        )
+        assert all(
+            not client.pane_is_same_idle_shell("p1", item) for item in mismatches
+        )
+
+        foreground["argv"] = [os.path.realpath("/usr/bin/sleep")]
+        assert not client.pane_is_same_idle_shell("p1", identity)
+    finally:
+        shell.terminate()
+        shell.wait(timeout=5)
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_real_non_shell_process_cannot_be_adopted_as_a_pane_shell() -> None:
+    executable = os.path.realpath("/usr/bin/sleep")
+    process = subprocess.Popen([executable, "30"], start_new_session=True)
+    try:
+        process_info: dict[str, object] = {
+            "pane_id": "p1",
+            "shell_pid": process.pid,
+            "foreground_process_group_id": process.pid,
+            "foreground_processes": [{
+                "pid": process.pid,
+                "name": "sleep",
+                "cmdline": f"{executable} 30",
+                "argv": [executable, "30"],
+                "executable": executable,
+            }],
+        }
+        client = HerdrClient(
+            herdr_bin="fixture-herdr", run=Runner({"process_info": process_info})
+        )
+        observed = client._process_identity(process.pid)
+        assert observed is not None
+        with pytest.raises(HerdrUnavailable, match="supported identity-bound shell"):
+            client.pane_shell_identity("p1")
+        assert not client.pane_is_idle_shell("p1")
+        assert not client.pane_is_same_idle_shell("p1", observed[0])
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
 def test_recorded_custom_process_identity_survives_atomic_executable_replacement(
     tmp_path: Path,
 ) -> None:

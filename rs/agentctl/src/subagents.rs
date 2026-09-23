@@ -223,6 +223,22 @@ pub trait ManagedApi: AgentApi {
             "idle shell verification is unavailable",
         ))
     }
+    /// Capture the exact process generation of the shell Herdr owns for a pane.
+    fn pane_shell_identity(&self, _pane: &str) -> crate::error::Result<CustomProcessIdentity> {
+        Err(crate::error::AdapterError::unavailable(
+            "pane shell identity is unavailable",
+        ))
+    }
+    /// Prove both idle-shell state and the exact process generation captured earlier.
+    fn pane_is_same_idle_shell(
+        &self,
+        _pane: &str,
+        _expected: &CustomProcessIdentity,
+    ) -> crate::error::Result<bool> {
+        Err(crate::error::AdapterError::unavailable(
+            "identity-bound idle shell verification is unavailable",
+        ))
+    }
     /// Cancellation-aware custom harness verification.
     fn verify_custom_harness_with_runtime(
         &self,
@@ -403,6 +419,16 @@ impl ManagedApi for HerdrClient {
     fn pane_is_idle_shell(&self, pane: &str) -> crate::error::Result<bool> {
         HerdrClient::pane_is_idle_shell(self, pane)
     }
+    fn pane_shell_identity(&self, pane: &str) -> crate::error::Result<CustomProcessIdentity> {
+        HerdrClient::pane_shell_identity(self, pane)
+    }
+    fn pane_is_same_idle_shell(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+    ) -> crate::error::Result<bool> {
+        HerdrClient::pane_is_same_idle_shell(self, pane, expected)
+    }
     fn verify_custom_harness_with_runtime(
         &self,
         pane: &str,
@@ -446,6 +472,8 @@ struct AgentRecord {
     pane_reported_by_agentctl: bool,
     #[serde(default)]
     custom_process_identity: Option<CustomProcessIdentity>,
+    #[serde(default)]
+    foreign_shell_identity: Option<CustomProcessIdentity>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
     name: String,
@@ -1238,6 +1266,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         || record.pane_id.as_deref().is_none_or(str::is_empty)
                         || !identity.valid()
                 })
+            || record
+                .foreign_shell_identity
+                .as_ref()
+                .is_some_and(|identity| {
+                    record.adapter != "herdr-foreign"
+                        || record.pane_id.as_deref().is_none_or(str::is_empty)
+                        || !identity.valid()
+                })
         {
             return Err(fail(format!("invalid agent record: {}", path.display())));
         }
@@ -1378,6 +1414,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             runtime_home: None,
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
+            foreign_shell_identity: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -1540,6 +1577,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 options.pane_id
             )));
         }
+        let shell_identity = self.client.pane_shell_identity(&info.pane_id)?;
         for entry in fs::read_dir(&self.registry).map_err(|error| fail(error.to_string()))? {
             let entry = entry.map_err(|error| fail(error.to_string()))?;
             let existing_name = entry.file_name().to_string_lossy().into_owned();
@@ -1594,6 +1632,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 options.pane_id
             )));
         }
+        if self.client.pane_shell_identity(&confirmed.pane_id)? != shell_identity {
+            return Err(fail(format!(
+                "refusing pane {}: pane shell process changed before adoption",
+                options.pane_id
+            )));
+        }
         DirBuilder::new()
             .mode(0o700)
             .create(&directory)
@@ -1610,6 +1654,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             runtime_home: None,
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
+            foreign_shell_identity: Some(shell_identity.clone()),
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -1661,6 +1706,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 || Some(&live[0].workspace_id) != record.workspace_id.as_ref()
             {
                 return Err(fail("final live-presentation verification failed"));
+            }
+            if self.client.pane_shell_identity(&confirmed.pane_id)? != shell_identity {
+                return Err(fail("final pane shell process identity changed"));
             }
             Ok(result)
         });
@@ -1863,6 +1911,88 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             },
             &record.target()?,
         )
+    }
+
+    fn inspect_foreign(
+        &self,
+        agent_name: &str,
+        record: &AgentRecord,
+    ) -> Result<(bool, AgentPaneInfo, Pane)> {
+        let pane_id = record
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| fail("adopted agent record has no pane identity"))?;
+        let mut presentations: Vec<Pane> = self
+            .client
+            .panes()?
+            .into_iter()
+            .filter(|pane| pane.pane_id == pane_id)
+            .collect();
+        if presentations.len() != 1 {
+            return Err(fail(format!(
+                "refusing to unregister adopted agent {agent_name:?}: expected one recorded pane, found {}",
+                presentations.len()
+            )));
+        }
+        let presentation = presentations.pop().expect("one presentation was checked");
+        if record.workspace_id.as_deref() != Some(presentation.workspace_id.as_str()) {
+            return Err(fail(format!(
+                "refusing to unregister adopted agent {agent_name:?}: recorded presentation workspace changed"
+            )));
+        }
+        let info = self.client.pane_info(&presentation.pane_id)?;
+        let cwd_matches = info.cwd == record.cwd
+            || fs::canonicalize(&info.cwd)
+                .ok()
+                .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+        if info.pane_id != presentation.pane_id
+            || Some(&info.workspace_id) != record.workspace_id.as_ref()
+            || !cwd_matches
+        {
+            return Err(fail(format!(
+                "refusing to unregister adopted agent {agent_name:?}: recorded pane, workspace, or cwd changed"
+            )));
+        }
+        let shell_identity = record.foreign_shell_identity.as_ref().ok_or_else(|| {
+            fail(format!(
+                "refusing to unregister adopted agent {agent_name:?}: legacy record has no identity-bound pane shell"
+            ))
+        })?;
+        if self.client.pane_shell_identity(&info.pane_id)? != *shell_identity {
+            return Err(fail(format!(
+                "refusing to unregister adopted agent {agent_name:?}: recorded pane shell generation changed"
+            )));
+        }
+        if info.agent.is_none() {
+            // A live agent is pinned by its harness and, when one was
+            // reported, native session. A returned shell has no such process
+            // identity, so its recorded tab remains part of the fallback
+            // proof. This still lets an operator unregister a fully
+            // revalidated live agent after moving its pane between tabs in the
+            // same workspace.
+            if record.tab_id.as_deref() != Some(presentation.tab_id.as_str()) {
+                return Err(fail(format!(
+                    "refusing to unregister adopted agent {agent_name:?}: recorded tab changed while the agent was absent"
+                )));
+            }
+            if info.session_agent.is_some() || info.session_value.is_some() {
+                return Err(fail(format!(
+                    "refusing pane {}: absent agent has native session identity",
+                    info.pane_id
+                )));
+            }
+            if !self
+                .client
+                .pane_is_same_idle_shell(&info.pane_id, shell_identity)?
+            {
+                return Err(fail(format!(
+                    "refusing pane {}: absent agent is not at the recorded identity-bound idle shell process group",
+                    info.pane_id
+                )));
+            }
+            return Ok((false, info, presentation));
+        }
+        Ok((true, self.checked(record)?, presentation))
     }
 
     /// Report live state or an explicit probe error without reaping durable records.
@@ -2472,7 +2602,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut record = self.load(agent_name)?;
         record.supported()?;
         if record.adapter == "herdr-foreign" {
-            let info = self.checked(&record)?;
+            let (live, info, presentation) = self.inspect_foreign(agent_name, &record)?;
             let mut text = self
                 .client
                 .read(&info.pane_id, "recent-unwrapped", Some(5000))?;
@@ -2482,7 +2612,30 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             self.snapshot(&record, &text)?;
             // Output capture is another control round trip. Refuse archival if
             // the exact foreign identity changed while it was in progress.
-            self.checked(&record)?;
+            let (final_live, final_info, final_presentation) = self
+                .inspect_foreign(agent_name, &record)
+                .map_err(|error| {
+                    fail(format!(
+                        "refusing to unregister adopted agent {agent_name:?}: runtime identity could not be reverified after output capture: {error}"
+                    ))
+                })?;
+            let cwd_stable = final_info.cwd == info.cwd
+                || fs::canonicalize(&final_info.cwd)
+                    .ok()
+                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&info.cwd).ok());
+            if final_live != live
+                || final_info.pane_id != info.pane_id
+                || final_info.workspace_id != info.workspace_id
+                || !cwd_stable
+                || final_info.agent != info.agent
+                || final_info.session_agent != info.session_agent
+                || final_info.session_value != info.session_value
+                || final_presentation != presentation
+            {
+                return Err(fail(format!(
+                    "refusing to unregister adopted agent {agent_name:?}: runtime identity changed during output capture"
+                )));
+            }
             record.lifecycle = "stopped".to_owned();
             self.save(&record)?;
             let archive = self.registry.join("archive");
@@ -2640,6 +2793,12 @@ mod tests {
                     custom_dies_after_report: AtomicBool::new(false),
                     custom_fails_after_identity: AtomicBool::new(false),
                     custom_at_idle_shell: AtomicBool::new(true),
+                    foreign_shell_identity: Mutex::new(Fake::foreign_shell_identity()),
+                    change_foreign_shell_after_save: AtomicBool::new(false),
+                    change_foreign_shell_on_read: AtomicBool::new(false),
+                    restart_foreign_on_read: AtomicBool::new(false),
+                    leave_idle_shell_on_read: AtomicBool::new(false),
+                    wrong_foreign_cwd: AtomicBool::new(false),
                 },
                 root,
             }
@@ -2726,6 +2885,12 @@ mod tests {
         custom_dies_after_report: AtomicBool,
         custom_fails_after_identity: AtomicBool,
         custom_at_idle_shell: AtomicBool,
+        foreign_shell_identity: Mutex<CustomProcessIdentity>,
+        change_foreign_shell_after_save: AtomicBool,
+        change_foreign_shell_on_read: AtomicBool,
+        restart_foreign_on_read: AtomicBool,
+        leave_idle_shell_on_read: AtomicBool,
+        wrong_foreign_cwd: AtomicBool,
     }
     impl Fake {
         fn pane(id: &str) -> Pane {
@@ -2744,6 +2909,17 @@ mod tests {
                 starttime_ticks: 9001,
                 executable_device: 7,
                 executable_inode: 11,
+            }
+        }
+
+        fn foreign_shell_identity() -> CustomProcessIdentity {
+            CustomProcessIdentity {
+                version: 1,
+                boot_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
+                pid: 100,
+                starttime_ticks: 8001,
+                executable_device: 13,
+                executable_inode: 17,
             }
         }
     }
@@ -2806,7 +2982,11 @@ mod tests {
                     "workspace"
                 }
                 .to_owned(),
-                cwd: self.root.display().to_string(),
+                cwd: if self.wrong_foreign_cwd.load(Ordering::Relaxed) {
+                    self.root.join("other").display().to_string()
+                } else {
+                    self.root.display().to_string()
+                },
                 agent: self
                     .started
                     .load(Ordering::Relaxed)
@@ -2840,6 +3020,19 @@ mod tests {
         fn read(&self, _: &str, _: &str, _: Option<usize>) -> AdapterResult<String> {
             if self.add_sibling_on_read.swap(false, Ordering::Relaxed) {
                 self.panes.lock().unwrap().push(Self::pane("human"));
+            }
+            if self.restart_foreign_on_read.swap(false, Ordering::Relaxed) {
+                self.started.store(true, Ordering::Relaxed);
+                self.report_session.store(true, Ordering::Relaxed);
+            }
+            if self.leave_idle_shell_on_read.swap(false, Ordering::Relaxed) {
+                self.custom_at_idle_shell.store(false, Ordering::Relaxed);
+            }
+            if self
+                .change_foreign_shell_on_read
+                .swap(false, Ordering::Relaxed)
+            {
+                self.foreign_shell_identity.lock().unwrap().starttime_ticks += 1;
             }
             Ok("visible output".to_owned())
         }
@@ -2962,6 +3155,24 @@ mod tests {
         fn pane_is_idle_shell(&self, _: &str) -> AdapterResult<bool> {
             Ok(!self.custom_alive.load(Ordering::Relaxed)
                 && self.custom_at_idle_shell.load(Ordering::Relaxed))
+        }
+        fn pane_shell_identity(&self, _: &str) -> AdapterResult<CustomProcessIdentity> {
+            let mut identity = self.foreign_shell_identity.lock().unwrap().clone();
+            if self.change_foreign_shell_after_save.load(Ordering::Relaxed)
+                && self.root.join("registry/foreign/agent.json").exists()
+            {
+                identity.starttime_ticks += 1;
+            }
+            Ok(identity)
+        }
+        fn pane_is_same_idle_shell(
+            &self,
+            _: &str,
+            expected: &CustomProcessIdentity,
+        ) -> AdapterResult<bool> {
+            Ok(!self.custom_alive.load(Ordering::Relaxed)
+                && self.custom_at_idle_shell.load(Ordering::Relaxed)
+                && *expected == *self.foreign_shell_identity.lock().unwrap())
         }
         fn agent_pane(&self, _: &str) -> AdapterResult<String> {
             Ok("owned".to_owned())
@@ -3299,6 +3510,10 @@ mod tests {
         assert_eq!(adopted["pane_id"], "owned");
         assert_eq!(adopted["session_agent"], "codex");
         assert_eq!(adopted["session_value"], "thread");
+        assert_eq!(
+            adopted["foreign_shell_identity"],
+            json!(Fake::foreign_shell_identity())
+        );
         assert_eq!(manager.list().unwrap().len(), 1);
         manager
             .send("foreign", "follow up", DrainOptions::default())
@@ -3361,6 +3576,489 @@ mod tests {
                 .unwrap()
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn adoption_archives_a_failed_generation_if_the_shell_changes_after_save() {
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        fixture
+            .client
+            .change_foreign_shell_after_save
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture
+            .manager()
+            .adopt("foreign", fixture.adopt_options())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("was not registered"));
+        assert!(!fixture.root.join("registry/foreign").exists());
+        let archives = fs::read_dir(fixture.root.join("registry/archive"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(archives.len(), 1);
+        let saved = agent::read_private_json(&archives[0].path().join("agent.json")).unwrap();
+        assert_eq!(saved["lifecycle"], "adopt_failed");
+        assert!(saved["error"]
+            .as_str()
+            .unwrap()
+            .contains("shell process identity changed"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stopping_a_confirmed_dead_adopted_agent_only_archives_control_state() {
+        let fixture = Fixture::new();
+        let adopted = fixture.adopt();
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let presentation = Fake::pane("owned");
+
+        let stopped = fixture.manager().stop("foreign").unwrap();
+
+        assert_eq!(stopped["runtime_preserved"], true);
+        assert_eq!(stopped["pane_closed"], false);
+        assert_eq!(stopped["tab_closed"], false);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(*fixture.client.panes.lock().unwrap(), [presentation]);
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        let saved = agent::read_private_json(&archive.join("agent.json")).unwrap();
+        assert_eq!(saved["token"], adopted["token"]);
+        assert!(archive.join("output.json").is_file());
+    }
+
+    #[test]
+    fn stopping_an_absent_adopted_agent_refuses_a_non_idle_pane() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .custom_at_idle_shell
+            .store(false, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error.to_string().contains("identity-bound idle shell"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_an_absent_adopted_agent_refuses_native_session_residue() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture.client.started.store(false, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("absent agent has native session identity"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_an_absent_adopted_agent_refuses_replaced_shell_generations() {
+        let original = Fake::foreign_shell_identity();
+        let mut replacements = Vec::new();
+        let mut new_pane_shell = original.clone();
+        new_pane_shell.pid += 1;
+        replacements.push(new_pane_shell);
+        let mut reused_pid = original.clone();
+        reused_pid.starttime_ticks += 1;
+        replacements.push(reused_pid);
+        let mut replaced_image = original;
+        replaced_image.executable_inode += 1;
+        replacements.push(replaced_image);
+
+        for replacement in replacements {
+            let fixture = Fixture::new();
+            fixture.adopt();
+            fixture.client.started.store(false, Ordering::Relaxed);
+            fixture
+                .client
+                .report_session
+                .store(false, Ordering::Relaxed);
+            *fixture.client.foreign_shell_identity.lock().unwrap() = replacement;
+
+            let error = fixture.manager().stop("foreign").unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("recorded pane shell generation changed"));
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert_eq!(
+                fixture.manager().load("foreign").unwrap().lifecycle,
+                "running"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_an_absent_legacy_adopted_agent_refuses_missing_shell_identity() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        let path = fixture.root.join("registry/foreign/agent.json");
+        let mut document = agent::read_private_json(&path).unwrap();
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("foreign_shell_identity");
+        agent::atomic_json(&path, &document).unwrap();
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("legacy record has no identity-bound"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_live_adopted_agents_refuses_replaced_shell_generations() {
+        let original = Fake::foreign_shell_identity();
+        let mut replacements = Vec::new();
+        let mut new_pane_shell = original.clone();
+        new_pane_shell.pid += 1;
+        replacements.push(new_pane_shell);
+        let mut reused_pid = original.clone();
+        reused_pid.starttime_ticks += 1;
+        replacements.push(reused_pid);
+        let mut replaced_image = original;
+        replaced_image.executable_inode += 1;
+        replacements.push(replaced_image);
+
+        for replacement in replacements {
+            let fixture = Fixture::new();
+            fixture.adopt();
+            *fixture.client.foreign_shell_identity.lock().unwrap() = replacement;
+
+            let error = fixture.manager().stop("foreign").unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("recorded pane shell generation changed"));
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.client.started.load(Ordering::Relaxed));
+            assert_eq!(
+                fixture.manager().load("foreign").unwrap().lifecycle,
+                "running"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_a_sessionless_live_adopted_agent_refuses_replaced_shell_generation() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let adopted = fixture.adopt();
+        assert!(adopted["session_value"].is_null());
+        fixture
+            .client
+            .foreign_shell_identity
+            .lock()
+            .unwrap()
+            .starttime_ticks += 1;
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("recorded pane shell generation changed"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert!(fixture.client.started.load(Ordering::Relaxed));
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_a_live_legacy_adopted_agent_refuses_missing_shell_identity() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        let path = fixture.root.join("registry/foreign/agent.json");
+        let mut document = agent::read_private_json(&path).unwrap();
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("foreign_shell_identity");
+        agent::atomic_json(&path, &document).unwrap();
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("legacy record has no identity-bound"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert!(fixture.client.started.load(Ordering::Relaxed));
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_a_live_adopted_agent_refuses_shell_change_during_capture() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture
+            .client
+            .change_foreign_shell_on_read
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("identity could not be reverified"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert!(fixture.client.started.load(Ordering::Relaxed));
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_an_absent_adopted_agent_refuses_shell_change_during_capture() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .change_foreign_shell_on_read
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("identity could not be reverified"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_an_absent_adopted_agent_refuses_cwd_change() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .wrong_foreign_cwd
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error.to_string().contains("workspace, or cwd changed"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_an_absent_adopted_agent_refuses_a_moved_tab() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture.client.panes.lock().unwrap()[0].tab_id = "moved-tab".to_owned();
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("recorded tab changed while the agent was absent"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_a_revalidated_live_adopted_agent_allows_a_moved_tab() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture.client.panes.lock().unwrap()[0].tab_id = "moved-tab".to_owned();
+
+        let stopped = fixture.manager().stop("foreign").unwrap();
+
+        assert_eq!(stopped["runtime_preserved"], true);
+        assert_eq!(stopped["pane_closed"], false);
+        assert_eq!(stopped["tab_closed"], false);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(fixture.client.panes.lock().unwrap()[0].tab_id, "moved-tab");
+        assert!(fixture.manager().list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stopping_an_adopted_agent_refuses_missing_or_duplicated_recorded_pane() {
+        for presentation_count in [0, 2] {
+            let fixture = Fixture::new();
+            fixture.adopt();
+            let original = fixture.client.panes.lock().unwrap()[0].clone();
+            let mut panes = fixture.client.panes.lock().unwrap();
+            panes.clear();
+            if presentation_count == 2 {
+                panes.push(original.clone());
+                let mut duplicate = original;
+                duplicate.tab_id = "duplicate-tab".to_owned();
+                panes.push(duplicate);
+            }
+            drop(panes);
+
+            let error = fixture.manager().stop("foreign").unwrap_err();
+
+            assert!(error.to_string().contains(&format!(
+                "expected one recorded pane, found {presentation_count}"
+            )));
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert_eq!(
+                fixture.manager().load("foreign").unwrap().lifecycle,
+                "running"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_a_live_adopted_agent_refuses_a_replaced_native_session() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture
+            .client
+            .change_session_after_save
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error.to_string().contains("exactly one live pane"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_a_dead_adopted_agent_refuses_leaving_idle_during_capture() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .leave_idle_shell_on_read
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("identity could not be reverified"));
+        assert!(message.contains("identity-bound idle shell"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_a_dead_adopted_agent_refuses_restart_during_capture() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .restart_foreign_on_read
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error.to_string().contains("runtime identity changed"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
+        );
+    }
+
+    #[test]
+    fn stopping_a_sessionless_adopted_agent_refuses_a_new_session_during_capture() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture.adopt();
+        fixture
+            .client
+            .restart_foreign_on_read
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture.manager().stop("foreign").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("runtime identity changed during output capture"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture.manager().load("foreign").unwrap().lifecycle,
+            "running"
         );
     }
 
@@ -3901,6 +4599,48 @@ mod tests {
         agent::atomic_json(&path, &record).unwrap();
         let error = manager.load("worker").unwrap_err();
         assert!(error.to_string().contains("invalid agent record"));
+    }
+
+    #[test]
+    fn foreign_shell_identity_record_is_strict_but_legacy_absence_loads() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        let manager = fixture.manager();
+        let path = fixture.root.join("registry/foreign/agent.json");
+        let original = agent::read_private_json(&path).unwrap();
+
+        let mut malformed = original.clone();
+        malformed["foreign_shell_identity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("starttime_ticks");
+        agent::atomic_json(&path, &malformed).unwrap();
+        assert!(manager
+            .load("foreign")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid agent record"));
+
+        let mut wrong_adapter = original.clone();
+        wrong_adapter["adapter"] = json!("herdr");
+        agent::atomic_json(&path, &wrong_adapter).unwrap();
+        assert!(manager
+            .load("foreign")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid agent record"));
+
+        let mut legacy = original;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("foreign_shell_identity");
+        agent::atomic_json(&path, &legacy).unwrap();
+        assert!(manager
+            .load("foreign")
+            .unwrap()
+            .foreign_shell_identity
+            .is_none());
     }
 
     #[test]

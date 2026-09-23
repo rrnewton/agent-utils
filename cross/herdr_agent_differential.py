@@ -108,7 +108,12 @@ if args[:2] == ["pane", "list"]:
         print("server unavailable", file=sys.stderr)
         save()
         raise SystemExit(1)
-    panes = [] if state.get("closed") else [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}]
+    panes = [] if state.get("closed") or state.get("missing_pane") else [{
+        "pane_id": "w1:p1", "tab_id": state.get("tab_id", "w1:t1"),
+        "workspace_id": "w1",
+    }]
+    if state.get("duplicate_recorded_pane"):
+        panes.append({"pane_id":"w1:p1", "tab_id":"w1:duplicate", "workspace_id":"w1"})
     if state.get("extra_pane"):
         panes.append({"pane_id":"w1:p2", "tab_id":"w1:t1", "workspace_id":"w1"})
     envelope({"panes": panes})
@@ -125,24 +130,39 @@ elif args[:2] == ["pane", "get"]:
         "cwd": root,
         "agent": None if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("harness", "codex"),
         "agent_status": "unknown" if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("status", "idle"),
-        "agent_session": None if human or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": "session-1"},
+        "agent_session": None if human or state.get("empty_shell") or state.get("sessionless") or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": "session-1"},
     }})
 elif args[:2] == ["pane", "process-info"]:
-    command = ("/tmp/lookalike/muse" if state.get("wrong_custom_process")
-               else state.get("launch_command", "/usr/local/bin/muse"))
-    parsed = shlex.split(command)
-    executable = parsed[0]
-    process_pid = state.get("custom_pid", 200)
-    foreground_processes = [] if state.get("custom_identity_hidden") else [
-        {"pid":process_pid, "name":os.path.basename(executable),
-         "cmdline":command, "argv":parsed, "executable":executable}
-    ]
-    envelope({"process_info": {
-        "pane_id":"w1:p1", "shell_pid":100,
-        "foreground_process_group_id":(
+    shell_pid = state["fixture_shell_pid"]
+    shell_executable = state["fixture_shell_executable"]
+    if state.get("empty_shell"):
+        process_pid = shell_pid
+        command = shell_executable
+        parsed = [shell_executable]
+        foreground_processes = [
+            {"pid":process_pid, "name":os.path.basename(shell_executable),
+             "cmdline":command, "argv":parsed, "executable":shell_executable}
+        ]
+        foreground_process_group_id = (
+            process_pid + 1 if state.get("idle_shell_busy") else process_pid
+        )
+    else:
+        command = ("/tmp/lookalike/muse" if state.get("wrong_custom_process")
+                   else state.get("launch_command", "/usr/local/bin/muse"))
+        parsed = shlex.split(command)
+        executable = parsed[0]
+        process_pid = state.get("custom_pid", 200)
+        foreground_processes = [] if state.get("custom_identity_hidden") else [
+            {"pid":process_pid, "name":os.path.basename(executable),
+             "cmdline":command, "argv":parsed, "executable":executable}
+        ]
+        foreground_process_group_id = (
             process_pid + 1 if state.get("wrong_custom_process_group")
             else process_pid if state.get("custom_pid") else 200
-        ),
+        )
+    envelope({"process_info": {
+        "pane_id":"w1:p1", "shell_pid":shell_pid,
+        "foreground_process_group_id":foreground_process_group_id,
         "foreground_processes":foreground_processes,
     }})
 elif args[:2] == ["tab", "create"]:
@@ -245,6 +265,10 @@ elif args[:2] == ["agent", "wait"]:
 elif args[:2] == ["pane", "read"]:
     if state.get("extra_pane_on_read"):
         state["extra_pane"] = True
+    if state.get("restart_agent_on_read"):
+        state["empty_shell"] = False
+    if state.get("leave_idle_shell_on_read"):
+        state["idle_shell_busy"] = True
     source = args[args.index("--source") + 1]
     if source == "visible" and state.get("screen"):
         sys.stdout.write(state["screen"])
@@ -322,6 +346,35 @@ class Harness:
         self.python = tuple(python)
         self.rust = tuple(rust)
         self.serial = 0
+        shell = os.path.realpath("/bin/bash")
+        self.fixture_shell = subprocess.Popen(
+            [shell, "--noprofile", "--norc"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.replacement_shell = subprocess.Popen(
+            [shell, "--noprofile", "--norc"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.fixture_shell_executable = shell
+
+    def close(self) -> None:
+        """Reap only the two shell generations created by this differential."""
+        for process in (self.fixture_shell, self.replacement_shell):
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
     def case(self, label: str, state: Mapping[str, object] | None = None) -> PairCase:
         self.serial += 1
@@ -329,7 +382,13 @@ class Harness:
         base = self.root / f"{self.serial:03d}-{safe}"
         python_root = base / "python" / "project"
         rust_root = base / "rust" / "project"
-        initial: dict[str, object] = {"status": "idle", "calls": [], "submitted": []}
+        initial: dict[str, object] = {
+            "status": "idle",
+            "calls": [],
+            "submitted": [],
+            "fixture_shell_pid": self.fixture_shell.pid,
+            "fixture_shell_executable": self.fixture_shell_executable,
+        }
         if state is not None:
             initial.update(state)
         for root in (python_root, rust_root):
@@ -1184,15 +1243,18 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
     report = Report()
     with tempfile.TemporaryDirectory(prefix="herdr-agent-cross-") as temporary:
         harness = Harness(Path(temporary), python_command, rust_command)
-        _bootstrap(harness, report)
-        _status_and_read(harness, report)
-        _successful_send(harness, report)
-        _pending_and_ambiguous(harness, report)
-        _adversarial_queue(harness, report)
-        _shared_queue_interop(harness, report)
-        _cross_process_serialization(harness, report)
-        _invalid_cli(harness, report)
-        _managed_lifecycle(harness, report)
+        try:
+            _bootstrap(harness, report)
+            _status_and_read(harness, report)
+            _successful_send(harness, report)
+            _pending_and_ambiguous(harness, report)
+            _adversarial_queue(harness, report)
+            _shared_queue_interop(harness, report)
+            _cross_process_serialization(harness, report)
+            _invalid_cli(harness, report)
+            _managed_lifecycle(harness, report)
+        finally:
+            harness.close()
     return report
 
 

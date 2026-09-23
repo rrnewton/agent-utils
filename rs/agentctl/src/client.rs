@@ -27,11 +27,12 @@ const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CAPTURE_READ_BURST: usize = 256 * 1024;
 const PROC_STAT_BYTES: usize = 8 * 1024;
 const BOOT_ID_BYTES: usize = 128;
+const SUPPORTED_PANE_SHELLS: [&str; 6] = ["bash", "zsh", "sh", "dash", "fish", "ksh"];
 #[cfg(all(test, target_os = "linux"))]
 static POLL_CAPTURE_INTERRUPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Durable identity of one custom harness process.
+/// Durable identity of one pane-owned process generation.
 ///
 /// A pathname is deliberately absent: package upgrades may atomically replace the
 /// installed image while the old process remains alive. The boot/start tuple binds
@@ -39,8 +40,8 @@ static POLL_CAPTURE_INTERRUPTS: std::sync::atomic::AtomicUsize =
 /// Each observation holds a pidfd so PID reuse cannot interleave its `/proc` reads.
 /// Across separate invocations, Linux exposes no persistent handle in this schema;
 /// reuse of the same PID by the same executable within one scheduler tick remains a
-/// theoretical ambiguity and is why this identity authorizes pane closure, not an
-/// independently targeted signal to that PID.
+/// theoretical ambiguity. The identity is used only alongside pane and terminal-state
+/// checks; it never independently authorizes a signal to the PID.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomProcessIdentity {
@@ -81,6 +82,14 @@ struct PinnedHarnessExecutable {
 struct LiveCustomProcess {
     identity: CustomProcessIdentity,
     process_group_id: u64,
+    executable_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct PaneProcessState {
+    shell_pid: u64,
+    foreground_process_group_id: u64,
+    processes: Vec<Map<String, Value>>,
 }
 
 fn canonical_boot_uuid(value: &str) -> bool {
@@ -245,14 +254,26 @@ fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
     require_live_pidfd(&pidfd, pid)?;
     let boot_before = current_boot_uuid()?;
     let stat_before = process_stat(pid)?;
+    let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
+    let executable_path_before = fs::read_link(&executable_path).map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot read executable path for custom process {pid}: {error}"
+        ))
+    })?;
     let executable_before = executable_identity(pid)?;
     let stat_after = process_stat(pid)?;
     let executable_after = executable_identity(pid)?;
+    let executable_path_after = fs::read_link(&executable_path).map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot reread executable path for custom process {pid}: {error}"
+        ))
+    })?;
     let boot_after = current_boot_uuid()?;
     require_live_pidfd(&pidfd, pid)?;
     if boot_before != boot_after
         || stat_before != stat_after
         || executable_before != executable_after
+        || executable_path_before != executable_path_after
     {
         return Err(AdapterError::unavailable(format!(
             "custom process {pid} identity changed while it was inspected"
@@ -268,6 +289,7 @@ fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
             executable_inode: executable_before.1,
         },
         process_group_id: stat_before.0,
+        executable_path: executable_path_before,
     })
 }
 
@@ -276,6 +298,21 @@ fn live_custom_process(_pid: u64) -> Result<LiveCustomProcess> {
     Err(AdapterError::unavailable(
         "custom process identity requires Linux pidfds and procfs",
     ))
+}
+
+fn supported_shell_name(path: &Path) -> bool {
+    let Some(mut name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if let Some(value) = name.strip_suffix(" (deleted)") {
+        name = value;
+    }
+    SUPPORTED_PANE_SHELLS.contains(&name)
+}
+
+fn supported_shell_process(pid: u64) -> Result<Option<LiveCustomProcess>> {
+    let observed = live_custom_process(pid)?;
+    Ok(supported_shell_name(&observed.executable_path).then_some(observed))
 }
 
 fn safe_executable_metadata(metadata: &fs::Metadata) -> bool {
@@ -887,6 +924,48 @@ impl HerdrClient {
         Ok(())
     }
 
+    fn pane_process_state(
+        &self,
+        pane_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PaneProcessState> {
+        let result = self.call_with_cancellation(
+            &strings(&["pane", "process-info", "--pane", pane_id]),
+            &format!("pane process-info {pane_id}"),
+            cancelled,
+        )?;
+        let info = required_object(&result, "process_info", "pane process-info")?;
+        if required_string(info, "pane_id", "pane process-info")? != pane_id {
+            return Err(AdapterError::unavailable(
+                "pane process-info returned a different pane identity",
+            ));
+        }
+        let shell_pid = info
+            .get("shell_pid")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+            .ok_or_else(|| {
+                AdapterError::unavailable(
+                    "pane process-info: shell_pid is not a positive Linux process id",
+                )
+            })?;
+        let foreground_process_group_id = info
+            .get("foreground_process_group_id")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+            .ok_or_else(|| {
+                AdapterError::unavailable(
+                    "pane process-info: foreground_process_group_id is not a positive Linux process id",
+                )
+            })?;
+        let processes = value_array(info.get("foreground_processes"), "foreground_processes")?;
+        Ok(PaneProcessState {
+            shell_pid,
+            foreground_process_group_id,
+            processes: object_entries(processes, "foreground process")?,
+        })
+    }
+
     fn foreground_processes(
         &self,
         pane_id: &str,
@@ -1014,42 +1093,11 @@ impl HerdrClient {
     /// Prove that no child command owns the terminal and the foreground process
     /// group contains only the pane's Herdr-reported shell process.
     pub fn pane_is_idle_shell(&self, pane_id: &str) -> Result<bool> {
-        let result = self.call(
-            &strings(&["pane", "process-info", "--pane", pane_id]),
-            &format!("pane process-info {pane_id}"),
-        )?;
-        let info = required_object(&result, "process_info", "pane process-info")?;
-        if required_string(info, "pane_id", "pane process-info")? != pane_id {
-            return Err(AdapterError::unavailable(
-                "pane process-info returned a different pane identity",
-            ));
-        }
-        let shell_pid = info
-            .get("shell_pid")
-            .and_then(Value::as_u64)
-            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
-            .ok_or_else(|| {
-                AdapterError::unavailable(
-                    "pane process-info: shell_pid is not a positive Linux process id",
-                )
-            })?;
-        let foreground_pgid = info
-            .get("foreground_process_group_id")
-            .and_then(Value::as_u64)
-            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
-            .ok_or_else(|| {
-                AdapterError::unavailable(
-                    "pane process-info: foreground_process_group_id is not a positive Linux process id",
-                )
-            })?;
-        let processes = object_entries(
-            value_array(info.get("foreground_processes"), "foreground_processes")?,
-            "foreground process",
-        )?;
-        if foreground_pgid != shell_pid || processes.len() != 1 {
+        let state = self.pane_process_state(pane_id, &|| false)?;
+        if state.foreground_process_group_id != state.shell_pid || state.processes.len() != 1 {
             return Ok(false);
         }
-        let process = &processes[0];
+        let process = &state.processes[0];
         let pid = process
             .get("pid")
             .and_then(Value::as_u64)
@@ -1066,8 +1114,71 @@ impl HerdrClient {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let argv_executable = fs::canonicalize(argv0).ok();
-        let kernel_executable = fs::canonicalize(format!("/proc/{shell_pid}/exe")).ok();
-        Ok(pid == shell_pid && argv_executable.is_some() && argv_executable == kernel_executable)
+        let kernel_executable = fs::canonicalize(format!("/proc/{}/exe", state.shell_pid)).ok();
+        let observed = supported_shell_process(state.shell_pid)?;
+        Ok(pid == state.shell_pid
+            && argv_executable.is_some()
+            && argv_executable == kernel_executable
+            && observed.is_some_and(|value| value.process_group_id == state.shell_pid))
+    }
+
+    /// Capture the exact Linux process generation and executable image for a pane shell.
+    pub fn pane_shell_identity(&self, pane_id: &str) -> Result<CustomProcessIdentity> {
+        let state = self.pane_process_state(pane_id, &|| false)?;
+        let observed = supported_shell_process(state.shell_pid)?
+            .filter(|value| value.process_group_id == state.shell_pid)
+            .ok_or_else(|| {
+                AdapterError::unavailable(format!(
+                    "cannot capture a supported identity-bound shell process for pane {pane_id}"
+                ))
+            })?;
+        Ok(observed.identity)
+    }
+
+    /// Require the recorded shell generation and Herdr's strict idle-shell presentation.
+    pub fn pane_is_same_idle_shell(
+        &self,
+        pane_id: &str,
+        expected: &CustomProcessIdentity,
+    ) -> Result<bool> {
+        if !expected.valid() {
+            return Err(AdapterError::unavailable(
+                "recorded pane shell identity is invalid",
+            ));
+        }
+        let state = self.pane_process_state(pane_id, &|| false)?;
+        if state.shell_pid != expected.pid
+            || state.foreground_process_group_id != state.shell_pid
+            || state.processes.len() != 1
+        {
+            return Ok(false);
+        }
+        let process = &state.processes[0];
+        let pid = process
+            .get("pid")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+            .ok_or_else(|| {
+                AdapterError::unavailable(
+                    "foreground process: \"pid\" is not a positive Linux process id",
+                )
+            })?;
+        let argv0 = process
+            .get("argv")
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let argv_executable = fs::canonicalize(argv0).ok();
+        let kernel_executable = fs::canonicalize(format!("/proc/{}/exe", state.shell_pid)).ok();
+        let observed = supported_shell_process(state.shell_pid)?;
+        Ok(pid == state.shell_pid
+            && argv_executable.is_some()
+            && argv_executable == kernel_executable
+            && observed.is_some_and(|value| {
+                value.identity == *expected
+                    && value.process_group_id == state.foreground_process_group_id
+            }))
     }
 
     pub(crate) fn verify_custom_harness_with_cancellation(
@@ -2511,6 +2622,104 @@ mod tests {
             executable.arguments(),
             serde_json::json!(["pane", "close", "workspace:pane"])
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorded_pane_shell_identity_refuses_every_generation_change() {
+        let executable = fs::canonicalize("/bin/bash").unwrap();
+        let mut command = Command::new(&executable);
+        command
+            .args(["--noprofile", "--norc"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let shell = ChildGuard(command.spawn().expect("start real test shell"));
+        let pid = shell.0.id();
+        let response = |argv0: &Path| {
+            serde_json::json!({
+                "result": {
+                    "process_info": {
+                        "pane_id": "pane",
+                        "shell_pid": pid,
+                        "foreground_process_group_id": pid,
+                        "foreground_processes": [{
+                            "pid": pid,
+                            "argv": [argv0.display().to_string()]
+                        }]
+                    }
+                }
+            })
+            .to_string()
+        };
+        let herdr = FakeExecutable::new(&response(&executable));
+        let identity = herdr.client().pane_shell_identity("pane").unwrap();
+        assert!(herdr
+            .client()
+            .pane_is_same_idle_shell("pane", &identity)
+            .unwrap());
+
+        let mut mismatches = Vec::new();
+        let mut value = identity.clone();
+        value.boot_id = "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned();
+        mismatches.push(value);
+        let mut value = identity.clone();
+        value.pid += 1;
+        mismatches.push(value);
+        let mut value = identity.clone();
+        value.starttime_ticks += 1;
+        mismatches.push(value);
+        let mut value = identity.clone();
+        value.executable_device += 1;
+        mismatches.push(value);
+        let mut value = identity.clone();
+        value.executable_inode += 1;
+        mismatches.push(value);
+        for mismatch in mismatches {
+            assert!(!herdr
+                .client()
+                .pane_is_same_idle_shell("pane", &mismatch)
+                .unwrap());
+        }
+
+        herdr.set_response(&response(Path::new("/usr/bin/sleep")));
+        assert!(!herdr
+            .client()
+            .pane_is_same_idle_shell("pane", &identity)
+            .unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_non_shell_process_cannot_be_adopted_as_a_pane_shell() {
+        let executable = fs::canonicalize("/usr/bin/sleep").unwrap();
+        let process = spawn_test_process(&executable);
+        let pid = process.0.id();
+        let response = serde_json::json!({
+            "result": {
+                "process_info": {
+                    "pane_id": "pane",
+                    "shell_pid": pid,
+                    "foreground_process_group_id": pid,
+                    "foreground_processes": [{
+                        "pid": pid,
+                        "argv": [executable.display().to_string(), "30"]
+                    }]
+                }
+            }
+        })
+        .to_string();
+        let herdr = FakeExecutable::new(&response);
+        let identity = live_custom_process(u64::from(pid)).unwrap().identity;
+
+        let error = herdr.client().pane_shell_identity("pane").unwrap_err();
+        assert!(error.to_string().contains("supported identity-bound shell"));
+        assert!(!herdr.client().pane_is_idle_shell("pane").unwrap());
+        assert!(!herdr
+            .client()
+            .pane_is_same_idle_shell("pane", &identity)
+            .unwrap());
     }
 
     #[cfg(target_os = "linux")]

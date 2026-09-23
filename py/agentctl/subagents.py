@@ -135,6 +135,7 @@ class AgentRecord:
     runtime_home: str | None = None
     pane_reported_by_agentctl: bool = False
     custom_process_identity: CustomProcessIdentity | None = None
+    foreign_shell_identity: CustomProcessIdentity | None = None
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
     def to_document(self) -> dict[str, object]:
@@ -201,14 +202,16 @@ class AgentRecord:
             raise AgentDeliveryError(f"invalid pause state in {path}")
         if not isinstance(document.get("pane_reported_by_agentctl", False), bool):
             raise AgentDeliveryError(f"invalid pane report ownership in {path}")
-        raw_identity = document.get("custom_process_identity")
-        if raw_identity is not None:
+        def process_identity(key: str) -> CustomProcessIdentity | None:
+            raw_identity = document.get(key)
+            if raw_identity is None:
+                return None
             if (not isinstance(raw_identity, dict)
                     or set(raw_identity) != {
                         "version", "boot_id", "pid", "starttime_ticks",
                         "executable_device", "executable_inode",
                     }):
-                raise AgentDeliveryError(f"invalid custom process identity in {path}")
+                raise AgentDeliveryError(f"invalid {key.replace('_', ' ')} in {path}")
             identity = cast(dict[str, object], raw_identity)
             integers = [
                 identity.get("version"), identity.get("pid"),
@@ -227,20 +230,33 @@ class AgentRecord:
                     or not 1 <= cast(int, identity["starttime_ticks"]) <= _MAX_U64
                     or not 1 <= cast(int, identity["executable_device"]) <= _MAX_U64
                     or not 1 <= cast(int, identity["executable_inode"]) <= _MAX_U64):
-                raise AgentDeliveryError(f"invalid custom process identity in {path}")
-            fields["custom_process_identity"] = CustomProcessIdentity(
+                raise AgentDeliveryError(f"invalid {key.replace('_', ' ')} in {path}")
+            return CustomProcessIdentity(
                 version=1, boot_id=boot_id, pid=cast(int, identity["pid"]),
                 starttime_ticks=cast(int, identity["starttime_ticks"]),
                 executable_device=cast(int, identity["executable_device"]),
                 executable_inode=cast(int, identity["executable_inode"]),
             )
-        if (raw_identity is not None
+        custom_identity = process_identity("custom_process_identity")
+        foreign_shell_identity = process_identity("foreign_shell_identity")
+        if custom_identity is not None:
+            fields["custom_process_identity"] = custom_identity
+        if foreign_shell_identity is not None:
+            fields["foreign_shell_identity"] = foreign_shell_identity
+        if (custom_identity is not None
                 and (document.get("adapter", "herdr") != "herdr-pane"
                      or document.get("harness") != "muse"
                      or not isinstance(document.get("pane_id"), str)
                      or not document["pane_id"])):
             raise AgentDeliveryError(
                 f"custom process identity requires a Muse herdr-pane in {path}"
+            )
+        if (foreign_shell_identity is not None
+                and (document.get("adapter", "herdr") != "herdr-foreign"
+                     or not isinstance(document.get("pane_id"), str)
+                     or not document["pane_id"])):
+            raise AgentDeliveryError(
+                f"foreign shell identity requires a herdr-foreign pane in {path}"
             )
         home = document.get("runtime_home")
         if home is not None and (not isinstance(home, str) or not Path(home).is_absolute()):
@@ -737,6 +753,7 @@ class ManagedAgents:
             raise AgentDeliveryError(
                 f"refusing pane {pane_id}: presentation workspace identity changed"
             )
+        shell_identity = self.client.pane_shell_identity(info.pane_id)
         if self.registry.exists():
             agent._validate_private_directory(str(self.registry), "agent registry")
             for path in self.registry.iterdir():
@@ -772,6 +789,10 @@ class ManagedAgents:
             raise AgentDeliveryError(
                 f"refusing pane {pane_id}: live presentation changed before adoption"
             )
+        if self.client.pane_shell_identity(confirmed.pane_id) != shell_identity:
+            raise AgentDeliveryError(
+                f"refusing pane {pane_id}: pane shell process changed before adoption"
+            )
         directory.mkdir(mode=0o700)
         agent._fsync_dir(str(self.registry))
         record = AgentRecord(
@@ -781,6 +802,7 @@ class ManagedAgents:
             session_agent=info.session_agent,
             session_value=info.session_value,
             adapter="herdr-foreign", mode="interactive", backend="herdr",
+            foreign_shell_identity=shell_identity,
         )
         self._save(record)
         try:
@@ -800,6 +822,8 @@ class ManagedAgents:
             if (len(live) != 1 or live[0].tab_id != record.tab_id
                     or live[0].workspace_id != record.workspace_id):
                 raise AgentDeliveryError("final live-presentation verification failed")
+            if self.client.pane_shell_identity(confirmed.pane_id) != shell_identity:
+                raise AgentDeliveryError("final pane shell process identity changed")
             return result
         except (HerdrRunError, OSError) as exc:
             try:
@@ -1100,7 +1124,69 @@ class ManagedAgents:
                 # This registry owns only delivery state.  Revalidate and retain
                 # one final snapshot, but never close, rename, signal, or
                 # otherwise mutate the adopted runtime.
-                info = self._checked(record)
+                def inspect_foreign() -> tuple[str, AgentPaneInfo, Pane]:
+                    presentations = [
+                        pane for pane in self.client.panes()
+                        if pane.pane_id == record.pane_id
+                    ]
+                    if len(presentations) != 1:
+                        raise AgentDeliveryError(
+                            f"refusing to unregister adopted agent {name!r}: "
+                            f"expected one recorded pane, found {len(presentations)}"
+                        )
+                    presentation = presentations[0]
+                    if presentation.workspace_id != record.workspace_id:
+                        raise AgentDeliveryError(
+                            f"refusing to unregister adopted agent {name!r}: "
+                            "recorded presentation workspace changed"
+                        )
+                    info = self.client.pane_info(presentation.pane_id)
+                    if (info.pane_id != record.pane_id
+                            or info.workspace_id != record.workspace_id
+                            or os.path.realpath(info.cwd) != os.path.realpath(record.cwd)):
+                        raise AgentDeliveryError(
+                            f"refusing to unregister adopted agent {name!r}: "
+                            "recorded pane, workspace, or cwd changed"
+                        )
+                    shell_identity = record.foreign_shell_identity
+                    if shell_identity is None:
+                        raise AgentDeliveryError(
+                            f"refusing to unregister adopted agent {name!r}: "
+                            "legacy record has no identity-bound pane shell"
+                        )
+                    if self.client.pane_shell_identity(info.pane_id) != shell_identity:
+                        raise AgentDeliveryError(
+                            f"refusing to unregister adopted agent {name!r}: "
+                            "recorded pane shell generation changed"
+                        )
+                    if info.agent is None:
+                        # A live agent is pinned by its harness and, when one was
+                        # reported, native session.  A returned shell has no such
+                        # process identity, so its recorded tab remains part of
+                        # the fallback proof.  This still lets an operator
+                        # unregister a fully revalidated live agent after moving
+                        # its pane between tabs in the same workspace.
+                        if presentation.tab_id != record.tab_id:
+                            raise AgentDeliveryError(
+                                f"refusing to unregister adopted agent {name!r}: "
+                                "recorded tab changed while the agent was absent"
+                            )
+                        if info.session_agent is not None or info.session_value is not None:
+                            raise AgentDeliveryError(
+                                f"refusing pane {info.pane_id}: absent agent has "
+                                "native session identity"
+                            )
+                        if not self.client.pane_is_same_idle_shell(
+                            info.pane_id, shell_identity
+                        ):
+                            raise AgentDeliveryError(
+                                f"refusing pane {info.pane_id}: absent agent is not "
+                                "at the recorded identity-bound idle shell process group"
+                            )
+                        return "absent", info, presentation
+                    return "live", self._checked(record), presentation
+
+                state, info, presentation = inspect_foreign()
                 try:
                     output = self.client.read(info.pane_id, source="recent-unwrapped", lines=5000)
                     if not output:
@@ -1112,7 +1198,38 @@ class ManagedAgents:
                     raise AgentDeliveryError(
                         f"cannot preserve terminal output before unregistering: {exc}"
                     ) from exc
-                self._checked(record)
+                try:
+                    final_state, final_info, final_presentation = inspect_foreign()
+                except (AgentDeliveryError, HerdrRunError) as exc:
+                    raise AgentDeliveryError(
+                        f"refusing to unregister adopted agent {name!r}: "
+                        "runtime identity could not be reverified after output capture"
+                    ) from exc
+                if (
+                    final_state,
+                    final_info.pane_id,
+                    final_info.workspace_id,
+                    os.path.realpath(final_info.cwd),
+                    final_info.agent,
+                    final_info.session_agent,
+                    final_info.session_value,
+                    final_presentation.tab_id,
+                    final_presentation.workspace_id,
+                ) != (
+                    state,
+                    info.pane_id,
+                    info.workspace_id,
+                    os.path.realpath(info.cwd),
+                    info.agent,
+                    info.session_agent,
+                    info.session_value,
+                    presentation.tab_id,
+                    presentation.workspace_id,
+                ):
+                    raise AgentDeliveryError(
+                        f"refusing to unregister adopted agent {name!r}: "
+                        "runtime identity changed during output capture"
+                    )
                 record.lifecycle = "stopped"
                 self._save(record)
                 archive = self.registry / "archive"

@@ -43,6 +43,7 @@ CONTROL_TIMEOUT_SECONDS = 30.0
 # implementation (or a Linux process API) cannot represent.
 _MAX_PROCESS_ID = 2_147_483_647
 _MAX_U64 = (1 << 64) - 1
+_SUPPORTED_PANE_SHELLS = frozenset(("bash", "zsh", "sh", "dash", "fish", "ksh"))
 _MUSE_EFFORT = re.compile(r"[a-z0-9_-]{1,32}\Z")
 _BOOT_ID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
@@ -179,7 +180,7 @@ class ProcessInfo:
 
 @dataclass(frozen=True)
 class CustomProcessIdentity:
-    """Kernel identity of one custom harness process across executable upgrades."""
+    """Kernel identity of one pane-owned process generation."""
 
     version: int
     boot_id: str
@@ -618,8 +619,10 @@ class HerdrClient:
             return None
 
     @staticmethod
-    def _process_identity(pid: int) -> tuple[CustomProcessIdentity, int] | None:
-        """Read a coherent Linux process/image identity without following its pathname."""
+    def _process_identity(
+        pid: int,
+    ) -> tuple[CustomProcessIdentity, int, str] | None:
+        """Read a coherent Linux process/image identity and kernel executable link."""
         if not hasattr(os, "pidfd_open"):
             return None
         descriptor: int | None = None
@@ -667,9 +670,11 @@ class HerdrClient:
 
             boot_before = boot_identity()
             first = process_stat()
+            executable_link_before = os.readlink(f"/proc/{pid}/exe")
             executable_before = os.stat(f"/proc/{pid}/exe")
             second = process_stat()
             executable_after = os.stat(f"/proc/{pid}/exe")
+            executable_link_after = os.readlink(f"/proc/{pid}/exe")
             boot_after = boot_identity()
             if poller.poll(0):
                 return None
@@ -679,6 +684,7 @@ class HerdrClient:
             os.close(descriptor)
         if (boot_before is None or boot_before != boot_after
                 or first is None or second is None or first != second
+                or executable_link_before != executable_link_after
                 or not stat.S_ISREG(executable_before.st_mode)
                 or not stat.S_ISREG(executable_after.st_mode)
                 or executable_before.st_dev <= 0 or executable_before.st_ino <= 0
@@ -694,7 +700,25 @@ class HerdrClient:
                 executable_inode=executable_before.st_ino,
             ),
             first[0],
+            executable_link_before,
         )
+
+    @staticmethod
+    def _supported_shell_name(executable: str) -> bool:
+        """Recognize the bounded shell roles supported by Herdr's default policy."""
+        name = os.path.basename(executable)
+        if name.endswith(" (deleted)"):
+            name = name.removesuffix(" (deleted)")
+        return name in _SUPPORTED_PANE_SHELLS
+
+    def _supported_shell_identity(
+        self, pid: int,
+    ) -> tuple[CustomProcessIdentity, int, str] | None:
+        """Return one coherent generation only when the kernel image is a known shell."""
+        observed = self._process_identity(pid)
+        if observed is None or not self._supported_shell_name(observed[2]):
+            return None
+        return observed
 
     def _pane_process_identity(
         self, info: ProcessInfo, executable: str | None,
@@ -722,10 +746,11 @@ class HerdrClient:
                         executable_device=metadata.st_dev, executable_inode=metadata.st_ino,
                     ),
                     info.foreground_pgid,
+                    reported_executable,
                 )
             if observed is None:
                 continue
-            identity, process_group_id = observed
+            identity, process_group_id, _observed_executable = observed
             if process_group_id != info.foreground_pgid:
                 continue
             if expected is not None:
@@ -764,7 +789,43 @@ class HerdrClient:
             return False
         _pid, _name, _command, argv0, _reported = info.foreground[0]
         observed = self._process_executable(info.shell_pid)
-        return observed is not None and observed == os.path.realpath(argv0)
+        shell = self._supported_shell_identity(info.shell_pid)
+        return (
+            observed is not None
+            and observed == os.path.realpath(argv0)
+            and shell is not None
+            and shell[1] == info.shell_pid
+        )
+
+    def pane_shell_identity(self, pane_id: str) -> CustomProcessIdentity:
+        """Capture the kernel identity of the shell process Herdr owns for one pane."""
+        info = self.process_info(pane_id)
+        observed = self._supported_shell_identity(info.shell_pid)
+        if observed is None or observed[1] != info.shell_pid:
+            raise HerdrUnavailable(
+                f"cannot capture a supported identity-bound shell process for pane {pane_id}"
+            )
+        return observed[0]
+
+    def pane_is_same_idle_shell(
+        self, pane_id: str, expected: CustomProcessIdentity,
+    ) -> bool:
+        """Prove both idle-shell state and the exact shell generation captured earlier."""
+        info = self.process_info(pane_id)
+        if (info.foreground_pgid != info.shell_pid or len(info.foreground) != 1
+                or info.foreground[0][0] != info.shell_pid
+                or info.shell_pid != expected.pid):
+            return False
+        _pid, _name, _command, argv0, _reported = info.foreground[0]
+        observed_path = self._process_executable(info.shell_pid)
+        observed = self._supported_shell_identity(info.shell_pid)
+        return (
+            observed_path is not None
+            and observed_path == os.path.realpath(argv0)
+            and observed is not None
+            and observed[0] == expected
+            and observed[1] == info.foreground_pgid
+        )
 
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),

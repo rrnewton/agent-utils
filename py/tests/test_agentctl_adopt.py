@@ -10,7 +10,7 @@ from typing import cast
 import pytest
 
 from agentctl import cli
-from agentctl.client import AgentPaneInfo, HerdrClient
+from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient
 from agentctl.errors import AgentDeliveryError
 from agentctl.sessions import Sessions
 from agentctl.subagents import AgentRecord
@@ -57,6 +57,14 @@ def test_adopted_agent_supports_named_operations_and_preserves_native_identity(
     assert result["pane_id"] == pane
     assert result["session_agent"] == "codex"
     assert result["session_value"] == "native-session"
+    assert result["foreign_shell_identity"] == {
+        "version": 1,
+        "boot_id": "11111111-2222-3333-4444-555555555555",
+        "pid": 100,
+        "starttime_ticks": 100,
+        "executable_device": 3,
+        "executable_inode": 4,
+    }
     assert result["capabilities"] == [
         "send", "status", "read", "wait", "stop", "attach", "pause", "resume",
         "terminal-snapshot", "drain", "goal", "bind-session",
@@ -99,6 +107,458 @@ def test_stop_unregisters_foreign_agent_without_closing_or_mutating_runtime(
     assert saved["token"] == original["token"]
     assert (archive / "output.json").is_file()
     assert list((archive / "queue/processed").iterdir())
+
+
+def test_stop_unregisters_confirmed_dead_foreign_agent_without_closing_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    presentation = fake.presentations[0]
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+
+    stopped = sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert stopped["runtime_preserved"] is True
+    assert stopped["pane_closed"] is False and stopped["tab_closed"] is False
+    assert fake.closed == []
+    assert fake.presentations == [presentation]
+    assert fake.infos[pane].agent is None
+    assert sessions.list() == []
+    archive = Path(str(stopped["archive"]))
+    assert (archive / "output.json").is_file()
+    assert json.loads((archive / "agent.json").read_text())["token"] == original["token"]
+
+
+def test_malformed_foreign_shell_identities_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, pane = setup_foreign(tmp_path, monkeypatch)
+    adopt(sessions, pane, tmp_path)
+    path = sessions.registry / "foreign" / "agent.json"
+    original = json.loads(path.read_text(encoding="utf-8"))
+    identity = original["foreign_shell_identity"]
+    assert isinstance(identity, dict)
+
+    variants: list[dict[str, object]] = []
+    for field, value in (
+        ("version", True),
+        ("pid", 0),
+        ("pid", 2_147_483_648),
+        ("starttime_ticks", 0),
+        ("starttime_ticks", 1 << 64),
+        ("executable_device", 0),
+        ("executable_inode", 1 << 64),
+        ("boot_id", "NOT-A-BOOT-ID"),
+    ):
+        variant = json.loads(json.dumps(original))
+        variant["foreign_shell_identity"][field] = value
+        variants.append(variant)
+    missing = json.loads(json.dumps(original))
+    del missing["foreign_shell_identity"]["starttime_ticks"]
+    variants.append(missing)
+    unknown = json.loads(json.dumps(original))
+    unknown["foreign_shell_identity"]["unexpected"] = 1
+    variants.append(unknown)
+    wrong_adapter = json.loads(json.dumps(original))
+    wrong_adapter["adapter"] = "herdr"
+    variants.append(wrong_adapter)
+
+    for document in variants:
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with pytest.raises(AgentDeliveryError, match="foreign shell identity"):
+            sessions.get("foreign")
+
+
+def test_stop_refuses_absent_foreign_agent_when_pane_is_not_idle_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    fake.custom_at_idle_shell = False
+
+    with pytest.raises(AgentDeliveryError, match="identity-bound idle shell"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_dead_foreign_agent_that_leaves_idle_shell_during_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    calls = 0
+
+    def changing_idle_shell(
+        pane_id: str, expected: object,
+    ) -> bool:
+        nonlocal calls
+        assert pane_id == pane
+        assert expected == fake.foreign_shell_identity
+        calls += 1
+        return calls == 1
+
+    monkeypatch.setattr(fake, "pane_is_same_idle_shell", changing_idle_shell)
+    with pytest.raises(AgentDeliveryError, match="could not be reverified"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert calls == 2
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        CustomProcessIdentity(
+            version=1, boot_id="11111111-2222-3333-4444-555555555555",
+            pid=101, starttime_ticks=100, executable_device=3, executable_inode=4,
+        ),
+        CustomProcessIdentity(
+            version=1, boot_id="11111111-2222-3333-4444-555555555555",
+            pid=100, starttime_ticks=101, executable_device=3, executable_inode=4,
+        ),
+        CustomProcessIdentity(
+            version=1, boot_id="11111111-2222-3333-4444-555555555555",
+            pid=100, starttime_ticks=100, executable_device=3, executable_inode=5,
+        ),
+    ),
+    ids=("new-pane-shell-pid", "pid-reuse", "replaced-shell-image"),
+)
+def test_stop_refuses_absent_foreign_agent_with_replaced_shell_generation(
+    replacement: CustomProcessIdentity,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    fake.foreign_shell_identity = replacement
+
+    with pytest.raises(AgentDeliveryError, match="pane shell generation changed"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        CustomProcessIdentity(
+            version=1, boot_id="11111111-2222-3333-4444-555555555555",
+            pid=101, starttime_ticks=100, executable_device=3, executable_inode=4,
+        ),
+        CustomProcessIdentity(
+            version=1, boot_id="11111111-2222-3333-4444-555555555555",
+            pid=100, starttime_ticks=101, executable_device=3, executable_inode=4,
+        ),
+        CustomProcessIdentity(
+            version=1, boot_id="11111111-2222-3333-4444-555555555555",
+            pid=100, starttime_ticks=100, executable_device=3, executable_inode=5,
+        ),
+    ),
+    ids=("new-pane-shell-pid", "pid-reuse", "replaced-shell-image"),
+)
+def test_stop_refuses_live_foreign_agent_with_replaced_shell_generation(
+    replacement: CustomProcessIdentity,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.foreign_shell_identity = replacement
+
+    with pytest.raises(AgentDeliveryError, match="pane shell generation changed"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert fake.infos[pane].agent == "codex"
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_sessionless_live_agent_with_replaced_shell_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch, native_session=False)
+    original = adopt(sessions, pane, tmp_path)
+    assert original["session_value"] is None
+    fake.foreign_shell_identity = replace(
+        fake.foreign_shell_identity,
+        starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1,
+    )
+
+    with pytest.raises(AgentDeliveryError, match="pane shell generation changed"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert fake.infos[pane].agent == "codex"
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_absent_legacy_foreign_record_without_shell_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    path = sessions.registry / "foreign" / "agent.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    del document["foreign_shell_identity"]
+    path.write_text(json.dumps(document), encoding="utf-8")
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+
+    with pytest.raises(AgentDeliveryError, match="legacy record has no identity-bound"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_live_legacy_foreign_record_without_shell_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    path = sessions.registry / "foreign" / "agent.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    del document["foreign_shell_identity"]
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError, match="legacy record has no identity-bound"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert fake.infos[pane].agent == "codex"
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_shell_generation_change_during_output_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    original_read = fake.read
+
+    def read(pane_id: str, *, source: str, lines: int) -> str:
+        fake.foreign_shell_identity = replace(
+            fake.foreign_shell_identity,
+            starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1,
+        )
+        return original_read(pane_id, source=source, lines=lines)
+
+    monkeypatch.setattr(fake, "read", read)
+    with pytest.raises(AgentDeliveryError, match="could not be reverified"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_live_shell_generation_change_during_output_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    original_read = fake.read
+
+    def read(pane_id: str, *, source: str, lines: int) -> str:
+        fake.foreign_shell_identity = replace(
+            fake.foreign_shell_identity,
+            starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1,
+        )
+        return original_read(pane_id, source=source, lines=lines)
+
+    monkeypatch.setattr(fake, "read", read)
+    with pytest.raises(AgentDeliveryError, match="could not be reverified"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert fake.infos[pane].agent == "codex"
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_dead_foreign_agent_replaced_during_output_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    original_read = fake.read
+
+    def read(pane_id: str, *, source: str, lines: int) -> str:
+        fake.infos[pane_id] = replace(
+            fake.infos[pane_id], agent="codex", status="idle",
+            session_agent="codex", session_value="replacement-session",
+        )
+        return original_read(pane_id, source=source, lines=lines)
+
+    monkeypatch.setattr(fake, "read", read)
+    with pytest.raises(AgentDeliveryError, match="identity could not be reverified"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_dead_foreign_agent_that_resumes_same_session_during_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The before/after comparison, not only _checked(), must reject a restart."""
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    original_read = fake.read
+
+    def read(pane_id: str, *, source: str, lines: int) -> str:
+        fake.infos[pane_id] = replace(
+            fake.infos[pane_id], agent="codex", status="idle",
+            session_agent="codex", session_value="native-session",
+        )
+        return original_read(pane_id, source=source, lines=lines)
+
+    monkeypatch.setattr(fake, "read", read)
+    with pytest.raises(AgentDeliveryError, match="changed during output capture"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_sessionless_foreign_agent_that_gains_session_during_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(
+        tmp_path, monkeypatch, native_session=False
+    )
+    original = adopt(sessions, pane, tmp_path)
+    original_read = fake.read
+
+    def read(pane_id: str, *, source: str, lines: int) -> str:
+        fake.infos[pane_id] = replace(
+            fake.infos[pane_id], session_agent="codex",
+            session_value="new-native-session",
+        )
+        return original_read(pane_id, source=source, lines=lines)
+
+    monkeypatch.setattr(fake, "read", read)
+    with pytest.raises(AgentDeliveryError, match="changed during output capture"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_refuses_live_foreign_agent_with_replaced_native_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.infos[pane] = replace(
+        fake.infos[pane], session_value="replacement-session",
+    )
+
+    with pytest.raises(AgentDeliveryError, match="exactly one live pane"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+def test_stop_unregisters_revalidated_live_foreign_agent_after_tab_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.presentations[0] = replace(fake.presentations[0], tab_id="w1:moved")
+
+    stopped = sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert stopped["runtime_preserved"] is True
+    assert stopped["pane_closed"] is False and stopped["tab_closed"] is False
+    assert fake.closed == []
+    assert fake.presentations[0].tab_id == "w1:moved"
+    assert sessions.list() == []
+
+
+@pytest.mark.parametrize("presentation_count", [0, 2])
+def test_stop_refuses_missing_or_duplicated_recorded_foreign_pane(
+    presentation_count: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    original_presentation = fake.presentations[0]
+    fake.presentations.clear()
+    if presentation_count == 2:
+        fake.presentations.extend(
+            (
+                original_presentation,
+                replace(original_presentation, tab_id="w1:duplicate"),
+            )
+        )
+
+    with pytest.raises(
+        AgentDeliveryError,
+        match=rf"expected one recorded pane, found {presentation_count}",
+    ):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
+
+
+@pytest.mark.parametrize("change", ["cwd", "presentation", "session"])
+def test_stop_refuses_dead_foreign_agent_with_changed_identity(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    if change == "cwd":
+        fake.infos[pane] = replace(fake.infos[pane], cwd=str(tmp_path / "other"))
+    elif change == "presentation":
+        fake.presentations[0] = replace(fake.presentations[0], tab_id="w1:other")
+    else:
+        fake.infos[pane] = replace(
+            fake.infos[pane], session_agent="codex", session_value="stale-session",
+        )
+
+    with pytest.raises(AgentDeliveryError, match="refusing"):
+        sessions.stop("foreign", expected_token=str(original["token"]))
+
+    assert fake.closed == []
+    assert sessions.get("foreign").lifecycle == "running"
 
 
 @pytest.mark.parametrize(
@@ -298,6 +758,33 @@ def test_adopt_archives_failed_generation_if_identity_changes_after_save(
     saved = json.loads(archives[0].read_text())
     assert saved["lifecycle"] == "adopt_failed"
     assert saved["error"]
+    assert fake.closed == [] and fake.submitted == []
+
+
+def test_adopt_archives_failed_generation_if_shell_changes_after_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = fake.pane_shell_identity
+
+    def changing(pane_id: str) -> CustomProcessIdentity:
+        identity = original(pane_id)
+        if (sessions.registry / "foreign/agent.json").exists():
+            return replace(identity, starttime_ticks=identity.starttime_ticks + 1)
+        return identity
+
+    monkeypatch.setattr(fake, "pane_shell_identity", changing)
+    with pytest.raises(AgentDeliveryError, match="was not registered"):
+        adopt(sessions, pane, tmp_path)
+
+    assert not (sessions.registry / "foreign").exists()
+    archives = list((sessions.registry / "archive").glob(
+        "foreign-*-adopt-failed/agent.json"
+    ))
+    assert len(archives) == 1
+    saved = json.loads(archives[0].read_text(encoding="utf-8"))
+    assert saved["lifecycle"] == "adopt_failed"
+    assert "shell process identity changed" in saved["error"]
     assert fake.closed == [] and fake.submitted == []
 
 
