@@ -705,15 +705,33 @@ grep -qv 'nothing answered at' <<< "$out" \
     || fail "the missing-browser check never reached the browser — it reported the server instead: $out"
 ok "a missing browser fails by name, exit 30, with the install command"
 
-rc=0
-out="$(timeout 60 env VIBE_TALK_WRITE_TOKEN=irrelevant-for-this-check \
-        python3 "$SCRIPT_DIR/screenshots.py" --url "http://127.0.0.1:$ABSENT_PORT" \
-        --out "$TMPDIR_TEST/shots" 2>&1)" || rc=$?
-printf '%s\n' "$out" >> "$ALL_OUTPUT"
-[ "$rc" -eq 33 ] || fail "an unreachable server should exit 33 (server_unreachable), got $rc: $out"
-grep -q "127.0.0.1:$ABSENT_PORT" <<< "$out" \
-    || fail "the unreachable-server failure does not name the URL it tried: $out"
-ok "the screenshot harness reports an unreachable server as its own failure, naming the URL"
+# The ONE check in this file that needs a working browser. To report an unreachable server the
+# harness must first get PAST its own browser precondition; without one it exits 30 for exactly
+# the reason the previous check just certified, so this would be asserting the wrong failure.
+#
+# Probed rather than assumed. Every other check here runs on a machine with no playwright at all
+# — which is the point, because this suite is what you are told to run before a deploy, and a
+# suite that needs a 150MB browser download to say anything about --logs is a suite nobody runs.
+BROWSER_PATH="$(python3 - <<'PROBE' 2>/dev/null || true
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as play:
+    print(play.chromium.executable_path)
+PROBE
+)"
+if [ -n "$BROWSER_PATH" ] && [ -x "$BROWSER_PATH" ]; then
+    rc=0
+    out="$(timeout 60 env VIBE_TALK_WRITE_TOKEN=irrelevant-for-this-check \
+            python3 "$SCRIPT_DIR/screenshots.py" --url "http://127.0.0.1:$ABSENT_PORT" \
+            --out "$TMPDIR_TEST/shots" 2>&1)" || rc=$?
+    printf '%s\n' "$out" >> "$ALL_OUTPUT"
+    [ "$rc" -eq 33 ] || fail "an unreachable server should exit 33 (server_unreachable), got $rc: $out"
+    grep -q "127.0.0.1:$ABSENT_PORT" <<< "$out" \
+        || fail "the unreachable-server failure does not name the URL it tried: $out"
+    ok "the screenshot harness reports an unreachable server as its own failure, naming the URL"
+else
+    echo "SKIP no playwright chromium: the unreachable-server exit code was not checked" >&2
+fi
 
 rc=0
 out="$(timeout 60 env -u VIBE_TALK_WRITE_TOKEN python3 "$SCRIPT_DIR/screenshots.py" \
