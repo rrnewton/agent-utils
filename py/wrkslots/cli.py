@@ -28998,6 +28998,7 @@ def _parse_find_path_matches(
     targets: Mapping[Path, str],
     *,
     census: str,
+    match_sink: list[tuple[int, str, str, str]] | None = None,
 ) -> tuple[tuple[int, str, str, str], ...]:
     fields = output.split(b"\0")
     if fields and fields[-1] == b"":
@@ -29022,7 +29023,10 @@ def _parse_find_path_matches(
                 f"PID {pid} generation changed during {census} find census"
             )
         _target, slot = matched
-        matches.append((pid, slot, "link", raw_target))
+        match = (pid, slot, "link", raw_target)
+        matches.append(match)
+        if match_sink is not None:
+            match_sink.append(match)
     return tuple(matches)
 
 
@@ -29032,6 +29036,7 @@ def _parse_maps_path_matches(
     targets: Mapping[Path, str],
     *,
     census: str,
+    match_sink: list[tuple[int, str, str, str]] | None = None,
 ) -> tuple[tuple[int, str, str, str], ...]:
     matches: list[tuple[int, str, str, str]] = []
     match_cache: dict[Path, tuple[Path, str] | None] = {}
@@ -29062,7 +29067,10 @@ def _parse_maps_path_matches(
                 f"PID {pid} generation changed during {census} maps census"
             )
         _target, slot = matched
-        matches.append((pid, slot, "map", str(observed)))
+        match = (pid, slot, "map", str(observed))
+        matches.append(match)
+        if match_sink is not None:
+            match_sink.append(match)
     return tuple(matches)
 
 
@@ -29274,6 +29282,8 @@ def _same_uid_batched_path_matches(
     processes: Sequence[_AbsentProcessObservation],
     targets: Mapping[Path, str],
     budget: _ReadOnlyCommandBudget,
+    *,
+    match_sink: list[tuple[int, str, str, str]] | None = None,
 ) -> tuple[
     tuple[tuple[int, str, str, str], ...],
     tuple[_AbsentProcessObservation, ...],
@@ -29317,11 +29327,14 @@ def _same_uid_batched_path_matches(
         ):
             indeterminate[process.pid] = process
         find_chunks.append(stdout)
-    matches.extend(
-        _parse_find_path_matches(
-            b"".join(find_chunks), observed_by_pid, targets, census="same-UID"
-        )
+    link_matches = _parse_find_path_matches(
+        b"".join(find_chunks),
+        observed_by_pid,
+        targets,
+        census="same-UID",
+        match_sink=match_sink,
     )
+    matches.extend(link_matches)
 
     files = [
         str(Path("/proc") / str(process.pid) / "maps")
@@ -29353,11 +29366,14 @@ def _same_uid_batched_path_matches(
         ):
             indeterminate[process.pid] = process
         maps_chunks.append(stdout)
-    matches.extend(
-        _parse_maps_path_matches(
-            b"".join(maps_chunks), observed_by_pid, targets, census="same-UID"
-        )
+    map_matches = _parse_maps_path_matches(
+        b"".join(maps_chunks),
+        observed_by_pid,
+        targets,
+        census="same-UID",
+        match_sink=match_sink,
     )
+    matches.extend(map_matches)
     return tuple(matches), tuple(indeterminate.values())
 
 
@@ -29443,12 +29459,13 @@ def _capture_excluded_same_uid_process_path_census(
     """Census a root-owned mode-000 tree without chasing unrelated exits.
 
     The caller has already moved every selected path behind a root-owned,
-    non-searchable guard.  A newly created same-UID process cannot acquire a
-    path into that namespace, so this scan binds one initial process snapshot.
-    A snapshotted generation that is later absent or terminal can be retired;
-    PID reuse and incomplete evidence from a still-live generation remain
-    retryable failures.  The shared deadline bounds any amount of benign exit
-    churn, while genuine live motion retains the ordinary three-attempt cap.
+    non-searchable guard.  New processes cannot open a name below that guard,
+    but they can inherit or receive a descriptor from an earlier holder.  Scan
+    fresh generations until one complete observation and the following process
+    snapshot agree.  Positive holder evidence is never discarded merely
+    because its source generation exits.  The shared deadline bounds unrelated
+    population churn, while stable live evidence motion and PID reuse retain a
+    three-attempt cap.
     """
 
     targets = {path: str(path) for path in slot_paths}
@@ -29458,26 +29475,57 @@ def _capture_excluded_same_uid_process_path_census(
     motion_attempts = 0
     while True:
         budget.remaining_seconds()
+        observed_matches: list[tuple[int, str, str, str]] = []
         try:
             active = _excluded_same_uid_live_processes(processes, budget)
             if not active:
-                return _ProcessPathCensus((), (), owner_cgroup_complete=False)
+                refreshed = _same_uid_process_observations(budget)
+                if not refreshed:
+                    return _ProcessPathCensus(
+                        (), (), owner_cgroup_complete=False
+                    )
+                processes = refreshed
+                continue
             direct_matches, indeterminate = _same_uid_batched_path_matches(
-                active, targets, budget
+                active, targets, budget, match_sink=observed_matches
             )
-            privileged_matches = (
-                *_absent_validate_find_matches(indeterminate, targets, budget),
-                *_absent_validate_maps_matches(indeterminate, targets, budget),
+            assert tuple(observed_matches) == direct_matches
+            privileged_find = _absent_validate_find_matches(
+                indeterminate, targets, budget
             )
+            observed_matches.extend(privileged_find)
+            privileged_maps = _absent_validate_maps_matches(
+                indeterminate, targets, budget
+            )
+            observed_matches.extend(privileged_maps)
             mount_matches = _absent_validate_mount_matches(active, targets, budget)
-            surviving = _excluded_same_uid_live_processes(active, budget)
+            observed_matches.extend(mount_matches)
         except _ProcessEvidenceChanged:
+            if any(match[0] != os.getpid() for match in observed_matches):
+                return _ProcessPathCensus(
+                    processes,
+                    tuple(observed_matches),
+                    owner_cgroup_complete=False,
+                )
             try:
-                surviving = _excluded_same_uid_live_processes(processes, budget)
+                refreshed = _same_uid_process_observations(budget)
             except _ProcessEvidenceChanged:
-                surviving = processes
-            if len(surviving) < len(processes):
-                processes = surviving
+                refreshed = processes
+            previous_by_pid = {process.pid: process for process in processes}
+            refreshed_by_pid = {process.pid: process for process in refreshed}
+            reused = any(
+                pid in refreshed_by_pid
+                and refreshed_by_pid[pid].start_ticks != process.start_ticks
+                for pid, process in previous_by_pid.items()
+            )
+            previous_generations = {
+                (process.pid, process.start_ticks) for process in processes
+            }
+            refreshed_generations = {
+                (process.pid, process.start_ticks) for process in refreshed
+            }
+            processes = refreshed
+            if not reused and refreshed_generations != previous_generations:
                 continue
             motion_attempts += 1
             if motion_attempts < 3:
@@ -29486,15 +29534,35 @@ def _capture_excluded_same_uid_process_path_census(
                 "post-exclusion same-UID process evidence changed during three "
                 "liveness attempts"
             )
-        surviving_pids = {process.pid for process in surviving}
-        matches = tuple(
-            match
-            for match in (*mount_matches, *direct_matches, *privileged_matches)
-            if match[0] in surviving_pids
-        )
-        return _ProcessPathCensus(
-            surviving, matches, owner_cgroup_complete=False
-        )
+        if observed_matches:
+            return _ProcessPathCensus(
+                active, tuple(observed_matches), owner_cgroup_complete=False
+            )
+        refreshed = _same_uid_process_observations(budget)
+        active_generations = {
+            (process.pid, process.start_ticks) for process in active
+        }
+        refreshed_generations = {
+            (process.pid, process.start_ticks) for process in refreshed
+        }
+        if refreshed_generations == active_generations:
+            return _ProcessPathCensus(
+                active, (), owner_cgroup_complete=False
+            )
+        active_by_pid = {process.pid: process for process in active}
+        refreshed_by_pid = {process.pid: process for process in refreshed}
+        if any(
+            pid in refreshed_by_pid
+            and refreshed_by_pid[pid].start_ticks != process.start_ticks
+            for pid, process in active_by_pid.items()
+        ):
+            motion_attempts += 1
+            if motion_attempts >= 3:
+                raise Refusal(
+                    "post-exclusion same-UID process evidence changed during three "
+                    "liveness attempts"
+                )
+        processes = refreshed
 
 
 @dataclasses.dataclass(frozen=True)

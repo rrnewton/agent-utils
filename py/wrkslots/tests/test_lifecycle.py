@@ -30162,7 +30162,7 @@ def test_same_uid_census_retries_share_one_batch_deadline(
 
 
 @pytest.mark.parametrize("retirement", ("absent", "terminal"))
-def test_excluded_same_uid_census_retires_churn_and_stale_matches(
+def test_excluded_same_uid_census_retires_unrelated_churn(
     monkeypatch: pytest.MonkeyPatch,
     retirement: str,
 ) -> None:
@@ -30176,7 +30176,7 @@ def test_excluded_same_uid_census_retires_churn_and_stale_matches(
     ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
         nonlocal snapshots
         snapshots += 1
-        return (process,)
+        return () if retired else (process,)
 
     def read_stat(_path: Path) -> wrkslots._ProcessStat | None:
         if retired and retirement == "absent":
@@ -30192,13 +30192,16 @@ def test_excluded_same_uid_census_retires_churn_and_stale_matches(
         _processes: Sequence[wrkslots._AbsentProcessObservation],
         _targets: Mapping[Path, str],
         _budget: wrkslots._ReadOnlyCommandBudget,
+        *,
+        match_sink: list[tuple[int, str, str, str]] | None = None,
     ) -> tuple[
         tuple[tuple[int, str, str, str], ...],
         tuple[wrkslots._AbsentProcessObservation, ...],
     ]:
         nonlocal retired
+        assert match_sink is not None
         retired = True
-        return (((123, str(target), "cwd", str(target)),), ())
+        return ((), ())
 
     monkeypatch.setattr(wrkslots, "_same_uid_process_observations", snapshot)
     monkeypatch.setattr(wrkslots, "_read_process_stat", read_stat)
@@ -30221,9 +30224,132 @@ def test_excluded_same_uid_census_retires_churn_and_stale_matches(
         (target,), budget=budget
     )
 
-    assert snapshots == 1
+    assert snapshots >= 2
     assert census.processes == ()
     assert census.matches == ()
+
+
+def test_excluded_same_uid_census_retains_holder_that_forks_inherited_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "excluded"
+    target.mkdir()
+    payload = target / "payload"
+    payload.write_text("held\n", encoding="utf-8")
+    command_read, command_write = os.pipe()
+    report_read, report_write = os.pipe()
+    release_read, release_write = os.pipe()
+    payload_fd = os.open(payload, os.O_RDONLY)
+    carrier = os.fork()
+    if carrier == 0:
+        os.close(command_write)
+        os.close(report_read)
+        os.close(release_write)
+        try:
+            os.read(command_read, 1)
+            inherited = os.fork()
+            if inherited == 0:
+                os.write(report_write, f"{os.getpid()}\n".encode("ascii"))
+                os.close(report_write)
+                os.read(release_read, 1)
+                os._exit(0)
+            os._exit(0)
+        finally:
+            os._exit(255)
+    os.close(command_read)
+    os.close(report_write)
+    os.close(release_read)
+    os.close(payload_fd)
+    inherited = -1
+    inherited_pidfd = -1
+    carrier_reaped = False
+    try:
+        generation = wrkslots._read_process_stat(Path("/proc") / str(carrier))
+        assert generation is not None
+        process = wrkslots._AbsentProcessObservation(
+            carrier, generation.start_ticks, "", f"mnt:[{carrier}]"
+        )
+        monkeypatch.setattr(
+            wrkslots, "_same_uid_process_observations", lambda _budget: (process,)
+        )
+
+        def observe_holder(
+            processes: Sequence[wrkslots._AbsentProcessObservation],
+            _targets: Mapping[Path, str],
+            _budget: wrkslots._ReadOnlyCommandBudget,
+            *,
+            match_sink: list[tuple[int, str, str, str]] | None = None,
+        ) -> tuple[
+            tuple[tuple[int, str, str, str], ...],
+            tuple[wrkslots._AbsentProcessObservation, ...],
+        ]:
+            nonlocal inherited, inherited_pidfd, carrier_reaped
+            assert match_sink is not None
+            assert processes == (process,)
+            os.write(command_write, b"f")
+            assert select.select([report_read], [], [], 5)[0] == [report_read]
+            inherited = int(os.read(report_read, 64).strip())
+            inherited_pidfd = os.pidfd_open(inherited)
+            os.waitpid(carrier, 0)
+            carrier_reaped = True
+            held = tuple(
+                os.readlink(entry)
+                for entry in (Path("/proc") / str(inherited) / "fd").iterdir()
+            )
+            assert str(payload) in held
+            match = (carrier, str(target), "fd", str(payload))
+            match_sink.append(match)
+            return ((match,), ())
+
+        monkeypatch.setattr(wrkslots, "_same_uid_batched_path_matches", observe_holder)
+
+        def changed_after_holder(*_args: object) -> tuple[()]:
+            raise wrkslots._ProcessEvidenceChanged(
+                "carrier exited after transferring its descriptor"
+            )
+
+        monkeypatch.setattr(
+            wrkslots, "_absent_validate_find_matches", changed_after_holder
+        )
+        monkeypatch.setattr(
+            wrkslots,
+            "_absent_validate_maps_matches",
+            lambda *_args: pytest.fail("stale positive holder evidence was discarded"),
+        )
+        monkeypatch.setattr(
+            wrkslots,
+            "_absent_validate_mount_matches",
+            lambda *_args: pytest.fail("stale positive holder evidence was discarded"),
+        )
+        budget = wrkslots._ReadOnlyCommandBudget.start(
+            timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+        )
+
+        census = wrkslots._capture_excluded_same_uid_process_path_census(
+            (target,), budget=budget
+        )
+
+        with pytest.raises(wrkslots.Refusal, match=f"live process {carrier}"):
+            census.assert_slot_unused(target, None, ignore_current_process=False)
+    finally:
+        with contextlib.suppress(OSError):
+            os.write(release_write, b"q")
+        if inherited_pidfd >= 0:
+            select.select([inherited_pidfd], [], [], 5)
+        for descriptor in (command_write, report_read, release_write):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        if not carrier_reaped:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(carrier, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(carrier, 0)
+        if inherited > 0:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(inherited, signal.SIGKILL)
+        if inherited_pidfd >= 0:
+            os.close(inherited_pidfd)
 
 
 def test_excluded_same_uid_census_retries_pid_reuse_three_times(
@@ -30255,7 +30381,63 @@ def test_excluded_same_uid_census_retries_pid_reuse_three_times(
         wrkslots._capture_excluded_same_uid_process_path_census(
             (target,), budget=budget
         )
-    assert reads == 6
+    assert reads == 3
+
+
+def test_excluded_same_uid_census_rescans_new_process_before_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    child = wrkslots._AbsentProcessObservation(124, 19, "", "mnt:[123]")
+    target = Path("/excluded/validation/payload")
+    snapshots = iter(((parent,), (parent, child)))
+    calls: list[tuple[wrkslots._AbsentProcessObservation, ...]] = []
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_process_observations", lambda _budget: next(snapshots)
+    )
+    monkeypatch.setattr(
+        wrkslots, "_excluded_same_uid_live_processes", lambda rows, _budget: tuple(rows)
+    )
+
+    def paths(
+        processes: Sequence[wrkslots._AbsentProcessObservation],
+        _targets: Mapping[Path, str],
+        _budget: wrkslots._ReadOnlyCommandBudget,
+        *,
+        match_sink: list[tuple[int, str, str, str]] | None = None,
+    ) -> tuple[
+        tuple[tuple[int, str, str, str], ...],
+        tuple[wrkslots._AbsentProcessObservation, ...],
+    ]:
+        assert match_sink is not None
+        calls.append(tuple(processes))
+        if child not in processes:
+            return ((), ())
+        match = (child.pid, str(target), "fd", str(target / "held"))
+        match_sink.append(match)
+        return ((match,), ())
+
+    monkeypatch.setattr(wrkslots, "_same_uid_batched_path_matches", paths)
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_find_matches", lambda *_args: ()
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_maps_matches", lambda *_args: ()
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_mount_matches", lambda *_args: ()
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+    )
+
+    census = wrkslots._capture_excluded_same_uid_process_path_census(
+        (target,), budget=budget
+    )
+
+    assert calls == [(parent,), (parent, child)]
+    with pytest.raises(wrkslots.Refusal, match="live process 124"):
+        census.assert_slot_unused(target, None, ignore_current_process=False)
 
 
 @pytest.mark.parametrize("missing", ("cwd", "fd"))
@@ -30273,7 +30455,7 @@ def test_excluded_same_uid_census_retries_live_proc_entry_motion_three_times(
         wrkslots, "_excluded_same_uid_live_processes", lambda rows, _budget: tuple(rows)
     )
 
-    def moved(*_args: object) -> tuple[()]:
+    def moved(*_args: object, **_kwargs: object) -> tuple[()]:
         nonlocal calls
         calls += 1
         raise wrkslots._ProcessEvidenceChanged(
@@ -30304,11 +30486,19 @@ def test_excluded_same_uid_census_retains_stable_target_holder(
     monkeypatch.setattr(
         wrkslots, "_excluded_same_uid_live_processes", lambda rows, _budget: tuple(rows)
     )
-    monkeypatch.setattr(
-        wrkslots,
-        "_same_uid_batched_path_matches",
-        lambda *_args: ((match,), ()),
-    )
+    def holder(
+        *_args: object,
+        match_sink: list[tuple[int, str, str, str]] | None = None,
+        **_kwargs: object,
+    ) -> tuple[
+        tuple[tuple[int, str, str, str], ...],
+        tuple[wrkslots._AbsentProcessObservation, ...],
+    ]:
+        assert match_sink is not None
+        match_sink.append(match)
+        return ((match,), ())
+
+    monkeypatch.setattr(wrkslots, "_same_uid_batched_path_matches", holder)
     monkeypatch.setattr(
         wrkslots, "_absent_validate_find_matches", lambda *_args: ()
     )
@@ -30345,7 +30535,7 @@ def test_excluded_same_uid_census_keeps_hard_evidence_refusals(
         wrkslots, "_excluded_same_uid_live_processes", lambda rows, _budget: tuple(rows)
     )
 
-    def refused(*_args: object) -> tuple[()]:
+    def refused(*_args: object, **_kwargs: object) -> tuple[()]:
         nonlocal calls
         calls += 1
         raise wrkslots.Refusal(f"{evidence} process evidence")
@@ -30381,7 +30571,7 @@ def test_excluded_same_uid_census_keeps_shared_deadline(
         budget.remaining_seconds()
         return tuple(rows)
 
-    def moved(*_args: object) -> tuple[()]:
+    def moved(*_args: object, **_kwargs: object) -> tuple[()]:
         nonlocal now, calls
         calls += 1
         now = 6.0
