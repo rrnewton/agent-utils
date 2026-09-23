@@ -13,6 +13,13 @@ RUST_REPLAY = REPO_ROOT / "rs" / "wrkslotsd" / "src" / "replay.rs"
 STATE_EVENT_KINDS = {
     "active-state-recorded",
     "archive-state-recorded",
+    "operation-completed",
+    "operation-progress-recorded",
+    "reclaim-started",
+    "recovery-started",
+    "retirement-attempted",
+    "slot-held",
+    "slot-hold-released",
     "state-imported",
 }
 EVENT_WRITER_NAMES = {"event_writer", "writer"}
@@ -110,9 +117,28 @@ def _rust_non_state_event_kinds() -> set[str]:
     return set(re.findall(r'"([^"]+)"', declaration.group("body")))
 
 
+def _rust_state_event_kinds() -> set[str]:
+    source = RUST_REPLAY.read_text(encoding="utf-8")
+    dispatch = re.search(
+        r"fn apply_event\(.*?match event\.kind\.as_str\(\) \{"
+        r"(?P<body>.*?)kind if NON_STATE_EVENT_KINDS",
+        source,
+        flags=re.DOTALL,
+    )
+    assert dispatch is not None
+    return set(
+        re.findall(
+            r'^\s*"([^"]+)"\s*=>\s*apply_[a-z_]+\(event, state\),$',
+            dispatch.group("body"),
+            flags=re.MULTILINE,
+        )
+    )
+
+
 def test_rust_replay_knows_every_python_emitted_event_kind() -> None:
     """A new Python event kind cannot silently make every Rust rebuild fail."""
 
     emitted = _python_emitted_event_kinds()
     assert STATE_EVENT_KINDS <= emitted
+    assert _rust_state_event_kinds() == STATE_EVENT_KINDS
     assert emitted - STATE_EVENT_KINDS == _rust_non_state_event_kinds()

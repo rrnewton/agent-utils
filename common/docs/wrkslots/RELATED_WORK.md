@@ -26,17 +26,89 @@ worktree-manager mechanics and own only this cross-harness evidence and recovery
 ### Current implementation and migration boundary
 
 The migration is staged. Python `wrkslots` remains the lifecycle authority. The current Rust
-`wrkslotsd` component is only a read-only observer of the hash-linked event log and a builder of a
-disposable SQLite index. It has no daemon or socket behavior and performs no lease management,
-cleanup, rescue, deletion, or repository mutation. The reconciliation daemon and lifecycle actions
-discussed below are roadmap, not behavior shipped in the current Rust component. Its fail-closed
+`wrkslotsd` component is a read-only observer of the hash-linked event log, a builder of a
+disposable SQLite index, and a diagnostic shadow policy evaluator. Its `explain` and
+`plan` commands reconstruct and self-consistency-check decisions from the captured inputs; they
+also reject evidence that has aged out, and cannot apply a plan. The disposable index is not an
+authenticated store: a coordinated same-UID rewrite of every bound input and projection can stay
+self-consistent, and this phase does not compare it atomically with the live `EVENTS` directory.
+Rebuild from trusted event/config/evidence inputs before treating its output as current. It has no
+daemon or socket behavior and performs no lease management, cleanup, rescue, deletion, or
+repository mutation. It also has no repository-discovery inventory beyond its supplied event and
+evidence inputs. The reconciliation daemon and lifecycle actions discussed below are roadmap,
+not behavior shipped in the current Rust component. Its fail-closed
 input boundary accepts at most 16 MiB per event and 127 nested JSON containers, Unicode scalar
 strings, exact signed/unsigned 64-bit integers, and finite binary64 floats; Python remains
-authoritative for its broader JSON input domain. Rust also rejects unknown event kinds, non-array
-imported holds, and non-object state evidence even where the current Python reader ignores those
-values; the Python writer emits the stricter shape. The CLI renders active and archive revisions as
+authoritative for its broader JSON input domain. Rust also rejects unknown event kinds, malformed
+or generation-mismatched hold transitions, and non-object state evidence even where the current
+Python reader ignores some of those values; the Python writer emits the stricter shape. The CLI renders active and archive revisions as
 decimal JSON strings so all `u64` values remain exact. First index publication requires a filesystem
-that supports Linux `renameat2(RENAME_NOREPLACE)`.
+that supports Linux `renameat2(RENAME_NOREPLACE)`. The candidate can diagnose a generation-bound
+task-scope claim, census freshness, heartbeat and minimum-stale boundaries, holds and operation
+markers, reported process use, and reported checkout `(device, inode, mount-id)` identities. It
+does not yet independently reread `/proc/<pid>/stat`, the current boot ID, the systemd invocation
+link, or cgroup existence at evaluation/read time. It also has no fresh TaskGraph claim document
+bound to repository, task, owner, and lifecycle attempt. Every otherwise unblocked scoped row
+therefore includes `TASK_SCOPE_RUNTIME_UNVERIFIED` and `TASKGRAPH_CLAIM_UNVERIFIED` and remains
+`UNKNOWN`; legacy rows remain `UNKNOWN` as well. No current input can produce `ELIGIBLE`.
+
+The policy JSON is a narrow evaluator configuration, not the project's authoritative
+`.wrkslots.yml`. This slice does not compare checkout/repository paths, layout defaults, or landed
+refs against that originating registry; it does not enumerate Git registrations from repositories
+that are absent from the supplied rows; and it does not discover initialized nested repositories.
+Those configuration-coupled and repository-coupled checks remain with Python `wrkslots`. The
+evidence JSON is caller-supplied and no shipped collector authenticates or independently rechecks
+its claims, which is why digest binding and freshness alone do not remove the runtime gate.
+
+The policy file is strict JSON with `schema: 1`, the event-log `machine`,
+`minimum_stale_seconds`, `max_plan_slots`, `evidence_max_age_seconds`,
+`maximum_census_seconds`, and `maximum_future_skew_seconds`. The evidence file is strict JSON with
+`schema: 1`, that same `machine`, the exact `event_tip_sha256`, RFC 3339
+`census_started_at`/`observed_at` bounds, the observing `boot_id`, and one row per observed slot.
+Each row binds `slot`, `generation`, and `active_record_sha256`; identifies and classifies the
+recorded scope when present; records journal and process-use state; and lists each checkout's name,
+path, directory/symlink/mount checks, device, inode, and mount ID. Unknown fields, duplicate rows,
+incomplete present identities, unbound extra slots, stale or future evidence, overlong census
+windows, a census beginning before its bound event-tip timestamp beyond configured skew, and
+evidence for another event tip are refused. Heartbeat age is evaluated at the earlier of census
+start and evaluation time, so a future-skewed census cannot make a live heartbeat look old.
+Missing evidence for an active slot
+becomes a digest-bound `UNKNOWN` decision. The SQLite index retains canonical policy inputs and the
+evaluation instant; `explain` and `plan` replay the indexed event chain, compare active/archive/hold
+projections, re-evaluate every decision, reject evidence that is stale at read time, and reject
+incomplete coverage or any changed field. Open progress, reclaim, recovery, and retirement markers
+block their slot; an absent-journal census alongside an open marker also records an unknown
+evidence conflict while preserving the stronger blocker.
+If an interrupted operation has no ACTIVE row, the observer still emits one `BLOCKED` decision for
+its slot so both `explain` and `plan` expose the open marker. Such a pending-only decision has null
+generation, active-record, and heartbeat fields when the event history does not provide them; it
+cannot be mistaken for a reclaim candidate and does not require an invented evidence-census row.
+This remains true for a plain rebuild without optional policy inputs; that decision also carries
+`POLICY_INPUTS_MISSING` and null policy/evidence bindings.
+
+This marker treatment is deliberately stricter than the current Python audit, not a parity claim.
+Python records `reclaim-started`, `recovery-started`, and `retirement-attempted` as attempt evidence
+but has no separate abort event when a checked operation refuses. The Rust shadow therefore keeps
+such an attempt blocked until the append-only history contains both the exact-generation archive
+record with `physical_storage: removed` and removal of that generation from ACTIVE. Python's
+`operation-completed` records only journal cleanup; rollback and late-refusal paths emit it while
+retaining the slot, so it does not clear reclaim, recovery, or retirement markers. Until a future
+producer adds an explicit terminal outcome for non-removing operations, those attempts remain a
+rollout blocker; the observer can explain them but cannot clear or override them.
+For a pre-event-log finish journal, recovery can import snapshots that are already at any side of
+the archive/ACTIVE publication boundary. Once those snapshots prove physical removal, the observer
+retains a synthetic legacy-journal cleanup marker until the following `operation-completed`; this
+keeps the interrupted operation visible without leaving a false recovery blocker after completion.
+
+Python `clean-caches --only SLOT` limits cache-directory traversal and scoped-journal checkout/Git
+inspection to the named slot. It reads each complete bounded unselected scoped journal and verifies
+both its shape and its exact append-only progress provenance without inspecting its checkouts. It still
+performs global control-plane discovery, validates every active record path, and replays every
+authoritative `EVENTS.<machine>` shard before mutation. That replay is intentional with the current
+format: event filenames contain only sequence numbers, and event-first journal publication means a
+slot can exist only in an event when the process stops. Eliminating unselected-shard replay safely
+requires a trusted locator that is bound to every shard's count and terminal digest (and that also
+indexes pending operations); compatibility `ACTIVE`/`ARCHIVED` snapshots are not such an authority.
 
 ## Capability comparison
 
