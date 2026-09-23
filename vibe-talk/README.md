@@ -569,6 +569,68 @@ curl -s -X POST localhost:8080/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
+## Surviving a reboot
+
+`scripts/run.sh` launches the container with restart policy `on-failure:5`, which is a policy
+about the container *crashing*, not about the machine *rebooting*: `podman-restart.service`
+restores only containers whose policy is literally `always`, and on this host it is disabled
+anyway. So a hand-started container does not come back after a reboot. On 2026-09-23 that is
+exactly what happened — the tunnel unit came back, its origin did not, and the public hostname
+served **502 for eighteen hours**: a live tunnel in front of a dead origin.
+
+The fix is a systemd **user** unit that starts the container run.sh already deployed. It builds
+nothing and creates nothing, so enabling it cannot change the deployed build.
+
+`~/.config/systemd/user/vibe-talk.service`:
+
+```ini
+[Unit]
+Description=vibe-talk web app (origin for newton-gent-talk.deepscry.net)
+Documentation=file:///home/newton/work/agent-utils/vibe-talk/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/podman container exists vibe-talk
+ExecStart=/usr/bin/podman start --attach vibe-talk
+ExecStop=/usr/bin/podman stop --time=10 vibe-talk
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now vibe-talk.service
+```
+
+**Linger is the half that is easy to miss.** A user unit does not start at boot unless the user
+lingers; without it you have built something that looks fixed and is not. Check, and enable it if
+it is off:
+
+```sh
+loginctl show-user "$USER" -p Linger      # must print Linger=yes
+loginctl enable-linger "$USER"
+```
+
+`ExecStartPre` fails loudly when the container has been removed, rather than leaving the unit
+"running" in front of nothing. Recreate it with `scripts/run.sh`, then
+`systemctl --user restart vibe-talk` so systemd, not your shell, owns the process again — a
+redeploy replaces the container out from under the unit.
+
+**Prove it rather than asserting it**, and prove it through the *public* hostname: a local 200
+says the process started, which is never what was broken.
+
+```sh
+systemctl --user stop  vibe-talk    # then the public URL must go 502
+systemctl --user start vibe-talk    # then it must come back 200
+```
+
+Rebooting is not the test. The stop/start pair is the control that actually discriminates.
+
 ## Asking the server what is wrong
 
 `GET /api/v1/diagnostics`, **read scope**, `Cache-Control: no-store`. It re-runs, on demand, the
