@@ -585,7 +585,7 @@ nothing and creates nothing, so enabling it cannot change the deployed build.
 
 ```ini
 [Unit]
-Description=vibe-talk web app (origin for newton-gent-talk.deepscry.net)
+Description=vibe-talk web app origin
 Documentation=file:///home/newton/work/agent-utils/vibe-talk/README.md
 After=network-online.target
 Wants=network-online.target
