@@ -29,17 +29,10 @@ const NON_STATE_EVENT_KINDS: &[&str] = &[
     "handoff-write-intended",
     "handoff-written",
     "legacy-validate-checkout-removed",
-    "operation-completed",
-    "operation-progress-recorded",
     "ownerless-agent-cache-relocated",
     "ownerless-agent-worktree-removed",
     "ownerless-validate-path-removed",
     "partial-updates-recovered",
-    "reclaim-started",
-    "recovery-started",
-    "retirement-attempted",
-    "slot-held",
-    "slot-hold-released",
 ];
 
 /// The replay tip and materialized active/archive counters for one machine.
@@ -75,8 +68,43 @@ pub(crate) struct Event {
 #[derive(Debug)]
 pub(crate) struct ReplayedLog {
     pub(crate) summary: ReplaySummary,
+    pub(crate) tip_recorded_at: String,
     pub(crate) active_records: BTreeMap<String, Value>,
+    pub(crate) active_metadata: BTreeMap<String, ActiveRecordMeta>,
     pub(crate) archive_records: Vec<Value>,
+    pub(crate) holds: BTreeMap<String, SlotHold>,
+    pub(crate) pending_operations: Vec<PendingOperation>,
+}
+
+/// One event-derived operation that has begun but has no durable completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingOperation {
+    pub(crate) slot: String,
+    pub(crate) generation: Option<u64>,
+    pub(crate) kind: PendingOperationKind,
+    pub(crate) operation: Option<String>,
+    pub(crate) journal_path: Option<String>,
+    pub(crate) journal_sha256: Option<String>,
+    pub(crate) event_sha256: String,
+}
+
+/// Stable classes of unfinished lifecycle work understood by the observer.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum PendingOperationKind {
+    Journal,
+    Reclaim,
+    Recovery,
+    Retirement,
+}
+
+/// A validated hold bound to one active slot generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SlotHold {
+    pub(crate) slot: String,
+    pub(crate) generation: u64,
+    pub(crate) held_at: String,
+    pub(crate) reason: String,
+    pub(crate) event_sha256: String,
 }
 
 #[derive(Debug)]
@@ -94,6 +122,10 @@ struct State {
     archive_records: Vec<Value>,
     archive_ids: BTreeSet<String>,
     archived_slots: BTreeSet<String>,
+    archived_generations: BTreeMap<String, u64>,
+    holds: BTreeMap<String, SlotHold>,
+    pending_operations: BTreeMap<String, PendingOperation>,
+    completed_operations: BTreeMap<String, (String, String)>,
 }
 
 pub(crate) struct ReplayGuard<'a> {
@@ -148,6 +180,7 @@ fn replay_stream_after_count(
     after_count();
 
     let mut previous = ZERO_DIGEST.to_owned();
+    let mut tip_recorded_at = None;
     let mut state = State::default();
     for expected_sequence in 1..=event_count {
         let path = events_dir.join(format!("{expected_sequence:020}.json"));
@@ -166,8 +199,86 @@ fn replay_stream_after_count(
         apply_event(&event, &mut state)?;
         consume(&event)?;
         previous.clone_from(&event.sha256);
+        tip_recorded_at = Some(event.recorded_at);
     }
 
+    finish_replay(
+        machine,
+        event_count,
+        previous,
+        tip_recorded_at
+            .ok_or_else(|| ObserverError::invalid("event log has no terminal timestamp"))?,
+        state,
+    )
+}
+
+/// Revalidate and replay canonical event rows retained in a disposable index.
+///
+/// This keeps policy reads dependent on the indexed event chain rather than on
+/// independently editable active/hold projection rows.
+pub(crate) fn replay_indexed_events(
+    machine: &str,
+    events: Vec<Event>,
+) -> Result<ReplayedLog, ObserverError> {
+    validate_name(machine, "indexed event machine")?;
+    if events.is_empty() {
+        return Err(ObserverError::invalid("indexed event log is empty"));
+    }
+    let mut previous = ZERO_DIGEST.to_owned();
+    let mut tip_recorded_at = None;
+    let mut state = State::default();
+    for (offset, event) in events.iter().enumerate() {
+        let expected_sequence = u64::try_from(offset)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| ObserverError::invalid("indexed event sequence overflow"))?;
+        if event.sequence != expected_sequence
+            || event.machine != machine
+            || event.previous_sha256 != previous
+            || event.kind.is_empty()
+            || !event.payload.is_object()
+        {
+            return Err(ObserverError::invalid(format!(
+                "indexed event envelope or hash chain is invalid at sequence {expected_sequence}"
+            )));
+        }
+        parse_timestamp(&event.recorded_at, "indexed event.recorded_at")?;
+        let core = serde_json::json!({
+            "schema": EVENT_SCHEMA,
+            "machine": event.machine,
+            "sequence": event.sequence,
+            "previous_sha256": event.previous_sha256,
+            "recorded_at": event.recorded_at,
+            "kind": event.kind,
+            "payload": event.payload,
+        });
+        if canonical_sha256(&core)? != event.sha256 {
+            return Err(ObserverError::invalid(format!(
+                "indexed event digest is invalid at sequence {expected_sequence}"
+            )));
+        }
+        apply_event(event, &mut state)?;
+        previous.clone_from(&event.sha256);
+        tip_recorded_at = Some(event.recorded_at.clone());
+    }
+    finish_replay(
+        machine.to_owned(),
+        u64::try_from(events.len())
+            .map_err(|_| ObserverError::invalid("indexed event count does not fit u64"))?,
+        previous,
+        tip_recorded_at
+            .ok_or_else(|| ObserverError::invalid("indexed event log has no terminal timestamp"))?,
+        state,
+    )
+}
+
+fn finish_replay(
+    machine: String,
+    event_count: u64,
+    tip_sha256: String,
+    tip_recorded_at: String,
+    state: State,
+) -> Result<ReplayedLog, ObserverError> {
     let active_revision = state
         .active_revision
         .ok_or_else(|| ObserverError::invalid("event log has no complete imported active state"))?;
@@ -178,22 +289,31 @@ fn replay_stream_after_count(
         .map_err(|_| ObserverError::invalid("active record count does not fit in u64"))?;
     let archive_count = u64::try_from(state.archive_records.len())
         .map_err(|_| ObserverError::invalid("archive record count does not fit in u64"))?;
+    let active_metadata = state
+        .active_records
+        .iter()
+        .map(|(slot, entry)| (slot.clone(), entry.meta.clone()))
+        .collect();
     Ok(ReplayedLog {
         summary: ReplaySummary {
             machine,
             replay_count: event_count,
-            tip_sha256: previous,
+            tip_sha256,
             active_revision,
             active_count,
             archive_revision,
             archive_count,
         },
+        tip_recorded_at,
         active_records: state
             .active_records
             .into_iter()
             .map(|(slot, entry)| (slot, entry.value))
             .collect(),
+        active_metadata,
         archive_records: state.archive_records,
+        holds: state.holds,
+        pending_operations: state.pending_operations.into_values().collect(),
     })
 }
 
@@ -647,12 +767,543 @@ fn apply_event(event: &Event, state: &mut State) -> Result<(), ObserverError> {
         "state-imported" => apply_import(event, state),
         "active-state-recorded" => apply_active(event, state),
         "archive-state-recorded" => apply_archive(event, state),
+        "slot-held" => apply_hold(event, state),
+        "slot-hold-released" => apply_hold_release(event, state),
+        "operation-progress-recorded" => apply_operation_progress(event, state),
+        "operation-completed" => apply_operation_completed(event, state),
+        "reclaim-started" => apply_reclaim_started(event, state),
+        "recovery-started" => apply_recovery_started(event, state),
+        "retirement-attempted" => apply_retirement_attempted(event, state),
         kind if NON_STATE_EVENT_KINDS.contains(&kind) => Ok(()),
         kind => Err(ObserverError::invalid(format!(
             "unknown event kind {kind:?} at sequence {}",
             event.sequence
         ))),
     }
+}
+
+const JOURNAL_OPERATIONS: &[&str] = &[
+    "create",
+    "finish",
+    "import-existing",
+    "legacy-validate-remove",
+    "ownerless-validate-remove",
+    "ownerless-agent-remove",
+    "ownerless-agent-cache-relocate",
+    "recover-absent-validate-rows",
+    "recover-absent-agent-row",
+];
+
+fn active_generation(state: &State, slot: &str) -> Option<u64> {
+    state
+        .active_records
+        .get(slot)
+        .map(|entry| entry.meta.generation)
+}
+
+fn pending_key(kind: PendingOperationKind, slot: &str, suffix: &str) -> String {
+    format!("{kind:?}\0{slot}\0{suffix}")
+}
+
+fn insert_pending(state: &mut State, suffix: &str, pending: PendingOperation) {
+    state
+        .pending_operations
+        .insert(pending_key(pending.kind, &pending.slot, suffix), pending);
+}
+
+fn validate_operation(operation: &str, label: &str) -> Result<(), ObserverError> {
+    if JOURNAL_OPERATIONS.contains(&operation) {
+        Ok(())
+    } else {
+        Err(ObserverError::invalid(format!(
+            "{label} is not a known operation: {operation:?}"
+        )))
+    }
+}
+
+fn expected_journal_path(machine: &str, slot: &str, operation: &str, path: &str) -> String {
+    let singleton = format!("ACTIVE.{machine}.journal");
+    if operation == "create" && path.starts_with("CREATE.") {
+        format!(
+            "CREATE.{}.{machine}.{}.{slot}.journal",
+            machine.len(),
+            slot.len()
+        )
+    } else if operation == "finish" && path.starts_with("FINISH.") {
+        format!(
+            "FINISH.{}.{machine}.{}.{slot}.journal",
+            machine.len(),
+            slot.len()
+        )
+    } else {
+        singleton
+    }
+}
+
+fn operation_identity(
+    payload: &Map<String, Value>,
+    machine: &str,
+    label: &str,
+) -> Result<(String, String, String), ObserverError> {
+    let slot = string(&payload["slot"], &format!("{label}.slot"))?;
+    validate_name(slot, &format!("{label}.slot"))?;
+    let operation = string(&payload["operation"], &format!("{label}.operation"))?;
+    validate_operation(operation, &format!("{label}.operation"))?;
+    let default_path = format!("ACTIVE.{machine}.journal");
+    let journal_path = payload
+        .get("journal_path")
+        .map(|value| string(value, &format!("{label}.journal_path")))
+        .transpose()?
+        .unwrap_or(&default_path);
+    if journal_path.contains('/')
+        || journal_path != expected_journal_path(machine, slot, operation, journal_path)
+    {
+        return Err(ObserverError::invalid(format!(
+            "{label}.journal_path does not match its machine, slot, and operation"
+        )));
+    }
+    Ok((
+        slot.to_owned(),
+        operation.to_owned(),
+        journal_path.to_owned(),
+    ))
+}
+
+fn apply_operation_progress(event: &Event, state: &mut State) -> Result<(), ObserverError> {
+    let payload = object(&event.payload, "operation-progress-recorded payload")?;
+    exact_keys_optional(
+        payload,
+        &["slot", "operation", "journal"],
+        &["journal_path"],
+        "operation-progress-recorded payload",
+    )?;
+    let (slot, operation, journal_path) = operation_identity(
+        payload,
+        &event.machine,
+        "operation-progress-recorded payload",
+    )?;
+    let journal = object(
+        &payload["journal"],
+        "operation-progress-recorded payload.journal",
+    )?;
+    if string(
+        journal
+            .get("machine")
+            .ok_or_else(|| ObserverError::invalid("operation journal has no machine"))?,
+        "operation journal.machine",
+    )? != event.machine
+        || string(
+            journal
+                .get("slot")
+                .ok_or_else(|| ObserverError::invalid("operation journal has no slot"))?,
+            "operation journal.slot",
+        )? != slot
+        || string(
+            journal
+                .get("kind")
+                .ok_or_else(|| ObserverError::invalid("operation journal has no kind"))?,
+            "operation journal.kind",
+        )? != operation
+    {
+        return Err(ObserverError::invalid(
+            "operation-progress-recorded identity differs from its embedded journal",
+        ));
+    }
+    if let Some(completed_identity) = state.completed_operations.get(&journal_path) {
+        if (journal_path.starts_with("CREATE.") || journal_path.starts_with("FINISH."))
+            && completed_identity != &(slot.clone(), operation.clone())
+        {
+            return Err(ObserverError::invalid(
+                "scoped operation journal path was reused for a different identity",
+            ));
+        }
+        // Scoped filenames are deterministic per machine and slot, so a
+        // supported abort/refusal followed by a retry legitimately reuses the
+        // same path.  New progress begins a new attempt and supersedes only an
+        // exactly matching completed identity.  The singleton compatibility
+        // journal is intentionally reusable across identities as well.
+        state.completed_operations.remove(&journal_path);
+    }
+    if state.pending_operations.values().any(|pending| {
+        pending.kind == PendingOperationKind::Journal
+            && ((pending.journal_path.as_deref() == Some(journal_path.as_str())
+                && (pending.slot != slot
+                    || pending.operation.as_deref() != Some(operation.as_str())))
+                || (pending.slot == slot
+                    && pending.operation.as_deref() == Some(operation.as_str())
+                    && pending.journal_path.as_deref() != Some(journal_path.as_str())))
+    }) {
+        return Err(ObserverError::invalid(
+            "append-only history has the same pending operation under multiple journal paths",
+        ));
+    }
+    let generation = active_generation(state, &slot);
+    insert_pending(
+        state,
+        &journal_path,
+        PendingOperation {
+            slot,
+            generation,
+            kind: PendingOperationKind::Journal,
+            operation: Some(operation),
+            journal_path: Some(journal_path.clone()),
+            journal_sha256: Some(canonical_sha256(&Value::Object(journal.clone()))?),
+            event_sha256: event.sha256.clone(),
+        },
+    );
+    Ok(())
+}
+
+fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), ObserverError> {
+    let payload = object(&event.payload, "operation-completed payload")?;
+    exact_keys_optional(
+        payload,
+        &["slot", "operation"],
+        &["journal_path"],
+        "operation-completed payload",
+    )?;
+    let (slot, operation, journal_path) =
+        operation_identity(payload, &event.machine, "operation-completed payload")?;
+    let journal_key = pending_key(PendingOperationKind::Journal, &slot, &journal_path);
+    let pending_journal = state.pending_operations.remove(&journal_key);
+    let matching_recovery = state.pending_operations.values().any(|pending| {
+        pending.kind == PendingOperationKind::Recovery
+            && pending.slot == slot
+            && pending.operation.as_deref() == Some(operation.as_str())
+    });
+    let duplicate_completion = state
+        .completed_operations
+        .get(&journal_path)
+        .is_some_and(|identity| identity == &(slot.clone(), operation.clone()));
+    if pending_journal.is_none() && !matching_recovery && !duplicate_completion {
+        return Err(ObserverError::invalid(
+            "operation-completed has no pending progress or recovery attempt",
+        ));
+    }
+    match pending_journal {
+        Some(pending)
+            if pending.operation.as_deref() == Some(operation.as_str())
+                && pending.journal_path.as_deref() == Some(journal_path.as_str()) =>
+        {
+            // The completion closes this physical journal only. Lifecycle
+            // attempts have a different terminal condition below.
+        }
+        Some(_) => {
+            return Err(ObserverError::invalid(
+                "append-only completion does not match its pending operation",
+            ))
+        }
+        None => {}
+    }
+    state
+        .completed_operations
+        .insert(journal_path, (slot.clone(), operation));
+    clear_archived_removal_markers(state, &slot);
+    Ok(())
+}
+
+/// Close lifecycle attempts only after the append-only history proves that the
+/// same generation was archived with removed storage and left ACTIVE. Python's
+/// `operation-completed` means only that a journal was cleared: rollback and
+/// late-refusal paths emit it while deliberately retaining the slot.
+fn clear_archived_removal_markers(state: &mut State, slot: &str) {
+    let Some(generation) = state.archived_generations.get(slot).copied() else {
+        return;
+    };
+    if state.active_records.contains_key(slot) {
+        return;
+    }
+    let existing_journals = state
+        .pending_operations
+        .values()
+        .filter(|pending| pending.kind == PendingOperationKind::Journal && pending.slot == slot)
+        .filter_map(|pending| Some((pending.operation.clone()?, pending.journal_path.clone()?)))
+        .collect::<BTreeSet<_>>();
+    let mut legacy_journals = Vec::new();
+    state.pending_operations.retain(|_, pending| {
+        if pending.slot != slot || pending.kind == PendingOperationKind::Journal {
+            return true;
+        }
+        if pending.operation.as_deref() != Some("finish") {
+            return true;
+        }
+        if pending.generation != Some(generation) {
+            return true;
+        }
+        if pending.kind == PendingOperationKind::Recovery {
+            if let Some(journal_path) = pending.journal_path.as_ref() {
+                let journal_identity = ("finish".to_owned(), journal_path.clone());
+                let completed_identity = (pending.slot.clone(), "finish".to_owned());
+                if !existing_journals.contains(&journal_identity)
+                    && state.completed_operations.get(journal_path) != Some(&completed_identity)
+                {
+                    legacy_journals.push(PendingOperation {
+                        slot: pending.slot.clone(),
+                        generation: pending.generation,
+                        kind: PendingOperationKind::Journal,
+                        operation: pending.operation.clone(),
+                        journal_path: Some(journal_path.clone()),
+                        journal_sha256: None,
+                        event_sha256: pending.event_sha256.clone(),
+                    });
+                }
+            }
+        }
+        false
+    });
+    for pending in legacy_journals {
+        let journal_path = pending
+            .journal_path
+            .clone()
+            .expect("legacy recovery journal path is present");
+        insert_pending(state, &journal_path, pending);
+    }
+}
+
+fn apply_reclaim_started(event: &Event, state: &mut State) -> Result<(), ObserverError> {
+    let payload = object(&event.payload, "reclaim-started payload")?;
+    // The append-only log predates both authenticated host-runner evidence
+    // (e5074d1) and local-salvage configuration (2a61b65).  Accept only the
+    // three exact shapes the Python authority has emitted; an arbitrary
+    // subset would turn corruption into an undocumented compatibility form.
+    let expected_fields: &[&str] = if payload.contains_key("salvage_archive_root") {
+        &[
+            "slot",
+            "generation",
+            "actor",
+            "runner",
+            "handoff_writer",
+            "coordinator_authorized",
+            "owner_state",
+            "registered_liveness",
+            "heartbeat_age_seconds",
+            "heartbeat_ttl_seconds",
+            "validate_complete",
+            "live_validate_owner",
+            "salvage_archive_root",
+        ]
+    } else if payload.contains_key("runner") || payload.contains_key("handoff_writer") {
+        &[
+            "slot",
+            "generation",
+            "actor",
+            "runner",
+            "handoff_writer",
+            "coordinator_authorized",
+            "owner_state",
+            "registered_liveness",
+            "heartbeat_age_seconds",
+            "heartbeat_ttl_seconds",
+            "validate_complete",
+            "live_validate_owner",
+        ]
+    } else {
+        &[
+            "slot",
+            "generation",
+            "actor",
+            "coordinator_authorized",
+            "owner_state",
+            "registered_liveness",
+            "heartbeat_age_seconds",
+            "heartbeat_ttl_seconds",
+            "validate_complete",
+            "live_validate_owner",
+        ]
+    };
+    exact_keys(payload, expected_fields, "reclaim-started payload")?;
+    let slot = string(&payload["slot"], "reclaim-started payload.slot")?;
+    validate_name(slot, "reclaim-started payload.slot")?;
+    let generation = unsigned(&payload["generation"], "reclaim-started payload.generation")?;
+    if generation == 0 || active_generation(state, slot) != Some(generation) {
+        return Err(ObserverError::invalid(
+            "reclaim-started does not match an active slot generation",
+        ));
+    }
+    object(&payload["actor"], "reclaim-started payload.actor")?;
+    if let Some(runner) = payload.get("runner") {
+        object(runner, "reclaim-started payload.runner")?;
+    }
+    if payload
+        .get("handoff_writer")
+        .is_some_and(|writer| !writer.is_null())
+    {
+        object(
+            &payload["handoff_writer"],
+            "reclaim-started payload.handoff_writer",
+        )?;
+    }
+    if payload["coordinator_authorized"].as_bool().is_none()
+        || payload["validate_complete"].as_bool().is_none()
+        || payload["live_validate_owner"].as_bool().is_none()
+        || payload
+            .get("salvage_archive_root")
+            .is_some_and(|root| !matches!(root, Value::Null | Value::String(_)))
+    {
+        return Err(ObserverError::invalid(
+            "reclaim-started has invalid typed evidence fields",
+        ));
+    }
+    string(
+        &payload["owner_state"],
+        "reclaim-started payload.owner_state",
+    )?;
+    string(
+        &payload["registered_liveness"],
+        "reclaim-started payload.registered_liveness",
+    )?;
+    unsigned(
+        &payload["heartbeat_age_seconds"],
+        "reclaim-started payload.heartbeat_age_seconds",
+    )?;
+    unsigned(
+        &payload["heartbeat_ttl_seconds"],
+        "reclaim-started payload.heartbeat_ttl_seconds",
+    )?;
+    insert_pending(
+        state,
+        &generation.to_string(),
+        PendingOperation {
+            slot: slot.to_owned(),
+            generation: Some(generation),
+            kind: PendingOperationKind::Reclaim,
+            operation: Some("finish".to_owned()),
+            journal_path: None,
+            journal_sha256: None,
+            event_sha256: event.sha256.clone(),
+        },
+    );
+    Ok(())
+}
+
+fn apply_recovery_started(event: &Event, state: &mut State) -> Result<(), ObserverError> {
+    let payload = object(&event.payload, "recovery-started payload")?;
+    // recovery-started originally carried only the durable actor.  Runner and
+    // handoff-writer evidence were added together in ded39ae; preserve the old
+    // event as a pending recovery without accepting a half-modern shape.
+    let expected_fields: &[&str] =
+        if payload.contains_key("runner") || payload.contains_key("handoff_writer") {
+            &[
+                "slot",
+                "operation",
+                "actor",
+                "runner",
+                "handoff_writer",
+                "coordinator_authorized",
+            ]
+        } else {
+            &["slot", "operation", "actor", "coordinator_authorized"]
+        };
+    exact_keys(payload, expected_fields, "recovery-started payload")?;
+    let slot = string(&payload["slot"], "recovery-started payload.slot")?;
+    validate_name(slot, "recovery-started payload.slot")?;
+    let operation = string(&payload["operation"], "recovery-started payload.operation")?;
+    validate_operation(operation, "recovery-started payload.operation")?;
+    object(&payload["actor"], "recovery-started payload.actor")?;
+    if let Some(runner) = payload.get("runner") {
+        object(runner, "recovery-started payload.runner")?;
+    }
+    if payload
+        .get("handoff_writer")
+        .is_some_and(|writer| !writer.is_null())
+    {
+        object(
+            &payload["handoff_writer"],
+            "recovery-started payload.handoff_writer",
+        )?;
+    }
+    if payload["coordinator_authorized"].as_bool().is_none() {
+        return Err(ObserverError::invalid(
+            "recovery-started payload.coordinator_authorized must be boolean",
+        ));
+    }
+    let pending_journal = state.pending_operations.values().find(|pending| {
+        pending.kind == PendingOperationKind::Journal
+            && pending.slot == slot
+            && pending.operation.as_deref() == Some(operation)
+    });
+    let generation = active_generation(state, slot)
+        .or_else(|| pending_journal.and_then(|pending| pending.generation))
+        .or_else(|| {
+            (operation == "finish")
+                .then(|| state.archived_generations.get(slot).copied())
+                .flatten()
+        });
+    let journal_path = pending_journal
+        .and_then(|pending| pending.journal_path.clone())
+        .unwrap_or_else(|| format!("ACTIVE.{}.journal", event.machine));
+    insert_pending(
+        state,
+        operation,
+        PendingOperation {
+            slot: slot.to_owned(),
+            generation,
+            kind: PendingOperationKind::Recovery,
+            operation: Some(operation.to_owned()),
+            journal_path: Some(journal_path),
+            journal_sha256: None,
+            event_sha256: event.sha256.clone(),
+        },
+    );
+    clear_archived_removal_markers(state, slot);
+    Ok(())
+}
+
+fn apply_retirement_attempted(event: &Event, state: &mut State) -> Result<(), ObserverError> {
+    let payload = object(&event.payload, "retirement-attempted payload")?;
+    exact_keys(
+        payload,
+        &[
+            "slot",
+            "generation",
+            "sha256",
+            "handoff_read_sequence",
+            "reason",
+        ],
+        "retirement-attempted payload",
+    )?;
+    let slot = string(&payload["slot"], "retirement-attempted payload.slot")?;
+    validate_name(slot, "retirement-attempted payload.slot")?;
+    let generation = unsigned(
+        &payload["generation"],
+        "retirement-attempted payload.generation",
+    )?;
+    if generation == 0 || active_generation(state, slot) != Some(generation) {
+        return Err(ObserverError::invalid(
+            "retirement-attempted does not match an active slot generation",
+        ));
+    }
+    let digest = string(&payload["sha256"], "retirement-attempted payload.sha256")?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || unsigned(
+            &payload["handoff_read_sequence"],
+            "retirement-attempted payload.handoff_read_sequence",
+        )? == 0
+        || string(&payload["reason"], "retirement-attempted payload.reason")?
+            .trim()
+            .is_empty()
+    {
+        return Err(ObserverError::invalid(
+            "retirement-attempted has invalid provenance fields",
+        ));
+    }
+    insert_pending(
+        state,
+        &generation.to_string(),
+        PendingOperation {
+            slot: slot.to_owned(),
+            generation: Some(generation),
+            kind: PendingOperationKind::Retirement,
+            operation: Some("finish".to_owned()),
+            journal_path: None,
+            journal_sha256: None,
+            event_sha256: event.sha256.clone(),
+        },
+    );
+    Ok(())
 }
 
 fn apply_import(event: &Event, state: &mut State) -> Result<(), ObserverError> {
@@ -667,11 +1318,7 @@ fn apply_import(event: &Event, state: &mut State) -> Result<(), ObserverError> {
         &["active", "archive", "holds"],
         "state-imported payload",
     )?;
-    if !payload["holds"].is_array() {
-        return Err(ObserverError::invalid(
-            "state-imported payload.holds must be a JSON array",
-        ));
-    }
+    let imported_holds = array(&payload["holds"], "state-imported payload.holds")?;
 
     let active = object(&payload["active"], "imported active state")?;
     exact_keys(
@@ -731,6 +1378,114 @@ fn apply_import(event: &Event, state: &mut State) -> Result<(), ObserverError> {
         &archive["revision"],
         "imported archive state.revision",
     )?);
+    for (index, value) in imported_holds.iter().enumerate() {
+        let label = format!("state-imported payload.holds[{index}]");
+        let hold = object(value, &label)?;
+        exact_keys(
+            hold,
+            &["schema", "machine", "slot", "held_at", "reason"],
+            &label,
+        )?;
+        if unsigned(&hold["schema"], &format!("{label}.schema"))? != 1
+            || string(&hold["machine"], &format!("{label}.machine"))? != event.machine
+        {
+            return Err(ObserverError::invalid(format!(
+                "{label} has an invalid schema or machine"
+            )));
+        }
+        let slot = string(&hold["slot"], &format!("{label}.slot"))?;
+        validate_name(slot, &format!("{label}.slot"))?;
+        let active = state.active_records.get(slot).ok_or_else(|| {
+            ObserverError::invalid(format!("{label} does not name an active slot"))
+        })?;
+        let held_at = string(&hold["held_at"], &format!("{label}.held_at"))?;
+        parse_timestamp(held_at, &format!("{label}.held_at"))?;
+        let reason = string(&hold["reason"], &format!("{label}.reason"))?;
+        if reason.trim().is_empty() || state.holds.contains_key(slot) {
+            return Err(ObserverError::invalid(format!(
+                "{label} has an empty reason or duplicates a slot"
+            )));
+        }
+        state.holds.insert(
+            slot.to_owned(),
+            SlotHold {
+                slot: slot.to_owned(),
+                generation: active.meta.generation,
+                held_at: held_at.to_owned(),
+                reason: reason.to_owned(),
+                event_sha256: event.sha256.clone(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn apply_hold(event: &Event, state: &mut State) -> Result<(), ObserverError> {
+    let payload = object(&event.payload, "slot-held payload")?;
+    exact_keys(
+        payload,
+        &["slot", "generation", "reason"],
+        "slot-held payload",
+    )?;
+    let slot = string(&payload["slot"], "slot-held payload.slot")?;
+    validate_name(slot, "slot-held payload.slot")?;
+    let generation = unsigned(&payload["generation"], "slot-held payload.generation")?;
+    let active = state.active_records.get(slot).ok_or_else(|| {
+        ObserverError::invalid(format!("slot-held event names absent slot {slot}"))
+    })?;
+    let reason = string(&payload["reason"], "slot-held payload.reason")?;
+    if generation == 0 || generation != active.meta.generation || reason.trim().is_empty() {
+        return Err(ObserverError::invalid(format!(
+            "slot-held event does not match active generation for {slot}"
+        )));
+    }
+    if state.holds.contains_key(slot) {
+        return Err(ObserverError::invalid(format!(
+            "slot-held event duplicates active hold for {slot}"
+        )));
+    }
+    state.holds.insert(
+        slot.to_owned(),
+        SlotHold {
+            slot: slot.to_owned(),
+            generation,
+            held_at: event.recorded_at.clone(),
+            reason: reason.to_owned(),
+            event_sha256: event.sha256.clone(),
+        },
+    );
+    Ok(())
+}
+
+fn apply_hold_release(event: &Event, state: &mut State) -> Result<(), ObserverError> {
+    let payload = object(&event.payload, "slot-hold-released payload")?;
+    exact_keys(
+        payload,
+        &["slot", "generation"],
+        "slot-hold-released payload",
+    )?;
+    let slot = string(&payload["slot"], "slot-hold-released payload.slot")?;
+    validate_name(slot, "slot-hold-released payload.slot")?;
+    let generation = unsigned(
+        &payload["generation"],
+        "slot-hold-released payload.generation",
+    )?;
+    let active = state.active_records.get(slot).ok_or_else(|| {
+        ObserverError::invalid(format!("slot-hold-released event names absent slot {slot}"))
+    })?;
+    if generation == 0 || generation != active.meta.generation {
+        return Err(ObserverError::invalid(format!(
+            "slot-hold-released event does not match active generation for {slot}"
+        )));
+    }
+    let hold = state.holds.remove(slot).ok_or_else(|| {
+        ObserverError::invalid(format!("slot-hold-released event has no hold for {slot}"))
+    })?;
+    if hold.generation != generation {
+        return Err(ObserverError::invalid(format!(
+            "slot-hold-released event does not match held generation for {slot}"
+        )));
+    }
     Ok(())
 }
 
@@ -866,6 +1621,17 @@ fn apply_active(event: &Event, state: &mut State) -> Result<(), ObserverError> {
             meta,
         })
     };
+    if let Some(hold) = state.holds.get(slot) {
+        if next
+            .as_ref()
+            .is_none_or(|entry| entry.meta.generation != hold.generation)
+        {
+            return Err(ObserverError::invalid(format!(
+                "active-state-recorded changes held generation for {slot}"
+            )));
+        }
+    }
+    let removed_generation = current_meta.as_ref().map(|meta| meta.generation);
     if let Some(current) = state.active_records.remove(slot) {
         if current.meta.has_unique_agent()
             && state
@@ -877,6 +1643,7 @@ fn apply_active(event: &Event, state: &mut State) -> Result<(), ObserverError> {
             state.active_agents.remove(&current.meta.agent);
         }
     }
+    let removed_active = next.is_none();
     if let Some(next) = next {
         if next.meta.has_unique_agent() {
             state
@@ -886,6 +1653,9 @@ fn apply_active(event: &Event, state: &mut State) -> Result<(), ObserverError> {
         state.active_records.insert(slot.to_owned(), next);
     }
     state.active_revision = Some(current_revision + 1);
+    if removed_active && removed_generation.is_some() {
+        clear_archived_removal_markers(state, slot);
+    }
     Ok(())
 }
 
@@ -962,6 +1732,7 @@ fn apply_archive(event: &Event, state: &mut State) -> Result<(), ObserverError> 
     }
     insert_archive_record(&payload["record"], meta, state)?;
     state.archive_revision = Some(current_revision + 1);
+    clear_archived_removal_markers(state, slot);
     Ok(())
 }
 
@@ -982,6 +1753,9 @@ fn insert_archive_record(
             meta.slot
         )));
     }
+    state
+        .archived_generations
+        .insert(meta.slot.clone(), meta.generation);
     state.archive_records.push(record.clone());
     Ok(())
 }
@@ -1105,6 +1879,29 @@ fn exact_keys(
     if actual != expected {
         let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
         let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+        return Err(ObserverError::invalid(format!(
+            "{label} has invalid fields: missing {missing:?}; unknown {unknown:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn exact_keys_optional(
+    value: &Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> Result<(), ObserverError> {
+    let actual = value.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let required = required.iter().copied().collect::<BTreeSet<_>>();
+    let allowed = required
+        .iter()
+        .copied()
+        .chain(optional.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let missing = required.difference(&actual).copied().collect::<Vec<_>>();
+    let unknown = actual.difference(&allowed).copied().collect::<Vec<_>>();
+    if !missing.is_empty() || !unknown.is_empty() {
         return Err(ObserverError::invalid(format!(
             "{label} has invalid fields: missing {missing:?}; unknown {unknown:?}"
         )));
