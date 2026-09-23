@@ -23199,6 +23199,14 @@ def test_abort_create_refuses_source_hidden_inside_submodule(
         ("stash", "repository-local ref refs/stash"),
         ("external-worktree", "external linked worktree"),
         ("unreachable-commit", "unreachable repository state"),
+        (
+            "unconfigured-remote-ref",
+            "repository-local ref refs/remotes/local-only/preserve",
+        ),
+        (
+            "unfetched-configured-remote-ref",
+            "repository-local ref refs/remotes/origin/preserve-local",
+        ),
     ),
 )
 def test_abort_create_refuses_submodule_repository_only_authored_state(
@@ -23228,6 +23236,7 @@ def test_abort_create_refuses_submodule_repository_only_authored_state(
     git(component, "config", "user.name", "Wrkslots Test")
     git(component, "config", "user.email", "wrkslots@example.invalid")
     original_head = git(component, "rev-parse", "HEAD").stdout.strip()
+    preserved_head: str | None = None
     external = tmp_path / "external-component-worktree"
     if repository_state == "local-branch":
         git(component, "branch", "preserve-local")
@@ -23245,6 +23254,26 @@ def test_abort_create_refuses_submodule_repository_only_authored_state(
         git(component, "add", "component.txt")
         git(component, "commit", "-m", "preserve unreachable source")
         git(component, "reset", "--hard", original_head)
+    elif repository_state in {
+        "unconfigured-remote-ref",
+        "unfetched-configured-remote-ref",
+    }:
+        (component / "component.txt").write_text(
+            "remote-looking authored source\n", encoding="utf-8"
+        )
+        git(component, "add", "component.txt")
+        git(component, "commit", "-m", "preserve remote-looking source")
+        preserved_head = git(component, "rev-parse", "HEAD").stdout.strip()
+        git(component, "reset", "--hard", original_head)
+        remote_ref = (
+            "refs/remotes/local-only/preserve"
+            if repository_state == "unconfigured-remote-ref"
+            else "refs/remotes/origin/preserve-local"
+        )
+        git(component, "update-ref", remote_ref, preserved_head)
+        assert git(
+            component, "fsck", "--unreachable", "--no-reflogs", "--no-progress"
+        ).stdout == ""
     else:
         raise AssertionError(repository_state)
     assert git(component, "status", "--porcelain").stdout == ""
@@ -23296,10 +23325,87 @@ def test_abort_create_refuses_submodule_repository_only_authored_state(
             for line in git(component, "worktree", "list", "--porcelain").stdout.splitlines()
             if line.startswith("worktree ")
         }
-    else:
+    elif repository_state == "unreachable-commit":
         assert "unreachable commit" in git(
             component, "fsck", "--unreachable", "--no-reflogs", "--no-progress"
         ).stdout
+    else:
+        assert preserved_head is not None
+        remote_ref = (
+            "refs/remotes/local-only/preserve"
+            if repository_state == "unconfigured-remote-ref"
+            else "refs/remotes/origin/preserve-local"
+        )
+        assert git(component, "rev-parse", remote_ref).stdout.strip() == preserved_head
+        assert (
+            git(component, "show", f"{preserved_head}:component.txt").stdout
+            == "remote-looking authored source\n"
+        )
+
+
+def test_abort_create_accepts_a_configured_fetched_submodule_remote_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component",
+            "exit 9",
+        ],
+    )
+    refused = create(project)
+    assert refused.returncode == 3
+    tree = checkout(project)
+    component = tree / "component"
+    component_source = tmp_path / "component-source"
+    git(component_source, "switch", "-c", "fetched-proof")
+    (component_source / "fetched-proof.txt").write_text(
+        "remote-backed source\n", encoding="utf-8"
+    )
+    git(component_source, "add", "fetched-proof.txt")
+    git(component_source, "commit", "-m", "remote-backed commit")
+    git(component_source, "push", "origin", "fetched-proof")
+    git(
+        component,
+        "fetch",
+        "origin",
+        "refs/heads/fetched-proof:refs/remotes/origin/fetched-proof",
+    )
+    assert git(
+        component,
+        "reflog",
+        "show",
+        "-1",
+        "--format=%gs",
+        "refs/remotes/origin/fetched-proof",
+    ).stdout.startswith("fetch ")
+    assert git(component, "status", "--porcelain").stdout == ""
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 0, output.err
+    assert not tree.exists()
+    assert not create_journal_path(project).exists()
 
 
 def test_abort_create_refuses_live_clean_worktree(
