@@ -1774,6 +1774,9 @@ def stub_validate_batch_censuses(
     monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
     monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
     monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+    monkeypatch.setattr(
+        wrkslots, "_capture_excluded_same_uid_process_path_census", fresh
+    )
 
 
 def validation_exclusion_guard(project: Path) -> Path:
@@ -3486,7 +3489,9 @@ def test_ownerless_validate_batch_shares_one_census_and_preserves_checkouts(
         return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
 
     monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
-    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+    monkeypatch.setattr(
+        wrkslots, "_capture_excluded_same_uid_process_path_census", fresh
+    )
 
     rc = wrkslots.main(
         [
@@ -3756,7 +3761,7 @@ def test_frozen_validate_batch_closes_operation_owned_fds_before_censuses(
 
     monkeypatch.setattr(wrkslots, "_capture_lsof_process_path_census", shared)
     monkeypatch.setattr(
-        wrkslots, "_capture_same_uid_process_path_census", fresh
+        wrkslots, "_capture_excluded_same_uid_process_path_census", fresh
     )
 
     rc = wrkslots.main(
@@ -3891,7 +3896,7 @@ def test_frozen_validate_batch_does_not_ignore_current_process_census_use(
     )
     monkeypatch.setattr(
         wrkslots,
-        "_capture_same_uid_process_path_census",
+        "_capture_excluded_same_uid_process_path_census",
         lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
             (), (), owner_cgroup_complete=False
         ),
@@ -5062,7 +5067,7 @@ def test_frozen_validate_rebinds_external_proof_after_exclusion_census(
 
     monkeypatch.setattr(
         wrkslots,
-        "_capture_same_uid_process_path_census",
+        "_capture_excluded_same_uid_process_path_census",
         mutate_during_exclusion_census,
     )
 
@@ -5593,7 +5598,7 @@ def test_frozen_validate_detects_pre_exclusion_same_uid_holder_and_rolls_back(
 
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", enter_before_exclusion_move)
     monkeypatch.setattr(
-        wrkslots, "_capture_same_uid_process_path_census", observe_holder
+        wrkslots, "_capture_excluded_same_uid_process_path_census", observe_holder
     )
     try:
         rc = wrkslots.main(
@@ -6802,7 +6807,7 @@ def test_ownerless_validate_batch_retains_shared_census_use_and_other(
     )
     monkeypatch.setattr(
         wrkslots,
-        "_capture_same_uid_process_path_census",
+        "_capture_excluded_same_uid_process_path_census",
         lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
             (), (), owner_cgroup_complete=False
         ),
@@ -6866,7 +6871,7 @@ def test_ownerless_validate_batch_refuses_before_fresh_same_uid_census(
     )
     monkeypatch.setattr(
         wrkslots,
-        "_capture_same_uid_process_path_census",
+        "_capture_excluded_same_uid_process_path_census",
         lambda paths, **_kwargs: wrkslots._ProcessPathCensus(
             (), ((4343, str(paths[0]), "cwd", str(paths[0])),), owner_cgroup_complete=False
         ),
@@ -6922,7 +6927,7 @@ def test_ownerless_validate_batch_refuses_invoking_process_working_directory(
     )
     monkeypatch.setattr(
         wrkslots,
-        "_capture_same_uid_process_path_census",
+        "_capture_excluded_same_uid_process_path_census",
         lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
             (), (), owner_cgroup_complete=False
         ),
@@ -13886,6 +13891,13 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
         "_capture_same_uid_process_path_census",
         lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
     )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_excluded_same_uid_process_path_census",
+        lambda *_args, **_kwargs: pytest.fail(
+            "registered mode-700 cleanup used the post-exclusion census"
+        ),
+    )
 
     rc = wrkslots.main(
         [
@@ -19520,7 +19532,7 @@ def test_host_context_runner_recovers_ownerless_validation_cargo_home(
     install_validation_exclusion_fixture(project, monkeypatch, request)
     monkeypatch.setattr(
         wrkslots,
-        "_capture_same_uid_process_path_census",
+        "_capture_excluded_same_uid_process_path_census",
         lambda *_args, **_kwargs: wrkslots._ProcessPathCensus(
             (), (), owner_cgroup_complete=False
         ),
@@ -29419,6 +29431,245 @@ def test_same_uid_census_retries_share_one_batch_deadline(
     assert calls == 2
 
 
+@pytest.mark.parametrize("retirement", ("absent", "terminal"))
+def test_excluded_same_uid_census_retires_churn_and_stale_matches(
+    monkeypatch: pytest.MonkeyPatch,
+    retirement: str,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    target = Path("/excluded/validation/payload")
+    retired = False
+    snapshots = 0
+
+    def snapshot(
+        _budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        nonlocal snapshots
+        snapshots += 1
+        return (process,)
+
+    def read_stat(_path: Path) -> wrkslots._ProcessStat | None:
+        if retired and retirement == "absent":
+            return None
+        return wrkslots._ProcessStat(17, 0)
+
+    def terminal(
+        _path: Path, _generation: wrkslots._ProcessStat
+    ) -> bool:
+        return retired and retirement == "terminal"
+
+    def paths(
+        _processes: Sequence[wrkslots._AbsentProcessObservation],
+        _targets: Mapping[Path, str],
+        _budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[
+        tuple[tuple[int, str, str, str], ...],
+        tuple[wrkslots._AbsentProcessObservation, ...],
+    ]:
+        nonlocal retired
+        retired = True
+        return (((123, str(target), "cwd", str(target)),), ())
+
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", snapshot)
+    monkeypatch.setattr(wrkslots, "_read_process_stat", read_stat)
+    monkeypatch.setattr(wrkslots, "_process_generation_is_terminal", terminal)
+    monkeypatch.setattr(wrkslots, "_same_uid_batched_path_matches", paths)
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_find_matches", lambda *_args: ()
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_maps_matches", lambda *_args: ()
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_mount_matches", lambda *_args: ()
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+    )
+
+    census = wrkslots._capture_excluded_same_uid_process_path_census(
+        (target,), budget=budget
+    )
+
+    assert snapshots == 1
+    assert census.processes == ()
+    assert census.matches == ()
+
+
+def test_excluded_same_uid_census_retries_pid_reuse_three_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    target = Path("/excluded/validation/payload")
+    reads = 0
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_process_observations", lambda _budget: (process,)
+    )
+
+    def reused(_path: Path) -> wrkslots._ProcessStat:
+        nonlocal reads
+        reads += 1
+        return wrkslots._ProcessStat(18, 0)
+
+    monkeypatch.setattr(wrkslots, "_read_process_stat", reused)
+    monkeypatch.setattr(
+        wrkslots,
+        "_same_uid_batched_path_matches",
+        lambda *_args: pytest.fail("reused PID reached path observers"),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+    )
+
+    with pytest.raises(wrkslots.Refusal, match="three liveness attempts"):
+        wrkslots._capture_excluded_same_uid_process_path_census(
+            (target,), budget=budget
+        )
+    assert reads == 6
+
+
+@pytest.mark.parametrize("missing", ("cwd", "fd"))
+def test_excluded_same_uid_census_retries_live_proc_entry_motion_three_times(
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    target = Path("/excluded/validation/payload")
+    calls = 0
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_process_observations", lambda _budget: (process,)
+    )
+    monkeypatch.setattr(
+        wrkslots, "_excluded_same_uid_live_processes", lambda rows, _budget: tuple(rows)
+    )
+
+    def moved(*_args: object) -> tuple[()]:
+        nonlocal calls
+        calls += 1
+        raise wrkslots._ProcessEvidenceChanged(
+            f"live PID 123 lost {missing} evidence"
+        )
+
+    monkeypatch.setattr(wrkslots, "_same_uid_batched_path_matches", moved)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+    )
+
+    with pytest.raises(wrkslots.Refusal, match="three liveness attempts"):
+        wrkslots._capture_excluded_same_uid_process_path_census(
+            (target,), budget=budget
+        )
+    assert calls == 3
+
+
+def test_excluded_same_uid_census_retains_stable_target_holder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    target = Path("/excluded/validation/payload")
+    match = (123, str(target), "cwd", str(target))
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_process_observations", lambda _budget: (process,)
+    )
+    monkeypatch.setattr(
+        wrkslots, "_excluded_same_uid_live_processes", lambda rows, _budget: tuple(rows)
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_same_uid_batched_path_matches",
+        lambda *_args: ((match,), ()),
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_find_matches", lambda *_args: ()
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_maps_matches", lambda *_args: ()
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_mount_matches", lambda *_args: ()
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+    )
+
+    census = wrkslots._capture_excluded_same_uid_process_path_census(
+        (target,), budget=budget
+    )
+
+    with pytest.raises(wrkslots.Refusal, match="live process 123"):
+        census.assert_slot_unused(target, None, ignore_current_process=False)
+
+
+@pytest.mark.parametrize("evidence", ("malformed", "permission"))
+def test_excluded_same_uid_census_keeps_hard_evidence_refusals(
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    target = Path("/excluded/validation/payload")
+    calls = 0
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_process_observations", lambda _budget: (process,)
+    )
+    monkeypatch.setattr(
+        wrkslots, "_excluded_same_uid_live_processes", lambda rows, _budget: tuple(rows)
+    )
+
+    def refused(*_args: object) -> tuple[()]:
+        nonlocal calls
+        calls += 1
+        raise wrkslots.Refusal(f"{evidence} process evidence")
+
+    monkeypatch.setattr(wrkslots, "_same_uid_batched_path_matches", refused)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+    )
+
+    with pytest.raises(wrkslots.Refusal, match=f"{evidence} process evidence"):
+        wrkslots._capture_excluded_same_uid_process_path_census(
+            (target,), budget=budget
+        )
+    assert calls == 1
+
+
+def test_excluded_same_uid_census_keeps_shared_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    target = Path("/excluded/validation/payload")
+    now = 0.0
+    calls = 0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_process_observations", lambda _budget: (process,)
+    )
+
+    def live(
+        rows: Sequence[wrkslots._AbsentProcessObservation],
+        budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        budget.remaining_seconds()
+        return tuple(rows)
+
+    def moved(*_args: object) -> tuple[()]:
+        nonlocal now, calls
+        calls += 1
+        now = 6.0
+        raise wrkslots._ProcessEvidenceChanged("live process moved")
+
+    monkeypatch.setattr(wrkslots, "_excluded_same_uid_live_processes", live)
+    monkeypatch.setattr(wrkslots, "_same_uid_batched_path_matches", moved)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+    )
+
+    with pytest.raises(wrkslots.Refusal, match="operation-wide time bound"):
+        wrkslots._capture_excluded_same_uid_process_path_census(
+            (target,), budget=budget
+        )
+    assert calls == 1
+
+
 def test_privileged_census_enforces_one_operation_wide_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -30018,6 +30269,9 @@ def test_current_incomplete_frozen_rechecks_after_fresh_census(
             git(repo, "update-index", "--assume-unchanged", tracked)
         return wrkslots._ProcessPathCensus((), ())
     monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+    monkeypatch.setattr(
+        wrkslots, "_capture_excluded_same_uid_process_path_census", fresh
+    )
     assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
     row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)
     assert row["blocks_entry"] is True, row
@@ -30129,6 +30383,9 @@ def test_current_incomplete_frozen_binds_checkout_and_gitlink_identity(
             shutil.copytree(preserved, checkout, symlinks=True)
             return wrkslots._ProcessPathCensus((), ())
         monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+        monkeypatch.setattr(
+            wrkslots, "_capture_excluded_same_uid_process_path_census", fresh
+        )
     before = (record.read_bytes(), sidecar.read_bytes())
     assert run_current_incomplete_batch(project, source, checkout, record, action=action) == 0
     row = incomplete_batch_row(json.loads(capsys.readouterr().out), action)

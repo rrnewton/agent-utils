@@ -23157,7 +23157,9 @@ def _assert_excluded_validation_unused(
     census_paths = tuple(
         dict.fromkeys((exclusion.payload, exclusion.source_alias, fenced, target))
     )
-    fresh = _capture_same_uid_process_path_census(census_paths, budget=budget)
+    fresh = _capture_excluded_same_uid_process_path_census(
+        census_paths, budget=budget
+    )
     matches = list(fresh.matches)
     if expected_match is not None and expected_match in matches:
         matches.remove(expected_match)
@@ -26436,6 +26438,98 @@ def _capture_same_uid_process_path_census(
         "same-UID liveness proof is indeterminate because relevant process "
         "evidence changed during three attempts"
     )
+
+
+def _excluded_same_uid_live_processes(
+    processes: Sequence[_AbsentProcessObservation],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[_AbsentProcessObservation, ...]:
+    """Retain only live snapshotted generations after a mode-000 exclusion."""
+
+    live: list[_AbsentProcessObservation] = []
+    for process in processes:
+        budget.remaining_seconds()
+        pid_dir = Path("/proc") / str(process.pid)
+        before = _read_process_stat(pid_dir)
+        if before is None:
+            continue
+        if before.start_ticks != process.start_ticks:
+            raise _ProcessEvidenceChanged(
+                f"PID {process.pid} generation changed after validation exclusion"
+            )
+        if _process_generation_is_terminal(pid_dir, before):
+            continue
+        after = _read_process_stat(pid_dir)
+        if after is None:
+            continue
+        if after.start_ticks != process.start_ticks:
+            raise _ProcessEvidenceChanged(
+                f"PID {process.pid} generation changed after validation exclusion"
+            )
+        live.append(process)
+    return tuple(live)
+
+
+def _capture_excluded_same_uid_process_path_census(
+    slot_paths: Sequence[Path],
+    *,
+    budget: _ReadOnlyCommandBudget,
+) -> _ProcessPathCensus:
+    """Census a root-owned mode-000 tree without chasing unrelated exits.
+
+    The caller has already moved every selected path behind a root-owned,
+    non-searchable guard.  A newly created same-UID process cannot acquire a
+    path into that namespace, so this scan binds one initial process snapshot.
+    A snapshotted generation that is later absent or terminal can be retired;
+    PID reuse and incomplete evidence from a still-live generation remain
+    retryable failures.  The shared deadline bounds any amount of benign exit
+    churn, while genuine live motion retains the ordinary three-attempt cap.
+    """
+
+    targets = {path: str(path) for path in slot_paths}
+    if not targets:
+        return _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    processes = _same_uid_process_observations(budget)
+    motion_attempts = 0
+    while True:
+        budget.remaining_seconds()
+        try:
+            active = _excluded_same_uid_live_processes(processes, budget)
+            if not active:
+                return _ProcessPathCensus((), (), owner_cgroup_complete=False)
+            direct_matches, indeterminate = _same_uid_batched_path_matches(
+                active, targets, budget
+            )
+            privileged_matches = (
+                *_absent_validate_find_matches(indeterminate, targets, budget),
+                *_absent_validate_maps_matches(indeterminate, targets, budget),
+            )
+            mount_matches = _absent_validate_mount_matches(active, targets, budget)
+            surviving = _excluded_same_uid_live_processes(active, budget)
+        except _ProcessEvidenceChanged:
+            try:
+                surviving = _excluded_same_uid_live_processes(processes, budget)
+            except _ProcessEvidenceChanged:
+                surviving = processes
+            if len(surviving) < len(processes):
+                processes = surviving
+                continue
+            motion_attempts += 1
+            if motion_attempts < 3:
+                continue
+            raise Refusal(
+                "post-exclusion same-UID process evidence changed during three "
+                "liveness attempts"
+            )
+        surviving_pids = {process.pid for process in surviving}
+        matches = tuple(
+            match
+            for match in (*mount_matches, *direct_matches, *privileged_matches)
+            if match[0] in surviving_pids
+        )
+        return _ProcessPathCensus(
+            surviving, matches, owner_cgroup_complete=False
+        )
 
 
 @dataclasses.dataclass(frozen=True)
