@@ -884,6 +884,19 @@ EOF
             || fail "the launched container is not on-failure:5 with logs retained, it is: $mode"
         ok "the launched container has the fixed name, restart policy on-failure:5, and no --rm"
 
+        # The driver has to be PINNED, and this is the check that says so. Inheriting the host
+        # default is how the three --logs checks below came to fail on a rootless host whose
+        # default is journald and whose journal the calling user cannot read: 'podman logs'
+        # returned NOTHING, with no error, so a launcher that was working perfectly looked like a
+        # server that had said nothing. Asserting the driver names that cause directly, instead of
+        # leaving it to be rediscovered from three silent log checks.
+        driver="$("$ENGINE" inspect --format '{{.HostConfig.LogConfig.Type}}' "$TEST_CONTAINER_NAME")"
+        case "$driver" in
+            k8s-file|json-file) ;;
+            *) fail "the launched container did not pin a file log driver, it inherited: $driver" ;;
+        esac
+        ok "the launched container pins a file log driver rather than inheriting the host's"
+
         # --smoke-agent, DRY RUN ONLY. The suite must never hold a real conversation: that costs
         # the owner vendor minutes. What is checkable for free is everything up to the connection
         # — that it resolves the URL, the channel and the CONTAINER THAT IS ACTUALLY SERVING out

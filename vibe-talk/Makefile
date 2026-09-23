@@ -65,8 +65,15 @@ test:
 page:
 	node --test tests/js/*.test.mjs
 
-# The image is the deployment artifact, and it is not part of `validate` because it needs a
-# container engine and a minute of build. CI runs it on every change; run it here before a deploy.
+# The LAUNCHER -- run.sh, the script the owner types -- as opposed to the image it starts, which
+# the `container` CI job covers separately. Not part of `validate` because it needs a container
+# engine and a minute of build. Run it before a deploy.
+#
+# This comment used to claim "CI runs it on every change" while no workflow ran it at all, and
+# that claim is why nobody checked: run.sh had shipped inheriting the host's log driver, so on a
+# rootless host defaulting to journald `--logs` printed nothing while --status promised retained,
+# readable logs. The suite below catches exactly that and had no runner. It has one now, in
+# .github/workflows/vibe-talk.yml, so the sentence is true rather than reassuring.
 container-smoke:
 	./scripts/test-run-sh.sh
 

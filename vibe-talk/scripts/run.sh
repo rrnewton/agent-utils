@@ -37,7 +37,11 @@
 #                  and its logs; see --logs.
 #   --restart      Stop the running vibe-talk container, then continue with rebuild and relaunch.
 #   --logs         Print the container's output SO FAR and exit — a one-shot dump. Works on a
-#                  stopped container too, which is the whole point of not using --rm.
+#                  stopped container too, which is the whole point of not using --rm. Reads a
+#                  file the container owns, because this script pins the log driver rather than
+#                  inheriting it ($VIBE_TALK_LOG_DRIVER; k8s-file under podman, json-file under
+#                  docker). Inheriting it is how --logs comes back EMPTY on a host whose default
+#                  is journald and whose journal the calling user cannot read.
 #   --follow       Stream the container's output live until you interrupt it (Ctrl-C). This is
 #                  the "attach" action: a terminal tab running it follows the server exactly as
 #                  though you had started the container in the foreground yourself. Nothing is
@@ -155,6 +159,14 @@
 #     * no --rm     the container survives stopping, so 'podman logs' still has the per-request
 #                   access log AFTER a crash — which is exactly when you want to read it. With
 #                   --rm the log was destroyed by the very event you were investigating.
+#     * k8s-file    the log driver is PINNED rather than inherited. Podman's default is often
+#                   journald, and under journald this script's retention promise is not one it
+#                   can keep: on a rootless host with no readable journal 'podman logs' returns
+#                   NOTHING AT ALL — no error, just silence, which reads as "the server said
+#                   nothing" rather than "you cannot see what it said". Where the journal does
+#                   work the lifetime is still wrong, because entries outlive the container and
+#                   rotate on the journal's schedule instead of the container's. k8s-file writes
+#                   a file the container owns, which is exactly the lifetime promised below.
 #   The retention guarantee, stated exactly: logs survive stopping, and are discarded at the
 #   NEXT launch, when the old container is removed to make room. So look before you relaunch.
 #   A leftover stopped container is removed automatically just before the relaunch, so a stale
@@ -228,6 +240,7 @@ LAUNCHER_VARS=(
     VIBE_TALK_HOST_ADDR
     VIBE_TALK_CONTAINER_NAME
     VIBE_TALK_RESTART_POLICY
+    VIBE_TALK_LOG_DRIVER
     VIBE_TALK_TUNNEL_ENABLED
     VIBE_TALK_TUNNEL_UNIT
     VIBE_TALK_TUNNEL_CONFIG
@@ -715,6 +728,17 @@ IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
 # and can never collide with the real 'vibe-talk'.
 CONTAINER_NAME="${VIBE_TALK_CONTAINER_NAME:-$IMAGE_NAME}"
 RESTART_POLICY="${POLICY_OVERRIDE:-${VIBE_TALK_RESTART_POLICY:-on-failure:5}}"
+# Pinned, not inherited — see "How the container is run, and why" above for what inheriting it
+# costs. The two engines spell the same thing differently: podman writes a container-owned file
+# under 'k8s-file', docker under 'json-file'. Overridable for an operator who has a log pipeline
+# of their own and wants the container to feed it instead.
+if [ -n "${VIBE_TALK_LOG_DRIVER:-}" ]; then
+    LOG_DRIVER="$VIBE_TALK_LOG_DRIVER"
+elif [ "$(basename "$ENGINE")" = docker ]; then
+    LOG_DRIVER=json-file
+else
+    LOG_DRIVER=k8s-file
+fi
 
 case "$HOST_PORT" in
     ''|*[!0-9]*) die "host port must be a number, got: $HOST_PORT" ;;
@@ -918,6 +942,8 @@ if [ "$STATUS_ONLY" = 1 ]; then
     note "logs:           RETAINED after the container stops (it is not run with --rm)."
     note "                read them with: $SCRIPT_DIR/run.sh --logs   (or --follow to stream)"
     note "                they are discarded at the next launch, when the old container is removed."
+    note "                driver: $LOG_DRIVER (pinned at launch, so the retention above is this"
+    note "                script's to keep rather than the host default's to decide)."
     note "config file:    ${SOURCED_FILES[*]}"
     if [ -d "$DATA_DIR" ]; then
         note "durable state:  $DATA_DIR -> $CONTAINER_DATA_DIR  (exists; transcripts and read marks survive a rebuild)"
@@ -1316,7 +1342,8 @@ host, so either chown the directory to it (sudo chown $CONTAINER_UID:$CONTAINER_
 or point VIBE_TALK_DATA_DIR at a directory that user can write."
 fi
 
-run_args=(run -d --name "$CONTAINER_NAME" --restart "$RESTART_POLICY" -p "${HOST_ADDR}:${HOST_PORT}:8080")
+run_args=(run -d --name "$CONTAINER_NAME" --restart "$RESTART_POLICY" --log-driver "$LOG_DRIVER" \
+    -p "${HOST_ADDR}:${HOST_PORT}:8080")
 run_args+=("${mount_args[@]}")
 for var in "${REQUIRED_VARS[@]}" "${OPTIONAL_VARS[@]}"; do
     [ -n "${!var:-}" ] || continue

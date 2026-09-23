@@ -243,3 +243,13 @@ jobs:
             exit 1
           fi
           podman stop vibe-talk-ci
+
+      # The LAUNCHER, as opposed to the image. Everything above tests what the container serves;
+      # nothing above ran run.sh, which is the script the owner actually types. That gap was not
+      # theoretical: run.sh inherited the host's container log driver, so on a rootless host whose
+      # default is journald `run.sh --logs` returned empty output while promising in --help and
+      # --status that logs are retained and readable. Its own suite catches that, and its own
+      # suite had no runner. `vibe-talk/Makefile` said "CI runs it on every change", which is the
+      # kind of claim that stops anyone checking; this step is what makes it true.
+      - name: the launcher's own self-test
+        run: make -C vibe-talk container-smoke
