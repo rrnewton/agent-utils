@@ -29,7 +29,7 @@
 #                  [--smoke-agent [--nonce] [--replay-check]]
 #                  [--screenshots [--out DIR] [--theme THEME]]
 #                  [--config FILE] [--tunnel|--no-tunnel] [--tag TAG] [--port PORT]
-#                  [--restart-policy POLICY] [--dry-run] [--help]
+#                  [--restart-policy POLICY] [--build-network MODE] [--dry-run] [--help]
 #
 # Flags, one action per invocation:
 #   --shutdown     Stop the running vibe-talk container and EXIT (it does not go on to rebuild or
@@ -148,6 +148,15 @@
 #   --restart-policy POLICY
 #                  Restart policy for the launched container (default: on-failure:5, or
 #                  $VIBE_TALK_RESTART_POLICY). See the discussion below before changing it.
+#   --build-network MODE
+#                  Network mode for the BUILD only, passed straight through to the engine
+#                  ('host', 'none', a named network — whatever your engine accepts). Default:
+#                  unset, meaning the engine's own default, or $VIBE_TALK_BUILD_NETWORK.
+#                  Reach for this when the build fails downloading dependencies while the same
+#                  host can fetch them fine from a shell: the build runs in its own network
+#                  namespace, and on some hosts outbound access exists only in the host's.
+#                  Affects nothing about the running container, which is published on a port.
+#                    ./scripts/run.sh --build-network host
 #   --dry-run      Run every check and print the build/run commands, but build and start nothing.
 #   --help         This text.
 #
@@ -241,6 +250,7 @@ LAUNCHER_VARS=(
     VIBE_TALK_CONTAINER_NAME
     VIBE_TALK_RESTART_POLICY
     VIBE_TALK_LOG_DRIVER
+    VIBE_TALK_BUILD_NETWORK
     VIBE_TALK_TUNNEL_ENABLED
     VIBE_TALK_TUNNEL_UNIT
     VIBE_TALK_TUNNEL_CONFIG
@@ -266,6 +276,7 @@ TUNNEL_OVERRIDE=""
 TAG_OVERRIDE=""
 PORT_OVERRIDE=""
 POLICY_OVERRIDE=""
+BUILD_NETWORK_OVERRIDE=""
 
 # The header comment above IS the help text: printed from line 2 up to the first non-comment
 # line, so it cannot drift out of sync with the flags it documents.
@@ -285,6 +296,7 @@ while [ $# -gt 0 ]; do
         --tag) TAG_OVERRIDE="${2:?--tag needs a value}"; shift 2 ;;
         --port) PORT_OVERRIDE="${2:?--port needs a value}"; shift 2 ;;
         --restart-policy) POLICY_OVERRIDE="${2:?--restart-policy needs a value}"; shift 2 ;;
+        --build-network) BUILD_NETWORK_OVERRIDE="${2:?--build-network needs a value}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --status) STATUS_ONLY=1; shift ;;
         --logs) LOGS_ONLY=1; shift ;;
@@ -739,6 +751,13 @@ elif [ "$(basename "$ENGINE")" = docker ]; then
 else
     LOG_DRIVER=k8s-file
 fi
+# Empty by default, which means "say nothing and let the engine choose" — the behaviour this
+# script has always had. It exists because the build gets its own network namespace, and on a host
+# where outbound access lives only in the host's, the build fails fetching dependencies while the
+# very same host fetches them fine from a shell. That failure is indistinguishable from a broken
+# Containerfile until you know the build is not on the network you think it is, and before this
+# there was no lever here to try: BUILD only, never the running container.
+BUILD_NETWORK="${BUILD_NETWORK_OVERRIDE:-${VIBE_TALK_BUILD_NETWORK:-}}"
 
 case "$HOST_PORT" in
     ''|*[!0-9]*) die "host port must be a number, got: $HOST_PORT" ;;
@@ -1232,11 +1251,16 @@ fi
 # ---------------------------------------------------------------------------------------------
 
 step "Building $IMAGE_REF from $VIBE_TALK_DIR/Containerfile"
+build_args=(build -t "$IMAGE_REF" -f "$VIBE_TALK_DIR/Containerfile")
+[ -n "$BUILD_NETWORK" ] && build_args+=(--network "$BUILD_NETWORK")
+build_args+=("$VIBE_TALK_DIR")
 if [ "$DRY_RUN" = 1 ]; then
-    note "(dry run) $ENGINE build -t $IMAGE_REF -f $VIBE_TALK_DIR/Containerfile $VIBE_TALK_DIR"
+    note "(dry run) $ENGINE ${build_args[*]}"
 else
-    "$ENGINE" build -t "$IMAGE_REF" -f "$VIBE_TALK_DIR/Containerfile" "$VIBE_TALK_DIR" \
-        || die "image build failed. Fix the build before relaunching; the previous image is untouched."
+    "$ENGINE" "${build_args[@]}" \
+        || die "image build failed. Fix the build before relaunching; the previous image is
+untouched. If it failed DOWNLOADING DEPENDENCIES rather than compiling them, the build's own
+network namespace is the first thing to suspect, not the Containerfile: try --build-network host."
 fi
 
 # ---------------------------------------------------------------------------------------------

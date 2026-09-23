@@ -415,6 +415,22 @@ grep -q 'sometimes' <<< "$out" || fail "invalid-policy error does not name the v
 grep -q 'build -t' <<< "$out" && fail "invalid restart policy was only caught after the build step"
 ok "an invalid restart policy fails early, naming the value and the valid ones"
 
+# --build-network, and the two halves of it that matter. The default must stay ABSENT rather than
+# becoming some explicit mode, because "whatever the engine chooses" is what every host that works
+# today is relying on; and the flag must reach the BUILD and not the run, since the container is
+# published on a port and has no business on the host's network namespace.
+out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel)"
+grep '(dry run).*build -t' <<< "$out" | grep -q -- '--network' \
+    && fail "the build names a network mode by default; it must leave the engine's default alone"
+ok "the build passes no network mode unless asked, leaving the engine's default alone"
+
+out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel --build-network host)"
+grep '(dry run).*build -t' <<< "$out" | grep -q -- '--network host' \
+    || fail "--build-network host did not reach the build command: $out"
+grep '(dry run).*run -d' <<< "$out" | grep -q -- '--network' \
+    && fail "--build-network leaked into the run command, which must stay on its published port"
+ok "--build-network reaches the build only, never the launched container"
+
 # Two actions at once is a mistake, and silently honouring one of them is the worst answer.
 rc=0; out="$(run_sh --config "$GOOD_CONFIG" --status --logs)" || rc=$?
 [ "$rc" -ne 0 ] || fail "--status --logs together did not fail"
