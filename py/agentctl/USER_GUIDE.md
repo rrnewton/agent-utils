@@ -9,7 +9,7 @@ can still examine and steer directly.
 ## Dependencies and available adapters
 
 The core interactive adapter calls Herdr's public CLI directly. Install Herdr
-and the selected Codex or Claude harness separately, and authenticate the
+and the selected Codex, Claude, or Muse harness separately, and authenticate the
 harness before launching workers. The integration uses Herdr's pane, tab,
 workspace, agent prompt, agent wait, and session inspection APIs.
 
@@ -28,8 +28,8 @@ workers and MCP remain bundled capabilities of the Python distribution.
 
 | Mode or service | What it controls | Additional dependency |
 | --- | --- | --- |
-| Interactive | A native Codex or Claude TUI that remains directly accessible | Herdr |
-| Headless worker extension | Resumable Codex or AGY structured turns; a terminal shows the transcript | Herdr or tmux and the chosen harness |
+| Interactive | A native Codex, Claude, or Muse TUI that remains directly accessible | Herdr |
+| Headless worker extension | Resumable Codex, AGY, or Muse structured turns; a terminal shows the transcript | Herdr or tmux and the chosen harness |
 | Chat service | Provider messages connected to an interactive coordinator | Herdr and either the Python Google Chat transport or a Rust subscription plugin |
 | MCP extension | The same session operations over local MCP stdio | An MCP client |
 
@@ -225,6 +225,66 @@ They share its files and credentials. Separate Git worktrees are an operator
 choice when simultaneous edits need isolation; agent control does not require
 creating worktrees.
 
+## Private launch profiles and harness skills
+
+Repeated harness policy can live in `.agentctl/profiles.json` under the working
+directory. The file is deliberately project-local and untracked. `agentctl`
+requires `.agentctl/` to match a Git ignore rule, requires the directory and
+file to be owned by the current user with no group or other permissions, and
+refuses symlinks, hard links, unknown fields, malformed text, NUL, and
+credential-shaped environment or argument names.
+
+```json
+{
+  "schema": "agentctl-profiles/v1",
+  "profiles": {
+    "preferred-reviewer": {
+      "harness": "muse",
+      "mode": "interactive",
+      "model": "provider-model-id",
+      "reasoning_effort": "high",
+      "argv": [],
+      "env": {"ROUTING_SELECTOR": "provider-route"}
+    }
+  }
+}
+```
+
+`harness` and `mode` are required. `model`, `reasoning_effort`, `argv`, and
+`env` are optional. Values are parsed as JSON strings and passed as literal
+arguments or environment entries; they are never shell-expanded. A profile
+cannot specify the model or effort both structurally and in `argv`. When
+`--profile NAME` is present, explicit `--harness`, `--mode`, `--model`,
+`--reasoning-effort`, `--resume`, `--harness-arg`, and `--env` are refused instead of
+silently winning or losing. The config is not a credential store. Environment
+values are not written to session records or profile-list output; raw arguments
+are launch policy and therefore must not contain secrets. Raw Codex
+`-c`/`--config` and `-p`/`--profile` arguments cannot accompany a structured
+model or effort because those opaque settings could override the structured
+selection.
+
+Interactive profiles support Codex, Claude, and Muse. Headless profiles support
+Codex, AGY, and Muse in installations that include the worker extension.
+Headless Muse keeps `exec`, `--json`, `--session-id`, and the prompt under the
+runner's control. Extra options with values use one literal `--option=value`
+entry; repeatable options such as `--image=...` may be repeated.
+
+```sh
+chmod 700 .agentctl
+chmod 600 .agentctl/profiles.json
+agentctl profiles --cwd .
+agentctl start reviewer --cwd . --profile preferred-reviewer
+```
+
+`agentctl skill install` installs the bundled `agentctl` skill for Codex,
+Claude, and Muse. A byte-identical installation is left unchanged. Divergent
+content and symlink destinations are refused unless a regular file is replaced
+with explicit `--force`; symlinks are never followed. Select one or more targets
+with repeatable `--harness`. Codex and Claude receive the file directly in
+their configured skill roots. Muse is installed through its native
+`muse skills install --scope user` command and managed XDG skill store; the
+command is skipped when that managed copy is already byte-identical.
+
 ## Start and delegate
 
 ```sh
@@ -233,7 +293,7 @@ agentctl start reviewer --harness codex --cwd /work/project \
 agentctl start implementer --harness claude --cwd /work/project \
   --file /tmp/implementation-task.txt
 agentctl start gateway-worker --harness codex --cwd /work/project \
-  --env META_CODEX_AI_GATEWAY=azure-codex-cyber:openai \
+  --env ROUTING_SELECTOR=provider-route \
   --brief 'Use the configured gateway for this task'
 agentctl list
 agentctl status reviewer
@@ -241,6 +301,7 @@ agentctl send reviewer 'Focus on cancellation and restart behavior'
 ```
 
 `--model` selects an accessible model; omission preserves the harness default.
+`--reasoning-effort` maps to the selected harness's structured effort option.
 `--harness-arg=ARG` passes a literal argument to an interactive harness and may
 be repeated. `--resume SESSION` resumes an explicitly identified conversation.
 Use `--workspace-id` to choose an exact Herdr workspace.
@@ -251,6 +312,39 @@ harness starts; spaces, shell characters, additional `=` characters, Unicode,
 and an empty value are not expanded or rewritten. Names must match
 `[A-Za-z_][A-Za-z0-9_]*`, and neither names nor values may contain NUL. This
 option does not apply to headless workers.
+
+Muse is launched through Herdr's generic `pane run` interface because Herdr's
+native agent-kind registry does not currently accept it. `agentctl` resolves the
+installed executable, launches a shell-quoted literal argv, verifies both its
+kernel `/proc/PID/exe` identity and argv in the allocated pane, and then publishes pane-local agent
+status. New owned sessions persist the Linux boot ID, PID, process start time,
+and executable device/inode before readiness checks. Subsequent operations bind
+to that tuple and intentionally do not consult the installation pathname, so
+an atomic package upgrade may leave `/proc/PID/exe` marked `(deleted)` without
+invalidating the still-running session; the new image applies only to future
+sessions. Interactive shebang scripts and other binfmt wrappers are refused
+because their kernel executable identity belongs to the interpreter rather
+than the configured harness. Records without the tuple retain strict
+current-path verification and are not auto-migrated after their image is
+already deleted. It never resolves this adapter with `agent get NAME`. A visible
+workspace-trust prompt fails startup and leaves the pane for a human; only an
+owner-configured literal `--trust-workspace` argument bypasses that refusal.
+For delivery, the adapter verifies the same foreground Muse process and a bare
+idle composer, inserts the prompt as one bracketed literal paste with Herdr's
+`pane send-text` (so embedded newlines cannot submit it), proves the draft is
+visibly present in the bottom composer, re-verifies the recorded process, and
+only then sends `Enter`. It marks
+the queue item delivered only after the same literal prompt has moved out of
+the composer into Muse's transcript. A redraw or error that leaves the draft in
+the composer is not acceptance. Failure
+after either input boundary remains `possibly_submitted`; it is never replayed
+automatically.
+Requested reasoning effort is launch intent, not proof of the provider's
+resolved effort. In deployments where an `ultra` gate is closed, Muse can
+visibly resolve the request to `xhigh`. `start` and `status` preserve that
+bounded sentence as `startup_warning` and report the explicitly selected
+`effective_reasoning_effort`; they do not relabel requested `ultra` as the
+effective setting. The live footer remains the primary UI evidence.
 
 Environment values are launch-only input. `agentctl` does not write them to the
 session registry or return them from `status` or `list`. They still become part
@@ -434,6 +528,17 @@ The worker inbox marks claimed turns before execution. After an interruption,
 inspect uncertain turn state and the native conversation rather than assuming
 that rerunning a command is harmless. Stop and migration operations verify
 ownership and preserve recoverable state on failure.
+
+Muse headless turns put the subcommand first—`muse exec ... --json`—and pass an
+agentctl-generated UUID as `--session-id` on every turn. A `--` option terminator
+immediately before the literal prompt prevents prompt text such as `--help` or
+`--disable-sandbox` from becoming a Muse option. They never use Muse's
+separate interactive `resume` subcommand. The runner accepts only schema-version-1 JSONL
+events for that exact session, requires monotonically increasing per-turn
+sequence numbers, one accepted command, and one terminal outcome. Event count,
+event size, final-answer size, wall time, and stderr retention are bounded.
+Missing, duplicate, malformed, or cross-session terminal events produce an
+explicit protocol error rather than an apparent successful answer.
 
 ## Chat and MCP extensions
 

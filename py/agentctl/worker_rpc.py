@@ -31,6 +31,15 @@ def _optional_int(request: dict[str, object], key: str) -> int | None:
     return value
 
 
+def _string_array(request: dict[str, object], key: str) -> list[str]:
+    value = request.get(key, [])
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item or "\0" in item for item in value
+    ):
+        raise ValueError(f"{key} must be an array of nonempty NUL-free strings")
+    return value
+
+
 def dispatch(request: dict[str, object]) -> dict[str, object]:
     """Execute one explicitly supported runtime operation."""
     action = get_str(request, "action", "runtime request")
@@ -40,7 +49,8 @@ def dispatch(request: dict[str, object]) -> dict[str, object]:
         result = lib.bring_up_agent(name, cwd=get_str(request, "cwd", "start"),
             harness=get_str(request, "harness", "start"),
             model=_optional_text(request, "model"), brief=_optional_text(request, "brief"),
-            backend=get_str(request, "backend", "start"), mode="headless")
+            backend=get_str(request, "backend", "start"), mode="headless",
+            harness_args=_string_array(request, "harness_args"))
     elif action == "status":
         result = lib.status_snapshot(name, run_gc=False)
     elif action == "send":

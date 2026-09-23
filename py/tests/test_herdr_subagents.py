@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError, AgentPending, HerdrUnavailable
 from agentctl.subagents import ManagedAgents, environment_entries, harness_arguments
 import agentctl.legacy_cli as cli
@@ -27,6 +28,14 @@ class FakeManagedClient:
         self.serial = 0
         self.offline = False
         self.fail_start = False
+        self.custom_dies_after_report = False
+        self.custom_fails_after_observation = False
+        self.custom_running = False
+        self.custom_at_idle_shell = True
+        self.custom_identity = CustomProcessIdentity(
+            version=1, boot_id="00000000-0000-0000-0000-000000000000",
+            pid=200, starttime_ticks=200, executable_device=1, executable_inode=2,
+        )
 
     def workspace_id_for_label(self, label: str) -> str | None:
         assert label == "subagents"
@@ -76,6 +85,36 @@ class FakeManagedClient:
         if self.fail_start:
             raise HerdrUnavailable("trust prompt needs attention")
         self.infos[pane_id] = replace(self.infos[pane_id], agent=kind, status="idle", session_agent=kind, session_value=f"session-{self.serial}")
+
+    def start_pane_agent(
+        self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
+        on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+    ) -> CustomProcessIdentity:
+        assert timeout > 0
+        self.launched.append((name, kind, pane_id, arguments))
+        self.custom_running = True
+        if on_observed is not None:
+            on_observed(self.custom_identity)
+        if self.custom_fails_after_observation:
+            raise HerdrUnavailable("trust prompt requires human attention")
+        self.infos[pane_id] = replace(
+            self.infos[pane_id], agent=kind, status="idle",
+        )
+        self.custom_running = not self.custom_dies_after_report
+        return self.custom_identity
+
+    def verify_custom_harness(
+        self, pane_id: str, kind: str,
+        expected_identity: CustomProcessIdentity | None = None,
+    ) -> None:
+        if (self.infos[pane_id].agent not in (None, kind) or not self.custom_running
+                or (expected_identity is not None
+                    and expected_identity != self.custom_identity)):
+            raise HerdrUnavailable("custom harness is not the foreground process")
+
+    def pane_is_idle_shell(self, pane_id: str) -> bool:
+        assert pane_id in self.infos
+        return self.custom_at_idle_shell
 
     def agent_pane(self, name: str) -> str:
         matches = [entry[2] for entry in self.launched if entry[0] == name]
@@ -252,6 +291,80 @@ def test_failed_launch_cleanup_refuses_replacement_harness(tmp_path: Path, monke
     assert fake.closed == []
 
 
+def test_failed_muse_launch_with_our_stale_pane_report_is_stoppable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    fake.custom_dies_after_report = True
+    with pytest.raises(AgentDeliveryError, match="foreground process"):
+        manager.start("failed", cwd=str(tmp_path), harness="muse")
+    failed = manager.get("failed")
+    assert failed.lifecycle == "launch_failed"
+    assert failed.pane_reported_by_agentctl is True
+    assert manager.stop("failed")["pane_closed"] is True
+
+
+def test_muse_process_identity_is_saved_before_trust_failure_and_permits_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    fake.custom_fails_after_observation = True
+
+    with pytest.raises(AgentDeliveryError, match="trust prompt"):
+        manager.start("failed", cwd=str(tmp_path), harness="muse")
+
+    failed = manager.get("failed")
+    assert failed.lifecycle == "launch_failed"
+    assert failed.pane_reported_by_agentctl is False
+    assert failed.custom_process_identity == fake.custom_identity
+    assert manager.stop("failed")["pane_closed"] is True
+
+
+def test_unreported_starting_muse_without_identity_is_not_assumed_to_own_idle_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    path = manager.registry / "worker" / "agent.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["lifecycle"] = "starting"
+    document["pane_reported_by_agentctl"] = False
+    document["custom_process_identity"] = None
+    path.write_text(json.dumps(document), encoding="utf-8")
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], agent=None)
+
+    with pytest.raises(HerdrUnavailable, match="cannot prove starting"):
+        manager.stop("worker")
+    assert fake.closed == []
+    assert path.exists()
+
+
+def test_failed_muse_launch_cleanup_refuses_a_replacement_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    fake.custom_dies_after_report = True
+    with pytest.raises(AgentDeliveryError):
+        manager.start("failed", cwd=str(tmp_path), harness="muse")
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], agent="codex")
+    with pytest.raises(HerdrUnavailable, match="foreground process"):
+        manager.stop("failed")
+    assert fake.closed == []
+
+
+def test_failed_muse_launch_cleanup_refuses_non_shell_foreground_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    fake.custom_dies_after_report = True
+    with pytest.raises(AgentDeliveryError):
+        manager.start("failed", cwd=str(tmp_path), harness="muse")
+    fake.custom_at_idle_shell = False
+    with pytest.raises(HerdrUnavailable, match="foreground process"):
+        manager.stop("failed")
+    assert fake.closed == []
+
+
 def test_busy_delivery_stays_pending_and_can_drain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
@@ -351,6 +464,51 @@ def test_private_state_and_malformed_record_are_rejected(tmp_path: Path, monkeyp
     record.chmod(0o644)
     with pytest.raises(AgentDeliveryError, match="not private"):
         manager.get("worker")
+
+
+def test_malformed_custom_process_identities_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    path = manager.registry / "worker" / "agent.json"
+    original = json.loads(path.read_text(encoding="utf-8"))
+    identity = original["custom_process_identity"]
+    assert isinstance(identity, dict)
+
+    variants: list[dict[str, object]] = []
+    for field, value in (
+        ("version", True),
+        ("pid", True),
+        ("pid", 2_147_483_648),
+        ("starttime_ticks", 1 << 64),
+        ("executable_device", 0),
+        ("executable_device", 1 << 64),
+        ("executable_inode", 1 << 64),
+        ("boot_id", "NOT-A-BOOT-ID"),
+    ):
+        variant = json.loads(json.dumps(original))
+        variant["custom_process_identity"][field] = value
+        variants.append(variant)
+    missing = json.loads(json.dumps(original))
+    del missing["custom_process_identity"]["starttime_ticks"]
+    variants.append(missing)
+    unknown = json.loads(json.dumps(original))
+    unknown["custom_process_identity"]["unexpected"] = 1
+    variants.append(unknown)
+    for record_field, record_value in (
+        ("adapter", "herdr"),
+        ("harness", "codex"),
+        ("pane_id", None),
+    ):
+        variant = json.loads(json.dumps(original))
+        variant[record_field] = record_value
+        variants.append(variant)
+
+    for document in variants:
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with pytest.raises(AgentDeliveryError, match="custom process identity|invalid agent record"):
+            manager.get("worker")
 
 
 @pytest.mark.parametrize("name", ["../outside", "archive", "Has-Capitals", "under_score", "0worker", "a" * 33])

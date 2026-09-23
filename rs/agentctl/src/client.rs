@@ -4,27 +4,467 @@
 //! server and has no shell executor, broker, or allowlist dependency.
 use crate::error::{AdapterError, Result};
 use chat_subscription_plugin::process::ProcessPluginChild;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::fs::{self, File};
+use std::ffi::{CStr, OsString};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::thread;
 use std::time::{Duration, Instant};
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const CONTROL_STDERR_BYTES: usize = 64 * 1024;
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CAPTURE_READ_BURST: usize = 256 * 1024;
+const PROC_STAT_BYTES: usize = 8 * 1024;
+const BOOT_ID_BYTES: usize = 128;
 #[cfg(all(test, target_os = "linux"))]
 static POLL_CAPTURE_INTERRUPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Durable identity of one custom harness process.
+///
+/// A pathname is deliberately absent: package upgrades may atomically replace the
+/// installed image while the old process remains alive. The boot/start tuple binds
+/// the PID, while device/inode binds the executable image that Linux actually ran.
+/// Each observation holds a pidfd so PID reuse cannot interleave its `/proc` reads.
+/// Across separate invocations, Linux exposes no persistent handle in this schema;
+/// reuse of the same PID by the same executable within one scheduler tick remains a
+/// theoretical ambiguity and is why this identity authorizes pane closure, not an
+/// independently targeted signal to that PID.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomProcessIdentity {
+    /// Identity schema version.
+    pub version: u32,
+    /// Canonical Linux boot UUID.
+    pub boot_id: String,
+    /// Positive Linux process identifier.
+    pub pid: u64,
+    /// Field 22 from `/proc/PID/stat`.
+    pub starttime_ticks: u64,
+    /// Device number of the opened executable image.
+    pub executable_device: u64,
+    /// Inode number of the opened executable image.
+    pub executable_inode: u64,
+}
+
+impl CustomProcessIdentity {
+    pub(crate) fn valid(&self) -> bool {
+        self.version == 1
+            && canonical_boot_uuid(&self.boot_id)
+            && (1..=i32::MAX as u64).contains(&self.pid)
+            && self.starttime_ticks > 0
+            && self.executable_device > 0
+            && self.executable_inode > 0
+    }
+}
+
+#[derive(Debug)]
+struct PinnedHarnessExecutable {
+    path: PathBuf,
+    _image: File,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct LiveCustomProcess {
+    identity: CustomProcessIdentity,
+    process_group_id: u64,
+}
+
+fn canonical_boot_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
+fn bounded_file(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
+    let value = fs::read(path).map_err(|error| {
+        AdapterError::unavailable(format!("cannot read {label} {}: {error}", path.display()))
+    })?;
+    if value.is_empty() || value.len() > limit {
+        return Err(AdapterError::unavailable(format!(
+            "{label} {} has an invalid length",
+            path.display()
+        )));
+    }
+    Ok(value)
+}
+
+fn current_boot_uuid() -> Result<String> {
+    let path = Path::new("/proc/sys/kernel/random/boot_id");
+    let value = bounded_file(path, BOOT_ID_BYTES, "boot identity")?;
+    let value = std::str::from_utf8(&value)
+        .map_err(|_| AdapterError::unavailable("Linux boot identity is not UTF-8"))?
+        .trim();
+    if !canonical_boot_uuid(value) {
+        return Err(AdapterError::unavailable(
+            "Linux boot identity is not a canonical UUID",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn process_stat(pid: u64) -> Result<(u64, u64)> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let value = bounded_file(&path, PROC_STAT_BYTES, "process stat")?;
+    let value = std::str::from_utf8(&value)
+        .map_err(|_| AdapterError::unavailable("Linux process stat is not UTF-8"))?;
+    let close = value.rfind(')').ok_or_else(|| {
+        AdapterError::unavailable(format!("cannot parse process stat for pid {pid}"))
+    })?;
+    let recorded_pid = value[..close]
+        .split_once(" (")
+        .and_then(|(value, _)| value.parse::<u64>().ok())
+        .filter(|value| *value == pid)
+        .ok_or_else(|| {
+            AdapterError::unavailable(format!("process stat identity changed for pid {pid}"))
+        })?;
+    debug_assert_eq!(recorded_pid, pid);
+    let fields = value[close + 1..].split_whitespace().collect::<Vec<_>>();
+    if fields.len() <= 19 || fields[0] == "Z" {
+        return Err(AdapterError::unavailable(format!(
+            "process stat for pid {pid} is incomplete or exited"
+        )));
+    }
+    let process_group_id = fields[2]
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+        .ok_or_else(|| {
+            AdapterError::unavailable(format!("process group is invalid for pid {pid}"))
+        })?;
+    let starttime_ticks = fields[19]
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            AdapterError::unavailable(format!("process start time is invalid for pid {pid}"))
+        })?;
+    Ok((process_group_id, starttime_ticks))
+}
+
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u64) -> Result<OwnedFd> {
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| AdapterError::unavailable("custom process id is invalid"))?;
+    for _attempt in 0..4 {
+        // SAFETY: pidfd_open receives a checked positive pid and no pointer arguments.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if descriptor >= 0 {
+            // SAFETY: pidfd_open returned a new descriptor owned by this call.
+            return Ok(unsafe { OwnedFd::from_raw_fd(descriptor as i32) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(AdapterError::unavailable(format!(
+                "cannot pin custom process {pid}: {error}"
+            )));
+        }
+    }
+    Err(AdapterError::unavailable(format!(
+        "cannot pin custom process {pid}: interrupted repeatedly"
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn require_live_pidfd(pidfd: &OwnedFd, pid: u64) -> Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: descriptor points to one initialized pollfd for the duration of this call.
+        let status = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if status == 0 && descriptor.revents == 0 {
+            return Ok(());
+        }
+        if status < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if status < 0 {
+            return Err(AdapterError::unavailable(format!(
+                "cannot inspect pinned custom process {pid}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        return Err(AdapterError::unavailable(format!(
+            "custom process {pid} exited while its identity was inspected"
+        )));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn executable_identity(pid: u64) -> Result<(u64, u64)> {
+    let path = PathBuf::from(format!("/proc/{pid}/exe"));
+    let image = File::open(&path).map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot open executable image for custom process {pid}: {error}"
+        ))
+    })?;
+    let metadata = image.metadata().map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot inspect executable image for custom process {pid}: {error}"
+        ))
+    })?;
+    if !metadata.is_file() || metadata.dev() == 0 || metadata.ino() == 0 {
+        return Err(AdapterError::unavailable(format!(
+            "custom process {pid} has an invalid executable image"
+        )));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(target_os = "linux")]
+fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
+    if !(1..=i32::MAX as u64).contains(&pid) {
+        return Err(AdapterError::unavailable(
+            "custom process id is not a positive Linux process id",
+        ));
+    }
+    let pidfd = open_pidfd(pid)?;
+    require_live_pidfd(&pidfd, pid)?;
+    let boot_before = current_boot_uuid()?;
+    let stat_before = process_stat(pid)?;
+    let executable_before = executable_identity(pid)?;
+    let stat_after = process_stat(pid)?;
+    let executable_after = executable_identity(pid)?;
+    let boot_after = current_boot_uuid()?;
+    require_live_pidfd(&pidfd, pid)?;
+    if boot_before != boot_after
+        || stat_before != stat_after
+        || executable_before != executable_after
+    {
+        return Err(AdapterError::unavailable(format!(
+            "custom process {pid} identity changed while it was inspected"
+        )));
+    }
+    Ok(LiveCustomProcess {
+        identity: CustomProcessIdentity {
+            version: 1,
+            boot_id: boot_before,
+            pid,
+            starttime_ticks: stat_before.1,
+            executable_device: executable_before.0,
+            executable_inode: executable_before.1,
+        },
+        process_group_id: stat_before.0,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn live_custom_process(_pid: u64) -> Result<LiveCustomProcess> {
+    Err(AdapterError::unavailable(
+        "custom process identity requires Linux pidfds and procfs",
+    ))
+}
+
+fn safe_executable_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && metadata.permissions().mode() & 0o111 != 0
+        && metadata.permissions().mode() & 0o022 == 0
+        && metadata.dev() > 0
+        && metadata.ino() > 0
+}
+
+fn pin_harness_executable(path: PathBuf) -> Result<PinnedHarnessExecutable> {
+    let mut image = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| {
+            AdapterError::unavailable(format!(
+                "cannot pin custom harness executable {}: {error}",
+                path.display()
+            ))
+        })?;
+    let metadata = image.metadata().map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot inspect pinned custom harness executable {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !safe_executable_metadata(&metadata) {
+        return Err(AdapterError::unavailable(format!(
+            "refusing unsafe pinned custom harness executable: {}",
+            path.display()
+        )));
+    }
+    let mut magic = [0_u8; 4];
+    image.read_exact(&mut magic).map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot read pinned custom harness executable {}: {error}",
+            path.display()
+        ))
+    })?;
+    if magic != *b"\x7fELF" {
+        return Err(AdapterError::unavailable(format!(
+            "custom harness executable must be an ELF image, not a script or binfmt payload: {}",
+            path.display()
+        )));
+    }
+    let revalidated = image.metadata().map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot revalidate pinned custom harness executable {}: {error}",
+            path.display()
+        ))
+    })?;
+    let current = fs::metadata(&path).map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot recheck custom harness executable {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !safe_executable_metadata(&revalidated)
+        || !safe_executable_metadata(&current)
+        || revalidated.dev() != metadata.dev()
+        || revalidated.ino() != metadata.ino()
+        || current.dev() != metadata.dev()
+        || current.ino() != metadata.ino()
+    {
+        return Err(AdapterError::unavailable(format!(
+            "custom harness executable changed while it was pinned: {}",
+            path.display()
+        )));
+    }
+    Ok(PinnedHarnessExecutable {
+        path,
+        _image: image,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn muse_effort(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
+}
+
+/// Return only Muse's bounded downgrade sentence and its explicit effective effort.
+pub(crate) fn muse_startup_metadata(screen: &str) -> (Option<String>, Option<String>) {
+    for raw_line in screen.lines() {
+        let line = raw_line.trim();
+        if !line.is_ascii() || line.len() > 256 {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("reasoning effort ") else {
+            continue;
+        };
+        let Some((unavailable, effective)) = rest.rsplit_once("; using ") else {
+            continue;
+        };
+        let Some((requested, detail)) = unavailable.split_once(" is not available") else {
+            continue;
+        };
+        if !muse_effort(requested) || !muse_effort(effective) {
+            continue;
+        }
+        if !detail.is_empty() && !(detail.starts_with(" (") && detail.ends_with(')')) {
+            continue;
+        }
+        return (Some(line.to_owned()), Some(effective.to_owned()));
+    }
+    (None, None)
+}
+
+/// Recognize only explicit workspace-trust questions.
+pub(crate) fn muse_trust_prompt(screen: &str) -> bool {
+    let lowered = screen.to_ascii_lowercase();
+    lowered.contains("trust this workspace")
+        || (lowered.contains("do you trust")
+            && (lowered.contains("workspace") || lowered.contains("folder")))
+        || lowered.contains("workspace trust")
+}
+
+pub(crate) fn muse_idle_composer(screen: &str) -> bool {
+    screen.contains("Auto-review") && screen.lines().any(|line| matches!(line.trim(), "❯" | "›"))
+}
+
+fn muse_text_visible(screen: &str, text: &str) -> bool {
+    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let rendered = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    if wanted.is_empty() {
+        return false;
+    }
+    if wanted.chars().count() <= 160 {
+        return rendered.contains(&wanted);
+    }
+    let prefix = wanted.chars().take(80).collect::<String>();
+    let mut suffix = wanted.chars().rev().take(80).collect::<Vec<_>>();
+    suffix.reverse();
+    let suffix = suffix.into_iter().collect::<String>();
+    rendered.contains(&prefix) && rendered.contains(&suffix)
+}
+
+fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
+    let lines = screen.lines().collect::<Vec<_>>();
+    let footer = lines
+        .iter()
+        .rposition(|line| line.contains("Auto-review"))?;
+    let dividers = lines[..footer]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            (trimmed.chars().count() >= 3
+                && trimmed
+                    .chars()
+                    .all(|value| matches!(value, '─' | '━' | '═')))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let bottom = *dividers.last()?;
+    let top = *dividers.get(dividers.len().checked_sub(2)?)?;
+    Some((lines[..top].join("\n"), lines[top + 1..bottom].join("\n")))
+}
+
+pub(crate) fn muse_prompt_in_composer(screen: &str, text: &str) -> bool {
+    muse_composer_regions(screen).is_some_and(|(_, composer)| muse_text_visible(&composer, text))
+}
+
+pub(crate) fn muse_prompt_transcript_count(screen: &str, text: &str) -> usize {
+    let Some((transcript, _)) = muse_composer_regions(screen) else {
+        return 0;
+    };
+    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let rendered = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+    if wanted.is_empty() {
+        return 0;
+    }
+    if wanted.chars().count() <= 160 {
+        return rendered.match_indices(&wanted).count();
+    }
+    let prefix = wanted.chars().take(80).collect::<String>();
+    let mut suffix = wanted.chars().rev().take(80).collect::<Vec<_>>();
+    suffix.reverse();
+    let suffix = suffix.into_iter().collect::<String>();
+    rendered
+        .match_indices(&prefix)
+        .count()
+        .min(rendered.match_indices(&suffix).count())
+}
 #[derive(Debug)]
 pub(crate) struct BoundedOutput {
     pub status: ExitStatus,
@@ -33,7 +473,6 @@ pub(crate) struct BoundedOutput {
 }
 
 /// Capture a subprocess while enforcing wall-clock and byte bounds on multiplexed output pipes.
-#[cfg(test)]
 pub(crate) fn bounded_output(command: Command, timeout: Duration) -> io::Result<BoundedOutput> {
     bounded_output_with_cancellation(command, timeout, &|| false)
 }
@@ -441,6 +880,328 @@ impl HerdrClient {
         }
         Ok(())
     }
+
+    fn foreground_processes(
+        &self,
+        pane_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(u64, Vec<Map<String, Value>>)> {
+        let result = self.call_with_cancellation(
+            &strings(&["pane", "process-info", "--pane", pane_id]),
+            &format!("pane process-info {pane_id}"),
+            cancelled,
+        )?;
+        let info = required_object(&result, "process_info", "pane process-info")?;
+        if required_string(info, "pane_id", "pane process-info")? != pane_id {
+            return Err(AdapterError::unavailable(
+                "pane process-info returned a different pane identity",
+            ));
+        }
+        let foreground_process_group_id = info
+            .get("foreground_process_group_id")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+            .ok_or_else(|| {
+                AdapterError::unavailable(
+                    "pane process-info: foreground_process_group_id is not a positive Linux process id",
+                )
+            })?;
+        let processes = value_array(info.get("foreground_processes"), "foreground_processes")?;
+        Ok((
+            foreground_process_group_id,
+            object_entries(processes, "foreground process")?,
+        ))
+    }
+
+    fn custom_harness_observed(
+        &self,
+        pane_id: &str,
+        executable: &PinnedHarnessExecutable,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<CustomProcessIdentity>> {
+        let (foreground_process_group_id, processes) =
+            self.foreground_processes(pane_id, cancelled)?;
+        let mut candidate = None;
+        for process in processes {
+            let pid = process
+                .get("pid")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+                .ok_or_else(|| {
+                    AdapterError::unavailable(
+                        "foreground process: \"pid\" is not a positive Linux process id",
+                    )
+                })?;
+            let argv0 = process
+                .get("argv")
+                .and_then(Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let exact_argv =
+                fs::canonicalize(argv0).is_ok_and(|path| path == executable.path.as_path());
+            if !exact_argv {
+                continue;
+            }
+            if candidate.replace(pid).is_some() {
+                return Err(AdapterError::unavailable(
+                    "pane process-info returned multiple matching custom harness processes",
+                ));
+            }
+        }
+        let Some(pid) = candidate else {
+            return Ok(None);
+        };
+        let observed = live_custom_process(pid)?;
+        Ok((observed.process_group_id == foreground_process_group_id
+            && observed.identity.executable_device == executable.device
+            && observed.identity.executable_inode == executable.inode)
+            .then_some(observed.identity))
+    }
+
+    fn recorded_custom_harness_observed(
+        &self,
+        pane_id: &str,
+        identity: &CustomProcessIdentity,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        if !identity.valid() {
+            return Err(AdapterError::unavailable(
+                "recorded custom process identity is invalid",
+            ));
+        }
+        let (foreground_process_group_id, processes) =
+            self.foreground_processes(pane_id, cancelled)?;
+        let mut matches = 0_u8;
+        for process in processes {
+            let pid = process
+                .get("pid")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+                .ok_or_else(|| {
+                    AdapterError::unavailable(
+                        "foreground process: \"pid\" is not a positive Linux process id",
+                    )
+                })?;
+            if pid == identity.pid {
+                matches = matches.saturating_add(1);
+            }
+        }
+        if matches != 1 {
+            return Ok(false);
+        }
+        let observed = live_custom_process(identity.pid)?;
+        Ok(observed.process_group_id == foreground_process_group_id
+            && observed.identity == *identity)
+    }
+
+    /// Require the fixed-location custom harness executable in one exact foreground pane.
+    pub fn verify_custom_harness(
+        &self,
+        pane_id: &str,
+        kind: &str,
+        identity: Option<&CustomProcessIdentity>,
+    ) -> Result<()> {
+        self.verify_custom_harness_with_cancellation(pane_id, kind, identity, &|| false)
+    }
+
+    /// Prove that no child command owns the terminal and the foreground process
+    /// group contains only the pane's Herdr-reported shell process.
+    pub fn pane_is_idle_shell(&self, pane_id: &str) -> Result<bool> {
+        let result = self.call(
+            &strings(&["pane", "process-info", "--pane", pane_id]),
+            &format!("pane process-info {pane_id}"),
+        )?;
+        let info = required_object(&result, "process_info", "pane process-info")?;
+        if required_string(info, "pane_id", "pane process-info")? != pane_id {
+            return Err(AdapterError::unavailable(
+                "pane process-info returned a different pane identity",
+            ));
+        }
+        let shell_pid = info
+            .get("shell_pid")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+            .ok_or_else(|| {
+                AdapterError::unavailable(
+                    "pane process-info: shell_pid is not a positive Linux process id",
+                )
+            })?;
+        let foreground_pgid = info
+            .get("foreground_process_group_id")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+            .ok_or_else(|| {
+                AdapterError::unavailable(
+                    "pane process-info: foreground_process_group_id is not a positive Linux process id",
+                )
+            })?;
+        let processes = object_entries(
+            value_array(info.get("foreground_processes"), "foreground_processes")?,
+            "foreground process",
+        )?;
+        if foreground_pgid != shell_pid || processes.len() != 1 {
+            return Ok(false);
+        }
+        let process = &processes[0];
+        let pid = process
+            .get("pid")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
+            .ok_or_else(|| {
+                AdapterError::unavailable(
+                    "foreground process: \"pid\" is not a positive Linux process id",
+                )
+            })?;
+        let argv0 = process
+            .get("argv")
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let argv_executable = fs::canonicalize(argv0).ok();
+        let kernel_executable = fs::canonicalize(format!("/proc/{shell_pid}/exe")).ok();
+        Ok(pid == shell_pid && argv_executable.is_some() && argv_executable == kernel_executable)
+    }
+
+    pub(crate) fn verify_custom_harness_with_cancellation(
+        &self,
+        pane_id: &str,
+        kind: &str,
+        identity: Option<&CustomProcessIdentity>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let observed = if let Some(identity) = identity {
+            // Do not consult the installation pathname here. An upgrade may have atomically
+            // replaced it while this still-running process retains the recorded image inode.
+            self.recorded_custom_harness_observed(pane_id, identity, cancelled)?
+        } else {
+            // Records without a durable process tuple retain strict current-path
+            // check; never interpret a missing identity as a wildcard for a deleted executable.
+            let executable = pin_harness_executable(resolve_harness_executable(kind)?)?;
+            self.custom_harness_observed(pane_id, &executable, cancelled)?
+                .is_some()
+        };
+        if !observed {
+            return Err(AdapterError::unavailable(format!(
+                "custom harness {kind:?} is not the foreground process in pane {pane_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Launch an otherwise unsupported TUI through one exact pane.
+    ///
+    /// This path never supplies input to a workspace-trust prompt. It proves
+    /// the foreground executable, publishes a pane-local agent report, and
+    /// re-reads that exact pane rather than consulting a name registry.
+    pub fn start_pane_agent(
+        &self,
+        _name: &str,
+        kind: &str,
+        pane_id: &str,
+        arguments: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
+    ) -> Result<()> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(AdapterError::unavailable(
+                "agent startup timeout must be between 0 and 300 seconds",
+            ));
+        }
+        if kind.is_empty()
+            || !kind.as_bytes()[0].is_ascii_lowercase()
+            || !kind
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(AdapterError::unavailable(
+                "custom harness name must contain lowercase ASCII letters, digits, or hyphens",
+            ));
+        }
+        let executable = pin_harness_executable(resolve_harness_executable(kind)?)?;
+        let mut command = vec![executable.path.display().to_string()];
+        command.extend_from_slice(arguments);
+        let line = shell_join(&command)?;
+        self.call_ok(
+            &[
+                "pane".to_owned(),
+                "run".to_owned(),
+                pane_id.to_owned(),
+                line,
+            ],
+            &format!("pane run {kind:?}"),
+        )?;
+        let deadline = Instant::now() + timeout;
+        let mut observed = None;
+        while Instant::now() < deadline {
+            observed = self.custom_harness_observed(pane_id, &executable, &|| false)?;
+            if observed.is_some() {
+                break;
+            }
+            thread::sleep(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        let observed = observed.ok_or_else(|| {
+            AdapterError::unavailable(format!(
+                "custom harness {kind:?} was not the foreground process in pane {pane_id}"
+            ))
+        })?;
+        // Persist before trust/readiness/report checks. If any later step fails, stop still has
+        // enough kernel identity to close only this observed process's pane.
+        persist_identity(observed.clone())?;
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
+                return Err(AdapterError::unavailable(format!(
+                    "custom harness {kind:?} identity changed before readiness in pane {pane_id}"
+                )));
+            }
+            let screen = self.read(pane_id, "visible", Some(200))?;
+            if muse_trust_prompt(&screen)
+                && !arguments.iter().any(|value| value == "--trust-workspace")
+            {
+                return Err(AdapterError::unavailable(format!(
+                    "{kind} workspace trust prompt requires human attention; no input was submitted"
+                )));
+            }
+            ready = muse_idle_composer(&screen);
+            if ready {
+                break;
+            }
+            thread::sleep(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        if !ready {
+            return Err(AdapterError::unavailable(format!(
+                "custom harness {kind:?} did not reach a verified idle composer in pane {pane_id}"
+            )));
+        }
+        if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
+            return Err(AdapterError::unavailable(format!(
+                "custom harness {kind:?} identity changed before report in pane {pane_id}"
+            )));
+        }
+        self.call_ok(
+            &strings(&[
+                "pane",
+                "report-agent",
+                pane_id,
+                "--source",
+                "agentctl",
+                "--agent",
+                kind,
+                "--state",
+                "idle",
+                "--message",
+                "agentctl custom harness",
+            ]),
+            &format!("report custom agent {pane_id}"),
+        )?;
+        Ok(())
+    }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn agent_pane(&self, name: &str) -> Result<String> {
         self.agent_pane_with_cancellation(name, &|| false)
@@ -685,6 +1446,22 @@ impl HerdrClient {
     pub fn prompt_agent(&self, pane_id: &str, text: &str) -> Result<()> {
         self.prompt_agent_with_cancellation(pane_id, text, &|| false)
     }
+    /// Insert literal text into one pane without submitting it.
+    pub fn send_text(&self, pane_id: &str, text: &str) -> Result<()> {
+        self.send_text_with_cancellation(pane_id, text, &|| false)
+    }
+    pub(crate) fn send_text_with_cancellation(
+        &self,
+        pane_id: &str,
+        text: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.call_ok_with_cancellation(
+            &strings(&["pane", "send-text", pane_id, text]),
+            &format!("pane send-text {pane_id}"),
+            cancelled,
+        )
+    }
     pub(crate) fn prompt_agent_with_cancellation(
         &self,
         pane_id: &str,
@@ -891,6 +1668,156 @@ fn resolve_executable(configured: &Path) -> Result<PathBuf> {
         configured.display()
     )))
 }
+
+pub(crate) fn account_home() -> Result<PathBuf> {
+    // SAFETY: getpwuid_r writes only into the supplied record and byte buffer;
+    // the C string is copied before either backing allocation is dropped.
+    let uid = unsafe { libc::getuid() };
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut size = if suggested > 0 {
+        usize::try_from(suggested).unwrap_or(16_384)
+    } else {
+        16_384
+    };
+    loop {
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; size];
+        let code = unsafe {
+            libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if code == libc::ERANGE {
+            size = size.saturating_mul(2);
+            if size > 16 * 1024 * 1024 {
+                return Err(AdapterError::unavailable(
+                    "cannot resolve current account home: account record is too large",
+                ));
+            }
+            continue;
+        }
+        if code != 0 {
+            return Err(AdapterError::unavailable(format!(
+                "cannot resolve current account home: {}",
+                io::Error::from_raw_os_error(code)
+            )));
+        }
+        if result.is_null() {
+            return Err(AdapterError::unavailable(
+                "cannot resolve current account home: no account record",
+            ));
+        }
+        let record = unsafe { record.assume_init() };
+        if record.pw_dir.is_null() {
+            return Err(AdapterError::unavailable(
+                "the current account has no home directory",
+            ));
+        }
+        let bytes = unsafe { CStr::from_ptr(record.pw_dir) }.to_bytes();
+        if bytes.is_empty() {
+            return Err(AdapterError::unavailable(
+                "the current account has no home directory",
+            ));
+        }
+        return Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())));
+    }
+}
+
+pub(crate) fn resolve_harness_executable(kind: &str) -> Result<PathBuf> {
+    if kind.is_empty()
+        || !kind.as_bytes()[0].is_ascii_lowercase()
+        || !kind
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(AdapterError::unavailable(
+            "custom harness name must contain lowercase ASCII letters, digits, or hyphens",
+        ));
+    }
+    if kind == "muse" {
+        if let Some(configured) = std::env::var_os("AGENTCTL_MUSE_BIN") {
+            let path = PathBuf::from(configured);
+            if !path.is_absolute() {
+                return Err(AdapterError::unavailable(
+                    "AGENTCTL_MUSE_BIN must be an absolute path",
+                ));
+            }
+            let resolved = fs::canonicalize(&path).map_err(|error| {
+                AdapterError::unavailable(format!(
+                    "cannot inspect muse executable {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let metadata = fs::metadata(&resolved).map_err(|error| {
+                AdapterError::unavailable(format!(
+                    "cannot inspect muse executable {}: {error}",
+                    resolved.display()
+                ))
+            })?;
+            if !metadata.is_file()
+                || metadata.permissions().mode() & 0o111 == 0
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                return Err(AdapterError::unavailable(format!(
+                    "refusing unsafe muse executable: {}",
+                    resolved.display()
+                )));
+            }
+            return Ok(resolved);
+        }
+    }
+    let home = account_home()?;
+    let candidates = [
+        PathBuf::from("/usr/local/bin").join(kind),
+        PathBuf::from("/usr/bin").join(kind),
+        home.join(".local/bin").join(kind),
+        home.join("bin").join(kind),
+        home.join(".cargo/bin").join(kind),
+    ];
+    for path in candidates {
+        if fs::metadata(&path).is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.permissions().mode() & 0o111 != 0
+                && metadata.permissions().mode() & 0o022 == 0
+        }) {
+            return fs::canonicalize(&path).map_err(|error| {
+                AdapterError::unavailable(format!(
+                    "cannot resolve custom harness executable {kind:?}: {error}"
+                ))
+            });
+        }
+    }
+    Err(AdapterError::unavailable(format!(
+        "custom harness executable {kind:?} was not found in fixed install locations"
+    )))
+}
+
+fn shell_join(arguments: &[String]) -> Result<String> {
+    let mut quoted = Vec::with_capacity(arguments.len());
+    for value in arguments {
+        if value.contains('\0') {
+            return Err(AdapterError::unavailable(
+                "harness arguments must contain no NUL",
+            ));
+        }
+        if !value.is_empty()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':' | b'=' | b',' | b'+')
+            })
+        {
+            quoted.push(value.clone());
+        } else {
+            quoted.push(format!("'{}'", value.replace('\'', "'\\''")));
+        }
+    }
+    Ok(quoted.join(" "))
+}
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -1011,6 +1938,33 @@ mod tests {
     static EXECUTABLE_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[cfg(target_os = "linux")]
     static SIGNAL_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn muse_prompt_must_move_from_composer_to_transcript() {
+        let prompt = "literal $(unexpanded) delivery\nsecond line";
+        let header = "Muse Code 1.3.0\n";
+        let divider = "────────────────\n";
+        let footer = "watermelon-preview · xhigh · /work/project · Auto-review\n";
+        let staged = format!("{header}{divider}❯ {prompt}\n{divider}{footer}");
+        let accepted = format!("{header}❯ {prompt}\nWorking...\n{divider}❯\n{divider}{footer}");
+        let error_redraw = format!("{header}{divider}❯ {prompt}\nError: retry\n{divider}{footer}");
+        assert!(muse_prompt_in_composer(&staged, prompt));
+        assert_eq!(muse_prompt_transcript_count(&staged, prompt), 0);
+        assert_eq!(muse_prompt_transcript_count(&accepted, prompt), 1);
+        assert!(!muse_prompt_in_composer(&accepted, prompt));
+        assert!(muse_prompt_in_composer(&error_redraw, prompt));
+        assert_eq!(muse_prompt_transcript_count(&error_redraw, prompt), 0);
+        let repeated_staged =
+            format!("{header}❯ {prompt}\n◆ prior answer\n{divider}❯ {prompt}\n{divider}{footer}");
+        let cleared_without_submit =
+            format!("{header}❯ {prompt}\n◆ prior answer\n{divider}❯\n{divider}{footer}");
+        assert_eq!(muse_prompt_transcript_count(&repeated_staged, prompt), 1);
+        assert_eq!(
+            muse_prompt_transcript_count(&cleared_without_submit, prompt),
+            1
+        );
+    }
+
     #[cfg(target_os = "linux")]
     struct FakeExecutable {
         root: PathBuf,
@@ -1027,13 +1981,18 @@ mod tests {
             ));
             fs::create_dir(&root).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-            let script = format!("#!/usr/bin/python3\nimport json, pathlib, sys\npathlib.Path(__file__).with_name('args').write_text(json.dumps(sys.argv[1:]))\nprint({response:?})\n");
-            fs::write(root.join("herdr"), script).unwrap();
-            fs::set_permissions(root.join("herdr"), fs::Permissions::from_mode(0o700)).unwrap();
-            Self {
+            let fixture = Self {
                 root,
                 _guard: guard,
-            }
+            };
+            fixture.set_response(response);
+            fixture
+        }
+        fn set_response(&self, response: &str) {
+            let script = format!("#!/usr/bin/python3\nimport json, pathlib, sys\npathlib.Path(__file__).with_name('args').write_text(json.dumps(sys.argv[1:]))\nprint({response:?})\n");
+            fs::write(self.root.join("herdr"), script).unwrap();
+            fs::set_permissions(self.root.join("herdr"), fs::Permissions::from_mode(0o700))
+                .unwrap();
         }
         fn client(&self) -> HerdrClient {
             HerdrClient::with_executable("direct", &self.root.join("herdr")).unwrap()
@@ -1163,6 +2122,36 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_test_elf(source: &str, destination: &Path) {
+        fs::copy(source, destination).unwrap();
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_test_process(executable: &Path) -> ChildGuard {
+        let mut command = Command::new(executable);
+        command.arg("30").process_group(0);
+        ChildGuard(command.spawn().expect("start test executable"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_info_response(pid: u32, executable: &Path) -> String {
+        serde_json::json!({
+            "result": {
+                "process_info": {
+                    "pane_id": "pane",
+                    "foreground_process_group_id": pid,
+                    "foreground_processes": [{
+                        "pid": pid,
+                        "argv": [executable.display().to_string(), "30"]
+                    }]
+                }
+            }
+        })
+        .to_string()
     }
 
     #[cfg(target_os = "linux")]
@@ -1516,6 +2505,150 @@ mod tests {
             executable.arguments(),
             serde_json::json!(["pane", "close", "workspace:pane"])
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorded_custom_identity_survives_atomic_pathname_replacement() {
+        let herdr = FakeExecutable::new("{}");
+        let harness = herdr.root.join("muse");
+        install_test_elf("/bin/sleep", &harness);
+        let pinned = pin_harness_executable(harness.clone()).unwrap();
+        let process = spawn_test_process(&harness);
+        let pid = process.0.id();
+        herdr.set_response(&process_info_response(pid, &harness));
+        let identity = herdr
+            .client()
+            .custom_harness_observed("pane", &pinned, &|| false)
+            .unwrap()
+            .expect("observe the pinned launch image");
+
+        let replacement = herdr.root.join("muse.replacement");
+        install_test_elf("/bin/true", &replacement);
+        fs::rename(&replacement, &harness).unwrap();
+
+        herdr
+            .client()
+            .verify_custom_harness("pane", "muse", Some(&identity))
+            .expect("verification uses the recorded image, not the replaced pathname");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorded_custom_identity_refuses_replacement_process_and_field_mismatches() {
+        let herdr = FakeExecutable::new("{}");
+        let harness = herdr.root.join("muse");
+        install_test_elf("/bin/sleep", &harness);
+        let pinned = pin_harness_executable(harness.clone()).unwrap();
+        let mut original = spawn_test_process(&harness);
+        let original_pid = original.0.id();
+        herdr.set_response(&process_info_response(original_pid, &harness));
+        let identity = herdr
+            .client()
+            .custom_harness_observed("pane", &pinned, &|| false)
+            .unwrap()
+            .expect("observe original process");
+
+        let mut mismatches = Vec::new();
+        let mut value = identity.clone();
+        value.boot_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+        mismatches.push(value);
+        let mut value = identity.clone();
+        value.pid = value.pid.saturating_add(1);
+        mismatches.push(value);
+        let mut value = identity.clone();
+        value.starttime_ticks += 1;
+        mismatches.push(value);
+        let mut value = identity.clone();
+        value.executable_device += 1;
+        mismatches.push(value);
+        let mut value = identity.clone();
+        value.executable_inode += 1;
+        mismatches.push(value);
+        for mismatch in mismatches {
+            assert!(herdr
+                .client()
+                .verify_custom_harness("pane", "muse", Some(&mismatch))
+                .is_err());
+        }
+        let wrong_group = serde_json::json!({
+            "result": {
+                "process_info": {
+                    "pane_id": "pane",
+                    "foreground_process_group_id": u64::from(original_pid) + 1,
+                    "foreground_processes": [{
+                        "pid": original_pid,
+                        "argv": [harness.display().to_string(), "30"]
+                    }]
+                }
+            }
+        })
+        .to_string();
+        herdr.set_response(&wrong_group);
+        assert!(herdr
+            .client()
+            .verify_custom_harness("pane", "muse", Some(&identity))
+            .is_err());
+        let duplicate = serde_json::json!({
+            "result": {
+                "process_info": {
+                    "pane_id": "pane",
+                    "foreground_process_group_id": original_pid,
+                    "foreground_processes": [
+                        {"pid": original_pid, "argv": [harness.display().to_string(), "30"]},
+                        {"pid": u64::from(original_pid) + 1, "argv": [harness.display().to_string(), "30"]}
+                    ]
+                }
+            }
+        })
+        .to_string();
+        herdr.set_response(&duplicate);
+        assert!(herdr
+            .client()
+            .custom_harness_observed("pane", &pinned, &|| false)
+            .is_err());
+
+        let duplicate_identity = serde_json::json!({
+            "result": {
+                "process_info": {
+                    "pane_id": "pane",
+                    "foreground_process_group_id": original_pid,
+                    "foreground_processes": [
+                        {"pid": original_pid, "argv": [harness.display().to_string(), "30"]},
+                        {"pid": original_pid, "argv": [harness.display().to_string(), "30"]}
+                    ]
+                }
+            }
+        })
+        .to_string();
+        herdr.set_response(&duplicate_identity);
+        assert!(herdr
+            .client()
+            .verify_custom_harness("pane", "muse", Some(&identity))
+            .is_err());
+
+        original.0.kill().unwrap();
+        original.0.wait().unwrap();
+        let replacement = herdr.root.join("muse.replacement");
+        install_test_elf("/bin/sleep", &replacement);
+        fs::rename(&replacement, &harness).unwrap();
+        let replacement = spawn_test_process(&harness);
+        herdr.set_response(&process_info_response(replacement.0.id(), &harness));
+        assert!(herdr
+            .client()
+            .verify_custom_harness("pane", "muse", Some(&identity))
+            .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn custom_harness_pin_refuses_interpreter_payloads() {
+        let herdr = FakeExecutable::new("{}");
+        let harness = herdr.root.join("muse-script");
+        fs::write(&harness, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = pin_harness_executable(harness).unwrap_err();
+        assert!(error.to_string().contains("ELF image"));
     }
 
     #[cfg(target_os = "linux")]

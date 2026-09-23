@@ -15,7 +15,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
-use crate::client::{AgentPaneInfo, HerdrClient, Pane};
+use crate::client::{
+    muse_idle_composer, muse_prompt_in_composer, muse_prompt_transcript_count,
+    muse_startup_metadata, muse_trust_prompt, AgentPaneInfo, CustomProcessIdentity, HerdrClient,
+    Pane,
+};
+
+const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 
 /// Result of a managed-agent operation, including durable delivery outcomes.
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -51,7 +58,7 @@ fn name(value: &str) -> Result<&str> {
     Ok(value)
 }
 
-/// Harness arguments for Codex/Claude presets, leaving permission policy untouched.
+/// Harness arguments for Codex/Claude/Muse presets, leaving permission policy untouched.
 pub fn harness_arguments(
     harness: &str,
     model: Option<&str>,
@@ -94,8 +101,18 @@ pub fn harness_arguments(
                 arguments.extend(["--model".to_owned(), model.to_owned()]);
             }
         }
+        "muse" => {
+            if resume.is_some() {
+                return Err(fail(
+                    "interactive Muse resume is not supported; use literal owner-configured argv",
+                ));
+            }
+            if let Some(model) = model.filter(|value| !value.is_empty()) {
+                arguments.extend(["--model".to_owned(), model.to_owned()]);
+            }
+        }
         _ if model.is_some() || resume.is_some() => return Err(fail(
-            "model and resume presets support codex/claude; use harness arguments for other kinds",
+            "model and resume presets support codex/claude/muse; use harness arguments for other kinds",
         )),
         _ => {}
     }
@@ -175,6 +192,72 @@ pub trait ManagedApi: AgentApi {
         args: &[String],
         timeout: Duration,
     ) -> crate::error::Result<()>;
+    /// Start a custom harness through `pane run` and verify the foreground process.
+    fn start_pane_agent(
+        &self,
+        _name: &str,
+        _harness: &str,
+        _pane: &str,
+        _args: &[String],
+        _timeout: Duration,
+        _persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        Err(crate::error::AdapterError::unavailable(
+            "custom pane harness launch is unavailable",
+        ))
+    }
+    /// Require the configured custom harness in one exact foreground pane.
+    fn verify_custom_harness(
+        &self,
+        _pane: &str,
+        _harness: &str,
+        _identity: Option<&CustomProcessIdentity>,
+    ) -> crate::error::Result<()> {
+        Err(crate::error::AdapterError::unavailable(
+            "custom pane harness verification is unavailable",
+        ))
+    }
+    /// Prove the pane has returned to its original shell process group.
+    fn pane_is_idle_shell(&self, _pane: &str) -> crate::error::Result<bool> {
+        Err(crate::error::AdapterError::unavailable(
+            "idle shell verification is unavailable",
+        ))
+    }
+    /// Cancellation-aware custom harness verification.
+    fn verify_custom_harness_with_runtime(
+        &self,
+        pane: &str,
+        harness: &str,
+        identity: Option<&CustomProcessIdentity>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "Herdr control operation was cancelled",
+            ));
+        }
+        self.verify_custom_harness(pane, harness, identity)
+    }
+    /// Insert literal text without a submission key.
+    fn send_text(&self, _pane: &str, _text: &str) -> crate::error::Result<()> {
+        Err(crate::error::AdapterError::unavailable(
+            "literal pane text insertion is unavailable",
+        ))
+    }
+    /// Cancellation-aware literal text insertion.
+    fn send_text_with_runtime(
+        &self,
+        pane: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "Herdr control operation was cancelled",
+            ));
+        }
+        self.send_text(pane, text)
+    }
     /// Resolve an exact live Herdr agent name.
     fn agent_pane(&self, name: &str) -> crate::error::Result<String>;
     /// Resolve an exact live Herdr agent name with service cancellation.
@@ -298,6 +381,50 @@ impl ManagedApi for HerdrClient {
     ) -> crate::error::Result<()> {
         HerdrClient::start_agent(self, name, harness, pane, args, timeout)
     }
+    fn start_pane_agent(
+        &self,
+        name: &str,
+        harness: &str,
+        pane: &str,
+        args: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist_identity)
+    }
+    fn verify_custom_harness(
+        &self,
+        pane: &str,
+        harness: &str,
+        identity: Option<&CustomProcessIdentity>,
+    ) -> crate::error::Result<()> {
+        HerdrClient::verify_custom_harness(self, pane, harness, identity)
+    }
+    fn pane_is_idle_shell(&self, pane: &str) -> crate::error::Result<bool> {
+        HerdrClient::pane_is_idle_shell(self, pane)
+    }
+    fn verify_custom_harness_with_runtime(
+        &self,
+        pane: &str,
+        harness: &str,
+        identity: Option<&CustomProcessIdentity>,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        HerdrClient::verify_custom_harness_with_cancellation(self, pane, harness, identity, &|| {
+            runtime.cancelled()
+        })
+    }
+    fn send_text(&self, pane: &str, text: &str) -> crate::error::Result<()> {
+        HerdrClient::send_text(self, pane, text)
+    }
+    fn send_text_with_runtime(
+        &self,
+        pane: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        HerdrClient::send_text_with_cancellation(self, pane, text, &|| runtime.cancelled())
+    }
     fn close_tab(&self, tab: &str) -> crate::error::Result<()> {
         HerdrClient::close_tab(self, tab)
     }
@@ -315,6 +442,10 @@ struct AgentRecord {
     paused: bool,
     #[serde(default)]
     runtime_home: Option<String>,
+    #[serde(default)]
+    pane_reported_by_agentctl: bool,
+    #[serde(default)]
+    custom_process_identity: Option<CustomProcessIdentity>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
     name: String,
@@ -332,6 +463,10 @@ struct AgentRecord {
     model: Option<String>,
     resume: Option<String>,
     arguments: Vec<String>,
+    #[serde(default)]
+    startup_warning: Option<String>,
+    #[serde(default)]
+    effective_reasoning_effort: Option<String>,
     error: Option<String>,
     goal: Option<String>,
     goal_delivery: Option<String>,
@@ -351,8 +486,10 @@ fn interactive_mode() -> String {
 
 impl AgentRecord {
     fn supported(&self) -> Result<()> {
-        if !matches!(self.adapter.as_str(), "herdr" | "herdr-foreign")
-            || self.mode != "interactive"
+        if !matches!(
+            self.adapter.as_str(),
+            "herdr" | "herdr-pane" | "herdr-foreign"
+        ) || self.mode != "interactive"
             || self.backend != "herdr"
         {
             return Err(fail(format!("agent {:?} uses adapter {:?}, mode {:?}, backend {:?}; use the agentctl with the worker extension implementation for this runtime", self.name, self.adapter, self.mode, self.backend)));
@@ -393,10 +530,18 @@ fn goal_replacement_selected(screen: &str, objective: &str) -> bool {
         && screen.contains("2. Cancel Keep the current goal") && screen.contains("Press enter to confirm or esc to go back")
 }
 
+#[derive(Clone, Debug)]
+struct CustomPaneSubmission {
+    staged_screen: String,
+    text: String,
+    prior_transcript_count: usize,
+}
+
 struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
     client: &'a A,
     record: &'a AgentRecord,
     goal_objective: Mutex<Option<String>>,
+    custom_submission: Mutex<Option<CustomPaneSubmission>>,
     queue: Option<&'a Path>,
     check_prompt: bool,
 }
@@ -419,7 +564,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 self.record.name
             )));
         }
-        let info = self.client.pane_info(pane_id)?;
+        let mut info = self.client.pane_info(pane_id)?;
         if Some(&info.workspace_id) != self.record.workspace_id.as_ref() {
             return Err(crate::error::AdapterError::unavailable(format!(
                 "agent {:?} workspace identity changed",
@@ -449,6 +594,24 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
                 }
             }
+            if self.record.adapter == "herdr-pane" {
+                self.client.verify_custom_harness(
+                    pane_id,
+                    &self.record.harness,
+                    self.record.custom_process_identity.as_ref(),
+                )?;
+                let screen = self.client.read(pane_id, "visible", Some(200))?;
+                if muse_trust_prompt(&screen) {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Muse workspace trust prompt requires human attention; no input was submitted",
+                    ));
+                }
+                info.status = if muse_idle_composer(&screen) {
+                    "idle".to_owned()
+                } else {
+                    "working".to_owned()
+                };
+            }
         }
         Ok(info)
     }
@@ -477,7 +640,60 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 }
             }
         }
-        self.client.run(pane_id, text)
+        if self.record.adapter != "herdr-pane" {
+            return self.client.run(pane_id, text);
+        }
+        if text.contains(['\0', '\u{1b}']) {
+            return Err(crate::error::AdapterError::unavailable(
+                "Muse pane prompts cannot contain NUL or terminal escape characters",
+            ));
+        }
+        let info = self.pane_info(pane_id)?;
+        if info.status != "idle" {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "custom pane {pane_id} is not at a verified idle Muse composer"
+            )));
+        }
+        let before = self.client.read(pane_id, "visible", Some(200))?;
+        self.client.send_text(
+            pane_id,
+            &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let staged = loop {
+            self.client.verify_custom_harness(
+                pane_id,
+                &self.record.harness,
+                self.record.custom_process_identity.as_ref(),
+            )?;
+            let screen = self.client.read(pane_id, "visible", Some(200))?;
+            if screen != before && muse_prompt_in_composer(&screen, text) {
+                break screen;
+            }
+            if Instant::now() >= deadline {
+                return Err(crate::error::AdapterError::unavailable(
+                    "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent",
+                ));
+            }
+            std::thread::sleep(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        };
+        self.client.verify_custom_harness(
+            pane_id,
+            &self.record.harness,
+            self.record.custom_process_identity.as_ref(),
+        )?;
+        self.client.send_keys(pane_id, "Enter")?;
+        *self
+            .custom_submission
+            .lock()
+            .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
+            prior_transcript_count: muse_prompt_transcript_count(&staged, text),
+            staged_screen: staged,
+            text: text.to_owned(),
+        });
+        Ok(())
     }
     fn wait_agent_status(
         &self,
@@ -485,6 +701,47 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         status: &str,
         timeout_ms: u64,
     ) -> crate::error::Result<()> {
+        if self.record.adapter == "herdr-pane" && status == "working" {
+            let submission = self
+                .custom_submission
+                .lock()
+                .expect("custom submission lock poisoned")
+                .clone()
+                .ok_or_else(|| {
+                    crate::error::AdapterError::unavailable(
+                        "custom pane harness has no pending submission receipt",
+                    )
+                })?;
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                self.client.verify_custom_harness(
+                    pane_id,
+                    &self.record.harness,
+                    self.record.custom_process_identity.as_ref(),
+                )?;
+                let screen = self.client.read(pane_id, "visible", Some(200))?;
+                if screen != submission.staged_screen
+                    && muse_prompt_transcript_count(&screen, &submission.text)
+                        > submission.prior_transcript_count
+                    && !muse_prompt_in_composer(&screen, &submission.text)
+                {
+                    *self
+                        .custom_submission
+                        .lock()
+                        .expect("custom submission lock poisoned") = None;
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Muse did not show a verified post-Enter screen transition",
+                    ));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
         let Some(objective) = self
             .goal_objective
             .lock()
@@ -548,7 +805,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 self.record.name
             )));
         }
-        let info = self.client.pane_info_with_runtime(pane_id, runtime)?;
+        let mut info = self.client.pane_info_with_runtime(pane_id, runtime)?;
         if Some(&info.workspace_id) != self.record.workspace_id.as_ref() {
             return Err(crate::error::AdapterError::unavailable(format!(
                 "agent {:?} workspace identity changed",
@@ -579,6 +836,27 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 {
                     return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
                 }
+            }
+            if self.record.adapter == "herdr-pane" {
+                self.client.verify_custom_harness_with_runtime(
+                    pane_id,
+                    &self.record.harness,
+                    self.record.custom_process_identity.as_ref(),
+                    runtime,
+                )?;
+                let screen =
+                    self.client
+                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                if muse_trust_prompt(&screen) {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Muse workspace trust prompt requires human attention; no input was submitted",
+                    ));
+                }
+                info.status = if muse_idle_composer(&screen) {
+                    "idle".to_owned()
+                } else {
+                    "working".to_owned()
+                };
             }
         }
         Ok(info)
@@ -625,7 +903,73 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 }
             }
         }
-        self.client.run_with_runtime(pane_id, text, runtime)
+        if self.record.adapter != "herdr-pane" {
+            return self.client.run_with_runtime(pane_id, text, runtime);
+        }
+        if text.contains(['\0', '\u{1b}']) {
+            return Err(crate::error::AdapterError::unavailable(
+                "Muse pane prompts cannot contain NUL or terminal escape characters",
+            ));
+        }
+        let info = self.pane_info_with_runtime(pane_id, runtime)?;
+        if info.status != "idle" {
+            return Err(crate::error::AdapterError::unavailable(format!(
+                "custom pane {pane_id} is not at a verified idle Muse composer"
+            )));
+        }
+        let before = self
+            .client
+            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+        self.client.send_text_with_runtime(
+            pane_id,
+            &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
+            runtime,
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let staged = loop {
+            if runtime.cancelled() {
+                return Err(crate::error::AdapterError::unavailable(
+                    "Herdr control operation was cancelled",
+                ));
+            }
+            self.client.verify_custom_harness_with_runtime(
+                pane_id,
+                &self.record.harness,
+                self.record.custom_process_identity.as_ref(),
+                runtime,
+            )?;
+            let screen = self
+                .client
+                .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+            if screen != before && muse_prompt_in_composer(&screen, text) {
+                break screen;
+            }
+            if Instant::now() >= deadline {
+                return Err(crate::error::AdapterError::unavailable(
+                    "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent",
+                ));
+            }
+            std::thread::sleep(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        };
+        self.client.verify_custom_harness_with_runtime(
+            pane_id,
+            &self.record.harness,
+            self.record.custom_process_identity.as_ref(),
+            runtime,
+        )?;
+        self.client
+            .send_keys_with_runtime(pane_id, "Enter", runtime)?;
+        *self
+            .custom_submission
+            .lock()
+            .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
+            prior_transcript_count: muse_prompt_transcript_count(&staged, text),
+            staged_screen: staged,
+            text: text.to_owned(),
+        });
+        Ok(())
     }
 
     fn wait_agent_status_with_runtime(
@@ -635,6 +979,55 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         timeout_ms: u64,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
+        if self.record.adapter == "herdr-pane" && status == "working" {
+            let submission = self
+                .custom_submission
+                .lock()
+                .expect("custom submission lock poisoned")
+                .clone()
+                .ok_or_else(|| {
+                    crate::error::AdapterError::unavailable(
+                        "custom pane harness has no pending submission receipt",
+                    )
+                })?;
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                if runtime.cancelled() {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Herdr control operation was cancelled",
+                    ));
+                }
+                self.client.verify_custom_harness_with_runtime(
+                    pane_id,
+                    &self.record.harness,
+                    self.record.custom_process_identity.as_ref(),
+                    runtime,
+                )?;
+                let screen =
+                    self.client
+                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                if screen != submission.staged_screen
+                    && muse_prompt_transcript_count(&screen, &submission.text)
+                        > submission.prior_transcript_count
+                    && !muse_prompt_in_composer(&screen, &submission.text)
+                {
+                    *self
+                        .custom_submission
+                        .lock()
+                        .expect("custom submission lock poisoned") = None;
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Muse did not show a verified post-Enter screen transition",
+                    ));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
         let Some(objective) = self
             .goal_objective
             .lock()
@@ -824,6 +1217,27 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         .iter()
                         .any(|value| value.is_empty() || value.contains('\0'))
             })
+            || record.startup_warning.as_deref().is_some_and(|warning| {
+                warning.len() > 256 || !warning.is_ascii() || warning.contains(['\r', '\n', '\0'])
+            })
+            || record
+                .effective_reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| {
+                    !matches!(
+                        effort,
+                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                    )
+                })
+            || record
+                .custom_process_identity
+                .as_ref()
+                .is_some_and(|identity| {
+                    record.adapter != "herdr-pane"
+                        || record.harness != "muse"
+                        || record.pane_id.as_deref().is_none_or(str::is_empty)
+                        || !identity.valid()
+                })
         {
             return Err(fail(format!("invalid agent record: {}", path.display())));
         }
@@ -919,11 +1333,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
         let mut record = AgentRecord {
-            adapter: herdr_adapter(),
+            adapter: if options.harness == "muse" {
+                "herdr-pane".to_owned()
+            } else {
+                herdr_adapter()
+            },
             mode: interactive_mode(),
             backend: herdr_adapter(),
             paused: false,
             runtime_home: None,
+            pane_reported_by_agentctl: false,
+            custom_process_identity: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -940,6 +1360,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             model: options.model.clone(),
             resume: options.resume.clone(),
             arguments,
+            startup_warning: None,
+            effective_reasoning_effort: None,
             error: None,
             goal: None,
             goal_delivery: None,
@@ -1147,6 +1569,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             backend: herdr_adapter(),
             paused: false,
             runtime_home: None,
+            pane_reported_by_agentctl: false,
+            custom_process_identity: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -1163,6 +1587,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             model: None,
             resume: None,
             arguments: Vec::new(),
+            startup_warning: None,
+            effective_reasoning_effort: None,
             error: None,
             goal: None,
             goal_delivery: None,
@@ -1230,19 +1656,46 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     fn launch(&self, record: &mut AgentRecord, options: &StartOptions) -> Result<()> {
         self.create_presentation(record, options)?;
-        let pane_id = record.pane_id.as_deref().expect("new tab has pane");
-        self.client.start_agent(
-            &record.name,
-            &record.harness,
-            pane_id,
-            &record.arguments,
-            options.startup_timeout,
-        )?;
+        let pane_id = record.pane_id.clone().expect("new tab has pane");
+        if record.adapter == "herdr-pane" {
+            let agent_name = record.name.clone();
+            let harness = record.harness.clone();
+            let arguments = record.arguments.clone();
+            self.client.start_pane_agent(
+                &agent_name,
+                &harness,
+                &pane_id,
+                &arguments,
+                options.startup_timeout,
+                &mut |identity| {
+                    record.custom_process_identity = Some(identity);
+                    self.save(record).map_err(|error| {
+                        crate::error::AdapterError::unavailable(format!(
+                            "cannot persist custom process identity: {error}"
+                        ))
+                    })
+                },
+            )?;
+            record.pane_reported_by_agentctl = true;
+            self.save(record)?;
+            let screen = self.client.read(&pane_id, "visible", Some(200))?;
+            (record.startup_warning, record.effective_reasoning_effort) =
+                muse_startup_metadata(&screen);
+        } else {
+            self.client.start_agent(
+                &record.name,
+                &record.harness,
+                &pane_id,
+                &record.arguments,
+                options.startup_timeout,
+            )?;
+        }
         let info = agent::resolve_target(
             &WorkspaceClient {
                 client: self.client,
                 record,
                 goal_objective: Mutex::new(None),
+                custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: true,
             },
@@ -1365,6 +1818,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 client: self.client,
                 record,
                 goal_objective: Mutex::new(None),
+                custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: false,
             },
@@ -1395,6 +1849,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 client: self.client,
                 record: &record,
                 goal_objective: Mutex::new(None),
+                custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: false,
             },
@@ -1414,9 +1869,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             Value::Null
         };
         result["goal_delivery"] = json!(self.goal_delivery(record));
-        let probe = self
-            .checked(record)
-            .and_then(|_| agent::status(self.client, &record.target()?, &self.queue(agent_name)?));
+        let client = WorkspaceClient {
+            client: self.client,
+            record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: None,
+            check_prompt: false,
+        };
+        let probe = record.target().and_then(|target| {
+            agent::resolve_target(&client, &target)
+                .and_then(|_| agent::status(&client, &target, &self.queue(agent_name)?))
+        });
         match probe {
             Ok(status) => {
                 result
@@ -1484,6 +1948,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             client: self.client,
             record: &record,
             goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
         };
@@ -1535,6 +2000,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             client: self.client,
             record,
             goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
         };
@@ -1580,6 +2046,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 client: self.client,
                 record: &record,
                 goal_objective: Mutex::new(None),
+                custom_submission: Mutex::new(None),
                 queue: Some(&self.queue(agent_name)?),
                 check_prompt: true,
             },
@@ -1605,6 +2072,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 client: self.client,
                 record: &record,
                 goal_objective: Mutex::new(None),
+                custom_submission: Mutex::new(None),
                 queue: Some(&queue),
                 check_prompt: true,
             },
@@ -1651,6 +2119,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 client: self.client,
                 record: &record,
                 goal_objective: Mutex::new(None),
+                custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: false,
             },
@@ -1873,6 +2342,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             client: self.client,
             record: &record,
             goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
         };
@@ -1904,9 +2374,56 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn checked_or_launch_failed(&self, record: &AgentRecord, pane: &str) -> Result<()> {
-        if record.lifecycle != "launch_failed" || self.client.pane_info(pane)?.agent.is_some() {
-            self.checked(record)?;
+        if record.adapter != "herdr-pane" {
+            if record.lifecycle != "launch_failed" || self.client.pane_info(pane)?.agent.is_some() {
+                self.checked(record)?;
+            }
+            return Ok(());
         }
+        if matches!(record.lifecycle.as_str(), "starting" | "launch_failed")
+            && record.custom_process_identity.is_some()
+        {
+            let info = self.client.pane_info(pane)?;
+            let cwd_matches = info.cwd == record.cwd
+                || fs::canonicalize(&info.cwd)
+                    .ok()
+                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+            if info.pane_id == pane
+                && Some(&info.workspace_id) == record.workspace_id.as_ref()
+                && cwd_matches
+                && self
+                    .client
+                    .verify_custom_harness(
+                        pane,
+                        &record.harness,
+                        record.custom_process_identity.as_ref(),
+                    )
+                    .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        if record.lifecycle == "launch_failed" && record.pane_reported_by_agentctl {
+            let info = self.client.pane_info(pane)?;
+            let cwd_matches = info.cwd == record.cwd
+                || fs::canonicalize(&info.cwd)
+                    .ok()
+                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+            if info.pane_id == pane
+                && Some(&info.workspace_id) == record.workspace_id.as_ref()
+                && cwd_matches
+                && info.agent.as_deref() == Some(&record.harness)
+                && self.client.pane_is_idle_shell(pane)?
+            {
+                return Ok(());
+            }
+        }
+        if record.lifecycle == "starting" && record.custom_process_identity.is_none() {
+            return Err(fail(format!(
+                "cannot prove starting custom harness ownership in pane {pane}"
+            )));
+        }
+        self.checked(record)?;
         Ok(())
     }
 
@@ -1977,10 +2494,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             {
                 return Err(fail("refusing to close a tab whose pane ownership changed"));
             }
-            if record.lifecycle == "running"
+            if record.adapter == "herdr-pane"
+                || record.lifecycle == "running"
                 || self.client.pane_info(&owned[0].pane_id)?.agent.is_some()
             {
-                self.checked(&record)?;
+                self.checked_or_launch_failed(&record, &owned[0].pane_id)?;
             }
             let pane_id = &owned[0].pane_id;
             let mut text = self.client.read(pane_id, "recent-unwrapped", Some(5000))?;
@@ -2076,6 +2594,11 @@ mod tests {
                     change_session_after_save: AtomicBool::new(false),
                     change_owned_session_after_save: AtomicBool::new(false),
                     fail_close: AtomicBool::new(false),
+                    custom_reported: AtomicBool::new(false),
+                    custom_alive: AtomicBool::new(false),
+                    custom_dies_after_report: AtomicBool::new(false),
+                    custom_fails_after_identity: AtomicBool::new(false),
+                    custom_at_idle_shell: AtomicBool::new(true),
                 },
                 root,
             }
@@ -2155,6 +2678,11 @@ mod tests {
         change_session_after_save: AtomicBool,
         change_owned_session_after_save: AtomicBool,
         fail_close: AtomicBool,
+        custom_reported: AtomicBool,
+        custom_alive: AtomicBool,
+        custom_dies_after_report: AtomicBool,
+        custom_fails_after_identity: AtomicBool,
+        custom_at_idle_shell: AtomicBool,
     }
     impl Fake {
         fn pane(id: &str) -> Pane {
@@ -2162,6 +2690,17 @@ mod tests {
                 pane_id: id.to_owned(),
                 tab_id: "tab".to_owned(),
                 workspace_id: "workspace".to_owned(),
+            }
+        }
+
+        fn custom_identity() -> CustomProcessIdentity {
+            CustomProcessIdentity {
+                version: 1,
+                boot_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+                pid: 4242,
+                starttime_ticks: 9001,
+                executable_device: 7,
+                executable_inode: 11,
             }
         }
     }
@@ -2207,7 +2746,13 @@ mod tests {
             let report_session = self.report_session.load(Ordering::Relaxed)
                 || changed_after_save
                 || pane == "reported";
-            let kind = if pane == "claude" { "claude" } else { "codex" };
+            let kind = if self.custom_reported.load(Ordering::Relaxed) {
+                "muse"
+            } else if pane == "claude" {
+                "claude"
+            } else {
+                "codex"
+            };
             Ok(AgentPaneInfo {
                 pane_id: pane.to_owned(),
                 workspace_id: if pane == "external" {
@@ -2323,6 +2868,55 @@ mod tests {
             }
             self.started.store(true, Ordering::Relaxed);
             Ok(())
+        }
+        fn start_pane_agent(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: Duration,
+            persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> AdapterResult<()>,
+        ) -> AdapterResult<()> {
+            self.started.store(true, Ordering::Relaxed);
+            self.custom_alive.store(true, Ordering::Relaxed);
+            persist_identity(Self::custom_identity())?;
+            if self.custom_fails_after_identity.load(Ordering::Relaxed) {
+                let record =
+                    agent::read_private_json(&self.root.join("registry/worker/agent.json"))
+                        .expect("identity callback persisted the starting record");
+                assert_eq!(record["lifecycle"], "starting");
+                assert_eq!(record["custom_process_identity"]["pid"], 4242);
+                return Err(AdapterError::unavailable(
+                    "Muse workspace trust prompt requires human attention; no input was submitted",
+                ));
+            }
+            self.custom_reported.store(true, Ordering::Relaxed);
+            self.custom_alive.store(
+                !self.custom_dies_after_report.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            Ok(())
+        }
+        fn verify_custom_harness(
+            &self,
+            _: &str,
+            _: &str,
+            identity: Option<&CustomProcessIdentity>,
+        ) -> AdapterResult<()> {
+            if self.custom_alive.load(Ordering::Relaxed)
+                && identity.is_none_or(|identity| identity == &Self::custom_identity())
+            {
+                Ok(())
+            } else {
+                Err(AdapterError::unavailable(
+                    "custom harness is not the foreground process",
+                ))
+            }
+        }
+        fn pane_is_idle_shell(&self, _: &str) -> AdapterResult<bool> {
+            Ok(!self.custom_alive.load(Ordering::Relaxed)
+                && self.custom_at_idle_shell.load(Ordering::Relaxed))
         }
         fn agent_pane(&self, _: &str) -> AdapterResult<String> {
             Ok("owned".to_owned())
@@ -2936,6 +3530,212 @@ mod tests {
         assert_eq!(record["lifecycle"], "launch_failed");
         fixture.client.fail_panes.store(false, Ordering::Relaxed);
         assert_eq!(manager.stop("worker").unwrap()["pane_closed"], true);
+    }
+
+    #[test]
+    fn failed_muse_launch_with_our_stale_pane_report_is_stoppable() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .custom_dies_after_report
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let error = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("foreground process"));
+        let record = manager.load("worker").unwrap();
+        assert_eq!(record.lifecycle, "launch_failed");
+        assert!(record.pane_reported_by_agentctl);
+        assert_eq!(manager.stop("worker").unwrap()["pane_closed"], true);
+    }
+
+    #[test]
+    fn muse_identity_is_persisted_before_a_trust_failure_and_allows_stop() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .custom_fails_after_identity
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let error = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("trust prompt"));
+        let record = manager.load("worker").unwrap();
+        assert_eq!(record.lifecycle, "launch_failed");
+        assert_eq!(
+            record.custom_process_identity,
+            Some(Fake::custom_identity())
+        );
+        assert!(!record.pane_reported_by_agentctl);
+        assert_eq!(manager.stop("worker").unwrap()["pane_closed"], true);
+    }
+
+    #[test]
+    fn persisted_muse_identity_makes_a_starting_record_stoppable() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let mut record = manager.load("worker").unwrap();
+        assert!(record.custom_process_identity.is_some());
+        record.lifecycle = "starting".to_owned();
+        manager.save(&record).unwrap();
+        assert_eq!(manager.stop("worker").unwrap()["pane_closed"], true);
+    }
+
+    #[test]
+    fn starting_muse_without_report_or_identity_is_not_stoppable() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let mut record = manager.load("worker").unwrap();
+        record.lifecycle = "starting".to_owned();
+        record.pane_reported_by_agentctl = false;
+        record.custom_process_identity = None;
+        manager.save(&record).unwrap();
+        let error = manager.stop("worker").unwrap_err();
+        assert!(error.to_string().contains("cannot prove starting"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn running_muse_record_does_not_gain_idle_shell_cleanup_fallback() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        fixture.client.custom_alive.store(false, Ordering::Relaxed);
+        let error = manager.stop("worker").unwrap_err();
+        assert!(error.to_string().contains("foreground process"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn custom_process_identity_record_is_atomic_and_strict() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut record = agent::read_private_json(&path).unwrap();
+        record["custom_process_identity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("starttime_ticks");
+        agent::atomic_json(&path, &record).unwrap();
+        let error = manager.load("worker").unwrap_err();
+        assert!(error.to_string().contains("invalid agent record"));
+    }
+
+    #[test]
+    fn failed_muse_launch_cleanup_refuses_a_replacement_report() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .custom_dies_after_report
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        assert!(manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .is_err());
+        fixture
+            .client
+            .custom_reported
+            .store(false, Ordering::Relaxed);
+        let error = manager.stop("worker").unwrap_err();
+        assert!(error.to_string().contains("foreground process"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_muse_launch_cleanup_refuses_non_shell_foreground_process() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .custom_dies_after_report
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        assert!(manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .is_err());
+        fixture
+            .client
+            .custom_at_idle_shell
+            .store(false, Ordering::Relaxed);
+        let error = manager.stop("worker").unwrap_err();
+        assert!(error.to_string().contains("foreground process"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 
     #[test]

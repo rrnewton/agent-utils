@@ -15,6 +15,7 @@ from agentctl import agent
 from agentctl.client import HerdrClient, _bounded_control_command
 from agentctl.errors import AgentDeliveryError, HerdrRunError
 from agentctl.jsonx import as_mapping
+from agentctl.profiles import validate_muse_headless_arguments
 from agentctl.subagents import AgentRecord, ManagedAgents, _name
 
 
@@ -54,7 +55,7 @@ class Sessions(ManagedAgents):
             result.extend(("final-answer", "reset", "migrate", "repair"))
         else:
             result.append("terminal-snapshot")
-        if record.adapter in ("herdr", "herdr-foreign"):
+        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             result.extend(("drain", "goal", "bind-session"))
         return result
 
@@ -67,12 +68,21 @@ class Sessions(ManagedAgents):
             if backend != "herdr":
                 raise AgentDeliveryError("interactive sessions require Herdr; tmux supports headless runners")
             return super().start(name, cwd=cwd, harness=harness, model=model, brief=brief, **options)  # type: ignore[arg-type]
-        if mode != "headless" or backend not in ("herdr", "tmux") or harness not in ("codex", "agy"):
-            raise AgentDeliveryError("headless sessions support codex/agy with herdr/tmux")
-        if any(options.get(key) for key in ("resume", "harness_args", "workspace_id", "environment")):
+        if mode != "headless" or backend not in ("herdr", "tmux") or harness not in ("codex", "agy", "muse"):
+            raise AgentDeliveryError("headless sessions support codex/agy/muse with herdr/tmux")
+        if any(options.get(key) for key in ("resume", "workspace_id", "environment")):
             raise AgentDeliveryError(
-                "headless start does not accept resume, harness arguments, workspace-id, or environment"
+                "headless start does not accept resume, workspace-id, or environment"
             )
+        harness_args = options.get("harness_args", ())
+        if not isinstance(harness_args, (list, tuple)) or any(
+            not isinstance(item, str) or not item or "\0" in item for item in harness_args
+        ):
+            raise AgentDeliveryError("headless harness arguments must be nonempty and contain no NUL")
+        if harness != "muse" and harness_args:
+            raise AgentDeliveryError("headless harness arguments currently apply only to Muse")
+        if harness == "muse":
+            validate_muse_headless_arguments(list(harness_args))
         root = str(Path(cwd).expanduser().resolve())
         if not Path(root).is_dir():
             raise AgentDeliveryError(f"cwd is not a directory: {root}")
@@ -87,7 +97,8 @@ class Sessions(ManagedAgents):
                 self._save(record)
                 try:
                     response = self._worker(record, "start", cwd=root, harness=harness,
-                                            model=model, backend=backend, brief=brief)
+                                            model=model, backend=backend, brief=brief,
+                                            harness_args=list(harness_args))
                     self._sync_worker_record(record, response, save=False)
                     if record.session_value is not None:
                         owner = self._identity_owner(
@@ -133,7 +144,7 @@ class Sessions(ManagedAgents):
         return self._status_record(self._load(name))
 
     def _status_record(self, record: AgentRecord) -> dict[str, object]:
-        if record.adapter in ("herdr", "herdr-foreign"):
+        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             result = super()._status_record(record)
         else:
             result = record.to_document()
@@ -158,7 +169,7 @@ class Sessions(ManagedAgents):
                      model: str | None = None, **options: object) -> dict[str, object]:
         """Submit to the selected adapter without reusing another generation's name."""
         record = self._load(name)
-        if record.adapter in ("herdr", "herdr-foreign"):
+        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             if model is not None:
                 raise AgentDeliveryError("per-turn model overrides require a headless session")
             return asdict(super().send(name, text, message_id=message_id, expected_token=record.token, **options))
@@ -180,7 +191,7 @@ class Sessions(ManagedAgents):
             raise AgentDeliveryError("--output since_turn requires since-turn")
         with self._lock(name):
             record = self._load(name)
-            if record.adapter in ("herdr", "herdr-foreign"):
+            if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
                 if output not in ("tail", "all") or since_turn is not None:
                     raise AgentDeliveryError("interactive terminals expose snapshots, not final-answer boundaries")
                 self._checked(record)
@@ -196,7 +207,7 @@ class Sessions(ManagedAgents):
     def stop(self, name: str, *, expected_token: str | None = None) -> dict[str, object]:
         """Retire a runtime, then archive its canonical identity and artifacts."""
         record = self._load_expected(name, expected_token)
-        if record.adapter in ("herdr", "herdr-foreign"):
+        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             return super().stop(name, expected_token=record.token)
         with self._lock(name):
             current = self._load(name)
@@ -241,7 +252,7 @@ class Sessions(ManagedAgents):
         if not math.isfinite(timeout) or not 0 <= timeout <= 31_536_000:
             raise AgentDeliveryError("wait timeout must be finite and between 0 and 31536000 seconds")
         initial = self._load(name)
-        if initial.adapter in ("herdr", "herdr-foreign"):
+        if initial.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             return super().wait(name, timeout=timeout, expected_token=initial.token, **options)  # type: ignore[arg-type]
         deadline = time.monotonic() + timeout
         while True:
@@ -270,7 +281,7 @@ class Sessions(ManagedAgents):
     def attach(self, name: str, *, expected_token: str | None = None) -> dict[str, object]:
         """Focus a verified Herdr tab or attach the current terminal to an exact tmux window."""
         initial = self._load_expected(name, expected_token)
-        if initial.adapter in ("herdr", "herdr-foreign"):
+        if initial.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             return super().attach(name, expected_token=initial.token)
         attach_command: list[str] | None = None
         with self._lock(name):

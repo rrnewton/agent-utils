@@ -15,9 +15,15 @@ Each tool skill points to the installed command's quickstart, help, and embedded
 - `wrkviz` — archive and visualize coordinator and subagent activity.
 - `herdr-run` — run an allowlisted command in a Herdr pane, outside whatever constrains the caller; a sandboxed agent's blocked `git` is one case, not the definition.
 - `herdr-agent` — durably deliver and inspect prompts for an interactive agent in a Herdr pane.
+- `agentctl` — start, inspect, message, and retire named agents, including owner-configured profiles.
 - `wrkslots` — provision and audit isolated Git worktree slots, protect or reclaim their caches, record handoff, and remove source only after verified owner absence.
 
 ## Install in an agent harness
+
+For `agentctl`, prefer `agentctl skill install`: it installs byte-identical
+copies for Codex and Claude and uses Muse's native managed skill installer.
+It refuses divergent content unless explicitly forced. The links below remain
+useful for tools that do not provide their own installer.
 
 Link the desired directory into the skill directory configured by your harness:
 
@@ -31,6 +37,7 @@ ln -s /path/to/agent-utils/skills/parallel-experiment-runner /path/to/agent-skil
 ln -s /path/to/agent-utils/skills/wrkviz /path/to/agent-skills/wrkviz
 ln -s /path/to/agent-utils/skills/herdr-run /path/to/agent-skills/herdr-run
 ln -s /path/to/agent-utils/skills/herdr-agent /path/to/agent-skills/herdr-agent
+ln -s /path/to/agent-utils/skills/agentctl /path/to/agent-skills/agentctl
 ln -s /path/to/agent-utils/skills/wrkslots /path/to/agent-skills/wrkslots
 ```
 

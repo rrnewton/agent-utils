@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -64,6 +66,9 @@ class PairCase:
 
 _FAKE_HERDR = r'''import json
 import os
+import shlex
+import signal
+import subprocess
 import sys
 import time
 
@@ -118,9 +123,27 @@ elif args[:2] == ["pane", "get"]:
         "pane_id": pane,
         "workspace_id": "w1",
         "cwd": root,
-        "agent": None if human else state.get("harness", "codex"),
-        "agent_status": "unknown" if human else state.get("status", "idle"),
-        "agent_session": None if human else {"agent": state.get("harness", "codex"), "value": "session-1"},
+        "agent": None if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("harness", "codex"),
+        "agent_status": "unknown" if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("status", "idle"),
+        "agent_session": None if human or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": "session-1"},
+    }})
+elif args[:2] == ["pane", "process-info"]:
+    command = ("/tmp/lookalike/muse" if state.get("wrong_custom_process")
+               else state.get("launch_command", "/usr/local/bin/muse"))
+    parsed = shlex.split(command)
+    executable = parsed[0]
+    process_pid = state.get("custom_pid", 200)
+    foreground_processes = [] if state.get("custom_identity_hidden") else [
+        {"pid":process_pid, "name":os.path.basename(executable),
+         "cmdline":command, "argv":parsed, "executable":executable}
+    ]
+    envelope({"process_info": {
+        "pane_id":"w1:p1", "shell_pid":100,
+        "foreground_process_group_id":(
+            process_pid + 1 if state.get("wrong_custom_process_group")
+            else process_pid if state.get("custom_pid") else 200
+        ),
+        "foreground_processes":foreground_processes,
     }})
 elif args[:2] == ["tab", "create"]:
     state["closed"] = False
@@ -134,6 +157,11 @@ elif args[:2] == ["tab", "create"]:
 elif args[:2] == ["pane", "close"]:
     if args[2] != "w1:p1":
         raise SystemExit("refusing unexpected pane close")
+    if state.get("custom_pid"):
+        try:
+            os.kill(state["custom_pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     state["closed"] = True
     state.setdefault("closed_panes", []).append(args[2])
 elif args[:2] in (["agent", "focus"], ["tab", "focus"]):
@@ -146,6 +174,22 @@ elif args[:2] == ["agent", "start"]:
         print("startup requires attention", file=sys.stderr)
         save()
         raise SystemExit(1)
+elif args[:2] == ["pane", "run"]:
+    state["launch_command"] = args[3]
+    parsed = shlex.split(args[3])
+    state["launch_arguments"] = parsed[1:]
+    state["custom_harness"] = True
+    child_command = (["/bin/sleep", "60"] if state.get("wrong_custom_process_identity")
+                     else [parsed[0], "-c", "import time; time.sleep(60)"])
+    child = subprocess.Popen(
+        child_command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    state["custom_pid"] = child.pid
+elif args[:2] == ["pane", "report-agent"]:
+    state["harness"] = args[args.index("--agent") + 1]
+    state["status"] = args[args.index("--state") + 1]
+    state["custom_reported"] = True
 elif args[:2] == ["agent", "get"]:
     if state.get("offline") or state.get("name") != args[2]:
         print("named agent unavailable", file=sys.stderr)
@@ -175,6 +219,19 @@ elif args[:2] == ["agent", "prompt"]:
         print("transport lost after write", file=sys.stderr)
         save()
         raise SystemExit(1)
+elif args[:2] == ["pane", "send-text"]:
+    pasted = args[3]
+    start, end = "\x1b[200~", "\x1b[201~"
+    state["paste_wrapped"] = pasted.startswith(start) and pasted.endswith(end)
+    state["custom_draft"] = pasted[len(start):-len(end)] if state["paste_wrapped"] else pasted
+    state["custom_submitted"] = False
+    if state.get("custom_exit_after_send_text") and state.get("custom_pid"):
+        state["retired_custom_pid"] = state["custom_pid"]
+        try:
+            os.kill(state["custom_pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        state["custom_identity_hidden"] = True
 elif args[:2] == ["agent", "wait"]:
     if state.get("goal_menu") and not state.get("confirmed_goal"):
         print("replacement menu requires confirmation", file=sys.stderr)
@@ -191,17 +248,69 @@ elif args[:2] == ["pane", "read"]:
     source = args[args.index("--source") + 1]
     if source == "visible" and state.get("screen"):
         sys.stdout.write(state["screen"])
+    elif source == "visible" and state.get("custom_harness"):
+        prefix = "Muse Code 1.3.0\n\nreasoning effort ultra is not available (gate ultra_reasoning_effort is closed); using xhigh\n"
+        divider = "────────────────\n"
+        history = "".join("❯ " + text + "\n◆ accepted\n" for text in state.get("submitted", []))
+        footer = "watermelon-preview · xhigh · project · Auto-review\n"
+        if state.get("custom_submitted"):
+            if state.get("custom_post_error"):
+                sys.stdout.write(prefix + history + divider + "❯ " + state["custom_draft"] +
+                                 "\nError: retry\n" + divider + footer)
+            else:
+                sys.stdout.write(prefix + history + "Working...\n" + divider + "❯\n" +
+                                 divider + footer)
+        elif state.get("custom_draft"):
+            sys.stdout.write(prefix + history + divider + "❯ " + state["custom_draft"] +
+                             "\n" + divider + footer)
+        else:
+            sys.stdout.write(prefix + history + divider + "❯\n" + divider + footer)
     elif source == "recent-unwrapped":
         sys.stdout.write(state.get("read_unwrapped", "agent transcript\n"))
     else:
         sys.stdout.write(state.get("read_recent", "fallback transcript\n"))
 elif args[:2] == ["pane", "send-keys"]:
-    state["confirmed_goal"] = args[3] == "Enter"
+    if state.get("custom_harness") and state.get("custom_draft") and args[3] == "Enter":
+        state["custom_submitted"] = True
+        if not state.get("custom_clear_without_submit"):
+            state.setdefault("submitted", []).append(state["custom_draft"])
+    else:
+        state["confirmed_goal"] = args[3] == "Enter"
 else:
     print("unsupported fake Herdr call: " + repr(args), file=sys.stderr)
     save()
     raise SystemExit(2)
 save()
+'''
+
+_FAKE_MUSE_SKILLS = r'''import json, os, pathlib, shutil, sys
+args = sys.argv[1:]
+if args[:2] != ["skills", "install"] or len(args) < 8:
+    print("unsupported fake Muse call", file=sys.stderr)
+    raise SystemExit(2)
+source = pathlib.Path(args[2])
+if args[3:5] != ["--scope", "user"] or args[5] != "--name" or args[7] != "--json":
+    print("invalid fake Muse install shape", file=sys.stderr)
+    raise SystemExit(2)
+name = args[6]
+if name != "agentctl" or any(value not in ("--force",) for value in args[8:]):
+    print("invalid fake Muse install options", file=sys.stderr)
+    raise SystemExit(2)
+config = os.environ.get("XDG_CONFIG_HOME")
+if not config or not os.path.isabs(config):
+    print("missing isolated XDG_CONFIG_HOME", file=sys.stderr)
+    raise SystemExit(2)
+destination = pathlib.Path(config) / "muse" / "skills" / name / "SKILL.md"
+if destination.exists() and "--force" not in args:
+    print("skill-already-installed", file=sys.stderr)
+    raise SystemExit(1)
+destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+shutil.copyfile(source / "SKILL.md", destination)
+destination.chmod(0o600)
+log = pathlib.Path(__file__).with_name("muse-skill-calls.jsonl")
+with log.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(args) + "\n")
+print(json.dumps({"installed": {"id": name}}))
 '''
 
 
@@ -228,6 +337,14 @@ class Harness:
             fixture = root / "fake-herdr"
             fixture.write_text(f"#!{sys.executable}\n{_FAKE_HERDR}", encoding="utf-8")
             fixture.chmod(0o700)
+            fake_muse = root / "fake-muse-skills"
+            fake_muse.write_text(
+                f"#!{sys.executable}\n{_FAKE_MUSE_SKILLS}", encoding="utf-8"
+            )
+            fake_muse.chmod(0o700)
+            fake_muse_runtime = root / "fake-muse-runtime"
+            shutil.copyfile(sys.executable, fake_muse_runtime)
+            fake_muse_runtime.chmod(0o700)
             (root / "state.json").write_text(
                 json.dumps(initial, sort_keys=True), encoding="utf-8"
             )
@@ -251,6 +368,28 @@ class Harness:
         local = str(REPO_ROOT / "py")
         environment["PYTHONPATH"] = local if not existing else local + os.pathsep + existing
         environment.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "NO_COLOR": "1", "HERDR_WORKSPACE_ID": "w1"})
+        for harness_name in ("CODEX", "CLAUDE"):
+            environment[f"AGENTCTL_{harness_name}_SKILLS_DIR"] = str(
+                root / "skill-homes" / harness_name.lower()
+            )
+        fixture_state = _state(root)
+        if fixture_state.get("hostile_path"):
+            environment["PATH"] = str(root / "hostile-bin")
+        environment["AGENTCTL_MUSE_BIN"] = (
+            str(root / "missing-muse")
+            if fixture_state.get("missing_custom_executable")
+            else str(root / "fake-muse-skills")
+            if tuple(arguments[:2]) == ("skill", "install")
+            else str(root / "fake-muse-runtime")
+        )
+        environment["XDG_CONFIG_HOME"] = str(root / "xdg-config")
+        empty_environment = fixture_state.get("empty_environment", [])
+        if not isinstance(empty_environment, list) or any(
+            not isinstance(variable, str) for variable in empty_environment
+        ):
+            raise TypeError("empty_environment fixture must contain strings")
+        for variable in empty_environment:
+            environment[variable] = ""
         try:
             completed = subprocess.run(
                 [*command, *expanded],

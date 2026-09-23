@@ -9,6 +9,9 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import re
+import select
+import shlex
 import signal
 import stat
 import subprocess
@@ -23,6 +26,7 @@ __all__ = [
     "HerdrClient",
     "Pane",
     "ProcessInfo",
+    "CustomProcessIdentity",
     "Runner",
     "CONTROL_TIMEOUT_SECONDS",
     "AgentPaneInfo",
@@ -38,6 +42,109 @@ CONTROL_TIMEOUT_SECONDS = 30.0
 # explicit so Python's arbitrary-precision integers cannot accept protocol values that the Rust
 # implementation (or a Linux process API) cannot represent.
 _MAX_PROCESS_ID = 2_147_483_647
+_MAX_U64 = (1 << 64) - 1
+_MUSE_EFFORT = re.compile(r"[a-z0-9_-]{1,32}\Z")
+_BOOT_ID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
+
+
+def muse_startup_metadata(screen: str) -> tuple[str | None, str | None]:
+    """Return a bounded Muse downgrade warning and its explicit effective effort.
+
+    Launch arguments describe requested policy, not necessarily the policy the
+    provider accepted.  Only Muse's narrow, human-visible downgrade sentence is
+    persisted; arbitrary terminal text never becomes agent metadata.
+    """
+    for raw_line in screen.splitlines():
+        line = raw_line.strip()
+        if not line.isascii() or len(line) > 256:
+            continue
+        prefix = "reasoning effort "
+        if not line.startswith(prefix) or "; using " not in line:
+            continue
+        unavailable, effective = line[len(prefix):].rsplit("; using ", 1)
+        requested, marker, detail = unavailable.partition(" is not available")
+        if (not marker or _MUSE_EFFORT.fullmatch(requested) is None
+                or _MUSE_EFFORT.fullmatch(effective) is None):
+            continue
+        if detail and not (detail.startswith(" (") and detail.endswith(")")):
+            continue
+        return line, effective
+    return None, None
+
+
+def muse_trust_prompt(screen: str) -> bool:
+    """Recognize only explicit workspace-trust questions."""
+    lowered = screen.lower()
+    return (
+        "trust this workspace" in lowered
+        or ("do you trust" in lowered
+            and ("workspace" in lowered or "folder" in lowered))
+        or "workspace trust" in lowered
+    )
+
+
+def muse_idle_composer(screen: str) -> bool:
+    """Recognize Muse's idle composer without mistaking a choice prompt for it."""
+    if "Auto-review" not in screen:
+        return False
+    return any(line.strip() in ("❯", "›") for line in screen.splitlines())
+
+
+def _muse_text_visible(screen: str, text: str) -> bool:
+    wanted = " ".join(text.split())
+    rendered = " ".join(screen.split())
+    if not wanted:
+        return False
+    if len(wanted) <= 160:
+        return wanted in rendered
+    return wanted[:80] in rendered and wanted[-80:] in rendered
+
+
+def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
+    """Split transcript/composer using Muse's two rules above its status footer."""
+    lines = screen.splitlines()
+    footer = next(
+        (index for index in range(len(lines) - 1, -1, -1) if "Auto-review" in lines[index]),
+        None,
+    )
+    if footer is None:
+        return None
+    dividers = [
+        index for index, line in enumerate(lines[:footer])
+        if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+    ]
+    if len(dividers) < 2:
+        return None
+    top, bottom = dividers[-2:]
+    return "\n".join(lines[:top]), "\n".join(lines[top + 1:bottom])
+
+
+def muse_prompt_in_composer(screen: str, text: str) -> bool:
+    """Require the literal prompt inside Muse's active bottom editor region."""
+    regions = _muse_composer_regions(screen)
+    return regions is not None and _muse_text_visible(regions[1], text)
+
+
+def muse_prompt_in_transcript(screen: str, text: str) -> bool:
+    """Require the literal prompt above Muse's active bottom editor region."""
+    regions = _muse_composer_regions(screen)
+    return regions is not None and _muse_text_visible(regions[0], text)
+
+
+def muse_prompt_transcript_count(screen: str, text: str) -> int:
+    """Count bounded prompt renderings above the composer for transition proofs."""
+    regions = _muse_composer_regions(screen)
+    if regions is None:
+        return 0
+    wanted = " ".join(text.split())
+    rendered = " ".join(regions[0].split())
+    if not wanted:
+        return 0
+    if len(wanted) <= 160:
+        return rendered.count(wanted)
+    return min(rendered.count(wanted[:80]), rendered.count(wanted[-80:]))
 
 
 def _get_process_id(mapping: dict[str, object], key: str, what: str) -> int:
@@ -66,8 +173,20 @@ class ProcessInfo:
     pane_id: str
     shell_pid: int
     foreground_pgid: int
-    #: ``(pid, name, cmdline)`` for each process in the pane's foreground process group.
-    foreground: tuple[tuple[int, str, str], ...]
+    #: ``(pid, name, cmdline, argv0, reported_executable)`` for each foreground process.
+    foreground: tuple[tuple[int, str, str, str, str | None], ...]
+
+
+@dataclass(frozen=True)
+class CustomProcessIdentity:
+    """Kernel identity of one custom harness process across executable upgrades."""
+
+    version: int
+    boot_id: str
+    pid: int
+    starttime_ticks: int
+    executable_device: int
+    executable_inode: int
 
 
 @dataclass(frozen=True)
@@ -448,6 +567,280 @@ class HerdrClient:
             detail = (completed.stderr or completed.stdout).strip() or f"exit {completed.returncode}"
             raise HerdrUnavailable(f"agent start {name!r}: {detail}")
 
+    def _harness_executable(self, kind: str) -> str:
+        if not kind or any(
+            not (character.isascii() and (character.islower() or character.isdigit() or character == "-"))
+            for character in kind
+        ):
+            raise HerdrUnavailable(
+                "custom harness name must contain lowercase ASCII letters, digits, or hyphens"
+            )
+        configured = self._environ.get("AGENTCTL_MUSE_BIN") if kind == "muse" else None
+        if configured is not None:
+            if not os.path.isabs(configured):
+                raise HerdrUnavailable("AGENTCTL_MUSE_BIN must be an absolute path")
+            return _validated_executable(configured, kind)
+        home = self._account_home()
+        candidates = (
+            os.path.join("/usr/local/bin", kind),
+            os.path.join("/usr/bin", kind),
+            os.path.join(home, ".local", "bin", kind),
+            os.path.join(home, "bin", kind),
+            os.path.join(home, ".cargo", "bin", kind),
+        )
+        candidate = next(
+            (path for path in candidates if os.path.isfile(path) and os.access(path, os.X_OK)),
+            "",
+        )
+        if not candidate:
+            raise HerdrUnavailable(
+                f"custom harness executable {kind!r} was not found in fixed install locations"
+            )
+        return _validated_executable(candidate, kind)
+
+    def report_pane_agent(self, pane_id: str, kind: str, state: str) -> None:
+        """Label one exact custom-harness pane without registering an agent name."""
+        self._call_ok(
+            [
+                "pane", "report-agent", pane_id, "--source", "agentctl",
+                "--agent", kind, "--state", state,
+                "--message", "agentctl custom harness",
+            ],
+            f"report custom agent {pane_id}",
+        )
+
+    @staticmethod
+    def _process_executable(pid: int) -> str | None:
+        """Resolve the kernel-owned executable identity, not spoofable argv text."""
+        try:
+            return os.path.realpath(os.readlink(f"/proc/{pid}/exe"))
+        except OSError:
+            return None
+
+    @staticmethod
+    def _process_identity(pid: int) -> tuple[CustomProcessIdentity, int] | None:
+        """Read a coherent Linux process/image identity without following its pathname."""
+        if not hasattr(os, "pidfd_open"):
+            return None
+        descriptor: int | None = None
+        for _attempt in range(4):
+            try:
+                descriptor = os.pidfd_open(pid)
+                break
+            except InterruptedError:
+                continue
+            except OSError:
+                return None
+        if descriptor is None:
+            return None
+        try:
+            poller = select.poll()
+            poller.register(descriptor, select.POLLIN)
+            if poller.poll(0):
+                return None
+
+            def boot_identity() -> str | None:
+                with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as stream:
+                    boot_data = stream.read(129)
+                if not boot_data or len(boot_data) > 128:
+                    return None
+                boot_id = boot_data.strip()
+                return boot_id if _BOOT_ID.fullmatch(boot_id) is not None else None
+
+            def process_stat() -> tuple[int, int] | None:
+                with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+                    raw = stream.read(8193)
+                if not raw or len(raw) > 8192:
+                    return None
+                close = raw.rfind(")")
+                if not raw.startswith(f"{pid} (") or close < 0:
+                    return None
+                fields = raw[close + 2:].split()
+                if len(fields) <= 19 or fields[0] == "Z":
+                    return None
+                pgrp = int(fields[2])
+                starttime = int(fields[19])
+                if (not 1 <= pgrp <= _MAX_PROCESS_ID
+                        or not 1 <= starttime <= _MAX_U64):
+                    return None
+                return pgrp, starttime
+
+            boot_before = boot_identity()
+            first = process_stat()
+            executable_before = os.stat(f"/proc/{pid}/exe")
+            second = process_stat()
+            executable_after = os.stat(f"/proc/{pid}/exe")
+            boot_after = boot_identity()
+            if poller.poll(0):
+                return None
+        except (OSError, UnicodeError, ValueError):
+            return None
+        finally:
+            os.close(descriptor)
+        if (boot_before is None or boot_before != boot_after
+                or first is None or second is None or first != second
+                or not stat.S_ISREG(executable_before.st_mode)
+                or not stat.S_ISREG(executable_after.st_mode)
+                or executable_before.st_dev <= 0 or executable_before.st_ino <= 0
+                or executable_before.st_dev > _MAX_U64
+                or executable_before.st_ino > _MAX_U64
+                or (executable_before.st_dev, executable_before.st_ino)
+                != (executable_after.st_dev, executable_after.st_ino)):
+            return None
+        return (
+            CustomProcessIdentity(
+                version=1, boot_id=boot_before, pid=pid,
+                starttime_ticks=first[1], executable_device=executable_before.st_dev,
+                executable_inode=executable_before.st_ino,
+            ),
+            first[0],
+        )
+
+    def _pane_process_identity(
+        self, info: ProcessInfo, executable: str | None,
+        expected: CustomProcessIdentity | None = None,
+        launch_image: tuple[int, int] | None = None,
+    ) -> CustomProcessIdentity | None:
+        matches: list[CustomProcessIdentity] = []
+        for pid, _process_name, _command, argv0, reported_executable in info.foreground:
+            if expected is not None and pid != expected.pid:
+                continue
+            if expected is None and (executable is None or os.path.realpath(argv0) != executable):
+                continue
+            observed_path = self._process_executable(pid)
+            observed = self._process_identity(pid)
+            if (observed is None and observed_path is None
+                    and not self._production_runner and reported_executable is not None):
+                try:
+                    metadata = os.stat(reported_executable)
+                except OSError:
+                    continue
+                observed = (
+                    CustomProcessIdentity(
+                        version=1, boot_id="00000000-0000-0000-0000-000000000000",
+                        pid=pid, starttime_ticks=pid,
+                        executable_device=metadata.st_dev, executable_inode=metadata.st_ino,
+                    ),
+                    info.foreground_pgid,
+                )
+            if observed is None:
+                continue
+            identity, process_group_id = observed
+            if process_group_id != info.foreground_pgid:
+                continue
+            if expected is not None:
+                if identity == expected:
+                    matches.append(identity)
+                continue
+            if launch_image is not None and (
+                identity.executable_device, identity.executable_inode
+            ) != launch_image:
+                continue
+            if launch_image is not None or observed_path == executable or (
+                not self._production_runner and reported_executable is not None
+                and os.path.realpath(reported_executable) == executable
+            ):
+                matches.append(identity)
+        return matches[0] if len(matches) == 1 else None
+
+    def verify_custom_harness(
+        self, pane_id: str, kind: str,
+        expected_identity: CustomProcessIdentity | None = None,
+    ) -> None:
+        """Require the recorded custom process or strict current-path identity."""
+        executable = None if expected_identity is not None else self._harness_executable(kind)
+        if self._pane_process_identity(
+            self.process_info(pane_id), executable, expected_identity
+        ) is None:
+            raise HerdrUnavailable(
+                f"custom harness {kind!r} is not the foreground process in pane {pane_id}"
+            )
+
+    def pane_is_idle_shell(self, pane_id: str) -> bool:
+        """Prove the pane has returned to Herdr's original shell process group."""
+        info = self.process_info(pane_id)
+        if (info.foreground_pgid != info.shell_pid or len(info.foreground) != 1
+                or info.foreground[0][0] != info.shell_pid):
+            return False
+        _pid, _name, _command, argv0, _reported = info.foreground[0]
+        observed = self._process_executable(info.shell_pid)
+        return observed is not None and observed == os.path.realpath(argv0)
+
+    def start_pane_agent(
+        self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
+        *, timeout: float = 30.0,
+        on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+    ) -> CustomProcessIdentity:
+        """Launch and verify a custom TUI through one exact Herdr pane.
+
+        Unknown harness kinds cannot use Herdr's native ``agent start`` path.
+        No trust-prompt input is synthesized by this adapter.
+        """
+        del name
+        if not 0 < timeout <= 300:
+            raise ValueError("agent startup timeout must be between 0 and 300 seconds")
+        executable = self._harness_executable(kind)
+        try:
+            descriptor = os.open(executable, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise HerdrUnavailable(f"cannot pin {kind} executable {executable}: {exc}") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o111 == 0
+                    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or metadata.st_dev <= 0 or metadata.st_ino <= 0
+                    or metadata.st_dev > _MAX_U64 or metadata.st_ino > _MAX_U64):
+                raise HerdrUnavailable(
+                    f"refusing unsafe {kind} executable after opening: {executable}"
+                )
+            if os.pread(descriptor, 4, 0) != b"\x7fELF":
+                raise HerdrUnavailable(
+                    f"custom harness {kind!r} must be a native ELF executable"
+                )
+            launch_image = (metadata.st_dev, metadata.st_ino)
+            self._call_ok(
+                ["pane", "run", pane_id, shlex.join([executable, *arguments])],
+                f"pane run {kind!r}",
+            )
+            deadline = time.monotonic() + timeout
+            observed: CustomProcessIdentity | None = None
+            while time.monotonic() < deadline:
+                observed = self._pane_process_identity(
+                    self.process_info(pane_id), executable, launch_image=launch_image
+                )
+                if observed is not None:
+                    break
+                self._sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            if observed is None:
+                raise HerdrUnavailable(
+                    f"custom harness {kind!r} was not the foreground process in pane {pane_id}"
+                )
+            if on_observed is not None:
+                on_observed(observed)
+        finally:
+            os.close(descriptor)
+        ready = False
+        while time.monotonic() < deadline:
+            self.verify_custom_harness(pane_id, kind, observed)
+            screen = self.read(pane_id, source="visible", lines=200)
+            if muse_trust_prompt(screen) and "--trust-workspace" not in arguments:
+                raise HerdrUnavailable(
+                    f"{kind} workspace trust prompt requires human attention; no input was submitted"
+                )
+            # An arrow alone is also used by choice dialogs. Muse's idle screen
+            # couples its composer marker with the Auto-review status label.
+            ready = muse_idle_composer(screen)
+            if ready:
+                break
+            self._sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        if not ready:
+            raise HerdrUnavailable(
+                f"custom harness {kind!r} did not reach a verified idle composer in pane {pane_id}"
+            )
+        self.verify_custom_harness(pane_id, kind, observed)
+        self.report_pane_agent(pane_id, kind, "idle")
+        return observed
+
     def agent_pane(self, name: str) -> str:
         """Resolve an exact live Herdr agent name, rejecting a stale pane occupant."""
         result = self._call(["agent", "get", name], f"agent get {name!r}")
@@ -591,16 +984,21 @@ class HerdrClient:
         )
         try:
             info = as_mapping(result.get("process_info"), "pane process-info")
-            foreground: list[tuple[int, str, str]] = []
+            foreground: list[tuple[int, str, str, str, str | None]] = []
             for entry in as_sequence(
                 info.get("foreground_processes"), "foreground_processes"
             ):
                 process = as_mapping(entry, "foreground process")
+                argv = as_sequence(process.get("argv"), "foreground process argv")
+                if not argv or not isinstance(argv[0], str) or not argv[0]:
+                    raise TypeError("foreground process argv must have a nonempty argv[0]")
                 foreground.append(
                     (
                         _get_process_id(process, "pid", "foreground process"),
                         opt_str(process, "name") or "",
                         opt_str(process, "cmdline") or "",
+                        argv[0],
+                        opt_str(process, "executable"),
                     )
                 )
             parsed = ProcessInfo(
@@ -664,6 +1062,10 @@ class HerdrClient:
         This call does not wait for a lifecycle transition.
         """
         self._call_ok(["agent", "prompt", pane_id, text], f"agent prompt {pane_id}")
+
+    def send_text(self, pane_id: str, text: str) -> None:
+        """Insert literal text without synthesizing a submission keystroke."""
+        self._call_ok(["pane", "send-text", pane_id, text], f"pane send-text {pane_id}")
 
     def send_keys(self, pane_id: str, keys: str) -> None:
         """Send named key presses (for example ``ctrl+u``) to a pane."""

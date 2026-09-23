@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Iterator, NoReturn, Optional, cast
@@ -57,13 +58,14 @@ PROJECT_DEFAULTS_CONFIG: Path = Path(os.environ.get("HERDR_SUBAGENTS_PROJECT_DEF
 CODEX_SESSIONS: Path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
 
 DEFAULT_HARNESS: str = "codex"
-SUPPORTED_HARNESSES: tuple[str, ...] = ("codex", "agy")
+SUPPORTED_HARNESSES: tuple[str, ...] = ("codex", "agy", "muse")
 SUPPORTED_BACKENDS: tuple[str, ...] = ("tmux", "herdr")
 HEADLESS_MODE: str = "headless"
 TUI_MODE: str = "tui"
 SUPPORTED_MODES: tuple[str, ...] = (HEADLESS_MODE, TUI_MODE)
 CODEX_BIN: str = os.environ.get("CODEX_BIN", "codex")
 AGY_BIN: str = os.environ.get("AGY_BIN", "agy")
+MUSE_BIN: str = os.environ.get("MUSE_BIN", "muse")
 HERDR_BIN: str = os.environ.get("HERDR_BIN", "herdr")
 HERDR_WORKSPACE_LABEL: str = os.environ.get("SUBAGENTS_HERDR_WORKSPACE", "subagents")
 HERDR_API_TIMEOUT_S: float = float(os.environ.get("SUBAGENTS_HERDR_TIMEOUT", "2"))
@@ -426,12 +428,15 @@ class AgentRecord:
     presentation_pane: Optional[str] = None
     # New workers use native permissions unless the caller explicitly opts in.
     codex_bypass_permissions: bool = False
+    # Literal non-secret Muse options. Profiles reject credential-shaped
+    # arguments before these durable launch settings are recorded.
+    harness_args: tuple[str, ...] = ()
 
     @staticmethod
     def from_dict(d: dict[str, object]) -> "AgentRecord":
         """Load a worker record, restoring omitted presentation fields from preserved identity metadata."""
         fields = {f.name for f in dataclasses.fields(AgentRecord)}
-        missing = fields - set(d) - {"runner_started_at", "backend", "mode", "presentation_pane", "codex_bypass_permissions"}
+        missing = fields - set(d) - {"runner_started_at", "backend", "mode", "presentation_pane", "codex_bypass_permissions", "harness_args"}
         if missing:
             die(f"registry row for {d.get('name')!r} missing keys: {sorted(missing)}")
         preserved = _load_presentation_identity(d)
@@ -452,6 +457,11 @@ class AgentRecord:
             else (preserved.presentation_pane if preserved is not None and mode == TUI_MODE else None)
         )
         bypass = _load_codex_permission_policy(d)
+        raw_harness_args = d.get("harness_args", [])
+        if not isinstance(raw_harness_args, list) or any(
+            not isinstance(item, str) or not item or "\0" in item for item in raw_harness_args
+        ):
+            die("registry row has invalid harness_args")
         return AgentRecord(
             name=str(d["name"]),
             harness=str(d["harness"]),
@@ -471,6 +481,7 @@ class AgentRecord:
             mode=mode,
             presentation_pane=presentation_pane,
             codex_bypass_permissions=bypass,
+            harness_args=tuple(raw_harness_args),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -2203,7 +2214,7 @@ def _child_python_command(script: Path, *args: str) -> str:
     }
     if os.environ.get("HERDR_SUBAGENTS_POLICY"):
         environment["HERDR_SUBAGENTS_POLICY"] = str(Path(os.environ["HERDR_SUBAGENTS_POLICY"]).expanduser().resolve())
-    for key in ("CODEX_BIN", "AGY_BIN", "HERDR_BIN", "CODEX_HOME", "SUBAGENT_EFFORT", "SUBAGENTS_TMUX_SESSION", "SUBAGENTS_HERDR_WORKSPACE", "SUBAGENTS_TURN_TIMEOUT"):
+    for key in ("CODEX_BIN", "AGY_BIN", "MUSE_BIN", "HERDR_BIN", "CODEX_HOME", "SUBAGENT_EFFORT", "SUBAGENTS_TMUX_SESSION", "SUBAGENTS_HERDR_WORKSPACE", "SUBAGENTS_TURN_TIMEOUT"):
         if key in os.environ:
             environment[key] = os.environ[key]
     prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in environment.items())
@@ -2233,9 +2244,20 @@ def bring_up_agent(
     backend: Optional[str] = None,
     mode: Optional[str] = None,
     purpose: str = "development",
+    harness_args: Sequence[str] = (),
 ) -> UpResult:
     """Validate policy and launch a named worker, optionally enqueueing its first task."""
     harness = require_supported_harness(harness)
+    if any(not isinstance(item, str) or not item or "\0" in item for item in harness_args):
+        raise AgentOperationError(
+            "invalid_harness_arguments",
+            "harness arguments must be nonempty NUL-free strings",
+        )
+    if harness != "muse" and harness_args:
+        raise AgentOperationError(
+            "unsupported_harness_arguments",
+            "headless harness arguments currently apply only to Muse",
+        )
     bypass_permissions = _configured_codex_bypass_permissions()
     backend = selected_backend(backend)
     mode = selected_mode(harness, mode, backend=backend)
@@ -2278,7 +2300,7 @@ def bring_up_agent(
             tmux_target=f"{TMUX_SESSION}:{valid_name}",
             cwd=str(root),
             model=model,
-            session_id=None,
+            session_id=str(uuid.uuid4()) if harness == "muse" and mode == HEADLESS_MODE else None,
             status="starting",
             runner_pid=None,
             runner_started_at=None,
@@ -2287,6 +2309,7 @@ def bring_up_agent(
             last_turn_at=None,
             mode=mode,
             codex_bypass_permissions=bypass_permissions,
+            harness_args=tuple(harness_args),
         )
 
     ensure_agent_dirs(valid_name)
@@ -2685,7 +2708,7 @@ def reset_agent_context(name: str) -> ResetResult:
                 f"agent {valid_name!r} has an active or queued turn; reset it at an idle task boundary",
             )
         previous_session_id = rec.session_id
-        rec.session_id = None
+        rec.session_id = str(uuid.uuid4()) if rec.harness == "muse" else None
         transcript = transcript_path(valid_name)
         transcript.parent.mkdir(parents=True, exist_ok=True)
         with transcript.open("a") as fh:

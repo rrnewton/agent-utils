@@ -3,12 +3,16 @@
 Use one named-session interface to delegate work to persistent coding agents
 while keeping their terminals available for direct inspection.
 
-1. Install Herdr and an authenticated Codex or Claude harness. Start a Herdr
+1. Install Herdr and an authenticated Codex, Claude, or Muse harness. Start a Herdr
    workspace for the project. Check this installation's adapters:
 
    ```sh
    agentctl capabilities
+   agentctl skill install
    ```
+
+   Muse skills are installed through Muse's native user-scope skill manager;
+   Codex and Claude receive the same bundled file in their skill roots.
 
 2. Start a worker in your project. Choose an accessible model with `--model` if
    the harness default is unsuitable:
@@ -18,6 +22,15 @@ while keeping their terminals available for direct inspection.
      --brief 'Review the current changes and report concrete problems'
    agentctl list
    agentctl status reviewer
+   ```
+
+   A project can keep owner-specific launch choices in the private, ignored
+   `.agentctl/profiles.json` file. Inspect safe profile metadata, then select
+   one without restating its model, environment, or permission arguments:
+
+   ```sh
+   agentctl profiles --cwd .
+   agentctl start reviewer --cwd . --profile preferred-reviewer
    ```
 
    To keep an agent that is already running in Herdr, adopt its exact live

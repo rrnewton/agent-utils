@@ -310,11 +310,13 @@ def _package_links() -> tuple[PackageLink, ...]:
             PackageLink("py/agentctl/LICENSE", "LICENSE"),
             PackageLink("py/agentctl/AGENT_USER_GUIDE.md", "py/agentctl/USER_GUIDE.md"),
             PackageLink("py/agentctl/FOREIGN_USER_GUIDE.md", "py/agentctl/USER_GUIDE.md"),
+            PackageLink("py/agentctl/AGENTCTL_SKILL.md", "skills/agentctl/SKILL.md"),
             PackageLink("rs/agentctl/LICENSE", "LICENSE"),
             PackageLink("rs/agentctl/README.md", "py/agentctl/README.md"),
             PackageLink("rs/agentctl/src/embedded_userguide.md", "py/agentctl/USER_GUIDE.md"),
             PackageLink("rs/agentctl/src/embedded_agent_userguide.md", "py/agentctl/USER_GUIDE.md"),
             PackageLink("rs/agentctl/src/embedded_quickstart.md", "py/agentctl/QUICKSTART.md"),
+            PackageLink("rs/agentctl/src/embedded_agentctl_skill.md", "skills/agentctl/SKILL.md"),
             PackageLink(
                 "rs/herdr-run/src/config_template.yaml",
                 "common/docs/herdr-run/CONFIG_TEMPLATE.yaml",

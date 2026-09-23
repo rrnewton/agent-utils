@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Ryan Newton" }]
-keywords = ["agents", "terminal", "codex", "claude", "chat"]
+keywords = ["agents", "terminal", "codex", "claude", "muse", "chat"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Operating System :: POSIX :: Linux",
@@ -37,4 +37,4 @@ package-dir = { agentctl = "." }
 include-package-data = false
 
 [tool.setuptools.package-data]
-agentctl = ["py.typed", "README.md", "USER_GUIDE.md", "QUICKSTART.md", "AGENT_USER_GUIDE.md", "FOREIGN_USER_GUIDE.md", "CHAT_USER_GUIDE.md"]
+agentctl = ["py.typed", "README.md", "USER_GUIDE.md", "QUICKSTART.md", "AGENT_USER_GUIDE.md", "FOREIGN_USER_GUIDE.md", "CHAT_USER_GUIDE.md", "AGENTCTL_SKILL.md"]

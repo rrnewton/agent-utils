@@ -16,6 +16,7 @@ import pytest
 from agentctl import cli, mcp
 from agentctl.client import HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError
+from agentctl.profiles import validate_muse_headless_arguments
 from agentctl.sessions import Sessions
 from agentctl.subagents import AgentRecord
 from .test_herdr_subagents import FakeManagedClient
@@ -146,6 +147,84 @@ def test_headless_start_rejects_interactive_tab_environment(
     assert fake.environments == []
     assert calls == []
     assert not (tmp_path / "registry").exists()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("--session-id=foreign",),
+        ("--json",),
+        ("--prompt-file=/tmp/prompt",),
+        ("resume",),
+        ("--",),
+        ("--api-key-stdin",),
+        ("--provider", "meta"),
+    ],
+)
+def test_headless_muse_reserves_session_prompt_and_precedence_options(
+    arguments: tuple[str, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, calls = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError):
+        sessions.start_session(
+            "worker", cwd=str(tmp_path), mode="headless", harness="muse",
+            harness_args=arguments,
+        )
+    assert fake.environments == []
+    assert calls == []
+    assert not (tmp_path / "registry").exists()
+
+
+def test_headless_muse_accepts_compiled_effort_and_repeatable_literal_options() -> None:
+    validate_muse_headless_arguments([
+        "--reasoning-effort", "ultra", "--image=first.png", "--image=second.png",
+    ])
+
+
+def test_cli_headless_muse_profile_reaches_worker_with_exact_structured_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    subprocess.run(["/usr/bin/git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = tmp_path / ".agentctl"
+    directory.mkdir(mode=0o700)
+    config = directory / "profiles.json"
+    config.write_text(json.dumps({
+        "schema": "agentctl-profiles/v1",
+        "profiles": {
+            "watermelon-exec": {
+                "harness": "muse",
+                "mode": "headless",
+                "model": "kiki_gb300_mxfp8_6p2_840_nwr",
+                "reasoning_effort": "ultra",
+                "argv": ["--image=first.png", "--image=second.png"],
+                "env": {},
+            },
+        },
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    captured: dict[str, object] = {}
+
+    def start_session(
+        _sessions: Sessions, name: str, **options: object,
+    ) -> dict[str, object]:
+        captured.update(options)
+        return {"name": name}
+
+    monkeypatch.setattr(Sessions, "start_session", start_session)
+    assert cli.main([
+        "start", "worker", "--cwd", str(tmp_path),
+        "--profile", "watermelon-exec", "--brief", "return PROFILE_OK",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out) == {"name": "worker"}
+    assert captured["mode"] == "headless"
+    assert captured["harness"] == "muse"
+    assert captured["model"] == "kiki_gb300_mxfp8_6p2_840_nwr"
+    assert captured["harness_args"] == [
+        "--reasoning-effort", "ultra", "--image=first.png", "--image=second.png",
+    ]
+    assert captured["environment"] == []
+    assert captured["brief"] == "return PROFILE_OK"
 
 
 def test_mcp_routes_into_the_cli_registry_and_honors_its_pause(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

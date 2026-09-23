@@ -168,6 +168,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("py/", frozenset({WORKSPACE, CROSS, PACKAGES})),
     ("cross/", frozenset({CROSS})),
     ("common/docs/", frozenset({DOCS, PACKAGES})),
+    ("skills/agentctl/", frozenset({DOCS, PACKAGES})),
     ("examples/", frozenset({CROSS})),
     # The log fetcher and its shell wrapper. Type-checked by `make check` (mypy walks the repo)
     # and covered by `py/tests/test_agent_log_archive_fetcher.py`, so it owes the workspace
@@ -287,6 +288,7 @@ def self_test() -> int:
     expect(["py/dagrun/sizing.py"], {WORKSPACE, CROSS, PACKAGES}, "python source needs the full chain")
     expect(["cross/differential.py"], {CROSS}, "the differential harness needs only itself")
     expect(["common/docs/herdr-run/README.template.md"], {DOCS, PACKAGES}, "embedded docs ship inside packages")
+    expect(["skills/agentctl/SKILL.md"], {DOCS, PACKAGES}, "the bundled agentctl skill ships inside packages")
     expect(["AGENTS.md"], set(), "the agent guide is embedded nowhere")
     expect(["ai_docs/note.md", "reviews/x.md"], set(), "prose selects nothing")
     expect(["scripts/embed_userguides.py"], {DOCS, PACKAGES}, "longest prefix must beat the scripts catch-all")

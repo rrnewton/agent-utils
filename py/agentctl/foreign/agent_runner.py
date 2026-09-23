@@ -56,6 +56,16 @@ _AGY_AUTH_RE = re.compile(
     r"error getting token source|not logged into Antigravity",
     re.IGNORECASE,
 )
+_MUSE_MAX_EVENTS = 100_000
+_MUSE_MAX_EVENT_BYTES = 1_048_576
+_MUSE_MAX_TRANSCRIPT_BYTES = 64 * 1_048_576
+_MUSE_MAX_ANSWER_BYTES = 4 * 1_048_576
+_MUSE_RUNNER_OWNED_OPTIONS = frozenset(
+    ("--", "--api-key-stdin", "--json", "--model", "--prompt-file", "--session-id")
+)
+_MUSE_WORKSPACE_RECORD_KEYS = frozenset(
+    ("command_id", "commit", "dirty", "reference", "vcs", "workspace_root")
+)
 
 
 @dataclass(frozen=True)
@@ -115,7 +125,8 @@ def _spawn_harness(name: str, argv: list[str], cwd: str, *, stdin: bool = False)
     with lib._harness_lock(name):
         if _STOP_REQUESTED or lib.stop_path(name).exists():
             raise InterruptedError("worker was stopped before harness launch")
-        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if stdin else None,
+        proc = subprocess.Popen(argv, cwd=cwd,
+                                stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True)
         try:
@@ -252,6 +263,74 @@ def _build_agy_argv(rec: lib.AgentRecord, msg: lib.Message, log_path: Path) -> l
         msg.text,
     ]
     return argv
+
+
+def _build_muse_argv(rec: lib.AgentRecord, msg: lib.Message) -> list[str]:
+    """Build one exact Muse exec turn around the caller-owned session id.
+
+    Muse 1.3 parses options before ``exec`` as TUI options.  Put the subcommand
+    immediately after the executable on every turn; ``--session-id`` is the
+    exec protocol's continuation identity, not the separate TUI ``resume``
+    subcommand.
+    """
+    if not rec.session_id:
+        raise ValueError("Muse worker has no caller-owned session id")
+    for item in rec.harness_args:
+        key = item.split("=", 1)[0]
+        if key in _MUSE_RUNNER_OWNED_OPTIONS or item in ("exec", "resume"):
+            raise ValueError(f"Muse harness arguments cannot override runner-owned argument {key!r}")
+    argv = [lib.MUSE_BIN, "exec", *rec.harness_args]
+    model = msg.model or rec.model
+    if model:
+        argv.extend(("--model", model))
+    argv.extend(("--json", "--session-id", rec.session_id, "--", msg.text))
+    return argv
+
+
+def _is_muse_workspace_epilogue(
+    event: dict[str, object], payload: dict[str, object], command_id: str | None
+) -> bool:
+    """Recognize Muse's sole observed post-terminal bookkeeping event.
+
+    This event is accepted only once by the caller and never changes the
+    terminal outcome or answer.  Keep its version-1 shape and command binding
+    strict so a second output cannot masquerade as harmless bookkeeping.
+    """
+    if command_id is None:
+        return False
+    if (
+        event.get("payload_type") != "session.workspace_branch.observed"
+        or event.get("payload_schema_version") != 1
+        or event.get("record_type") != "event"
+        or event.get("durability") != "durable"
+        or event.get("causation_id") != command_id
+        or set(payload) != {"command_id", "kind", "record"}
+        or payload.get("command_id") != command_id
+        or payload.get("kind") != "workspace_branch_observed"
+    ):
+        return False
+    record = payload.get("record")
+    if not isinstance(record, dict):
+        return False
+    record_keys = set(record)
+    if (
+        not {"command_id", "commit", "reference", "vcs", "workspace_root"}
+        <= record_keys
+        or not record_keys <= _MUSE_WORKSPACE_RECORD_KEYS
+        or record.get("command_id") != command_id
+        or not isinstance(record.get("commit"), str)
+        or record.get("vcs") != "git"
+        or not isinstance(record.get("workspace_root"), str)
+        or ("dirty" in record and not isinstance(record["dirty"], bool))
+    ):
+        return False
+    reference = record.get("reference")
+    return (
+        isinstance(reference, dict)
+        and set(reference) == {"kind", "name"}
+        and reference.get("kind") == "branch"
+        and isinstance(reference.get("name"), str)
+    )
 
 
 def _capture_agy_session_id(log_path: Path) -> Optional[str]:
@@ -504,6 +583,186 @@ def _run_agy_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
     _set_status(name, outcome.status, mark_turn=True)
 
 
+def _run_muse_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
+    """Run and validate one bounded Muse JSONL turn with a stable session id."""
+    argv = _build_muse_argv(rec, msg)
+    requested_model = msg.model or rec.model or "<muse-default>"
+    _set_status(name, "busy")
+    lib.write_event("turn_started", name, seq=msg.seq, preview=lib.last_message_preview(name))
+    _append(
+        name,
+        f"===TURN {msg.seq} START {lib.now_iso()} mode=exec harness=muse "
+        f"model={requested_model} session={rec.session_id}===\n>>> {msg.text}",
+    )
+    proc = _spawn_harness(name, argv, rec.cwd)
+    assert proc.stdout is not None
+    stderr_chunks: list[str] = []
+
+    def drain_stderr() -> None:
+        assert proc.stderr is not None
+        try:
+            while block := proc.stderr.read(4096):
+                stderr_chunks.append(block)
+                if len(stderr_chunks) > 16:
+                    del stderr_chunks[0]
+        except UnicodeError as exc:
+            # A malformed diagnostic must not produce an unhandled exception in
+            # the background reader.  Preserve a bounded, printable indication.
+            stderr_chunks.append(f"[Muse stderr Unicode decode error: {exc}]")
+
+    event_count = 0
+    transcript_bytes = 0
+    previous_sequence: int | None = None
+    accepted_command_id: str | None = None
+    terminal: str | None = None
+    saw_workspace_epilogue = False
+    answer = ""
+    protocol_error: str | None = None
+    with _owned_harness(name, proc) as timed_out:
+        stderr_reader = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_reader.start()
+        with lib.transcript_path(name).open("a") as transcript:
+            while True:
+                try:
+                    line = proc.stdout.readline(_MUSE_MAX_EVENT_BYTES + 1)
+                except UnicodeError as exc:
+                    protocol_error = f"Muse JSONL Unicode decode failure: {exc}"
+                    break
+                if not line:
+                    break
+                try:
+                    encoded = line.encode("utf-8")
+                except UnicodeError as exc:
+                    protocol_error = f"Muse JSONL contains invalid Unicode: {exc}"
+                    break
+                if len(encoded) > _MUSE_MAX_EVENT_BYTES:
+                    protocol_error = f"Muse JSONL event exceeds {_MUSE_MAX_EVENT_BYTES} bytes"
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    break
+                transcript_bytes += len(encoded)
+                if transcript_bytes > _MUSE_MAX_TRANSCRIPT_BYTES:
+                    protocol_error = (
+                        f"Muse turn transcript exceeds {_MUSE_MAX_TRANSCRIPT_BYTES} bytes"
+                    )
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    break
+                event_count += 1
+                if event_count > _MUSE_MAX_EVENTS:
+                    protocol_error = f"Muse turn exceeds {_MUSE_MAX_EVENTS} events"
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    break
+                transcript.write(line)
+                transcript.flush()
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, RecursionError) as exc:
+                    protocol_error = f"Muse emitted invalid JSONL: {exc}"
+                    break
+                if not isinstance(event, dict) or event.get("schema_version") != 1:
+                    protocol_error = "Muse emitted an unsupported event envelope"
+                    break
+                stream = event.get("stream")
+                if not isinstance(stream, dict) or stream.get("kind") != "session" or stream.get("id") != rec.session_id:
+                    protocol_error = "Muse event session identity changed"
+                    break
+                sequence = event.get("sequence")
+                if (not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0
+                        or (previous_sequence is not None and sequence <= previous_sequence)):
+                    protocol_error = "Muse event sequence is invalid or non-monotonic"
+                    break
+                previous_sequence = sequence
+                payload = event.get("payload")
+                payload = payload if isinstance(payload, dict) else {}
+                if terminal is not None:
+                    if (
+                        not saw_workspace_epilogue
+                        and _is_muse_workspace_epilogue(
+                            event, payload, accepted_command_id
+                        )
+                    ):
+                        saw_workspace_epilogue = True
+                        continue
+                    protocol_error = "Muse emitted an unexpected event after its terminal outcome"
+                    break
+                if event.get("payload_type") == "runtime.command.accepted":
+                    command_id = payload.get("command_id")
+                    if (accepted_command_id is not None
+                            or payload.get("command_kind") != "turn.submit"
+                            or not isinstance(command_id, str) or not command_id):
+                        protocol_error = "Muse emitted an invalid or duplicate command acceptance"
+                        break
+                    accepted_command_id = command_id
+                if event.get("payload_type") == "run.terminal.completed":
+                    if (accepted_command_id is None
+                            or payload.get("command_id") != accepted_command_id):
+                        protocol_error = "Muse terminal outcome does not match the accepted command"
+                        break
+                    terminal_value = payload.get("terminal")
+                    text_value = payload.get("text")
+                    if terminal_value not in ("completed", "failed", "cancelled") or not isinstance(text_value, str):
+                        protocol_error = "Muse terminal outcome is malformed"
+                        break
+                    try:
+                        answer_bytes = len(text_value.encode("utf-8"))
+                    except UnicodeError as exc:
+                        protocol_error = f"Muse final answer contains invalid Unicode: {exc}"
+                        break
+                    if answer_bytes > _MUSE_MAX_ANSWER_BYTES:
+                        protocol_error = f"Muse final answer exceeds {_MUSE_MAX_ANSWER_BYTES} bytes"
+                        break
+                    terminal, answer = str(terminal_value), text_value
+        if protocol_error is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        rc = proc.wait()
+        stderr_reader.join()
+    stderr_tail = "".join(stderr_chunks).strip()[-8000:]
+    if timed_out.is_set():
+        outcome = "timeout"
+    elif protocol_error is not None:
+        outcome = "protocol_error"
+    elif rc != 0:
+        outcome = str(rc)
+    elif accepted_command_id is None or terminal is None:
+        protocol_error = "Muse exited without a complete accepted terminal outcome"
+        outcome = "protocol_error"
+    elif terminal != "completed":
+        outcome = terminal
+    else:
+        outcome = "0"
+    if outcome == "protocol_error":
+        detail = protocol_error or "Muse emitted an invalid event stream"
+        if answer:
+            answer = f"[MUSE ERROR] {detail}\n[MUSE UNVERIFIED OUTPUT]\n{answer}"
+        else:
+            answer = f"[MUSE ERROR] {detail}"
+    elif not answer:
+        answer = f"[MUSE ERROR] {protocol_error or stderr_tail or f'process exited {rc}'}"
+    lib.last_message_path(name).write_text(answer)
+    for line in answer.strip().splitlines()[:12]:
+        print(f"| {line[:200]}", flush=True)
+    if len(answer.strip().splitlines()) > 12:
+        print("| ... (more lines in transcript)", flush=True)
+    _append(name, f"===TURN {msg.seq} OUTPUT===\n{answer}")
+    if stderr_tail:
+        _append(name, f"===TURN {msg.seq} STDERR (tail)===\n{stderr_tail}")
+    _append(name, f"===TURN-DONE {msg.seq} rc={outcome} {lib.now_iso()}===")
+    lib.write_event("TURN-DONE", name, seq=msg.seq, rc=outcome,
+                    preview=lib.last_message_preview(name))
+    _set_status(name, "idle" if outcome == "0" else "error", mark_turn=True)
+
+
 def _run_turn(name: str, msg: lib.Message) -> None:
     with lib.registry_lock() as agents:
         rec = agents.get(name)
@@ -513,6 +772,8 @@ def _run_turn(name: str, msg: lib.Message) -> None:
         _run_codex_turn(name, rec, msg)
     elif rec.harness == "agy":
         _run_agy_turn(name, rec, msg)
+    elif rec.harness == "muse":
+        _run_muse_turn(name, rec, msg)
     else:
         _append(
             name,

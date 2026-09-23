@@ -177,7 +177,7 @@ def test_embed_check_rejects_regular_copy_and_wrong_link_target(
 def test_package_docs_and_licenses_are_authoritative_links() -> None:
     docs = _load_script("embed_userguides")
 
-    assert len(docs.PACKAGE_LINKS) == 49
+    assert len(docs.PACKAGE_LINKS) == 51
     assert {
         "rs/chat-subscription/README.md",
         "rs/chat-subscription/LICENSE",
@@ -185,8 +185,10 @@ def test_package_docs_and_licenses_are_authoritative_links() -> None:
         "rs/chat-subscription-plugin/LICENSE",
         "py/agentctl/AGENT_USER_GUIDE.md",
         "py/agentctl/FOREIGN_USER_GUIDE.md",
+        "py/agentctl/AGENTCTL_SKILL.md",
         "rs/agentctl/src/embedded_userguide.md",
         "rs/agentctl/src/embedded_quickstart.md",
+        "rs/agentctl/src/embedded_agentctl_skill.md",
     } <= {link.destination for link in docs.PACKAGE_LINKS}
     assert not {
         "py/herdr_run/AGENT_USER_GUIDE.md",

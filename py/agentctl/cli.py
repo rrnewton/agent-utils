@@ -17,7 +17,12 @@ from agentctl import __version__
 from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
+from agentctl.profiles import (
+    load_profiles, profile_arguments, reasoning_arguments,
+    validate_raw_harness_arguments,
+)
 from agentctl.sessions import Sessions
+from agentctl.skill_install import install_skill
 from agentctl.subagents import environment_entries
 
 
@@ -82,13 +87,17 @@ def parser() -> argparse.ArgumentParser:
     start = command("start", "Start a named interactive agent or a resumable headless worker.",
         "agentctl start reviewer --harness codex --cwd . --brief 'Review this change'", named=True)
     start.add_argument("--cwd", default=".", metavar="DIR", help="worker working directory (default: current directory)")
-    start.add_argument("--mode", choices=("interactive", "headless"), default="interactive",
+    start.add_argument("--profile", metavar="NAME",
+        help="owner-configured profile from CWD/.agentctl/profiles.json; conflicts with harness launch settings")
+    start.add_argument("--mode", choices=("interactive", "headless"), default=None,
         help="interactive keeps a native TUI; headless runs resumable structured turns (default: interactive)")
     start.add_argument("--backend", choices=("herdr", "tmux"), default="herdr",
         help="terminal host; interactive requires Herdr (default: herdr)")
-    start.add_argument("--harness", default="codex", metavar="KIND",
-        help="native harness: codex/claude interactive, codex/agy headless (default: codex)")
+    start.add_argument("--harness", default=None, metavar="KIND",
+        help="native harness: codex/claude/muse interactive, codex/agy/muse headless (default: codex)")
     start.add_argument("--model", metavar="MODEL", help="native model name; omission preserves the harness default")
+    start.add_argument("--reasoning-effort", metavar="EFFORT",
+        help="structured harness effort; use the profile or this option, never a duplicate raw argument")
     start.add_argument("--resume", metavar="SESSION", help="resume an explicit native conversation (interactive only)")
     start.add_argument("--harness-arg", action="append", default=[], metavar="ARG",
         help="literal interactive harness argument; repeat and use = for flags")
@@ -162,6 +171,20 @@ def parser() -> argparse.ArgumentParser:
     migrate.add_argument("--mode", choices=("interactive", "headless"), help="destination execution mode; default: retain current mode")
     command("quickstart", "Print a short working setup, available offline.", "agentctl quickstart")
     command("userguide", "Print the complete installed operator guide.", "agentctl userguide")
+    profiles = command("profiles", "List safe metadata for ignored private launch profiles.",
+        "agentctl profiles --cwd /work/project")
+    profiles.add_argument("--cwd", default=".", metavar="DIR",
+        help="project directory containing .agentctl/profiles.json (default: current directory)")
+    skill = commands.add_parser("skill", help="Install the bundled agentctl harness skill.",
+        description="Install the bundled agentctl harness skill.", allow_abbrev=False)
+    _common(skill, inherited=True)
+    skill_commands = skill.add_subparsers(dest="skill_command", required=True, metavar="COMMAND")
+    install = skill_commands.add_parser("install", help="Install for Codex, Claude, and Muse.", allow_abbrev=False)
+    _common(install, inherited=True)
+    install.add_argument("--harness", action="append", choices=("codex", "claude", "muse"), default=[],
+        help="target harness; repeat; omission installs all supported harnesses")
+    install.add_argument("--force", action="store_true",
+        help="replace divergent regular SKILL.md content; symlinks are always refused")
     command("chat", "Connect Google Chat to one coordinator; use agentctl chat --help.", "agentctl chat --help")
     command("mcp", "Serve the same session operations over MCP stdio.", "agentctl mcp")
     return root
@@ -216,14 +239,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         root.print_help()
         return 0
     if args.command == "capabilities":
-        print(json.dumps({"interactive": {"backends": ["herdr"], "harnesses": ["codex", "claude"]},
-            "headless": {"backends": ["herdr", "tmux"], "harnesses": ["codex", "agy"]},
+        print(json.dumps({"interactive": {"backends": ["herdr"], "harnesses": ["codex", "claude", "muse"]},
+            "headless": {"backends": ["herdr", "tmux"], "harnesses": ["codex", "agy", "muse"]},
             "services": ["chat", "mcp"], "registry": args.registry}, indent=2, sort_keys=True))
         return 0
     if args.command == "mcp":
         from agentctl.mcp import _serve
         return _serve(args.registry, args.herdr_bin)
     try:
+        if args.command == "profiles":
+            path, profiles = load_profiles(args.cwd, absent_ok=True)
+            print(json.dumps({"path": str(path), "profiles": [item.public() for item in profiles.values()]},
+                indent=2, sort_keys=True))
+            return 0
+        if args.command == "skill":
+            if args.herdr_bin != "herdr" or args.registry != ".agentctl":
+                raise ValueError("--registry and --herdr-bin do not apply to skill install")
+            print(json.dumps(install_skill(args.harness, force=args.force), indent=2, sort_keys=True))
+            return 0
         for key in ("ready_timeout", "working_timeout", "startup_timeout", "timeout"):
             value = getattr(args, key, None)
             if value is not None and (not math.isfinite(value) or value < 0 or value > 31_536_000
@@ -238,10 +271,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         result: object
         name = getattr(args, "name", "")
         if args.command == "start":
+            profile = None
+            if args.profile is not None:
+                overlaps = []
+                for option, value in (
+                    ("--mode", args.mode), ("--harness", args.harness), ("--model", args.model),
+                    ("--reasoning-effort", args.reasoning_effort),
+                    ("--resume", args.resume),
+                ):
+                    if value is not None:
+                        overlaps.append(option)
+                if args.harness_arg:
+                    overlaps.append("--harness-arg")
+                if args.env:
+                    overlaps.append("--env")
+                if overlaps:
+                    raise ValueError(f"--profile conflicts with explicit launch settings: {', '.join(overlaps)}")
+                _path, available = load_profiles(args.cwd)
+                try:
+                    profile = available[args.profile]
+                except KeyError as exc:
+                    raise ValueError(f"unknown profile {args.profile!r}; run agentctl profiles --cwd {args.cwd}") from exc
+            harness = profile.harness if profile else (args.harness or "codex")
+            mode = profile.mode if profile else (args.mode or "interactive")
+            model = profile.model if profile else args.model
+            if profile is None:
+                validate_raw_harness_arguments(
+                    harness, args.harness_arg, label="launch",
+                    structured_model=args.model is not None,
+                    structured_effort=args.reasoning_effort is not None,
+                    structured_resume=args.resume is not None,
+                )
+            harness_args = list(profile_arguments(profile) if profile else (
+                *reasoning_arguments(harness, args.reasoning_effort), *args.harness_arg
+            ))
+            environment = list(profile.environment) if profile else args.env
             brief = Path(args.file).read_text(encoding="utf-8") if args.file else args.brief
-            result = sessions.start_session(name, cwd=args.cwd, mode=args.mode, backend=args.backend,
-                harness=args.harness, model=args.model, brief=brief, resume=args.resume,
-                harness_args=args.harness_arg, environment=args.env,
+            result = sessions.start_session(name, cwd=args.cwd, mode=mode, backend=args.backend,
+                harness=harness, model=model, brief=brief, resume=args.resume,
+                harness_args=harness_args, environment=environment,
                 workspace_id=args.workspace_id,
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
                 working_timeout=args.working_timeout, max_attempts=args.max_attempts)

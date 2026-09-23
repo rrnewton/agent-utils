@@ -2,7 +2,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read as _, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
@@ -20,7 +20,7 @@ const MAX_CHAT_PUBLISH_BYTES: usize = 30_000;
     name = "agentctl",
     version,
     about = "Manage persistent coding agents that you can message and inspect",
-    long_about = "Manage named coding-agent sessions with durable prompt delivery and direct human access.\nThe Rust implementation controls interactive Codex/Claude sessions through Herdr and can run a durable event-driven chat bridge through installed subscription plugins.",
+    long_about = "Manage named coding-agent sessions with durable prompt delivery and direct human access.\nThe Rust implementation controls interactive Codex, Claude, and Muse sessions through Herdr and can run a durable event-driven chat bridge through installed subscription plugins.",
     after_help = "Examples:\n  agentctl quickstart\n  agentctl start reviewer --cwd .\n  agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex\n  agentctl send reviewer 'Review the current changes'\n  agentctl chat status --bridge-state ~/.local/state/agentctl/chat\n  agentctl pause reviewer\n  agentctl attach reviewer\n  agentctl resume reviewer\n  agentctl stop reviewer"
 )]
 struct Cli {
@@ -52,7 +52,12 @@ enum Commands {
     #[command(
         after_help = "Example: agentctl start reviewer --cwd . --harness codex --brief 'Review the changes'"
     )]
-    Start(Start),
+    Start(Box<Start>),
+    /// List safe metadata for ignored private launch profiles
+    #[command(after_help = "Example: agentctl profiles --cwd /work/project")]
+    Profiles(Profiles),
+    /// Install the bundled agentctl harness skill
+    Skill(Skill),
     /// Register an existing Herdr agent without taking ownership of its runtime
     #[command(
         after_help = "Example: agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"
@@ -144,18 +149,24 @@ struct Start {
     /// Working directory for the new harness
     #[arg(long, default_value = ".", value_name = "DIR")]
     cwd: PathBuf,
+    /// Owner-configured profile from CWD/.agentctl/profiles.json
+    #[arg(long)]
+    profile: Option<String>,
     /// Execution mode; headless workers require an installation with the worker extension
-    #[arg(long, default_value = "interactive", value_parser = ["interactive", "headless"])]
-    mode: String,
+    #[arg(long, value_parser = ["interactive", "headless"])]
+    mode: Option<String>,
     /// Terminal host; interactive Rust agents require Herdr
     #[arg(long, default_value = "herdr", value_parser = ["herdr", "tmux"])]
     backend: String,
-    /// Herdr harness kind; Codex and Claude have model/resume presets
-    #[arg(long, default_value = "codex")]
-    harness: String,
+    /// Herdr harness kind; Codex, Claude, and Muse have model presets
+    #[arg(long)]
+    harness: Option<String>,
     /// Model identifier passed unchanged to the Codex or Claude harness
     #[arg(long)]
     model: Option<String>,
+    /// Structured harness reasoning effort
+    #[arg(long)]
+    reasoning_effort: Option<String>,
     /// Existing native conversation ID to resume instead of starting a new one
     #[arg(long, value_name = "SESSION")]
     resume: Option<String>,
@@ -179,6 +190,35 @@ struct Start {
     startup_timeout: f64,
     #[command(flatten)]
     delivery: Delivery,
+}
+
+#[derive(Args)]
+struct Profiles {
+    /// Project directory containing .agentctl/profiles.json
+    #[arg(long, default_value = ".", value_name = "DIR")]
+    cwd: PathBuf,
+}
+
+#[derive(Args)]
+struct Skill {
+    #[command(subcommand)]
+    command: SkillCommand,
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Install for Codex, Claude, and Muse
+    Install(SkillInstall),
+}
+
+#[derive(Args)]
+struct SkillInstall {
+    /// Target harness; repeat; omission installs all supported harnesses
+    #[arg(long, value_parser = ["codex", "claude", "muse"])]
+    harness: Vec<String>,
+    /// Replace divergent regular content; symlinks are always refused
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -615,6 +655,29 @@ fn run(args: Cli) -> Result<i32, Failure> {
         Commands::Chat(value) => {
             return run_chat(args.registry, args.herdr_bin, value);
         }
+        Commands::Profiles(value) => {
+            let (path, profiles) = crate::profiles::load_profiles(&value.cwd, true)?;
+            write_json(&json!({
+                "path": path,
+                "profiles": profiles.values().map(crate::profiles::LaunchProfile::public).collect::<Vec<_>>()
+            }))
+            .map_err(Failure::Output)?;
+            return Ok(0);
+        }
+        Commands::Skill(value) => {
+            if args.registry != Path::new(".agentctl") || args.herdr_bin != Path::new("herdr") {
+                return Err(Failure::Usage(
+                    "--registry and --herdr-bin do not apply to skill install".to_owned(),
+                ));
+            }
+            let SkillCommand::Install(install) = value.command;
+            write_json(&crate::skill_install::install(
+                &install.harness,
+                install.force,
+            )?)
+            .map_err(Failure::Output)?;
+            return Ok(0);
+        }
         _ => {}
     }
     let client =
@@ -622,7 +685,74 @@ fn run(args: Cli) -> Result<i32, Failure> {
     let manager = ManagedAgents::new(&client, &args.registry)?;
     let mut result = match command {
         Commands::Start(value) => {
-            if value.mode != "interactive" || value.backend != "herdr" {
+            let (harness, mode, model, harness_args, environment) =
+                if let Some(profile_name) = value.profile.as_deref() {
+                    let mut overlaps = Vec::new();
+                    if value.mode.is_some() {
+                        overlaps.push("--mode");
+                    }
+                    if value.harness.is_some() {
+                        overlaps.push("--harness");
+                    }
+                    if value.model.is_some() {
+                        overlaps.push("--model");
+                    }
+                    if value.reasoning_effort.is_some() {
+                        overlaps.push("--reasoning-effort");
+                    }
+                    if value.resume.is_some() {
+                        overlaps.push("--resume");
+                    }
+                    if !value.harness_args.is_empty() {
+                        overlaps.push("--harness-arg");
+                    }
+                    if !value.environment.is_empty() {
+                        overlaps.push("--env");
+                    }
+                    if !overlaps.is_empty() {
+                        return Err(Failure::Usage(format!(
+                            "--profile conflicts with explicit launch settings: {}",
+                            overlaps.join(", ")
+                        )));
+                    }
+                    let (_, profiles) = crate::profiles::load_profiles(&value.cwd, false)?;
+                    let profile = profiles.get(profile_name).ok_or_else(|| {
+                        Failure::Usage(format!(
+                            "unknown profile {profile_name:?}; run agentctl profiles --cwd {}",
+                            value.cwd.display()
+                        ))
+                    })?;
+                    (
+                        profile.harness.clone(),
+                        profile.mode.clone(),
+                        profile.model.clone(),
+                        crate::profiles::profile_arguments(profile)?,
+                        profile.environment.clone(),
+                    )
+                } else {
+                    let harness = value.harness.unwrap_or_else(|| "codex".to_owned());
+                    crate::profiles::validate_raw_harness_arguments(
+                        "launch",
+                        &harness,
+                        &value.harness_args,
+                        value.model.is_some(),
+                        value.reasoning_effort.is_some(),
+                        value.resume.is_some(),
+                    )?;
+                    let mut arguments = crate::profiles::reasoning_arguments(
+                        &harness,
+                        value.reasoning_effort.as_deref(),
+                    )?;
+                    arguments.extend(value.harness_args);
+                    (
+                        harness,
+                        value.mode.unwrap_or_else(|| "interactive".to_owned()),
+                        value.model,
+                        arguments,
+                        value.environment,
+                    )
+                };
+            if mode != "interactive" || value.backend != "herdr" {
                 return Err(Failure::Usage("Rust agentctl supports interactive Herdr sessions; use agentctl with the worker extension for headless workers".to_owned()));
             }
             let brief = match value.file {
@@ -636,11 +766,11 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 &value.cwd,
                 StartOptions {
                     workspace_id: value.workspace_id,
-                    harness: value.harness,
-                    model: value.model,
+                    harness,
+                    model,
                     resume: value.resume,
-                    harness_args: value.harness_args,
-                    environment: value.environment,
+                    harness_args,
+                    environment,
                     brief,
                     startup_timeout: Duration::from_secs_f64(value.startup_timeout),
                     delivery: value.delivery.options(),
@@ -720,7 +850,12 @@ fn run(args: Cli) -> Result<i32, Failure> {
         Commands::Attach(value) => manager.attach(&value.name)?,
         Commands::Pause(value) => manager.pause(&value.name, true)?,
         Commands::Resume(value) => manager.pause(&value.name, false)?,
-        Commands::Capabilities | Commands::Quickstart | Commands::Userguide | Commands::Chat(_) => {
+        Commands::Capabilities
+        | Commands::Quickstart
+        | Commands::Userguide
+        | Commands::Chat(_)
+        | Commands::Profiles(_)
+        | Commands::Skill(_) => {
             unreachable!()
         }
     };
@@ -817,7 +952,7 @@ fn capabilities_document(
     json!({
         "interactive": {
             "backends": ["herdr"],
-            "harnesses": ["codex", "claude"]
+            "harnesses": ["codex", "claude", "muse"]
         },
         "headless": null,
         "services": [{
@@ -867,28 +1002,29 @@ fn add_capabilities(value: &mut serde_json::Value) {
             add_capabilities(value);
         }
     } else if value.get("adapter").is_some() && value.get("name").is_some() {
-        value["capabilities"] =
-            if matches!(value["adapter"].as_str(), Some("herdr" | "herdr-foreign"))
-                && value["mode"] == "interactive"
-                && value["backend"] == "herdr"
-            {
-                json!([
-                    "send",
-                    "status",
-                    "read",
-                    "wait",
-                    "stop",
-                    "attach",
-                    "pause",
-                    "resume",
-                    "terminal-snapshot",
-                    "drain",
-                    "goal",
-                    "bind-session"
-                ])
-            } else {
-                json!(["status"])
-            };
+        value["capabilities"] = if matches!(
+            value["adapter"].as_str(),
+            Some("herdr" | "herdr-pane" | "herdr-foreign")
+        ) && value["mode"] == "interactive"
+            && value["backend"] == "herdr"
+        {
+            json!([
+                "send",
+                "status",
+                "read",
+                "wait",
+                "stop",
+                "attach",
+                "pause",
+                "resume",
+                "terminal-snapshot",
+                "drain",
+                "goal",
+                "bind-session"
+            ])
+        } else {
+            json!(["status"])
+        };
     }
 }
 

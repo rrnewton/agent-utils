@@ -13,6 +13,8 @@ pub mod codex_goal;
 pub mod error;
 pub mod legacy_cli;
 pub mod plugins;
+pub(crate) mod profiles;
+pub(crate) mod skill_install;
 pub mod subagents;
 
 /// Reference for the canonical command and its supported adapters.
@@ -25,3 +27,5 @@ pub const AGENT_USER_GUIDE: &str = include_str!("embedded_agent_userguide.md");
 pub const CHAT_USER_GUIDE: &str = include_str!("embedded_chat_userguide.md");
 /// One-screen setup for the Rust chat subscription service.
 pub const CHAT_QUICKSTART: &str = include_str!("embedded_chat_quickstart.md");
+/// Harness skill installed by `agentctl skill install`.
+pub const AGENTCTL_SKILL: &str = include_str!("embedded_agentctl_skill.md");

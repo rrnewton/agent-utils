@@ -9,8 +9,13 @@ are advertised separately and are not treated as shared capabilities.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -27,6 +32,7 @@ def _normalize(value: object) -> object:
         return [_normalize(item) for item in value]
     if isinstance(value, dict):
         return {str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
+                          else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
                           else "<ARCHIVE>" if key == "archive"
                           # Native identity diagnostics use edition-specific quote styles.
                           else re.sub(r'"([a-z][a-z0-9-]*)"', r"'\1'", item)
@@ -64,6 +70,37 @@ def _submission_count(root: Path, text: str) -> int:
     return values.count(text) if isinstance(values, list) else 0
 
 
+def _retire_fixture_processes(case: PairCase) -> None:
+    """Stop only custom children created by this differential's private Herdr fixtures."""
+    process_ids: list[int] = []
+    for root in (case.python_root, case.rust_root):
+        state = _state(root)
+        for field in ("custom_pid", "retired_custom_pid"):
+            process_id = state.get(field)
+            if isinstance(process_id, int) and process_id not in process_ids:
+                process_ids.append(process_id)
+        subprocess.run(
+            [str(root / "fake-herdr"), "pane", "close", "w1:p1"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    deadline = time.monotonic() + 2
+    while process_ids and time.monotonic() < deadline:
+        remaining: list[int] = []
+        for process_id in process_ids:
+            try:
+                process_stat = Path(f"/proc/{process_id}/stat").read_text(encoding="utf-8")
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            close = process_stat.rfind(")")
+            if close < 0 or process_stat[close + 2:].split(maxsplit=1)[0] != "Z":
+                remaining.append(process_id)
+        process_ids = remaining
+        if process_ids:
+            time.sleep(0.01)
+    if process_ids:
+        raise AssertionError(f"fixture custom processes did not exit: {process_ids!r}")
+
+
 def _start(harness: Harness, report: Report, case: PairCase, label: str,
            *options: str) -> bool:
     outcomes = _pair(harness, report, case, label,
@@ -93,7 +130,7 @@ def _orientation(harness: Harness, report: Report) -> None:
     for edition, outcome in zip(("python", "rust"), harness.invoke(case, ("capabilities",)), strict=True):
         value = _json(outcome)
         report.require(f"primary/capabilities/{edition}", outcome.returncode == 0 and isinstance(value, dict)
-                       and value.get("interactive") == {"backends": ["herdr"], "harnesses": ["codex", "claude"]}
+                       and value.get("interactive") == {"backends": ["herdr"], "harnesses": ["codex", "claude", "muse"]}
                        and value.get("registry") == ".agentctl",
                        f"shared adapter metadata differs: {outcome!r}")
     _pair(harness, report, case, "primary/empty-list", ("list", *_COMMON))
@@ -163,7 +200,685 @@ def _lifecycle(harness: Harness, report: Report) -> None:
         report.require(f"primary/{kind}/exact-pane-retirement", all(
             _state(root).get("closed_panes") == ["w1:p1"] and not (root / "registry/worker").exists()
             and len(list((root / "registry/archive").iterdir())) == 1
-            for root in (case.python_root, case.rust_root)), "owned pane or archival contract diverged")
+                       for root in (case.python_root, case.rust_root)), "owned pane or archival contract diverged")
+
+    custom = harness.case("primary-existing-native-kind")
+    python, _ = _pair(harness, report, custom, "primary/native-kind/start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--harness", "third-party", *_COMMON,
+    ))
+    status = _json(python)
+    report.require("primary/native-kind/adapter",
+                   isinstance(status, dict) and status.get("adapter") == "herdr"
+                   and all(_state(root).get("harness") == "third-party"
+                           and _state(root).get("custom_harness") is not True
+                           for root in (custom.python_root, custom.rust_root)),
+                   f"existing Herdr-native third-party kind was rerouted: {status!r}")
+    _pair(harness, report, custom, "primary/native-kind/stop", (
+        "stop", "worker", *_COMMON,
+    ))
+
+
+def _profiles(harness: Harness, report: Report) -> None:
+    document = {
+        "schema": "agentctl-profiles/v1",
+        "profiles": {
+            "astra-ultra": {
+                "harness": "codex", "mode": "interactive", "model": "gpt-6-astra",
+                "reasoning_effort": "ultra",
+                "argv": ["--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
+                "env": {"META_CODEX_AI_GATEWAY": "azure-codex-cyber:openai"},
+            },
+            "sol": {
+                "harness": "codex", "mode": "interactive", "model": "gpt-5.6-sol",
+                "argv": ["--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
+                "env": {"META_CODEX_AI_GATEWAY": "azure-codex-cyber:openai"},
+            },
+            "watermelon": {
+                "harness": "muse", "mode": "interactive",
+                "model": "kiki_gb300_mxfp8_6p2_840_nwr", "reasoning_effort": "ultra",
+                "argv": [], "env": {},
+            },
+            "muse-literal": {
+                "harness": "muse", "mode": "interactive",
+                "argv": [
+                    "--trust-workspace",
+                    '--meta-tag=literal $(unexpanded) "quotes"',
+                    "--meta-tag=repeatable",
+                ],
+                "env": {},
+            },
+            "codex-safe-config": {
+                "harness": "codex", "mode": "interactive",
+                "argv": ["--config=features.web_search=true"], "env": {},
+            },
+        },
+    }
+    expected = {
+        "astra-ultra": ["--no-alt-screen", "--model", "gpt-6-astra", "--config",
+                         "model_reasoning_effort=ultra", "--dangerously-enable-internet-mode",
+                         "--dangerously-bypass-approvals-and-sandbox"],
+        "sol": ["--no-alt-screen", "--model", "gpt-5.6-sol",
+                "--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
+        "watermelon": ["--model", "kiki_gb300_mxfp8_6p2_840_nwr", "--reasoning-effort", "ultra"],
+        "muse-literal": ["--trust-workspace", '--meta-tag=literal $(unexpanded) "quotes"',
+                         "--meta-tag=repeatable"],
+        "codex-safe-config": ["--no-alt-screen", "--config=features.web_search=true"],
+    }
+    for profile in ("astra-ultra", "sol", "watermelon", "muse-literal", "codex-safe-config"):
+        case = harness.case(f"primary-profile-{profile}")
+        for root in (case.python_root, case.rust_root):
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+            directory = root / ".agentctl"
+            directory.mkdir(mode=0o700)
+            config = directory / "profiles.json"
+            config.write_text(json.dumps(document), encoding="utf-8")
+            config.chmod(0o600)
+        _pair(harness, report, case, f"primary/profile/{profile}/list",
+              ("profiles", "--cwd", "<ROOT>"))
+        python, rust = _pair(harness, report, case, f"primary/profile/{profile}/start", (
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "--profile", profile, *_COMMON,
+        ))
+        status = _json(python)
+        report.require(f"primary/profile/{profile}/argv", all(
+            _state(root).get("launch_arguments") == expected[profile]
+            for root in (case.python_root, case.rust_root)
+        ), "profile argv changed, split, or reordered")
+        adapter = "herdr-pane" if profile in ("watermelon", "muse-literal") else "herdr"
+        report.require(f"primary/profile/{profile}/adapter",
+                       isinstance(status, dict) and status.get("adapter") == adapter,
+                       f"profile selected wrong adapter: {status!r}")
+        if profile == "watermelon":
+            for edition, outcome in zip(("python", "rust"), (python, rust), strict=True):
+                raw_status = json.loads(outcome.stdout)
+                identity = raw_status.get("custom_process_identity")
+                report.require(
+                    f"primary/profile/watermelon/process-identity/{edition}",
+                    isinstance(identity, dict)
+                    and set(identity) == {
+                        "version", "boot_id", "pid", "starttime_ticks",
+                        "executable_device", "executable_inode",
+                    }
+                    and identity.get("version") == 1
+                    and isinstance(identity.get("boot_id"), str)
+                    and all(
+                        isinstance(identity.get(field), int) and identity[field] > 0
+                        for field in (
+                            "pid", "starttime_ticks", "executable_device", "executable_inode",
+                        )
+                    ),
+                    f"{edition} omitted the pinned custom process identity: {raw_status!r}",
+                )
+            report.require("primary/profile/watermelon/effective-effort",
+                           isinstance(status, dict)
+                           and status.get("effective_reasoning_effort") == "xhigh"
+                           and status.get("startup_warning") == (
+                               "reasoning effort ultra is not available "
+                               "(gate ultra_reasoning_effort is closed); using xhigh"
+                           ), f"Muse downgrade was hidden or misreported: {status!r}")
+            for root in (case.python_root, case.rust_root):
+                executable = root / "fake-muse-runtime"
+                replacement = root / "fake-muse-runtime.new"
+                shutil.copyfile(sys.executable, replacement)
+                replacement.chmod(0o700)
+                os.replace(replacement, executable)
+                process_id = _state(root).get("custom_pid")
+                report.require(
+                    f"primary/profile/watermelon/deleted-image/{root.parent.name}",
+                    isinstance(process_id, int)
+                    and os.readlink(f"/proc/{process_id}/exe").endswith(" (deleted)"),
+                    "atomic replacement did not retain the old running executable inode",
+                )
+            _pair(harness, report, case, "primary/profile/watermelon/status-after-upgrade", (
+                "status", "worker", *_COMMON,
+            ))
+            original_records = {
+                root: json.loads(
+                    (root / "registry/worker/agent.json").read_text(encoding="utf-8")
+                )
+                for root in (case.python_root, case.rust_root)
+            }
+            mismatch_values: tuple[tuple[str, str, object], ...] = (
+                ("pid", "pid", 1),
+                ("starttime", "starttime_ticks", 1),
+                ("boot", "boot_id", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
+                ("device", "executable_device", 1),
+                ("inode", "executable_inode", 1),
+            )
+            for label, field, adjustment in mismatch_values:
+                for root, original in original_records.items():
+                    changed = json.loads(json.dumps(original))
+                    if field == "boot_id":
+                        changed["custom_process_identity"][field] = adjustment
+                    else:
+                        changed["custom_process_identity"][field] += adjustment
+                    (root / "registry/worker/agent.json").write_text(
+                        json.dumps(changed), encoding="utf-8"
+                    )
+                _pair(
+                    harness, report, case,
+                    f"primary/profile/watermelon/refuse-{label}-status",
+                    ("status", "worker", *_COMMON),
+                )
+                refused = harness.invoke(case, ("stop", "worker", *_COMMON))
+                report.require(
+                    f"primary/profile/watermelon/refuse-{label}-stop",
+                    all(outcome.returncode == 69 for outcome in refused)
+                    and all(
+                        (root / "registry/worker/agent.json").is_file()
+                        and not _state(root).get("closed")
+                        for root in (case.python_root, case.rust_root)
+                    ),
+                    f"{label} identity mismatch allowed pane retirement: {refused!r}",
+                )
+                for root, original in original_records.items():
+                    (root / "registry/worker/agent.json").write_text(
+                        json.dumps(original), encoding="utf-8"
+                    )
+            _change(case, {"wrong_custom_process_group": True})
+            _pair(
+                harness, report, case,
+                "primary/profile/watermelon/refuse-process-group-status",
+                ("status", "worker", *_COMMON),
+            )
+            refused = harness.invoke(case, ("stop", "worker", *_COMMON))
+            report.require(
+                "primary/profile/watermelon/refuse-process-group-stop",
+                all(outcome.returncode == 69 for outcome in refused)
+                and all(
+                    (root / "registry/worker/agent.json").is_file()
+                    and not _state(root).get("closed")
+                    for root in (case.python_root, case.rust_root)
+                ),
+                f"foreground process-group mismatch allowed pane retirement: {refused!r}",
+            )
+            _change(case, {"wrong_custom_process_group": False})
+
+            malformed_variants: tuple[tuple[str, str, object], ...] = (
+                ("bool", "pid", True),
+                ("overflow", "starttime_ticks", 1 << 64),
+                ("zero-device", "executable_device", 0),
+                ("unknown", "unexpected", 1),
+            )
+            for label, field, value in malformed_variants:
+                for root, original in original_records.items():
+                    changed = json.loads(json.dumps(original))
+                    changed["custom_process_identity"][field] = value
+                    (root / "registry/worker/agent.json").write_text(
+                        json.dumps(changed), encoding="utf-8"
+                    )
+                _pair(
+                    harness, report, case,
+                    f"primary/profile/watermelon/malformed-{label}",
+                    ("status", "worker", *_COMMON), 75,
+                )
+                for root, original in original_records.items():
+                    (root / "registry/worker/agent.json").write_text(
+                        json.dumps(original), encoding="utf-8"
+                    )
+            prompt = "Muse literal $(unexpanded) delivery\nsecond line"
+            _pair(harness, report, case, "primary/profile/watermelon/send", (
+                "send", "worker", prompt, "--message-id", "muse-first", *_COMMON,
+            ))
+            report.require("primary/profile/watermelon/pane-delivery",
+                           all(_state(root).get("submitted") == [prompt]
+                               and _state(root).get("paste_wrapped") is True
+                               and (root / "registry/worker/queue/processed/muse-first.json").is_file()
+                               and not list((root / "registry/worker/queue/inflight").glob("*.json"))
+                               and not list((root / "registry/worker/queue/failed").glob("*.json"))
+                               for root in (case.python_root, case.rust_root)),
+                           "Muse pane delivery lacked an exact post-Enter receipt")
+            _change(case, {
+                "custom_post_error": True, "custom_submitted": False, "custom_draft": "",
+            })
+            _pair(harness, report, case, "primary/profile/watermelon/redraw-refusal", (
+                "send", "worker", "must remain uncertain", "--message-id", "muse-error",
+                "--working-timeout", "0.05", *_COMMON,
+            ), 76)
+            report.require("primary/profile/watermelon/redraw-quarantine", all(
+                (root / "registry/worker/queue/failed/muse-error.json").is_file()
+                for root in (case.python_root, case.rust_root)
+            ), "Muse draft/error redraw was incorrectly accepted as delivery")
+            _change(case, {
+                "custom_post_error": False, "custom_clear_without_submit": True,
+                "custom_submitted": False, "custom_draft": "",
+            })
+            _pair(harness, report, case, "primary/profile/watermelon/repeated-redraw", (
+                "send", "worker", prompt, "--message-id", "muse-repeat",
+                "--working-timeout", "0.05", *_COMMON,
+            ), 76)
+            report.require("primary/profile/watermelon/repeated-quarantine", all(
+                (root / "registry/worker/queue/failed/muse-repeat.json").is_file()
+                for root in (case.python_root, case.rust_root)
+            ), "an old identical transcript entry was mistaken for a new submission")
+        if profile not in ("watermelon", "muse-literal"):
+            expected_environment = (
+                ["META_CODEX_AI_GATEWAY=azure-codex-cyber:openai"]
+                if profile in ("astra-ultra", "sol") else []
+            )
+            report.require(f"primary/profile/{profile}/environment", all(
+                _state(root).get("tab_environment") == expected_environment
+                for root in (case.python_root, case.rust_root)
+            ), "profile environment changed or leaked")
+        _pair(harness, report, case, f"primary/profile/{profile}/stop", (
+            "stop", "worker", *_COMMON,
+        ))
+
+
+def _skill_install(harness: Harness, report: Report) -> None:
+    case = harness.case("primary-skill-install")
+    first_python, first_rust = harness.invoke(case, ("skill", "install"))
+    report.require("primary/skill/install", first_python.returncode == first_rust.returncode == 0
+                   and _json(first_python) == _json(first_rust),
+                   f"skill install diverged: {first_python!r} {first_rust!r}")
+    for root in (case.python_root, case.rust_root):
+        paths = [
+            root / "skill-homes/codex/agentctl/SKILL.md",
+            root / "skill-homes/claude/agentctl/SKILL.md",
+            root / "xdg-config/muse/skills/agentctl/SKILL.md",
+        ]
+        report.require(f"primary/skill/content/{root.parent.name}",
+                       all(path.is_file() for path in paths)
+                       and len({path.read_bytes() for path in paths}) == 1,
+                       "not every harness received the same skill")
+        calls = (root / "muse-skill-calls.jsonl").read_text(encoding="utf-8").splitlines()
+        report.require(f"primary/skill/muse-native/{root.parent.name}", len(calls) == 1,
+                       "Muse skill did not use its native managed installer exactly once")
+    second_python, second_rust = harness.invoke(case, ("skill", "install"))
+    report.require("primary/skill/idempotent", second_python.returncode == second_rust.returncode == 0
+                   and _json(second_python) == _json(second_rust)
+                   and _json(second_python) == {"installed": [], "unchanged": ["codex", "claude", "muse"]},
+                   f"second install was not idempotent: {second_python!r} {second_rust!r}")
+    report.require("primary/skill/muse-idempotent-native", all(
+        len((root / "muse-skill-calls.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+        for root in (case.python_root, case.rust_root)
+    ), "idempotent Muse install needlessly invoked the native installer")
+    for root in (case.python_root, case.rust_root):
+        (root / "skill-homes/codex/agentctl/SKILL.md").write_text("owner customization\n", encoding="utf-8")
+    refused = harness.invoke(case, ("skill", "install", "--harness", "codex"))
+    report.require("primary/skill/divergent-refusal",
+                   all(outcome.returncode == 75 for outcome in refused),
+                   f"divergent skill was overwritten without force: {refused!r}")
+    forced_python, forced_rust = harness.invoke(
+        case, ("skill", "install", "--harness", "codex", "--force")
+    )
+    report.require("primary/skill/explicit-force",
+                   forced_python.returncode == forced_rust.returncode == 0
+                   and _json(forced_python) == _json(forced_rust),
+                   f"explicit skill replacement diverged: {forced_python!r} {forced_rust!r}")
+
+    for root in (case.python_root, case.rust_root):
+        (root / "xdg-config/muse/skills/agentctl/SKILL.md").write_text(
+            "owner customization\n", encoding="utf-8"
+        )
+    refused = harness.invoke(case, ("skill", "install", "--harness", "muse"))
+    report.require("primary/skill/muse-divergent-refusal",
+                   all(outcome.returncode == 75 for outcome in refused)
+                   and all(
+                       (root / "xdg-config/muse/skills/agentctl/SKILL.md").read_text(
+                           encoding="utf-8"
+                       ) == "owner customization\n"
+                       for root in (case.python_root, case.rust_root)
+                   ), f"divergent managed Muse skill was overwritten: {refused!r}")
+    forced_python, forced_rust = harness.invoke(
+        case, ("skill", "install", "--harness", "muse", "--force")
+    )
+    report.require("primary/skill/muse-explicit-force",
+                   forced_python.returncode == forced_rust.returncode == 0
+                   and _json(forced_python) == _json(forced_rust)
+                   and all(
+                       len((root / "muse-skill-calls.jsonl").read_text(
+                           encoding="utf-8"
+                       ).splitlines()) == 2
+                       for root in (case.python_root, case.rust_root)
+                   ), f"explicit managed Muse replacement diverged: {forced_python!r} {forced_rust!r}")
+
+    symlink = harness.case("primary-skill-symlink")
+    for root in (symlink.python_root, symlink.rust_root):
+        destination = root / "skill-homes/codex/agentctl"
+        destination.mkdir(parents=True, mode=0o700)
+        (root / "outside-skill").write_text("outside\n", encoding="utf-8")
+        (destination / "SKILL.md").symlink_to(root / "outside-skill")
+    outcomes = harness.invoke(symlink, ("skill", "install", "--harness", "codex", "--force"))
+    report.require("primary/skill/symlink-refusal",
+                   all(outcome.returncode == 75 for outcome in outcomes)
+                   and all((root / "outside-skill").read_text(encoding="utf-8") == "outside\n"
+                           for root in (symlink.python_root, symlink.rust_root)),
+                   f"skill symlink was followed: {outcomes!r}")
+
+    muse_symlink = harness.case("primary-skill-muse-symlink")
+    for root in (muse_symlink.python_root, muse_symlink.rust_root):
+        outside = root / "outside-muse-skills"
+        outside.mkdir(mode=0o700)
+        destination = root / "xdg-config/muse"
+        destination.mkdir(parents=True, mode=0o700)
+        (destination / "skills").symlink_to(outside)
+    outcomes = harness.invoke(
+        muse_symlink, ("skill", "install", "--harness", "muse", "--force")
+    )
+    report.require("primary/skill/muse-symlink-refusal",
+                   all(outcome.returncode == 75 for outcome in outcomes)
+                   and all(not list((root / "outside-muse-skills").iterdir())
+                           for root in (muse_symlink.python_root, muse_symlink.rust_root)),
+                   f"Muse skill destination symlink was followed: {outcomes!r}")
+
+    missing_muse = harness.case("primary-skill-muse-missing-executable")
+    for root in (missing_muse.python_root, missing_muse.rust_root):
+        (root / "fake-muse-skills").unlink()
+    outcomes = harness.invoke(missing_muse, ("skill", "install", "--harness", "muse"))
+    report.require("primary/skill/muse-missing-executable",
+                   all(outcome.returncode == 75 for outcome in outcomes)
+                   and all(not (root / "xdg-config/muse/skills").exists()
+                           for root in (missing_muse.python_root, missing_muse.rust_root)),
+                   f"missing Muse installer mutated configuration: {outcomes!r}")
+
+    for variable, selected in (
+        ("AGENTCTL_CODEX_SKILLS_DIR", "codex"),
+        ("AGENTCTL_CLAUDE_SKILLS_DIR", "claude"),
+        ("AGENTCTL_MUSE_BIN", "muse"),
+        ("XDG_CONFIG_HOME", "muse"),
+    ):
+        empty = harness.case(
+            f"primary-skill-empty-{variable.lower()}",
+            {"empty_environment": [variable]},
+        )
+        outcomes = harness.invoke(empty, (
+            "skill", "install", "--harness", selected,
+        ))
+        report.require(f"primary/skill/empty/{variable}",
+                       all(outcome.returncode == 75 for outcome in outcomes),
+                       f"empty environment override diverged or was accepted: {outcomes!r}")
+
+
+def _profile_refusals(harness: Harness, report: Report) -> None:
+    base = {"schema": "agentctl-profiles/v1", "profiles": {
+        "worker": {"harness": "codex", "mode": "interactive", "argv": [], "env": {}}
+    }}
+    for label in ("nonignored", "permissions", "symlink", "unknown-field"):
+        case = harness.case(f"primary-profile-refusal-{label}")
+        for root in (case.python_root, case.rust_root):
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            if label != "nonignored":
+                (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+            directory = root / ".agentctl"
+            directory.mkdir(mode=0o700)
+            document = json.loads(json.dumps(base))
+            if label == "unknown-field":
+                document["profiles"]["worker"]["surprise"] = True
+            target = directory / "profiles.json"
+            if label == "symlink":
+                real = directory / "real.json"
+                real.write_text(json.dumps(document), encoding="utf-8")
+                real.chmod(0o600)
+                target.symlink_to(real.name)
+            else:
+                target.write_text(json.dumps(document), encoding="utf-8")
+                target.chmod(0o644 if label == "permissions" else 0o600)
+        outcomes = harness.invoke(case, ("profiles", "--cwd", "<ROOT>"))
+        report.require(f"primary/profile/refusal/{label}",
+                       all(outcome.returncode == 75 and "traceback" not in outcome.stderr.lower()
+                           and "panicked" not in outcome.stderr.lower() for outcome in outcomes),
+                       f"unsafe profile config was accepted or crashed: {outcomes!r}")
+
+    overlap = harness.case("primary-profile-refusal-overlap")
+    for root in (overlap.python_root, overlap.rust_root):
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+        directory = root / ".agentctl"
+        directory.mkdir(mode=0o700)
+        config = directory / "profiles.json"
+        config.write_text(json.dumps(base), encoding="utf-8")
+        config.chmod(0o600)
+    outcomes = harness.invoke(overlap, (
+        "start", "worker", "--cwd", "<ROOT>", "--profile", "worker", "--model", "override",
+    ))
+    report.require("primary/profile/refusal/precedence",
+                   all(outcome.returncode == 2 for outcome in outcomes),
+                   f"profile precedence was ambiguous: {outcomes!r}")
+    outcomes = harness.invoke(overlap, (
+        "start", "worker", "--cwd", "<ROOT>", "--profile", "worker", "--resume", "session-1",
+    ))
+    report.require("primary/profile/refusal/resume-precedence",
+                   all(outcome.returncode == 2 for outcome in outcomes),
+                   f"profile resume precedence was ambiguous: {outcomes!r}")
+
+    direct_precedence = (
+        ("model-short-attached", "codex", ("--model", "structured"), ("-mother-model",)),
+        ("effort-config-attached", "codex", ("--reasoning-effort", "ultra"),
+         ("--config=model_reasoning_effort=low",)),
+        ("model-quoted-config-key", "codex", ("--model", "structured"),
+         ('--config="model"="attacker"',)),
+        ("effort-quoted-config-key", "codex", ("--reasoning-effort", "ultra"),
+         ('--config="model_reasoning_effort"="low"',)),
+        ("codex-resume", "codex", ("--resume", "session-1"), ("resume",)),
+        ("claude-resume", "claude", ("--resume", "session-1"), ("--continue",)),
+    )
+    for label, kind, structured, raw in direct_precedence:
+        case = harness.case(f"primary-direct-precedence-{label}")
+        arguments = [
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "--harness", kind, *structured,
+        ]
+        for item in raw:
+            arguments.append(f"--harness-arg={item}")
+        outcomes = harness.invoke(case, (*arguments, *_COMMON))
+        report.require(f"primary/profile/refusal/direct-{label}",
+                       all(outcome.returncode == 75 for outcome in outcomes),
+                       f"direct launch precedence was ambiguous: {outcomes!r}")
+
+    hostile_path = harness.case("primary-profile-hostile-path", {"hostile_path": True})
+    for root in (hostile_path.python_root, hostile_path.rust_root):
+        subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+        (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+        directory = root / ".agentctl"
+        directory.mkdir(mode=0o700)
+        config = directory / "profiles.json"
+        config.write_text(json.dumps(base), encoding="utf-8")
+        config.chmod(0o600)
+        hostile = root / "hostile-bin"
+        hostile.mkdir(mode=0o700)
+        fake_git = hostile / "git"
+        fake_git.write_text(
+            f"#!/bin/sh\ntouch {root / 'hostile-git-executed'}\nexit 0\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o700)
+    _pair(harness, report, hostile_path, "primary/profile/hostile-path", (
+        "profiles", "--cwd", "<ROOT>",
+    ))
+    report.require("primary/profile/hostile-path-not-executed", all(
+        not (root / "hostile-git-executed").exists()
+        for root in (hostile_path.python_root, hostile_path.rust_root)
+    ), "profile discovery executed Git from caller PATH")
+
+    strict_documents = {
+        "duplicate-json": (
+            '{"schema":"agentctl-profiles/v1","profiles":{'
+            '"worker":{"harness":"codex","mode":"interactive"},'
+            '"worker":{"harness":"muse","mode":"interactive"}}}'
+        ),
+        "reserved-headless": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "muse", "mode": "headless",
+                       "argv": ["--session-id=attacker"], "env": {}}
+        }}),
+        "headless-option-terminator": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "muse", "mode": "headless", "argv": ["--"], "env": {}}
+        }}),
+        "headless-secret-stdin": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "muse", "mode": "headless",
+                       "argv": ["--api-key-stdin"], "env": {}}
+        }}),
+        "unsupported-combination": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "claude", "mode": "headless", "argv": [], "env": {}}
+        }}),
+        "unsupported-interactive-agy": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "agy", "mode": "interactive", "argv": [], "env": {}}
+        }}),
+        "unsupported-headless-codex-argv": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "headless",
+                       "argv": ["--search"], "env": {}}
+        }}),
+        "unsupported-headless-codex-effort": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "headless",
+                       "reasoning_effort": "high", "argv": [], "env": {}}
+        }}),
+        "unsupported-headless-agy-effort": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "agy", "mode": "headless",
+                       "reasoning_effort": "high", "argv": [], "env": {}}
+        }}),
+        "unsupported-headless-environment": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "muse", "mode": "headless", "argv": [],
+                       "env": {"ROUTING_SELECTOR": "route"}}
+        }}),
+        "codex-model-short-attached": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "interactive", "model": "structured",
+                       "argv": ["-mother-model"], "env": {}}
+        }}),
+        "codex-model-config-attached": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "interactive", "model": "structured",
+                       "argv": ['--config= model = "other"'], "env": {}}
+        }}),
+        "codex-effort-config-short": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "interactive", "reasoning_effort": "ultra",
+                       "argv": ['-c=model_reasoning_effort = "low"'], "env": {}}
+        }}),
+        "codex-effort-config-split": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "interactive", "reasoning_effort": "ultra",
+                       "argv": ["--config", ' model_reasoning_effort = "low"'], "env": {}}
+        }}),
+        "codex-model-config-quoted": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "interactive", "model": "structured",
+                       "argv": ["--config", '\"model\"=\"other\"'], "env": {}}
+        }}),
+        "codex-effort-config-quoted": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "interactive", "reasoning_effort": "ultra",
+                       "argv": ['-c"model_reasoning_effort"="low"'], "env": {}}
+        }}),
+        "codex-opaque-config-profile": json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+            "worker": {"harness": "codex", "mode": "interactive", "model": "structured",
+                       "argv": ["-powner-defaults"], "env": {}}
+        }}),
+        "oversized": json.dumps(base) + (" " * (256 * 1024)),
+    }
+    for label, content in strict_documents.items():
+        case = harness.case(f"primary-profile-strict-{label}")
+        for root in (case.python_root, case.rust_root):
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+            directory = root / ".agentctl"
+            directory.mkdir(mode=0o700)
+            config = directory / "profiles.json"
+            config.write_text(content, encoding="utf-8")
+            config.chmod(0o600)
+        outcomes = harness.invoke(case, ("profiles", "--cwd", "<ROOT>"))
+        report.require(f"primary/profile/strict/{label}",
+                       all(outcome.returncode == 75 for outcome in outcomes),
+                       f"ambiguous or unbounded profile was accepted: {outcomes!r}")
+
+    missing = harness.case(
+        "primary-custom-missing",
+        {"missing_custom_executable": True, "empty_shell": True},
+    )
+    outcomes = harness.invoke(missing, (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--harness", "muse", *_COMMON,
+    ))
+    report.require("primary/custom/missing-executable",
+                   all(outcome.returncode == 75
+                   and "cannot inspect muse executable" in outcome.stderr
+                       for outcome in outcomes),
+                   f"missing custom executable was not refused: {outcomes!r}")
+    stopped = harness.invoke(missing, ("stop", "worker", *_COMMON))
+    report.require("primary/custom/missing-executable-retained",
+                   all(outcome.returncode == 69 for outcome in stopped)
+                   and all((root / "registry/worker/agent.json").is_file()
+                           and not _state(root).get("closed")
+                           for root in (missing.python_root, missing.rust_root)),
+                   f"unobserved missing-executable launch was incorrectly retired: {stopped!r}")
+
+    wrong_process = harness.case(
+        "primary-custom-wrong-process", {"wrong_custom_process": True}
+    )
+    outcomes = harness.invoke(wrong_process, (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--harness", "muse", "--startup-timeout", "0.05", *_COMMON,
+    ))
+    report.require("primary/custom/exact-process",
+                   all(outcome.returncode == 75 and "foreground process" in outcome.stderr
+                       for outcome in outcomes),
+                   f"lookalike custom process was accepted: {outcomes!r}")
+    stopped = harness.invoke(wrong_process, ("stop", "worker", *_COMMON))
+    report.require("primary/custom/exact-process-retained",
+                   all(outcome.returncode == 69 for outcome in stopped)
+                   and all((root / "registry/worker/agent.json").is_file()
+                           and not _state(root).get("closed")
+                           for root in (wrong_process.python_root, wrong_process.rust_root)),
+                   f"unobserved wrong-process launch was incorrectly retired: {stopped!r}")
+    _retire_fixture_processes(wrong_process)
+
+    wrong_identity = harness.case(
+        "primary-custom-wrong-kernel-identity", {"wrong_custom_process_identity": True}
+    )
+    outcomes = harness.invoke(wrong_identity, (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--harness", "muse", "--startup-timeout", "0.05", *_COMMON,
+    ))
+    report.require("primary/custom/kernel-process-identity",
+                   all(outcome.returncode == 75 and "foreground process" in outcome.stderr
+                       for outcome in outcomes),
+                   f"self-reported executable bypassed kernel identity: {outcomes!r}")
+    stopped = harness.invoke(wrong_identity, ("stop", "worker", *_COMMON))
+    report.require("primary/custom/kernel-process-retained",
+                   all(outcome.returncode == 69 for outcome in stopped)
+                   and all((root / "registry/worker/agent.json").is_file()
+                           and not _state(root).get("closed")
+                           for root in (wrong_identity.python_root, wrong_identity.rust_root)),
+                   f"unobserved wrong-kernel launch was incorrectly retired: {stopped!r}")
+    _retire_fixture_processes(wrong_identity)
+
+    trust = harness.case("primary-muse-trust", {"screen": "Do you trust this workspace? yes / no"})
+    outcomes = harness.invoke(trust, (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--harness", "muse", *_COMMON,
+    ))
+    report.require("primary/muse/trust-refusal",
+                   all(outcome.returncode == 75 and "trust prompt" in outcome.stderr
+                       and _state(root).get("submitted") == []
+                       for outcome, root in zip(outcomes, (trust.python_root, trust.rust_root), strict=True)),
+                   f"Muse trust prompt was accepted or mutated: {outcomes!r}")
+    stopped = harness.invoke(trust, ("stop", "worker", *_COMMON))
+    report.require("primary/muse/failed-start-cleanup",
+                   all(outcome.returncode == 0 for outcome in stopped)
+                   and all(_state(root).get("closed_panes") == ["w1:p1"]
+                           and not (root / "registry/worker").exists()
+                           and len(list((root / "registry/archive").iterdir())) == 1
+                           for root in (trust.python_root, trust.rust_root)),
+                   f"retained failed Muse launch was not safely stoppable: {stopped!r}")
+
+    exited = harness.case("primary-muse-exit-after-send-text")
+    if _start(
+        harness, report, exited, "primary/muse/exit-after-send-text/start",
+        "--harness", "muse",
+    ):
+        _change(exited, {"custom_exit_after_send_text": True})
+        outcomes = harness.invoke(exited, (
+            "send", "worker", "must never reach a replacement shell",
+            "--message-id", "exit-race", *_COMMON,
+        ))
+        report.require(
+            "primary/muse/exit-after-send-text/no-enter",
+            all(outcome.returncode == 76 for outcome in outcomes)
+            and all(
+                _state(root).get("custom_submitted") is False
+                and _state(root).get("submitted") == []
+                and (root / "registry/worker/queue/failed/exit-race.json").is_file()
+                for root in (exited.python_root, exited.rust_root)
+            ),
+            f"Muse exit between text and Enter submitted to a replacement: {outcomes!r}",
+        )
+        _retire_fixture_processes(exited)
 
 
 def _handoff_and_pending(harness: Harness, report: Report) -> None:
@@ -408,6 +1123,9 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
         harness = Harness(Path(temporary), python_command, rust_command)
         _orientation(harness, report)
         _lifecycle(harness, report)
+        _profiles(harness, report)
+        _skill_install(harness, report)
+        _profile_refusals(harness, report)
         _handoff_and_pending(harness, report)
         _registry_and_interop(harness, report)
         _ownership(harness, report)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import contextlib
+import io
 import signal
 import threading
 import subprocess
@@ -86,6 +87,335 @@ def test_harness_defaults_are_not_overridden(
     )
     assert "-m" not in argv
     assert "-c" not in argv
+
+
+def _run_fake_muse_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    rec: lib.AgentRecord,
+    events: list[dict[str, object]],
+    *,
+    returncode: int = 0,
+    stdout: object | None = None,
+) -> list[str]:
+    launched: list[str] = []
+
+    class FakePopen:
+        def __init__(self, argv: list[str]) -> None:
+            launched.extend(argv)
+            self.stdout = (
+                stdout
+                if stdout is not None
+                else io.StringIO("".join(json.dumps(event) + "\n" for event in events))
+            )
+            self.stderr = _EmptyReader()
+            self.returncode = returncode
+            self.pid = os.getpid()
+
+        def wait(self) -> int:
+            return self.returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    class _EmptyReader:
+        def read(self, _size: int) -> str:
+            return ""
+
+    monkeypatch.setattr(agent_runner, "_spawn_harness", lambda _name, argv, _cwd: FakePopen(argv))
+    monkeypatch.setattr(agent_runner, "_owned_harness", lambda _name, _proc: contextlib.nullcontext(threading.Event()))
+    agent_runner._run_muse_turn(
+        name, rec, lib.Message(seq=0, text='literal $(prompt) "quoted"', model=None, queued_at=lib.now_iso())
+    )
+    return launched
+
+
+def _muse_event(session: str, sequence: int, payload_type: str, payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "stream": {"kind": "session", "id": session},
+        "sequence": sequence,
+        "payload_type": payload_type,
+        "payload": payload,
+    }
+
+
+def _muse_workspace_epilogue(
+    session: str,
+    sequence: int,
+    command_id: str,
+    *,
+    extra_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "command_id": command_id,
+        "kind": "workspace_branch_observed",
+        "record": {
+            "command_id": command_id,
+            "commit": "feffed69e553",
+            "dirty": True,
+            "reference": {"kind": "branch", "name": "main"},
+            "vcs": "git",
+            "workspace_root": "/work/project",
+        },
+    }
+    if extra_payload:
+        payload.update(extra_payload)
+    event = _muse_event(
+        session,
+        sequence,
+        "session.workspace_branch.observed",
+        payload,
+    )
+    event.update(
+        {
+            "id": "018f0000-0000-7000-8000-00000000c350",
+            "recorded_at": 1_790_114_640_260_776,
+            "record_type": "event",
+            "durability": "durable",
+            "causation_id": command_id,
+            "payload_schema_version": 1,
+        }
+    )
+    return event
+
+
+def test_muse_headless_uses_stable_session_and_requires_terminal_receipt(
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "muse-worker"
+    rec = _install_agy_agent(fake_runner_state, name)
+    rec.harness = "muse"
+    rec.model = "watermelon-model"
+    rec.harness_args = ("--reasoning-effort", "ultra", 'literal $(unexpanded) "quotes"')
+    with lib.registry_lock() as agents:
+        agents[name] = rec
+    session = rec.session_id or ""
+    argv = _run_fake_muse_turn(monkeypatch, name, rec, [
+        _muse_event(session, 1, "runtime.command.accepted", {
+            "command_kind": "turn.submit", "command_id": "command-1",
+        }),
+        _muse_event(session, 2, "run.terminal.completed", {
+            "command_id": "command-1", "terminal": "completed", "text": "muse answer",
+        }),
+    ])
+    assert argv == [
+        lib.MUSE_BIN, "exec", "--reasoning-effort", "ultra", 'literal $(unexpanded) "quotes"',
+        "--model", "watermelon-model", "--json", "--session-id", session,
+        "--", 'literal $(prompt) "quoted"',
+    ]
+    later = agent_runner._build_muse_argv(
+        rec, lib.Message(seq=1, text="second turn", model=None, queued_at=lib.now_iso())
+    )
+    assert later == [
+        lib.MUSE_BIN, "exec", "--reasoning-effort", "ultra", 'literal $(unexpanded) "quotes"',
+        "--model", "watermelon-model", "--json", "--session-id", session, "--", "second turn",
+    ]
+    assert "resume" not in later
+    assert lib.last_message_path(name).read_text() == "muse answer"
+    assert "===TURN-DONE 0 rc=0 " in lib.transcript_path(name).read_text()
+    assert lib.read_registry()[name].status == "idle"
+
+
+@pytest.mark.parametrize("prompt", ["--help", "--disable-shell", "-mattacker-model"])
+def test_muse_headless_terminates_options_before_literal_prompt(
+    fake_runner_state: Path, prompt: str,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "muse-literal-prompt")
+    rec.harness = "muse"
+
+    argv = agent_runner._build_muse_argv(
+        rec, lib.Message(seq=0, text=prompt, model=None, queued_at=lib.now_iso())
+    )
+
+    assert argv[-2:] == ["--", prompt]
+
+
+def test_muse_headless_rejects_cross_session_or_missing_terminal_events(
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "muse-invalid"
+    rec = _install_agy_agent(fake_runner_state, name)
+    rec.harness = "muse"
+    with lib.registry_lock() as agents:
+        agents[name] = rec
+    _run_fake_muse_turn(monkeypatch, name, rec, [
+        _muse_event("different-session", 1, "runtime.command.accepted", {"command_kind": "turn.submit"}),
+    ])
+    assert "Muse event session identity changed" in lib.last_message_path(name).read_text()
+    assert "===TURN-DONE 0 rc=protocol_error " in lib.transcript_path(name).read_text()
+    assert lib.read_registry()[name].status == "error"
+
+
+def test_muse_headless_binds_terminal_to_exact_accepted_command(
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "muse-command-mismatch"
+    rec = _install_agy_agent(fake_runner_state, name)
+    rec.harness = "muse"
+    with lib.registry_lock() as agents:
+        agents[name] = rec
+    session = rec.session_id or ""
+    _run_fake_muse_turn(monkeypatch, name, rec, [
+        _muse_event(session, 1, "runtime.command.accepted", {
+            "command_kind": "turn.submit", "command_id": "accepted-command",
+        }),
+        _muse_event(session, 2, "run.terminal.completed", {
+            "command_id": "other-command", "terminal": "completed", "text": "wrong answer",
+        }),
+    ])
+    assert "terminal outcome does not match" in lib.last_message_path(name).read_text()
+    assert "===TURN-DONE 0 rc=protocol_error " in lib.transcript_path(name).read_text()
+    assert lib.read_registry()[name].status == "error"
+
+
+def test_muse_headless_allows_one_bound_workspace_observation_after_terminal(
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "muse-workspace-epilogue"
+    rec = _install_agy_agent(fake_runner_state, name)
+    rec.harness = "muse"
+    with lib.registry_lock() as agents:
+        agents[name] = rec
+    session = rec.session_id or ""
+    command_id = "accepted-command"
+
+    _run_fake_muse_turn(monkeypatch, name, rec, [
+        _muse_event(session, 34, "runtime.command.accepted", {
+            "command_kind": "turn.submit", "command_id": command_id,
+        }),
+        _muse_event(session, 35, "run.terminal.completed", {
+            "command_id": command_id, "terminal": "completed", "text": "verified answer",
+        }),
+        _muse_workspace_epilogue(session, 36, command_id),
+    ])
+
+    assert lib.last_message_path(name).read_text() == "verified answer"
+    assert "===TURN-DONE 0 rc=0 " in lib.transcript_path(name).read_text()
+    assert lib.read_registry()[name].status == "idle"
+
+
+@pytest.mark.parametrize("post_terminal", ["second-terminal", "mutated-epilogue"])
+def test_muse_headless_rejects_semantic_events_after_terminal_and_labels_output_unverified(
+    fake_runner_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    post_terminal: str,
+) -> None:
+    name = f"muse-post-terminal-{post_terminal}"
+    rec = _install_agy_agent(fake_runner_state, name)
+    rec.harness = "muse"
+    with lib.registry_lock() as agents:
+        agents[name] = rec
+    session = rec.session_id or ""
+    command_id = "accepted-command"
+    extra = (
+        _muse_event(session, 3, "run.terminal.completed", {
+            "command_id": command_id, "terminal": "completed", "text": "second answer",
+        })
+        if post_terminal == "second-terminal"
+        else _muse_workspace_epilogue(
+            session, 3, command_id, extra_payload={"text": "semantic mutation"}
+        )
+    )
+
+    _run_fake_muse_turn(monkeypatch, name, rec, [
+        _muse_event(session, 1, "runtime.command.accepted", {
+            "command_kind": "turn.submit", "command_id": command_id,
+        }),
+        _muse_event(session, 2, "run.terminal.completed", {
+            "command_id": command_id, "terminal": "completed", "text": "first answer",
+        }),
+        extra,
+    ])
+
+    last_message = lib.last_message_path(name).read_text()
+    assert last_message.startswith("[MUSE ERROR] Muse emitted an unexpected event")
+    assert "[MUSE UNVERIFIED OUTPUT]\nfirst answer" in last_message
+    assert "second answer" not in last_message
+    assert "semantic mutation" not in last_message
+    assert "===TURN-DONE 0 rc=protocol_error " in lib.transcript_path(name).read_text()
+    assert lib.read_registry()[name].status == "error"
+
+
+@pytest.mark.parametrize(
+    "harness_args",
+    [
+        ("--json",),
+        ("--json=true",),
+        ("--model=attacker-selected",),
+        ("--prompt-file=/tmp/attacker-prompt",),
+        ("--session-id=00000000-0000-0000-0000-000000000000",),
+        ("exec",),
+        ("resume",),
+    ],
+)
+def test_muse_headless_defensively_rejects_runner_owned_arguments(
+    fake_runner_state: Path,
+    harness_args: tuple[str, ...],
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "muse-owned-arguments")
+    rec.harness = "muse"
+    rec.harness_args = harness_args
+
+    with pytest.raises(ValueError, match="cannot override runner-owned argument"):
+        agent_runner._build_muse_argv(
+            rec,
+            lib.Message(seq=0, text="trusted prompt", model=None, queued_at=lib.now_iso()),
+        )
+
+
+def test_muse_headless_turn_reports_unicode_decode_failure_as_protocol_error(
+    fake_runner_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class InvalidUtf8Reader:
+        def readline(self, _size: int = -1) -> str:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    name = "muse-invalid-utf8"
+    rec = _install_agy_agent(fake_runner_state, name)
+    rec.harness = "muse"
+    with lib.registry_lock() as agents:
+        agents[name] = rec
+
+    _run_fake_muse_turn(
+        monkeypatch,
+        name,
+        rec,
+        [],
+        stdout=InvalidUtf8Reader(),
+    )
+
+    assert "Muse JSONL Unicode decode failure" in lib.last_message_path(name).read_text()
+    assert "===TURN-DONE 0 rc=protocol_error " in lib.transcript_path(name).read_text()
+    assert lib.read_registry()[name].status == "error"
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_muse_headless_turn_reports_pathologically_deep_json_as_protocol_error(
+    fake_runner_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "muse-deep-json"
+    rec = _install_agy_agent(fake_runner_state, name)
+    rec.harness = "muse"
+    with lib.registry_lock() as agents:
+        agents[name] = rec
+    deeply_nested_json = "[" * 10_000 + "0" + "]" * 10_000 + "\n"
+
+    _run_fake_muse_turn(
+        monkeypatch,
+        name,
+        rec,
+        [],
+        stdout=io.StringIO(deeply_nested_json),
+    )
+
+    assert "Muse emitted invalid JSONL" in lib.last_message_path(name).read_text()
+    assert "maximum recursion depth" in lib.last_message_path(name).read_text()
+    assert "===TURN-DONE 0 rc=protocol_error " in lib.transcript_path(name).read_text()
+    assert lib.read_registry()[name].status == "error"
 
 
 QUOTA_EXHAUSTED_LOG = (

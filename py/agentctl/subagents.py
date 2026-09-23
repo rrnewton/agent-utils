@@ -20,12 +20,25 @@ from pathlib import Path
 from typing import cast
 
 from agentctl import agent
-from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.client import (
+    AgentPaneInfo,
+    CustomProcessIdentity,
+    HerdrClient,
+    Pane,
+    muse_idle_composer,
+    muse_prompt_in_composer,
+    muse_prompt_transcript_count,
+    muse_startup_metadata,
+    muse_trust_prompt,
+)
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 _KIND = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_BRACKETED_PASTE_START = "\x1b[200~"
+_BRACKETED_PASTE_END = "\x1b[201~"
+_MAX_U64 = (1 << 64) - 1
 
 
 def _name(value: str) -> str:
@@ -55,8 +68,13 @@ def harness_arguments(
             args.extend(("--resume", resume))
         if model:
             args.extend(("--model", model))
+    elif harness == "muse":
+        if resume is not None:
+            raise AgentDeliveryError("interactive Muse resume is not supported; use literal owner-configured argv")
+        if model:
+            args.extend(("--model", model))
     elif model is not None or resume is not None:
-        raise AgentDeliveryError("model and resume presets support codex/claude; use harness arguments for other kinds")
+        raise AgentDeliveryError("model and resume presets support codex/claude/muse; use harness arguments for other kinds")
     if any("\0" in value for value in args):
         raise AgentDeliveryError("harness arguments must contain no NUL")
     return tuple((*args, *extra))
@@ -97,6 +115,8 @@ class AgentRecord:
     model: str | None = None
     resume: str | None = None
     arguments: list[str] = field(default_factory=list)
+    startup_warning: str | None = None
+    effective_reasoning_effort: str | None = None
     error: str | None = None
     goal: str | None = None
     goal_delivery: str | None = None
@@ -109,6 +129,8 @@ class AgentRecord:
     backend: str = "herdr"
     paused: bool = False
     runtime_home: str | None = None
+    pane_reported_by_agentctl: bool = False
+    custom_process_identity: CustomProcessIdentity | None = None
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
     def to_document(self) -> dict[str, object]:
@@ -130,7 +152,7 @@ class AgentRecord:
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
-        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resume", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id"):
+        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id"):
             if document.get(key) is not None and not isinstance(document[key], str):
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
         created = document.get("created_at")
@@ -152,9 +174,20 @@ class AgentRecord:
         goal_message_id = document.get("goal_message_id")
         if goal_message_id is not None and (not isinstance(goal_message_id, str) or agent._MESSAGE_ID.fullmatch(goal_message_id) is None):
             raise AgentDeliveryError(f"invalid goal message id in agent record: {path}")
+        warning = document.get("startup_warning")
+        effective_effort = document.get("effective_reasoning_effort")
+        if (isinstance(warning, str)
+                and (len(warning) > 256 or not warning.isascii()
+                     or any(character in warning for character in "\r\n\0"))):
+            raise AgentDeliveryError(f"invalid startup warning in agent record: {path}")
+        if (isinstance(effective_effort, str)
+                and effective_effort not in (
+                    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+                )):
+            raise AgentDeliveryError(f"invalid effective reasoning effort in agent record: {path}")
         known = {key for key, field_info in cls.__dataclass_fields__.items() if field_info.init}
         fields = {key: document[key] for key in known if key in document}
-        if document.get("adapter", "herdr") not in ("herdr", "herdr-foreign", "turn-runner"):
+        if document.get("adapter", "herdr") not in ("herdr", "herdr-pane", "herdr-foreign", "turn-runner"):
             raise AgentDeliveryError(f"unsupported runtime adapter in {path}")
         if document.get("mode", "interactive") not in ("interactive", "headless"):
             raise AgentDeliveryError(f"invalid execution mode in {path}")
@@ -162,6 +195,49 @@ class AgentRecord:
             raise AgentDeliveryError(f"invalid terminal backend in {path}")
         if not isinstance(document.get("paused", False), bool):
             raise AgentDeliveryError(f"invalid pause state in {path}")
+        if not isinstance(document.get("pane_reported_by_agentctl", False), bool):
+            raise AgentDeliveryError(f"invalid pane report ownership in {path}")
+        raw_identity = document.get("custom_process_identity")
+        if raw_identity is not None:
+            if (not isinstance(raw_identity, dict)
+                    or set(raw_identity) != {
+                        "version", "boot_id", "pid", "starttime_ticks",
+                        "executable_device", "executable_inode",
+                    }):
+                raise AgentDeliveryError(f"invalid custom process identity in {path}")
+            identity = cast(dict[str, object], raw_identity)
+            integers = [
+                identity.get("version"), identity.get("pid"),
+                identity.get("starttime_ticks"), identity.get("executable_device"),
+                identity.get("executable_inode"),
+            ]
+            boot_id = identity.get("boot_id")
+            if (any(not isinstance(value, int) or isinstance(value, bool) for value in integers)
+                    or identity.get("version") != 1
+                    or not isinstance(boot_id, str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                        boot_id,
+                    ) is None
+                    or not 1 <= cast(int, identity["pid"]) <= 2_147_483_647
+                    or not 1 <= cast(int, identity["starttime_ticks"]) <= _MAX_U64
+                    or not 1 <= cast(int, identity["executable_device"]) <= _MAX_U64
+                    or not 1 <= cast(int, identity["executable_inode"]) <= _MAX_U64):
+                raise AgentDeliveryError(f"invalid custom process identity in {path}")
+            fields["custom_process_identity"] = CustomProcessIdentity(
+                version=1, boot_id=boot_id, pid=cast(int, identity["pid"]),
+                starttime_ticks=cast(int, identity["starttime_ticks"]),
+                executable_device=cast(int, identity["executable_device"]),
+                executable_inode=cast(int, identity["executable_inode"]),
+            )
+        if (raw_identity is not None
+                and (document.get("adapter", "herdr") != "herdr-pane"
+                     or document.get("harness") != "muse"
+                     or not isinstance(document.get("pane_id"), str)
+                     or not document["pane_id"])):
+            raise AgentDeliveryError(
+                f"custom process identity requires a Muse herdr-pane in {path}"
+            )
         home = document.get("runtime_home")
         if home is not None and (not isinstance(home, str) or not Path(home).is_absolute()):
             raise AgentDeliveryError(f"invalid runtime directory in {path}")
@@ -198,6 +274,7 @@ class _WorkspaceClient:
         self.goal_objective: str | None = None
         self.queue = queue
         self.check_prompt = check_prompt
+        self.custom_submission: tuple[str, str, int] | None = None
 
     def pane_info(self, pane_id: str) -> AgentPaneInfo:
         # Sessions started by this manager have a second lifecycle identity in
@@ -219,6 +296,24 @@ class _WorkspaceClient:
                 if ("Quick safety check: Is this a project you created or one you trust?" in screen
                     and "No, exit" in screen and "Yes, I trust this folder" in screen):
                     raise HerdrUnavailable("Claude workspace trust prompt requires human attention; no input was submitted")
+            if self.record.adapter == "herdr-pane":
+                self.client.verify_custom_harness(
+                    pane_id, self.record.harness, self.record.custom_process_identity
+                )
+                screen = self.client.read(pane_id, source="visible", lines=200)
+                if muse_trust_prompt(screen):
+                    raise HerdrUnavailable(
+                        "Muse workspace trust prompt requires human attention; no input was submitted"
+                    )
+                info = AgentPaneInfo(
+                    pane_id=info.pane_id,
+                    workspace_id=info.workspace_id,
+                    cwd=info.cwd,
+                    agent=info.agent,
+                    status="idle" if muse_idle_composer(screen) else "working",
+                    session_agent=info.session_agent,
+                    session_value=info.session_value,
+                )
         return info
 
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
@@ -238,9 +333,66 @@ class _WorkspaceClient:
                     if isinstance(document, dict) and document.get("text") == command:
                         self.goal_objective = objective
                         break
-        self.client.prompt_agent(pane_id, command)
+        if self.record.adapter != "herdr-pane":
+            self.client.prompt_agent(pane_id, command)
+            return
+        if "\0" in command or "\x1b" in command:
+            raise HerdrUnavailable(
+                "Muse pane prompts cannot contain NUL or terminal escape characters"
+            )
+        info = self.pane_info(pane_id)
+        if info.status != "idle":
+            raise HerdrUnavailable(
+                f"custom pane {pane_id} is not at a verified idle Muse composer"
+            )
+        before = self.client.read(pane_id, source="visible", lines=200)
+        self.client.send_text(
+            pane_id, f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}"
+        )
+        deadline = time.monotonic() + 2.0
+        staged = ""
+        while time.monotonic() < deadline:
+            self.client.verify_custom_harness(
+                pane_id, self.record.harness, self.record.custom_process_identity
+            )
+            staged = self.client.read(pane_id, source="visible", lines=200)
+            if staged != before and muse_prompt_in_composer(staged, command):
+                break
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        else:
+            raise HerdrUnavailable(
+                "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent"
+            )
+        self.client.verify_custom_harness(
+            pane_id, self.record.harness, self.record.custom_process_identity
+        )
+        self.client.send_keys(pane_id, "Enter")
+        self.custom_submission = (
+            staged, command, muse_prompt_transcript_count(staged, command)
+        )
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
+        if self.record.adapter == "herdr-pane" and status == "working":
+            if self.custom_submission is None:
+                raise HerdrUnavailable(
+                    "custom pane harness has no pending submission receipt"
+                )
+            staged, command, prior_count = self.custom_submission
+            deadline = time.monotonic() + timeout_ms / 1000
+            while time.monotonic() < deadline:
+                self.client.verify_custom_harness(
+                    pane_id, self.record.harness, self.record.custom_process_identity
+                )
+                screen = self.client.read(pane_id, source="visible", lines=200)
+                if (screen != staged
+                        and muse_prompt_transcript_count(screen, command) > prior_count
+                        and not muse_prompt_in_composer(screen, command)):
+                    self.custom_submission = None
+                    return
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            raise HerdrUnavailable(
+                "Muse did not show a verified post-Enter screen transition"
+            )
         if self.goal_objective is None or status != "working":
             self.client.wait_agent_status(pane_id, status, timeout_ms)
             return
@@ -377,12 +529,30 @@ class ManagedAgents:
                 directory.mkdir(mode=0o700)
                 agent._fsync_dir(str(self.registry))
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(),
-                                     model=model, resume=resume, arguments=list(arguments))
+                                     model=model, resume=resume, arguments=list(arguments),
+                                     adapter="herdr-pane" if harness == "muse" else "herdr")
                 self._save(record)
                 try:
                     self._create_presentation(record, workspace_id, environment)
                     assert record.pane_id is not None
-                    self.client.start_agent(name, harness, record.pane_id, arguments, timeout=startup_timeout)
+                    if record.adapter == "herdr-pane":
+                        def persist_identity(identity: CustomProcessIdentity) -> None:
+                            record.custom_process_identity = identity
+                            self._save(record)
+
+                        self.client.start_pane_agent(
+                            name, harness, record.pane_id, arguments,
+                            timeout=startup_timeout, on_observed=persist_identity,
+                        )
+                        record.pane_reported_by_agentctl = True
+                        self._save(record)
+                        screen = self.client.read(
+                            record.pane_id, source="visible", lines=200
+                        )
+                        (record.startup_warning,
+                         record.effective_reasoning_effort) = muse_startup_metadata(screen)
+                    else:
+                        self.client.start_agent(name, harness, record.pane_id, arguments, timeout=startup_timeout)
                     info = self._checked(record, ready=True)
                     if info.workspace_id != record.workspace_id:
                         raise AgentDeliveryError("started agent moved to another workspace")
@@ -662,13 +832,46 @@ class ManagedAgents:
             os.close(lock)
 
     def _checked(self, record: AgentRecord, *, ready: bool = False) -> AgentPaneInfo:
-        if record.adapter not in ("herdr", "herdr-foreign"):
+        if record.adapter not in ("herdr", "herdr-pane", "herdr-foreign"):
             raise AgentDeliveryError("this operation requires the interactive Herdr adapter")
         client = cast(HerdrClient, _WorkspaceClient(self.client, record, check_prompt=ready))
         info = agent.resolve_target(client, record.target())
         if info.workspace_id != record.workspace_id:
             raise AgentDeliveryError(f"agent {record.name!r} workspace identity changed")
         return info
+
+    def _checked_or_failed_pane_report(self, record: AgentRecord, pane_id: str) -> None:
+        """Prove a failed custom launch is still ours or has returned to its shell."""
+        if (record.lifecycle in ("starting", "launch_failed")
+                and record.adapter == "herdr-pane"
+                and record.custom_process_identity is not None):
+            info = self.client.pane_info(pane_id)
+            if (info.pane_id == pane_id and info.workspace_id == record.workspace_id
+                    and os.path.realpath(info.cwd) == os.path.realpath(record.cwd)):
+                try:
+                    self.client.verify_custom_harness(
+                        pane_id, record.harness, record.custom_process_identity
+                    )
+                    return
+                except HerdrUnavailable:
+                    pass
+        # Preserve the original failed-launch fallback exactly. A stale report plus
+        # return to the original shell is sufficient only after agentctl itself
+        # reported that pane; an unreported pre-readiness pane remains unowned.
+        if (record.lifecycle == "launch_failed" and record.adapter == "herdr-pane"
+                and record.pane_reported_by_agentctl):
+            info = self.client.pane_info(pane_id)
+            if (info.pane_id == pane_id and info.workspace_id == record.workspace_id
+                    and os.path.realpath(info.cwd) == os.path.realpath(record.cwd)
+                    and info.agent == record.harness
+                    and self.client.pane_is_idle_shell(pane_id)):
+                return
+        if (record.lifecycle == "starting" and record.adapter == "herdr-pane"
+                and record.custom_process_identity is None):
+            raise HerdrUnavailable(
+                f"cannot prove starting custom harness ownership in pane {pane_id}"
+            )
+        self._checked(record)
 
     def status(self, name: str) -> dict[str, object]:
         """Report live state or a visible probe error, preserving every durable record."""
@@ -683,8 +886,12 @@ class ManagedAgents:
         result["goal_source"] = "requested" if record.goal is not None else None
         result["goal_delivery"] = self._goal_delivery(record)
         try:
-            self._checked(record)
-            result.update(agent.status(self.client, record.target(), self._queue(name)))
+            client = cast(
+                HerdrClient,
+                _WorkspaceClient(self.client, record, check_prompt=False),
+            )
+            agent.resolve_target(client, record.target())
+            result.update(agent.status(client, record.target(), self._queue(name)))
             result["probe_error"] = None
         except HerdrRunError as exc:
             result["agent_status"], result["probe_error"] = "unknown", str(exc)
@@ -906,8 +1113,9 @@ class ManagedAgents:
             if owned:
                 if len(owned) != 1 or owned[0].pane_id != record.pane_id or owned[0].workspace_id != record.workspace_id:
                     raise AgentDeliveryError("refusing to close a tab whose pane ownership changed")
-                if record.lifecycle == "running" or self.client.pane_info(owned[0].pane_id).agent is not None:
-                    self._checked(record)
+                if (record.adapter == "herdr-pane" or record.lifecycle == "running"
+                        or self.client.pane_info(owned[0].pane_id).agent is not None):
+                    self._checked_or_failed_pane_report(record, owned[0].pane_id)
                 try:
                     output = self.client.read(owned[0].pane_id, source="recent-unwrapped", lines=5000)
                     if not output:
@@ -918,8 +1126,9 @@ class ManagedAgents:
                     raise AgentDeliveryError(f"cannot preserve terminal output before stop: {exc}") from exc
                 # Output capture can involve another control round trip. Recheck
                 # the owned native identity before acting on that pane again.
-                if record.lifecycle == "running" or self.client.pane_info(owned[0].pane_id).agent is not None:
-                    self._checked(record)
+                if (record.adapter == "herdr-pane" or record.lifecycle == "running"
+                        or self.client.pane_info(owned[0].pane_id).agent is not None):
+                    self._checked_or_failed_pane_report(record, owned[0].pane_id)
                 record.lifecycle = "stopping"
                 self._save(record)
                 assert record.pane_id is not None
