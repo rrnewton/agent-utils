@@ -160,7 +160,10 @@ def _codex_config_key(argv: tuple[str, ...], index: int) -> str | None:
         assignment = item[2:].removeprefix("=")
     if assignment is None or "=" not in assignment:
         return None
-    return assignment.split("=", 1)[0].strip()
+    key = assignment.split("=", 1)[0].strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in ('"', "'"):
+        return key[1:-1]
+    return key
 
 
 def validate_raw_harness_arguments(
@@ -169,6 +172,12 @@ def validate_raw_harness_arguments(
     structured_resume: bool = False,
 ) -> None:
     """Keep structured model and effort settings authoritative over raw argv."""
+    validate_structured_harness_argument_conflicts(
+        harness, argv, label=label,
+        structured_model=structured_model,
+        structured_effort=structured_effort,
+        structured_resume=structured_resume,
+    )
     arguments = tuple(argv)
     option_keys = [item.split("=", 1)[0] for item in arguments if item.startswith("-")]
     config_keys = {
@@ -193,6 +202,45 @@ def validate_raw_harness_arguments(
         raise AgentDeliveryError(
             f"{label} cannot combine structured model or reasoning effort "
             "with raw Codex config or profile arguments"
+        )
+
+
+def validate_structured_harness_argument_conflicts(
+    harness: str, argv: tuple[str, ...] | list[str], *, label: str,
+    structured_model: bool = False, structured_effort: bool = False,
+    structured_resume: bool = False,
+) -> None:
+    """Reject only raw arguments that duplicate an active structured selector.
+
+    The primary CLI and profiles apply the stricter raw-policy validator above.
+    This narrower check protects direct API callers while leaving raw arguments
+    unchanged when the corresponding structured field is absent.
+    """
+    arguments = tuple(argv)
+    option_keys = [item.split("=", 1)[0] for item in arguments if item.startswith("-")]
+    config_keys = {
+        key for index in range(len(arguments))
+        if (key := _codex_config_key(arguments, index)) is not None
+    } if harness == "codex" else set()
+    if structured_model and (
+        any(_value_option(item, "-m", "--model") for item in arguments)
+        or "model" in config_keys
+    ):
+        raise AgentDeliveryError(f"{label} must set model with the model field")
+    if structured_effort and (
+        any(key in ("--reasoning-effort", "--effort") for key in option_keys)
+        or any(item.startswith("model_reasoning_effort=") for item in arguments)
+        or "model_reasoning_effort" in config_keys
+    ):
+        raise AgentDeliveryError(
+            f"{label} must set reasoning effort with the reasoning_effort field"
+        )
+    if (harness == "codex" and (structured_model or structured_effort)
+            and ("profile" in config_keys
+                 or any(_value_option(item, "-p", "--profile") for item in arguments))):
+        raise AgentDeliveryError(
+            f"{label} cannot combine structured model or reasoning effort "
+            "with a raw Codex profile selector"
         )
     duplicate_resume = (
         harness == "codex" and "resume" in arguments
@@ -327,21 +375,15 @@ def load_profiles(cwd: str | Path, *, absent_ok: bool = False) -> tuple[Path, di
     return path, dict(sorted(profiles.items()))
 
 
-def profile_arguments(profile: LaunchProfile) -> tuple[str, ...]:
-    """Translate structured settings to literal harness argv."""
-    args = list(reasoning_arguments(profile.harness, profile.reasoning_effort))
-    args.extend(profile.argv)
-    return tuple(args)
-
-
 def validate_muse_headless_arguments(
     argv: tuple[str, ...] | list[str], *, profile: str | None = None,
 ) -> None:
     """Keep Muse exec's subcommand, session identity, and prompt runner-owned."""
     label = f"profile {profile!r}" if profile is not None else "Muse headless launch"
-    # Structured settings are compiled to two-token pairs before Sessions sees
-    # them. Other option values must remain in one literal ``--key=value``
-    # element, so an unowned positional can never replace the runner's prompt.
+    # Sessions compiles structured settings to two-token pairs before this
+    # final validation. Other option values must remain in one literal
+    # ``--key=value`` element, so an unowned positional can never replace the
+    # runner's prompt.
     seen_singletons: set[str] = set()
     index = 0
     while index < len(argv):

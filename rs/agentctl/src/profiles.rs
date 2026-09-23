@@ -184,7 +184,16 @@ fn codex_config_key(argv: &[String], index: usize) -> Option<&str> {
     } else {
         return None;
     };
-    assignment.split_once('=').map(|(key, _)| key.trim())
+    assignment.split_once('=').map(|(key, _)| {
+        let key = key.trim();
+        key.strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                key.strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(key)
+    })
 }
 
 pub(crate) fn validate_raw_harness_arguments(
@@ -195,6 +204,14 @@ pub(crate) fn validate_raw_harness_arguments(
     structured_effort: bool,
     structured_resume: bool,
 ) -> Result<(), AgentError> {
+    validate_structured_harness_argument_conflicts(
+        label,
+        harness,
+        argv,
+        structured_model,
+        structured_effort,
+        structured_resume,
+    )?;
     let option_keys = argv
         .iter()
         .filter(|value| value.starts_with('-'))
@@ -239,6 +256,61 @@ pub(crate) fn validate_raw_harness_arguments(
     {
         return Err(fail(format!(
             "{label} cannot combine structured model or reasoning effort with raw Codex config or profile arguments"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_structured_harness_argument_conflicts(
+    label: &str,
+    harness: &str,
+    argv: &[String],
+    structured_model: bool,
+    structured_effort: bool,
+    structured_resume: bool,
+) -> Result<(), AgentError> {
+    let option_keys = argv
+        .iter()
+        .filter(|value| value.starts_with('-'))
+        .map(|value| value.split_once('=').map_or(value.as_str(), |(key, _)| key))
+        .collect::<Vec<_>>();
+    let config_keys = if harness == "codex" {
+        (0..argv.len())
+            .filter_map(|index| codex_config_key(argv, index))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if structured_model
+        && (argv
+            .iter()
+            .any(|value| value_option(value, "-m", "--model"))
+            || config_keys.contains(&"model"))
+    {
+        return Err(fail(format!("{label} must set model with the model field")));
+    }
+    if structured_effort
+        && (option_keys
+            .iter()
+            .any(|key| matches!(*key, "--reasoning-effort" | "--effort"))
+            || argv
+                .iter()
+                .any(|value| value.starts_with("model_reasoning_effort="))
+            || config_keys.contains(&"model_reasoning_effort"))
+    {
+        return Err(fail(format!(
+            "{label} must set reasoning effort with the reasoning_effort field"
+        )));
+    }
+    if harness == "codex"
+        && (structured_model || structured_effort)
+        && (config_keys.contains(&"profile")
+            || argv
+                .iter()
+                .any(|value| value_option(value, "-p", "--profile")))
+    {
+        return Err(fail(format!(
+            "{label} cannot combine structured model or reasoning effort with a raw Codex profile selector"
         )));
     }
     let duplicate_resume = (harness == "codex" && argv.iter().any(|value| value == "resume"))
@@ -625,10 +697,4 @@ pub(crate) fn reasoning_arguments(
             "reasoning effort is not supported for harness {harness:?}"
         ))),
     }
-}
-
-pub(crate) fn profile_arguments(profile: &LaunchProfile) -> Result<Vec<String>, AgentError> {
-    let mut arguments = reasoning_arguments(&profile.harness, profile.reasoning_effort.as_deref())?;
-    arguments.extend_from_slice(&profile.argv);
-    Ok(arguments)
 }

@@ -25,6 +25,8 @@ class FakeManagedClient:
         self.environments: list[tuple[str, ...]] = []
         self.closed: list[str] = []
         self.submitted: list[str] = []
+        self.panes_calls = 0
+        self.pane_info_calls = 0
         self.serial = 0
         self.offline = False
         self.fail_start = False
@@ -123,11 +125,13 @@ class FakeManagedClient:
         return matches[-1]
 
     def pane_info(self, pane_id: str) -> AgentPaneInfo:
+        self.pane_info_calls += 1
         if self.offline:
             raise HerdrUnavailable("server unavailable")
         return self.infos[pane_id]
 
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
+        self.panes_calls += 1
         del workspace_id
         if self.offline:
             raise HerdrUnavailable("server unavailable")
@@ -249,6 +253,115 @@ def test_invalid_environment_is_refused_before_registry_or_tab_creation(
         manager.start("worker", cwd=str(tmp_path), environment=("BAD-NAME=value",))
     assert not (tmp_path / "registry").exists()
     assert fake.environments == []
+
+
+def test_interactive_muse_refuses_raw_duplicate_structured_options_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="model field"):
+        manager.start(
+            "worker", cwd=str(tmp_path), harness="muse", model="structured",
+            harness_args=("--model", "raw"),
+        )
+    with pytest.raises(AgentDeliveryError, match="reasoning effort"):
+        manager.start(
+            "worker", cwd=str(tmp_path), harness="muse", reasoning_effort="ultra",
+            harness_args=("--reasoning-effort=low",),
+        )
+    assert not manager.registry.exists()
+    assert fake.launched == []
+    assert fake.environments == []
+
+
+def test_interactive_start_rejects_string_harness_arguments_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="harness arguments must be a sequence"):
+        manager.start(
+            "worker", cwd=str(tmp_path), harness="muse", model="structured",
+            harness_args="--model=raw",
+        )
+    assert not manager.registry.exists()
+    assert fake.launched == []
+    assert fake.environments == []
+
+
+def test_direct_start_preserves_unstructured_raw_policy_and_nonoverriding_codex_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start(
+        "claude-worker", cwd=str(tmp_path), harness="claude",
+        harness_args=("--effort=high",),
+    )
+    manager.start(
+        "codex-worker", cwd=str(tmp_path), harness="codex", model="structured",
+        harness_args=("-c", "sandbox_mode=read-only"),
+    )
+    assert fake.launched[0][3] == ("--effort=high",)
+    assert fake.launched[1][3] == (
+        "--no-alt-screen", "--model", "structured", "-c", "sandbox_mode=read-only",
+    )
+
+
+def test_direct_start_rejects_quoted_config_and_opaque_profile_conflicts_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="model field"):
+        manager.start(
+            "worker", cwd=str(tmp_path), model="structured",
+            harness_args=('--config="model"="raw"',),
+        )
+    with pytest.raises(AgentDeliveryError, match="reasoning effort"):
+        manager.start(
+            "worker", cwd=str(tmp_path), reasoning_effort="ultra",
+            harness_args=('-c"model_reasoning_effort"="low"',),
+        )
+    with pytest.raises(AgentDeliveryError, match="raw Codex profile"):
+        manager.start(
+            "worker", cwd=str(tmp_path), model="structured",
+            harness_args=("--profile", "attacker"),
+        )
+    with pytest.raises(AgentDeliveryError, match="raw Codex profile"):
+        manager.start(
+            "worker", cwd=str(tmp_path), reasoning_effort="ultra",
+            harness_args=("-pattacker",),
+        )
+    for arguments in (
+        ("-c", "profile=attacker"),
+        ("--config=profile=attacker",),
+        ('-c"profile"="attacker"',),
+    ):
+        with pytest.raises(AgentDeliveryError, match="raw Codex profile"):
+            manager.start(
+                "worker", cwd=str(tmp_path), model="structured",
+                harness_args=arguments,
+            )
+    assert not manager.registry.exists()
+    assert fake.launched == []
+    assert fake.environments == []
+
+
+def test_adoption_rejects_muse_before_registry_or_live_pane_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    fake.workspace = "w1"
+    fake.presentations.append(Pane("w1:p1", "w1:t1", "w1"))
+    fake.infos["w1:p1"] = AgentPaneInfo(
+        "w1:p1", "w1", str(tmp_path), "muse", "idle", None, None,
+    )
+    with pytest.raises(AgentDeliveryError, match="adopting Muse is unsupported"):
+        manager.adopt(
+            "worker", pane_id="w1:p1", expected_workspace="subagents",
+            expected_cwd=str(tmp_path), harness="muse",
+        )
+    assert not manager.registry.exists()
+    assert fake.panes_calls == 0
+    assert fake.pane_info_calls == 0
 
 
 def test_failed_launch_status_does_not_retain_environment_values(

@@ -1288,7 +1288,28 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     /// Start one fresh tab and retain failed launch artifacts for diagnosis.
-    pub fn start(&self, agent_name: &str, cwd: &Path, mut options: StartOptions) -> Result<Value> {
+    pub fn start(&self, agent_name: &str, cwd: &Path, options: StartOptions) -> Result<Value> {
+        self.start_inner(agent_name, cwd, options, None)
+    }
+
+    /// Start one fresh tab with an explicit structured reasoning effort.
+    pub fn start_with_reasoning_effort(
+        &self,
+        agent_name: &str,
+        cwd: &Path,
+        reasoning_effort: &str,
+        options: StartOptions,
+    ) -> Result<Value> {
+        self.start_inner(agent_name, cwd, options, Some(reasoning_effort))
+    }
+
+    fn start_inner(
+        &self,
+        agent_name: &str,
+        cwd: &Path,
+        mut options: StartOptions,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Value> {
         name(agent_name)?;
         let cwd = fs::canonicalize(cwd)
             .map_err(|_| fail(format!("cwd is not a directory: {}", cwd.display())))?;
@@ -1301,11 +1322,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if options.brief.as_deref().is_some_and(str::is_empty) {
             return Err(fail("brief must not be empty"));
         }
+        if matches!(options.harness.as_str(), "codex" | "claude" | "muse") {
+            crate::profiles::validate_structured_harness_argument_conflicts(
+                &format!("{} launch", options.harness),
+                &options.harness,
+                &options.harness_args,
+                options.model.is_some(),
+                reasoning_effort.is_some(),
+                options.resume.is_some(),
+            )?;
+        }
+        let mut structured_arguments =
+            crate::profiles::reasoning_arguments(&options.harness, reasoning_effort)?;
+        structured_arguments.extend_from_slice(&options.harness_args);
         let arguments = harness_arguments(
             &options.harness,
             options.model.as_deref(),
             options.resume.as_deref(),
-            &options.harness_args,
+            &structured_arguments,
         )?;
         options.environment = environment_entries(&options.environment)?;
         let _lock = self.lock(agent_name)?;
@@ -1404,6 +1438,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             ));
         }
         harness_arguments(&options.harness, None, None, &[])?;
+        if options.harness == "muse" {
+            return Err(fail(
+                "adopting Muse is unsupported because agentctl cannot yet pin the existing foreground process identity; start an owned Muse session instead",
+            ));
+        }
         let cwd = fs::canonicalize(&options.cwd)
             .map_err(|_| fail(format!("cwd is not a directory: {}", options.cwd.display())))?;
         if !cwd.is_dir() {
@@ -2581,6 +2620,8 @@ mod tests {
                 client: Fake {
                     root: root.clone(),
                     panes: Mutex::new(Vec::new()),
+                    panes_calls: AtomicU64::new(0),
+                    pane_info_calls: AtomicU64::new(0),
                     runs: Mutex::new(Vec::new()),
                     environments: Mutex::new(Vec::new()),
                     closed: Mutex::new(Vec::new()),
@@ -2665,6 +2706,8 @@ mod tests {
     struct Fake {
         root: PathBuf,
         panes: Mutex<Vec<Pane>>,
+        panes_calls: AtomicU64,
+        pane_info_calls: AtomicU64,
         runs: Mutex<Vec<String>>,
         environments: Mutex<Vec<Vec<String>>>,
         closed: Mutex<Vec<String>>,
@@ -2706,6 +2749,7 @@ mod tests {
     }
     impl AgentApi for Fake {
         fn panes(&self) -> AdapterResult<Vec<Pane>> {
+            self.panes_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail_panes.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable(
                     "pane query failed after allocation",
@@ -2714,6 +2758,7 @@ mod tests {
             Ok(self.panes.lock().unwrap().clone())
         }
         fn pane_info(&self, pane: &str) -> AdapterResult<AgentPaneInfo> {
+            self.pane_info_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail_panes.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable(
                     "pane query failed after allocation",
@@ -3013,6 +3058,182 @@ mod tests {
         assert!(error.to_string().contains("environment variable name"));
         assert!(!fixture.root.join("registry").exists());
         assert!(fixture.client.environments.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn interactive_muse_refuses_raw_duplicate_structured_options_before_allocation() {
+        let fixture = Fixture::new();
+        let model_error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    model: Some("structured".to_owned()),
+                    harness_args: vec!["--model".to_owned(), "raw".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(model_error.to_string().contains("model field"));
+        let effort_error = fixture
+            .manager()
+            .start_with_reasoning_effort(
+                "worker",
+                &fixture.root,
+                "ultra",
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    harness_args: vec!["--reasoning-effort=low".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(effort_error.to_string().contains("reasoning effort"));
+        assert!(!fixture.root.join("registry").exists());
+        assert!(!fixture.client.started.load(Ordering::Relaxed));
+        assert!(fixture.client.environments.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn direct_start_preserves_unstructured_raw_policy_and_nonoverriding_codex_config() {
+        let unstructured = Fixture::new();
+        let unstructured_status = unstructured
+            .manager()
+            .start(
+                "worker",
+                &unstructured.root,
+                StartOptions {
+                    harness_args: vec!["--reasoning-effort=high".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            unstructured_status["arguments"],
+            json!(["--no-alt-screen", "--reasoning-effort=high"])
+        );
+
+        let codex = Fixture::new();
+        let codex_status = codex
+            .manager()
+            .start(
+                "worker",
+                &codex.root,
+                StartOptions {
+                    model: Some("structured".to_owned()),
+                    harness_args: vec!["-c".to_owned(), "sandbox_mode=read-only".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            codex_status["arguments"],
+            json!([
+                "--no-alt-screen",
+                "--model",
+                "structured",
+                "-c",
+                "sandbox_mode=read-only"
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_start_rejects_quoted_config_and_opaque_profile_conflicts_before_allocation() {
+        let fixture = Fixture::new();
+        let model_error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    model: Some("structured".to_owned()),
+                    harness_args: vec!["--config=\"model\"=\"raw\"".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(model_error.to_string().contains("model field"));
+        let effort_error = fixture
+            .manager()
+            .start_with_reasoning_effort(
+                "worker",
+                &fixture.root,
+                "ultra",
+                StartOptions {
+                    harness_args: vec!["-c\"model_reasoning_effort\"=\"low\"".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(effort_error.to_string().contains("reasoning effort"));
+        let profile_model_error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    model: Some("structured".to_owned()),
+                    harness_args: vec!["--profile".to_owned(), "attacker".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(profile_model_error
+            .to_string()
+            .contains("raw Codex profile"));
+        let profile_effort_error = fixture
+            .manager()
+            .start_with_reasoning_effort(
+                "worker",
+                &fixture.root,
+                "ultra",
+                StartOptions {
+                    harness_args: vec!["-pattacker".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(profile_effort_error
+            .to_string()
+            .contains("raw Codex profile"));
+        for arguments in [
+            vec!["-c".to_owned(), "profile=attacker".to_owned()],
+            vec!["--config=profile=attacker".to_owned()],
+            vec!["-c\"profile\"=\"attacker\"".to_owned()],
+        ] {
+            let error = fixture
+                .manager()
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        model: Some("structured".to_owned()),
+                        harness_args: arguments,
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("raw Codex profile"));
+        }
+        assert!(!fixture.root.join("registry").exists());
+        assert!(!fixture.client.started.load(Ordering::Relaxed));
+        assert!(fixture.client.environments.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn adoption_rejects_muse_before_registry_or_live_pane_access() {
+        let fixture = Fixture::new();
+        fixture.prepare_foreign();
+        let mut options = fixture.adopt_options();
+        options.harness = "muse".to_owned();
+        let error = fixture.manager().adopt("foreign", options).unwrap_err();
+        assert!(error.to_string().contains("adopting Muse is unsupported"));
+        assert!(!fixture.root.join("registry").exists());
+        assert_eq!(fixture.client.panes_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fixture.client.pane_info_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -1020,6 +1020,70 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
         report.require(f"managed/{kind}/literal-launch", _state(case.python_root).get("launch_arguments") == _state(case.rust_root).get("launch_arguments"),
                        "harness arguments differed")
 
+    compatibility_cases = (
+        (
+            "claude-unstructured-effort",
+            ("--harness", "claude", "--harness-arg=--effort=high"),
+            ["--effort=high"],
+        ),
+        (
+            "codex-nonoverriding-config",
+            (
+                "--harness", "codex", "--model", "selected-model",
+                "--harness-arg=-c", "--harness-arg=sandbox_mode=read-only",
+            ),
+            [
+                "--no-alt-screen", "--model", "selected-model",
+                "-c", "sandbox_mode=read-only",
+            ],
+        ),
+    )
+    for label, launch_policy, expected_arguments in compatibility_cases:
+        case = harness.case(f"managed-compatibility-{label}")
+        common = (
+            "--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry",
+            "--goal-command-json", '["<HERDR>","goal-rpc"]',
+        )
+        outcomes = harness.invoke(case, (
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            *launch_policy, *common,
+        ))
+        report.require(
+            f"managed/compatibility/{label}",
+            all(outcome.returncode == 0 for outcome in outcomes)
+            and all(
+                _state(root).get("launch_arguments") == expected_arguments
+                for root in (case.python_root, case.rust_root)
+            ),
+            f"legacy raw launch policy regressed: {outcomes!r}",
+        )
+
+    profile_selectors = (
+        ("split-config-profile", ("--harness-arg=-c", "--harness-arg=profile=attacker")),
+        ("attached-config-profile", ("--harness-arg=--config=profile=attacker",)),
+        ("quoted-config-profile", ('--harness-arg=-c"profile"="attacker"',)),
+    )
+    for label, raw_arguments in profile_selectors:
+        case = harness.case(f"managed-profile-selector-refusal-{label}")
+        common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
+        outcomes = harness.invoke(case, (
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "--harness", "codex", "--model", "structured",
+            *raw_arguments, *common,
+        ))
+        report.require(
+            f"managed/profile-selector-refusal/{label}",
+            all(
+                outcome.returncode == 75 and "raw Codex profile" in outcome.stderr
+                for outcome in outcomes
+            )
+            and all(
+                not (root / "registry").exists()
+                for root in (case.python_root, case.rust_root)
+            ),
+            f"indirect Codex profile selector was accepted or allocated state: {outcomes!r}",
+        )
+
     # A record written by Python can be read, messaged and archived by Rust, and vice versa.
     for label, producer, consumer in (("python-rust", harness.python, harness.rust), ("rust-python", harness.rust, harness.python)):
         case = harness.case(f"managed-interop-{label}")

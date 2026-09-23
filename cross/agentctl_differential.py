@@ -120,6 +120,7 @@ def _orientation(harness: Harness, report: Report) -> None:
                            and ("--env" in outcome.stdout if arguments == ("start", "--help") else True)
                            and (all(option in outcome.stdout for option in
                                     ("--pane", "--workspace", "--cwd", "--harness", "--session"))
+                                and "muse is refused" in outcome.stdout.lower()
                                 if arguments == ("adopt", "--help") else True),
                            f"missing operation help: {outcome!r}")
     for command in ("quickstart", "userguide"):
@@ -239,6 +240,11 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "model": "kiki_gb300_mxfp8_6p2_840_nwr", "reasoning_effort": "ultra",
                 "argv": [], "env": {},
             },
+            "watermelon-exec": {
+                "harness": "muse", "mode": "headless",
+                "model": "kiki_gb300_mxfp8_6p2_840_nwr", "reasoning_effort": "ultra",
+                "argv": ["--image=private-fixture.png"], "env": {},
+            },
             "muse-literal": {
                 "harness": "muse", "mode": "interactive",
                 "argv": [
@@ -275,8 +281,26 @@ def _profiles(harness: Harness, report: Report) -> None:
             config = directory / "profiles.json"
             config.write_text(json.dumps(document), encoding="utf-8")
             config.chmod(0o600)
-        _pair(harness, report, case, f"primary/profile/{profile}/list",
-              ("profiles", "--cwd", "<ROOT>"))
+        listed = _pair(harness, report, case, f"primary/profile/{profile}/list",
+                       ("profiles", "--cwd", "<ROOT>"))
+        for edition, outcome in zip(("python", "rust"), listed, strict=True):
+            public = json.loads(outcome.stdout)
+            serialized = json.dumps(public, sort_keys=True)
+            report.require(
+                f"primary/profile/{profile}/list-redaction/{edition}",
+                "azure-codex-cyber:openai" not in serialized
+                and "--dangerously-enable-internet-mode" not in serialized
+                and "private-fixture.png" not in serialized
+                and any(
+                    item.get("name") == "watermelon-exec"
+                    and item.get("harness") == "muse"
+                    and item.get("mode") == "headless"
+                    and item.get("argv_count") == 1
+                    and item.get("environment") == []
+                    for item in public.get("profiles", [])
+                ),
+                f"safe profile metadata disclosed private values or omitted headless Muse: {public!r}",
+            )
         python, rust = _pair(harness, report, case, f"primary/profile/{profile}/start", (
             "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
             "--profile", profile, *_COMMON,
@@ -652,6 +676,8 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
          ('--config="model"="attacker"',)),
         ("effort-quoted-config-key", "codex", ("--reasoning-effort", "ultra"),
          ('--config="model_reasoning_effort"="low"',)),
+        ("model-opaque-config", "codex", ("--model", "structured"),
+         ("--config=sandbox_mode=read-only",)),
         ("codex-resume", "codex", ("--resume", "session-1"), ("resume",)),
         ("claude-resume", "claude", ("--resume", "session-1"), ("--continue",)),
     )
@@ -667,6 +693,26 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
         report.require(f"primary/profile/refusal/direct-{label}",
                        all(outcome.returncode == 75 for outcome in outcomes),
                        f"direct launch precedence was ambiguous: {outcomes!r}")
+        report.require(
+            f"primary/profile/refusal/direct-{label}-atomic",
+            all(not (root / "registry").exists()
+                for root in (case.python_root, case.rust_root)),
+            "rejected direct launch allocated registry state",
+        )
+
+    adopt_muse = harness.case("primary-adopt-muse-refusal")
+    outcomes = harness.invoke(adopt_muse, (
+        "adopt", "worker", "--pane", "w1:p1", "--workspace", "project",
+        "--cwd", "<ROOT>", "--harness", "muse", *_COMMON,
+    ))
+    report.require(
+        "primary/adopt/muse-refusal",
+        all(outcome.returncode == 75 and "adopting Muse is unsupported" in outcome.stderr
+            for outcome in outcomes)
+        and all(not (root / "registry").exists()
+                for root in (adopt_muse.python_root, adopt_muse.rust_root)),
+        f"Muse adoption was accepted or allocated state: {outcomes!r}",
+    )
 
     hostile_path = harness.case("primary-profile-hostile-path", {"hostile_path": True})
     for root in (hostile_path.python_root, hostile_path.rust_root):
@@ -971,6 +1017,147 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
                        "another edition discarded unknown record metadata during handoff/retirement")
 
 
+def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None:
+    """Read and drain one literal pre-profile adopted record and queue artifact."""
+
+    case = harness.case("primary-legacy-adopted-registry")
+    # The field set is derived from AgentRecord in pre-profile revision
+    # 475c2498c2c54767f70e3056cf6fda668738205a. These are constructed test
+    # artifacts rather than captured command output; each root has distinct
+    # expected_cwd bytes, which are frozen before either edition reads them.
+    for root in (case.python_root, case.rust_root):
+        agent_root = root / "registry/foreign"
+        queue = agent_root / "queue"
+        for directory in (
+            root / "registry", agent_root, queue,
+            queue / "inbox", queue / "inflight", queue / "processed", queue / "failed",
+        ):
+            directory.mkdir(mode=0o700, exist_ok=True)
+            directory.chmod(0o700)
+        record = {
+            "name": "foreign",
+            "token": "legacy-token",
+            "harness": "codex",
+            "cwd": str(root),
+            "created_at": 1.0,
+            "schema": 1,
+            "lifecycle": "running",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "pane_id": "w1:p1",
+            "session_agent": "codex",
+            "session_value": "session-1",
+            "model": None,
+            "resume": None,
+            "arguments": [],
+            "error": None,
+            "goal": None,
+            "goal_delivery": None,
+            "goal_session_id": None,
+            "goal_command": None,
+            "goal_messages": {},
+            "goal_message_id": None,
+            "adapter": "herdr-foreign",
+            "mode": "interactive",
+            "backend": "herdr",
+            "paused": False,
+            "runtime_home": None,
+        }
+        binding = {
+            "kind": "session",
+            "agent": "codex",
+            "value": "session-1",
+            "expected_agent": "codex",
+            "expected_workspace": None,
+            "expected_cwd": str(root),
+        }
+        artifacts = {
+            agent_root / "agent.json": json.dumps(record, sort_keys=True) + "\n",
+            queue / "target.json": json.dumps(binding, sort_keys=True) + "\n",
+            queue / "inbox/000000000007.json": (
+                '{"seq":7,"text":"legacy fifo","tui_delivery_attempts":0}\n'
+            ),
+        }
+        for path, content in artifacts.items():
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o600)
+
+    immutable_paths = ("agent.json", "queue/target.json")
+    immutable_before = [
+        {
+            relative: (root / "registry/foreign" / relative).read_bytes()
+            for relative in immutable_paths
+        }
+        for root in (case.python_root, case.rust_root)
+    ]
+    queue_before_status = [
+        _queue_snapshot(root, "registry/foreign/queue")
+        for root in (case.python_root, case.rust_root)
+    ]
+
+    python, _ = _pair(
+        harness, report, case, "primary/legacy-adopted/status",
+        ("status", "foreign", *_COMMON),
+    )
+    status = _json(python)
+    report.require(
+        "primary/legacy-adopted/status-shape",
+        isinstance(status, dict)
+        and status.get("adapter") == "herdr-foreign"
+        and status.get("agent_status") == "idle"
+        and status.get("pending") == ["000000000007"],
+        f"pre-profile adopted record or pending queue was not readable: {status!r}",
+    )
+    immutable_after_status = [
+        {
+            relative: (root / "registry/foreign" / relative).read_bytes()
+            for relative in immutable_paths
+        }
+        for root in (case.python_root, case.rust_root)
+    ]
+    queue_after_status = [
+        _queue_snapshot(root, "registry/foreign/queue")
+        for root in (case.python_root, case.rust_root)
+    ]
+    report.require(
+        "primary/legacy-adopted/status-nonmutation",
+        immutable_after_status == immutable_before
+        and queue_after_status == queue_before_status,
+        "status rewrote the pre-profile record, binding, or queue",
+    )
+    _pair(
+        harness, report, case, "primary/legacy-adopted/drain",
+        ("drain", "foreign", *_COMMON),
+    )
+    snapshots = [
+        _queue_snapshot(root, "registry/foreign/queue")
+        for root in (case.python_root, case.rust_root)
+    ]
+    immutable_after_drain = [
+        {
+            relative: (root / "registry/foreign" / relative).read_bytes()
+            for relative in immutable_paths
+        }
+        for root in (case.python_root, case.rust_root)
+    ]
+    processed = snapshots[0].get("processed/000000000007.json")
+    report.require(
+        "primary/legacy-adopted/drained-once",
+        all(_state(root).get("submitted") == ["legacy fifo"]
+            and not list((root / "registry/foreign/queue/inbox").iterdir())
+            and (root / "registry/foreign/queue/processed/000000000007.json").is_file()
+            for root in (case.python_root, case.rust_root))
+        and immutable_after_drain == immutable_before
+        and snapshots[0] == snapshots[1]
+        and set(snapshots[0]) == {"processed/000000000007.json"}
+        and isinstance(processed, dict)
+        and processed.get("seq") == 7
+        and processed.get("text") == "legacy fifo"
+        and processed.get("tui_delivery_attempts") == 0,
+        f"pre-profile pending artifact diverged or was lost: {snapshots!r}",
+    )
+
+
 def _ownership(harness: Harness, report: Report) -> None:
     for label, change in (("unavailable", {"offline": True}), ("replacement", {"name": "different"}),
                           ("late-human-pane", {"extra_pane_on_read": True})):
@@ -1128,6 +1315,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
         _profile_refusals(harness, report)
         _handoff_and_pending(harness, report)
         _registry_and_interop(harness, report)
+        _legacy_adopted_registry_and_queue(harness, report)
         _ownership(harness, report)
         _adoption(harness, report)
         _invalid_cli(harness, report)

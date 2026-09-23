@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
@@ -15,7 +16,11 @@ from agentctl import agent
 from agentctl.client import HerdrClient, _bounded_control_command
 from agentctl.errors import AgentDeliveryError, HerdrRunError
 from agentctl.jsonx import as_mapping
-from agentctl.profiles import validate_muse_headless_arguments
+from agentctl.profiles import (
+    reasoning_arguments,
+    validate_muse_headless_arguments,
+    validate_structured_harness_argument_conflicts,
+)
 from agentctl.subagents import AgentRecord, ManagedAgents, _name
 
 
@@ -61,28 +66,51 @@ class Sessions(ManagedAgents):
 
     def start_session(self, name: str, *, cwd: str, mode: str = "interactive",
                       backend: str = "herdr", harness: str = "codex", model: str | None = None,
-                      brief: str | None = None, **options: object) -> dict[str, object]:
+                      reasoning_effort: str | None = None,
+                      resume: str | None = None, harness_args: Sequence[str] = (),
+                      environment: Sequence[str] = (), brief: str | None = None,
+                      workspace_id: str | None = None, startup_timeout: float = 30.0,
+                      ready_timeout: float = 900.0, working_timeout: float = 30.0,
+                      max_attempts: int = 3) -> dict[str, object]:
         """Create a native interactive terminal or a persistent headless runner."""
         _name(name)
         if mode == "interactive":
             if backend != "herdr":
                 raise AgentDeliveryError("interactive sessions require Herdr; tmux supports headless runners")
-            return super().start(name, cwd=cwd, harness=harness, model=model, brief=brief, **options)  # type: ignore[arg-type]
+            return super().start(
+                name, cwd=cwd, harness=harness, model=model,
+                reasoning_effort=reasoning_effort, resume=resume,
+                harness_args=harness_args, environment=environment, brief=brief,
+                workspace_id=workspace_id, startup_timeout=startup_timeout,
+                ready_timeout=ready_timeout, working_timeout=working_timeout,
+                max_attempts=max_attempts,
+            )
         if mode != "headless" or backend not in ("herdr", "tmux") or harness not in ("codex", "agy", "muse"):
             raise AgentDeliveryError("headless sessions support codex/agy/muse with herdr/tmux")
-        if any(options.get(key) for key in ("resume", "workspace_id", "environment")):
+        if resume is not None or workspace_id is not None or environment:
             raise AgentDeliveryError(
                 "headless start does not accept resume, workspace-id, or environment"
             )
-        harness_args = options.get("harness_args", ())
-        if not isinstance(harness_args, (list, tuple)) or any(
-            not isinstance(item, str) or not item or "\0" in item for item in harness_args
+        if isinstance(harness_args, (str, bytes)) or any(
+            not isinstance(item, str) or not item or "\0" in item
+            for item in harness_args
         ):
             raise AgentDeliveryError("headless harness arguments must be nonempty and contain no NUL")
         if harness != "muse" and harness_args:
             raise AgentDeliveryError("headless harness arguments currently apply only to Muse")
+        if harness != "muse" and reasoning_effort is not None:
+            raise AgentDeliveryError(
+                f"headless {harness} does not support reasoning_effort"
+            )
         if harness == "muse":
-            validate_muse_headless_arguments(list(harness_args))
+            validate_structured_harness_argument_conflicts(
+                harness, list(harness_args), label="Muse headless launch",
+                structured_model=model is not None,
+                structured_effort=reasoning_effort is not None,
+            )
+        arguments = (*reasoning_arguments(harness, reasoning_effort), *harness_args)
+        if harness == "muse":
+            validate_muse_headless_arguments(list(arguments))
         root = str(Path(cwd).expanduser().resolve())
         if not Path(root).is_dir():
             raise AgentDeliveryError(f"cwd is not a directory: {root}")
@@ -98,7 +126,7 @@ class Sessions(ManagedAgents):
                 try:
                     response = self._worker(record, "start", cwd=root, harness=harness,
                                             model=model, backend=backend, brief=brief,
-                                            harness_args=list(harness_args))
+                                            harness_args=list(arguments))
                     self._sync_worker_record(record, response, save=False)
                     if record.session_value is not None:
                         owner = self._identity_owner(

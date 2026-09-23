@@ -304,6 +304,8 @@ agentctl send reviewer 'Focus on cancellation and restart behavior'
 `--reasoning-effort` maps to the selected harness's structured effort option.
 `--harness-arg=ARG` passes a literal argument to an interactive harness and may
 be repeated. `--resume SESSION` resumes an explicitly identified conversation.
+When `--resume` is set, raw Codex `resume` and Claude
+`--resume`/`--continue` selectors are refused before registry state is created.
 Use `--workspace-id` to choose an exact Herdr workspace.
 
 Interactive Herdr starts also accept repeatable `--env KEY=VALUE`. Each entry is
@@ -366,6 +368,12 @@ herdr workspace get w1
 agentctl adopt reviewer --pane w1:p2 --workspace project \
   --cwd /work/project --harness codex
 ```
+
+Muse uses a custom pane protocol whose existing foreground process cannot yet be
+pinned during adoption, so `adopt --harness muse` is refused before registry
+state is created. Start an owned Muse session instead, either directly with
+`agentctl start --harness muse ...` or through a validated profile; other
+Herdr-native harness kinds keep the existing adoption path.
 
 Use the pane ID, working directory, harness, workspace ID, and workspace label
 reported by those read-only Herdr commands; do not infer them from a tab title.
@@ -634,6 +642,16 @@ uses `.herdr-agents` for managed sessions and `.herdr-agent` for an explicit
 delivery queue; `herdr-chat` uses `.herdr-chat`. The worker compatibility command
 uses `HERDR_SUBAGENTS_HOME`, or `$XDG_STATE_HOME/herdr-agent/foreign` (default:
 `~/.local/state/herdr-agent/foreign`).
+
+`herdr-agent start` continues to accept raw harness policy when the matching
+structured selector is absent, including a raw Claude `--effort=high`, and it
+accepts non-overriding Codex `-c` assignments. With structured `--model`, a raw
+model option, a Codex `model=...` assignment, or a Codex profile selector
+(`-p`/`--profile` or `-c`/`--config profile=...`) is refused before registry
+state is created. The shared API applies the same rule to an explicit structured
+reasoning effort; `herdr-agent` has no structured effort flag, so its raw effort
+arguments remain unchanged. A structured `--resume` also cannot be repeated
+through raw Codex `resume` or Claude `--resume`/`--continue` selectors.
 
 Use `agentctl --registry .herdr-agents` to continue a managed interactive
 registry. An independent worker-compatibility registry retains its own command

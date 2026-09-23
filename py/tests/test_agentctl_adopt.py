@@ -425,3 +425,4 @@ def test_adopt_help_names_every_required_identity_assertion(
     for value in ("--pane", "--workspace", "--cwd", "--harness", "--session",
                   "without taking ownership"):
         assert value in output
+    assert "muse is refused" in output.lower()

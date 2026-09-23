@@ -181,6 +181,39 @@ def test_headless_muse_accepts_compiled_effort_and_repeatable_literal_options() 
     ])
 
 
+def test_headless_muse_refuses_raw_duplicate_structured_options_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, calls = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="model field"):
+        sessions.start_session(
+            "worker", cwd=str(tmp_path), mode="headless", harness="muse",
+            model="structured", harness_args=("--model=raw",),
+        )
+    with pytest.raises(AgentDeliveryError, match="reasoning effort"):
+        sessions.start_session(
+            "worker", cwd=str(tmp_path), mode="headless", harness="muse",
+            reasoning_effort="ultra", harness_args=("--effort", "low"),
+        )
+    assert not (tmp_path / "registry").exists()
+    assert fake.environments == []
+    assert calls == []
+
+
+def test_headless_muse_rejects_string_harness_arguments_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, calls = setup(tmp_path, monkeypatch)
+    with pytest.raises(AgentDeliveryError, match="headless harness arguments"):
+        sessions.start_session(
+            "worker", cwd=str(tmp_path), mode="headless", harness="muse",
+            harness_args="--image=not-a-sequence-of-arguments",
+        )
+    assert not (tmp_path / "registry").exists()
+    assert fake.environments == []
+    assert calls == []
+
+
 def test_cli_headless_muse_profile_reaches_worker_with_exact_structured_arguments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -203,28 +236,46 @@ def test_cli_headless_muse_profile_reaches_worker_with_exact_structured_argument
         },
     }), encoding="utf-8")
     config.chmod(0o600)
-    captured: dict[str, object] = {}
+    fake = FakeManagedClient()
+    captured: list[dict[str, object]] = []
 
-    def start_session(
-        _sessions: Sessions, name: str, **options: object,
+    def worker(
+        _sessions: Sessions, record: AgentRecord, action: str, **options: object,
     ) -> dict[str, object]:
-        captured.update(options)
-        return {"name": name}
+        if action == "start":
+            captured.append(dict(options))
+        return {
+            "record": {
+                "mode": "headless", "backend": record.backend,
+                "session_id": "native-thread", "tmux_target": "workers:worker",
+                "presentation_pane": "w1:headless",
+            },
+            "result": {
+                "agents": [{
+                    "name": record.name, "status": "idle", "pending": 0,
+                    "runner_alive": True,
+                }],
+            },
+        }
 
-    monkeypatch.setattr(Sessions, "start_session", start_session)
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+    monkeypatch.setattr(Sessions, "_worker", worker)
     assert cli.main([
         "start", "worker", "--cwd", str(tmp_path),
+        "--registry", str(tmp_path / "registry"),
         "--profile", "watermelon-exec", "--brief", "return PROFILE_OK",
     ]) == 0
-    assert json.loads(capsys.readouterr().out) == {"name": "worker"}
-    assert captured["mode"] == "headless"
-    assert captured["harness"] == "muse"
-    assert captured["model"] == "kiki_gb300_mxfp8_6p2_840_nwr"
-    assert captured["harness_args"] == [
+    status = json.loads(capsys.readouterr().out)
+    assert status["name"] == "worker"
+    assert status["adapter"] == "turn-runner"
+    assert len(captured) == 1
+    assert captured[0]["harness"] == "muse"
+    assert captured[0]["model"] == "kiki_gb300_mxfp8_6p2_840_nwr"
+    assert captured[0]["harness_args"] == [
         "--reasoning-effort", "ultra", "--image=first.png", "--image=second.png",
     ]
-    assert captured["environment"] == []
-    assert captured["brief"] == "return PROFILE_OK"
+    assert captured[0]["brief"] == "return PROFILE_OK"
+    assert fake.launched == []
 
 
 def test_mcp_routes_into_the_cli_registry_and_honors_its_pause(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -42,6 +42,10 @@ while keeping their terminals available for direct inspection.
      --cwd /work/project --harness codex
    ```
 
+   `adopt --harness muse` is refused. Start an owned Muse session—for example,
+   through a validated profile—so agentctl can pin the exact foreground process
+   identity itself.
+
 3. Send follow-up work and inspect progress:
 
    ```sh

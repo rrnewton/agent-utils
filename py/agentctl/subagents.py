@@ -32,6 +32,10 @@ from agentctl.client import (
     muse_trust_prompt,
 )
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
+from agentctl.profiles import (
+    reasoning_arguments,
+    validate_structured_harness_argument_conflicts,
+)
 
 _NAME = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
 _KIND = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -495,6 +499,7 @@ class ManagedAgents:
     def start(
         self, name: str, *, cwd: str, workspace_id: str | None = None,
         harness: str = "codex", model: str | None = None, resume: str | None = None,
+        reasoning_effort: str | None = None,
         harness_args: Sequence[str] = (), environment: Sequence[str] = (),
         brief: str | None = None,
         startup_timeout: float = 30.0, ready_timeout: float = 900.0,
@@ -511,7 +516,25 @@ class ManagedAgents:
             raise AgentDeliveryError(f"cwd is not a directory: {root}")
         if not math.isfinite(startup_timeout) or not 0 < startup_timeout <= 300:
             raise AgentDeliveryError("startup timeout must be between 0 and 300 seconds")
-        arguments = harness_arguments(harness, model=model, resume=resume, extra=harness_args)
+        if isinstance(harness_args, (str, bytes)) or any(
+            not isinstance(item, str) or not item or "\0" in item
+            for item in harness_args
+        ):
+            raise AgentDeliveryError(
+                "harness arguments must be a sequence of nonempty NUL-free strings"
+            )
+        if harness in ("codex", "claude", "muse"):
+            validate_structured_harness_argument_conflicts(
+                harness, list(harness_args), label=f"{harness} launch",
+                structured_model=model is not None,
+                structured_effort=reasoning_effort is not None,
+                structured_resume=resume is not None,
+            )
+        structured_effort = reasoning_arguments(harness, reasoning_effort)
+        arguments = harness_arguments(
+            harness, model=model, resume=resume,
+            extra=(*structured_effort, *harness_args),
+        )
         environment = environment_entries(environment)
         if brief is not None and not brief:
             raise AgentDeliveryError("brief must not be empty")
@@ -636,6 +659,11 @@ class ManagedAgents:
             raise AgentDeliveryError("adopt needs a nonempty expected workspace label without NUL")
         if not _KIND.fullmatch(harness):
             raise AgentDeliveryError("harness must be a Herdr agent kind")
+        if harness == "muse":
+            raise AgentDeliveryError(
+                "adopting Muse is unsupported because agentctl cannot yet pin the existing "
+                "foreground process identity; start an owned Muse session instead"
+            )
         root = str(Path(expected_cwd).expanduser().resolve())
         if not Path(root).is_dir():
             raise AgentDeliveryError(f"cwd is not a directory: {root}")

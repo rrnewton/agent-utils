@@ -18,8 +18,7 @@ from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
 from agentctl.profiles import (
-    load_profiles, profile_arguments, reasoning_arguments,
-    validate_raw_harness_arguments,
+    load_profiles, validate_raw_harness_arguments,
 )
 from agentctl.sessions import Sessions
 from agentctl.skill_install import install_skill
@@ -112,7 +111,7 @@ def parser() -> argparse.ArgumentParser:
         help="interactive startup deadline, greater than 0 and at most 300 (default: 30)")
     _delivery(start)
 
-    adopt = command("adopt", "Register an existing Herdr agent without taking ownership of its runtime.",
+    adopt = command("adopt", "Register an existing Herdr agent without taking ownership of its runtime; Muse is refused.",
         "agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex",
         named=True)
     adopt.add_argument("--pane", required=True, metavar="ID",
@@ -122,7 +121,7 @@ def parser() -> argparse.ArgumentParser:
     adopt.add_argument("--cwd", required=True, metavar="DIR",
         help="expected live agent working directory; compared canonically (required)")
     adopt.add_argument("--harness", required=True, metavar="KIND",
-        help="expected live harness kind, for example codex or claude (required)")
+        help="expected live harness kind, for example codex or claude; muse is refused (required)")
     adopt.add_argument("--session", metavar="ID",
         help="optional stable native conversation ID already reported by this exact pane")
 
@@ -295,6 +294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             harness = profile.harness if profile else (args.harness or "codex")
             mode = profile.mode if profile else (args.mode or "interactive")
             model = profile.model if profile else args.model
+            reasoning_effort = profile.reasoning_effort if profile else args.reasoning_effort
             if profile is None:
                 validate_raw_harness_arguments(
                     harness, args.harness_arg, label="launch",
@@ -302,14 +302,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     structured_effort=args.reasoning_effort is not None,
                     structured_resume=args.resume is not None,
                 )
-            harness_args = list(profile_arguments(profile) if profile else (
-                *reasoning_arguments(harness, args.reasoning_effort), *args.harness_arg
-            ))
+            harness_args = list(profile.argv) if profile else args.harness_arg
             environment = list(profile.environment) if profile else args.env
             brief = Path(args.file).read_text(encoding="utf-8") if args.file else args.brief
             result = sessions.start_session(name, cwd=args.cwd, mode=mode, backend=args.backend,
                 harness=harness, model=model, brief=brief, resume=args.resume,
-                harness_args=harness_args, environment=environment,
+                reasoning_effort=reasoning_effort, harness_args=harness_args,
+                environment=environment,
                 workspace_id=args.workspace_id,
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
                 working_timeout=args.working_timeout, max_attempts=args.max_attempts)

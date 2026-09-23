@@ -58,7 +58,7 @@ enum Commands {
     Profiles(Profiles),
     /// Install the bundled agentctl harness skill
     Skill(Skill),
-    /// Register an existing Herdr agent without taking ownership of its runtime
+    /// Register an existing Herdr agent without taking ownership of its runtime; Muse is refused
     #[command(
         after_help = "Example: agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"
     )]
@@ -234,7 +234,7 @@ struct Adopt {
     /// Expected live agent working directory; compared canonically (required)
     #[arg(long, value_name = "DIR")]
     cwd: PathBuf,
-    /// Expected live Herdr harness kind, such as codex or claude (required)
+    /// Expected live Herdr harness kind, such as codex or claude; muse is refused (required)
     #[arg(long, value_name = "KIND")]
     harness: String,
     /// Stable native conversation ID already reported by this exact pane
@@ -685,7 +685,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
     let manager = ManagedAgents::new(&client, &args.registry)?;
     let mut result = match command {
         Commands::Start(value) => {
-            let (harness, mode, model, harness_args, environment) =
+            let (harness, mode, model, reasoning_effort, harness_args, environment) =
                 if let Some(profile_name) = value.profile.as_deref() {
                     let mut overlaps = Vec::new();
                     if value.mode.is_some() {
@@ -726,7 +726,8 @@ fn run(args: Cli) -> Result<i32, Failure> {
                         profile.harness.clone(),
                         profile.mode.clone(),
                         profile.model.clone(),
-                        crate::profiles::profile_arguments(profile)?,
+                        profile.reasoning_effort.clone(),
+                        profile.argv.clone(),
                         profile.environment.clone(),
                     )
                 } else {
@@ -739,16 +740,12 @@ fn run(args: Cli) -> Result<i32, Failure> {
                         value.reasoning_effort.is_some(),
                         value.resume.is_some(),
                     )?;
-                    let mut arguments = crate::profiles::reasoning_arguments(
-                        &harness,
-                        value.reasoning_effort.as_deref(),
-                    )?;
-                    arguments.extend(value.harness_args);
                     (
                         harness,
                         value.mode.unwrap_or_else(|| "interactive".to_owned()),
                         value.model,
-                        arguments,
+                        value.reasoning_effort,
+                        value.harness_args,
                         value.environment,
                     )
                 };
@@ -761,21 +758,27 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 ),
                 None => value.brief,
             };
-            manager.start(
-                &value.agent.name,
-                &value.cwd,
-                StartOptions {
-                    workspace_id: value.workspace_id,
-                    harness,
-                    model,
-                    resume: value.resume,
-                    harness_args,
-                    environment,
-                    brief,
-                    startup_timeout: Duration::from_secs_f64(value.startup_timeout),
-                    delivery: value.delivery.options(),
-                },
-            )?
+            let options = StartOptions {
+                workspace_id: value.workspace_id,
+                harness,
+                model,
+                resume: value.resume,
+                harness_args,
+                environment,
+                brief,
+                startup_timeout: Duration::from_secs_f64(value.startup_timeout),
+                delivery: value.delivery.options(),
+            };
+            if let Some(effort) = reasoning_effort.as_deref() {
+                manager.start_with_reasoning_effort(
+                    &value.agent.name,
+                    &value.cwd,
+                    effort,
+                    options,
+                )?
+            } else {
+                manager.start(&value.agent.name, &value.cwd, options)?
+            }
         }
         Commands::Adopt(value) => manager.adopt(
             &value.agent.name,
@@ -1059,6 +1062,7 @@ mod tests {
             assert!(help.contains(required));
         }
         assert!(help.contains("without taking ownership"));
+        assert!(help.to_ascii_lowercase().contains("muse is refused"));
         assert!(Cli::try_parse_from([
             "agentctl",
             "chat",
