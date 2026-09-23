@@ -381,7 +381,13 @@ pub(crate) fn muse_startup_metadata(screen: &str) -> (Option<String>, Option<Str
         if !muse_effort(requested) || !muse_effort(effective) {
             continue;
         }
-        if !detail.is_empty() && !(detail.starts_with(" (") && detail.ends_with(')')) {
+        // Either there is no trailing detail at all, or it is a parenthesised aside. Named rather
+        // than written inline: clippy refuses the inline form as a non-minimal boolean, and its
+        // own suggested rewrite folds the two acceptable shapes into one negated disjunction that
+        // no longer says which shapes are acceptable.
+        let detail_is_acceptable =
+            detail.is_empty() || (detail.starts_with(" (") && detail.ends_with(')'));
+        if !detail_is_acceptable {
             continue;
         }
         return (Some(line.to_owned()), Some(effective.to_owned()));
