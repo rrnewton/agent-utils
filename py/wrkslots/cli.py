@@ -18977,9 +18977,12 @@ def _assert_abort_create_submodule_repository_pristine(
                 f"{submodule_name} returned a duplicate ref"
             )
         refs[ref] = (sha, symref)
+    allowed_remote_refs = _abort_create_fetched_remote_refs(
+        repository, refs, submodule_name, checkout_name, vcs
+    )
     allowed_local_heads: set[str] = set()
     for ref, (sha, symref) in refs.items():
-        if not ref.startswith("refs/remotes/") or not ref.endswith("/HEAD"):
+        if ref not in allowed_remote_refs or not ref.endswith("/HEAD"):
             continue
         remote_prefix = ref.removesuffix("HEAD")
         if not symref.startswith(remote_prefix):
@@ -18994,7 +18997,7 @@ def _assert_abort_create_submodule_repository_pristine(
     authored_refs = sorted(
         ref
         for ref in refs
-        if not ref.startswith("refs/remotes/") and ref not in allowed_local_heads
+        if ref not in allowed_remote_refs and ref not in allowed_local_heads
     )
     if authored_refs:
         raise Refusal(
@@ -19013,6 +19016,165 @@ def _assert_abort_create_submodule_repository_pristine(
             f"{submodule_name} has unreachable repository state "
             f"({evidence.splitlines()[0]}); preserve it for inspection"
         )
+
+
+def _abort_create_fetched_remote_refs(
+    repository: Path,
+    refs: Mapping[str, tuple[str, str]],
+    submodule_name: str,
+    checkout_name: str,
+    vcs: _GitVcs,
+) -> set[str]:
+    """Return remote refs with local evidence that Git cloned or fetched them."""
+
+    raw_remotes = vcs._run(repository, ["remote"]).stdout.splitlines()
+    if len(raw_remotes) != len(set(raw_remotes)):
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} returned duplicate configured remotes"
+        )
+    remotes: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for remote in raw_remotes:
+        try:
+            _validate_remote(remote)
+        except Refusal as exc:
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} returned an invalid configured remote"
+            ) from exc
+        urls = vcs._run(
+            repository, ["config", "--local", "--get-all", f"remote.{remote}.url"],
+            check=False,
+        )
+        if urls.returncode not in (0, 1):
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} remote {remote} URL inventory failed"
+            )
+        url_values = urls.stdout.splitlines()
+        if urls.returncode != 0 or len(url_values) != 1 or not url_values[0]:
+            continue
+        fetches = vcs._run(
+            repository,
+            ["config", "--local", "--get-all", f"remote.{remote}.fetch"],
+            check=False,
+        )
+        if fetches.returncode not in (0, 1):
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} remote {remote} fetch inventory failed"
+            )
+        fetch_values = (
+            tuple(fetches.stdout.splitlines()) if fetches.returncode == 0 else ()
+        )
+        remotes[remote] = (url_values[0], fetch_values)
+
+    direct_remote_refs = {
+        ref
+        for ref, (_sha, symref) in refs.items()
+        if ref.startswith("refs/remotes/") and not symref
+    }
+    allowed: set[str] = set()
+    for ref in sorted(direct_remote_refs):
+        candidates = [
+            remote
+            for remote, (_url, fetches) in remotes.items()
+            if any(
+                _fetch_refspec_maps_remote_ref(fetch, remote, ref)
+                for fetch in fetches
+            )
+        ]
+        if len(candidates) == 1 and _remote_ref_has_fetch_reflog(
+            repository,
+            ref,
+            refs[ref][0],
+            candidates[0],
+            remotes[candidates[0]][0],
+            vcs,
+        ):
+            allowed.add(ref)
+
+    for ref, (sha, symref) in refs.items():
+        if not symref:
+            continue
+        candidates = [
+            remote
+            for remote in remotes
+            if ref == f"refs/remotes/{remote}/HEAD"
+            and symref.startswith(f"refs/remotes/{remote}/")
+            and symref != ref
+        ]
+        if len(candidates) != 1 or refs.get(symref) != (sha, ""):
+            continue
+        remote = candidates[0]
+        if not any(
+            _fetch_refspec_maps_remote_ref(fetch, remote, symref)
+            for fetch in remotes[remote][1]
+        ):
+            continue
+        if symref in allowed or _remote_ref_has_fetch_reflog(
+            repository, ref, sha, remote, remotes[remote][0], vcs
+        ):
+            allowed.update((ref, symref))
+    return allowed
+
+
+def _fetch_refspec_maps_remote_ref(refspec: str, remote: str, ref: str) -> bool:
+    """Recognize conventional positive fetch mappings without widening them."""
+
+    value = refspec.removeprefix("+")
+    if value.startswith("^") or value.count(":") != 1:
+        return False
+    source, destination = value.split(":", 1)
+    prefix = f"refs/remotes/{remote}/"
+    if not source.startswith("refs/heads/") or not destination.startswith(prefix):
+        return False
+    if source.count("*") != destination.count("*") or source.count("*") > 1:
+        return False
+    if "*" not in destination:
+        return destination == ref
+    before, after = destination.split("*", 1)
+    if not ref.startswith(before) or not ref.endswith(after):
+        return False
+    middle = ref[len(before) : len(ref) - len(after) if after else None]
+    if not middle:
+        return False
+    expanded_source = source.replace("*", middle)
+    try:
+        _validate_full_ref(expanded_source, "fetched source ref")
+    except Refusal:
+        return False
+    return True
+
+
+def _remote_ref_has_fetch_reflog(
+    repository: Path,
+    ref: str,
+    sha: str,
+    remote: str,
+    remote_url: str,
+    vcs: _GitVcs,
+) -> bool:
+    result = vcs._run(
+        repository,
+        ["reflog", "show", "-1", "--format=%H%x00%gs", ref],
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise Refusal(f"cannot inspect reflog evidence for {ref}")
+    if not result.stdout:
+        return False
+    fields = result.stdout.rstrip("\n").split("\x00")
+    if len(fields) != 2 or not SHA_RE.fullmatch(fields[0]):
+        raise Refusal(f"Git returned malformed reflog evidence for {ref}")
+    message = fields[1]
+    fetched = (
+        message.startswith(f"fetch {remote}:")
+        or message.startswith(f"fetch {remote} ")
+        or message.startswith("fetch:")
+    )
+    cloned = message == f"clone: from {remote_url}"
+    return fields[0] == sha and (fetched or cloned)
 
 
 def _abort_create(
