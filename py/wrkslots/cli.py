@@ -185,6 +185,7 @@ _CREATE_JOURNAL_OPTIONAL = frozenset(
         "failure_policy",
         "submodule_baselines",
         "abort_removal",
+        "abort_exclusion",
     }
 )
 _IMPORT_JOURNAL_REQUIRED = frozenset(
@@ -244,6 +245,7 @@ _OWNERLESS_VALIDATION_EXCLUSION_PHASES = frozenset(
     {"guard-created", "payload-moved"}
 )
 _OWNERLESS_VALIDATION_EXCLUSION_ROOTS = (Path("/data/misc"),)
+_CREATE_ABORT_EXCLUSION_ROOTS = (Path("/tmp"), Path("/data/misc"))
 _OWNERLESS_LINKED_VALIDATION_REFUSAL = (
     "ownerless linked validation checkout recovery is disabled because the checkout "
     "and its Git administration cannot both be fenced against same-UID replacement; "
@@ -2425,8 +2427,29 @@ _PrivateCleanupIdentity = tuple[int, int, int] | tuple[int, int, int, str]
 
 
 @dataclasses.dataclass(frozen=True)
+class _CreateAbortExcludedPayload:
+    """One proved directory moved behind a root-owned exclusion guard."""
+
+    source: Path
+    source_alias: Path
+    name: str
+    identity: tuple[int, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class _CreateAbortExclusion:
+    """Root-owned namespace that an ordinary same-UID process cannot mutate."""
+
+    root: Path
+    root_identity: tuple[int, int, int]
+    guard: Path
+    guard_identity: tuple[int, int, int]
+    payloads: tuple[_CreateAbortExcludedPayload, ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class _AbortRemovalEntry:
-    """One inode and its contents authorized by the final create-abort proof."""
+    """Internal manifest for detecting changes before namespace exclusion."""
 
     name: str
     device: int
@@ -6630,6 +6653,10 @@ def _validate_journal_shape(
             )
         if "abort_removal" in raw:
             _create_abort_removal_target(config, slot, slot_type, raw["abort_removal"])
+        if "abort_exclusion" in raw:
+            _create_abort_exclusion_from_obj(
+                config, slot, slot_type, raw["abort_exclusion"]
+            )
     elif kind == "import-existing":
         _exact_keys(raw, _IMPORT_JOURNAL_REQUIRED, set(), "import journal")
         record = _record_from_obj(raw["record"], "import journal.record")
@@ -22615,6 +22642,62 @@ def _capture_abort_removal_tree(path: Path) -> _AbortRemovalEntry:
     )
 
 
+def _assert_abort_removal_directory(
+    directory_fd: int,
+    path: Path,
+    children: Sequence[_AbortRemovalEntry],
+) -> None:
+    if set(_directory_names(directory_fd, path)) != {
+        child.name for child in children
+    }:
+        raise Refusal(f"create-abort removal tree changed after final proof: {path}")
+    for child in children:
+        child_path = path / child.name
+        observed = _assert_abort_removal_entry(
+            directory_fd, child.name, child_path, child
+        )
+        if not stat.S_ISDIR(observed.st_mode):
+            continue
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            child_fd = os.open(child.name, flags, dir_fd=directory_fd)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot open create-abort removal directory {child_path}: {exc}"
+            ) from exc
+        try:
+            opened = os.fstat(child_fd)
+            if (opened.st_dev, opened.st_ino) != (child.device, child.inode):
+                raise Refusal(
+                    f"create-abort removal directory identity changed: {child_path}"
+                )
+            _assert_abort_removal_directory(child_fd, child_path, child.children)
+        finally:
+            os.close(child_fd)
+
+
+def _open_asserted_abort_removal_tree(
+    path: Path, expected: _AbortRemovalEntry
+) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot open create-abort removal target {path}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (expected.device, expected.inode)
+        ):
+            raise Refusal(f"create-abort removal target identity changed: {path}")
+        _assert_abort_removal_directory(descriptor, path, expected.children)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _assert_abort_removal_entry(
     directory_fd: int,
     name: str,
@@ -22655,159 +22738,6 @@ def _assert_abort_removal_entry(
     return observed
 
 
-def _clear_abort_removal_directory(
-    directory_fd: int,
-    path: Path,
-    children: Sequence[_AbortRemovalEntry],
-    before_destructive: Callable[[], None],
-) -> None:
-    remaining = {child.name for child in children}
-    if set(_directory_names(directory_fd, path)) != remaining:
-        raise Refusal(f"create-abort removal tree changed after final proof: {path}")
-    for child in children:
-        _interrupt_for_test("before-create-abort-entry-quarantine")
-        if set(_directory_names(directory_fd, path)) != remaining:
-            raise Refusal(f"create-abort removal tree changed before quarantine: {path}")
-        tombstone = f".wrkslots-abort-remove-{uuid.uuid4().hex}"
-        if tombstone in remaining:
-            raise StateError("generated create-abort tombstone collides with source")
-        child_path = path / child.name
-        tombstone_path = path / tombstone
-        _assert_abort_removal_entry(directory_fd, child.name, child_path, child)
-        try:
-            os.rename(
-                child.name,
-                tombstone,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-            )
-            os.fsync(directory_fd)
-        except OSError as exc:
-            raise Refusal(
-                f"cannot quarantine create-abort removal entry {child_path}: {exc}"
-            ) from exc
-        try:
-            _assert_abort_removal_entry(
-                directory_fd, tombstone, tombstone_path, child
-            )
-            expected_names = (remaining - {child.name}) | {tombstone}
-            if set(_directory_names(directory_fd, path)) != expected_names:
-                raise Refusal(
-                    f"create-abort removal tree changed during quarantine: {path}"
-                )
-            if stat.S_ISDIR(child.mode):
-                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-                child_fd = os.open(tombstone, flags, dir_fd=directory_fd)
-                try:
-                    opened = os.fstat(child_fd)
-                    if (opened.st_dev, opened.st_ino) != (child.device, child.inode):
-                        raise Refusal(
-                            f"quarantined create-abort directory identity changed: "
-                            f"{tombstone_path}"
-                        )
-                    _clear_abort_removal_directory(
-                        child_fd,
-                        tombstone_path,
-                        child.children,
-                        before_destructive,
-                    )
-                finally:
-                    os.close(child_fd)
-            _interrupt_for_test("before-create-abort-entry-remove")
-            if set(_directory_names(directory_fd, path)) != expected_names:
-                raise Refusal(
-                    f"create-abort removal tree changed before entry removal: {path}"
-                )
-            current = _assert_abort_removal_entry(
-                directory_fd, tombstone, tombstone_path, child
-            )
-            try:
-                before_destructive()
-                if stat.S_ISDIR(current.st_mode):
-                    os.rmdir(tombstone, dir_fd=directory_fd)
-                else:
-                    os.unlink(tombstone, dir_fd=directory_fd)
-                os.fsync(directory_fd)
-            except OSError as exc:
-                raise Refusal(
-                    f"cannot remove quarantined create-abort entry "
-                    f"{tombstone_path}: {exc}"
-                ) from exc
-        except BaseException:
-            try:
-                tombstone_present = os.stat(
-                    tombstone, dir_fd=directory_fd, follow_symlinks=False
-                )
-            except FileNotFoundError:
-                tombstone_present = None
-            try:
-                os.stat(child.name, dir_fd=directory_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                original_absent = True
-            else:
-                original_absent = False
-            if tombstone_present is not None and original_absent:
-                try:
-                    os.rename(
-                        tombstone,
-                        child.name,
-                        src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd,
-                    )
-                    os.fsync(directory_fd)
-                except OSError:
-                    pass
-            raise
-        remaining.remove(child.name)
-    if _directory_names(directory_fd, path):
-        raise Refusal(f"create-abort removal tree changed while cleared: {path}")
-
-
-def _remove_abort_removal_tree(
-    path: Path,
-    expected: _AbortRemovalEntry,
-    before_destructive: Callable[[], None],
-) -> None:
-    try:
-        parent_fd = os.open(
-            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-        )
-    except OSError as exc:
-        raise Refusal(f"cannot open create-abort removal parent {path.parent}: {exc}") from exc
-    root_fd: int | None = None
-    try:
-        observed = _assert_abort_removal_entry(parent_fd, path.name, path, expected)
-        if not stat.S_ISDIR(observed.st_mode):
-            raise Refusal(f"create-abort removal target is not a directory: {path}")
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-        root_fd = os.open(path.name, flags, dir_fd=parent_fd)
-        opened = os.fstat(root_fd)
-        if (opened.st_dev, opened.st_ino) != (expected.device, expected.inode):
-            raise Refusal(f"create-abort removal target identity changed: {path}")
-        _interrupt_for_test("before-create-abort-removal-tree-clear")
-        _clear_abort_removal_directory(
-            root_fd, path, expected.children, before_destructive
-        )
-        _interrupt_for_test("before-create-abort-removal-root-rmdir")
-        if _directory_names(root_fd, path):
-            raise Refusal(f"create-abort removal target changed before rmdir: {path}")
-        current = _assert_abort_removal_entry(parent_fd, path.name, path, expected)
-        if not stat.S_ISDIR(current.st_mode):
-            raise Refusal(f"create-abort removal target changed before rmdir: {path}")
-        try:
-            before_destructive()
-            os.rmdir(path.name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-        except OSError as exc:
-            raise Refusal(f"cannot remove create-abort directory {path}: {exc}") from exc
-    except OSError as exc:
-        raise Refusal(f"create-abort removal tree changed at {path}: {exc}") from exc
-    finally:
-        if root_fd is not None:
-            os.close(root_fd)
-        os.close(parent_fd)
-
-
 def _create_abort_worktree_admin(
     repository: Path, checkout: Path, vcs: _GitVcs
 ) -> Path:
@@ -22829,6 +22759,400 @@ def _create_abort_worktree_admin(
     return admin
 
 
+def _rollback_create_abort_path(
+    config: Config,
+    source: Path,
+    destination: Path,
+    expected_identity: _PrivateCleanupIdentity,
+    expected_mode: int,
+    label: str,
+) -> None:
+    _rename_noreplace(source, destination, label)
+    mismatch: Refusal | None = None
+    try:
+        observed = _private_cleanup_path_identity(
+            config, destination, allowed_modes={expected_mode}
+        )
+        if observed != expected_identity:
+            mismatch = Refusal(f"{label} moved an unexpected source identity")
+    except Refusal as exc:
+        mismatch = exc
+    if mismatch is None:
+        return
+    if source.exists() or source.is_symlink():
+        raise Refusal(
+            f"{label} moved an unexpected object and its source name reappeared; "
+            "preserve both paths"
+        ) from mismatch
+    try:
+        _rename_noreplace(
+            destination, source, f"restore unexpected object after {label}"
+        )
+    except Refusal as restore:
+        raise Refusal(
+            f"{label} moved an unexpected object and could not restore it: {restore}"
+        ) from restore
+    raise Refusal(
+        f"{label} refused an unexpected source identity and restored its path"
+    ) from mismatch
+
+
+def _create_abort_exclusion_name(config: Config, slot: str) -> str:
+    digest = hashlib.sha256(
+        f"{config.root}\0{slot}\0create-abort".encode("utf-8")
+    ).hexdigest()[:24]
+    return f".wrkslots-create-abort-{digest}"
+
+
+def _create_abort_exclusion_from_obj(
+    config: Config,
+    slot: str,
+    slot_type: str,
+    value: object,
+) -> _CreateAbortExclusion:
+    label = "create journal.abort_exclusion"
+    raw = _as_mapping(value, label)
+    _exact_keys(
+        raw,
+        {"schema", "root", "root_identity", "guard", "guard_identity", "payloads"},
+        set(),
+        label,
+    )
+    if _as_int(raw["schema"], f"{label}.schema") != 1:
+        raise StateError("create-abort exclusion schema is unsupported")
+    root = Path(_as_str(raw["root"], f"{label}.root"))
+    guard = Path(_as_str(raw["guard"], f"{label}.guard"))
+    if (
+        not root.is_absolute()
+        or root not in _CREATE_ABORT_EXCLUSION_ROOTS
+        or guard != root / _create_abort_exclusion_name(config, slot)
+    ):
+        raise StateError("create-abort exclusion paths are not canonical")
+    payloads: list[_CreateAbortExcludedPayload] = []
+    seen_sources: set[Path] = set()
+    for index, value_item in enumerate(
+        _as_list(raw["payloads"], f"{label}.payloads")
+    ):
+        item_label = f"{label}.payloads[{index}]"
+        item = _as_mapping(value_item, item_label)
+        _exact_keys(
+            item, {"source", "source_alias", "name", "identity"}, set(), item_label
+        )
+        _relative, source = _relative_inside(
+            config.root,
+            _as_str(item["source"], f"{item_label}.source"),
+            f"{item_label}.source",
+        )
+        source_alias = Path(
+            _as_str(item["source_alias"], f"{item_label}.source_alias")
+        )
+        name = _as_str(item["name"], f"{item_label}.name")
+        identity_values = _as_list(item["identity"], f"{item_label}.identity")
+        if (
+            not source_alias.is_absolute()
+            or ".." in source_alias.parts
+            or "\n" in str(source_alias)
+            or "\0" in str(source_alias)
+            or name != f"payload-{index}"
+            or len(identity_values) != 2
+        ):
+            raise StateError(f"{item_label} is not canonical")
+        identity = (
+            _as_int(identity_values[0], f"{item_label}.identity[0]", minimum=1),
+            _as_int(identity_values[1], f"{item_label}.identity[1]", minimum=1),
+        )
+        if source in seen_sources:
+            raise StateError("create-abort exclusion repeats a source path")
+        seen_sources.add(source)
+        payloads.append(
+            _CreateAbortExcludedPayload(source, source_alias, name, identity)
+        )
+    if not payloads:
+        raise StateError("create-abort exclusion has no payloads")
+    # The slot directory and each linked-worktree administration directory are
+    # all direct deletion subjects.  No other project path may enter the guard.
+    canonical = _slot_directory(config, slot, slot_type)
+    if not any(
+        payload.source.parent == canonical.parent
+        and payload.source.name.startswith(f".{slot}.abort-remove.")
+        for payload in payloads
+    ):
+        raise StateError("create-abort exclusion does not contain its removal fence")
+    return _CreateAbortExclusion(
+        root=root,
+        root_identity=_directory_identity_from_obj(
+            raw["root_identity"], f"{label}.root_identity"
+        ),
+        guard=guard,
+        guard_identity=_directory_identity_from_obj(
+            raw["guard_identity"], f"{label}.guard_identity"
+        ),
+        payloads=tuple(payloads),
+    )
+
+
+def _create_abort_exclusion_to_obj(
+    config: Config, exclusion: _CreateAbortExclusion
+) -> dict[str, object]:
+    return {
+        "schema": 1,
+        "root": str(exclusion.root),
+        "root_identity": list(exclusion.root_identity),
+        "guard": str(exclusion.guard),
+        "guard_identity": list(exclusion.guard_identity),
+        "payloads": [
+            {
+                "source": payload.source.relative_to(config.root).as_posix(),
+                "source_alias": str(payload.source_alias),
+                "name": payload.name,
+                "identity": list(payload.identity),
+            }
+            for payload in exclusion.payloads
+        ],
+    }
+
+
+def _prepare_create_abort_exclusion(
+    config: Config,
+    journal_path: Path,
+    journal: Mapping[str, object],
+    slot: str,
+    active_slot: Path,
+    removal_targets: Sequence[
+        tuple[
+            PlannedCheckout,
+            Path,
+            Path,
+            _AbortRemovalEntry,
+            Path,
+            _AbortRemovalEntry,
+        ]
+    ],
+) -> _CreateAbortExclusion:
+    if "abort_exclusion" in journal:
+        raise Refusal(
+            "create-abort exclusion is already recorded; preserve it for inspection"
+        )
+    root, root_identity, _active_alias = _trusted_validation_exclusion_root(
+        active_slot, roots=_CREATE_ABORT_EXCLUSION_ROOTS
+    )
+    guard = root / _create_abort_exclusion_name(config, slot)
+    if guard.exists() or guard.is_symlink():
+        raise Refusal(
+            f"unrecorded create-abort exclusion guard exists: {guard}; preserve it"
+        )
+    sources: list[tuple[Path, _AbortRemovalEntry]] = []
+    for _item, _repository, destination, checkout_tree, admin, admin_tree in (
+        removal_targets
+    ):
+        sources.extend(((destination, checkout_tree), (admin, admin_tree)))
+    records = _self_mountinfo_records()
+    payloads_list: list[_CreateAbortExcludedPayload] = []
+    for index, (source, manifest) in enumerate(sources):
+        source_alias = _path_alias_on_mount(source, root, records)
+        alias_metadata = source_alias.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(alias_metadata.st_mode)
+            or (alias_metadata.st_dev, alias_metadata.st_ino)
+            != (manifest.device, manifest.inode)
+        ):
+            raise Refusal(
+                f"create-abort mount alias names another object: {source_alias}"
+            )
+        payloads_list.append(
+            _CreateAbortExcludedPayload(
+                source=source,
+                source_alias=source_alias,
+                name=f"payload-{index}",
+                identity=(manifest.device, manifest.inode),
+            )
+        )
+    payloads = tuple(payloads_list)
+    _assert_verified_root_context()
+    _root_validation_exclusion_command(
+        Path("/usr/bin/mkdir"),
+        ("--mode=0700", "--", str(guard)),
+        "create the create-abort exclusion guard",
+    )
+    metadata = _root_validation_path_metadata(
+        guard, "create-abort exclusion guard"
+    )
+    guard_identity = (metadata.st_dev, metadata.st_ino, root_identity[2])
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise Refusal("create-abort exclusion guard is not root-owned and private")
+    exclusion = _CreateAbortExclusion(
+        root, root_identity, guard, guard_identity, payloads
+    )
+    updated_journal = dict(journal)
+    updated_journal["abort_exclusion"] = _create_abort_exclusion_to_obj(
+        config, exclusion
+    )
+    _write_journal(config, updated_journal, journal_path=journal_path)
+    _root_validation_exclusion_command(
+        Path("/usr/bin/chmod"),
+        ("000", "--", str(guard)),
+        "seal the create-abort exclusion guard",
+    )
+    sealed = _root_validation_path_metadata(guard, "create-abort exclusion guard")
+    if (
+        (sealed.st_dev, sealed.st_ino) != guard_identity[:2]
+        or sealed.st_uid != 0
+        or sealed.st_gid != 0
+        or stat.S_IMODE(sealed.st_mode) != 0
+    ):
+        raise Refusal("create-abort exclusion guard did not become root-owned mode 000")
+    _interrupt_for_test("after-create-abort-exclusion-seal")
+    return exclusion
+
+
+def _create_abort_excluded_payload_metadata(
+    exclusion: _CreateAbortExclusion,
+    payload: _CreateAbortExcludedPayload,
+) -> os.stat_result:
+    metadata = _root_validation_path_metadata(
+        exclusion.guard / payload.name, "excluded create-abort payload"
+    )
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != payload.identity
+    ):
+        raise Refusal(
+            f"excluded create-abort payload identity changed: {payload.name}"
+        )
+    return metadata
+
+
+def _exclude_create_abort_payloads(
+    exclusion: _CreateAbortExclusion,
+    manifests: Sequence[_AbortRemovalEntry],
+) -> None:
+    if len(manifests) != len(exclusion.payloads):
+        raise StateError("create-abort exclusion manifest count changed")
+    root_metadata = exclusion.root.stat(follow_symlinks=False)
+    if (
+        (
+            root_metadata.st_dev,
+            root_metadata.st_ino,
+            _open_directory_identity(exclusion.root, "create-abort exclusion root")[2],
+        )
+        != exclusion.root_identity
+        or root_metadata.st_uid != 0
+        or root_metadata.st_gid != 0
+        or stat.S_IMODE(root_metadata.st_mode) != 0o1777
+    ):
+        raise Refusal("create-abort exclusion root identity or permissions changed")
+    guard_metadata = _root_validation_path_metadata(
+        exclusion.guard, "create-abort exclusion guard"
+    )
+    if (
+        (guard_metadata.st_dev, guard_metadata.st_ino)
+        != exclusion.guard_identity[:2]
+        or guard_metadata.st_uid != 0
+        or guard_metadata.st_gid != 0
+        or stat.S_IMODE(guard_metadata.st_mode) != 0
+    ):
+        raise Refusal("create-abort exclusion guard identity or permissions changed")
+    records = _self_mountinfo_records()
+    for payload in exclusion.payloads:
+        if (
+            _path_alias_on_mount(payload.source, exclusion.root, records)
+            != payload.source_alias
+        ):
+            raise Refusal(
+                f"create-abort exclusion source alias changed: {payload.source}"
+            )
+    descriptors: list[int] = []
+    try:
+        for payload, manifest in zip(exclusion.payloads, manifests, strict=True):
+            descriptor = _open_asserted_abort_removal_tree(payload.source, manifest)
+            descriptors.append(descriptor)
+            _interrupt_for_test("before-create-abort-exclusion-move")
+            _root_validation_exclusion_command(
+                Path("/usr/bin/mv"),
+                (
+                    "--no-clobber",
+                    "--no-target-directory",
+                    "--",
+                    str(payload.source_alias),
+                    str(exclusion.guard / payload.name),
+                ),
+                "move a proved create-abort payload behind its exclusion guard",
+            )
+            _create_abort_excluded_payload_metadata(exclusion, payload)
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != payload.identity:
+                raise Refusal(
+                    f"excluded create-abort payload descriptor changed: {payload.name}"
+                )
+            _assert_abort_removal_directory(
+                descriptor, exclusion.guard / payload.name, manifest.children
+            )
+            _interrupt_for_test("after-create-abort-exclusion-move")
+            if payload.source.exists() or payload.source.is_symlink():
+                raise Refusal(
+                    f"create-abort source path reappeared after exclusion: "
+                    f"{payload.source}; preserve both objects"
+                )
+        # Descriptors were needed to validate the moved objects without
+        # traversing the sealed guard.  Close them before the final census so
+        # `/proc/<pid>/fd/<n>` cannot become a same-UID capability back into the
+        # otherwise inaccessible namespace.
+        for descriptor in descriptors:
+            os.close(descriptor)
+        descriptors.clear()
+        _assert_slot_unused(exclusion.guard)
+    except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+
+
+def _remove_create_abort_exclusion(
+    exclusion: _CreateAbortExclusion,
+    before_destructive: Callable[[], None],
+) -> None:
+    for payload in exclusion.payloads:
+        _create_abort_excluded_payload_metadata(exclusion, payload)
+        _interrupt_for_test("after-create-abort-excluded-entry-check")
+        if payload.source.exists() or payload.source.is_symlink():
+            raise Refusal(
+                f"create-abort source path reappeared before excluded removal: "
+                f"{payload.source}; preserve both objects"
+            )
+        before_destructive()
+        _root_validation_exclusion_command(
+            Path("/usr/bin/rm"),
+            (
+                "--recursive",
+                "--one-file-system",
+                "--",
+                str(exclusion.guard / payload.name),
+            ),
+            "remove an excluded create-abort payload",
+        )
+        if payload.name in _root_validation_directory_names(exclusion.guard):
+            raise Refusal("excluded create-abort payload remains after removal")
+    _interrupt_for_test("before-create-abort-exclusion-rmdir")
+    if any(
+        payload.source.exists() or payload.source.is_symlink()
+        for payload in exclusion.payloads
+    ):
+        raise Refusal(
+            "a create-abort source path reappeared before guard removal; preserve it"
+        )
+    _root_validation_exclusion_command(
+        Path("/usr/bin/rmdir"),
+        ("--", str(exclusion.guard)),
+        "remove the empty create-abort exclusion guard",
+    )
+    _interrupt_for_test("after-create-abort-exclusion-rmdir")
+
+
 def _abort_create(
     config: Config,
     journal_path: Path,
@@ -22839,6 +23163,23 @@ def _abort_create(
     recorded_created: Sequence[Checkout],
     submodule_baselines: Mapping[str, object],
 ) -> None:
+    if "abort_exclusion" in journal:
+        exclusion = _create_abort_exclusion_from_obj(
+            config, slot, slot_type, journal["abort_exclusion"]
+        )
+        if exclusion.guard.exists() or exclusion.guard.is_symlink():
+            raise Refusal(
+                "create-abort has a root-excluded cleanup payload at "
+                f"{exclusion.guard}; preserve it for inspection"
+            )
+        if any(
+            payload.source.exists() or payload.source.is_symlink()
+            for payload in exclusion.payloads
+        ):
+            raise Refusal(
+                "create-abort exclusion guard disappeared while a source path exists; "
+                "preserve every path for inspection"
+            )
     slot_path = _slot_directory(config, slot, slot_type)
     fenced_slot = _create_abort_fenced_slot(config, slot, slot_type)
     removal_record = (
@@ -22971,6 +23312,7 @@ def _abort_create(
                 _remove_cache_directory(config, cache)
 
     fence_created = False
+    exclusion_started = False
     removed_any = False
     original_mode: int | None = None
     try:
@@ -22983,9 +23325,11 @@ def _abort_create(
                     f"cannot establish abort path fence because it already exists: {fenced_slot}"
                 )
             try:
-                os.rename(slot_path, fenced_slot)
+                _rename_noreplace(
+                    slot_path, fenced_slot, "establish create-abort path fence"
+                )
                 _fsync_directory(slot_path.parent)
-            except OSError as exc:
+            except Refusal as exc:
                 raise Refusal(
                     f"cannot establish create-abort path fence {slot_path} -> "
                     f"{fenced_slot}: {exc}"
@@ -23068,7 +23412,11 @@ def _abort_create(
                 raise Refusal(
                     f"create-abort removal target already exists: {removal_slot}"
                 )
-            os.rename(active_slot, removal_slot)
+            _rename_noreplace(
+                active_slot,
+                removal_slot,
+                "establish create-abort removal fence",
+            )
             _fsync_directory(active_slot.parent)
             active_slot = removal_slot
             assert removal_record is not None
@@ -23110,47 +23458,53 @@ def _abort_create(
                 f"canonical slot path reappeared behind the create-abort fence: "
                 f"{slot_path}; preserve it for inspection"
             )
-        for (
-            _item,
-            _repository,
-            destination,
-            checkout_tree,
-            admin,
-            admin_tree,
-        ) in removal_targets:
+        if removal_targets:
+            exclusion = _prepare_create_abort_exclusion(
+                config,
+                journal_path,
+                journal,
+                slot,
+                active_slot,
+                removal_targets,
+            )
+            exclusion_started = True
+            manifests = tuple(
+                manifest
+                for (
+                    _item,
+                    _repository,
+                    _destination,
+                    checkout_tree,
+                    _admin,
+                    admin_tree,
+                ) in removal_targets
+                for manifest in (checkout_tree, admin_tree)
+            )
+            _exclude_create_abort_payloads(exclusion, manifests)
+
             def note_destructive_boundary() -> None:
                 nonlocal removed_any
                 removed_any = True
 
-            if slot_path.exists() or slot_path.is_symlink():
-                raise Refusal(
-                    f"canonical slot path reappeared before bound removal: {slot_path}; "
-                    "preserve it for inspection"
-                )
-            # Never give `git worktree remove --force` a writable pathname: it
-            # recursively deletes whatever happens to occupy that name.  Empty
-            # the exact proved inodes through rename/recheck boundaries, then
-            # remove the exact linked-worktree administration the same way.
-            _remove_abort_removal_tree(
-                destination, checkout_tree, note_destructive_boundary
-            )
-            _remove_abort_removal_tree(admin, admin_tree, note_destructive_boundary)
-            if (
-                slot_path.exists()
-                or slot_path.is_symlink()
-                or (
-                    active_slot != fenced_slot
-                    and (fenced_slot.exists() or fenced_slot.is_symlink())
-                )
+            # The source and Git-administration directories are now below a
+            # root-owned mode-000 guard.  An ordinary same-UID process cannot
+            # reach the names passed to recursive removal, so its only possible
+            # race is to recreate an original source name, which is checked and
+            # preserved before and after every excluded deletion.
+            _remove_create_abort_exclusion(exclusion, note_destructive_boundary)
+            if any(
+                payload.source.exists() or payload.source.is_symlink()
+                for payload in exclusion.payloads
             ):
                 raise Refusal(
-                    "an earlier create-abort path reappeared during forced removal; "
+                    "a create-abort source path reappeared during excluded removal; "
                     "the new path was preserved"
                 )
             _fsync_directory(active_slot.parent)
     except Refusal:
         if (
             fence_created
+            and not exclusion_started
             and not removed_any
             and removal_slot is not None
             and removal_slot.is_dir()
@@ -23160,11 +23514,28 @@ def _abort_create(
             and not slot_path.exists()
             and not slot_path.is_symlink()
         ):
-            os.rename(removal_slot, fenced_slot)
+            if removal_record is None or (
+                _private_cleanup_fence_identity(config, removal_slot)
+                != removal_record[1]
+            ):
+                raise Refusal(
+                    "create-abort removal fence identity changed before rollback; "
+                    "preserve every path"
+                )
+            _interrupt_for_test("before-create-abort-removal-fence-rollback")
+            _rollback_create_abort_path(
+                config,
+                removal_slot,
+                fenced_slot,
+                removal_record[1],
+                0o700,
+                "roll back create-abort removal fence",
+            )
             _fsync_directory(fenced_slot.parent)
             _repair_create_abort_registrations(config, plan, fenced_slot, vcs)
         if (
             fence_created
+            and not exclusion_started
             and not removed_any
             and not slot_path.exists()
             and not slot_path.is_symlink()
@@ -23173,7 +23544,17 @@ def _abort_create(
         ):
             if original_mode is not None:
                 fenced_slot.chmod(original_mode)
-            os.rename(fenced_slot, slot_path)
+            _interrupt_for_test("before-create-abort-path-fence-rollback")
+            assert removal_record is not None
+            assert original_mode is not None
+            _rollback_create_abort_path(
+                config,
+                fenced_slot,
+                slot_path,
+                removal_record[1],
+                original_mode,
+                "roll back create-abort path fence",
+            )
             _fsync_directory(slot_path.parent)
             _repair_create_abort_registrations(config, plan, slot_path, vcs)
         raise
@@ -26713,6 +27094,8 @@ def _path_alias_on_mount(
 
 def _trusted_validation_exclusion_root(
     fenced: Path,
+    *,
+    roots: Sequence[Path] | None = None,
 ) -> tuple[Path, tuple[int, int, int], Path]:
     """Select one root-owned sticky path with an unambiguous same-filesystem view."""
 
@@ -26720,7 +27103,9 @@ def _trusted_validation_exclusion_root(
     direct: list[tuple[Path, tuple[int, int, int], Path]] = []
     aliases: list[tuple[Path, tuple[int, int, int], Path]] = []
     source_mount = _mountinfo_record_for_path(fenced.parent, records, "validation path")
-    for candidate in _OWNERLESS_VALIDATION_EXCLUSION_ROOTS:
+    for candidate in (
+        _OWNERLESS_VALIDATION_EXCLUSION_ROOTS if roots is None else roots
+    ):
         try:
             metadata = candidate.stat(follow_symlinks=False)
             resolved = candidate.resolve(strict=True)

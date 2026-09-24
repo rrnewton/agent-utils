@@ -23037,6 +23037,7 @@ def test_failed_post_provision_hook_is_loud_and_recovery_resumes_hooks(
     assert attempts.read_text(encoding="utf-8") == "first\nsecond\nsecond\n"
 
 
+@pytest.mark.ordinary_environment
 def test_failed_post_provision_hook_can_be_explicitly_aborted(
     tmp_path: Path,
 ) -> None:
@@ -23074,6 +23075,7 @@ def test_failed_post_provision_hook_can_be_explicitly_aborted(
     ).returncode == 1
 
 
+@pytest.mark.ordinary_environment
 def test_abort_create_removes_clean_partially_initialized_submodules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -23467,6 +23469,7 @@ def test_abort_create_refuses_changed_submodule_private_git_metadata(
 
 
 @pytest.mark.parametrize("changed", (False, True))
+@pytest.mark.ordinary_environment
 def test_abort_create_binds_worktree_scoped_submodule_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -23520,6 +23523,7 @@ def test_abort_create_binds_worktree_scoped_submodule_config(
         assert not tree.exists()
 
 
+@pytest.mark.ordinary_environment
 def test_abort_create_accepts_freshly_verified_ordinary_submodule_tag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -23675,19 +23679,16 @@ def test_abort_create_path_fence_preserves_post_proof_fenced_write(
 
 
 @pytest.mark.parametrize(
-    "mutation",
-    (
-        "late-entry",
-        "replacement",
-        "tombstone-replacement",
-        "late-before-rmdir",
-    ),
+    "boundary",
+    ("after-create-abort-excluded-entry-check", "before-create-abort-exclusion-rmdir"),
 )
-def test_abort_create_object_bound_removal_preserves_post_proof_mutation(
+@pytest.mark.ordinary_environment
+def test_abort_create_exclusion_preserves_post_check_source_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
     capsys: pytest.CaptureFixture[str],
-    mutation: str,
+    boundary: str,
 ) -> None:
     project, _repository, _remote = make_project(
         tmp_path,
@@ -23697,33 +23698,71 @@ def test_abort_create_object_bound_removal_preserves_post_proof_mutation(
     )
     assert create(project).returncode == 3
     tree = checkout(project)
-    saved_git = tmp_path / "preserved-original-gitfile"
     fired = False
+    guard_mutation_blocked = False
+    payload_descriptor_absent = False
+
+    def cleanup_guard() -> None:
+        journal = create_journal_path(project)
+        if not journal.is_file():
+            return
+        raw = json.loads(journal.read_text(encoding="utf-8"))
+        if "abort_exclusion" not in raw:
+            return
+        exclusion = wrkslots._create_abort_exclusion_from_obj(
+            wrkslots._load_config(str(project), None),
+            "slot01",
+            "agent",
+            raw["abort_exclusion"],
+        )
+        if exclusion.guard.exists() or exclusion.guard.is_symlink():
+            wrkslots._root_validation_exclusion_command(
+                Path("/usr/bin/rm"),
+                ("--recursive", "--one-file-system", "--", str(exclusion.guard)),
+                "clean up the create-abort test guard",
+            )
+
+    request.addfinalizer(cleanup_guard)
 
     def interrupt(stage: str) -> None:
-        nonlocal fired
-        vulnerable_stage = {
-            "late-entry": "after-create-abort-final-removal-proof",
-            "replacement": "before-create-abort-entry-quarantine",
-            "tombstone-replacement": "before-create-abort-entry-remove",
-            "late-before-rmdir": "before-create-abort-removal-root-rmdir",
-        }[mutation]
-        if stage != vulnerable_stage or fired:
+        nonlocal fired, guard_mutation_blocked, payload_descriptor_absent
+        if stage != boundary or fired:
             return
         fired = True
-        removal = next(tree.parent.glob(".slot01.abort-remove.*"))
-        if mutation in {"late-entry", "late-before-rmdir"}:
-            (removal / "late-authored.txt").write_text(
-                "preserve me\n", encoding="utf-8"
-            )
-        elif mutation == "replacement":
-            gitfile = removal / ".git"
-            gitfile.rename(saved_git)
-            gitfile.write_bytes(saved_git.read_bytes())
-        else:
-            tombstone = next(removal.glob(".wrkslots-abort-remove-*"))
-            tombstone.rename(saved_git)
-            tombstone.write_bytes(saved_git.read_bytes())
+        raw = json.loads(create_journal_path(project).read_text(encoding="utf-8"))
+        exclusion = wrkslots._create_abort_exclusion_from_obj(
+            wrkslots._load_config(str(project), None),
+            "slot01",
+            "agent",
+            raw["abort_exclusion"],
+        )
+        payload_path = exclusion.guard / exclusion.payloads[0].name
+        payload_descriptor_absent = True
+        for descriptor in Path("/proc/self/fd").iterdir():
+            try:
+                metadata = descriptor.stat()
+            except FileNotFoundError:
+                continue
+            if (metadata.st_dev, metadata.st_ino) == exclusion.payloads[0].identity:
+                payload_descriptor_absent = False
+                break
+        protected_path = (
+            payload_path
+            if boundary == "after-create-abort-excluded-entry-check"
+            else exclusion.guard
+        )
+        protected_replacement = (
+            exclusion.guard / "attacker-replacement"
+            if boundary == "after-create-abort-excluded-entry-check"
+            else exclusion.root / "attacker-guard-replacement"
+        )
+        try:
+            protected_path.rename(protected_replacement)
+        except PermissionError:
+            guard_mutation_blocked = True
+        source = exclusion.payloads[0].source
+        source.mkdir()
+        (source / "late-authored.txt").write_text("preserve me\n", encoding="utf-8")
 
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
@@ -23743,23 +23782,141 @@ def test_abort_create_object_bound_removal_preserves_post_proof_mutation(
     output = capsys.readouterr()
     assert aborted == 3
     assert fired
-    assert "removal" in output.err and "changed" in output.err
-    preserved_tree = tree
-    if mutation == "late-before-rmdir":
-        preserved_tree = next(tree.parent.glob(".slot01.abort-remove.*"))
-        assert not tree.exists()
-    else:
-        assert tree.is_dir()
-    if mutation in {"late-entry", "late-before-rmdir"}:
-        assert (preserved_tree / "late-authored.txt").read_text(encoding="utf-8") == (
-            "preserve me\n"
+    assert guard_mutation_blocked
+    assert payload_descriptor_absent
+    assert "source path reappeared" in output.err
+    raw = json.loads(create_journal_path(project).read_text(encoding="utf-8"))
+    exclusion = wrkslots._create_abort_exclusion_from_obj(
+        wrkslots._load_config(str(project), None),
+        "slot01",
+        "agent",
+        raw["abort_exclusion"],
+    )
+    source = exclusion.payloads[0].source
+    assert (source / "late-authored.txt").read_text(encoding="utf-8") == "preserve me\n"
+    if boundary == "after-create-abort-excluded-entry-check":
+        preserved = wrkslots._root_validation_path_metadata(
+            exclusion.guard / exclusion.payloads[0].name,
+            "preserved create-abort payload",
         )
+        assert (preserved.st_dev, preserved.st_ino) == exclusion.payloads[0].identity
     else:
-        assert saved_git.is_file()
-        assert (tree / ".git").read_bytes() == saved_git.read_bytes()
+        assert wrkslots._root_validation_directory_names(exclusion.guard) == []
     assert create_journal_path(project).is_file()
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "before-create-abort-removal-fence-rollback",
+        "before-create-abort-path-fence-rollback",
+        "replace-create-abort-removal-fence-rollback-source",
+        "replace-create-abort-path-fence-rollback-source",
+    ),
+)
+def test_abort_create_rollback_never_overwrites_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    boundary: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    fenced = tree.with_name(".slot01.abort-create")
+    saved_authorized = tmp_path / "saved-authorized-rollback-source"
+    fired = False
+
+    def interrupt(stage: str) -> None:
+        nonlocal fired
+        if stage == "after-create-abort-final-proof":
+            active = fenced if fenced.exists() else next(
+                tree.parent.glob(".slot01.abort-remove.*")
+            )
+            (active / "force-rollback.txt").write_text("dirty\n", encoding="utf-8")
+        hook = {
+            "before-create-abort-removal-fence-rollback": (
+                "before-create-abort-removal-fence-rollback"
+            ),
+            "before-create-abort-path-fence-rollback": (
+                "before-create-abort-path-fence-rollback"
+            ),
+            "replace-create-abort-removal-fence-rollback-source": (
+                "before-create-abort-removal-fence-rollback"
+            ),
+            "replace-create-abort-path-fence-rollback-source": (
+                "before-create-abort-path-fence-rollback"
+            ),
+        }[boundary]
+        if stage != hook or fired:
+            return
+        fired = True
+        if boundary.startswith("replace-"):
+            source = (
+                next(tree.parent.glob(".slot01.abort-remove.*"))
+                if "removal-fence" in boundary
+                else fenced
+            )
+            source.rename(saved_authorized)
+            source.mkdir(mode=0o700 if "removal-fence" in boundary else 0o755)
+            (source / "replacement.txt").write_text(
+                "preserve replacement\n", encoding="utf-8"
+            )
+            return
+        destination = (
+            fenced
+            if boundary == "before-create-abort-removal-fence-rollback"
+            else tree
+        )
+        destination.mkdir()
+        (destination / "replacement.txt").write_text(
+            "preserve replacement\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 3
+    assert fired
+    if boundary.startswith("replace-"):
+        destination = (
+            next(tree.parent.glob(".slot01.abort-remove.*"))
+            if "removal-fence" in boundary
+            else fenced
+        )
+        assert saved_authorized.is_dir()
+        assert "unexpected source identity" in output.err
+    else:
+        destination = (
+            fenced
+            if boundary == "before-create-abort-removal-fence-rollback"
+            else tree
+        )
+        assert "already exists" in output.err
+    assert (destination / "replacement.txt").read_text(encoding="utf-8") == (
+        "preserve replacement\n"
+    )
+    assert create_journal_path(project).is_file()
+
+
+@pytest.mark.ordinary_environment
 def test_abort_create_resumes_after_path_fence_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -23823,6 +23980,7 @@ def test_abort_create_resumes_after_path_fence_interruption(
     assert not create_journal_path(project).exists()
 
 
+@pytest.mark.ordinary_environment
 def test_abort_create_resumes_after_removal_fence_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -23887,6 +24045,77 @@ def test_abort_create_resumes_after_removal_fence_interruption(
     ).returncode == 1
 
 
+@pytest.mark.ordinary_environment
+def test_abort_create_resumes_after_exclusion_cleanup_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+
+    def interrupt(stage: str) -> None:
+        if stage == "after-create-abort-exclusion-rmdir":
+            raise RuntimeError("simulated post-exclusion cleanup crash")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    with pytest.raises(RuntimeError, match="simulated post-exclusion cleanup crash"):
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--abort-create",
+                "--coordinator-authorized",
+            ]
+        )
+    raw = json.loads(create_journal_path(project).read_text(encoding="utf-8"))
+    exclusion = wrkslots._create_abort_exclusion_from_obj(
+        wrkslots._load_config(str(project), None),
+        "slot01",
+        "agent",
+        raw["abort_exclusion"],
+    )
+    assert not exclusion.guard.exists()
+    assert not tree.exists()
+    assert all(not payload.source.exists() for payload in exclusion.payloads)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _stage: None)
+    resumed = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert resumed == 0, output.err
+    assert not create_journal_path(project).exists()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 1
+
+
+@pytest.mark.ordinary_environment
 def test_abort_create_accepts_a_configured_fetched_submodule_remote_ref(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

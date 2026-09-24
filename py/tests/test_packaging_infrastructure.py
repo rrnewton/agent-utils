@@ -614,13 +614,21 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     assert ordinary | mapped == all_tests
     # Exact totals intentionally make every lifecycle-test addition account for
     # its execution partition; changing only collection cannot satisfy this gate.
-    assert len(all_tests) == 1168
-    assert len(ordinary) == 282
-    assert len(mapped) == 886
+    assert len(all_tests) == 1171
+    assert len(ordinary) == 293
+    assert len(mapped) == 878
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
         "test_adopt_refuses_pid_outside_invoking_process_ancestry",
+        "test_abort_create_accepts_a_configured_fetched_submodule_remote_ref",
+        "test_abort_create_accepts_freshly_verified_ordinary_submodule_tag",
+        "test_abort_create_binds_worktree_scoped_submodule_config",
+        "test_abort_create_exclusion_preserves_post_check_source_replacement",
+        "test_abort_create_removes_clean_partially_initialized_submodules",
+        "test_abort_create_resumes_after_exclusion_cleanup_interruption",
+        "test_abort_create_resumes_after_path_fence_interruption",
+        "test_abort_create_resumes_after_removal_fence_interruption",
         "test_batch_census_isolated_real_file_alias_mapping_and_socket",
         "test_batch_census_two_selected_trees_cannot_mask_socket_holder",
         "test_batch_census_validation_filesystem_outside_hardlink_mapping",
@@ -671,6 +679,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_frozen_validate_refuses_replacement_after_final_check",
         "test_frozen_validate_refuses_when_verified_root_context_is_unavailable",
         "test_frozen_validate_rejects_counterfeit_minimal_terminal_records",
+        "test_failed_post_provision_hook_can_be_explicitly_aborted",
         "test_historical_frozen_entry_classification_closes_operation_owned_fds",
         "test_historical_frozen_entry_classification_fails_closed_on_evidence_change",
         "test_historical_frozen_entry_classification_fails_closed_on_shape_changes",
