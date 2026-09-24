@@ -383,7 +383,7 @@ _LIVENESS_BATCH_REQUEST_SCHEMA = "wrkslots-liveness-batch-request/v1"
 _LIVENESS_BATCH_RESPONSE_SCHEMA = "wrkslots-liveness-batch-response/v1"
 _LIVENESS_BATCH_BYTES_LIMIT = 4 * 1024 * 1024
 _AUDIT_METRICS_SCHEMA = "wrkslots-audit-metrics/v1"
-_AUDIT_CACHE_CENSUS_SCHEMA = "wrkslots-audit-cache-census/v2"
+_AUDIT_CACHE_CENSUS_SCHEMA = "wrkslots-audit-cache-census/v3"
 _AUDIT_CACHE_STATE_BYTES_LIMIT = 64 * 1024 * 1024
 _AUDIT_CACHE_WORK_LIMIT = 100_000
 _AUDIT_CACHE_WALL_SECONDS = 5.0
@@ -15660,32 +15660,131 @@ def _new_audit_cache_root(
     return {
         "path": str(cache.path),
         "identity": list(identity),
+        "phase": "measure",
         "bytes": 0,
+        "verify_bytes": 0,
         "pending": ["."],
         "current": None,
-        "visited": [],
-        "verify_index": 0,
         "status": "partial",
         "entries_visited": 0,
         "directories_visited": 0,
+        "entries_verified": 0,
         "directories_verified": 0,
     }
+
+
+def _audit_cache_relative(value: object, label: str) -> str:
+    relative = _as_str(value, label)
+    if relative == ".":
+        return relative
+    lexical = Path(relative)
+    if (
+        lexical.is_absolute()
+        or not lexical.parts
+        or ".." in lexical.parts
+        or lexical.as_posix() != relative
+    ):
+        raise StateError(f"{label} is not canonical: {relative!r}")
+    return relative
+
+
+def _validated_audit_cache_root(
+    value: Mapping[str, object],
+    cache: CacheDirectory,
+    identity: Sequence[int],
+) -> dict[str, object]:
+    """Accept persisted progress only when every structural invariant holds."""
+
+    required = {
+        "path",
+        "identity",
+        "phase",
+        "bytes",
+        "verify_bytes",
+        "pending",
+        "current",
+        "status",
+        "entries_visited",
+        "directories_visited",
+        "entries_verified",
+        "directories_verified",
+    }
+    _exact_keys(value, required, set(), "audit cache root")
+    if value["path"] != str(cache.path) or value["identity"] != list(identity):
+        raise StateError("audit cache root identity changed")
+    phase = _as_str(value["phase"], "audit cache root.phase")
+    status = _as_str(value["status"], "audit cache root.status")
+    if phase not in {"measure", "verify"} or status not in {"partial", "complete"}:
+        raise StateError("audit cache root phase or status is invalid")
+    for field in (
+        "bytes",
+        "verify_bytes",
+        "entries_visited",
+        "directories_visited",
+        "entries_verified",
+        "directories_verified",
+    ):
+        _as_int(value[field], f"audit cache root.{field}", minimum=0)
+    pending = [
+        _audit_cache_relative(item, f"audit cache root.pending[{index}]")
+        for index, item in enumerate(
+            _as_list(value["pending"], "audit cache root.pending")
+        )
+    ]
+    if len(pending) != len(set(pending)):
+        raise StateError("audit cache root.pending contains duplicates")
+    current_raw = value["current"]
+    current: dict[str, object] | None
+    if current_raw is None:
+        current = None
+    else:
+        current = dict(_as_mapping(current_raw, "audit cache root.current"))
+        _exact_keys(
+            current,
+            {"path", "cursor", "identity"},
+            set(),
+            "audit cache root.current",
+        )
+        _audit_cache_relative(current["path"], "audit cache root.current.path")
+        _as_int(current["cursor"], "audit cache root.current.cursor", minimum=0)
+        current_identity = _as_list(
+            current["identity"], "audit cache root.current.identity"
+        )
+        if len(current_identity) != 4:
+            raise StateError("audit cache root.current.identity must contain four integers")
+        for item in current_identity:
+            _as_int(item, "audit cache root.current.identity item", minimum=0)
+    if phase == "measure" and (
+        _as_int(value["verify_bytes"], "audit cache root.verify_bytes") != 0
+        or _as_int(value["entries_verified"], "audit cache root.entries_verified") != 0
+        or _as_int(
+            value["directories_verified"], "audit cache root.directories_verified"
+        )
+        != 0
+    ):
+        raise StateError("measurement-phase cache state contains verification progress")
+    if phase == "verify" and _as_int(
+        value["directories_visited"], "audit cache root.directories_visited"
+    ) < 1:
+        raise StateError("verification cache state has no measured root directory")
+    if status == "complete" and (
+        phase != "verify"
+        or current is not None
+        or pending
+        or value["bytes"] != value["verify_bytes"]
+        or _as_int(
+            value["directories_verified"], "audit cache root.directories_verified"
+        )
+        < 1
+    ):
+        raise StateError("completed cache state lacks a full matching verification")
+    return {**value, "pending": pending, "current": current}
 
 
 def _open_audit_cache_relative(
     cache: CacheDirectory, relative: str
 ) -> tuple[int, os.stat_result, int]:
-    if relative != ".":
-        lexical = Path(relative)
-        if (
-            lexical.is_absolute()
-            or not lexical.parts
-            or ".." in lexical.parts
-            or lexical.as_posix() != relative
-        ):
-            raise StateError(
-                f"cache census relative path is not canonical: {relative!r}"
-            )
+    relative = _audit_cache_relative(relative, "cache census relative path")
     candidate = cache.path if relative == "." else cache.path / relative
     _ensure_no_symlink_components(cache.path, candidate, "cache census path")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -15709,91 +15808,63 @@ def _resume_audit_cache_root(
 
     consumed = 0
     while work_remaining > consumed and time.monotonic() < deadline:
+        phase = _as_str(root.get("phase"), "cache census phase")
+        if phase not in {"measure", "verify"}:
+            raise StateError(f"cache census has invalid phase {phase!r}")
+        bytes_field = "bytes" if phase == "measure" else "verify_bytes"
+        entries_field = (
+            "entries_visited" if phase == "measure" else "entries_verified"
+        )
+        directories_field = (
+            "directories_visited"
+            if phase == "measure"
+            else "directories_verified"
+        )
         current_raw = root.get("current")
         if current_raw is None:
             pending = _as_list(root.get("pending"), "cache census pending")
             if not pending:
-                visited = _as_list(root.get("visited"), "cache census visited")
-                verify_index = _as_int(
-                    root.get("verify_index"), "cache census verify_index"
+                if phase == "measure":
+                    root["phase"] = "verify"
+                    root["verify_bytes"] = 0
+                    root["entries_verified"] = 0
+                    root["directories_verified"] = 0
+                    root["pending"] = ["."]
+                    continue
+                measured = _as_int(root.get("bytes"), "cache census bytes", minimum=0)
+                verified = _as_int(
+                    root.get("verify_bytes"),
+                    "cache census verified bytes",
+                    minimum=0,
                 )
-                if verify_index < 0 or verify_index > len(visited):
-                    raise StateError("cache census verify_index is out of range")
-                if verify_index == len(visited):
-                    root["status"] = "complete"
-                    return consumed, True
-                visited_entry = dict(
-                    _as_mapping(
-                        visited[verify_index], "cache census visited directory"
-                    )
-                )
-                relative = _as_str(
-                    visited_entry.get("path"), "cache census visited path"
-                )
-                expected_identity = tuple(
-                    _as_int(value, "cache census visited identity")
-                    for value in _as_list(
-                        visited_entry.get("identity"),
-                        "cache census visited identity",
-                    )
-                )
-                previous_blocks = _as_int(
-                    visited_entry.get("blocks"), "cache census visited blocks"
-                )
-                fd, metadata, _mount_id = _open_audit_cache_relative(
-                    cache, relative
-                )
-                os.close(fd)
-                actual_identity = (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                    metadata.st_mtime_ns,
-                    metadata.st_ctime_ns,
-                )
-                if actual_identity != expected_identity:
-                    raise Refusal(
-                        "cache census directory changed before final verification: "
-                        f"{cache.path / relative}"
-                    )
-                root["bytes"] = (
-                    _as_int(root.get("bytes"), "cache census bytes")
-                    + (metadata.st_blocks - previous_blocks) * 512
-                )
-                visited_entry["blocks"] = metadata.st_blocks
-                visited[verify_index] = visited_entry
-                root["visited"] = visited
-                root["verify_index"] = verify_index + 1
-                root["directories_verified"] = _as_int(
+                if _as_int(
                     root.get("directories_verified"),
                     "cache census directories verified",
-                ) + 1
-                consumed += 1
-                if verify_index + 1 == len(visited):
-                    root["status"] = "complete"
-                    return consumed, True
-                continue
-            relative = _as_str(pending.pop(), "cache census pending path")
+                    minimum=0,
+                ) < 1:
+                    raise StateError("cache census verification omitted its root directory")
+                # The independent second pass is the freshest complete count.
+                # Directory blocks may settle after creation and ordinary file
+                # allocation may change between invocations; neither permits
+                # publishing the older value.
+                if measured != verified:
+                    root["bytes"] = verified
+                root["status"] = "complete"
+                return consumed, True
+            relative = _audit_cache_relative(
+                pending.pop(), "cache census pending path"
+            )
             root["pending"] = pending
             fd, metadata, _mount_id = _open_audit_cache_relative(cache, relative)
             os.close(fd)
-            root["bytes"] = _as_int(root.get("bytes"), "cache census bytes") + metadata.st_blocks * 512
-            root["directories_visited"] = _as_int(
-                root.get("directories_visited"), "cache census directories"
+            root[bytes_field] = _as_int(
+                root.get(bytes_field), f"cache census {bytes_field}", minimum=0
+            ) + metadata.st_blocks * 512
+            root[directories_field] = _as_int(
+                root.get(directories_field),
+                f"cache census {directories_field}",
+                minimum=0,
             ) + 1
-            visited = _as_list(root.get("visited"), "cache census visited")
-            visited.append(
-                {
-                    "path": relative,
-                    "identity": [
-                        metadata.st_dev,
-                        metadata.st_ino,
-                        metadata.st_mtime_ns,
-                        metadata.st_ctime_ns,
-                    ],
-                    "blocks": metadata.st_blocks,
-                }
-            )
-            root["visited"] = visited
             root["current"] = {
                 "path": relative,
                 "cursor": 0,
@@ -15854,13 +15925,10 @@ def _resume_audit_cache_root(
                             f"cannot inspect cache entry "
                             f"{cache.path / relative / name}: {exc}"
                         ) from exc
-                    if stat.S_ISLNK(child.st_mode):
-                        raise Refusal(
-                            f"cache census encountered a symlink: "
-                            f"{cache.path / relative / name}"
-                        )
-                    root["entries_visited"] = _as_int(
-                        root.get("entries_visited"), "cache census entries"
+                    root[entries_field] = _as_int(
+                        root.get(entries_field),
+                        f"cache census {entries_field}",
+                        minimum=0,
                     ) + 1
                     child_relative = (
                         name if relative == "." else f"{relative}/{name}"
@@ -15870,8 +15938,10 @@ def _resume_audit_cache_root(
                         pending.append(child_relative)
                         root["pending"] = pending
                     else:
-                        root["bytes"] = _as_int(
-                            root.get("bytes"), "cache census bytes"
+                        root[bytes_field] = _as_int(
+                            root.get(bytes_field),
+                            f"cache census {bytes_field}",
+                            minimum=0,
                         ) + child.st_blocks * 512
             if not complete:
                 root["current"] = dict(current)
@@ -15924,7 +15994,7 @@ def _audit_cache_census(
     remaining = work_limit
     root_results: dict[str, _AuditCacheMeasurement] = {}
     root_keys: dict[str, list[str]] = {}
-    directories = entries = verified = 0
+    directories = entries = verified = verified_entries = 0
     for subject, caches in sorted(planned.items()):
         subject_keys: list[str] = []
         for cache in sorted(caches, key=lambda value: str(value.path)):
@@ -15936,25 +16006,35 @@ def _audit_cache_census(
             if key in root_results:
                 continue
             root_raw = previous_roots.get(key)
-            root = (
-                dict(root_raw)
-                if isinstance(root_raw, Mapping)
-                and root_raw.get("path") == str(cache.path)
-                and root_raw.get("identity") == list(identity)
-                else _new_audit_cache_root(cache, identity)
-            )
+            try:
+                root = (
+                    _validated_audit_cache_root(root_raw, cache, identity)
+                    if isinstance(root_raw, Mapping)
+                    else _new_audit_cache_root(cache, identity)
+                )
+            except StateError:
+                root = _new_audit_cache_root(cache, identity)
             if root.get("status") == "complete":
-                # A completed byte count remains useful only after every
-                # visited directory is revalidated on this invocation. This
-                # catches nested structural mutations even when the cache
-                # root's own timestamps did not change.
+                # Persisted completion never establishes current deletion
+                # evidence by itself. Re-run the complete recursive verifier,
+                # including entry names and allocated blocks, on this
+                # invocation before publishing the cached measurement.
                 root["status"] = "partial"
-                root["verify_index"] = 0
+                root["phase"] = "verify"
+                root["verify_bytes"] = 0
+                root["entries_verified"] = 0
+                root["directories_verified"] = 0
+                root["pending"] = ["."]
+                root["current"] = None
             before_dirs = _as_int(root.get("directories_visited"), "cache census directories")
             before_entries = _as_int(root.get("entries_visited"), "cache census entries")
             before_verified = _as_int(
                 root.get("directories_verified"),
                 "cache census directories verified",
+            )
+            before_verified_entries = _as_int(
+                root.get("entries_verified"),
+                "cache census entries verified",
             )
             try:
                 if root.get("status") != "complete" and remaining > 0 and time.monotonic() < deadline:
@@ -15972,6 +16052,10 @@ def _audit_cache_census(
                     root.get("directories_verified"),
                     "cache census directories verified",
                 ) - before_verified
+                verified_entries += _as_int(
+                    root.get("entries_verified"),
+                    "cache census entries verified",
+                ) - before_verified_entries
                 if root.get("status") == "complete":
                     root_results[key] = _AuditCacheMeasurement(
                         _as_int(root.get("bytes"), "cache census bytes"), "complete"
@@ -16013,6 +16097,7 @@ def _audit_cache_census(
         "directories_visited": directories,
         "directories_verified": verified,
         "entries_visited": entries,
+        "entries_verified": verified_entries,
         "subjects": len(planned),
         "work_consumed": work_limit - remaining,
         "work_limit": work_limit,

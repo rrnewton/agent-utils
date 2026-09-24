@@ -431,7 +431,7 @@ def test_cache_census_is_partial_then_resumes_exactly(
     statuses: list[str] = []
     work: list[int] = []
 
-    for _ in range(10):
+    for _ in range(20):
         measured, counters = cli._audit_cache_census(
             config,
             states,
@@ -561,10 +561,10 @@ def test_cache_census_refuses_mutated_resume_path_outside_root(
         wall_seconds=5,
     )
 
-    assert observed["subject"].status == "error"
-    assert observed["subject"].bytes is None
-    assert observed["subject"].error is not None
-    assert "not canonical" in observed["subject"].error
+    assert observed["subject"].status == "complete"
+    assert observed["subject"].bytes == cli._allocated_cache_bytes(
+        config, planned["subject"][0]
+    )
 
 
 def test_cache_census_single_large_directory_makes_bounded_progress(
@@ -592,7 +592,7 @@ def test_cache_census_single_large_directory_makes_bounded_progress(
     state_path = tmp_path / "large-cache-state.json"
     consumed: list[int] = []
 
-    for _ in range(20):
+    for _ in range(40):
         measured, counters = cli._audit_cache_census(
             config,
             states,
@@ -608,7 +608,7 @@ def test_cache_census_single_large_directory_makes_bounded_progress(
 
     assert measured["subject"].status == "complete"
     assert all(0 < work <= 64 for work in consumed)
-    assert len(consumed) <= 18
+    assert len(consumed) <= 34
 
 
 def test_cache_census_preserves_nested_git_metadata_refusal(
@@ -692,4 +692,147 @@ def test_completed_cache_census_revalidates_nested_directories(
     assert changed["subject"].status == "error"
     assert changed["subject"].bytes is None
     assert changed["subject"].error is not None
-    assert "changed before final verification" in changed["subject"].error
+    assert "nested Git metadata" in changed["subject"].error
+
+
+def test_completed_cache_state_cannot_bypass_fresh_recursive_verification(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    (cache / ".git").mkdir()
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+    states = (cli.ActiveState("testhost", 15, ()),)
+    identity = cli._audit_cache_root_identity(config, directory)
+    assert identity is not None
+    key = cli._audit_cache_root_key(directory, identity)
+    forged = cli._new_audit_cache_root(directory, identity)
+    forged.update(
+        {
+            "phase": "verify",
+            "bytes": 0,
+            "verify_bytes": 0,
+            "pending": [],
+            "current": None,
+            "status": "complete",
+            "directories_visited": 1,
+            "directories_verified": 1,
+        }
+    )
+    state_path = tmp_path / "forged-complete.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema": cli._AUDIT_CACHE_CENSUS_SCHEMA,
+                "registry_revision": cli._audit_registry_revision(states),
+                "roots": {key: forged},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    measured, _work = cli._audit_cache_census(
+        config,
+        states,
+        {"subject": (directory,)},
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert measured["subject"].status == "error"
+    assert measured["subject"].bytes is None
+    assert measured["subject"].error is not None
+    assert "nested Git metadata" in measured["subject"].error
+
+
+def test_completed_cache_state_rechecks_file_allocation(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    artifact = cache / "artifact"
+    artifact.write_bytes(b"x")
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+    states = (cli.ActiveState("testhost", 16, ()),)
+    planned = {"subject": (directory,)}
+    state_path = tmp_path / "file-growth-state.json"
+    first, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+    assert first["subject"].status == "complete"
+
+    artifact.write_bytes(b"x" * (2 * 1024 * 1024))
+    historical = cli._allocated_cache_bytes(config, directory)
+    assert historical != first["subject"].bytes
+    second, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert second["subject"].status == "complete"
+    assert second["subject"].bytes == historical
+
+
+def test_cache_census_counts_symlink_without_following_like_historical_scan(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    outside = checkout / "outside"
+    outside.write_bytes(b"outside")
+    (cache / "link").symlink_to(outside)
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+    expected = cli._allocated_cache_bytes(config, directory)
+
+    measured, _work = cli._audit_cache_census(
+        config,
+        (cli.ActiveState("testhost", 17, ()),),
+        {"subject": (directory,)},
+        {},
+        state_path=tmp_path / "symlink-state.json",
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert measured["subject"].status == "complete"
+    assert measured["subject"].bytes == expected
