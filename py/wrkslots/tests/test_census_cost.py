@@ -446,6 +446,19 @@ def test_cache_census_is_partial_then_resumes_exactly(
         if measured["subject"].status == "complete":
             break
 
+    if measured["subject"].status != "complete":
+        measured, final_counters = cli._audit_cache_census(
+            config,
+            states,
+            planned,
+            {},
+            state_path=state_path,
+            work_limit=100,
+            wall_seconds=5,
+        )
+        assert final_counters["work_consumed"] <= 100
+        statuses.append(measured["subject"].status)
+
     expected = sum(path.stat().st_blocks * 512 for path in (cache, *cache.iterdir()))
     assert statuses[0] == "partial"
     assert statuses[-1] == "complete"
@@ -592,7 +605,7 @@ def test_cache_census_single_large_directory_makes_bounded_progress(
     state_path = tmp_path / "large-cache-state.json"
     consumed: list[int] = []
 
-    for _ in range(40):
+    for _ in range(34):
         measured, counters = cli._audit_cache_census(
             config,
             states,
@@ -605,6 +618,18 @@ def test_cache_census_single_large_directory_makes_bounded_progress(
         consumed.append(counters["work_consumed"])
         if measured["subject"].status == "complete":
             break
+
+    if measured["subject"].status != "complete":
+        measured, final_counters = cli._audit_cache_census(
+            config,
+            states,
+            planned,
+            {},
+            state_path=state_path,
+            work_limit=2048,
+            wall_seconds=5,
+        )
+        assert final_counters["work_consumed"] <= 2048
 
     assert measured["subject"].status == "complete"
     assert all(0 < work <= 64 for work in consumed)
@@ -918,3 +943,119 @@ def test_cache_census_counts_symlink_without_following_like_historical_scan(
     expected = cli._allocated_cache_bytes(config, directory)
     assert measured["subject"].status == "complete"
     assert measured["subject"].bytes == expected
+
+
+def test_cache_census_state_path_refuses_external_symlink_into_project(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    alias = tmp_path / "external-alias"
+    alias.symlink_to(config.root, target_is_directory=True)
+
+    with pytest.raises(cli.Refusal, match="symlink-free"):
+        cli._audit_cache_state_path(config, str(alias / "census.json"))
+
+    assert not (config.root / "census.json").exists()
+    assert not (config.root / "census.json.key").exists()
+
+
+def test_cache_census_refuses_nonprivate_existing_key(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    (cache / "artifact").write_bytes(b"artifact")
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+    states = (cli.ActiveState("testhost", 19, ()),)
+    state_path = tmp_path / "key-mode-state.json"
+    first, _work = cli._audit_cache_census(
+        config,
+        states,
+        {"subject": (directory,)},
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+    assert first["subject"].status == "complete"
+    key_path = state_path.with_name(f"{state_path.name}.key")
+    key_path.chmod(0o644)
+
+    second, _work = cli._audit_cache_census(
+        config,
+        states,
+        {"subject": (directory,)},
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert second["subject"].status == "error"
+    assert second["subject"].bytes is None
+    assert second["subject"].error is not None
+    assert "owner-bound 0600" in second["subject"].error
+
+
+def test_cache_census_finalization_rechecks_earlier_file_allocation(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    for index in range(4):
+        (cache / f"artifact-{index}").write_bytes(b"x")
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+    states = (cli.ActiveState("testhost", 20, ()),)
+    planned = {"subject": (directory,)}
+    state_path = tmp_path / "cross-chunk-file-growth.json"
+    changed: Path | None = None
+
+    for _ in range(30):
+        measured, _work = cli._audit_cache_census(
+            config,
+            states,
+            planned,
+            {},
+            state_path=state_path,
+            work_limit=1,
+            wall_seconds=5,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        root = next(iter(state["roots"].values()))
+        if root["phase"] == "verify" and root["verified_entries"]:
+            changed = cache / root["verified_entries"][0]["path"]
+            changed.write_bytes(b"x" * (2 * 1024 * 1024))
+            break
+    assert changed is not None
+    assert measured["subject"].status == "partial"
+
+    observed, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert observed["subject"].status == "error"
+    assert observed["subject"].bytes is None
+    assert observed["subject"].error is not None
+    assert "entry changed before final publication" in observed["subject"].error

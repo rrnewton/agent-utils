@@ -15595,11 +15595,63 @@ def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
         cache_home = Path(
             os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
         ).expanduser()
+        if not cache_home.is_absolute():
+            raise Refusal("XDG_CACHE_HOME must be absolute for audit cache state")
+        try:
+            cache_home = cache_home.resolve(strict=True)
+        except OSError as exc:
+            raise Refusal(f"audit cache home is unavailable: {cache_home}: {exc}") from exc
+        if _path_is_within(cache_home, config.root):
+            raise Refusal("audit cache home must be outside the managed project tree")
+        cache_parent = cache_home / "wrkslots" / "audit-cache"
+        cache_parent.mkdir(parents=True, exist_ok=True)
         project = hashlib.sha256(str(config.root).encode("utf-8")).hexdigest()
-        candidate = cache_home / "wrkslots" / "audit-cache" / f"{project}.json"
+        candidate = cache_parent / f"{project}.json"
     if not candidate.is_absolute() or _path_is_within(candidate, config.root):
         raise Refusal("audit cache census state must be outside the managed project tree")
+    try:
+        resolved_parent = candidate.parent.resolve(strict=True)
+    except OSError as exc:
+        raise Refusal(
+            f"audit cache census state parent must already exist: {candidate.parent}: {exc}"
+        ) from exc
+    if resolved_parent != candidate.parent or _path_is_within(
+        resolved_parent, config.root
+    ):
+        raise Refusal(
+            "audit cache census state parent must be symlink-free and outside the "
+            "managed project tree"
+        )
     return candidate
+
+
+def _audit_cache_parent_identity(
+    config: Config,
+    path: Path,
+    expected: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    try:
+        resolved = path.parent.resolve(strict=True)
+    except OSError as exc:
+        raise Refusal(f"audit cache census state parent is unavailable: {exc}") from exc
+    if resolved != path.parent or _path_is_within(resolved, config.root):
+        raise Refusal(
+            "audit cache census state parent changed, crosses a symlink, or entered "
+            "the managed project tree"
+        )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path.parent, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot bind audit cache census state parent: {exc}") from exc
+    try:
+        metadata = os.fstat(fd)
+        observed = metadata.st_dev, metadata.st_ino
+    finally:
+        os.close(fd)
+    if expected is not None and observed != expected:
+        raise Refusal("audit cache census state parent identity changed")
+    return observed
 
 
 def _audit_cache_state_mac(
@@ -15611,16 +15663,47 @@ def _audit_cache_state_mac(
     return hmac.new(key, canonical, hashlib.sha256).hexdigest()
 
 
-def _audit_cache_state_key(path: Path) -> bytes:
+def _read_audit_cache_key(path: Path) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size != _AUDIT_CACHE_KEY_BYTES
+        ):
+            raise Refusal(
+                "audit cache census key must be one owner-bound 0600 regular file "
+                f"of exactly {_AUDIT_CACHE_KEY_BYTES} bytes: {path}"
+            )
+        key = os.read(fd, _AUDIT_CACHE_KEY_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(key) != _AUDIT_CACHE_KEY_BYTES:
+        raise Refusal(
+            f"audit cache census key must contain exactly {_AUDIT_CACHE_KEY_BYTES} bytes"
+        )
+    return key
+
+
+def _audit_cache_state_key(
+    config: Config,
+    path: Path,
+    parent_identity: tuple[int, int],
+) -> bytes:
     key_path = path.with_name(f"{path.name}.key")
     try:
-        key = _read_bounded_regular_file(
-            key_path, "audit cache census key", _AUDIT_CACHE_KEY_BYTES
-        )
-    except Refusal:
+        _audit_cache_parent_identity(config, path, parent_identity)
+        key = _read_audit_cache_key(key_path)
+    except FileNotFoundError:
         if key_path.exists() or key_path.is_symlink():
-            raise
-        path.parent.mkdir(parents=True, exist_ok=True)
+            raise Refusal(f"audit cache census key changed while opening: {key_path}")
+        _audit_cache_parent_identity(config, path, parent_identity)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -15628,9 +15711,7 @@ def _audit_cache_state_key(path: Path) -> bytes:
         try:
             fd = os.open(key_path, flags, 0o600)
         except FileExistsError:
-            key = _read_bounded_regular_file(
-                key_path, "audit cache census key", _AUDIT_CACHE_KEY_BYTES
-            )
+            key = _read_audit_cache_key(key_path)
         else:
             try:
                 offset = 0
@@ -15644,17 +15725,18 @@ def _audit_cache_state_key(path: Path) -> bytes:
                 os.close(fd)
             _fsync_directory(path.parent)
             key = generated
-    if len(key) != _AUDIT_CACHE_KEY_BYTES:
-        raise Refusal(
-            f"audit cache census key must contain exactly {_AUDIT_CACHE_KEY_BYTES} bytes"
-        )
+    _audit_cache_parent_identity(config, path, parent_identity)
     return key
 
 
 def _write_audit_cache_state(
-    path: Path, payload: Mapping[str, object], key: bytes
+    config: Config,
+    path: Path,
+    payload: Mapping[str, object],
+    key: bytes,
+    parent_identity: tuple[int, int],
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _audit_cache_parent_identity(config, path, parent_identity)
     temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     fd = os.open(temporary, flags, 0o600)
@@ -15665,8 +15747,10 @@ def _write_audit_cache_state(
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        _audit_cache_parent_identity(config, path, parent_identity)
         os.replace(temporary, path)
         _fsync_directory(path.parent)
+        _audit_cache_parent_identity(config, path, parent_identity)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
@@ -15734,8 +15818,11 @@ def _new_audit_cache_root(
         "entries_verified": 0,
         "directories_verified": 0,
         "verified_directories": [],
+        "verified_entries": [],
         "finalize_index": 0,
+        "finalize_entry_index": 0,
         "directories_finalized": 0,
+        "entries_finalized": 0,
     }
 
 
@@ -15775,8 +15862,11 @@ def _validated_audit_cache_root(
         "entries_verified",
         "directories_verified",
         "verified_directories",
+        "verified_entries",
         "finalize_index",
+        "finalize_entry_index",
         "directories_finalized",
+        "entries_finalized",
     }
     _exact_keys(value, required, set(), "audit cache root")
     if value["path"] != str(cache.path) or value["identity"] != list(identity):
@@ -15796,7 +15886,9 @@ def _validated_audit_cache_root(
         "entries_verified",
         "directories_verified",
         "finalize_index",
+        "finalize_entry_index",
         "directories_finalized",
+        "entries_finalized",
     ):
         _as_int(value[field], f"audit cache root.{field}", minimum=0)
     pending = [
@@ -15839,10 +15931,24 @@ def _validated_audit_cache_root(
             value["verified_directories"],
             "audit cache root.verified_directories",
         )
+        or _as_list(
+            value["verified_entries"],
+            "audit cache root.verified_entries",
+        )
         or _as_int(value["finalize_index"], "audit cache root.finalize_index") != 0
+        or _as_int(
+            value["finalize_entry_index"],
+            "audit cache root.finalize_entry_index",
+        )
+        != 0
         or _as_int(
             value["directories_finalized"],
             "audit cache root.directories_finalized",
+        )
+        != 0
+        or _as_int(
+            value["entries_finalized"],
+            "audit cache root.entries_finalized",
         )
         != 0
     ):
@@ -15898,16 +16004,59 @@ def _validated_audit_cache_root(
         "audit cache root.directories_verified",
     ):
         raise StateError("audit cache verified directory count is inconsistent")
+    verified_entries: list[dict[str, object]] = []
+    for index, item in enumerate(
+        _as_list(value["verified_entries"], "audit cache root.verified_entries")
+    ):
+        entry = dict(
+            _as_mapping(item, f"audit cache root.verified_entries[{index}]")
+        )
+        _exact_keys(
+            entry,
+            {"path", "identity"},
+            set(),
+            f"audit cache root.verified_entries[{index}]",
+        )
+        _audit_cache_relative(
+            entry["path"], f"audit cache root.verified_entries[{index}].path"
+        )
+        entry_identity = _as_list(
+            entry["identity"],
+            f"audit cache root.verified_entries[{index}].identity",
+        )
+        if len(entry_identity) != 7:
+            raise StateError("audit cache verified entry identity must contain seven integers")
+        for identity_item in entry_identity:
+            _as_int(
+                identity_item,
+                "audit cache verified entry identity item",
+                minimum=0,
+            )
+        verified_entries.append(entry)
+    if len({str(item["path"]) for item in verified_entries}) != len(verified_entries):
+        raise StateError("audit cache verified entries contain duplicates")
     finalize_index = _as_int(
         value["finalize_index"], "audit cache root.finalize_index", minimum=0
     )
     if finalize_index > len(verified_directories):
         raise StateError("audit cache finalize index is out of range")
+    finalize_entry_index = _as_int(
+        value["finalize_entry_index"],
+        "audit cache root.finalize_entry_index",
+        minimum=0,
+    )
+    if finalize_entry_index > len(verified_entries):
+        raise StateError("audit cache finalize entry index is out of range")
     if phase != "finalize" and (
         finalize_index != 0
+        or finalize_entry_index != 0
         or _as_int(
             value["directories_finalized"],
             "audit cache root.directories_finalized",
+        )
+        != 0
+        or _as_int(
+            value["entries_finalized"], "audit cache root.entries_finalized"
         )
         != 0
     ):
@@ -15916,12 +16065,16 @@ def _validated_audit_cache_root(
         value["directories_finalized"],
         "audit cache root.directories_finalized",
     )
+    entries_finalized = _as_int(
+        value["entries_finalized"], "audit cache root.entries_finalized"
+    )
     if phase == "finalize" and (
         current is not None
         or pending
         or value["bytes"] != value["verify_bytes"]
         or not verified_directories
         or directories_finalized != finalize_index
+        or entries_finalized != finalize_entry_index
     ):
         raise StateError("audit cache finalization state is inconsistent")
     if status == "complete" and (
@@ -15931,6 +16084,8 @@ def _validated_audit_cache_root(
         or value["bytes"] != value["verify_bytes"]
         or finalize_index != len(verified_directories)
         or directories_finalized != len(verified_directories)
+        or finalize_entry_index != len(verified_entries)
+        or entries_finalized != len(verified_entries)
         or not verified_directories
     ):
         raise StateError("completed cache state lacks a full matching verification")
@@ -15939,6 +16094,7 @@ def _validated_audit_cache_root(
         "pending": pending,
         "current": current,
         "verified_directories": verified_directories,
+        "verified_entries": verified_entries,
     }
 
 
@@ -15982,47 +16138,106 @@ def _resume_audit_cache_root(
                 "cache census finalize index",
                 minimum=0,
             )
-            if finalize_index >= len(verified_directories):
+            if finalize_index < len(verified_directories):
+                verified_entry = _as_mapping(
+                    verified_directories[finalize_index],
+                    "cache census verified directory",
+                )
+                relative = _audit_cache_relative(
+                    verified_entry.get("path"),
+                    "cache census verified directory path",
+                )
+                expected_identity = tuple(
+                    _as_int(
+                        value,
+                        "cache census verified directory identity",
+                        minimum=0,
+                    )
+                    for value in _as_list(
+                        verified_entry.get("identity"),
+                        "cache census verified directory identity",
+                    )
+                )
+                fd, metadata, _mount_id = _open_audit_cache_relative(cache, relative)
+                os.close(fd)
+                actual_identity = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+                if expected_identity != actual_identity:
+                    raise Refusal(
+                        "cache census directory changed before final publication: "
+                        f"{cache.path / relative}"
+                    )
+                root["finalize_index"] = finalize_index + 1
+                root["directories_finalized"] = _as_int(
+                    root.get("directories_finalized"),
+                    "cache census directories finalized",
+                    minimum=0,
+                ) + 1
+                consumed += 1
+                continue
+            verified_entries = _as_list(
+                root.get("verified_entries"), "cache census verified entries"
+            )
+            finalize_entry_index = _as_int(
+                root.get("finalize_entry_index"),
+                "cache census finalize entry index",
+                minimum=0,
+            )
+            if finalize_entry_index >= len(verified_entries):
                 if not verified_directories:
                     raise StateError("cache census finalization has no directories")
                 root["status"] = "complete"
                 return consumed, True
             verified_entry = _as_mapping(
-                verified_directories[finalize_index],
-                "cache census verified directory",
+                verified_entries[finalize_entry_index],
+                "cache census verified entry",
             )
             relative = _audit_cache_relative(
-                verified_entry.get("path"),
-                "cache census verified directory path",
+                verified_entry.get("path"), "cache census verified entry path"
             )
-            expected_identity = tuple(
-                _as_int(value, "cache census verified directory identity", minimum=0)
+            candidate = cache.path / relative
+            _ensure_no_symlink_components(
+                cache.path, candidate.parent, "cache census verified entry parent"
+            )
+            try:
+                metadata = candidate.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise Refusal(
+                    f"cache census entry changed before final publication: {candidate}: {exc}"
+                ) from exc
+            expected_entry_identity = tuple(
+                _as_int(value, "cache census verified entry identity", minimum=0)
                 for value in _as_list(
                     verified_entry.get("identity"),
-                    "cache census verified directory identity",
+                    "cache census verified entry identity",
                 )
             )
-            fd, metadata, _mount_id = _open_audit_cache_relative(cache, relative)
-            os.close(fd)
-            actual_identity = (
+            actual_entry_identity = (
                 metadata.st_dev,
                 metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_size,
+                metadata.st_blocks,
                 metadata.st_mtime_ns,
                 metadata.st_ctime_ns,
             )
-            if expected_identity != actual_identity:
+            if expected_entry_identity != actual_entry_identity:
                 raise Refusal(
-                    "cache census directory changed before final publication: "
-                    f"{cache.path / relative}"
+                    "cache census entry changed before final publication: "
+                    f"{candidate}"
                 )
-            root["finalize_index"] = finalize_index + 1
-            root["directories_finalized"] = _as_int(
-                root.get("directories_finalized"),
-                "cache census directories finalized",
+            root["finalize_entry_index"] = finalize_entry_index + 1
+            root["entries_finalized"] = _as_int(
+                root.get("entries_finalized"),
+                "cache census entries finalized",
                 minimum=0,
             ) + 1
             consumed += 1
-            if finalize_index + 1 == len(verified_directories):
+            if finalize_entry_index + 1 == len(verified_entries):
                 root["status"] = "complete"
                 return consumed, True
             continue
@@ -16045,8 +16260,11 @@ def _resume_audit_cache_root(
                     root["entries_verified"] = 0
                     root["directories_verified"] = 0
                     root["verified_directories"] = []
+                    root["verified_entries"] = []
                     root["finalize_index"] = 0
+                    root["finalize_entry_index"] = 0
                     root["directories_finalized"] = 0
+                    root["entries_finalized"] = 0
                     root["pending"] = ["."]
                     continue
                 measured = _as_int(root.get("bytes"), "cache census bytes", minimum=0)
@@ -16069,7 +16287,9 @@ def _resume_audit_cache_root(
                     root["bytes"] = verified
                 root["phase"] = "finalize"
                 root["finalize_index"] = 0
+                root["finalize_entry_index"] = 0
                 root["directories_finalized"] = 0
+                root["entries_finalized"] = 0
                 continue
             relative = _audit_cache_relative(
                 pending.pop(), "cache census pending path"
@@ -16180,6 +16400,26 @@ def _resume_audit_cache_root(
                             f"cache census {bytes_field}",
                             minimum=0,
                         ) + child.st_blocks * 512
+                        if phase == "verify":
+                            verified_entries = _as_list(
+                                root.get("verified_entries"),
+                                "cache census verified entries",
+                            )
+                            verified_entries.append(
+                                {
+                                    "path": child_relative,
+                                    "identity": [
+                                        child.st_dev,
+                                        child.st_ino,
+                                        child.st_mode,
+                                        child.st_size,
+                                        child.st_blocks,
+                                        child.st_mtime_ns,
+                                        child.st_ctime_ns,
+                                    ],
+                                }
+                            )
+                            root["verified_entries"] = verified_entries
             if not complete:
                 root["current"] = dict(current)
                 return consumed, False
@@ -16201,7 +16441,8 @@ def _audit_cache_census(
 ) -> tuple[dict[str, _AuditCacheMeasurement], dict[str, int]]:
     registry_revision = _audit_registry_revision(states)
     try:
-        state_key = _audit_cache_state_key(state_path)
+        parent_identity = _audit_cache_parent_identity(config, state_path)
+        state_key = _audit_cache_state_key(config, state_path, parent_identity)
     except (OSError, Refusal) as exc:
         detail = f"cannot establish authenticated audit cache census state: {exc}"
         return {
@@ -16214,6 +16455,7 @@ def _audit_cache_census(
             "directories_finalized": 0,
             "entries_visited": 0,
             "entries_verified": 0,
+            "entries_finalized": 0,
             "subjects": len(planned),
             "work_consumed": 0,
             "work_limit": work_limit,
@@ -16258,6 +16500,7 @@ def _audit_cache_census(
     root_results: dict[str, _AuditCacheMeasurement] = {}
     root_keys: dict[str, list[str]] = {}
     directories = entries = verified = verified_entries = finalized = 0
+    finalized_entries = 0
     for subject, caches in sorted(planned.items()):
         subject_keys: list[str] = []
         for cache in sorted(caches, key=lambda value: str(value.path)):
@@ -16281,7 +16524,9 @@ def _audit_cache_census(
                 # The final identity sweep must occur wholly in the invocation
                 # that publishes completion; never resume halfway through it.
                 root["finalize_index"] = 0
+                root["finalize_entry_index"] = 0
                 root["directories_finalized"] = 0
+                root["entries_finalized"] = 0
             if root.get("status") == "complete":
                 # Persisted completion never establishes current deletion
                 # evidence by itself. Re-run the complete recursive verifier,
@@ -16293,8 +16538,11 @@ def _audit_cache_census(
                 root["entries_verified"] = 0
                 root["directories_verified"] = 0
                 root["verified_directories"] = []
+                root["verified_entries"] = []
                 root["finalize_index"] = 0
+                root["finalize_entry_index"] = 0
                 root["directories_finalized"] = 0
+                root["entries_finalized"] = 0
                 root["pending"] = ["."]
                 root["current"] = None
             before_dirs = _as_int(root.get("directories_visited"), "cache census directories")
@@ -16310,6 +16558,10 @@ def _audit_cache_census(
             before_finalized = _as_int(
                 root.get("directories_finalized"),
                 "cache census directories finalized",
+            )
+            before_finalized_entries = _as_int(
+                root.get("entries_finalized"),
+                "cache census entries finalized",
             )
             try:
                 if root.get("status") != "complete" and remaining > 0 and time.monotonic() < deadline:
@@ -16335,6 +16587,10 @@ def _audit_cache_census(
                     root.get("directories_finalized"),
                     "cache census directories finalized",
                 ) - before_finalized
+                finalized_entries += _as_int(
+                    root.get("entries_finalized"),
+                    "cache census entries finalized",
+                ) - before_finalized_entries
                 if root.get("status") == "complete":
                     root_results[key] = _AuditCacheMeasurement(
                         _as_int(root.get("bytes"), "cache census bytes"), "complete"
@@ -16351,7 +16607,9 @@ def _audit_cache_census(
         "roots": roots,
     }
     try:
-        _write_audit_cache_state(state_path, stored, state_key)
+        _write_audit_cache_state(
+            config, state_path, stored, state_key, parent_identity
+        )
     except OSError as exc:
         state_error = f"cannot persist audit cache census: {exc}"
         errors = {**errors, **{subject: state_error for subject in planned}}
@@ -16378,6 +16636,7 @@ def _audit_cache_census(
         "directories_finalized": finalized,
         "entries_visited": entries,
         "entries_verified": verified_entries,
+        "entries_finalized": finalized_entries,
         "subjects": len(planned),
         "work_consumed": work_limit - remaining,
         "work_limit": work_limit,
@@ -30981,8 +31240,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--cache-census-state",
         metavar="PATH",
         help=(
-            "canonical absolute resumable cache-accounting state path outside the "
-            "managed project (default: a project-keyed file below XDG_CACHE_HOME or "
+            "canonical absolute resumable cache-accounting state path beneath an "
+            "existing symlink-free parent outside the managed project (default: a "
+            "project-keyed file below XDG_CACHE_HOME or "
             "~/.cache); never stores lifecycle authority"
         ),
     )

@@ -102,8 +102,8 @@ interrupted, or unregistered slots; exits 2 when an expired slot cannot be class
 evidence is unavailable; and exits 0 only when neither condition exists. The output names the
 affected slots and the next command. It never converts an unknown result into permission to remove.
 Audit may update only its regenerable, project-keyed cache-accounting census below
-`XDG_CACHE_HOME` (or a canonical absolute path outside the managed project supplied with
-`--cache-census-state`); it does not change a
+`XDG_CACHE_HOME` (or a canonical absolute path beneath an existing symlink-free parent outside the
+managed project supplied with `--cache-census-state`); it does not change a
 registry, worktree, hold, journal, handoff, or Git repository. `--cache-work-limit` and
 `--cache-wall-seconds` bound each invocation. Until the census has visited and reverified every
 directory, JSON reports `cache_bytes: null` and `cache_status: "partial"`, and that incomplete
