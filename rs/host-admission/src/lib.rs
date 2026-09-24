@@ -1322,6 +1322,12 @@ impl HostAdmissionLedger {
                 },
             )
         }));
+        let original_counts = (data.leases.len(), data.queue.len());
+        data.leases
+            .retain(|lease| states.get(&lease.lease_id) != Some(&OwnerState::Absent));
+        data.queue
+            .retain(|entry| states.get(&entry.request.request_id) != Some(&OwnerState::Absent));
+        let swept = original_counts != (data.leases.len(), data.queue.len());
         if states.values().any(|state| *state == OwnerState::Unknown) {
             let leases = data
                 .leases
@@ -1333,6 +1339,9 @@ impl HostAdmissionLedger {
                 .iter()
                 .map(|entry| (entry.sequence, entry.request.clone()))
                 .collect::<Vec<_>>();
+            if swept {
+                self.store(&data)?;
+            }
             return Ok((
                 decide(
                     request,
@@ -1346,12 +1355,6 @@ impl HostAdmissionLedger {
                 None,
             ));
         }
-        let original_counts = (data.leases.len(), data.queue.len());
-        data.leases
-            .retain(|lease| states.get(&lease.lease_id) == Some(&OwnerState::Alive));
-        data.queue
-            .retain(|entry| states.get(&entry.request.request_id) == Some(&OwnerState::Alive));
-        let swept = original_counts != (data.leases.len(), data.queue.len());
         if let Some(existing) = data
             .leases
             .iter()
@@ -1920,6 +1923,64 @@ mod tests {
         assert!(no_lease.is_none());
         assert_eq!(fs::read(&path).unwrap(), before_conflict);
         holder_two_lease.as_mut().unwrap().release().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absent_queue_owner_is_swept_even_when_a_peer_is_unknown() {
+        let root = temp_path("mixed-owner-census");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ledger.json");
+        let ledger = HostAdmissionLedger::new(&path);
+        let mut tokens = BTreeMap::new();
+        tokens.insert("build".to_owned(), 1);
+        let policy = policy(tokens);
+        let mut holder = request("holder", 10, 100);
+        holder.named_tokens.insert("build".to_owned(), 1);
+        let mut dead = request("dead", 11, 101);
+        dead.named_tokens.insert("build".to_owned(), 1);
+        let mut uncertain = request("uncertain", 12, 102);
+        uncertain.named_tokens.insert("build".to_owned(), 1);
+        let (_, mut holder_lease) = ledger
+            .request(&holder, &snapshot(), &policy, 1010, |_, _| {
+                OwnerState::Alive
+            })
+            .unwrap();
+        for queued in [&dead, &uncertain] {
+            let (decision, lease) = ledger
+                .request(queued, &snapshot(), &policy, 1011, |_, _| OwnerState::Alive)
+                .unwrap();
+            assert_eq!(decision.verdict, Verdict::Queue);
+            assert!(lease.is_none());
+        }
+        holder_lease.as_mut().unwrap().release().unwrap();
+        let (decision, lease) = ledger
+            .request(
+                &request("current", 13, 103),
+                &snapshot(),
+                &policy,
+                1012,
+                |owner, _| {
+                    if owner.pid == dead.owner.pid {
+                        OwnerState::Absent
+                    } else if owner.pid == uncertain.owner.pid {
+                        OwnerState::Unknown
+                    } else {
+                        OwnerState::Alive
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(decision.verdict, Verdict::Unknown);
+        assert!(lease.is_none());
+        let state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let queued_ids: BTreeSet<_> = state["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["request"]["request_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(queued_ids, BTreeSet::from(["uncertain"]));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -68,8 +68,15 @@ class ProcessOwner:
     def __post_init__(self) -> None:
         _require_id("host_id", self.host_id)
         _require_id("boot_id", self.boot_id)
-        if self.pid < 1 or self.start_ticks < 1:
-            raise ValueError("pid and start_ticks must be positive")
+        if (
+            isinstance(self.pid, bool)
+            or not isinstance(self.pid, int)
+            or isinstance(self.start_ticks, bool)
+            or not isinstance(self.start_ticks, int)
+            or not 1 <= self.pid <= _MAX_U32
+            or not 1 <= self.start_ticks <= _MAX_U64
+        ):
+            raise ValueError("pid and start_ticks must be positive and bounded")
 
     def to_json(self) -> dict[str, object]:
         """Return the strict ledger representation."""
@@ -102,8 +109,12 @@ class HostSnapshot:
     errors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.captured_at_unix_ms < 0:
-            raise ValueError("captured_at_unix_ms must be non-negative")
+        if (
+            isinstance(self.captured_at_unix_ms, bool)
+            or not isinstance(self.captured_at_unix_ms, int)
+            or not 0 <= self.captured_at_unix_ms <= _MAX_U64
+        ):
+            raise ValueError("captured_at_unix_ms must be non-negative and bounded")
         _require_id("host_id", self.host_id)
         _require_id("boot_id", self.boot_id)
         for name in (
@@ -111,12 +122,26 @@ class HostSnapshot:
             "mem_available_bytes",
             "swap_total_bytes",
             "swap_free_bytes",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > _MAX_BYTES
+            ):
+                raise ValueError(f"{name} must be a non-negative bounded integer or null")
+        for name in (
             "memory_psi_some_avg10_micros",
             "memory_psi_full_avg10_micros",
         ):
             value = getattr(self, name)
-            if value is not None and (not isinstance(value, int) or value < 0 or value > _MAX_BYTES):
-                raise ValueError(f"{name} must be a non-negative bounded integer or null")
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 100 * PPM
+            ):
+                raise ValueError(f"{name} must be a valid PSI percentage or null")
         for error in self.errors:
             _require_id("snapshot error", error)
 
@@ -172,16 +197,25 @@ class ResourceRequest:
         _require_id("request_id", self.request_id)
         _require_id("caller", self.caller)
         _require_id("metadata_digest", self.metadata_digest)
-        if self.memory_bytes < 0 or self.memory_bytes > _MAX_BYTES:
+        if (
+            isinstance(self.memory_bytes, bool)
+            or not isinstance(self.memory_bytes, int)
+            or self.memory_bytes < 0
+            or self.memory_bytes > _MAX_BYTES
+        ):
             raise ValueError("memory_bytes is outside the supported range")
-        if not -(1 << 31) <= self.priority < (1 << 31):
+        if (
+            isinstance(self.priority, bool)
+            or not isinstance(self.priority, int)
+            or not -(1 << 31) <= self.priority < (1 << 31)
+        ):
             raise ValueError("priority is outside the signed 32-bit range")
         previous = ""
         for name, count in self.named_tokens:
             _require_id("token name", name)
             if name <= previous:
                 raise ValueError("named_tokens must be strictly sorted and unique")
-            if count < 1 or count > _MAX_U32:
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1 or count > _MAX_U32:
                 raise ValueError("token count must be positive and bounded")
             previous = name
 
@@ -226,19 +260,42 @@ class AdmissionPolicy:
             "no_swap_extra_memory_reserve_bytes",
         ):
             value = getattr(self, name)
-            if value is not None and (value < 0 or value > _MAX_BYTES):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > _MAX_BYTES
+            ):
                 raise ValueError(f"{name} is outside the supported range")
-        if not 0 <= self.swap_floor_fraction_ppm <= PPM:
+        if (
+            isinstance(self.swap_floor_fraction_ppm, bool)
+            or not isinstance(self.swap_floor_fraction_ppm, int)
+            or not 0 <= self.swap_floor_fraction_ppm <= PPM
+        ):
             raise ValueError("swap_floor_fraction_ppm must be in [0, 1000000]")
-        if self.max_snapshot_age_ms < 0:
-            raise ValueError("max_snapshot_age_ms must be non-negative")
+        if (
+            isinstance(self.max_snapshot_age_ms, bool)
+            or not isinstance(self.max_snapshot_age_ms, int)
+            or not 0 <= self.max_snapshot_age_ms <= _MAX_U64
+        ):
+            raise ValueError("max_snapshot_age_ms must be non-negative and bounded")
         for value in (self.psi_some_max_micros, self.psi_full_max_micros):
-            if value is not None and not 0 <= value <= 100 * PPM:
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= 100 * PPM
+            ):
                 raise ValueError("PSI thresholds must be in millionths of one percent")
         previous = ""
         for name, count in self.token_capacities:
             _require_id("token capacity name", name)
-            if name <= previous or count < 0 or count > _MAX_U32:
+            if (
+                name <= previous
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+                or count > _MAX_U32
+            ):
                 raise ValueError("token capacities must be sorted, unique, and bounded")
             previous = name
 
@@ -298,6 +355,17 @@ class LeaseView:
     request: ResourceRequest
     granted_at_unix_ms: int
 
+    def __post_init__(self) -> None:
+        _require_id("lease_id", self.lease_id)
+        if self.lease_id != self.request.request_id:
+            raise ValueError("lease_id must match request_id")
+        if (
+            isinstance(self.granted_at_unix_ms, bool)
+            or not isinstance(self.granted_at_unix_ms, int)
+            or not 0 <= self.granted_at_unix_ms <= _MAX_U64
+        ):
+            raise ValueError("granted_at_unix_ms must be non-negative and bounded")
+
     def to_json(self) -> dict[str, object]:
         """Return the strict ledger representation."""
         return {
@@ -313,6 +381,14 @@ class QueueView:
 
     request: ResourceRequest
     sequence: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.sequence, bool)
+            or not isinstance(self.sequence, int)
+            or not 0 <= self.sequence <= _MAX_U64
+        ):
+            raise ValueError("queue sequence must be non-negative and bounded")
 
     def to_json(self) -> dict[str, object]:
         """Return the strict ledger representation."""
@@ -426,6 +502,16 @@ def decide(
     owner_states: dict[str, OwnerState],
 ) -> Decision:
     """Purely decide one request from an already observed ledger and host snapshot."""
+    if isinstance(now_unix_ms, bool) or not 0 <= now_unix_ms <= _MAX_U64:
+        raise ValueError("now_unix_ms must be non-negative and bounded")
+    record_ids = [lease.lease_id for lease in leases] + [
+        entry.request.request_id for entry in queue
+    ]
+    queue_sequences = [entry.sequence for entry in queue]
+    if len(record_ids) != len(set(record_ids)) or len(queue_sequences) != len(
+        set(queue_sequences)
+    ):
+        raise ValueError("admission inputs contain duplicate ids or queue sequences")
     missing: list[str] = []
     if now_unix_ms < snapshot.captured_at_unix_ms or (
         now_unix_ms - snapshot.captured_at_unix_ms > policy.max_snapshot_age_ms
@@ -909,16 +995,22 @@ class HostAdmissionLedger:
                     for entry in queue
                 }
             )
-            if any(state is OwnerState.UNKNOWN for state in states.values()):
-                return decide(request, snapshot, policy, tuple(leases), tuple(queue), now_unix_ms=now, owner_states=states), None
             original_counts = (len(leases), len(queue))
-            leases = [lease for lease in leases if states[lease.lease_id] is OwnerState.ALIVE]
+            leases = [
+                lease
+                for lease in leases
+                if states[lease.lease_id] is not OwnerState.ABSENT
+            ]
             queue = [
                 entry
                 for entry in queue
-                if states[entry.request.request_id] is OwnerState.ALIVE
+                if states[entry.request.request_id] is not OwnerState.ABSENT
             ]
             swept = original_counts != (len(leases), len(queue))
+            if any(state is OwnerState.UNKNOWN for state in states.values()):
+                if swept:
+                    self._store(next_sequence, leases, queue)
+                return decide(request, snapshot, policy, tuple(leases), tuple(queue), now_unix_ms=now, owner_states=states), None
             existing_lease = next((lease for lease in leases if lease.request.request_id == request.request_id), None)
             if existing_lease is not None:
                 if swept:

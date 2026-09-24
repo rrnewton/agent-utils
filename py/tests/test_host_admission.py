@@ -218,6 +218,57 @@ def test_dead_queue_owner_is_swept_unknown_is_retained_and_conflict_refuses(tmp_
     blocker_lease.release()
 
 
+def test_absent_queue_owner_is_swept_even_when_a_peer_is_unknown(tmp_path: Path) -> None:
+    path = tmp_path / "host-admission.json"
+    ledger = HostAdmissionLedger(path)
+    policy = _policy(token_capacities=(("build", 1),))
+    holder = ResourceRequest("holder", "test", _owner(), 1, (("build", 1),))
+    dead = ResourceRequest("dead", "test", _owner(11, 101), 1, (("build", 1),))
+    uncertain = ResourceRequest(
+        "uncertain", "test", _owner(12, 102), 1, (("build", 1),)
+    )
+    _decision, holder_lease = ledger.request(
+        holder,
+        _snapshot(),
+        policy,
+        now_unix_ms=1010,
+        owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
+    )
+    assert holder_lease is not None
+    for queued in (dead, uncertain):
+        decision, lease = ledger.request(
+            queued,
+            _snapshot(),
+            policy,
+            now_unix_ms=1011,
+            owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
+        )
+        assert decision.verdict is Verdict.QUEUE and lease is None
+    holder_lease.release()
+
+    def mixed_probe(owner: ProcessOwner, _snapshot: HostSnapshot) -> OwnerState:
+        if owner.pid == dead.owner.pid:
+            return OwnerState.ABSENT
+        if owner.pid == uncertain.owner.pid:
+            return OwnerState.UNKNOWN
+        return OwnerState.ALIVE
+
+    decision, lease = ledger.request(
+        ResourceRequest("current", "test", _owner(13, 103), 1),
+        _snapshot(),
+        policy,
+        now_unix_ms=1012,
+        owner_probe=mixed_probe,
+    )
+    assert decision.verdict is Verdict.UNKNOWN and lease is None
+    state = _mapping(json.loads(path.read_text(encoding="utf-8")))
+    queued_ids = {
+        _text(_mapping(_mapping(entry)["request"])["request_id"])
+        for entry in _sequence(state["queue"])
+    }
+    assert queued_ids == {"uncertain"}
+
+
 def test_malformed_ledger_is_never_replaced_or_granted(tmp_path: Path) -> None:
     path = tmp_path / "host-admission.json"
     original = b'{"schema":"host-admission-ledger/v1","schema":"wrong"}\n'
@@ -289,6 +340,31 @@ def test_psi_decimal_parser_is_exact_and_rejects_hidden_precision() -> None:
     assert core._parse_percent_micros("1.0000001") is None
     assert core._parse_percent_micros("+1") is None
     assert core._parse_percent_micros("1.") is None
+
+
+def test_python_integer_domains_match_the_wire_types() -> None:
+    with pytest.raises(ValueError):
+        ProcessOwner("host-a", "boot-a", True, 1)
+    with pytest.raises(ValueError):
+        ProcessOwner("host-a", "boot-a", 1 << 32, 1)
+    with pytest.raises(ValueError):
+        ProcessOwner("host-a", "boot-a", 1, 1 << 64)
+    with pytest.raises(ValueError):
+        HostSnapshot(1 << 64, "host-a", "boot-a", 1, 1, 0, 0, 0, 0)
+    with pytest.raises(ValueError):
+        HostSnapshot(1, "host-a", "boot-a", 1, 1, 0, 0, 100_000_001, 0)
+    with pytest.raises(ValueError):
+        ResourceRequest("current", "test", _owner(), True)
+    with pytest.raises(ValueError):
+        decide(
+            ResourceRequest("current", "test", _owner(), 1),
+            _snapshot(),
+            _policy(),
+            (),
+            (),
+            now_unix_ms=1 << 64,
+            owner_states={},
+        )
 
 
 def test_measurement_parsers_reject_malformed_and_duplicate_fields(
