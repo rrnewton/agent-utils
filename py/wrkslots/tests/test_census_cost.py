@@ -976,6 +976,43 @@ def test_default_cache_parent_creation_refuses_intermediate_symlink(
     assert not (config.root / "audit-cache").exists()
 
 
+def test_default_cache_home_component_swap_refuses_before_project_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    outer = tmp_path / "external"
+    ancestor = outer / "ancestor"
+    cache_home = ancestor / "cache-home"
+    cache_home.mkdir(parents=True)
+    preserved = outer / "ancestor-preserved"
+    original_open = os.open
+    swapped = False
+
+    def swapping_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and path == "ancestor" and dir_fd is not None:
+            ancestor.rename(preserved)
+            ancestor.symlink_to(config.root, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    monkeypatch.setattr(os, "open", swapping_open)
+    with pytest.raises(cli.Refusal, match="audit cache home is unavailable"):
+        cli._audit_cache_state_path(config, None)
+
+    assert swapped is True
+    assert not (config.root / "wrkslots").exists()
+    assert not (config.root / "audit-cache").exists()
+
+
 def test_bound_cache_parent_survives_path_swap_without_project_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1091,6 +1128,36 @@ def test_cache_census_closes_bound_parent_on_prewrite_exception(
             config,
             (cli.ActiveState("testhost", 22, ()),),
             {"subject": (directory,)},
+            {},
+            state_path=state_path,
+            work_limit=10,
+            wall_seconds=5,
+        )
+
+    after = len(tuple(Path("/proc/self/fd").iterdir()))
+    assert after == before
+
+
+def test_cache_census_closes_bound_parent_when_key_setup_raises_unexpectedly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    state_path = tmp_path / "key-failure-state.json"
+    before = len(tuple(Path("/proc/self/fd").iterdir()))
+    monkeypatch.setattr(
+        cli,
+        "_audit_cache_state_key",
+        lambda _path, _parent_fd: (_ for _ in ()).throw(
+            RuntimeError("fixture key failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="fixture key failure"):
+        cli._audit_cache_census(
+            config,
+            (cli.ActiveState("testhost", 23, ()),),
+            {},
             {},
             state_path=state_path,
             work_limit=10,

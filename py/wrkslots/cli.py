@@ -15580,6 +15580,25 @@ def _audit_directory_stream(
             )
 
 
+def _open_absolute_directory_nofollow(path: Path, label: str) -> int:
+    if not path.is_absolute() or ".." in path.parts:
+        raise Refusal(f"{label} must be a canonical absolute directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(Path("/"), flags)
+    try:
+        for component in path.parts[1:]:
+            child_fd = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child_fd
+        raw_actual = os.readlink(f"/proc/self/fd/{fd}")
+        if raw_actual.endswith(" (deleted)") or Path(raw_actual) != path:
+            raise Refusal(f"{label} changed or crossed a symlink while binding")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
     if explicit is not None:
         candidate = Path(explicit)
@@ -15597,16 +15616,14 @@ def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
         ).expanduser()
         if not cache_home.is_absolute():
             raise Refusal("XDG_CACHE_HOME must be absolute for audit cache state")
-        try:
-            cache_home = cache_home.resolve(strict=True)
-        except OSError as exc:
-            raise Refusal(f"audit cache home is unavailable: {cache_home}: {exc}") from exc
         if _path_is_within(cache_home, config.root):
             raise Refusal("audit cache home must be outside the managed project tree")
-        parent_fd = os.open(
-            cache_home,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        )
+        try:
+            parent_fd = _open_absolute_directory_nofollow(
+                cache_home, "audit cache home"
+            )
+        except OSError as exc:
+            raise Refusal(f"audit cache home is unavailable: {cache_home}: {exc}") from exc
         cache_parent = cache_home
         try:
             for component in ("wrkslots", "audit-cache"):
@@ -15650,28 +15667,19 @@ def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
 
 
 def _open_audit_cache_state_parent(config: Config, path: Path) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    fd = os.open(Path("/"), flags)
     try:
-        for component in path.parent.parts[1:]:
-            child_fd = os.open(component, flags, dir_fd=fd)
-            os.close(fd)
-            fd = child_fd
-    except OSError as exc:
-        os.close(fd)
+        fd = _open_absolute_directory_nofollow(
+            path.parent, "audit cache census state parent"
+        )
+    except (OSError, Refusal) as exc:
         raise Refusal(f"cannot bind audit cache census state parent: {exc}") from exc
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISDIR(metadata.st_mode):
             raise Refusal("audit cache census state parent is not a directory")
-        raw_actual = os.readlink(f"/proc/self/fd/{fd}")
-        if raw_actual.endswith(" (deleted)"):
-            raise Refusal("audit cache census state parent was renamed while binding")
-        actual = Path(raw_actual)
-        if actual != path.parent or _path_is_within(actual, config.root):
+        if _path_is_within(path.parent, config.root):
             raise Refusal(
-                "audit cache census state parent changed, crosses a symlink, or "
-                "entered the managed project tree"
+                "audit cache census state parent entered the managed project tree"
             )
     except BaseException:
         os.close(fd)
@@ -16681,30 +16689,28 @@ def _audit_cache_census(
 ) -> tuple[dict[str, _AuditCacheMeasurement], dict[str, int]]:
     parent_fd: int | None = None
     try:
-        parent_fd = _open_audit_cache_state_parent(config, state_path)
-        state_key = _audit_cache_state_key(state_path, parent_fd)
-    except (OSError, Refusal) as exc:
-        if parent_fd is not None:
-            os.close(parent_fd)
-        detail = f"cannot establish authenticated audit cache census state: {exc}"
-        return {
-            subject: _AuditCacheMeasurement(None, "error", detail)
-            for subject in planned
-        }, {
-            "cache_roots": sum(len(caches) for caches in planned.values()),
-            "directories_visited": 0,
-            "directories_verified": 0,
-            "directories_finalized": 0,
-            "entries_visited": 0,
-            "entries_verified": 0,
-            "entries_finalized": 0,
-            "subjects": len(planned),
-            "work_consumed": 0,
-            "work_limit": work_limit,
-            "work_remaining": work_limit,
-        }
-    assert parent_fd is not None
-    try:
+        try:
+            parent_fd = _open_audit_cache_state_parent(config, state_path)
+            state_key = _audit_cache_state_key(state_path, parent_fd)
+        except (OSError, Refusal) as exc:
+            detail = f"cannot establish authenticated audit cache census state: {exc}"
+            return {
+                subject: _AuditCacheMeasurement(None, "error", detail)
+                for subject in planned
+            }, {
+                "cache_roots": sum(len(caches) for caches in planned.values()),
+                "directories_visited": 0,
+                "directories_verified": 0,
+                "directories_finalized": 0,
+                "entries_visited": 0,
+                "entries_verified": 0,
+                "entries_finalized": 0,
+                "subjects": len(planned),
+                "work_consumed": 0,
+                "work_limit": work_limit,
+                "work_remaining": work_limit,
+            }
+        assert parent_fd is not None
         return _audit_cache_census_bound(
             config,
             states,
@@ -16717,7 +16723,8 @@ def _audit_cache_census(
             state_key=state_key,
         )
     finally:
-        os.close(parent_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _clear_open_directory(
