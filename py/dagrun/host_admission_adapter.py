@@ -38,13 +38,15 @@ def compare_legacy_memory_decision(
     budget_bytes: int | None,
     headroom_bytes: int | None,
     reserved_bytes: int,
+    snapshot: HostSnapshot | None = None,
+    observed_at_unix_ms: int | None = None,
 ) -> ShadowComparison:
     """Compare one current decision without touching either ledger.
 
-    These inputs do not include a raw timestamped host snapshot. The generic
-    shadow therefore returns ``UNKNOWN`` instead of fabricating physical-memory
-    fields from derived limits; the adapter still returns the exact existing
-    verdict as authoritative.
+    A supplied raw snapshot and its observation time produce a meaningful
+    generic comparison. Omitting both preserves the original call surface and
+    reports ``UNKNOWN`` rather than fabricating physical-memory fields from
+    derived limits. The existing verdict remains authoritative in either case.
     """
     if budget_bytes is not None and requested_bytes > budget_bytes:
         legacy = LegacyVerdict.REFUSE
@@ -54,20 +56,27 @@ def compare_legacy_memory_decision(
         legacy = LegacyVerdict.QUEUE
     else:
         legacy = LegacyVerdict.GRANT
-    owner = ProcessOwner("shadow-host", "shadow-boot", 1, 1)
-    # These compatibility inputs are already-derived limits, not raw host
-    # measurements. Do not invent a physical-memory snapshot from them.
-    snapshot = HostSnapshot(
-        captured_at_unix_ms=1,
-        host_id=owner.host_id,
-        boot_id=owner.boot_id,
-        mem_total_bytes=None,
-        mem_available_bytes=None,
-        swap_total_bytes=None,
-        swap_free_bytes=None,
-        memory_psi_some_avg10_micros=None,
-        memory_psi_full_avg10_micros=None,
-    )
+    if (snapshot is None) != (observed_at_unix_ms is None):
+        raise ValueError("snapshot and observed_at_unix_ms must be supplied together")
+    if snapshot is None:
+        owner = ProcessOwner("shadow-host", "shadow-boot", 1, 1)
+        effective_snapshot = HostSnapshot(
+            captured_at_unix_ms=1,
+            host_id=owner.host_id,
+            boot_id=owner.boot_id,
+            mem_total_bytes=None,
+            mem_available_bytes=None,
+            swap_total_bytes=None,
+            swap_free_bytes=None,
+            memory_psi_some_avg10_micros=None,
+            memory_psi_full_avg10_micros=None,
+        )
+        effective_now = 1
+    else:
+        owner = ProcessOwner(snapshot.host_id, snapshot.boot_id, 1, 1)
+        effective_snapshot = snapshot
+        assert observed_at_unix_ms is not None
+        effective_now = observed_at_unix_ms
     policy = AdmissionPolicy(
         memory_budget_bytes=budget_bytes,
         memory_reserve_bytes=0,
@@ -80,11 +89,11 @@ def compare_legacy_memory_decision(
     request = ResourceRequest("shadow-request", "dagrun-shadow", owner, requested_bytes)
     shadow = decide(
         request,
-        snapshot,
+        effective_snapshot,
         policy,
         leases,
         (),
-        now_unix_ms=1,
+        now_unix_ms=effective_now,
         owner_states={"shadow-peer": OwnerState.ALIVE} if reserved_bytes else {},
     )
     return ShadowComparison(legacy, shadow.verdict, shadow.code)

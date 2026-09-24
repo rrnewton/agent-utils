@@ -89,6 +89,19 @@ Owner cleanup is conservative:
 - reusing a request id with different request bytes is unknown/conflict, never a
   new request.
 
+Each unique `(host, boot, PID, start ticks)` owner is probed once per locked
+transaction. That single observation is reused for the request, existing lease,
+and queued records, so a process transition cannot be mixed into one census.
+
+The configured parent pathname is also part of the authority. Each transaction
+retains its resolution root and re-resolves every parent component before any
+successful return; replacing any component refuses the transaction. A returned
+lease retains descriptors for the exact granted parent. If that path changes
+after grant, release cleans the exact original row under its lock and reports
+the pathname discontinuity instead of silently touching a replacement ledger.
+It also retains the granted lock inode: if the lock name was replaced, release
+serializes across both the prior and current lock domains before cleanup.
+
 The initial swap-floor policy is `max(configured fraction of SwapTotal,
 largest measured leaf swap use)`. Equality passes. A host with zero swap must
 select the explicit no-swap branch and its extra memory reserve; it never
@@ -119,17 +132,18 @@ files, file fsync, atomic replacement, and directory fsync.
 
 The compatibility adapter is intentionally read-only. Its existing budget and
 headroom inputs are derived limits, not raw `MemTotal`/`MemAvailable`; therefore
-the adapter does not fabricate a host snapshot from them. Until a future adapter
-supplies an actual captured snapshot, the generic side conservatively reports
-unknown while returning both results. The existing verdict remains the
+the adapter does not fabricate a host snapshot from them. When a caller omits an
+actual captured snapshot, the generic side conservatively reports unknown while
+returning both results. The Phase 1 adapter also accepts a real
+`HostSnapshot` and its observation time; that path produces a meaningful policy,
+arithmetic, and ordering comparison. The existing verdict remains the
 authoritative result. The adapter does not open the generic ledger, reserve a
 token, alter command output, or change exit status.
 
-This deliberately limits Phase 1 to wiring and authority-preservation checks.
-Shadow telemetry must report the unknown result; it must not silently change the
-live result. A later adapter can accept a real timestamped host snapshot, and a
-later authority decision can choose fail-closed behavior only as a separately
-reviewed compatibility change.
+Callers which do not yet capture a real snapshot get an explicit unknown shadow
+result. Shadow telemetry must report that result; it must not silently change
+the live result. A later authority decision can choose fail-closed behavior only
+as a separately reviewed compatibility change.
 
 ## Validation-consumer boundary
 

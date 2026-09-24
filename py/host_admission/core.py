@@ -451,12 +451,22 @@ class Lease:
     request: ResourceRequest
     ledger: "HostAdmissionLedger"
     _released: bool = field(default=False, repr=False)
+    _authority: "_LedgerAuthority | None" = field(default=None, repr=False, compare=False)
 
     def release(self) -> None:
         """Release this exact lease idempotently."""
         if not self._released:
-            self.ledger.release(self.lease_id, self.request.owner)
+            path_matches = self.ledger._release_bound(
+                self.lease_id, self.request.owner, self._authority
+            )
             self._released = True
+            if self._authority is not None:
+                self._authority.close()
+                self._authority = None
+            if not path_matches:
+                raise AdmissionError(
+                    "configured admission parent changed; exact lease was released"
+                )
 
     def __enter__(self) -> "Lease":
         return self
@@ -805,23 +815,27 @@ def probe_process_owner(owner: ProcessOwner, snapshot: HostSnapshot) -> OwnerSta
     return OwnerState.ALIVE if start_ticks == owner.start_ticks else OwnerState.ABSENT
 
 
-def _open_secure_parent(path: Path) -> tuple[int, str]:
+def _open_secure_parent(path: Path) -> tuple[int, int, str, tuple[str, ...]]:
     """Pin an existing symlink-free private parent and return its leaf name."""
     name = path.name
     if not name or name in {".", ".."} or "/" in name:
         raise AdmissionError("admission ledger has an invalid leaf name")
     parent = path.parent
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    components = tuple(
+        component
+        for component in parent.parts
+        if component not in {"/", ".", ""}
+    )
+    if ".." in components:
+        raise AdmissionError("admission parent may not contain '..'")
     try:
         try:
-            current = os.open("/" if parent.is_absolute() else ".", flags)
+            root = os.open("/" if parent.is_absolute() else ".", flags)
         except OSError as exc:
             raise AdmissionError("could not open admission path root") from exc
-        for component in parent.parts:
-            if component in {"/", ".", ""}:
-                continue
-            if component == "..":
-                raise AdmissionError("admission parent may not contain '..'")
+        current = os.dup(root)
+        for component in components:
             try:
                 following = os.open(component, flags, dir_fd=current)
             except OSError as exc:
@@ -831,6 +845,8 @@ def _open_secure_parent(path: Path) -> tuple[int, str]:
     except BaseException:
         if "current" in locals():
             os.close(current)
+        if "root" in locals():
+            os.close(root)
         raise
     metadata = os.fstat(current)
     if (
@@ -839,30 +855,90 @@ def _open_secure_parent(path: Path) -> tuple[int, str]:
         or metadata.st_mode & 0o022
     ):
         os.close(current)
+        os.close(root)
         raise AdmissionError("admission parent is not an owned non-writable directory")
-    return current, name
+    return root, current, name, components
+
+
+class _LedgerAuthority:
+    """Descriptors and identities needed to release one exact granted lease."""
+
+    def __init__(self, transaction: "_LedgerTransaction"):
+        self.root_fd = -1
+        self.directory_fd = -1
+        self.lock_fd = -1
+        self.root_fd = os.dup(transaction.root_fd)
+        self.directory_fd = os.dup(transaction.directory_fd)
+        self.lock_fd = os.dup(transaction.lock_fd)
+        self.ledger_name = transaction.ledger_name
+        self.lock_name = transaction.lock_name
+        self.components = transaction.components
+        self.directory_identity = transaction.directory_identity
+        self.lock_identity = transaction.lock_identity
+
+    def close(self) -> None:
+        for name in ("root_fd", "directory_fd", "lock_fd"):
+            descriptor = getattr(self, name)
+            if descriptor >= 0:
+                os.close(descriptor)
+                setattr(self, name, -1)
+
+    def __del__(self) -> None:
+        self.close()
 
 
 class _LedgerTransaction:
     """One descriptor-bound ledger transaction holding the stable flock."""
 
-    def __init__(self, path: Path):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        authority: _LedgerAuthority | None = None,
+        require_path: bool = True,
+    ):
         self.path = path
+        self.authority = authority
+        self.require_path = require_path
+        self.root_fd = -1
         self.directory_fd = -1
         self.lock_fd = -1
+        self.old_lock_guard_fd = -1
         self.ledger_name = ""
         self.lock_name = ""
         self.directory_identity: tuple[int, int] | None = None
         self.lock_identity: tuple[int, int] | None = None
+        self.components: tuple[str, ...] = ()
 
     def __enter__(self) -> "_LedgerTransaction":
-        self.directory_fd, self.ledger_name = _open_secure_parent(self.path)
-        self.lock_name = self.ledger_name + ".lock"
+        if self.authority is None:
+            (
+                self.root_fd,
+                self.directory_fd,
+                self.ledger_name,
+                self.components,
+            ) = _open_secure_parent(self.path)
+            self.lock_name = self.ledger_name + ".lock"
+        else:
+            self.root_fd = os.dup(self.authority.root_fd)
+            self.directory_fd = os.dup(self.authority.directory_fd)
+            self.ledger_name = self.authority.ledger_name
+            self.lock_name = self.authority.lock_name
+            self.components = self.authority.components
         directory = os.fstat(self.directory_fd)
         self.directory_identity = (directory.st_dev, directory.st_ino)
+        if (
+            self.authority is not None
+            and self.authority.directory_identity != self.directory_identity
+        ):
+            self.close()
+            raise AdmissionError("bound admission parent identity changed")
         try:
+            if self.authority is not None:
+                self.old_lock_guard_fd = os.dup(self.authority.lock_fd)
+                fcntl.flock(self.old_lock_guard_fd, fcntl.LOCK_EX)
             try:
-                self.lock_fd = os.open(
+                named_lock_fd = os.open(
                     self.lock_name,
                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
                     0o600,
@@ -870,23 +946,50 @@ class _LedgerTransaction:
                 )
             except OSError as exc:
                 raise AdmissionError("could not open admission lock") from exc
-            lock = os.fstat(self.lock_fd)
+            lock = os.fstat(named_lock_fd)
             if (
                 not stat.S_ISREG(lock.st_mode)
                 or lock.st_uid != os.geteuid()
                 or lock.st_nlink != 1
                 or lock.st_mode & 0o077
             ):
+                os.close(named_lock_fd)
                 raise AdmissionError(
                     "admission lock is not an owned single-link private file"
                 )
-            self.lock_identity = (lock.st_dev, lock.st_ino)
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+            named_identity = (lock.st_dev, lock.st_ino)
+            if (
+                self.authority is not None
+                and self.authority.lock_identity == named_identity
+            ):
+                os.close(named_lock_fd)
+                self.lock_fd = self.old_lock_guard_fd
+                self.old_lock_guard_fd = -1
+            else:
+                self.lock_fd = named_lock_fd
+                fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+            self.lock_identity = named_identity
             self.verify()
             return self
         except BaseException:
             self.close()
             raise
+
+    def path_matches(self) -> bool:
+        """Return whether the configured parent still resolves to the pinned inode."""
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        current = os.dup(self.root_fd)
+        try:
+            for component in self.components:
+                following = os.open(component, flags, dir_fd=current)
+                os.close(current)
+                current = following
+            metadata = os.fstat(current)
+            return self.directory_identity == (metadata.st_dev, metadata.st_ino)
+        except OSError:
+            return False
+        finally:
+            os.close(current)
 
     def verify(self) -> None:
         """Require the pinned parent and named lock to retain their identities."""
@@ -898,6 +1001,8 @@ class _LedgerTransaction:
             or directory.st_mode & 0o022
         ):
             raise AdmissionError("pinned admission parent changed")
+        if self.require_path and not self.path_matches():
+            raise AdmissionError("configured admission parent identity changed")
         lock = os.fstat(self.lock_fd)
         try:
             named_fd = os.open(
@@ -924,6 +1029,13 @@ class _LedgerTransaction:
             or named.st_mode & 0o077
         ):
             raise AdmissionError("admission lock identity changed")
+
+    def lease_authority(self) -> _LedgerAuthority:
+        """Duplicate the exact parent authority for a returned lease."""
+        self.verify()
+        authority = _LedgerAuthority(self)
+        self.verify()
+        return authority
 
     def create_temporary(self) -> tuple[str, int]:
         """Reserve a private staging file in the pinned parent."""
@@ -954,9 +1066,18 @@ class _LedgerTransaction:
             finally:
                 os.close(self.lock_fd)
                 self.lock_fd = -1
+        if self.old_lock_guard_fd >= 0:
+            try:
+                fcntl.flock(self.old_lock_guard_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.old_lock_guard_fd)
+                self.old_lock_guard_fd = -1
         if self.directory_fd >= 0:
             os.close(self.directory_fd)
             self.directory_fd = -1
+        if self.root_fd >= 0:
+            os.close(self.root_fd)
+            self.root_fd = -1
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None) -> None:
         self.close()
@@ -1136,6 +1257,7 @@ class HostAdmissionLedger:
         """Validate the current ledger without modifying it."""
         with _LedgerTransaction(self.path) as transaction:
             self._load(transaction)
+            transaction.verify()
 
     def request(
         self,
@@ -1157,30 +1279,35 @@ class HostAdmissionLedger:
                 entry.request.request_id == request.request_id and entry.request != request
                 for entry in queue
             ):
-                return _unknown(
+                decision = _unknown(
                     request, "request_id_conflict", ("existing_request_differs",)
-                ), None
+                )
+                transaction.verify()
+                return decision, None
+            owner_census: dict[ProcessOwner, OwnerState] = {}
+
             def checked_probe(owner: ProcessOwner) -> OwnerState:
+                if owner in owner_census:
+                    return owner_census[owner]
                 state = owner_probe(owner, snapshot)
                 if not isinstance(state, OwnerState):
                     raise AdmissionError("owner probe returned an invalid state")
+                owner_census[owner] = state
                 return state
 
             request_state = checked_probe(request.owner)
             if request_state is not OwnerState.ALIVE:
-                return _unknown(
+                decision = _unknown(
                     request, "request_owner_unconfirmed", (request_state.value,)
-                ), None
+                )
+                transaction.verify()
+                return decision, None
             states = {
                 lease.lease_id: checked_probe(lease.request.owner) for lease in leases
             }
             states.update(
                 {
-                    entry.request.request_id: (
-                        request_state
-                        if entry.request.request_id == request.request_id
-                        else checked_probe(entry.request.owner)
-                    )
+                    entry.request.request_id: checked_probe(entry.request.owner)
                     for entry in queue
                 }
             )
@@ -1199,27 +1326,39 @@ class HostAdmissionLedger:
             if any(state is OwnerState.UNKNOWN for state in states.values()):
                 if swept:
                     self._store(transaction, next_sequence, leases, queue)
-                return decide(request, snapshot, policy, tuple(leases), tuple(queue), now_unix_ms=now, owner_states=states), None
+                decision = decide(request, snapshot, policy, tuple(leases), tuple(queue), now_unix_ms=now, owner_states=states)
+                transaction.verify()
+                return decision, None
             existing_lease = next((lease for lease in leases if lease.request.request_id == request.request_id), None)
             if existing_lease is not None:
                 if swept:
                     self._store(transaction, next_sequence, leases, queue)
                 decision = Decision(Verdict.GRANT, "already_granted", request.request_id, sum(item.request.memory_bytes for item in leases if item.lease_id != existing_lease.lease_id), policy.memory_budget_bytes, None, None, (), (), None, existing_lease.lease_id)
-                return decision, Lease(existing_lease.lease_id, request, self)
+                transaction.verify()
+                return decision, Lease(
+                    existing_lease.lease_id,
+                    request,
+                    self,
+                    _authority=transaction.lease_authority(),
+                )
             existing_queue = next((entry for entry in queue if entry.request.request_id == request.request_id), None)
             if existing_queue is None:
                 if len(leases) + len(queue) >= MAX_RECORDS:
                     if swept:
                         self._store(transaction, next_sequence, leases, queue)
-                    return _unknown(
+                    decision = _unknown(
                         request, "record_capacity_exhausted", ("ledger_full",)
-                    ), None
+                    )
+                    transaction.verify()
+                    return decision, None
                 if next_sequence == _MAX_U64:
                     if swept:
                         self._store(transaction, next_sequence, leases, queue)
-                    return _unknown(
+                    decision = _unknown(
                         request, "queue_sequence_exhausted", ("ledger_counter_exhausted",)
-                    ), None
+                    )
+                    transaction.verify()
+                    return decision, None
                 existing_queue = QueueView(request, next_sequence)
                 next_sequence += 1
                 queue.append(existing_queue)
@@ -1232,18 +1371,41 @@ class HostAdmissionLedger:
                 queue = [entry for entry in queue if entry.request.request_id != request.request_id]
                 leases.append(LeaseView(request.request_id, request, now))
                 self._store(transaction, next_sequence, leases, queue)
-                return decision, Lease(request.request_id, request, self)
+                transaction.verify()
+                return decision, Lease(
+                    request.request_id,
+                    request,
+                    self,
+                    _authority=transaction.lease_authority(),
+                )
             if decision.verdict is Verdict.REFUSE:
                 queue = [entry for entry in queue if entry.request.request_id != request.request_id]
             if decision.verdict is not Verdict.UNKNOWN or swept:
                 self._store(transaction, next_sequence, leases, queue)
+            transaction.verify()
             return decision, None
 
     def release(self, lease_id: str, owner: ProcessOwner) -> None:
         """Release one exact lease without affecting peers."""
+        self._release_bound(lease_id, owner, None)
+
+    def _release_bound(
+        self,
+        lease_id: str,
+        owner: ProcessOwner,
+        authority: _LedgerAuthority | None,
+    ) -> bool:
+        """Release from the exact granted parent, reporting pathname continuity."""
         _require_id("lease_id", lease_id)
-        with _LedgerTransaction(self.path) as transaction:
+        with _LedgerTransaction(
+            self.path,
+            authority=authority,
+            require_path=authority is None,
+        ) as transaction:
+            path_matches = transaction.path_matches()
             next_sequence, leases, queue = self._load(transaction)
             kept = [lease for lease in leases if not (lease.lease_id == lease_id and lease.request.owner == owner)]
             if len(kept) != len(leases):
                 self._store(transaction, next_sequence, kept, queue)
+            transaction.verify()
+            return path_matches and transaction.path_matches()

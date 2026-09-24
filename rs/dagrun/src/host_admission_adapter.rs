@@ -21,12 +21,50 @@ pub struct ShadowComparison {
     pub shadow_code: String,
 }
 
-/// Compare one current memory decision without touching either ledger.
+/// Preserve the old call surface without inventing missing host measurements.
+///
+/// The authoritative decision remains meaningful; the shadow result is
+/// `UNKNOWN` until the caller uses
+/// [`compare_legacy_memory_decision_with_snapshot`] with a real observation.
 pub fn compare_legacy_memory_decision(
     requested_bytes: u64,
     budget_bytes: Option<u64>,
     headroom_bytes: Option<u64>,
     reserved_bytes: u64,
+) -> Result<ShadowComparison, host_admission::AdmissionError> {
+    compare_legacy_memory_decision_impl(
+        requested_bytes,
+        budget_bytes,
+        headroom_bytes,
+        reserved_bytes,
+        None,
+    )
+}
+
+/// Compare using a real timestamped host observation without changing authority.
+pub fn compare_legacy_memory_decision_with_snapshot(
+    requested_bytes: u64,
+    budget_bytes: Option<u64>,
+    headroom_bytes: Option<u64>,
+    reserved_bytes: u64,
+    snapshot: &HostSnapshot,
+    observed_at_unix_ms: u64,
+) -> Result<ShadowComparison, host_admission::AdmissionError> {
+    compare_legacy_memory_decision_impl(
+        requested_bytes,
+        budget_bytes,
+        headroom_bytes,
+        reserved_bytes,
+        Some((snapshot, observed_at_unix_ms)),
+    )
+}
+
+fn compare_legacy_memory_decision_impl(
+    requested_bytes: u64,
+    budget_bytes: Option<u64>,
+    headroom_bytes: Option<u64>,
+    reserved_bytes: u64,
+    observation: Option<(&HostSnapshot, u64)>,
 ) -> Result<ShadowComparison, host_admission::AdmissionError> {
     let authoritative_verdict = if budget_bytes.is_some_and(|budget| requested_bytes > budget) {
         LegacyVerdict::Refuse
@@ -38,25 +76,27 @@ pub fn compare_legacy_memory_decision(
     } else {
         LegacyVerdict::Grant
     };
+    let effective_snapshot = observation.map_or_else(
+        || HostSnapshot {
+            captured_at_unix_ms: 1,
+            host_id: "shadow-host".to_owned(),
+            boot_id: "shadow-boot".to_owned(),
+            mem_total_bytes: None,
+            mem_available_bytes: None,
+            swap_total_bytes: None,
+            swap_free_bytes: None,
+            memory_psi_some_avg10_micros: None,
+            memory_psi_full_avg10_micros: None,
+            errors: Vec::new(),
+        },
+        |(snapshot, _)| snapshot.clone(),
+    );
+    let observed_at_unix_ms = observation.map_or(1, |(_, observed_at)| observed_at);
     let owner = ProcessOwner {
-        host_id: "shadow-host".to_owned(),
-        boot_id: "shadow-boot".to_owned(),
+        host_id: effective_snapshot.host_id.clone(),
+        boot_id: effective_snapshot.boot_id.clone(),
         pid: 1,
         start_ticks: 1,
-    };
-    // These compatibility inputs are already-derived limits, not raw host
-    // measurements. Do not invent a physical-memory snapshot from them.
-    let snapshot = HostSnapshot {
-        captured_at_unix_ms: 1,
-        host_id: owner.host_id.clone(),
-        boot_id: owner.boot_id.clone(),
-        mem_total_bytes: None,
-        mem_available_bytes: None,
-        swap_total_bytes: None,
-        swap_free_bytes: None,
-        memory_psi_some_avg10_micros: None,
-        memory_psi_full_avg10_micros: None,
-        errors: Vec::new(),
     };
     let policy = AdmissionPolicy {
         memory_budget_bytes: budget_bytes,
@@ -99,7 +139,15 @@ pub fn compare_legacy_memory_decision(
         .iter()
         .map(|(id, _)| (id.clone(), OwnerState::Alive))
         .collect();
-    let shadow = decide(&request, &snapshot, &policy, &leases, &[], 1, &owner_states)?;
+    let shadow = decide(
+        &request,
+        &effective_snapshot,
+        &policy,
+        &leases,
+        &[],
+        observed_at_unix_ms,
+        &owner_states,
+    )?;
     Ok(ShadowComparison {
         authoritative_verdict,
         shadow_verdict: shadow.verdict,
@@ -121,10 +169,39 @@ mod tests {
             (1 << 40, None, None, 0, LegacyVerdict::Grant),
         ];
         for (requested, budget, headroom, reserved, expected) in cases {
-            let comparison = compare_legacy_memory_decision(requested, budget, headroom, reserved)
+            let observation = budget.zip(headroom).map(|(budget, headroom)| HostSnapshot {
+                captured_at_unix_ms: 1000,
+                host_id: "host-a".to_owned(),
+                boot_id: "boot-a".to_owned(),
+                mem_total_bytes: Some(budget.max(headroom)),
+                mem_available_bytes: Some(headroom),
+                swap_total_bytes: Some(0),
+                swap_free_bytes: Some(0),
+                memory_psi_some_avg10_micros: Some(0),
+                memory_psi_full_avg10_micros: Some(0),
+                errors: Vec::new(),
+            });
+            let comparison = observation
+                .as_ref()
+                .map_or_else(
+                    || compare_legacy_memory_decision(requested, budget, headroom, reserved),
+                    |snapshot| {
+                        compare_legacy_memory_decision_with_snapshot(
+                            requested, budget, headroom, reserved, snapshot, 1010,
+                        )
+                    },
+                )
                 .expect("shadow comparison");
             assert_eq!(comparison.authoritative_verdict, expected);
-            assert_eq!(comparison.shadow_verdict, Verdict::Unknown);
+            assert_eq!(
+                comparison.shadow_verdict,
+                match (observation.is_none(), expected) {
+                    (true, _) => Verdict::Unknown,
+                    (false, LegacyVerdict::Grant) => Verdict::Grant,
+                    (false, LegacyVerdict::Queue) => Verdict::Queue,
+                    (false, LegacyVerdict::Refuse) => Verdict::Refuse,
+                }
+            );
         }
         assert_eq!(
             compare_legacy_memory_decision(1 << 40, None, None, 0)
@@ -132,5 +209,28 @@ mod tests {
                 .shadow_verdict,
             Verdict::Unknown
         );
+        let stale = HostSnapshot {
+            captured_at_unix_ms: 1,
+            host_id: "host-a".to_owned(),
+            boot_id: "boot-a".to_owned(),
+            mem_total_bytes: Some(1000),
+            mem_available_bytes: Some(1000),
+            swap_total_bytes: Some(0),
+            swap_free_bytes: Some(0),
+            memory_psi_some_avg10_micros: Some(0),
+            memory_psi_full_avg10_micros: Some(0),
+            errors: Vec::new(),
+        };
+        let stale_comparison = compare_legacy_memory_decision_with_snapshot(
+            1,
+            Some(700),
+            Some(700),
+            0,
+            &stale,
+            30_002,
+        )
+        .expect("stale shadow comparison");
+        assert_eq!(stale_comparison.authoritative_verdict, LegacyVerdict::Grant);
+        assert_eq!(stale_comparison.shadow_verdict, Verdict::Unknown);
     }
 }

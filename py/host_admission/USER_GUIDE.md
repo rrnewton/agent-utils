@@ -16,6 +16,11 @@ another mode with no group/world write bits). Parent components and final files
 must not be symlinks. A malformed/unsafe/full ledger fails closed and remains
 unchanged.
 
+A returned lease retains the exact parent authority needed for release. If the
+configured path is replaced after grant, release cleans the original row and
+raises an admission error reporting the path discontinuity; it never releases a
+same-named row in the replacement directory.
+
 The default deployment mode for a new caller is shadow-only: call the pure
 decide function, retain the current admission authority, and compare the
 structured result. Never run two authoritative ledgers for the same resource

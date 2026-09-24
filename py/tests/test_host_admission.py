@@ -17,6 +17,7 @@ from host_admission import (
     AdmissionPolicy,
     HostAdmissionLedger,
     HostSnapshot,
+    Lease,
     LeaseView,
     OwnerState,
     ProcessOwner,
@@ -329,16 +330,13 @@ def test_ledger_parent_and_final_components_fail_closed(tmp_path: Path) -> None:
         )
 
 
-def test_descriptor_binding_detects_lock_unlink_and_contains_parent_retarget(
+def test_descriptor_binding_refuses_lock_unlink_and_parent_retarget(
     tmp_path: Path,
 ) -> None:
     parent = tmp_path / "parent"
     moved = tmp_path / "moved"
-    attacker = tmp_path / "attacker"
     parent.mkdir()
     parent.chmod(0o700)
-    attacker.mkdir()
-    attacker.chmod(0o700)
     ledger = HostAdmissionLedger(parent / "ledger.json")
 
     def unlink_lock(_owner: ProcessOwner, _snapshot: HostSnapshot) -> OwnerState:
@@ -355,22 +353,116 @@ def test_descriptor_binding_detects_lock_unlink_and_contains_parent_retarget(
         )
     assert not (parent / "ledger.json").exists()
 
-    def retarget_parent(_owner: ProcessOwner, _snapshot: HostSnapshot) -> OwnerState:
+    nested_lease: list[Lease] = []
+
+    def retarget_parent(
+        _observed_owner: ProcessOwner, _observed_snapshot: HostSnapshot
+    ) -> OwnerState:
         parent.rename(moved)
-        parent.symlink_to(attacker, target_is_directory=True)
+        parent.mkdir()
+        parent.chmod(0o700)
+        nested, lease = HostAdmissionLedger(parent / "ledger.json").request(
+            ResourceRequest("nested", "test", _owner(20, 200), 100),
+            _snapshot(),
+            AdmissionPolicy(memory_budget_bytes=100, memory_reserve_bytes=0),
+            now_unix_ms=1011,
+            owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
+        )
+        assert nested.verdict is Verdict.GRANT and lease is not None
+        nested_lease.append(lease)
         return OwnerState.ALIVE
 
+    with pytest.raises(AdmissionError):
+        ledger.request(
+            ResourceRequest("outer", "test", _owner(), 100),
+            _snapshot(),
+            AdmissionPolicy(memory_budget_bytes=100, memory_reserve_bytes=0),
+            now_unix_ms=1011,
+            owner_probe=retarget_parent,
+        )
+    assert not (moved / "ledger.json").exists()
+    new_state = _mapping(json.loads((parent / "ledger.json").read_text()))
+    assert [
+        _text(_mapping(entry)["lease_id"])
+        for entry in _sequence(new_state["leases"])
+    ] == ["nested"]
+    nested_lease[0].release()
+
+
+def test_returned_lease_releases_exact_parent_and_reports_retarget(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    moved = tmp_path / "moved"
+    parent.mkdir()
+    parent.chmod(0o700)
+    ledger = HostAdmissionLedger(parent / "ledger.json")
+    request = ResourceRequest("held", "test", _owner(), 1)
     decision, lease = ledger.request(
-        ResourceRequest("retarget", "test", _owner(), 1),
+        request,
+        _snapshot(),
+        _policy(),
+        now_unix_ms=1010,
+        owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
+    )
+    assert decision.verdict is Verdict.GRANT and lease is not None
+    parent.rename(moved)
+    parent.mkdir()
+    parent.chmod(0o700)
+    replacement_decision, replacement_lease = HostAdmissionLedger(
+        parent / "ledger.json"
+    ).request(
+        request,
         _snapshot(),
         _policy(),
         now_unix_ms=1011,
-        owner_probe=retarget_parent,
+        owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
     )
-    assert decision.verdict is Verdict.GRANT and lease is not None
-    assert (moved / "ledger.json").is_file()
-    assert not (attacker / "ledger.json").exists()
-    HostAdmissionLedger(moved / "ledger.json").release("retarget", _owner())
+    assert replacement_decision.verdict is Verdict.GRANT
+    assert replacement_lease is not None
+    with pytest.raises(AdmissionError, match="exact lease was released"):
+        lease.release()
+    lease.release()
+    old_state = _mapping(json.loads((moved / "ledger.json").read_text()))
+    assert _sequence(old_state["leases"]) == []
+    replacement_state = _mapping(json.loads((parent / "ledger.json").read_text()))
+    assert len(_sequence(replacement_state["leases"])) == 1
+    replacement_lease.release()
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_existing_grant_refuses_lock_change_and_bound_release_recovers(
+    tmp_path: Path, replace: bool,
+) -> None:
+    path = tmp_path / "ledger.json"
+    ledger = HostAdmissionLedger(path)
+    request = ResourceRequest("held", "test", _owner(), 1)
+    _decision, lease = ledger.request(
+        request,
+        _snapshot(),
+        _policy(),
+        now_unix_ms=1010,
+        owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
+    )
+    assert lease is not None
+
+    def unlink_lock(_owner: ProcessOwner, _snapshot: HostSnapshot) -> OwnerState:
+        lock = path.with_name(path.name + ".lock")
+        lock.unlink()
+        if replace:
+            lock.write_bytes(b"")
+            lock.chmod(0o600)
+        return OwnerState.ALIVE
+
+    with pytest.raises(AdmissionError):
+        ledger.request(
+            request,
+            _snapshot(),
+            _policy(),
+            now_unix_ms=1011,
+            owner_probe=unlink_lock,
+        )
+    lease.release()
+    state = _mapping(json.loads(path.read_text()))
+    assert _sequence(state["leases"]) == []
 
 
 def test_bare_relative_ledger_path_commits_without_ambiguous_error(
@@ -595,6 +687,42 @@ def test_invalid_owner_probe_state_fails_closed_without_writing(tmp_path: Path) 
     assert not path.exists()
 
 
+def test_each_unique_owner_is_probed_once_and_existing_grant_is_not_rewritten(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.json"
+    ledger = HostAdmissionLedger(path)
+    request = ResourceRequest("same", "test", _owner(), 1)
+    _first, first_lease = ledger.request(
+        request,
+        _snapshot(),
+        _policy(),
+        now_unix_ms=1010,
+        owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
+    )
+    assert first_lease is not None
+    before = path.read_bytes()
+    calls = 0
+
+    def changing_probe(_owner: ProcessOwner, _snapshot: HostSnapshot) -> OwnerState:
+        nonlocal calls
+        calls += 1
+        return OwnerState.ALIVE if calls == 1 else OwnerState.ABSENT
+
+    decision, retry_lease = ledger.request(
+        request,
+        _snapshot(),
+        _policy(),
+        now_unix_ms=2020,
+        owner_probe=changing_probe,
+    )
+    assert calls == 1
+    assert decision.verdict is Verdict.GRANT and decision.code == "already_granted"
+    assert retry_lease is not None and path.read_bytes() == before
+    retry_lease.release()
+    first_lease.release()
+
+
 def test_host_snapshot_timestamp_precedes_all_measurement_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -675,10 +803,53 @@ def test_dagrun_compatibility_adapter_preserves_legacy_authority() -> None:
         (1 << 40, None, None, 0, LegacyVerdict.GRANT),
     ]
     for requested, budget, headroom, reserved, expected in cases:
-        comparison = compare_legacy_memory_decision(requested, budget_bytes=budget, headroom_bytes=headroom, reserved_bytes=reserved)
+        real_snapshot = (
+            HostSnapshot(
+                1000,
+                "host-a",
+                "boot-a",
+                max(budget, headroom),
+                headroom,
+                0,
+                0,
+                0,
+                0,
+            )
+            if budget is not None and headroom is not None
+            else None
+        )
+        comparison = compare_legacy_memory_decision(
+            requested,
+            budget_bytes=budget,
+            headroom_bytes=headroom,
+            reserved_bytes=reserved,
+            snapshot=real_snapshot,
+            observed_at_unix_ms=1010 if real_snapshot is not None else None,
+        )
         assert comparison.authoritative_verdict is expected
-        assert comparison.shadow_verdict is Verdict.UNKNOWN
+        assert comparison.shadow_verdict is (
+            Verdict.UNKNOWN if real_snapshot is None else Verdict(expected.value)
+        )
     assert compare_legacy_memory_decision(1 << 40, budget_bytes=None, headroom_bytes=None, reserved_bytes=0).shadow_verdict is Verdict.UNKNOWN
+    stale = HostSnapshot(1, "host-a", "boot-a", 1000, 1000, 0, 0, 0, 0)
+    stale_comparison = compare_legacy_memory_decision(
+        1,
+        budget_bytes=700,
+        headroom_bytes=700,
+        reserved_bytes=0,
+        snapshot=stale,
+        observed_at_unix_ms=30_002,
+    )
+    assert stale_comparison.authoritative_verdict is LegacyVerdict.GRANT
+    assert stale_comparison.shadow_verdict is Verdict.UNKNOWN
+    with pytest.raises(ValueError):
+        compare_legacy_memory_decision(
+            1,
+            budget_bytes=700,
+            headroom_bytes=700,
+            reserved_bytes=0,
+            snapshot=_snapshot(),
+        )
 
 
 def test_snapshot_and_diagnostics_never_echo_caller_metadata() -> None:

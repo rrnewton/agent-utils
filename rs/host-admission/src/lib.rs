@@ -124,7 +124,7 @@ pub enum SwapMode {
 }
 
 /// Exact process ownership bound to one host and boot.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessOwner {
     /// Stable host identity.
@@ -1145,6 +1145,24 @@ pub fn probe_process_owner(owner: &ProcessOwner, snapshot: &HostSnapshot) -> Own
     }
 }
 
+fn census_owner<F>(
+    census: &mut BTreeMap<ProcessOwner, OwnerState>,
+    owner: &ProcessOwner,
+    snapshot: &HostSnapshot,
+    probe: &F,
+) -> OwnerState
+where
+    F: Fn(&ProcessOwner, &HostSnapshot) -> OwnerState,
+{
+    if let Some(state) = census.get(owner) {
+        *state
+    } else {
+        let state = probe(owner, snapshot);
+        census.insert(owner.clone(), state);
+        state
+    }
+}
+
 fn name_cstring(name: &OsStr) -> Result<CString, AdmissionError> {
     CString::new(name.as_bytes()).map_err(|_| AdmissionError("path contains NUL".to_owned()))
 }
@@ -1172,7 +1190,9 @@ fn openat_file(
     }
 }
 
-fn open_pinned_parent(path: &Path) -> Result<(File, OsString), AdmissionError> {
+fn open_pinned_parent(
+    path: &Path,
+) -> Result<(File, File, OsString, Vec<OsString>), AdmissionError> {
     let name = path
         .file_name()
         .ok_or_else(|| AdmissionError("admission ledger has no leaf name".to_owned()))?
@@ -1189,16 +1209,21 @@ fn open_pinned_parent(path: &Path) -> Result<(File, OsString), AdmissionError> {
     } else {
         Path::new(".")
     };
-    let mut directory = OpenOptions::new()
+    let root = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(start)
         .map_err(|_| AdmissionError("could not open admission path root".to_owned()))?;
+    let mut directory = root
+        .try_clone()
+        .map_err(|_| AdmissionError("could not pin admission path root".to_owned()))?;
+    let mut components = Vec::new();
     if let Some(parent) = parent {
         for component in parent.components() {
             match component {
                 Component::RootDir | Component::CurDir => {}
                 Component::Normal(part) => {
+                    components.push(part.to_os_string());
                     directory =
                         openat_file(&directory, part, libc::O_RDONLY | libc::O_DIRECTORY, 0)
                             .map_err(|_| {
@@ -1221,23 +1246,126 @@ fn open_pinned_parent(path: &Path) -> Result<(File, OsString), AdmissionError> {
             "admission parent is not an owned non-writable directory".to_owned(),
         ));
     }
-    Ok((directory, name))
+    Ok((root, directory, name, components))
 }
 
-struct LockedLedgerDirectory {
+#[derive(Debug)]
+struct LedgerAuthority {
+    resolution_root: File,
     directory: File,
+    lock: File,
     ledger_name: OsString,
     lock_name: OsString,
-    lock: File,
+    parent_components: Vec<OsString>,
     directory_identity: (u64, u64),
     lock_identity: (u64, u64),
 }
 
+struct LockedLedgerDirectory {
+    resolution_root: File,
+    directory: File,
+    ledger_name: OsString,
+    lock_name: OsString,
+    lock: File,
+    _old_lock_guard: Option<File>,
+    directory_identity: (u64, u64),
+    lock_identity: (u64, u64),
+    parent_components: Vec<OsString>,
+    require_path: bool,
+}
+
 impl LockedLedgerDirectory {
     fn open(path: &Path) -> Result<Self, AdmissionError> {
-        let (directory, ledger_name) = open_pinned_parent(path)?;
+        let (resolution_root, directory, ledger_name, parent_components) =
+            open_pinned_parent(path)?;
         let mut lock_name = ledger_name.clone();
         lock_name.push(".lock");
+        Self::from_parts(
+            resolution_root,
+            directory,
+            ledger_name,
+            lock_name,
+            parent_components,
+            true,
+        )
+    }
+
+    fn open_bound(authority: &LedgerAuthority) -> Result<Self, AdmissionError> {
+        let resolution_root = authority
+            .resolution_root
+            .try_clone()
+            .map_err(|_| AdmissionError("could not duplicate admission root".to_owned()))?;
+        let directory = authority
+            .directory
+            .try_clone()
+            .map_err(|_| AdmissionError("could not duplicate admission parent".to_owned()))?;
+        let metadata = directory
+            .metadata()
+            .map_err(|_| AdmissionError("could not inspect bound admission parent".to_owned()))?;
+        if authority.directory_identity != (metadata.dev(), metadata.ino()) {
+            return Err(AdmissionError(
+                "bound admission parent identity changed".to_owned(),
+            ));
+        }
+        let old_lock = authority
+            .lock
+            .try_clone()
+            .map_err(|_| AdmissionError("could not retain prior admission lock".to_owned()))?;
+        old_lock
+            .lock_exclusive()
+            .map_err(|_| AdmissionError("could not lock prior admission domain".to_owned()))?;
+        let named_lock = openat_file(
+            &directory,
+            &authority.lock_name,
+            libc::O_RDWR | libc::O_CREAT,
+            0o600,
+        )
+        .map_err(|_| AdmissionError("could not open admission lock".to_owned()))?;
+        let named_metadata = named_lock
+            .metadata()
+            .map_err(|_| AdmissionError("could not inspect admission lock".to_owned()))?;
+        if !named_metadata.is_file()
+            || named_metadata.uid() != current_uid()?
+            || named_metadata.nlink() != 1
+            || named_metadata.mode() & 0o077 != 0
+        {
+            return Err(AdmissionError(
+                "admission lock is not an owned single-link private file".to_owned(),
+            ));
+        }
+        let named_identity = (named_metadata.dev(), named_metadata.ino());
+        let (lock, old_lock_guard) = if authority.lock_identity == named_identity {
+            (old_lock, None)
+        } else {
+            named_lock.lock_exclusive().map_err(|_| {
+                AdmissionError("could not lock replacement admission domain".to_owned())
+            })?;
+            (named_lock, Some(old_lock))
+        };
+        let pinned = Self {
+            resolution_root,
+            directory,
+            ledger_name: authority.ledger_name.clone(),
+            lock_name: authority.lock_name.clone(),
+            lock,
+            _old_lock_guard: old_lock_guard,
+            directory_identity: authority.directory_identity,
+            lock_identity: named_identity,
+            parent_components: authority.parent_components.clone(),
+            require_path: false,
+        };
+        pinned.verify()?;
+        Ok(pinned)
+    }
+
+    fn from_parts(
+        resolution_root: File,
+        directory: File,
+        ledger_name: OsString,
+        lock_name: OsString,
+        parent_components: Vec<OsString>,
+        require_path: bool,
+    ) -> Result<Self, AdmissionError> {
         let lock = openat_file(&directory, &lock_name, libc::O_RDWR | libc::O_CREAT, 0o600)
             .map_err(|_| AdmissionError("could not open admission lock".to_owned()))?;
         let directory_metadata = directory
@@ -1258,18 +1386,32 @@ impl LockedLedgerDirectory {
         lock.lock_exclusive()
             .map_err(|_| AdmissionError("could not lock admission ledger".to_owned()))?;
         let pinned = Self {
+            resolution_root,
             directory,
             ledger_name,
             lock_name,
             lock,
+            _old_lock_guard: None,
             directory_identity: (directory_metadata.dev(), directory_metadata.ino()),
             lock_identity: (lock_metadata.dev(), lock_metadata.ino()),
+            parent_components,
+            require_path,
         };
         pinned.verify()?;
         Ok(pinned)
     }
 
     fn verify(&self) -> Result<(), AdmissionError> {
+        self.verify_storage()?;
+        if self.require_path && !self.path_matches() {
+            return Err(AdmissionError(
+                "configured admission parent identity changed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_storage(&self) -> Result<(), AdmissionError> {
         let directory = self
             .directory
             .metadata()
@@ -1304,6 +1446,53 @@ impl LockedLedgerDirectory {
             return Err(AdmissionError("admission lock identity changed".to_owned()));
         }
         Ok(())
+    }
+
+    fn path_matches(&self) -> bool {
+        let Ok(mut directory) = self.resolution_root.try_clone() else {
+            return false;
+        };
+        for component in &self.parent_components {
+            let Ok(next) =
+                openat_file(&directory, component, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+            else {
+                return false;
+            };
+            directory = next;
+        }
+        directory
+            .metadata()
+            .is_ok_and(|metadata| self.directory_identity == (metadata.dev(), metadata.ino()))
+    }
+
+    fn lease_authority(&self) -> Result<LedgerAuthority, AdmissionError> {
+        self.verify()?;
+        let retained_lock = openat_file(&self.directory, &self.lock_name, libc::O_RDONLY, 0)
+            .map_err(|_| AdmissionError("could not retain admission lock".to_owned()))?;
+        let retained_metadata = retained_lock
+            .metadata()
+            .map_err(|_| AdmissionError("could not inspect retained admission lock".to_owned()))?;
+        if self.lock_identity != (retained_metadata.dev(), retained_metadata.ino()) {
+            return Err(AdmissionError("admission lock identity changed".to_owned()));
+        }
+        let authority = LedgerAuthority {
+            resolution_root: self
+                .resolution_root
+                .try_clone()
+                .map_err(|_| AdmissionError("could not retain admission root".to_owned()))?,
+            directory: self
+                .directory
+                .try_clone()
+                .map_err(|_| AdmissionError("could not retain admission parent".to_owned()))?,
+            lock: retained_lock,
+            ledger_name: self.ledger_name.clone(),
+            lock_name: self.lock_name.clone(),
+            parent_components: self.parent_components.clone(),
+            directory_identity: self.directory_identity,
+            lock_identity: self.lock_identity,
+        };
+        self.verify()?;
+        Ok(authority)
     }
 
     fn temporary(&self) -> Result<(OsString, File), AdmissionError> {
@@ -1475,6 +1664,7 @@ impl HostAdmissionLedger {
             locked.directory.sync_all().map_err(|_| {
                 AdmissionError("could not sync admission ledger directory".to_owned())
             })?;
+            locked.verify()?;
             Ok(())
         })();
         if result.is_err() {
@@ -1486,7 +1676,8 @@ impl HostAdmissionLedger {
     /// Validate the current ledger without modifying it.
     pub fn validate(&self) -> Result<(), AdmissionError> {
         let locked = LockedLedgerDirectory::open(&self.path)?;
-        self.load(&locked).map(|_| ())
+        self.load(&locked)?;
+        locked.verify()
     }
 
     /// Atomically sweep, queue, decide, and commit one request.
@@ -1512,6 +1703,7 @@ impl HostAdmissionLedger {
                 entry.request.request_id == request.request_id && entry.request != *request
             })
         {
+            locked.verify()?;
             return Ok((
                 unknown(
                     request,
@@ -1521,13 +1713,15 @@ impl HostAdmissionLedger {
                 None,
             ));
         }
-        let request_state = owner_probe(&request.owner, snapshot);
+        let mut owner_census = BTreeMap::new();
+        let request_state = census_owner(&mut owner_census, &request.owner, snapshot, &owner_probe);
         if request_state != OwnerState::Alive {
             let blocker = match request_state {
                 OwnerState::Alive => unreachable!(),
                 OwnerState::Absent => "absent",
                 OwnerState::Unknown => "unknown",
             };
+            locked.verify()?;
             return Ok((
                 unknown(
                     request,
@@ -1543,18 +1737,24 @@ impl HostAdmissionLedger {
             .map(|lease| {
                 (
                     lease.lease_id.clone(),
-                    owner_probe(&lease.request.owner, snapshot),
+                    census_owner(
+                        &mut owner_census,
+                        &lease.request.owner,
+                        snapshot,
+                        &owner_probe,
+                    ),
                 )
             })
             .collect();
         states.extend(data.queue.iter().map(|entry| {
             (
                 entry.request.request_id.clone(),
-                if entry.request.request_id == request.request_id {
-                    request_state
-                } else {
-                    owner_probe(&entry.request.owner, snapshot)
-                },
+                census_owner(
+                    &mut owner_census,
+                    &entry.request.owner,
+                    snapshot,
+                    &owner_probe,
+                ),
             )
         }));
         let original_counts = (data.leases.len(), data.queue.len());
@@ -1577,6 +1777,7 @@ impl HostAdmissionLedger {
             if swept {
                 self.store(&locked, &data)?;
             }
+            locked.verify()?;
             return Ok((
                 decide(
                     request,
@@ -1617,6 +1818,8 @@ impl HostAdmissionLedger {
                 None,
                 Some(existing.lease_id.clone()),
             );
+            locked.verify()?;
+            let authority = locked.lease_authority()?;
             return Ok((
                 decision,
                 Some(Lease {
@@ -1624,6 +1827,7 @@ impl HostAdmissionLedger {
                     request: request.clone(),
                     ledger: self.clone(),
                     released: false,
+                    authority: Some(authority),
                 }),
             ));
         }
@@ -1636,6 +1840,7 @@ impl HostAdmissionLedger {
                 if swept {
                     self.store(&locked, &data)?;
                 }
+                locked.verify()?;
                 return Ok((
                     unknown(
                         request,
@@ -1649,6 +1854,7 @@ impl HostAdmissionLedger {
                 if swept {
                     self.store(&locked, &data)?;
                 }
+                locked.verify()?;
                 return Ok((
                     unknown(
                         request,
@@ -1702,6 +1908,8 @@ impl HostAdmissionLedger {
                     request: request.clone(),
                 });
                 self.store(&locked, &data)?;
+                locked.verify()?;
+                let authority = locked.lease_authority()?;
                 Ok((
                     decision,
                     Some(Lease {
@@ -1709,6 +1917,7 @@ impl HostAdmissionLedger {
                         request: request.clone(),
                         ledger: self.clone(),
                         released: false,
+                        authority: Some(authority),
                     }),
                 ))
             }
@@ -1716,23 +1925,35 @@ impl HostAdmissionLedger {
                 data.queue
                     .retain(|entry| entry.request.request_id != request.request_id);
                 self.store(&locked, &data)?;
+                locked.verify()?;
                 Ok((decision, None))
             }
             Verdict::Queue => {
                 self.store(&locked, &data)?;
+                locked.verify()?;
                 Ok((decision, None))
             }
             Verdict::Unknown => {
                 if swept {
                     self.store(&locked, &data)?;
                 }
+                locked.verify()?;
                 Ok((decision, None))
             }
         }
     }
 
-    fn release(&self, lease_id: &str, owner: &ProcessOwner) -> Result<(), AdmissionError> {
-        let locked = LockedLedgerDirectory::open(&self.path)?;
+    fn release_bound(
+        &self,
+        lease_id: &str,
+        owner: &ProcessOwner,
+        authority: Option<&LedgerAuthority>,
+    ) -> Result<bool, AdmissionError> {
+        let locked = match authority {
+            Some(authority) => LockedLedgerDirectory::open_bound(authority)?,
+            None => LockedLedgerDirectory::open(&self.path)?,
+        };
+        let path_matches = locked.path_matches();
         let mut data = self.load(&locked)?;
         let before = data.leases.len();
         data.leases
@@ -1740,7 +1961,8 @@ impl HostAdmissionLedger {
         if before != data.leases.len() {
             self.store(&locked, &data)?;
         }
-        Ok(())
+        locked.verify()?;
+        Ok(path_matches && locked.path_matches())
     }
 }
 
@@ -1751,14 +1973,25 @@ pub struct Lease {
     request: ResourceRequest,
     ledger: HostAdmissionLedger,
     released: bool,
+    authority: Option<LedgerAuthority>,
 }
 
 impl Lease {
     /// Return this exact lease idempotently.
     pub fn release(&mut self) -> Result<(), AdmissionError> {
         if !self.released {
-            self.ledger.release(&self.lease_id, &self.request.owner)?;
+            let path_matches = self.ledger.release_bound(
+                &self.lease_id,
+                &self.request.owner,
+                self.authority.as_ref(),
+            )?;
             self.released = true;
+            self.authority = None;
+            if !path_matches {
+                return Err(AdmissionError(
+                    "configured admission parent changed; exact lease was released".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1773,6 +2006,7 @@ fn current_uid() -> Result<u32, AdmissionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -2098,17 +2332,13 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_binding_detects_lock_unlink_and_contains_parent_retarget() {
-        use std::os::unix::fs::symlink;
-
+    fn descriptor_binding_refuses_lock_unlink_and_parent_retarget() {
         let root = temp_path("descriptor-races");
         fs::create_dir_all(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let parent = root.join("parent");
         let moved = root.join("moved");
-        let attacker = root.join("attacker");
         fs::create_dir(&parent).unwrap();
-        fs::create_dir(&attacker).unwrap();
         let ledger = HostAdmissionLedger::new(parent.join("ledger.json"));
         assert!(ledger
             .request(
@@ -2124,28 +2354,131 @@ mod tests {
             .is_err());
         assert!(!parent.join("ledger.json").exists());
 
-        let (decision, lease) = ledger
+        let nested_lease = RefCell::new(None);
+        let mut tight_policy = policy(BTreeMap::new());
+        tight_policy.memory_budget_bytes = Some(100);
+        let outer = request("outer", 10, 100);
+        let result = ledger.request(&outer, &snapshot(), &tight_policy, 1011, |_, _| {
+            fs::rename(&parent, &moved).unwrap();
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let (nested, lease) = HostAdmissionLedger::new(parent.join("ledger.json"))
+                .request(
+                    &request("nested", 20, 200),
+                    &snapshot(),
+                    &tight_policy,
+                    1011,
+                    |_, _| OwnerState::Alive,
+                )
+                .unwrap();
+            assert_eq!(nested.verdict, Verdict::Grant);
+            *nested_lease.borrow_mut() = lease;
+            OwnerState::Alive
+        });
+        assert!(result.is_err());
+        assert!(!moved.join("ledger.json").exists());
+        let new_state: Value =
+            serde_json::from_slice(&fs::read(parent.join("ledger.json")).unwrap()).unwrap();
+        assert_eq!(new_state["leases"][0]["lease_id"], "nested");
+        nested_lease
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .release()
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn returned_lease_releases_exact_parent_and_reports_retarget() {
+        let root = temp_path("bound-release-retarget");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = root.join("parent");
+        let moved = root.join("moved");
+        fs::create_dir(&parent).unwrap();
+        let ledger = HostAdmissionLedger::new(parent.join("ledger.json"));
+        let (_decision, mut lease) = ledger
             .request(
-                &request("retarget", 10, 100),
+                &request("held", 10, 100),
                 &snapshot(),
                 &policy(BTreeMap::new()),
-                1011,
-                |_, _| {
-                    fs::rename(&parent, &moved).unwrap();
-                    symlink(&attacker, &parent).unwrap();
-                    OwnerState::Alive
-                },
+                1010,
+                |_, _| OwnerState::Alive,
             )
             .unwrap();
-        assert_eq!(decision.verdict, Verdict::Grant);
-        assert!(lease.is_some());
-        assert!(moved.join("ledger.json").is_file());
-        assert!(!attacker.join("ledger.json").exists());
-        HostAdmissionLedger::new(moved.join("ledger.json"))
-            .release("retarget", &owner(10, 100))
-            .unwrap();
-        fs::remove_file(&parent).unwrap();
+        let mut lease = lease.take().unwrap();
+        fs::rename(&parent, &moved).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let (_replacement_decision, mut replacement_lease) =
+            HostAdmissionLedger::new(parent.join("ledger.json"))
+                .request(
+                    &request("held", 10, 100),
+                    &snapshot(),
+                    &policy(BTreeMap::new()),
+                    1011,
+                    |_, _| OwnerState::Alive,
+                )
+                .unwrap();
+        let error = lease.release().unwrap_err().to_string();
+        assert!(error.contains("exact lease was released"));
+        lease.release().unwrap();
+        let old_state: Value =
+            serde_json::from_slice(&fs::read(moved.join("ledger.json")).unwrap()).unwrap();
+        assert_eq!(old_state["leases"], serde_json::json!([]));
+        let replacement_state: Value =
+            serde_json::from_slice(&fs::read(parent.join("ledger.json")).unwrap()).unwrap();
+        assert_eq!(replacement_state["leases"].as_array().unwrap().len(), 1);
+        replacement_lease.as_mut().unwrap().release().unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_grant_refuses_lock_change_and_bound_release_recovers() {
+        for replace in [false, true] {
+            let root = temp_path(if replace {
+                "existing-lock-replace"
+            } else {
+                "existing-lock-unlink"
+            });
+            fs::create_dir_all(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = root.join("ledger.json");
+            let ledger = HostAdmissionLedger::new(&path);
+            let held = request("held", 10, 100);
+            let (_decision, mut lease) = ledger
+                .request(
+                    &held,
+                    &snapshot(),
+                    &policy(BTreeMap::new()),
+                    1010,
+                    |_, _| OwnerState::Alive,
+                )
+                .unwrap();
+            let mut lease = lease.take().unwrap();
+            assert!(ledger
+                .request(
+                    &held,
+                    &snapshot(),
+                    &policy(BTreeMap::new()),
+                    1011,
+                    |_, _| {
+                        let lock = path.with_file_name("ledger.json.lock");
+                        fs::remove_file(&lock).unwrap();
+                        if replace {
+                            fs::write(&lock, b"").unwrap();
+                            fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+                        }
+                        OwnerState::Alive
+                    },
+                )
+                .is_err());
+            lease.release().unwrap();
+            let state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(state["leases"], serde_json::json!([]));
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -2546,6 +2879,50 @@ mod tests {
     }
 
     #[test]
+    fn each_unique_owner_is_probed_once_and_existing_grant_is_not_rewritten() {
+        let root = temp_path("one-owner-probe");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("ledger.json");
+        let ledger = HostAdmissionLedger::new(&path);
+        let held = request("same", 10, 100);
+        let (_first, mut first_lease) = ledger
+            .request(
+                &held,
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1010,
+                |_, _| OwnerState::Alive,
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let calls = Cell::new(0);
+        let (decision, mut retry_lease) = ledger
+            .request(
+                &held,
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                2020,
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 1 {
+                        OwnerState::Alive
+                    } else {
+                        OwnerState::Absent
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(decision.verdict, Verdict::Grant);
+        assert_eq!(decision.code, "already_granted");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        retry_lease.as_mut().unwrap().release().unwrap();
+        first_lease.as_mut().unwrap().release().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn absent_queue_owner_is_swept_even_when_a_peer_is_unknown() {
         let root = temp_path("mixed-owner-census");
         fs::create_dir_all(&root).unwrap();
@@ -2604,7 +2981,7 @@ mod tests {
     }
 
     #[test]
-    fn boot_change_and_pid_reuse_are_absent_while_unreadable_is_unknown() {
+    fn boot_change_and_pid_reuse_are_absent_while_foreign_host_is_unknown() {
         let mut old_boot = owner(10, 100);
         old_boot.boot_id = "boot-old".to_owned();
         assert_eq!(
