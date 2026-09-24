@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import math
+import mmap
 import os
 import re
 import resource
@@ -15535,6 +15536,9 @@ class _AuditWorkBudget:
 
     limit: int
     consumed: int = 0
+    on_debit: Callable[[int], None] | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def remaining(self) -> int:
@@ -15543,7 +15547,10 @@ class _AuditWorkBudget:
     def debit(self) -> None:
         if self.remaining <= 0:
             raise StateError("cache census attempted work after exhausting its budget")
-        self.consumed += 1
+        consumed = self.consumed + 1
+        if self.on_debit is not None:
+            self.on_debit(consumed)
+        self.consumed = consumed
 
 
 class _LinuxDirent(ctypes.Structure):
@@ -15620,16 +15627,26 @@ def _audit_directory_stream(
             )
 
 
-def _open_absolute_directory_nofollow(path: Path, label: str) -> int:
+def _audit_cache_check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _AuditCacheTimeout("cache census traversal exhausted the fixed wall allowance")
+
+
+def _open_absolute_directory_nofollow(
+    path: Path, label: str, *, deadline: float | None = None
+) -> int:
     if not path.is_absolute() or ".." in path.parts:
         raise Refusal(f"{label} must be a canonical absolute directory")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    _audit_cache_check_deadline(deadline)
     fd = os.open(Path("/"), flags)
     try:
         for component in path.parts[1:]:
+            _audit_cache_check_deadline(deadline)
             child_fd = os.open(component, flags, dir_fd=fd)
             os.close(fd)
             fd = child_fd
+        _audit_cache_check_deadline(deadline)
         raw_actual = os.readlink(f"/proc/self/fd/{fd}")
         if raw_actual.endswith(" (deleted)") or Path(raw_actual) != path:
             raise Refusal(f"{label} changed or crossed a symlink while binding")
@@ -16086,24 +16103,26 @@ def _audit_cache_root_identity_unbounded(
         os.close(parent_fd)
 
 
-def _audit_cache_root_identity(
-    config: Config,
-    cache: CacheDirectory,
-    *,
-    deadline: float | None = None,
-) -> tuple[int, int, int, int, int] | None:
-    """Bound filesystem binding itself, including an already blocked open.
+class _AuditCacheTimeout(Refusal):
+    """The shared execution allowance expired, possibly during a syscall."""
 
-    Census callers supply their one absolute deadline. The child holds no
-    inherited registry or state locks and sends only a small identity packet.
-    The direct form is used by callers constructing census test fixtures.
+
+def _run_audit_cache_worker(
+    operation: str,
+    work: Callable[[], Mapping[str, object]],
+    *,
+    deadline: float,
+    result_limit: int,
+) -> Mapping[str, object]:
+    """Bound filesystem execution and its result transfer by one deadline.
+
+    No inherited registry or state locks survive in the child. Its private pipe
+    carries bounded JSON; a killed or late worker supplies no completion evidence.
     """
 
-    if deadline is None:
-        return _audit_cache_root_identity_unbounded(config, cache)
-    expired = "cache census root binding exceeded the fixed wall allowance"
+    expired = f"cache census {operation} exceeded the fixed wall allowance"
     if time.monotonic() >= deadline:
-        raise Refusal(expired)
+        raise _AuditCacheTimeout(expired)
     read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
     pid: int | None = None
     pid_fd: int | None = None
@@ -16123,16 +16142,45 @@ def _audit_cache_root_identity(
                             if exc.errno != errno.EBADF:
                                 raise
                 try:
-                    # A descheduled child must not start a late binding either.
+                    # A descheduled child must not start late work either.
                     if time.monotonic() >= deadline:
-                        raise Refusal(expired)
-                    identity = _audit_cache_root_identity_unbounded(config, cache)
-                    payload: dict[str, object] = {"identity": identity}
+                        os._exit(2)
+                    payload: dict[str, object] = {"value": work()}
+                except _AuditCacheTimeout:
+                    os._exit(2)
                 except BaseException as exc:
                     payload = {"error": str(exc)[:512]}
-                encoded = json.dumps(payload, ensure_ascii=True).encode("ascii")
-                if len(encoded) > 4096 or os.write(write_fd, encoded) != len(encoded):
-                    os._exit(1)
+                # Traversal progress can be large. Coalesce encoder fragments
+                # into bounded chunks; never allocate an unchecked whole result
+                # or issue a syscall for every tiny JSON token.
+                encoder = json.JSONEncoder(
+                    ensure_ascii=True, allow_nan=False, separators=(",", ":")
+                )
+                buffer = bytearray()
+                encoded_size = 0
+
+                def flush() -> None:
+                    offset = 0
+                    while offset < len(buffer):
+                        if time.monotonic() >= deadline:
+                            os._exit(2)
+                        written = os.write(write_fd, memoryview(buffer)[offset:])
+                        if written <= 0:
+                            os._exit(1)
+                        offset += written
+                    buffer.clear()
+
+                for fragment in encoder.iterencode(payload):
+                    if time.monotonic() >= deadline:
+                        os._exit(2)
+                    encoded = fragment.encode("ascii")
+                    encoded_size += len(encoded)
+                    if encoded_size > result_limit:
+                        os._exit(3)
+                    buffer.extend(encoded)
+                    if len(buffer) >= 64 * 1024:
+                        flush()
+                flush()
                 os._exit(0)
             except BaseException:
                 os._exit(1)
@@ -16148,48 +16196,40 @@ def _audit_cache_root_identity(
             while not (eof and exited):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise Refusal(expired)
+                    raise _AuditCacheTimeout(expired)
                 for key, _events in selector.select(remaining):
                     if key.data == "exit":
                         exited = True
                         selector.unregister(pid_fd)
                     else:
-                        chunk = os.read(read_fd, 4097 - len(received))
+                        chunk = os.read(read_fd, min(64 * 1024, result_limit + 1 - len(received)))
                         if not chunk:
                             eof = True
                             selector.unregister(read_fd)
                         received.extend(chunk)
-                        if len(received) > 4096:
-                            raise Refusal("cache census binding result is oversized")
+                        if len(received) > result_limit:
+                            raise Refusal(f"cache census {operation} result is oversized")
             _waited, status = os.waitpid(pid, 0)
             reaped = True
-        if time.monotonic() >= deadline:
-            raise Refusal(expired)
+        if time.monotonic() >= deadline or status == 2 << 8:
+            raise _AuditCacheTimeout(expired)
+        if status == 3 << 8:
+            raise Refusal(f"cache census {operation} result is oversized")
         if status != 0:
-            raise Refusal("cache census root binding worker failed")
+            raise Refusal(f"cache census {operation} worker failed")
         try:
             packet = json.loads(received)
         except (ValueError, RecursionError) as exc:
-            raise Refusal("invalid cache census root binding result") from exc
+            raise Refusal(f"invalid cache census {operation} result") from exc
+        if time.monotonic() >= deadline:
+            raise _AuditCacheTimeout(expired)
         if not isinstance(packet, dict):
-            raise Refusal("invalid cache census root binding result")
+            raise Refusal(f"invalid cache census {operation} result")
         if set(packet) == {"error"} and isinstance(packet["error"], str):
             raise Refusal(packet["error"])
-        identity_value = packet.get("identity")
-        if set(packet) != {"identity"}:
-            raise Refusal("invalid cache census root binding result")
-        if identity_value is None:
-            return None
-        if (
-            not isinstance(identity_value, list)
-            or len(identity_value) != 5
-            or any(type(value) is not int for value in identity_value)
-        ):
-            raise Refusal("invalid cache census root binding identity")
-        return (
-            identity_value[0], identity_value[1], identity_value[2],
-            identity_value[3], identity_value[4],
-        )
+        if set(packet) != {"value"}:
+            raise Refusal(f"invalid cache census {operation} result")
+        return _as_mapping(packet["value"], f"cache census {operation} result")
     finally:
         try:
             if pid is not None and pid > 0 and not reaped:
@@ -16212,6 +16252,34 @@ def _audit_cache_root_identity(
             for owned_fd in (read_fd, write_fd, pid_fd):
                 if owned_fd is not None and owned_fd >= 0:
                     os.close(owned_fd)
+
+
+def _audit_cache_root_identity(
+    config: Config,
+    cache: CacheDirectory,
+    *,
+    deadline: float | None = None,
+) -> tuple[int, int, int, int, int] | None:
+    if deadline is None:
+        return _audit_cache_root_identity_unbounded(config, cache)
+    packet = _run_audit_cache_worker(
+        "root binding",
+        lambda: {"identity": _audit_cache_root_identity_unbounded(config, cache)},
+        deadline=deadline,
+        result_limit=4096,
+    )
+    if set(packet) != {"identity"}:
+        raise Refusal("invalid cache census root binding result")
+    identity = packet["identity"]
+    if identity is None:
+        return None
+    if (
+        not isinstance(identity, list)
+        or len(identity) != 5
+        or any(type(value) is not int for value in identity)
+    ):
+        raise Refusal("invalid cache census root binding identity")
+    return identity[0], identity[1], identity[2], identity[3], identity[4]
 
 
 def _audit_cache_root_key(
@@ -16544,13 +16612,18 @@ def _open_audit_cache_child(
     component: str,
     cache: CacheDirectory,
     label: Path,
+    *,
+    deadline: float | None = None,
 ) -> tuple[int, os.stat_result, int]:
     """Open one child and close it on every failure before ownership transfer."""
 
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    _audit_cache_check_deadline(deadline)
     child_fd = os.open(component, flags, dir_fd=parent_fd)
     try:
+        _audit_cache_check_deadline(deadline)
         metadata = os.fstat(child_fd)
+        _audit_cache_check_deadline(deadline)
         mount_id = _fd_mount_id(child_fd, str(label))
         if (
             metadata.st_dev != cache.checkout_device
@@ -16567,6 +16640,8 @@ def _open_audit_cache_relative(
     cache: CacheDirectory,
     root_identity: Sequence[int],
     relative: str,
+    *,
+    deadline: float | None = None,
 ) -> tuple[int, os.stat_result, int]:
     """Open a descendant through exact checkout and cache-root identities."""
 
@@ -16582,14 +16657,18 @@ def _open_audit_cache_relative(
         raise StateError("cache census root identity must contain five integers")
     try:
         current_fd = _open_absolute_directory_nofollow(
-            cache.checkout_root, "cache census checkout"
+            cache.checkout_root, "cache census checkout", deadline=deadline
         )
+    except _AuditCacheTimeout:
+        raise
     except (OSError, Refusal) as exc:
         raise Refusal(
             f"cannot bind cache census checkout {cache.checkout_root}: {exc}"
         ) from exc
     try:
+        _audit_cache_check_deadline(deadline)
         checkout_metadata = os.fstat(current_fd)
+        _audit_cache_check_deadline(deadline)
         checkout_mount_id = _fd_mount_id(current_fd, str(cache.checkout_root))
         if (
             checkout_metadata.st_dev,
@@ -16609,7 +16688,7 @@ def _open_audit_cache_relative(
         for component in cache_parts:
             current_path /= component
             child_fd, metadata, mount_id = _open_audit_cache_child(
-                current_fd, component, cache, current_path
+                current_fd, component, cache, current_path, deadline=deadline
             )
             os.close(current_fd)
             current_fd = child_fd
@@ -16626,7 +16705,7 @@ def _open_audit_cache_relative(
             for component in Path(relative).parts:
                 current_path /= component
                 child_fd, metadata, mount_id = _open_audit_cache_child(
-                    current_fd, component, cache, current_path
+                    current_fd, component, cache, current_path, deadline=deadline
                 )
                 os.close(current_fd)
                 current_fd = child_fd
@@ -16636,7 +16715,182 @@ def _open_audit_cache_relative(
         raise
 
 
+_AUDIT_CACHE_PROGRESS_FIELDS = (
+    "directories_visited",
+    "entries_visited",
+    "directories_verified",
+    "entries_verified",
+    "directories_finalized",
+    "entries_finalized",
+)
+
+
+@dataclasses.dataclass
+class _AuditSharedCacheProgress:
+    """One child writer publishes aligned counters without kill-sensitive locks."""
+
+    memory: mmap.mmap
+    consumed_before: int
+    metrics_before: Mapping[str, int]
+
+    def _store(self, index: int, delta: int) -> None:
+        if not 0 <= delta < 1 << 64:
+            raise StateError("cache census progress delta is out of range")
+        ctypes.c_uint64.from_buffer(self.memory, index * 8).value = delta
+
+    def debit(self, consumed: int) -> None:
+        self._store(0, consumed - self.consumed_before)
+
+    def metric(self, field: str, value: int) -> None:
+        self._store(
+            _AUDIT_CACHE_PROGRESS_FIELDS.index(field) + 1,
+            value - self.metrics_before[field],
+        )
+
+    def work_delta(self) -> int:
+        return int(ctypes.c_uint64.from_buffer(self.memory, 0).value)
+
+    def metric_values(self) -> dict[str, int]:
+        return {
+            field: self.metrics_before[field]
+            + int(ctypes.c_uint64.from_buffer(self.memory, (index + 1) * 8).value)
+            for index, field in enumerate(_AUDIT_CACHE_PROGRESS_FIELDS)
+        }
+
+
+class _AuditTrackedCacheRoot(dict[str, object]):
+    """Publish completed observations before their child-local bookkeeping."""
+
+    def __init__(
+        self, root: Mapping[str, object], progress: _AuditSharedCacheProgress
+    ) -> None:
+        super().__init__(root)
+        self.progress = progress
+
+    def __setitem__(self, key: str, value: object) -> None:
+        if key in _AUDIT_CACHE_PROGRESS_FIELDS:
+            self.progress.metric(
+                key, _as_int(value, f"cache census {key}", minimum=0)
+            )
+        super().__setitem__(key, value)
+
+
 def _resume_audit_cache_root(
+    cache: CacheDirectory,
+    root_identity: Sequence[int],
+    root: dict[str, object],
+    *,
+    budget: _AuditWorkBudget,
+    deadline: float,
+    finalize: bool = True,
+) -> bool:
+    """Isolate traversal while retaining work already done on every failure."""
+
+    _audit_cache_check_deadline(deadline)
+    if budget.remaining <= 0 or (not finalize and root.get("phase") == "finalize"):
+        return False
+    consumed_before = budget.consumed
+    remaining_before = budget.remaining
+    metrics_before = {
+        field: _as_int(root[field], f"cache census {field}", minimum=0)
+        for field in _AUDIT_CACHE_PROGRESS_FIELDS
+    }
+    root_keys = set(root)
+    finalizing = finalize and root.get("phase") == "finalize"
+    applied = False
+    with mmap.mmap(-1, 8 * (1 + len(_AUDIT_CACHE_PROGRESS_FIELDS))) as memory:
+        progress = _AuditSharedCacheProgress(memory, consumed_before, metrics_before)
+
+        def work() -> Mapping[str, object]:
+            child_root = _AuditTrackedCacheRoot(root, progress)
+            child_budget = _AuditWorkBudget(
+                budget.limit, consumed_before, on_debit=progress.debit
+            )
+            error: str | None = None
+            try:
+                complete = _resume_audit_cache_root_unbounded(
+                    cache,
+                    root_identity,
+                    child_root,
+                    budget=child_budget,
+                    deadline=deadline,
+                    finalize=finalize,
+                )
+            except _AuditCacheTimeout:
+                raise
+            except (OSError, Refusal, StateError) as exc:
+                error = str(exc)[:4096]
+                complete = False
+                child_root["status"] = "partial"
+            _audit_cache_check_deadline(deadline)
+            return {
+                "root": child_root,
+                "complete": complete,
+                "error": error,
+                "work_consumed": child_budget.consumed,
+            }
+
+        try:
+            packet = _run_audit_cache_worker(
+                "traversal", work, deadline=deadline,
+                result_limit=_AUDIT_CACHE_STATE_BYTES_LIMIT,
+            )
+            _exact_keys(
+                packet,
+                {"root", "complete", "error", "work_consumed"},
+                set(),
+                "cache census traversal result",
+            )
+            returned = dict(_as_mapping(packet["root"], "cache census traversal root"))
+            if set(returned) != root_keys:
+                raise StateError("cache census traversal returned unexpected root fields")
+            phase = _as_str(returned["phase"], "cache census traversal root phase")
+            status = _as_str(returned["status"], "cache census traversal root status")
+            if (
+                returned["path"] != str(cache.path)
+                or returned["identity"] != list(root_identity)
+                or phase not in {"measure", "verify", "finalize"}
+                or status not in {"partial", "complete"}
+                or type(packet["complete"]) is not bool
+                or (status == "complete") != packet["complete"]
+                or (packet["error"] is not None and not isinstance(packet["error"], str))
+            ):
+                raise StateError("cache census traversal returned inconsistent root identity or status")
+            if _as_int(
+                packet["work_consumed"], "cache census traversal work", minimum=0
+            ) != consumed_before + progress.work_delta():
+                raise StateError("cache census traversal work counters disagree")
+            for field, value in progress.metric_values().items():
+                if _as_int(returned[field], f"cache census {field}", minimum=0) != value:
+                    raise StateError("cache census traversal observation counters disagree")
+            _audit_cache_check_deadline(deadline)
+            root.clear()
+            root.update(returned)
+            applied = True
+            error_value = packet["error"]
+            if isinstance(error_value, str):
+                raise Refusal(error_value)
+            return packet["complete"] is True
+        finally:
+            # This data survives SIGKILL and never depends on receiving the
+            # potentially large resumable-root response from the child.
+            delta = progress.work_delta()
+            if delta > remaining_before:
+                raise StateError("cache census traversal exceeded its shared work budget")
+            budget.consumed = consumed_before + delta
+            if budget.on_debit is not None:
+                budget.on_debit(budget.consumed)
+            root.update(progress.metric_values())
+            if finalizing and not applied:
+                # Keep the pre-call verified arrays staged. A later subject
+                # sweep starts at zero, but current metrics still describe all
+                # final observations completed before cancellation.
+                root["finalize_index"] = root["directories_finalized"]
+                root["finalize_entry_index"] = root["entries_finalized"]
+                root["status"] = "partial"
+
+
+def _resume_audit_cache_root_unbounded(
     cache: CacheDirectory,
     root_identity: Sequence[int],
     root: dict[str, object],
@@ -16685,7 +16939,7 @@ def _resume_audit_cache_root(
                 )
                 budget.debit()
                 fd, metadata, _mount_id = _open_audit_cache_relative(
-                    cache, root_identity, relative
+                    cache, root_identity, relative, deadline=deadline
                 )
                 os.close(fd)
                 actual_identity = (
@@ -16737,9 +16991,10 @@ def _resume_audit_cache_root(
                 parent_relative = "."
             budget.debit()
             parent_fd, _parent_metadata, _mount_id = _open_audit_cache_relative(
-                cache, root_identity, parent_relative
+                cache, root_identity, parent_relative, deadline=deadline
             )
             try:
+                _audit_cache_check_deadline(deadline)
                 metadata = os.stat(
                     Path(relative).name,
                     dir_fd=parent_fd,
@@ -16837,7 +17092,7 @@ def _resume_audit_cache_root(
             )
             root["pending"] = pending
             fd, metadata, _mount_id = _open_audit_cache_relative(
-                cache, root_identity, relative
+                cache, root_identity, relative, deadline=deadline
             )
             os.close(fd)
             root[bytes_field] = _as_int(
@@ -16886,7 +17141,7 @@ def _resume_audit_cache_root(
             for value in _as_list(current.get("identity"), "cache census current.identity")
         )
         fd, metadata, _mount_id = _open_audit_cache_relative(
-            cache, root_identity, relative
+            cache, root_identity, relative, deadline=deadline
         )
         try:
             actual_identity = (
@@ -16900,6 +17155,7 @@ def _resume_audit_cache_root(
                     f"cache census directory changed while resuming: {cache.path / relative}"
                 )
             complete = False
+            _audit_cache_check_deadline(deadline)
             with _audit_directory_stream(
                 fd, cursor, str(cache.path / relative)
             ) as next_entry:
@@ -16919,6 +17175,7 @@ def _resume_audit_cache_root(
                             f"{cache.path / relative / name}"
                         )
                     try:
+                        _audit_cache_check_deadline(deadline)
                         child = os.stat(name, dir_fd=fd, follow_symlinks=False)
                     except FileNotFoundError:
                         continue
@@ -17146,6 +17403,21 @@ def _audit_cache_census_bound(
                 )
             else:
                 root_results[key] = _AuditCacheMeasurement(None, "partial")
+        except _AuditCacheTimeout:
+            if finalize:
+                # Retain only the pre-call staged identities. The scheduler
+                # restarts the entire subject's final sweep and distinguishes
+                # an opportunistic interruption from a full fresh timeout.
+                root["status"] = "partial"
+                root_results[key] = _AuditCacheMeasurement(None, "partial")
+            else:
+                roots.pop(key, None)
+                root_results[key] = _AuditCacheMeasurement(
+                    None, "error",
+                    "cache census traversal exhausted the fixed wall allowance "
+                    f"of {wall_seconds:g} seconds; no cache total can be published "
+                    "within this allowance",
+                )
         except (OSError, Refusal, StateError) as exc:
             roots.pop(key, None)
             root_results[key] = _AuditCacheMeasurement(None, "error", str(exc))

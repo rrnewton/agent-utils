@@ -108,8 +108,8 @@ registry, worktree, hold, journal, handoff, or Git repository. `--cache-work-lim
 (default 100000 work units) and `--cache-wall-seconds` (default 5 seconds) bound the
 cache binding and traversal phase, not the end-to-end audit: registry/cache planning,
 bounded state decoding/authentication, and persistence occur outside that allowance.
-Root binding runs in an isolated worker with the remaining deadline enforced even
-if a filesystem open blocks. Expiry starts no further root binding and cancels
+Root binding and traversal run in isolated workers with the remaining deadline
+enforced even if a filesystem operation blocks. Expiry starts no further work and cancels
 the worker, with at most one additional second allowed for reaping it.
 Until the census has visited and reverified every directory and entry, JSON reports
 `cache_bytes: null` and `cache_status: "partial"`, keeping the row out of `DELETABLE`.
@@ -124,8 +124,10 @@ to that subject in one invocation. No persisted completed total supplies current
 If that subject's final sweep needs more work than the fixed allowance, or exhausts an
 entire fresh binding/traversal wall allowance, the result is `cache_status: "error"` with null
 bytes and a specific capacity error. It never cycles indefinitely as partial or publishes
-a stale total. Root binding that alone exhausts that wall allowance also reports a capacity
-error. Stable subjects whose fresh sweep fits can finish at an unchanged budget,
+a stale total. Binding or traversal that exhausts the wall allowance before staging
+also reports a capacity error, including a blocked operation that made no progress.
+Work debits and observation counters survive cancellation. Stable subjects whose
+fresh sweep fits can finish at an unchanged budget,
 even when measurement and verification together require several invocations. Partial
 finalization restarts for the whole subject; previous calls' final checks are never reused.
 

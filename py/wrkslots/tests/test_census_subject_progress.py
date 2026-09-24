@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import time
 from collections.abc import Mapping, Sequence
@@ -233,13 +234,113 @@ def test_mutated_early_staged_root_cannot_supply_stale_subject_bytes(
     assert "entry changed before final publication" in measured["subject"].error
 
 
-@dataclass
 class FinalStatClock:
-    now: float = 0
-    finalizing: bool = False
-    deadline: float = 5
-    expire_at: int | None = None
-    observed: list[Path] | None = None
+    """Keep synthetic time and observed paths visible across census workers.
+
+    Only one process writes at a time, but the waiting parent may read time.
+    Two slots publish complete snapshots by generation so a killed writer
+    cannot leave an incomplete active record or hold a synchronization lock.
+    The anonymous mapping also survives descriptor cleanup in the worker.
+    """
+
+    def __init__(
+        self, now: float = 0, finalizing: bool = False, deadline: float = 5,
+        expire_at: int | None = None, observed: list[Path] | None = None,
+    ) -> None:
+        self._shared = mmap.mmap(-1, 64 * 1024)
+        self._write(
+            {
+                "now": now, "finalizing": finalizing, "deadline": deadline,
+                "expire_at": expire_at,
+                "observed": None if observed is None else [str(path) for path in observed],
+            }
+        )
+
+    def _read(self) -> dict[str, object]:
+        slot_size = (len(self._shared) - 8) // 2
+        for _ in range(128):
+            generation = self._shared[:8]
+            offset = 8 + (int.from_bytes(generation, "big") % 2) * slot_size
+            size = int.from_bytes(self._shared[offset:offset + 4], "big")
+            encoded = self._shared[offset + 4:offset + 4 + size]
+            if generation == self._shared[:8]:
+                return dict(cli._as_mapping(json.loads(encoded), "test clock"))
+        raise AssertionError("shared test clock changed during every snapshot attempt")
+
+    def _write(self, value: Mapping[str, object]) -> None:
+        encoded = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        slot_size = (len(self._shared) - 8) // 2
+        assert len(encoded) <= slot_size - 4
+        generation = int.from_bytes(self._shared[:8], "big") + 1
+        offset = 8 + (generation % 2) * slot_size
+        self._shared[offset + 4:offset + 4 + len(encoded)] = encoded
+        self._shared[offset:offset + 4] = len(encoded).to_bytes(4, "big")
+        self._shared[:8] = generation.to_bytes(8, "big")
+
+    def _set(self, name: str, value: object) -> None:
+        record = self._read()
+        record[name] = value
+        self._write(record)
+
+    @property
+    def now(self) -> float:
+        value = self._read()["now"]
+        assert isinstance(value, (int, float))
+        return float(value)
+
+    @now.setter
+    def now(self, value: float) -> None:
+        self._set("now", value)
+
+    @property
+    def finalizing(self) -> bool:
+        value = self._read()["finalizing"]
+        assert isinstance(value, bool)
+        return value
+
+    @finalizing.setter
+    def finalizing(self, value: bool) -> None:
+        self._set("finalizing", value)
+
+    @property
+    def deadline(self) -> float:
+        value = self._read()["deadline"]
+        assert isinstance(value, (int, float))
+        return float(value)
+
+    @deadline.setter
+    def deadline(self, value: float) -> None:
+        self._set("deadline", value)
+
+    @property
+    def expire_at(self) -> int | None:
+        value = self._read()["expire_at"]
+        assert value is None or isinstance(value, int)
+        return value
+
+    @expire_at.setter
+    def expire_at(self, value: int | None) -> None:
+        self._set("expire_at", value)
+
+    @property
+    def observed(self) -> list[Path] | None:
+        value = self._read()["observed"]
+        if value is None:
+            return None
+        return [
+            Path(cli._as_str(path, "test clock observed path"))
+            for path in cli._as_list(value, "test clock observed paths")
+        ]
+
+    @observed.setter
+    def observed(self, value: list[Path] | None) -> None:
+        self._set("observed", None if value is None else [str(path) for path in value])
+
+    def record_observation(self, path: Path) -> None:
+        observed = self.observed
+        assert observed is not None
+        observed.append(path)
+        self.observed = observed
 
     def reset(self, expire_at: int | None) -> None:
         self.now = 0
@@ -293,7 +394,7 @@ def _install_final_stat_clock(monkeypatch: pytest.MonkeyPatch) -> FinalStatClock
         ):
             assert follow_symlinks is False
             assert clock.observed is not None
-            clock.observed.append(Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / path)
+            clock.record_observation(Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / path)
             if len(clock.observed) == clock.expire_at:
                 # Advance after the real stat returns, catching a missing final
                 # deadline check even when this was the last observation.
