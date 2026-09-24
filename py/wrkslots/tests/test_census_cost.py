@@ -406,6 +406,47 @@ def test_batch_liveness_malformed_response_makes_every_subject_unverifiable(
     assert all("not JSON" in detail for _state, detail in observed.values())
 
 
+def test_batch_liveness_duplicate_state_member_makes_whole_batch_unverifiable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, batch=True)
+    records = _records(3)
+
+    def conflicting_response(
+        _command: list[str], *, input_data: bytes, **_kwargs: object
+    ) -> tuple[int, bytes, bytes]:
+        request = json.loads(input_data)
+        results = [
+            {
+                "subject_id": subject["subject_id"],
+                "agent": subject["agent"],
+                "state": "dead",
+                "detail": "fixture dead",
+            }
+            for subject in request["subjects"]
+        ]
+        response = json.dumps(
+            {
+                "schema": cli._LIVENESS_BATCH_RESPONSE_SCHEMA,
+                "request_sha256": request["request_sha256"],
+                "results": results,
+            }
+        ).replace(
+            '"state": "dead"',
+            '"state": "unverifiable", "state": "dead"',
+            1,
+        )
+        return 0, response.encode("utf-8"), b""
+
+    monkeypatch.setattr(cli, "_run_bounded_read_only_command", conflicting_response)
+
+    observed = cli._registered_liveness_states(config, records)
+
+    assert set(state for state, _detail in observed.values()) == {"unverifiable"}
+    assert all("duplicate key 'state'" in detail for _state, detail in observed.values())
+
+
 def test_cache_census_partial_progress_is_bounded_then_exactly_finalized(
     tmp_path: Path,
 ) -> None:
@@ -671,6 +712,74 @@ def test_cache_census_preserves_nested_git_metadata_refusal(
     assert measured["subject"].bytes is None
     assert measured["subject"].error is not None
     assert "nested Git metadata" in measured["subject"].error
+
+
+def test_refused_cache_roots_debit_one_shared_budget_immediately(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    planned: dict[str, tuple[cli.CacheDirectory, ...]] = {}
+    for index in range(4):
+        checkout = config.root / f"checkout-{index}"
+        cache = checkout / "target"
+        (cache / ".git").mkdir(parents=True)
+        identity = cli._open_directory_identity(checkout, "checkout")
+        planned[str(index)] = (cli.CacheDirectory(cache, checkout, *identity),)
+
+    measured, counters = cli._audit_cache_census(
+        config,
+        (cli.ActiveState("testhost", 24, ()),),
+        planned,
+        {},
+        state_path=tmp_path / "refused-budget.json",
+        work_limit=3,
+        wall_seconds=5,
+    )
+
+    assert counters["work_consumed"] == 3
+    assert counters["work_remaining"] == 0
+    assert counters["directories_visited"] == 1
+    assert sum(item.status == "error" for item in measured.values()) == 1
+    assert sum(item.status == "partial" for item in measured.values()) == 3
+
+
+def test_cache_census_persisted_cursor_prevents_stable_root_starvation(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    planned: dict[str, tuple[cli.CacheDirectory, ...]] = {}
+    for index in range(3):
+        checkout = config.root / f"checkout-{index}"
+        cache = checkout / "target"
+        cache.mkdir(parents=True)
+        (cache / "artifact").write_bytes(b"x")
+        identity = cli._open_directory_identity(checkout, "checkout")
+        planned[f"subject-{index}"] = (
+            cli.CacheDirectory(cache, checkout, *identity),
+        )
+    states = (cli.ActiveState("testhost", 25, ()),)
+    state_path = tmp_path / "fair-cursor.json"
+    completed: set[str] = set()
+    cursors: list[str | None] = []
+
+    for _ in range(6):
+        measured, counters = cli._audit_cache_census(
+            config,
+            states,
+            planned,
+            {},
+            state_path=state_path,
+            work_limit=10,
+            wall_seconds=5,
+        )
+        assert counters["work_consumed"] <= 10
+        completed.update(
+            subject for subject, item in measured.items() if item.status == "complete"
+        )
+        cursors.append(json.loads(state_path.read_text(encoding="utf-8"))["next_root"])
+
+    assert completed == set(planned)
+    assert len(set(cursors)) == 3
 
 
 def test_completed_cache_census_revalidates_nested_directories(
@@ -1013,6 +1122,49 @@ def test_default_cache_home_component_swap_refuses_before_project_write(
     assert not (config.root / "audit-cache").exists()
 
 
+def test_default_cache_home_is_created_componentwise_for_fresh_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    fresh_home = tmp_path / "fresh-home"
+    fresh_home.mkdir()
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fresh_home))
+
+    state_path = cli._audit_cache_state_path(config, None)
+
+    assert state_path.parent == fresh_home / ".cache" / "wrkslots" / "audit-cache"
+    assert state_path.parent.is_dir()
+    assert not state_path.exists()
+
+
+def test_cache_census_without_roots_does_not_require_state_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_open_audit_cache_state_parent",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("storage was opened")),
+    )
+
+    measured, counters = cli._audit_cache_census(
+        config,
+        (cli.ActiveState("testhost", 26, ()),),
+        {"empty": ()},
+        {},
+        state_path=None,
+        work_limit=3,
+        wall_seconds=5,
+    )
+
+    assert measured["empty"] == cli._AuditCacheMeasurement(0, "complete")
+    assert counters["work_consumed"] == 0
+    assert counters["work_remaining"] == 3
+
+
 def test_bound_cache_parent_survives_path_swap_without_project_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1123,19 +1275,61 @@ def test_cache_census_closes_bound_parent_on_prewrite_exception(
         lambda _config, _cache: (_ for _ in ()).throw(cli.Refusal("fixture refusal")),
     )
 
-    with pytest.raises(cli.Refusal, match="fixture refusal"):
-        cli._audit_cache_census(
-            config,
-            (cli.ActiveState("testhost", 22, ()),),
-            {"subject": (directory,)},
-            {},
-            state_path=state_path,
-            work_limit=10,
-            wall_seconds=5,
-        )
+    measured, _counters = cli._audit_cache_census(
+        config,
+        (cli.ActiveState("testhost", 22, ()),),
+        {"subject": (directory,)},
+        {},
+        state_path=state_path,
+        work_limit=10,
+        wall_seconds=5,
+    )
 
     after = len(tuple(Path("/proc/self/fd").iterdir()))
+    assert measured["subject"].status == "error"
+    assert measured["subject"].error == "fixture refusal"
     assert after == before
+
+
+def test_cache_root_binding_refusal_is_local_to_its_subject(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    directories: dict[str, tuple[cli.CacheDirectory, ...]] = {}
+    for subject in ("refused", "healthy"):
+        checkout = config.root / subject
+        cache = checkout / "target"
+        cache.mkdir(parents=True)
+        (cache / "artifact").write_bytes(subject.encode("ascii"))
+        identity = cli._open_directory_identity(checkout, "checkout")
+        directories[subject] = (cli.CacheDirectory(cache, checkout, *identity),)
+    original = cli._audit_cache_root_identity
+
+    def bind(
+        bound_config: cli.Config, cache: cli.CacheDirectory
+    ) -> tuple[int, int, int, int, int] | None:
+        if cache.checkout_root.name == "refused":
+            raise cli.Refusal("fixture binding refusal")
+        return original(bound_config, cache)
+
+    monkeypatch.setattr(cli, "_audit_cache_root_identity", bind)
+
+    measured, counters = cli._audit_cache_census(
+        config,
+        (cli.ActiveState("testhost", 27, ()),),
+        directories,
+        {},
+        state_path=tmp_path / "local-binding-refusal.json",
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert measured["refused"].status == "error"
+    assert measured["refused"].error == "fixture binding refusal"
+    assert measured["healthy"].status == "complete"
+    assert type(measured["healthy"].bytes) is int
+    assert counters["subjects"] == 2
 
 
 def test_cache_census_closes_bound_parent_when_key_setup_raises_unexpectedly(
@@ -1143,6 +1337,11 @@ def test_cache_census_closes_bound_parent_when_key_setup_raises_unexpectedly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(cache, checkout, *identity)
     state_path = tmp_path / "key-failure-state.json"
     before = len(tuple(Path("/proc/self/fd").iterdir()))
     monkeypatch.setattr(
@@ -1157,7 +1356,7 @@ def test_cache_census_closes_bound_parent_when_key_setup_raises_unexpectedly(
         cli._audit_cache_census(
             config,
             (cli.ActiveState("testhost", 23, ()),),
-            {},
+            {"subject": (directory,)},
             {},
             state_path=state_path,
             work_limit=10,
@@ -1166,6 +1365,80 @@ def test_cache_census_closes_bound_parent_when_key_setup_raises_unexpectedly(
 
     after = len(tuple(Path("/proc/self/fd").iterdir()))
     assert after == before
+
+
+@pytest.mark.parametrize("failure", ("fstat", "mount"))
+def test_cache_relative_opener_closes_new_fd_on_identity_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(cache, checkout, *checkout_identity)
+    root_identity = cli._audit_cache_root_identity(config, directory)
+    assert root_identity is not None
+    before = set(os.listdir("/proc/self/fd"))
+    if failure == "fstat":
+        original_fstat = os.fstat
+        calls = 0
+
+        def fail_child_fstat(fd: int) -> os.stat_result:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("fixture fstat failure")
+            return original_fstat(fd)
+
+        monkeypatch.setattr(
+            os,
+            "fstat",
+            fail_child_fstat,
+        )
+    else:
+        original_mount_id = cli._fd_mount_id
+        calls = 0
+
+        def fail_child_mount(fd: int, label: str) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise cli.Refusal("fixture mount failure")
+            return original_mount_id(fd, label)
+
+        monkeypatch.setattr(
+            cli,
+            "_fd_mount_id",
+            fail_child_mount,
+        )
+
+    with pytest.raises((OSError, cli.Refusal), match=f"fixture {failure} failure"):
+        cli._open_audit_cache_relative(directory, root_identity, ".")
+
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
+def test_cache_relative_opener_refuses_swapped_absolute_checkout_ancestor(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    ancestor = tmp_path / "outer" / "ancestor"
+    checkout = ancestor / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(cache, checkout, *checkout_identity)
+    root_identity = cli._audit_cache_root_identity(config, directory)
+    assert root_identity is not None
+    preserved = ancestor.with_name("ancestor-preserved")
+    ancestor.rename(preserved)
+    ancestor.symlink_to(preserved, target_is_directory=True)
+
+    with pytest.raises(cli.Refusal, match="cannot bind cache census checkout"):
+        cli._open_audit_cache_relative(directory, root_identity, ".")
 
 
 def test_cache_census_refuses_nonprivate_existing_key(tmp_path: Path) -> None:

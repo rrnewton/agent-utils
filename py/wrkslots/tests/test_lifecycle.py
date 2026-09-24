@@ -24154,6 +24154,83 @@ def test_audit_partial_cache_census_cannot_upgrade_deletion_eligibility(
     assert complete["reasons"] == []
 
 
+def test_audit_cache_ancestor_swap_stays_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path, cache_globs=("build/target",)
+    )
+    made = create(
+        project,
+        slot="ancestor-swap",
+        agent="codex-ancestor",
+        branch="codex/ancestor-swap",
+    )
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, "ancestor-swap")
+    commit_task(repository, tree, "codex/ancestor-swap")
+    finished = finish(project, slot="ancestor-swap", agent="codex-ancestor")
+    assert finished.returncode == 0, finished.stderr
+    ancestor = tree / "build"
+    cache = ancestor / "target"
+    cache.mkdir(parents=True)
+    (cache / "artifact").write_bytes(b"original")
+    outside = tmp_path / "outside"
+    outside_cache = outside / "target"
+    outside_cache.mkdir(parents=True)
+    for index in range(3):
+        (outside_cache / str(index)).write_bytes(b"decoy")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    expire_heartbeat(project)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    original_identity = wrkslots._audit_cache_root_identity
+    preserved = tmp_path / "build-preserved"
+    swapped = False
+
+    def swap_after_binding(
+        config: wrkslots.Config, directory: wrkslots.CacheDirectory
+    ) -> tuple[int, int, int, int, int] | None:
+        nonlocal swapped
+        identity = original_identity(config, directory)
+        if not swapped:
+            ancestor.rename(preserved)
+            ancestor.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return identity
+
+    monkeypatch.setattr(wrkslots, "_audit_cache_root_identity", swap_after_binding)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "audit",
+                "--format",
+                "json",
+                "--cache-census-state",
+                str(tmp_path / "ancestor-swap-state.json"),
+            ]
+        )
+        == 0
+    )
+    row = json.loads(capsys.readouterr().out)["slots"][0]
+
+    assert swapped is True
+    assert row["cache_bytes"] is None
+    assert row["cache_status"] == "error"
+    assert row["verdict"] == "BLOCKED"
+    assert "build" in row["cache_error"]
+    assert row["reasons"] == [f"cache inspection failed: {row['cache_error']}"]
+
+
 def test_audit_invokes_configured_batch_liveness_protocol(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
