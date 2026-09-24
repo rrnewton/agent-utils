@@ -185,6 +185,16 @@ const session = {
   // forbids overrides ignores it silently. The page must not claim a text-only conversation it did
   // not get, so this is what turns that claim into a reported fact. See `handle`.
   vendorSentAudioInChat: false,
+  // State for the provider-neutral protocol. Its backend accepts one input/response turn at a
+  // time, so microphone audio, an opening greeting, and typed prompts must be sequenced instead
+  // of being written concurrently to the socket.
+  v1Ready: false,
+  capturePaused: false,
+  audioSegmentActive: false,
+  waitingForGreeting: false,
+  waitingForAudioEnd: false,
+  typedTurnInFlight: false,
+  pendingPrompts: [],
 };
 
 // Recording is FIRE-AND-FORGET and gives up after the first failure.
@@ -1833,7 +1843,8 @@ function sendClientEvent(event) {
   }
   if (session.protocol === "vibe-talk-v1") {
     if (event.type === "user_message") {
-      session.socket.send(JSON.stringify({ type: "prompt", text: event.text }));
+      session.pendingPrompts.push(event.text);
+      advanceVibeTalkInput();
     }
     // This protocol has no presence or contextual-update frame. Those events are advisory, so a
     // provider that cannot represent them still accepts the local action.
@@ -1841,6 +1852,39 @@ function sendClientEvent(event) {
   }
   session.socket.send(JSON.stringify(event));
   return true;
+}
+
+/**
+ * Advance one queued provider-neutral text turn when the backend is ready for it.
+ *
+ * Voice calls keep one audio segment open while the microphone is live. Before sending typed text
+ * we close that segment and wait for its `turn_complete`; after the typed response completes we
+ * open a fresh segment and resume capture. This avoids asking the backend to run two response
+ * turns at once. Text-only calls have no audio segment, but still serialize multiple quick sends.
+ */
+function advanceVibeTalkInput() {
+  if (
+    session.protocol !== "vibe-talk-v1" ||
+    !session.v1Ready ||
+    session.waitingForGreeting ||
+    session.waitingForAudioEnd ||
+    session.typedTurnInFlight ||
+    session.pendingPrompts.length === 0
+  ) {
+    return;
+  }
+  if (!session.chat && session.audioSegmentActive) {
+    session.capturePaused = true;
+    session.waitingForAudioEnd = true;
+    session.audioSegmentActive = false;
+    session.socket.send(JSON.stringify({ type: "audio_end" }));
+    setStatus("Finishing the spoken turn…");
+    return;
+  }
+  const text = session.pendingPrompts.shift();
+  session.typedTurnInFlight = true;
+  session.socket.send(JSON.stringify({ type: "prompt", text }));
+  setStatus("Waiting for the assistant…");
 }
 
 /** Is there a live conversation for a client event or typed text to reach? */
@@ -3281,6 +3325,13 @@ async function start(options) {
   session.inputRate = minted.input_sample_rate || 16000;
   session.outputRate = minted.output_sample_rate || 16000;
   session.lastTranscriptKey = null;
+  session.v1Ready = false;
+  session.capturePaused = false;
+  session.audioSegmentActive = false;
+  session.waitingForGreeting = false;
+  session.waitingForAudioEnd = false;
+  session.typedTurnInFlight = false;
+  session.pendingPrompts = [];
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
   // racing `onopen` — a payload that arrived after the agent had already spoken would be a
   // "here is what we said" delivered into the middle of a sentence.
@@ -3323,15 +3374,9 @@ async function start(options) {
       session.connected = true;
       conversationOpen = true;
       session.conversationId = conversationIdFrom(null);
-      if (!chat) {
-        socket.send(JSON.stringify({ type: "audio_start" }));
-      }
       setState("live");
-      setStatus(chat ? "Connected — type a message." : "Connected — say something.");
+      setStatus("Opening the voice session…");
       renderControls();
-      if (!chat) {
-        startCapture(socket);
-      }
       return;
     }
     // The initiation frame is UNCHANGED on the default path. `contextual_update` is the default
@@ -3555,9 +3600,31 @@ function handle(socket, message) {
 
 function handleVibeTalk(message) {
   switch (message.type) {
-    case "session_started":
+    case "session_started": {
       addDetail(`voice session ${message.session_id || "started"}`);
+      session.v1Ready = true;
+      if (session.chat) {
+        setStatus("Connected — type a message.");
+        advanceVibeTalkInput();
+        break;
+      }
+      session.waitingForGreeting = message.greeting === true;
+      session.capturePaused = session.waitingForGreeting;
+      session.audioSegmentActive = true;
+      session.socket.send(JSON.stringify({ type: "audio_start" }));
+      if (!session.node) {
+        startCapture(session.socket);
+      }
+      setStatus(
+        session.waitingForGreeting
+          ? "Connected — the assistant is joining…"
+          : "Connected — say something."
+      );
+      if (!session.waitingForGreeting) {
+        advanceVibeTalkInput();
+      }
       break;
+    }
     case "transcript": {
       const who = message.role === "user" ? "you" : "assistant";
       const said = message.text || "";
@@ -3575,6 +3642,33 @@ function handleVibeTalk(message) {
     }
     case "error":
       showError(message.message || message.detail || "the voice provider reported an error");
+      break;
+    case "turn_complete":
+      if (session.waitingForGreeting) {
+        session.waitingForGreeting = false;
+        session.capturePaused = false;
+        setStatus("Connected — say something.");
+        advanceVibeTalkInput();
+        break;
+      }
+      if (session.waitingForAudioEnd) {
+        session.waitingForAudioEnd = false;
+        advanceVibeTalkInput();
+        break;
+      }
+      if (session.typedTurnInFlight) {
+        session.typedTurnInFlight = false;
+        if (session.pendingPrompts.length > 0) {
+          advanceVibeTalkInput();
+        } else if (session.chat) {
+          setStatus("Connected — type a message.");
+        } else {
+          session.audioSegmentActive = true;
+          session.capturePaused = false;
+          session.socket.send(JSON.stringify({ type: "audio_start" }));
+          setStatus("Connected — say something.");
+        }
+      }
       break;
     default:
       break;
@@ -3608,7 +3702,7 @@ function startCapture(socket) {
     //
     // Anyone tidying `stop()` later: `track.stop()` MUST NOT become reachable from here, not even
     // conditionally. It ends the conversation, and with it everything the agent knows.
-    if (session.muted) {
+    if (session.muted || session.capturePaused) {
       return;
     }
     const mono = event.inputBuffer.getChannelData(0);
@@ -3665,6 +3759,13 @@ function teardown() {
   session.outputRate = 16000;
   session.lastTranscriptKey = null;
   session.muted = false;
+  session.v1Ready = false;
+  session.capturePaused = false;
+  session.audioSegmentActive = false;
+  session.waitingForGreeting = false;
+  session.waitingForAudioEnd = false;
+  session.typedTurnInFlight = false;
+  session.pendingPrompts = [];
   // Chat is a property of ONE conversation, decided when its socket opened. Carrying it into the
   // next one would mean the big control silently started a typed conversation because the previous
   // one was typed, which is the sort of stickiness the placement rules of this page keep removing.
@@ -4110,6 +4211,10 @@ async function changeChannelView(view, threadId = null, summary = null) {
   if (held) {
     el("scroll-area").scrollTop = held.top;
     restoreScroll(held.position);
+    // Switching back to a view already fetched in this page is a local
+    // presentation change. The live stream and periodic poll refresh the
+    // active view; a tab switch itself must not become another network wait.
+    return;
   } else {
     scrollToNewest();
   }
@@ -4139,17 +4244,24 @@ function threadCard(summary) {
   const meta = document.createElement("span");
   meta.className = "meta";
   meta.textContent = threadCount(summary.reply_count, summary.reply_count_exact);
-  const preview = document.createElement("span");
-  preview.className = "thread-preview";
-  preview.textContent = summary.root ? String(summary.root.content || "").slice(0, 240) : "Open this thread";
-  button.append(title, meta, preview);
+  button.append(title, meta);
   button.addEventListener("click", () => guardQuietly(() => openThread(summary.id, summary))());
   row.append(button);
   // `#129 message-search`. A thread card is what stands in this list where messages stand in the
   // others, so the filter has to reach it or searching on the threads tab silently does nothing.
-  // Title and preview, which is everything the card shows.
-  searchable(row, title.textContent, preview.textContent);
+  searchable(row, title.textContent);
   return row;
+}
+
+function renderChannelLoading(loading) {
+  const indicator = el("channel-loading");
+  indicator.hidden = !loading;
+  if (!loading) return;
+  indicator.textContent = channelView === "threads"
+    ? "Loading threads…"
+    : channelView === "thread"
+      ? "Loading thread…"
+      : "Loading messages…";
 }
 
 function addThreadDecoration(meta, message, row) {
@@ -4258,9 +4370,14 @@ async function loadTimeline(options) {
   discordFetchInFlight = true;
   const area = el("scroll-area");
   const position = channelReadPosition(area);
+  renderChannelLoading(true);
   try {
     const payload = await api(timelinePath());
     if (generation !== discordLoadGeneration || context !== channelContextKey()) return;
+    // Remove the in-flow indicator before measuring or restoring scroll. In
+    // real browsers scrollTop is clamped when it disappears, but making the
+    // order explicit also keeps the viewport model deterministic.
+    renderChannelLoading(false);
     if (!(options && options.keepPosition)) {
       // An explicit refresh starts a fresh provider snapshot. Retaining old pages here would
       // retain their expiring cursor forever, even though the newest request made a new one.
@@ -7250,6 +7367,7 @@ async function loadDiscord(options) {
   discordFetchInFlight = true;
   const area = el("scroll-area");
   const position = channelReadPosition(area);
+  renderChannelLoading(true);
   try {
     if (!keepPosition) {
       setStatus("fetching the channel…");
@@ -7260,6 +7378,7 @@ async function loadDiscord(options) {
     if (!currentDiscordLoad(generation, channel, false)) {
       return;
     }
+    renderChannelLoading(false);
     const loaded = applyNewestPage(payload);
     // Inline, at the head of the list, rather than on the transient strip. `#63
     // status-line-placement`: this is a standing fact about what you are looking at, and the strip
@@ -7407,6 +7526,7 @@ async function loadTodo(options) {
   discordFetchInFlight = true;
   const area = el("scroll-area");
   const position = channelReadPosition(area);
+  renderChannelLoading(true);
   try {
     // The SAME window the unfiltered read uses, and it is sent rather than left to the server's
     // default because the bulk clear has to send it back: `{through}` is resolved against a window
@@ -7418,6 +7538,7 @@ async function loadTodo(options) {
     if (!currentDiscordLoad(generation, channel, true)) {
       return;
     }
+    renderChannelLoading(false);
     // THE QUEUE, minus the reader's own words when they have said those are already read.
     //
     // Filtered HERE rather than on the server: this is a preference held in one browser, and the
@@ -7867,9 +7988,10 @@ async function sendReply() {
 // first time you looked. On the owner's phone that meant a view hours out of date, presented with
 // no hint that it was stale — which is worse than an empty view, because it reads as current.
 //
-// The view still re-reads once on every entry and on a timer while it is visible. A configured
-// adapter may additionally PUSH changes into the server; the timer is the authoritative fallback
-// if that adapter or the browser's stream is interrupted.
+// The first visit to each Main / Threads / All context fetches its projection, then tab switches
+// restore that page's in-memory snapshot. The active context still refreshes on a timer. A
+// configured adapter may additionally PUSH changes into the server; the timer is the authoritative
+// fallback if that adapter or the browser's stream is interrupted.
 
 const DISCORD_POLL_MS = 45000;
 let discordPollTimer = null;
@@ -7892,7 +8014,9 @@ async function finishDiscordLoad() {
   discordQueuedLoad = null;
   if (queued) {
     await loadDiscord(queued.options);
+    return;
   }
+  renderChannelLoading(false);
 }
 
 /** Whether a completed read still describes the channel and mode currently selected. */
@@ -9480,6 +9604,15 @@ el("read-aloud").addEventListener("click", () => {
   }
   setReadState(readingMode ? "ready" : "idle");
   if (readingMode) {
+    // A failed conversation banner belongs to the call that produced it. Leaving it over the
+    // independent device-speech mode makes a working Read control look broken; if device speech
+    // itself is unavailable, replace it immediately with that actionable reason.
+    clearError();
+    const speechProblem = readAloudPlayback === "browser" ? browserSpeechProblem() : "";
+    if (speechProblem) {
+      setReadState("failed");
+      showError(speechProblem);
+    }
     // AHEAD OF THE TAP. This is the request that makes every later tap cheap, and it is issued the
     // moment the mode is entered rather than when a message is chosen, because the reader is
     // already looking at the text and has not decided yet which line they want.

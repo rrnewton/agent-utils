@@ -300,6 +300,7 @@ const FIXTURE_TREE = {
     "clear-backlog",
     "load-older",
     "timeline-notice",
+    "channel-loading",
     "thread-list",
     "discord-log",
     "outgoing-log",
@@ -5469,7 +5470,11 @@ test("device speech gives useful unsupported-browser guidance without falling ba
   const page = newPage();
   page.readAloud = DEVICE_SPEECH;
   await signIn(page);
-  const rows = await inReadingMode(page, [message()]);
+  const rows = await showDiscord(page, [message()]);
+  await readButton(page).click();
+  await page.settle();
+  assert.match(page.el("error").textContent, /Chrome on Android/, "Read looked inert until a row tap");
+  assert.equal(readButton(page).getAttribute("data-read-state"), "failed");
   await rows[0].dispatch("click", {});
   await page.settle();
   assert.match(page.el("error").textContent, /Chrome on Android/);
@@ -11498,7 +11503,16 @@ test("the neutral WebSocket provider carries typed text, PCM, and deduplicated t
   const socket = page.sockets[0];
   socket.onopen();
 
+  assert.equal(socket.sent.length, 0, "the browser spoke before the server declared the session ready");
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: true }) });
   assert.deepStrictEqual(JSON.parse(socket.sent[0]), { type: "audio_start" });
+  speakInto(page);
+  assert.equal(
+    socket.sent.filter((frame) => typeof frame !== "string").length,
+    0,
+    "microphone PCM interrupted the opening greeting"
+  );
+  socket.onmessage({ data: JSON.stringify({ type: "turn_complete", turn: 1 }) });
   speakInto(page);
   assert.ok(
     socket.sent.some((frame) => typeof frame !== "string" && frame.byteLength > 0),
@@ -11507,6 +11521,12 @@ test("the neutral WebSocket provider carries typed text, PCM, and deduplicated t
 
   await compose(page, "is the bridge alive");
   await page.el("send-text").click();
+  assert.deepStrictEqual(
+    JSON.parse(socket.sent.at(-1)),
+    { type: "audio_end" },
+    "typed text raced an open microphone turn"
+  );
+  socket.onmessage({ data: JSON.stringify({ type: "turn_complete", turn: 2 }) });
   assert.ok(
     socket.sent.some(
       (frame) =>
@@ -11524,6 +11544,12 @@ test("the neutral WebSocket provider carries typed text, PCM, and deduplicated t
   });
   socket.onmessage({ data: transcript });
   socket.onmessage({ data: transcript });
+  socket.onmessage({ data: JSON.stringify({ type: "turn_complete", turn: 3 }) });
+  assert.deepStrictEqual(
+    JSON.parse(socket.sent.at(-1)),
+    { type: "audio_start" },
+    "microphone capture did not resume after the typed response"
+  );
   assert.equal(
     session_lines(page).filter((row) => row.text().includes("the bridge is alive")).length,
     1,
@@ -15747,6 +15773,9 @@ test("Threads is ordered oldest to newest, opens at bottom and returns to its sa
   assert.equal(list.hidden, false);
   assert.equal(page.el("discord-log").hidden, true);
   assert.deepEqual(list.children.map((row) => row.getAttribute("data-context-id")), page.threads.map((t) => t.id));
+  assert.equal(list.children[0].text(), "First discussion1 reply");
+  assert.doesNotMatch(list.children[0].text(), /first thread root/,
+    "the root body was repeated after the short thread title and reply count");
   const area = page.el("scroll-area");
   assert.equal(area.scrollTop, area.scrollHeight - area.clientHeight);
   area.scrollTop = 30;
@@ -15758,6 +15787,31 @@ test("Threads is ordered oldest to newest, opens at bottom and returns to its sa
   await page.el("thread-back").click();
   assert.equal(list.hidden, false);
   assert.equal(area.scrollTop, 30, "returning from a thread discarded the list's position");
+});
+
+test("channel tabs cache fetched views and show when an uncached view is loading", async () => {
+  const page = await threadPage();
+  const standard = page.timeline;
+  let finish;
+  page.timeline = (path) => path.includes("view=threads")
+    ? new Promise((resolve) => { finish = () => resolve(standard(path)); })
+    : standard(path);
+
+  const pendingThreads = page.el("channel-view-threads").click();
+  await page.settle();
+  assert.equal(page.el("channel-loading").hidden, false);
+  assert.equal(page.el("channel-loading").textContent, "Loading threads…");
+  finish();
+  await pendingThreads;
+  assert.equal(page.el("channel-loading").hidden, true);
+
+  await page.el("channel-view-flat").click();
+  const fetched = page.timelineCalls.length;
+  await page.el("channel-view-main").click();
+  await page.el("channel-view-threads").click();
+  await page.el("channel-view-flat").click();
+  assert.equal(page.timelineCalls.length, fetched,
+    "switching among cached channel views made another network request");
 });
 
 test("a rightward swipe leaves a thread and restores Main without archiving a message", async () => {

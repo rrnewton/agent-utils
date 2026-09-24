@@ -583,11 +583,21 @@ body {
   padding: 0.65rem;
 }
 
-.thread-preview {
-  display: block;
-  margin-top: 0.4rem;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+.channel-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.channel-loading::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0.85rem;
+  height: 0.85rem;
+  border: 2px solid var(--edge);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: outgoing-spin 0.8s linear infinite;
 }
 
 /* Local sends live beside the confirmed history until their provider IDs arrive. They look like
@@ -645,7 +655,8 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .outgoing-spinner { animation: none; }
+  .outgoing-spinner,
+  .channel-loading::before { animation: none; }
 }
 
 #channel-composer {

@@ -719,6 +719,9 @@ code path the startup probe uses, which is itself in the same position — see *
 | Channels | `[[channels]]` | `VIBE_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated |
 | ElevenLabs agent id | `elevenlabs.agent_id` | `VIBE_TALK_ELEVENLABS_AGENT_ID` | public |
 | Read-aloud backend | `read_aloud.backend` | `VIBE_TALK_READ_ALOUD_BACKEND` | `elevenlabs` (default) or `browser` for the device speech engine; independent of conversational voice mode |
+| Conversation backend | `conversation.backend` | — | `elevenlabs` (default) or `websocket` for a deployment-managed `vibe-talk-v1` endpoint |
+| Conversation WebSocket | `conversation.websocket_url` | — | required for the `websocket` backend; keep private endpoints in deployment configuration |
+| Conversation label | `conversation.label` | — | provider name shown in the UI and its connection errors |
 | Prepare bodies for speech | `speakable.enabled` | `VIBE_TALK_SPEAKABLE` | **on by default**; off relays exactly what was typed. Does not affect the time-zone conversion. A value that is neither `true` nor `false` refuses to start |
 | ElevenLabs API key | `elevenlabs.api_key` | `VIBE_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and for the ElevenLabs read-aloud backend |
 | Your own Discord user id | `discord.owner_user_id` | `VIBE_TALK_DISCORD_OWNER_USER_ID` | public; **cannot be derived** — see below. Without it, messages you type into Discord yourself are drawn as a third party |
@@ -1536,6 +1539,26 @@ Four guards on the relay, all load-bearing:
   conversation the reader is already having.
 * **A live socket.** There is nowhere to send it otherwise, and queuing it for the next call would
   deliver stale news at the start of a conversation about something else.
+
+## Conversational voice providers
+
+The server chooses a conversational provider through `[conversation]` and returns one common
+`VoiceSession` from `GET /api/v1/voice-session`. The page uses the returned `provider` as its
+display name and the returned `protocol` to select the wire adapter. It does not infer a provider
+from the URL or use signed-URL vocabulary in provider-neutral errors.
+
+The deployment-managed `vibe-talk-v1` WebSocket carries JSON control frames and raw 24 kHz,
+16-bit little-endian mono PCM binary frames. The server first sends
+`{"type":"session_started","greeting":true|false}`. A voice client then sends `audio_start` and,
+when `greeting` is true, withholds microphone frames until the first `turn_complete`. Typed input
+uses `{"type":"prompt","text":"…"}`. A client switching from an open microphone to typed input
+sends `audio_end`, waits for `turn_complete`, and then sends the prompt; after that response's
+`turn_complete`, it sends a fresh `audio_start` before resuming microphone frames. Server output is
+`transcript`, `turn_complete`, `error`, or binary PCM. `quit` ends the session.
+
+This protocol is deliberately public and provider-neutral. Authentication, endpoint discovery,
+and the implementation behind a deployment-managed socket belong in deployment configuration and
+private operations documentation.
 
 ## Signed conversation URLs
 
