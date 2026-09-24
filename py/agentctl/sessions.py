@@ -232,11 +232,24 @@ class Sessions(ManagedAgents):
             result = as_mapping(response["result"], "read result")
             return str(result.get("text", result.get("output", "")))
 
-    def stop(self, name: str, *, expected_token: str | None = None) -> dict[str, object]:
+    def stop(
+        self, name: str, *, expected_token: str | None = None,
+        recover_legacy_adoption: bool = False,
+        expected_record_sha256: str | None = None,
+    ) -> dict[str, object]:
         """Retire a runtime, then archive its canonical identity and artifacts."""
         record = self._load_expected(name, expected_token)
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
-            return super().stop(name, expected_token=record.token)
+            return self._stop(
+                name, expected_token=record.token,
+                recover_legacy_adoption=recover_legacy_adoption,
+                expected_record_sha256=expected_record_sha256,
+                expected_token_explicit=expected_token is not None,
+            )
+        if recover_legacy_adoption or expected_record_sha256 is not None:
+            raise AgentDeliveryError(
+                "legacy adoption recovery is supported only for interactive herdr-foreign records"
+            )
         with self._lock(name):
             current = self._load(name)
             if current.token != record.token:

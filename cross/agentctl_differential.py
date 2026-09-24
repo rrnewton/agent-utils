@@ -9,6 +9,7 @@ are advertised separately and are not treated as shared capabilities.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -137,7 +138,7 @@ def _orientation(harness: Harness, report: Report) -> None:
     case = harness.case("primary-orientation")
     _pair(harness, report, case, "primary/version", ("--version",))
     for arguments in ((), ("--help",), ("start", "--help"), ("adopt", "--help"),
-                      ("send", "--help"), ("goal", "--help")):
+                      ("stop", "--help"), ("send", "--help"), ("goal", "--help")):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, arguments), strict=True):
             report.require(f"primary/help/{arguments}/{edition}",
                            outcome.returncode == 0 and not outcome.stderr and "--registry" in outcome.stdout
@@ -146,7 +147,11 @@ def _orientation(harness: Harness, report: Report) -> None:
                            and (all(option in outcome.stdout for option in
                                     ("--pane", "--workspace", "--cwd", "--harness", "--session"))
                                 and "muse is refused" in outcome.stdout.lower()
-                                if arguments == ("adopt", "--help") else True),
+                                if arguments == ("adopt", "--help") else True)
+                           and (all(option in outcome.stdout for option in (
+                               "--recover-legacy-adoption", "--expected-token",
+                               "--expected-record-sha256",
+                           )) if arguments == ("stop", "--help") else True),
                            f"missing operation help: {outcome!r}")
     for command in ("quickstart", "userguide"):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, (command,)), strict=True):
@@ -1201,6 +1206,74 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
         "legacy adopted record without shell identity was retired or mutated",
     )
 
+    _change(case, {"fail_read": True})
+    capture_failures = []
+    for command, root in (
+        (harness.python, case.python_root), (harness.rust, case.rust_root),
+    ):
+        record_path = root / "registry/foreign/agent.json"
+        digest = hashlib.sha256(record_path.read_bytes()).hexdigest()
+        capture_failures.append(harness._invoke_one(command, root, (
+            "stop", "foreign", "--recover-legacy-adoption",
+            "--expected-token", "legacy-token",
+            "--expected-record-sha256", digest,
+            *_COMMON,
+        )))
+    report.require(
+        "primary/legacy-adopted/capture-failure-is-busy",
+        all(outcome.returncode == 75 for outcome in capture_failures)
+        and all((root / "registry/foreign/agent.json").is_file()
+                for root in (case.python_root, case.rust_root)),
+        f"legacy recovery capture failures did not preserve delivery classification: {capture_failures!r}",
+    )
+    _change(case, {"fail_read": False})
+
+    outcomes: list[Outcome] = []
+    recovery_values: list[dict[str, object]] = []
+    for command, root in (
+        (harness.python, case.python_root), (harness.rust, case.rust_root),
+    ):
+        record_path = root / "registry/foreign/agent.json"
+        digest = hashlib.sha256(record_path.read_bytes()).hexdigest()
+        outcome = harness._invoke_one(command, root, (
+            "stop", "foreign", "--recover-legacy-adoption",
+            "--expected-token", "legacy-token",
+            "--expected-record-sha256", digest,
+            *_COMMON,
+        ))
+        outcomes.append(outcome)
+        value = json.loads(outcome.stdout) if outcome.returncode == 0 else {}
+        if isinstance(value, dict):
+            report.require(
+                f"primary/legacy-adopted/recovery-hash-{root.parent.name}",
+                value.get("record_sha256") == digest,
+                f"recovery did not report its exact record digest: {outcome!r}",
+            )
+            value["record_sha256"] = "<ROOT-SPECIFIC-HASH>"
+        recovery_values.append(value)
+    report.require(
+        "primary/legacy-adopted/recovery-parity",
+        all(outcome.returncode == 0 and not outcome.stderr for outcome in outcomes)
+        and _normalize(recovery_values[0]) == _normalize(recovery_values[1]),
+        f"legacy recovery diverged: {outcomes!r}",
+    )
+    report.require(
+        "primary/legacy-adopted/recovery-preserves-bytes-and-runtime",
+        all(
+            not (root / "registry/foreign").exists()
+            and not _state(root).get("closed")
+            and not _state(root).get("closed_panes")
+            and len(list((root / "registry/archive").glob("*/agent.json"))) == 1
+            and list((root / "registry/archive").glob("*/agent.json"))[0].read_bytes()
+                == immutable_after_drain[index]["agent.json"]
+            and _queue_snapshot(
+                list((root / "registry/archive").glob("*"))[0], "queue"
+            ) == snapshots[index]
+            for index, root in enumerate((case.python_root, case.rust_root))
+        ),
+        "explicit recovery changed legacy record/queue bytes or mutated its runtime",
+    )
+
 
 def _ownership(harness: Harness, report: Report) -> None:
     for label, change in (("unavailable", {"offline": True}), ("replacement", {"name": "different"}),
@@ -1222,7 +1295,166 @@ def _ownership(harness: Harness, report: Report) -> None:
             outcomes = harness.invoke(case, ("stop", "worker", *_COMMON))
             report.require(f"primary/ownership/{label}/stop-refusal", all(outcome.returncode == 69 for outcome in outcomes)
                            and all((root / "registry/worker/agent.json").exists() and not _state(root).get("closed")
-                                   for root in (case.python_root, case.rust_root)), f"uncertain identity was retired: {outcomes!r}")
+                           for root in (case.python_root, case.rust_root)), f"uncertain identity was retired: {outcomes!r}")
+
+
+def _managed_dead_recovery(harness: Harness, report: Report) -> None:
+    case = harness.case("primary-managed-dead", {"empty_shell": False})
+    if not _start(harness, report, case, "primary/managed-dead/start"):
+        return
+    _change(case, {"empty_shell": True, "sessionless": True})
+    refused = harness.invoke(case, ("stop", "worker", *_COMMON))
+    report.require(
+        "primary/managed-dead/token-required",
+        all(outcome.returncode == 75 for outcome in refused)
+        and all((root / "registry/worker/agent.json").is_file()
+                and not _state(root).get("closed_panes")
+                for root in (case.python_root, case.rust_root)),
+        f"managed-dead retirement did not require a token: {refused!r}",
+    )
+    tokens = [
+        json.loads((root / "registry/worker/agent.json").read_text(encoding="utf-8"))["token"]
+        for root in (case.python_root, case.rust_root)
+    ]
+    _change(case, {"fail_read": True})
+    capture_failures = [
+        harness._invoke_one(command, root, (
+            "stop", "worker", "--expected-token", token, *_COMMON,
+        ))
+        for command, root, token in zip(
+            (harness.python, harness.rust),
+            (case.python_root, case.rust_root),
+            tokens,
+            strict=True,
+        )
+    ]
+    report.require(
+        "primary/managed-dead/capture-failure-is-busy",
+        all(outcome.returncode == 75 for outcome in capture_failures)
+        and all((root / "registry/worker/agent.json").is_file()
+                for root in (case.python_root, case.rust_root)),
+        f"managed-dead capture failures did not preserve delivery classification: {capture_failures!r}",
+    )
+    _change(case, {"fail_read": False, "fixture_shell_pid": 2_147_483_000})
+    proof_failures = [
+        harness._invoke_one(command, root, (
+            "stop", "worker", "--expected-token", token, *_COMMON,
+        ))
+        for command, root, token in zip(
+            (harness.python, harness.rust),
+            (case.python_root, case.rust_root),
+            tokens,
+            strict=True,
+        )
+    ]
+    report.require(
+        "primary/managed-dead/procfs-failure-is-busy",
+        all(outcome.returncode == 75 for outcome in proof_failures)
+        and all((root / "registry/worker/agent.json").is_file()
+                for root in (case.python_root, case.rust_root)),
+        f"managed-dead procfs failures diverged: {proof_failures!r}",
+    )
+    _change(case, {
+        "fixture_shell_pid": harness.fixture_shell.pid,
+        "fail_process_info": True,
+    })
+    control_failures = [
+        harness._invoke_one(command, root, (
+            "stop", "worker", "--expected-token", token, *_COMMON,
+        ))
+        for command, root, token in zip(
+            (harness.python, harness.rust),
+            (case.python_root, case.rust_root),
+            tokens,
+            strict=True,
+        )
+    ]
+    report.require(
+        "primary/managed-dead/process-info-failure-is-busy",
+        all(outcome.returncode == 75 for outcome in control_failures)
+        and all((root / "registry/worker/agent.json").is_file()
+                for root in (case.python_root, case.rust_root)),
+        f"managed-dead process-info failures diverged: {control_failures!r}",
+    )
+    _change(case, {"fail_process_info": False})
+    for field, value in (("mode", "headless"), ("backend", "tmux")):
+        original_documents: list[tuple[Path, dict[str, object]]] = []
+        for root in (case.python_root, case.rust_root):
+            path = root / "registry/worker/agent.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            original_documents.append((path, document.copy()))
+            document[field] = value
+            path.write_text(json.dumps(document), encoding="utf-8")
+        malformed = [
+            harness._invoke_one(command, root, (
+                "stop", "worker", "--expected-token", token, *_COMMON,
+            ))
+            for command, root, token in zip(
+                (harness.python, harness.rust),
+                (case.python_root, case.rust_root),
+                tokens,
+                strict=True,
+            )
+        ]
+        report.require(
+            f"primary/managed-dead/malformed-{field}-refusal",
+            all(outcome.returncode == 75 for outcome in malformed)
+            and all(not _state(root).get("closed_panes")
+                    for root in (case.python_root, case.rust_root)),
+            f"malformed managed record was not refused consistently: {malformed!r}",
+        )
+        for path, document in original_documents:
+            path.write_text(json.dumps(document), encoding="utf-8")
+    for root in (case.python_root, case.rust_root):
+        path = root / "registry/worker/agent.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["lifecycle"] = "stopping"
+        path.write_text(json.dumps(document), encoding="utf-8")
+    stopping = [
+        harness._invoke_one(command, root, (
+            "stop", "worker", "--expected-token", token, *_COMMON,
+        ))
+        for command, root, token in zip(
+            (harness.python, harness.rust),
+            (case.python_root, case.rust_root),
+            tokens,
+            strict=True,
+        )
+    ]
+    report.require(
+        "primary/managed-dead/stopping-without-proof-refusal",
+        all(outcome.returncode == 75 for outcome in stopping)
+        and all(not _state(root).get("closed_panes")
+                for root in (case.python_root, case.rust_root)),
+        f"unproved stopping generation was retired: {stopping!r}",
+    )
+    for root in (case.python_root, case.rust_root):
+        path = root / "registry/worker/agent.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["lifecycle"] = "running"
+        path.write_text(json.dumps(document), encoding="utf-8")
+    outcomes = []
+    for command, root in (
+        (harness.python, case.python_root), (harness.rust, case.rust_root),
+    ):
+        token = json.loads(
+            (root / "registry/worker/agent.json").read_text(encoding="utf-8")
+        )["token"]
+        outcomes.append(harness._invoke_one(command, root, (
+            "stop", "worker", "--expected-token", token, *_COMMON,
+        )))
+    report.require(
+        "primary/managed-dead/recovery-parity",
+        all(outcome.returncode == 0 for outcome in outcomes)
+        and _json(outcomes[0]) == _json(outcomes[1])
+        and all(
+            _state(root).get("closed_panes") == ["w1:p1"]
+            and not (root / "registry/worker").exists()
+            and len(list((root / "registry/archive").glob("*/output.json"))) == 1
+            for root in (case.python_root, case.rust_root)
+        ),
+        f"managed-dead retirement diverged: {outcomes!r}",
+    )
 
 
 def _adoption(harness: Harness, report: Report) -> None:
@@ -1449,6 +1681,17 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
         ("bad-goal-command", ("goal", "worker", "--goal-command-json", "[]")),
         ("missing-global-value", ("--registry", "--help")),
         ("wrong-command-option", ("status", "worker", "--brief", "text")),
+        ("legacy-recovery-missing-token", (
+            "stop", "worker", "--recover-legacy-adoption",
+            "--expected-record-sha256", "0" * 64,
+        )),
+        ("legacy-recovery-missing-hash", (
+            "stop", "worker", "--recover-legacy-adoption",
+            "--expected-token", "generation",
+        )),
+        ("legacy-hash-without-recovery", (
+            "stop", "worker", "--expected-record-sha256", "0" * 64,
+        )),
     ):
         outcomes = harness.invoke(case, arguments)
         report.require(f"primary/cli/{label}", all(outcome.returncode == 2
@@ -1473,6 +1716,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _registry_and_interop(harness, report)
             _legacy_adopted_registry_and_queue(harness, report)
             _ownership(harness, report)
+            _managed_dead_recovery(harness, report)
             _adoption(harness, report)
             _invalid_cli(harness, report)
         finally:

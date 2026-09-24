@@ -146,8 +146,15 @@ def parser() -> argparse.ArgumentParser:
     wait = command("wait", "Wait for readiness; readiness does not mean the goal is complete.",
         "agentctl wait reviewer --timeout 60", named=True)
     wait.add_argument("--timeout", type=_ascii_float, default=900.0, metavar="SECONDS", help="readiness deadline (default: 900 seconds)")
+    stop = command("stop", "Stop an owned runtime, or unregister an adopted runtime without closing it, and archive state.",
+        "agentctl stop reviewer", named=True)
+    stop.add_argument("--expected-token", metavar="TOKEN",
+        help="require this exact current registry generation; mandatory for managed-dead recovery")
+    stop.add_argument("--recover-legacy-adoption", action="store_true",
+        help="loud recovery for an identity-less dead adopted row; never mutates its pane")
+    stop.add_argument("--expected-record-sha256", metavar="SHA256",
+        help="exact lowercase SHA-256 of legacy agent.json; requires --recover-legacy-adoption")
     for name, purpose in (
-        ("stop", "Stop an owned runtime, or unregister an adopted runtime without closing it, and archive state."),
         ("attach", "Focus the session's terminal for direct inspection and interaction."),
         ("pause", "Pause automated input while allowing an active turn to finish."),
         ("resume", "Allow automated input after human interaction; clear any unfinished composer draft first."),
@@ -341,7 +348,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "attach":
             result = sessions.attach(name)
         elif args.command == "stop":
-            result = sessions.stop(name)
+            if args.recover_legacy_adoption and (
+                args.expected_token is None or args.expected_record_sha256 is None
+            ):
+                raise ValueError(
+                    "--recover-legacy-adoption requires --expected-token and "
+                    "--expected-record-sha256"
+                )
+            if (not args.recover_legacy_adoption
+                    and args.expected_record_sha256 is not None):
+                raise ValueError(
+                    "--expected-record-sha256 requires --recover-legacy-adoption"
+                )
+            result = sessions.stop(
+                name, expected_token=args.expected_token,
+                recover_legacy_adoption=args.recover_legacy_adoption,
+                expected_record_sha256=args.expected_record_sha256,
+            )
         elif args.command in ("reset", "repair"):
             result = sessions.runtime_operation(name, args.command)
         elif args.command == "migrate":

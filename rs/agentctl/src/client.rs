@@ -6,6 +6,7 @@ use crate::error::{AdapterError, Result};
 use chat_subscription_plugin::process::ProcessPluginChild;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -28,6 +29,9 @@ const CAPTURE_READ_BURST: usize = 256 * 1024;
 const PROC_STAT_BYTES: usize = 8 * 1024;
 const BOOT_ID_BYTES: usize = 128;
 const SUPPORTED_PANE_SHELLS: [&str; 6] = ["bash", "zsh", "sh", "dash", "fish", "ksh"];
+const MAX_SHELL_TASKS: usize = 4096;
+const MAX_CHILDREN_BYTES: usize = 64 * 1024;
+const MAX_PROC_ENTRIES: usize = 1024 * 1024;
 #[cfg(all(test, target_os = "linux"))]
 static POLL_CAPTURE_INTERRUPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -59,6 +63,15 @@ pub struct CustomProcessIdentity {
     pub executable_inode: u64,
 }
 
+/// Exact supported idle-shell process generation and kernel executable path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneShellProof {
+    /// Kernel process/image generation.
+    pub identity: CustomProcessIdentity,
+    /// Kernel-reported executable path observed with that generation.
+    pub executable_path: PathBuf,
+}
+
 impl CustomProcessIdentity {
     pub(crate) fn valid(&self) -> bool {
         self.version == 1
@@ -85,7 +98,7 @@ struct LiveCustomProcess {
     executable_path: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PaneProcessState {
     shell_pid: u64,
     foreground_process_group_id: u64,
@@ -313,6 +326,170 @@ fn supported_shell_name(path: &Path) -> bool {
 fn supported_shell_process(pid: u64) -> Result<Option<LiveCustomProcess>> {
     let observed = live_custom_process(pid)?;
     Ok(supported_shell_name(&observed.executable_path).then_some(observed))
+}
+
+fn process_task_ids(pid: u64) -> Result<Vec<String>> {
+    let root = PathBuf::from(format!("/proc/{pid}/task"));
+    let mut tasks = fs::read_dir(&root)
+        .map_err(|error| {
+            AdapterError::unavailable(format!(
+                "cannot enumerate shell tasks for process {pid}: {error}"
+            ))
+        })?
+        .map(|entry| {
+            entry
+                .map_err(|error| {
+                    AdapterError::unavailable(format!(
+                        "cannot inspect shell task for process {pid}: {error}"
+                    ))
+                })
+                .and_then(|entry| {
+                    entry.file_name().into_string().map_err(|_| {
+                        AdapterError::unavailable(format!(
+                            "shell task name for process {pid} is not UTF-8"
+                        ))
+                    })
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    tasks.sort();
+    if tasks.is_empty()
+        || tasks.len() > MAX_SHELL_TASKS
+        || tasks.iter().any(|task| {
+            task.is_empty()
+                || !task.bytes().all(|byte| byte.is_ascii_digit())
+                || task.parse::<u64>().ok().is_none_or(|value| value == 0)
+        })
+    {
+        return Err(AdapterError::unavailable(format!(
+            "shell task set for process {pid} is invalid"
+        )));
+    }
+    Ok(tasks)
+}
+
+fn process_has_no_descendants(pid: u64) -> Result<bool> {
+    let before = process_task_ids(pid)?;
+    let mut children_supported = true;
+    for task in &before {
+        let path = PathBuf::from(format!("/proc/{pid}/task/{task}/children"));
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                children_supported = false;
+                break;
+            }
+            Err(error) => {
+                return Err(AdapterError::unavailable(format!(
+                    "cannot inspect shell descendants for process {pid}: {error}"
+                )))
+            }
+        };
+        let mut children = Vec::with_capacity(MAX_CHILDREN_BYTES.saturating_add(1));
+        file.by_ref()
+            .take((MAX_CHILDREN_BYTES + 1) as u64)
+            .read_to_end(&mut children)
+            .map_err(|error| {
+                AdapterError::unavailable(format!(
+                    "cannot read shell descendants for process {pid}: {error}"
+                ))
+            })?;
+        if children.len() > MAX_CHILDREN_BYTES
+            || !children.iter().all(|byte| byte.is_ascii_whitespace())
+        {
+            return Ok(false);
+        }
+    }
+    if children_supported {
+        return Ok(process_task_ids(pid)? == before);
+    }
+
+    fn proc_parents() -> Result<HashMap<u64, u64>> {
+        let entries = fs::read_dir("/proc").map_err(|error| {
+            AdapterError::unavailable(format!("cannot enumerate process table: {error}"))
+        })?;
+        let mut parents = HashMap::new();
+        let mut numeric_entries = 0_usize;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                AdapterError::unavailable(format!("cannot inspect process table: {error}"))
+            })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            numeric_entries += 1;
+            if numeric_entries > MAX_PROC_ENTRIES {
+                return Err(AdapterError::unavailable(
+                    "process table exceeds descendant-proof bound",
+                ));
+            }
+            let process = name
+                .parse::<u64>()
+                .map_err(|_| AdapterError::unavailable("process table contains an invalid pid"))?;
+            let raw = match fs::read_to_string(entry.path().join("stat")) {
+                Ok(raw) => raw,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::ESRCH) =>
+                {
+                    continue
+                }
+                Err(error) => {
+                    return Err(AdapterError::unavailable(format!(
+                        "cannot inspect process {process} parent: {error}"
+                    )))
+                }
+            };
+            if raw.len() > 8192 || !raw.starts_with(&format!("{name} (")) {
+                return Err(AdapterError::unavailable(format!(
+                    "process {process} stat is invalid"
+                )));
+            }
+            let close = raw.rfind(')').ok_or_else(|| {
+                AdapterError::unavailable(format!("process {process} stat is invalid"))
+            })?;
+            let fields: Vec<&str> = raw[close + 1..].split_whitespace().collect();
+            if fields.len() < 2 {
+                return Err(AdapterError::unavailable(format!(
+                    "process {process} stat is incomplete"
+                )));
+            }
+            let parent = fields[1].parse::<u64>().map_err(|_| {
+                AdapterError::unavailable(format!("process {process} parent is invalid"))
+            })?;
+            if process > 0 {
+                parents.insert(process, parent);
+            }
+        }
+        Ok(parents)
+    }
+
+    fn has_descendant(pid: u64, parents: &HashMap<u64, u64>) -> bool {
+        let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (&process, &parent) in parents {
+            children.entry(parent).or_default().push(process);
+        }
+        let mut pending = children.get(&pid).cloned().unwrap_or_default();
+        let mut seen = HashSet::new();
+        while let Some(process) = pending.pop() {
+            if seen.insert(process) {
+                pending.extend(children.get(&process).into_iter().flatten().copied());
+            }
+        }
+        !seen.is_empty()
+    }
+
+    let first = proc_parents()?;
+    let second = proc_parents()?;
+    Ok(!has_descendant(pid, &first)
+        && !has_descendant(pid, &second)
+        && process_task_ids(pid)? == before)
 }
 
 fn safe_executable_metadata(metadata: &fs::Metadata) -> bool {
@@ -1093,9 +1270,12 @@ impl HerdrClient {
     /// Prove that no child command owns the terminal and the foreground process
     /// group contains only the pane's Herdr-reported shell process.
     pub fn pane_is_idle_shell(&self, pane_id: &str) -> Result<bool> {
-        let state = self.pane_process_state(pane_id, &|| false)?;
+        Ok(self.pane_idle_shell_identity(pane_id)?.is_some())
+    }
+
+    fn idle_shell_proof(&self, state: &PaneProcessState) -> Result<Option<PaneShellProof>> {
         if state.foreground_process_group_id != state.shell_pid || state.processes.len() != 1 {
-            return Ok(false);
+            return Ok(None);
         }
         let process = &state.processes[0];
         let pid = process
@@ -1115,11 +1295,43 @@ impl HerdrClient {
             .unwrap_or_default();
         let argv_executable = fs::canonicalize(argv0).ok();
         let kernel_executable = fs::canonicalize(format!("/proc/{}/exe", state.shell_pid)).ok();
-        let observed = supported_shell_process(state.shell_pid)?;
-        Ok(pid == state.shell_pid
-            && argv_executable.is_some()
-            && argv_executable == kernel_executable
-            && observed.is_some_and(|value| value.process_group_id == state.shell_pid))
+        let Some(observed) = supported_shell_process(state.shell_pid)? else {
+            return Ok(None);
+        };
+        if pid != state.shell_pid
+            || argv_executable.is_none()
+            || argv_executable != kernel_executable
+            || observed.process_group_id != state.shell_pid
+            || !process_has_no_descendants(state.shell_pid)?
+        {
+            return Ok(None);
+        }
+        let Some(confirmed) = supported_shell_process(state.shell_pid)? else {
+            return Ok(None);
+        };
+        if confirmed.identity != observed.identity
+            || confirmed.process_group_id != observed.process_group_id
+            || confirmed.executable_path != observed.executable_path
+        {
+            return Ok(None);
+        }
+        Ok(Some(PaneShellProof {
+            identity: observed.identity,
+            executable_path: observed.executable_path,
+        }))
+    }
+
+    /// Capture one stable supported idle-shell generation with no descendants.
+    pub fn pane_idle_shell_identity(&self, pane_id: &str) -> Result<Option<PaneShellProof>> {
+        let before = self.pane_process_state(pane_id, &|| false)?;
+        let Some(proof) = self.idle_shell_proof(&before)? else {
+            return Ok(None);
+        };
+        let after = self.pane_process_state(pane_id, &|| false)?;
+        if after != before || self.idle_shell_proof(&after)?.as_ref() != Some(&proof) {
+            return Ok(None);
+        }
+        Ok(Some(proof))
     }
 
     /// Capture the exact Linux process generation and executable image for a pane shell.
@@ -1146,39 +1358,9 @@ impl HerdrClient {
                 "recorded pane shell identity is invalid",
             ));
         }
-        let state = self.pane_process_state(pane_id, &|| false)?;
-        if state.shell_pid != expected.pid
-            || state.foreground_process_group_id != state.shell_pid
-            || state.processes.len() != 1
-        {
-            return Ok(false);
-        }
-        let process = &state.processes[0];
-        let pid = process
-            .get("pid")
-            .and_then(Value::as_u64)
-            .filter(|value| *value > 0 && *value <= i32::MAX as u64)
-            .ok_or_else(|| {
-                AdapterError::unavailable(
-                    "foreground process: \"pid\" is not a positive Linux process id",
-                )
-            })?;
-        let argv0 = process
-            .get("argv")
-            .and_then(Value::as_array)
-            .and_then(|values| values.first())
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let argv_executable = fs::canonicalize(argv0).ok();
-        let kernel_executable = fs::canonicalize(format!("/proc/{}/exe", state.shell_pid)).ok();
-        let observed = supported_shell_process(state.shell_pid)?;
-        Ok(pid == state.shell_pid
-            && argv_executable.is_some()
-            && argv_executable == kernel_executable
-            && observed.is_some_and(|value| {
-                value.identity == *expected
-                    && value.process_group_id == state.foreground_process_group_id
-            }))
+        Ok(self
+            .pane_idle_shell_identity(pane_id)?
+            .is_some_and(|proof| proof.identity == *expected))
     }
 
     pub(crate) fn verify_custom_harness_with_cancellation(
@@ -2041,6 +2223,8 @@ fn unique_label_id(
 mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
+    use std::io::Write as _;
+    #[cfg(target_os = "linux")]
     use std::process::Child;
     #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2238,6 +2422,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ProcessGroupGuard(libc::pid_t);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ProcessGroupGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests construct this guard only for a fresh process group they own.
+            let _ = unsafe { libc::kill(-self.0, libc::SIGKILL) };
         }
     }
 
@@ -2715,6 +2910,57 @@ mod tests {
 
         let error = herdr.client().pane_shell_identity("pane").unwrap_err();
         assert!(error.to_string().contains("supported identity-bound shell"));
+        assert!(!herdr.client().pane_is_idle_shell("pane").unwrap());
+        assert!(!herdr
+            .client()
+            .pane_is_same_idle_shell("pane", &identity)
+            .unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_supported_shell_with_background_descendant_is_not_idle() {
+        let executable = fs::canonicalize("/bin/bash").unwrap();
+        let mut command = Command::new(&executable);
+        command
+            .args(["--noprofile", "--norc"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut shell = ChildGuard(command.spawn().expect("start real test shell"));
+        let pid = shell.0.id();
+        let _group = ProcessGroupGuard(pid as libc::pid_t);
+        shell
+            .0
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"/usr/bin/sleep 30 & wait\n")
+            .unwrap();
+        shell.0.stdin.as_mut().unwrap().flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_has_no_descendants(u64::from(pid)).unwrap() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(shell.0.try_wait().unwrap().is_none());
+        assert!(!process_has_no_descendants(u64::from(pid)).unwrap());
+        let response = serde_json::json!({
+            "result": {
+                "process_info": {
+                    "pane_id": "pane",
+                    "shell_pid": pid,
+                    "foreground_process_group_id": pid,
+                    "foreground_processes": [{
+                        "pid": pid,
+                        "argv": [executable.display().to_string()]
+                    }]
+                }
+            }
+        })
+        .to_string();
+        let herdr = FakeExecutable::new(&response);
+        let identity = herdr.client().pane_shell_identity("pane").unwrap();
         assert!(!herdr.client().pane_is_idle_shell("pane").unwrap());
         assert!(!herdr
             .client()

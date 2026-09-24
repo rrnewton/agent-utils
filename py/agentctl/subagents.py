@@ -8,9 +8,15 @@ harness's permission settings. Coordinators and humans see the same terminal.
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import ctypes
+import errno
+import json
 import math
 import os
 import re
+import stat
+import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
@@ -25,6 +31,7 @@ from agentctl.client import (
     CustomProcessIdentity,
     HerdrClient,
     Pane,
+    PaneShellProof,
     muse_idle_composer,
     muse_prompt_in_composer,
     muse_prompt_transcript_count,
@@ -43,6 +50,88 @@ _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _BRACKETED_PASTE_START = "\x1b[200~"
 _BRACKETED_PASTE_END = "\x1b[201~"
 _MAX_U64 = (1 << 64) - 1
+_MAX_AGENT_RECORD_BYTES = 1 << 20
+_MAX_SNAPSHOT_BYTES = 16 << 20
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _rename_directory_noreplace_at(
+    source_parent: int,
+    source_name: str,
+    destination_parent: int,
+    destination_name: str,
+) -> None:
+    """Atomically move one entry between pinned directories without replacement."""
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise AgentDeliveryError(
+            "cannot archive agent: atomic no-replace rename is unavailable"
+        ) from exc
+    renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if renameat2(
+        source_parent,
+        os.fsencode(source_name),
+        destination_parent,
+        os.fsencode(destination_name),
+        1,
+    ) == 0:
+        return
+    number = ctypes.get_errno()
+    if number == errno.EEXIST:
+        raise AgentDeliveryError(
+            f"refusing to replace existing agent archive {destination_name}"
+        )
+    if number in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+        raise AgentDeliveryError(
+            "cannot archive agent: filesystem lacks atomic no-replace rename support"
+        )
+    raise AgentDeliveryError(
+        f"cannot archive agent {source_name} as {destination_name}: {os.strerror(number)}"
+    )
+
+
+def _fsync_pinned_directory(descriptor: int, label: str) -> None:
+    """Durably order one already-pinned directory; ``label`` is diagnostic only."""
+    del label
+    os.fsync(descriptor)
+
+
+def _snapshot_json_bytes(document: dict[str, object]) -> bytes:
+    """Encode retained terminal text as UTF-8 without ASCII escape expansion."""
+    return (
+        json.dumps(
+            document,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _close_descriptor(
+    descriptor: int, label: str, *, primary: BaseException | None,
+) -> None:
+    """Close one recovery fd without leaking a raw OS error or hiding its cause."""
+    try:
+        os.close(descriptor)
+    except OSError as exc:
+        if primary is not None:
+            error_type = (
+                _ArchivePublicationUncertainError
+                if isinstance(primary, _ArchivePublicationUncertainError)
+                else AgentDeliveryError
+            )
+            raise error_type(
+                f"{primary}; additionally could not close {label}: {exc}"
+            ) from primary
+        raise AgentDeliveryError(f"cannot close {label}: {exc}") from exc
 
 
 def _name(value: str) -> str:
@@ -151,6 +240,11 @@ class AgentRecord:
     def load(cls, path: Path, name: str) -> AgentRecord:
         """Reject malformed or non-private state before using any recorded identity."""
         value = agent._read_queue_json(str(path), "agent record", require_private=True)
+        return cls._from_value(value, path, name)
+
+    @classmethod
+    def _from_value(cls, value: object, path: Path, name: str) -> AgentRecord:
+        """Validate an already identity-bound record value."""
         if not isinstance(value, dict):
             raise AgentDeliveryError(f"invalid agent record: {path}")
         document = cast(dict[str, object], value)
@@ -274,6 +368,88 @@ class AgentRecord:
             session_value=self.session_value, expected_agent=self.harness,
             expected_cwd=self.cwd,
         )
+
+
+@dataclass(frozen=True)
+class _DeadPaneProof:
+    """One exact absent-agent, one-pane-tab, idle-shell observation."""
+
+    info: AgentPaneInfo
+    presentation: Pane
+    shell: PaneShellProof
+
+
+@dataclass(frozen=True)
+class _LegacyRecordSnapshot:
+    """Exact record bytes, parsed meaning, and containing directory generation."""
+
+    record: AgentRecord
+    content: bytes
+    digest: str
+    directory_device: int
+    directory_inode: int
+
+
+@dataclass(frozen=True)
+class _ManagedRecordSnapshot:
+    """Parsed managed record and its containing directory generation."""
+
+    record: AgentRecord
+    content: bytes
+    directory_device: int
+    directory_inode: int
+
+
+@dataclass(frozen=True)
+class _PinnedAgentDirectory:
+    """Open directory generation held from first proof through publication."""
+
+    name: str
+    path: Path
+    descriptor: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _PinnedParentDirectory:
+    """Open parent-directory generation used by one namespace transaction."""
+
+    path: Path
+    descriptor: int
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _InstalledArtifact:
+    """Exact private file generation installed under a pinned directory."""
+
+    name: str
+    device: int
+    inode: int
+    size: int
+    digest: str
+
+
+class _ArchivePublicationUncertainError(AgentDeliveryError):
+    """The held directory cannot safely be restored through the active name."""
+
+
+class _ArtifactNotInstalledError(AgentDeliveryError):
+    """An artifact write failed while the prior named generation stayed intact."""
+
+
+class _ArtifactInstalledError(AgentDeliveryError):
+    """An exact artifact was installed before a later bounded operation failed."""
+
+    def __init__(self, message: str, installed: _InstalledArtifact) -> None:
+        super().__init__(message)
+        self.installed = installed
+
+
+class _ArtifactPublicationUncertainError(_ArchivePublicationUncertainError):
+    """An artifact name no longer has a safely reversible generation."""
 
 
 def _goal_replacement_selected(screen: str, objective: str) -> bool:
@@ -484,6 +660,263 @@ class ManagedAgents:
         if expected_token is not None and record.token != expected_token:
             raise AgentDeliveryError(f"agent {name!r} was replaced before this operation")
         return record
+
+    @contextmanager
+    def _pinned_agent_directory(self, name: str) -> Iterator[_PinnedAgentDirectory]:
+        """Hold one private agent-directory inode across proof and publication."""
+        path = self._directory(name)
+        agent._validate_private_directory(str(path), "agent directory")
+        try:
+            before = os.stat(path, follow_symlinks=False)
+            if (not stat.S_ISDIR(before.st_mode) or before.st_uid != os.getuid()
+                    or stat.S_IMODE(before.st_mode) & 0o077):
+                raise AgentDeliveryError("agent directory is not a private directory")
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except AgentDeliveryError:
+            raise
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot pin agent directory: {exc}") from exc
+        try:
+            try:
+                opened = os.fstat(descriptor)
+            except OSError as exc:
+                raise AgentDeliveryError(
+                    f"cannot inspect pinned agent directory: {exc}"
+                ) from exc
+            if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.getuid()
+                    or stat.S_IMODE(opened.st_mode) & 0o077
+                    or (opened.st_dev, opened.st_ino)
+                    != (before.st_dev, before.st_ino)):
+                raise AgentDeliveryError(
+                    "agent directory changed or is not private while being pinned"
+                )
+            pinned = _PinnedAgentDirectory(
+                name=name,
+                path=path,
+                descriptor=descriptor,
+                device=before.st_dev,
+                inode=before.st_ino,
+            )
+            self._verify_pinned_agent_directory(pinned)
+            yield pinned
+        finally:
+            _close_descriptor(
+                descriptor, "pinned agent directory", primary=sys.exc_info()[1],
+            )
+
+    @staticmethod
+    def _verify_pinned_agent_directory(pinned: _PinnedAgentDirectory) -> None:
+        """Require the registry pathname to name the held directory generation."""
+        try:
+            path = os.stat(pinned.path, follow_symlinks=False)
+            opened = os.fstat(pinned.descriptor)
+        except OSError as exc:
+            raise AgentDeliveryError(
+                f"agent {pinned.name!r} registry directory changed: {exc}"
+            ) from exc
+        if (not stat.S_ISDIR(path.st_mode) or path.st_uid != os.getuid()
+                or stat.S_IMODE(path.st_mode) & 0o077
+                or not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) & 0o077
+                or (path.st_dev, path.st_ino) != (pinned.device, pinned.inode)
+                or (opened.st_dev, opened.st_ino) != (pinned.device, pinned.inode)):
+            raise AgentDeliveryError(
+                f"agent {pinned.name!r} registry directory changed"
+            )
+
+    @staticmethod
+    @contextmanager
+    def _pinned_parent_directory(
+        path: Path, *, label: str,
+    ) -> Iterator[_PinnedParentDirectory]:
+        agent._validate_private_directory(str(path), label)
+        try:
+            before = os.stat(path, follow_symlinks=False)
+            if (not stat.S_ISDIR(before.st_mode) or before.st_uid != os.getuid()
+                    or stat.S_IMODE(before.st_mode) & 0o077):
+                raise AgentDeliveryError(f"{label} is not a private directory")
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except AgentDeliveryError:
+            raise
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot pin {label}: {exc}") from exc
+        try:
+            try:
+                opened = os.fstat(descriptor)
+            except OSError as exc:
+                raise AgentDeliveryError(f"cannot inspect pinned {label}: {exc}") from exc
+            if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.getuid()
+                    or stat.S_IMODE(opened.st_mode) & 0o077
+                    or (opened.st_dev, opened.st_ino)
+                    != (before.st_dev, before.st_ino)):
+                raise AgentDeliveryError(
+                    f"{label} changed or is not private while being pinned"
+                )
+            pinned = _PinnedParentDirectory(
+                path=path,
+                descriptor=descriptor,
+                device=before.st_dev,
+                inode=before.st_ino,
+            )
+            ManagedAgents._verify_pinned_parent_directory(pinned, label=label)
+            yield pinned
+        finally:
+            _close_descriptor(
+                descriptor, f"pinned {label}", primary=sys.exc_info()[1],
+            )
+
+    @staticmethod
+    def _verify_pinned_parent_directory(
+        pinned: _PinnedParentDirectory, *, label: str,
+    ) -> None:
+        try:
+            path = os.stat(pinned.path, follow_symlinks=False)
+            opened = os.fstat(pinned.descriptor)
+        except OSError as exc:
+            raise AgentDeliveryError(f"{label} directory changed: {exc}") from exc
+        if (not stat.S_ISDIR(path.st_mode) or path.st_uid != os.getuid()
+                or stat.S_IMODE(path.st_mode) & 0o077
+                or not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) & 0o077
+                or (path.st_dev, path.st_ino) != (pinned.device, pinned.inode)
+                or (opened.st_dev, opened.st_ino) != (pinned.device, pinned.inode)):
+            raise AgentDeliveryError(f"{label} directory changed")
+
+    def _record_bytes(
+        self, pinned: _PinnedAgentDirectory, *, require_active_name: bool = True,
+    ) -> bytes:
+        """Read one bounded record relative to the held directory generation."""
+        path = pinned.path / "agent.json"
+        if require_active_name:
+            self._verify_pinned_agent_directory(pinned)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = -1
+        try:
+            descriptor = os.open("agent.json", flags, dir_fd=pinned.descriptor)
+            before = os.fstat(descriptor)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or stat.S_IMODE(before.st_mode) & 0o077 or before.st_nlink != 1
+                    or before.st_size > _MAX_AGENT_RECORD_BYTES):
+                raise AgentDeliveryError(f"unsafe agent record for recovery: {path}")
+            content = bytearray()
+            while True:
+                remaining = _MAX_AGENT_RECORD_BYTES + 1 - len(content)
+                if remaining <= 0:
+                    raise AgentDeliveryError(
+                        f"agent record exceeds {_MAX_AGENT_RECORD_BYTES} bytes: {path}"
+                    )
+                block = os.read(descriptor, min(64 << 10, remaining))
+                if not block:
+                    break
+                content.extend(block)
+            after = os.fstat(descriptor)
+            if (before.st_size != len(content)
+                    or (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                        after.st_nlink, after.st_size, after.st_mtime_ns,
+                        after.st_ctime_ns) != (
+                            before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+                            before.st_nlink, before.st_size, before.st_mtime_ns,
+                            before.st_ctime_ns,
+                        )):
+                raise AgentDeliveryError(f"agent record changed while hashing: {path}")
+            if require_active_name:
+                self._verify_pinned_agent_directory(pinned)
+            return bytes(content)
+        except AgentDeliveryError:
+            raise
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot hash agent record {path}: {exc}") from exc
+        finally:
+            if descriptor >= 0:
+                _close_descriptor(
+                    descriptor, "agent record", primary=sys.exc_info()[1],
+                )
+
+    def _legacy_record_snapshot(
+        self, pinned: _PinnedAgentDirectory, *, expected_token: str,
+        expected_digest: str,
+    ) -> _LegacyRecordSnapshot:
+        """Bind exact recovery bytes, meaning, digest, and directory generation."""
+        name = pinned.name
+        path = self._directory(name) / "agent.json"
+        if _SHA256.fullmatch(expected_digest) is None:
+            raise AgentDeliveryError(
+                "expected-record-sha256 must be exactly 64 lowercase hexadecimal characters"
+            )
+        content = self._record_bytes(pinned)
+        digest = hashlib.sha256(content).hexdigest()
+        try:
+            document = json.loads(content)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise AgentDeliveryError(
+                f"cannot inspect legacy agent record {path}: {exc}"
+            ) from exc
+        if not isinstance(document, dict):
+            raise AgentDeliveryError(f"invalid legacy agent record: {path}")
+        if "foreign_shell_identity" in document:
+            raise AgentDeliveryError(
+                "--recover-legacy-adoption requires foreign_shell_identity to be absent, "
+                "not null or populated"
+            )
+        record = AgentRecord._from_value(document, path, name)
+        if record.token != expected_token or digest != expected_digest:
+            raise AgentDeliveryError(
+                f"agent {name!r} record changed before adoption recovery"
+            )
+        return _LegacyRecordSnapshot(
+            record=record,
+            content=content,
+            digest=digest,
+            directory_device=pinned.device,
+            directory_inode=pinned.inode,
+        )
+
+    def _managed_record_snapshot(
+        self, pinned: _PinnedAgentDirectory, *, expected_token: str,
+    ) -> _ManagedRecordSnapshot:
+        """Bind a managed record read to one containing directory generation."""
+        content = self._record_bytes(pinned)
+        path = pinned.path / "agent.json"
+        try:
+            document = json.loads(content)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise AgentDeliveryError(f"cannot inspect agent record {path}: {exc}") from exc
+        record = AgentRecord._from_value(document, path, pinned.name)
+        if record.token != expected_token:
+            raise AgentDeliveryError(
+                f"agent {pinned.name!r} was replaced before this operation"
+            )
+        return _ManagedRecordSnapshot(
+            record=record,
+            content=content,
+            directory_device=pinned.device,
+            directory_inode=pinned.inode,
+        )
+
+    @contextmanager
+    def _pane_lock(self, pane_id: str) -> Iterator[None]:
+        """Serialize cooperative control across registries for one exact pane."""
+        descriptor = agent._open_private_lock(
+            agent._target_lock_path(pane_id), "host-wide target lock"
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
 
     def _save(self, record: AgentRecord) -> None:
         agent._atomic_json(str(self._directory(record.name) / "agent.json"), record.to_document())
@@ -1079,6 +1512,1112 @@ class ManagedAgents:
             result["goal"] = None if native is None else native["objective"]
         return result
 
+    def _dead_pane_proof(
+        self, record: AgentRecord, *, operation: str,
+    ) -> _DeadPaneProof:
+        """Prove one exact absent-agent, one-pane tab and idle shell generation."""
+        pane_id = record.pane_id
+        tab_id = record.tab_id
+        workspace_id = record.workspace_id
+        if not pane_id or not tab_id or not workspace_id:
+            raise AgentDeliveryError(
+                f"refusing to {operation} {record.name!r}: record lacks pane, tab, or workspace identity"
+            )
+        def snapshot() -> tuple[Pane, AgentPaneInfo]:
+            panes = self.client.panes()
+            presentations = [pane for pane in panes if pane.pane_id == pane_id]
+            if len(presentations) != 1:
+                raise AgentDeliveryError(
+                    f"refusing to {operation} {record.name!r}: expected one recorded pane, "
+                    f"found {len(presentations)}"
+                )
+            presentation = presentations[0]
+            if (presentation.tab_id != tab_id
+                    or presentation.workspace_id != workspace_id):
+                raise AgentDeliveryError(
+                    f"refusing to {operation} {record.name!r}: recorded pane, tab, or workspace changed"
+                )
+            tab_panes = [pane for pane in panes if pane.tab_id == tab_id]
+            if len(tab_panes) != 1 or tab_panes[0] != presentation:
+                raise AgentDeliveryError(
+                    f"refusing to {operation} {record.name!r}: recorded tab is not the exact one-pane tab"
+                )
+            info = self.client.pane_info(pane_id)
+            if (info.pane_id != pane_id or info.workspace_id != workspace_id
+                    or os.path.realpath(info.cwd) != os.path.realpath(record.cwd)):
+                raise AgentDeliveryError(
+                    f"refusing to {operation} {record.name!r}: recorded pane, workspace, or cwd changed"
+                )
+            if info.agent is not None:
+                raise AgentDeliveryError(
+                    f"refusing to {operation} {record.name!r}: pane still reports agent {info.agent!r}"
+                )
+            if info.session_agent is not None or info.session_value is not None:
+                raise AgentDeliveryError(
+                    f"refusing to {operation} {record.name!r}: absent agent has native session identity"
+                )
+            return presentation, info
+
+        presentation, info = snapshot()
+        try:
+            shell = self.client.pane_idle_shell_identity(pane_id)
+        except HerdrRunError as exc:
+            raise AgentDeliveryError(
+                f"refusing to {operation} {record.name!r}: cannot prove supported "
+                f"idle shell generation: {exc}"
+            ) from exc
+        if shell is None:
+            raise AgentDeliveryError(
+                f"refusing to {operation} {record.name!r}: pane is not a supported idle shell "
+                "generation without descendants"
+            )
+        final_presentation, final_info = snapshot()
+        if final_presentation != presentation or final_info != info:
+            raise AgentDeliveryError(
+                f"refusing to {operation} {record.name!r}: pane membership or agent state "
+                "changed during shell proof"
+            )
+        return _DeadPaneProof(
+            info=final_info, presentation=final_presentation, shell=shell,
+        )
+
+    def _bounded_terminal_text(self, pane_id: str, *, operation: str) -> str:
+        try:
+            output = self.client.read(
+                pane_id, source="recent-unwrapped", lines=5000
+            )
+            if not output:
+                output = self.client.read(pane_id, source="recent", lines=5000)
+            return output
+        except HerdrRunError as exc:
+            raise AgentDeliveryError(
+                f"cannot preserve terminal output before {operation}: {exc}"
+            ) from exc
+
+    def _archive_destination(self, record: AgentRecord) -> tuple[Path, Path]:
+        archive = self.registry / "archive"
+        try:
+            archive.mkdir(mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot prepare agent archive: {exc}") from exc
+        agent._validate_private_directory(str(archive), "agent archive")
+        destination = archive / f"{record.name}-{record.token}"
+        if os.path.lexists(destination):
+            raise AgentDeliveryError(
+                f"refusing to overwrite existing agent archive {destination}"
+            )
+        return archive, destination
+
+    @staticmethod
+    def _optional_snapshot_bytes(pinned: _PinnedAgentDirectory) -> bytes | None:
+        """Read an existing private snapshot exactly so publication can roll back."""
+        path = pinned.path / "output.json"
+        flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            descriptor = os.open("output.json", flags, dir_fd=pinned.descriptor)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AgentDeliveryError(
+                f"cannot open existing output snapshot {path}: {exc}"
+            ) from exc
+        try:
+            before = os.fstat(descriptor)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or stat.S_IMODE(before.st_mode) & 0o077 or before.st_nlink != 1
+                    or before.st_size > _MAX_SNAPSHOT_BYTES):
+                raise AgentDeliveryError(f"unsafe existing output snapshot: {path}")
+            content = bytearray()
+            while len(content) <= _MAX_SNAPSHOT_BYTES:
+                block = os.read(descriptor, min(64 << 10, _MAX_SNAPSHOT_BYTES + 1 - len(content)))
+                if not block:
+                    break
+                content.extend(block)
+            after = os.fstat(descriptor)
+            if (len(content) > _MAX_SNAPSHOT_BYTES or before.st_size != len(content)
+                    or (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                        after.st_nlink, after.st_size, after.st_mtime_ns,
+                        after.st_ctime_ns) != (
+                            before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+                            before.st_nlink, before.st_size, before.st_mtime_ns,
+                            before.st_ctime_ns,
+                        )):
+                raise AgentDeliveryError(f"existing output snapshot changed while reading: {path}")
+            return bytes(content)
+        except AgentDeliveryError:
+            raise
+        except OSError as exc:
+            raise AgentDeliveryError(
+                f"cannot inspect existing output snapshot {path}: {exc}"
+            ) from exc
+        finally:
+            _close_descriptor(
+                descriptor, "existing output snapshot", primary=sys.exc_info()[1],
+            )
+
+    @staticmethod
+    def _atomic_snapshot_bytes(
+        pinned: _PinnedAgentDirectory, content: bytes, *, name: str = "output.json",
+    ) -> _InstalledArtifact:
+        """Replace one private snapshot with exact bytes and durable directory metadata."""
+        if name not in {"agent.json", "output.json"}:
+            raise AgentDeliveryError("unsupported pinned registry artifact name")
+        limit = _MAX_AGENT_RECORD_BYTES if name == "agent.json" else _MAX_SNAPSHOT_BYTES
+        if len(content) > limit:
+            raise AgentDeliveryError(
+                f"refusing {name} larger than {limit} bytes"
+            )
+        temporary = f".{name}-recovery-{os.getpid()}-{uuid.uuid4().hex}"
+        descriptor = -1
+        temporary_owned = False
+        created: os.stat_result | None = None
+        rename_attempted = False
+        installed_verified = False
+        failure: BaseException | None = None
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=pinned.descriptor,
+            )
+            temporary_owned = True
+            created = os.fstat(descriptor)
+            if (not stat.S_ISREG(created.st_mode)
+                    or created.st_uid != os.getuid()
+                    or stat.S_IMODE(created.st_mode) & 0o077
+                    or created.st_nlink != 1):
+                raise AgentDeliveryError(
+                    f"unsafe pinned registry artifact staging file for {name}"
+                )
+            offset = 0
+            while offset < len(content):
+                written = os.write(descriptor, content[offset:])
+                if written <= 0:
+                    raise OSError("output snapshot restoration made no progress")
+                offset += written
+            os.fsync(descriptor)
+            held = os.fstat(descriptor)
+            held_content = os.pread(descriptor, len(content) + 1, 0)
+            staged = os.stat(
+                temporary, dir_fd=pinned.descriptor, follow_symlinks=False,
+            )
+            if (not stat.S_ISREG(held.st_mode)
+                    or not stat.S_ISREG(staged.st_mode)
+                    or held.st_uid != os.getuid() or staged.st_uid != os.getuid()
+                    or stat.S_IMODE(held.st_mode) & 0o077
+                    or stat.S_IMODE(staged.st_mode) & 0o077
+                    or held.st_nlink != 1 or staged.st_nlink != 1
+                    or held.st_size != len(content) or staged.st_size != len(content)
+                    or held_content != content
+                    or (held.st_dev, held.st_ino) != (created.st_dev, created.st_ino)
+                    or (staged.st_dev, staged.st_ino) != (
+                        created.st_dev, created.st_ino,
+                    )):
+                raise AgentDeliveryError(
+                    f"registry artifact staging generation changed before installing {name}"
+                )
+            rename_attempted = True
+            try:
+                os.replace(
+                    temporary, name,
+                    src_dir_fd=pinned.descriptor, dst_dir_fd=pinned.descriptor,
+                )
+            except OSError as exc:
+                raise AgentDeliveryError(
+                    f"cannot install pinned registry artifact {name}: {exc}"
+                ) from exc
+            # The staging name no longer belongs to this operation.  Never
+            # remove a new entry that appears there after the rename.
+            temporary_owned = False
+            installed = os.stat(
+                name, dir_fd=pinned.descriptor, follow_symlinks=False,
+            )
+            held = os.fstat(descriptor)
+            held_content = os.pread(descriptor, len(content) + 1, 0)
+            if (not stat.S_ISREG(installed.st_mode)
+                    or installed.st_uid != os.getuid()
+                    or stat.S_IMODE(installed.st_mode) & 0o077
+                    or installed.st_nlink != 1
+                    or installed.st_size != len(content)
+                    or held_content != content
+                    or (installed.st_dev, installed.st_ino) != (
+                        created.st_dev, created.st_ino,
+                    )
+                    or (held.st_dev, held.st_ino, held.st_size) != (
+                        created.st_dev, created.st_ino, len(content),
+                    )):
+                raise AgentDeliveryError(
+                    f"installed registry artifact {name} was not the staged generation"
+                )
+            installed_verified = True
+            os.fsync(pinned.descriptor)
+        except AgentDeliveryError as exc:
+            failure = exc
+        except OSError as exc:
+            failure = AgentDeliveryError(
+                f"cannot write pinned registry artifact {name}: {exc}"
+            )
+
+        # If replace(2) committed but its wrapper reported an error, classify
+        # the namespace before any cleanup. A known installed generation may
+        # be rolled back by a caller; a replacement or missing generation may
+        # not be overwritten.
+        if (failure is not None and rename_attempted and not installed_verified
+                and created is not None):
+            try:
+                held = os.fstat(descriptor)
+                held_content = os.pread(descriptor, len(content) + 1, 0)
+                reconciled_staging: os.stat_result | None
+                try:
+                    reconciled_staging = os.stat(
+                        temporary,
+                        dir_fd=pinned.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    reconciled_staging = None
+                reconciled_install: os.stat_result | None
+                try:
+                    reconciled_install = os.stat(
+                        name,
+                        dir_fd=pinned.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    reconciled_install = None
+                held_exact = (
+                    stat.S_ISREG(held.st_mode)
+                    and held.st_uid == os.getuid()
+                    and not stat.S_IMODE(held.st_mode) & 0o077
+                    and held.st_nlink == 1
+                    and held.st_size == len(content)
+                    and held_content == content
+                    and (held.st_dev, held.st_ino) == (created.st_dev, created.st_ino)
+                )
+                staged_exact = (
+                    reconciled_staging is not None
+                    and stat.S_ISREG(reconciled_staging.st_mode)
+                    and reconciled_staging.st_uid == os.getuid()
+                    and not stat.S_IMODE(reconciled_staging.st_mode) & 0o077
+                    and reconciled_staging.st_nlink == 1
+                    and (reconciled_staging.st_dev, reconciled_staging.st_ino) == (
+                        created.st_dev, created.st_ino,
+                    )
+                )
+                installed_exact = (
+                    reconciled_install is not None
+                    and stat.S_ISREG(reconciled_install.st_mode)
+                    and reconciled_install.st_uid == os.getuid()
+                    and not stat.S_IMODE(reconciled_install.st_mode) & 0o077
+                    and reconciled_install.st_nlink == 1
+                    and reconciled_install.st_size == len(content)
+                    and (reconciled_install.st_dev, reconciled_install.st_ino) == (
+                        created.st_dev, created.st_ino,
+                    )
+                )
+                if held_exact and installed_exact and not staged_exact:
+                    temporary_owned = False
+                    installed_verified = True
+                elif not (held_exact and staged_exact):
+                    temporary_owned = False
+            except OSError:
+                temporary_owned = False
+
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                cleanup_failures.append(("close staging file", exc))
+        if temporary_owned:
+            try:
+                staged = os.stat(
+                    temporary,
+                    dir_fd=pinned.descriptor,
+                    follow_symlinks=False,
+                )
+                if (created is None
+                        or (staged.st_dev, staged.st_ino) != (
+                            created.st_dev, created.st_ino,
+                        )
+                        or not stat.S_ISREG(staged.st_mode)
+                        or staged.st_uid != os.getuid()
+                        or stat.S_IMODE(staged.st_mode) & 0o077
+                        or staged.st_nlink != 1):
+                    raise AgentDeliveryError(
+                        "registry staging name no longer denotes the owned file; "
+                        "replacement was preserved"
+                    )
+                # A same-uid process ignoring the cooperative registry lock can
+                # still race this final identity check and unlink.
+                os.unlink(temporary, dir_fd=pinned.descriptor)
+            except FileNotFoundError:
+                pass
+            except (OSError, AgentDeliveryError) as exc:
+                cleanup_failures.append(("remove staging file", exc))
+        if cleanup_failures:
+            detail = "; ".join(
+                f"{label}: {error}" for label, error in cleanup_failures
+            )
+            cleanup_error = AgentDeliveryError(
+                f"registry artifact cleanup failed: {detail}"
+            )
+            if failure is None:
+                failure = cleanup_error
+            else:
+                failure = AgentDeliveryError(f"{failure}; {cleanup_error}")
+
+        installed_artifact = (
+            _InstalledArtifact(
+                name,
+                created.st_dev,
+                created.st_ino,
+                len(content),
+                hashlib.sha256(content).hexdigest(),
+            )
+            if created is not None else None
+        )
+        if failure is not None:
+            if installed_verified and installed_artifact is not None:
+                raise _ArtifactInstalledError(
+                    str(failure), installed_artifact,
+                ) from failure
+            if rename_attempted and not temporary_owned:
+                raise _ArtifactPublicationUncertainError(str(failure)) from failure
+            raise _ArtifactNotInstalledError(str(failure)) from failure
+        if installed_artifact is None or not installed_verified:
+            raise _ArtifactPublicationUncertainError(
+                f"cannot prove installed registry artifact {name}"
+            )
+        return installed_artifact
+
+    def _publish_pinned_directory(
+        self,
+        pinned: _PinnedAgentDirectory,
+        destination: Path,
+        *,
+        expected_record: bytes,
+    ) -> None:
+        """Atomically publish the exact held generation and its exact record."""
+        archive_path = destination.parent
+        if archive_path != self.registry / "archive" or not destination.name:
+            raise AgentDeliveryError("invalid agent archive destination")
+        publication_state = False
+        try:
+            with self._pinned_parent_directory(
+                self.registry, label="agent registry",
+            ) as registry_parent, self._pinned_parent_directory(
+                archive_path, label="agent archive",
+            ) as archive_parent:
+                self._verify_pinned_agent_directory(pinned)
+                try:
+                    source = os.stat(
+                        pinned.name,
+                        dir_fd=registry_parent.descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise AgentDeliveryError(
+                        f"cannot inspect active agent directory: {exc}"
+                    ) from exc
+                if (source.st_dev, source.st_ino) != (pinned.device, pinned.inode):
+                    raise AgentDeliveryError(
+                        f"agent {pinned.name!r} registry directory changed before publication"
+                    )
+                try:
+                    _rename_directory_noreplace_at(
+                        registry_parent.descriptor,
+                        pinned.name,
+                        archive_parent.descriptor,
+                        destination.name,
+                    )
+                except Exception as rename_error:
+                    # A successful rename may be reported as an error by the
+                    # filesystem or wrapper.  Reconcile both names before the
+                    # caller decides whether restoring output is safe.
+                    try:
+                        try:
+                            active = os.stat(
+                                pinned.name,
+                                dir_fd=registry_parent.descriptor,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            active = None
+                        try:
+                            archived = os.stat(
+                                destination.name,
+                                dir_fd=archive_parent.descriptor,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            archived = None
+                        opened = os.fstat(pinned.descriptor)
+                    except OSError as proof_error:
+                        publication_state = True
+                        raise _ArchivePublicationUncertainError(
+                            f"archive rename reported failure ({rename_error}) and its "
+                            f"namespace outcome could not be proved: {proof_error}"
+                        ) from proof_error
+                    active_exact = (
+                        active is not None
+                        and stat.S_ISDIR(active.st_mode)
+                        and active.st_uid == os.getuid()
+                        and not stat.S_IMODE(active.st_mode) & 0o077
+                        and (active.st_dev, active.st_ino)
+                        == (pinned.device, pinned.inode)
+                    )
+                    archived_exact = (
+                        archived is not None
+                        and stat.S_ISDIR(archived.st_mode)
+                        and archived.st_uid == os.getuid()
+                        and not stat.S_IMODE(archived.st_mode) & 0o077
+                        and (archived.st_dev, archived.st_ino)
+                        == (pinned.device, pinned.inode)
+                    )
+                    opened_exact = (
+                        stat.S_ISDIR(opened.st_mode)
+                        and opened.st_uid == os.getuid()
+                        and not stat.S_IMODE(opened.st_mode) & 0o077
+                        and (opened.st_dev, opened.st_ino)
+                        == (pinned.device, pinned.inode)
+                    )
+                    if active_exact and opened_exact and not archived_exact:
+                        raise
+                    publication_state = True
+                    if active is None and archived_exact and opened_exact:
+                        try:
+                            published_record = self._record_bytes(
+                                pinned, require_active_name=False,
+                            )
+                        except Exception as proof_error:
+                            raise _ArchivePublicationUncertainError(
+                                f"archive rename reported failure ({rename_error}); the "
+                                "generation was published but its record could not be "
+                                f"proved: {proof_error}"
+                            ) from proof_error
+                        if published_record == expected_record:
+                            raise _ArchivePublicationUncertainError(
+                                f"archive rename reported failure ({rename_error}) after the "
+                                "proved generation was published"
+                            ) from rename_error
+                        raise _ArchivePublicationUncertainError(
+                            f"archive rename reported failure ({rename_error}); the "
+                            "generation was published but its record changed"
+                        ) from rename_error
+                    raise _ArchivePublicationUncertainError(
+                        f"archive rename reported failure ({rename_error}) with an "
+                        "ambiguous namespace outcome"
+                    ) from rename_error
+                publication_state = True
+                try:
+                    self._verify_pinned_parent_directory(
+                        registry_parent, label="agent registry",
+                    )
+                    self._verify_pinned_parent_directory(
+                        archive_parent, label="agent archive",
+                    )
+                    try:
+                        os.stat(
+                            pinned.name,
+                            dir_fd=registry_parent.descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        raise AgentDeliveryError(
+                            f"cannot inspect active agent directory after publication: {exc}"
+                        ) from exc
+                    else:
+                        raise AgentDeliveryError(
+                            f"agent {pinned.name!r} active name reappeared during publication"
+                        )
+                    try:
+                        published = os.stat(
+                            destination.name,
+                            dir_fd=archive_parent.descriptor,
+                            follow_symlinks=False,
+                        )
+                        opened = os.fstat(pinned.descriptor)
+                    except OSError as exc:
+                        raise AgentDeliveryError(
+                            f"cannot inspect published agent directory: {exc}"
+                        ) from exc
+                    if (not stat.S_ISDIR(published.st_mode)
+                            or published.st_uid != os.getuid()
+                            or stat.S_IMODE(published.st_mode) & 0o077
+                            or not stat.S_ISDIR(opened.st_mode)
+                            or opened.st_uid != os.getuid()
+                            or stat.S_IMODE(opened.st_mode) & 0o077
+                            or (published.st_dev, published.st_ino)
+                            != (pinned.device, pinned.inode)
+                            or (opened.st_dev, opened.st_ino)
+                            != (pinned.device, pinned.inode)):
+                        raise AgentDeliveryError(
+                            f"agent {pinned.name!r} published directory was not the proved generation"
+                        )
+                    if self._record_bytes(
+                        pinned, require_active_name=False,
+                    ) != expected_record:
+                        raise AgentDeliveryError(
+                            f"agent {pinned.name!r} record changed during archival publication"
+                        )
+                except Exception as cause:
+                    # All agentctl participants hold the name lock.  Reprove both
+                    # namespace entries immediately before the inverse rename so a
+                    # replacement at either name is never promoted to active state.
+                    # renameat2 cannot compare an inode atomically, so an actor that
+                    # ignores the cooperative lock can still race this last check;
+                    # the no-replace rename at least refuses an occupied active name.
+                    try:
+                        os.stat(
+                            pinned.name,
+                            dir_fd=registry_parent.descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    except OSError as proof_error:
+                        raise _ArchivePublicationUncertainError(
+                            f"archive identity check failed ({cause}); cannot prove the "
+                            f"active name absent before rollback: {proof_error}"
+                        ) from proof_error
+                    else:
+                        raise _ArchivePublicationUncertainError(
+                            f"archive identity check failed ({cause}); active name reappeared, "
+                            "so rollback was not attempted"
+                        ) from cause
+                    try:
+                        rollback_source = os.stat(
+                            destination.name,
+                            dir_fd=archive_parent.descriptor,
+                            follow_symlinks=False,
+                        )
+                    except OSError as proof_error:
+                        raise _ArchivePublicationUncertainError(
+                            f"archive identity check failed ({cause}); cannot reprove the "
+                            f"published generation before rollback: {proof_error}"
+                        ) from proof_error
+                    if (not stat.S_ISDIR(rollback_source.st_mode)
+                            or rollback_source.st_uid != os.getuid()
+                            or stat.S_IMODE(rollback_source.st_mode) & 0o077
+                            or (rollback_source.st_dev, rollback_source.st_ino) != (
+                                pinned.device, pinned.inode,
+                            )):
+                        raise _ArchivePublicationUncertainError(
+                            f"archive identity check failed ({cause}); archive destination "
+                            "was replaced, or became unsafe, so rollback was not attempted"
+                        ) from cause
+                    try:
+                        _rename_directory_noreplace_at(
+                            archive_parent.descriptor,
+                            destination.name,
+                            registry_parent.descriptor,
+                            pinned.name,
+                        )
+                    except Exception as rollback:
+                        raise _ArchivePublicationUncertainError(
+                            f"archive identity check failed ({cause}) and rollback was incomplete: "
+                            f"{rollback}"
+                        ) from rollback
+                    try:
+                        self._verify_pinned_parent_directory(
+                            registry_parent, label="agent registry",
+                        )
+                        self._verify_pinned_parent_directory(
+                            archive_parent, label="agent archive",
+                        )
+                        self._verify_pinned_agent_directory(pinned)
+                        restored = os.stat(
+                            pinned.name,
+                            dir_fd=registry_parent.descriptor,
+                            follow_symlinks=False,
+                        )
+                        if (restored.st_dev, restored.st_ino) != (
+                            pinned.device, pinned.inode,
+                        ):
+                            raise AgentDeliveryError(
+                                "restored active name is not the proved generation"
+                            )
+                        try:
+                            os.stat(
+                                destination.name,
+                                dir_fd=archive_parent.descriptor,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise AgentDeliveryError(
+                                "archive destination remained after rollback"
+                            )
+                        if self._record_bytes(pinned) != expected_record:
+                            raise AgentDeliveryError(
+                                "restored agent record is not the proved content"
+                            )
+                    except Exception as rollback_proof:
+                        raise _ArchivePublicationUncertainError(
+                            f"archive identity check failed ({cause}); inverse rename completed "
+                            f"but rollback state could not be proved: {rollback_proof}"
+                        ) from rollback_proof
+                    sync_failures: list[str] = []
+                    for parent, label in (
+                        (archive_parent, "agent archive rollback"),
+                        (registry_parent, "agent registry rollback"),
+                    ):
+                        try:
+                            _fsync_pinned_directory(parent.descriptor, label)
+                        except OSError as exc:
+                            sync_failures.append(f"{label}: {exc}")
+                    if sync_failures:
+                        raise _ArchivePublicationUncertainError(
+                            f"archive identity check failed ({cause}); rollback completed but "
+                            f"directory durability is uncertain: {'; '.join(sync_failures)}"
+                        ) from cause
+                    publication_state = False
+                    raise
+                sync_failures = []
+                for parent, label in (
+                    (archive_parent, "published agent archive"),
+                    (registry_parent, "published agent registry"),
+                ):
+                    try:
+                        _fsync_pinned_directory(parent.descriptor, label)
+                    except OSError as exc:
+                        sync_failures.append(f"{label}: {exc}")
+                if sync_failures:
+                    raise _ArchivePublicationUncertainError(
+                        "agent archive was published but directory durability is uncertain: "
+                        f"{'; '.join(sync_failures)}"
+                    )
+        except _ArchivePublicationUncertainError:
+            raise
+        except Exception as error:
+            if publication_state:
+                raise _ArchivePublicationUncertainError(
+                    f"agent archive publication state is uncertain after publication: {error}"
+                ) from error
+            raise
+
+    @staticmethod
+    def _restore_output_snapshot(
+        pinned: _PinnedAgentDirectory, previous: bytes | None,
+    ) -> None:
+        if previous is None:
+            try:
+                os.unlink("output.json", dir_fd=pinned.descriptor)
+            except FileNotFoundError:
+                pass
+            os.fsync(pinned.descriptor)
+        else:
+            ManagedAgents._atomic_snapshot_bytes(pinned, previous)
+
+    @staticmethod
+    def _verify_installed_output_snapshot(
+        pinned: _PinnedAgentDirectory,
+        installed: _InstalledArtifact,
+    ) -> None:
+        """Require output to retain the exact generation and bytes we installed."""
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                installed.name,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=pinned.descriptor,
+            )
+            before = os.fstat(descriptor)
+            content = bytearray()
+            while len(content) <= installed.size:
+                block = os.read(
+                    descriptor,
+                    min(64 << 10, installed.size + 1 - len(content)),
+                )
+                if not block:
+                    break
+                content.extend(block)
+            after = os.fstat(descriptor)
+        except OSError as exc:
+            raise _ArchivePublicationUncertainError(
+                f"cannot reprove installed output before rollback: {exc}"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                _close_descriptor(
+                    descriptor,
+                    "installed output rollback proof",
+                    primary=sys.exc_info()[1],
+                )
+        if (not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) & 0o077
+                or before.st_nlink != 1
+                or before.st_size != installed.size
+                or len(content) != installed.size
+                or hashlib.sha256(content).hexdigest() != installed.digest
+                or (before.st_dev, before.st_ino) != (
+                    installed.device, installed.inode,
+                )
+                or (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                    after.st_nlink, after.st_size, after.st_mtime_ns,
+                    after.st_ctime_ns) != (
+                        before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+                        before.st_nlink, before.st_size, before.st_mtime_ns,
+                        before.st_ctime_ns,
+                    )):
+            raise _ArchivePublicationUncertainError(
+                "installed output generation changed before use; replacement was preserved"
+            )
+
+    @staticmethod
+    def _restore_installed_output_snapshot(
+        pinned: _PinnedAgentDirectory,
+        previous: bytes | None,
+        installed: _InstalledArtifact,
+    ) -> None:
+        """Restore only while output still names the generation we installed."""
+        ManagedAgents._verify_installed_output_snapshot(pinned, installed)
+        # Registry participants hold the per-name lock; a same-uid process that
+        # ignores it can still race this final check and replacement operation.
+        ManagedAgents._restore_output_snapshot(pinned, previous)
+
+    def _publish_archive(
+        self,
+        pinned: _PinnedAgentDirectory,
+        destination: Path,
+        snapshot: dict[str, object],
+        *,
+        expected_record: bytes,
+        before_publish: Callable[[], None],
+    ) -> None:
+        """Prepare output, reprove state, then publish in one namespace move."""
+        previous = self._optional_snapshot_bytes(pinned)
+        installed: _InstalledArtifact | None = None
+        try:
+            installed = self._atomic_snapshot_bytes(
+                pinned, _snapshot_json_bytes(snapshot)
+            )
+            self._verify_installed_output_snapshot(pinned, installed)
+            before_publish()
+            self._publish_pinned_directory(
+                pinned, destination, expected_record=expected_record,
+            )
+        except _ArchivePublicationUncertainError:
+            # The held directory was moved and could not be safely returned to
+            # the active name.  Restoring through its fd would silently mutate a
+            # retained or displaced generation rather than roll back publication.
+            raise
+        except _ArtifactNotInstalledError:
+            # The previous named output was never replaced.
+            raise
+        except _ArtifactInstalledError as error:
+            try:
+                self._restore_installed_output_snapshot(
+                    pinned, previous, error.installed,
+                )
+            except Exception as rollback:
+                raise _ArchivePublicationUncertainError(
+                    f"archive preparation failed ({error}) and exact output rollback "
+                    f"was unsafe or incomplete: {rollback}"
+                ) from rollback
+            raise
+        except Exception:
+            if installed is None:
+                raise
+            try:
+                self._restore_installed_output_snapshot(pinned, previous, installed)
+            except Exception as rollback:
+                raise _ArchivePublicationUncertainError(
+                    "archive publication failed and exact output rollback was unsafe or "
+                    f"incomplete: {rollback}"
+                ) from rollback
+            raise
+
+    def _recover_legacy_adoption(
+        self, record: AgentRecord, *, expected_token: str | None,
+        expected_record_sha256: str | None,
+        expected_token_explicit: bool,
+    ) -> dict[str, object]:
+        """Explicitly retire an identity-less adopted record without touching its pane."""
+        if not record.pane_id:
+            raise AgentDeliveryError(
+                f"refusing to recover legacy adoption {record.name!r}: record lacks pane identity"
+            )
+        with self._pane_lock(record.pane_id):
+            with self._pinned_agent_directory(record.name) as pinned:
+                return self._recover_legacy_adoption_locked(
+                    record, pinned=pinned, expected_token=expected_token,
+                    expected_record_sha256=expected_record_sha256,
+                    expected_token_explicit=expected_token_explicit,
+                )
+
+    def _recover_legacy_adoption_locked(
+        self, record: AgentRecord, *, pinned: _PinnedAgentDirectory,
+        expected_token: str | None,
+        expected_record_sha256: str | None,
+        expected_token_explicit: bool,
+    ) -> dict[str, object]:
+        if (not expected_token_explicit or expected_token is None
+                or expected_record_sha256 is None):
+            raise AgentDeliveryError(
+                "legacy adoption recovery requires --expected-token and "
+                "--expected-record-sha256"
+            )
+        initial = self._legacy_record_snapshot(
+            pinned,
+            expected_token=expected_token,
+            expected_digest=expected_record_sha256,
+        )
+        if initial.record.to_document() != record.to_document():
+            raise AgentDeliveryError(
+                f"refusing to recover adoption {record.name!r}: registry record changed"
+            )
+        record = initial.record
+        if (record.adapter != "herdr-foreign"
+                or record.lifecycle != "running"
+                or record.mode != "interactive"
+                or record.backend != "herdr"
+                or record.foreign_shell_identity is not None):
+            raise AgentDeliveryError(
+                "--recover-legacy-adoption applies only to a running herdr-foreign "
+                "record missing foreign_shell_identity"
+            )
+        before = self._dead_pane_proof(record, operation="recover legacy adoption")
+        text = self._bounded_terminal_text(
+            before.info.pane_id, operation="legacy adoption recovery"
+        )
+        current_snapshot = self._legacy_record_snapshot(
+            pinned,
+            expected_token=expected_token,
+            expected_digest=expected_record_sha256,
+        )
+        if current_snapshot != initial:
+            raise AgentDeliveryError(
+                f"refusing to recover legacy adoption {record.name!r}: registry record changed"
+            )
+        current = current_snapshot.record
+        after = self._dead_pane_proof(current, operation="recover legacy adoption")
+        if after != before:
+            raise AgentDeliveryError(
+                f"refusing to recover legacy adoption {record.name!r}: "
+                "runtime identity changed during output capture"
+            )
+        _archive, destination = self._archive_destination(current)
+
+        def reprove_before_publish() -> None:
+            final_snapshot = self._legacy_record_snapshot(
+                pinned,
+                expected_token=expected_token,
+                expected_digest=expected_record_sha256,
+            )
+            if final_snapshot != initial:
+                raise AgentDeliveryError(
+                    f"refusing to recover adoption {record.name!r}: registry record changed"
+                )
+            if self._dead_pane_proof(
+                final_snapshot.record, operation="recover legacy adoption"
+            ) != before:
+                raise AgentDeliveryError(
+                    f"refusing to recover legacy adoption {record.name!r}: "
+                    "runtime identity changed before archival"
+                )
+
+        self._publish_archive(
+            pinned,
+            destination,
+            {"text": text, "captured_at": time.time(), "pane_id": record.pane_id,
+             "recovery_shell_identity": {
+                 **asdict(before.shell.identity),
+                 "executable_path": before.shell.executable_path,
+             }},
+            expected_record=initial.content,
+            before_publish=reprove_before_publish,
+        )
+        return {
+            "name": record.name,
+            "archive": str(destination),
+            "pane_closed": False,
+            "tab_closed": False,
+            "runtime_preserved": True,
+            "recovered_legacy_adoption": True,
+            "record_sha256": expected_record_sha256,
+            "recovery_shell_identity": {
+                **asdict(before.shell.identity),
+                "executable_path": before.shell.executable_path,
+            },
+        }
+
+    def _retire_managed_dead(
+        self, record: AgentRecord, *, expected_token: str | None,
+        expected_token_explicit: bool,
+    ) -> dict[str, object]:
+        """Retire one owned pane only after proving a stable returned shell."""
+        if not record.pane_id:
+            raise AgentDeliveryError(
+                f"refusing to retire dead managed agent {record.name!r}: record lacks pane identity"
+            )
+        with self._pane_lock(record.pane_id):
+            with self._pinned_agent_directory(record.name) as pinned:
+                return self._retire_managed_dead_locked(
+                    record, pinned=pinned, expected_token=expected_token,
+                    expected_token_explicit=expected_token_explicit,
+                )
+
+    def _retire_managed_dead_locked(
+        self, record: AgentRecord, *, pinned: _PinnedAgentDirectory,
+        expected_token: str | None,
+        expected_token_explicit: bool,
+    ) -> dict[str, object]:
+        if not expected_token_explicit or expected_token is None:
+            raise AgentDeliveryError(
+                f"retiring dead managed agent {record.name!r} requires --expected-token"
+            )
+        initial = self._managed_record_snapshot(
+            pinned, expected_token=expected_token,
+        )
+        if initial.record.to_document() != record.to_document():
+            raise AgentDeliveryError(
+                f"refusing to retire dead managed agent {record.name!r}: registry record changed"
+            )
+        record = initial.record
+        if (record.adapter != "herdr" or record.lifecycle != "running"
+                or record.mode != "interactive" or record.backend != "herdr"):
+            raise AgentDeliveryError(
+                "managed-dead retirement requires a running herdr record in "
+                "interactive/herdr mode"
+            )
+        before = self._dead_pane_proof(record, operation="retire dead managed agent")
+        text = self._bounded_terminal_text(
+            before.info.pane_id, operation="managed-dead retirement"
+        )
+        current_snapshot = self._managed_record_snapshot(
+            pinned, expected_token=expected_token,
+        )
+        if current_snapshot != initial:
+            raise AgentDeliveryError(
+                f"refusing to retire dead managed agent {record.name!r}: registry record changed"
+            )
+        current = current_snapshot.record
+        after = self._dead_pane_proof(current, operation="retire dead managed agent")
+        if after != before:
+            raise AgentDeliveryError(
+                f"refusing to retire dead managed agent {record.name!r}: "
+                "runtime identity changed during output capture"
+            )
+        _archive, destination = self._archive_destination(current)
+        final_snapshot = self._managed_record_snapshot(
+            pinned, expected_token=expected_token,
+        )
+        if final_snapshot != initial:
+            raise AgentDeliveryError(
+                f"refusing to retire dead managed agent {record.name!r}: registry record changed"
+            )
+        final = final_snapshot.record
+        if self._dead_pane_proof(final, operation="retire dead managed agent") != before:
+            raise AgentDeliveryError(
+                f"refusing to retire dead managed agent {record.name!r}: "
+                "runtime identity changed before close"
+            )
+        final.lifecycle = "stopped"
+        stopped_bytes = agent._json_text(final.to_document()).encode("utf-8")
+        if len(stopped_bytes) > _MAX_AGENT_RECORD_BYTES:
+            raise AgentDeliveryError(
+                f"refusing stopped agent record larger than {_MAX_AGENT_RECORD_BYTES} bytes"
+            )
+        previous_output = self._optional_snapshot_bytes(pinned)
+        installed: _InstalledArtifact | None = None
+        try:
+            installed = self._atomic_snapshot_bytes(
+                pinned,
+                _snapshot_json_bytes({
+                    "text": text, "captured_at": time.time(), "pane_id": record.pane_id,
+                    "retirement_shell_identity": {
+                        **asdict(before.shell.identity),
+                        "executable_path": before.shell.executable_path,
+                    },
+                }),
+            )
+        except _ArtifactNotInstalledError:
+            raise
+        except _ArtifactPublicationUncertainError:
+            raise
+        except _ArtifactInstalledError as error:
+            try:
+                self._restore_installed_output_snapshot(
+                    pinned, previous_output, error.installed,
+                )
+            except Exception as rollback:
+                raise _ArchivePublicationUncertainError(
+                    f"managed retirement preparation failed ({error}) and exact output "
+                    f"rollback was unsafe or incomplete: {rollback}"
+                ) from rollback
+            raise
+        except Exception:
+            if installed is None:
+                raise
+            try:
+                self._restore_installed_output_snapshot(
+                    pinned, previous_output, installed,
+                )
+            except Exception as rollback:
+                raise _ArchivePublicationUncertainError(
+                    "managed retirement preparation failed and exact output rollback was "
+                    f"unsafe or incomplete: {rollback}"
+                ) from rollback
+            raise
+        try:
+            assert installed is not None
+            self._verify_installed_output_snapshot(pinned, installed)
+            if self._record_bytes(pinned) != initial.content:
+                raise AgentDeliveryError(
+                    f"refusing to retire dead managed agent {record.name!r}: "
+                    "registry record changed immediately before close"
+                )
+            if self._dead_pane_proof(
+                final, operation="retire dead managed agent"
+            ) != before:
+                raise AgentDeliveryError(
+                    f"refusing to retire dead managed agent {record.name!r}: "
+                    "runtime identity changed immediately before close"
+                )
+        except Exception:
+            try:
+                assert installed is not None
+                self._restore_installed_output_snapshot(
+                    pinned, previous_output, installed,
+                )
+            except Exception as rollback:
+                raise _ArchivePublicationUncertainError(
+                    "managed retirement final runtime proof failed and rollback "
+                    f"was unsafe or incomplete: {rollback}"
+                ) from rollback
+            raise
+        assert final.pane_id is not None
+        self.client.close_pane(final.pane_id)
+        self._atomic_snapshot_bytes(pinned, stopped_bytes, name="agent.json")
+        self._publish_pinned_directory(
+            pinned, destination, expected_record=stopped_bytes,
+        )
+        try:
+            tab_closed: bool | None = not any(
+                pane.tab_id == final.tab_id for pane in self.client.panes()
+            )
+        except HerdrRunError:
+            tab_closed = None
+        return {
+            "name": record.name,
+            "archive": str(destination),
+            "pane_closed": True,
+            "tab_closed": tab_closed,
+            "managed_dead": True,
+        }
+
     def goal(self, name: str, text: str | None = None, *, goal_command: Sequence[str] | None = None, **options: object) -> dict[str, object]:
         """Read native goal state when bound, or submit a goal to the visible conversation.
 
@@ -1112,7 +2651,26 @@ class ManagedAgents:
             self._save(record)
             return self._goal_result(record, goal_command)
 
-    def stop(self, name: str, *, expected_token: str | None = None) -> dict[str, object]:
+    def stop(
+        self, name: str, *, expected_token: str | None = None,
+        recover_legacy_adoption: bool = False,
+        expected_record_sha256: str | None = None,
+    ) -> dict[str, object]:
+        """Retire one exact registered generation or recover an adopted runtime."""
+        return self._stop(
+            name,
+            expected_token=expected_token,
+            recover_legacy_adoption=recover_legacy_adoption,
+            expected_record_sha256=expected_record_sha256,
+            expected_token_explicit=expected_token is not None,
+        )
+
+    def _stop(
+        self, name: str, *, expected_token: str | None,
+        recover_legacy_adoption: bool,
+        expected_record_sha256: str | None,
+        expected_token_explicit: bool,
+    ) -> dict[str, object]:
         """Close only the owned single-pane tab and archive the complete record/queue.
 
         A confirmed missing pane permits archival. A probe failure, changed agent
@@ -1120,6 +2678,20 @@ class ManagedAgents:
         """
         with self._lock(name):
             record = self._load_expected(name, expected_token)
+            confirmed_record = self._load_expected(name, record.token)
+            if confirmed_record.to_document() != record.to_document():
+                raise AgentDeliveryError(f"agent {name!r} record changed before stop")
+            record = confirmed_record
+            if recover_legacy_adoption:
+                return self._recover_legacy_adoption(
+                    record, expected_token=expected_token,
+                    expected_record_sha256=expected_record_sha256,
+                    expected_token_explicit=expected_token_explicit,
+                )
+            if expected_record_sha256 is not None:
+                raise AgentDeliveryError(
+                    "--expected-record-sha256 requires --recover-legacy-adoption"
+                )
             if record.adapter == "herdr-foreign":
                 # This registry owns only delivery state.  Revalidate and retain
                 # one final snapshot, but never close, rename, signal, or
@@ -1187,17 +2759,9 @@ class ManagedAgents:
                     return "live", self._checked(record), presentation
 
                 state, info, presentation = inspect_foreign()
-                try:
-                    output = self.client.read(info.pane_id, source="recent-unwrapped", lines=5000)
-                    if not output:
-                        output = self.client.read(info.pane_id, source="recent", lines=5000)
-                    agent._atomic_json(str(self._directory(name) / "output.json"),
-                                       {"text": output, "captured_at": time.time(),
-                                        "pane_id": record.pane_id})
-                except HerdrRunError as exc:
-                    raise AgentDeliveryError(
-                        f"cannot preserve terminal output before unregistering: {exc}"
-                    ) from exc
+                output = self._bounded_terminal_text(
+                    info.pane_id, operation="unregistering"
+                )
                 try:
                     final_state, final_info, final_presentation = inspect_foreign()
                 except (AgentDeliveryError, HerdrRunError) as exc:
@@ -1230,12 +2794,44 @@ class ManagedAgents:
                         f"refusing to unregister adopted agent {name!r}: "
                         "runtime identity changed during output capture"
                     )
+                archive, destination = self._archive_destination(record)
+                agent._atomic_json(str(self._directory(name) / "output.json"),
+                                   {"text": output, "captured_at": time.time(),
+                                    "pane_id": record.pane_id})
+                try:
+                    persisted_state, persisted_info, persisted_presentation = inspect_foreign()
+                except (AgentDeliveryError, HerdrRunError) as exc:
+                    raise AgentDeliveryError(
+                        f"refusing to unregister adopted agent {name!r}: "
+                        "runtime identity could not be reverified before archival"
+                    ) from exc
+                if (
+                    persisted_state,
+                    persisted_info.pane_id,
+                    persisted_info.workspace_id,
+                    os.path.realpath(persisted_info.cwd),
+                    persisted_info.agent,
+                    persisted_info.session_agent,
+                    persisted_info.session_value,
+                    persisted_presentation.tab_id,
+                    persisted_presentation.workspace_id,
+                ) != (
+                    state,
+                    info.pane_id,
+                    info.workspace_id,
+                    os.path.realpath(info.cwd),
+                    info.agent,
+                    info.session_agent,
+                    info.session_value,
+                    presentation.tab_id,
+                    presentation.workspace_id,
+                ):
+                    raise AgentDeliveryError(
+                        f"refusing to unregister adopted agent {name!r}: "
+                        "runtime identity changed before archival"
+                    )
                 record.lifecycle = "stopped"
                 self._save(record)
-                archive = self.registry / "archive"
-                archive.mkdir(mode=0o700, exist_ok=True)
-                agent._validate_private_directory(str(archive), "agent archive")
-                destination = archive / f"{name}-{record.token}"
                 os.rename(self._directory(name), destination)
                 agent._fsync_dir(str(archive))
                 agent._fsync_dir(str(self.registry))
@@ -1243,6 +2839,20 @@ class ManagedAgents:
                         "pane_closed": False, "tab_closed": False,
                         "runtime_preserved": True}
             panes = self.client.panes()
+            if (record.adapter == "herdr" and record.lifecycle in ("running", "stopping")
+                    and record.pane_id is not None):
+                recorded = [pane for pane in panes if pane.pane_id == record.pane_id]
+                if len(recorded) == 1:
+                    observed = self.client.pane_info(record.pane_id)
+                    if observed.agent is None:
+                        if record.lifecycle != "running":
+                            raise AgentDeliveryError(
+                                "managed-dead retirement requires a running herdr record"
+                            )
+                        return self._retire_managed_dead(
+                            record, expected_token=expected_token,
+                            expected_token_explicit=expected_token_explicit,
+                        )
             tab_closed: bool | None = False
             owned = [pane for pane in panes if pane.tab_id == record.tab_id]
             if record.pane_id is None and record.lifecycle == "launch_failed" and len(owned) == 1:
@@ -1258,6 +2868,8 @@ class ManagedAgents:
             if owned:
                 if len(owned) != 1 or owned[0].pane_id != record.pane_id or owned[0].workspace_id != record.workspace_id:
                     raise AgentDeliveryError("refusing to close a tab whose pane ownership changed")
+            archive, destination = self._archive_destination(record)
+            if owned:
                 if (record.adapter == "herdr-pane" or record.lifecycle == "running"
                         or self.client.pane_info(owned[0].pane_id).agent is not None):
                     self._checked_or_failed_pane_report(record, owned[0].pane_id)
@@ -1284,10 +2896,6 @@ class ManagedAgents:
                     tab_closed = None
             record.lifecycle = "stopped"
             self._save(record)
-            archive = self.registry / "archive"
-            archive.mkdir(mode=0o700, exist_ok=True)
-            agent._validate_private_directory(str(archive), "agent archive")
-            destination = archive / f"{name}-{record.token}"
             os.rename(self._directory(name), destination)
             agent._fsync_dir(str(archive))
             agent._fsync_dir(str(self.registry))

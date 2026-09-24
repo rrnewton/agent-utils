@@ -411,6 +411,12 @@ harness, working directory, native session (when reported), and original shell
 generation remain independently pinned. Any other missing or changed identity
 refuses and leaves the registration in place.
 
+The supported-shell role is selected from the kernel-reported executable
+basename (`bash`, `zsh`, `sh`, `dash`, `fish`, or `ksh`) and then pinned by
+boot/process/image identity. It is not a package-signature or trusted-binary
+attestation; another executable installed under one of those basenames is
+outside this same-user cleanup boundary.
+
 `send` accepts literal text or `--file`. In interactive mode, the instruction is
 persisted before submission. The manager waits for native readiness, records an
 in-flight barrier, and asks Herdr to submit the text with paste plus Enter. It
@@ -511,6 +517,39 @@ session, and original shell identity must still match the record. An adopted
 record without the shell's boot ID, PID, start ticks, and executable
 device/inode cannot be retired automatically, whether the agent looks live or
 absent.
+
+A narrowly scoped recovery command exists only for an identity-less
+`herdr-foreign` record whose raw JSON omits `foreign_shell_identity`. Run
+`agentctl stop --help` for the exact required recovery selector, token, and raw
+record-digest options.
+
+```sh
+sha256sum .agentctl/NAME/agent.json
+```
+
+All three options are required together. Under the name and pane locks, the
+manager re-reads the exact record bytes, requires the token and digest twice,
+and requires one exact recorded pane/tab/workspace/cwd with no agent or native
+session. The pane must contain a supported idle shell with no descendants, and
+its boot ID, PID, start ticks, executable device/inode, and executable path must
+remain identical around bounded output capture. It then atomically moves the
+record, queue, and snapshot into the archive. It never signals, closes, moves,
+renames, or reports the foreign pane. An explicit `null` identity field is not
+the missing-key shape and is refused.
+
+If a managed `herdr` agent has exited and its exact owned pane has returned to
+an idle shell, normal stop requires an explicit generation assertion:
+
+```sh
+agentctl stop NAME --expected-token TOKEN
+```
+
+This path requires the exact one-pane tab, workspace, canonical cwd, absent
+agent/session, descendant-free supported shell, and unchanged shell generation
+around capture. It closes only the recorded pane. A moved pane, sibling pane,
+replacement process, capture failure, or changed registry generation refuses
+before close or archive.
+
 An unavailable terminal server is not proof that an agent died. A lost terminal
 view is not proof that a headless runner stopped. Preserve the registry and
 inspect `status` when ownership checks refuse an operation.

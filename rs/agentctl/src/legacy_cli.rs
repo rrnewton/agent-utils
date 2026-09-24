@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::agent::{self, AgentError, DrainOptions, QueueOutcome, Target};
 use crate::client::HerdrClient;
 use crate::error::AdapterError;
-use crate::subagents::{ManagedAgents, StartOptions};
+use crate::subagents::{ManagedAgents, StartOptions, StopOptions};
 
 const COMMANDS: [&str; 11] = [
     "start",
@@ -57,6 +57,9 @@ struct Args {
     brief: Option<String>,
     startup_timeout: f64,
     goal_command_json: Option<String>,
+    expected_token: Option<String>,
+    recover_legacy_adoption: bool,
+    expected_record_sha256: Option<String>,
 }
 
 impl Default for Args {
@@ -87,6 +90,9 @@ impl Default for Args {
             brief: None,
             startup_timeout: 30.0,
             goal_command_json: None,
+            expected_token: None,
+            recover_legacy_adoption: false,
+            expected_record_sha256: None,
         }
     }
 }
@@ -254,6 +260,15 @@ fn run(args: Args) -> Result<i32, CliError> {
 
 fn run_managed(args: Args) -> Result<i32, CliError> {
     let command = args.positional[0].as_str();
+    if command != "stop"
+        && (args.expected_token.is_some()
+            || args.recover_legacy_adoption
+            || args.expected_record_sha256.is_some())
+    {
+        return Err(CliError::Usage(
+            "legacy recovery options are valid only with stop".to_owned(),
+        ));
+    }
     let positional = args.positional.get(1);
     let mut name = args.name.as_deref();
     if matches!(command, "start" | "stop") {
@@ -276,6 +291,20 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
         || args.expected_workspace.is_some()
     {
         return Err(CliError::Usage("managed commands use registry identity; do not combine --name with pane/session assertions".to_owned()));
+    }
+    if command == "stop"
+        && args.recover_legacy_adoption
+        && (args.expected_token.is_none() || args.expected_record_sha256.is_none())
+    {
+        return Err(CliError::Usage(
+            "--recover-legacy-adoption requires --expected-token and --expected-record-sha256"
+                .to_owned(),
+        ));
+    }
+    if command == "stop" && !args.recover_legacy_adoption && args.expected_record_sha256.is_some() {
+        return Err(CliError::Usage(
+            "--expected-record-sha256 requires --recover-legacy-adoption".to_owned(),
+        ));
     }
     let goal_command = args
         .goal_command_json
@@ -333,7 +362,14 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
             };
             write_json(&manager.start(name, cwd, options)?)?;
         }
-        "stop" => write_json(&manager.stop(name)?)?,
+        "stop" => write_json(&manager.stop_with_options(
+            name,
+            StopOptions {
+                expected_token: args.expected_token.clone(),
+                recover_legacy_adoption: args.recover_legacy_adoption,
+                expected_record_sha256: args.expected_record_sha256.clone(),
+            },
+        )?)?,
         "list" => {
             if positional.is_some() || args.name.is_some() {
                 return Err(CliError::Usage(
@@ -509,6 +545,7 @@ where
                     return Ok(ParseResult::Exit(0));
                 }
                 "--userguide" => args.userguide = true,
+                "--recover-legacy-adoption" => args.recover_legacy_adoption = true,
                 option if value_option(option).is_some() => {
                     let value = raw
                         .get(index + 1)
@@ -566,6 +603,8 @@ fn value_option(option: &str) -> Option<()> {
             | "--brief"
             | "--startup-timeout"
             | "--goal-command-json"
+            | "--expected-token"
+            | "--expected-record-sha256"
     )
     .then_some(())
 }
@@ -600,6 +639,8 @@ fn assign(args: &mut Args, option: &str, value: String) -> Result<(), String> {
         "--brief" => args.brief = Some(value),
         "--startup-timeout" => args.startup_timeout = parse_float(option, &value)?,
         "--goal-command-json" => args.goal_command_json = Some(value),
+        "--expected-token" => args.expected_token = Some(value),
+        "--expected-record-sha256" => args.expected_record_sha256 = Some(value),
         _ => return Err(format!("unsupported option {option}")),
     }
     Ok(())
@@ -703,7 +744,7 @@ fn usage_line() -> &'static str {
 
 fn print_help() {
     println!(
-        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN\n  --name NAME\n  --registry REGISTRY\n  --workspace-id WORKSPACE_ID\n  --harness HARNESS\n  --model MODEL\n  --resume SESSION\n  --harness-arg ARGUMENT\n  --brief TEXT\n  --startup-timeout SECONDS\n  --goal-command-json ARGV_JSON",
+        "usage: {}\n\nQueue, submit, inspect, and read interactive agents hosted in Herdr panes.\n\npositional arguments:\n  {{start,stop,list,wait,goal,bind-session,send,drain,status,read,userguide}}\n  text\n\noptions:\n  -h, --help\n  --version\n  --userguide\n  --file FILE\n  --pane PANE\n  --session-agent SESSION_AGENT\n  --session SESSION\n  --agent AGENT\n  --workspace WORKSPACE\n  --cwd CWD\n  --queue QUEUE\n  --ready-timeout READY_TIMEOUT\n  --working-timeout WORKING_TIMEOUT\n  --max-attempts MAX_ATTEMPTS\n  --lines LINES\n  --herdr-bin HERDR_BIN\n  --name NAME\n  --registry REGISTRY\n  --workspace-id WORKSPACE_ID\n  --harness HARNESS\n  --model MODEL\n  --resume SESSION\n  --harness-arg ARGUMENT\n  --brief TEXT\n  --startup-timeout SECONDS\n  --goal-command-json ARGV_JSON\n  --expected-token TOKEN\n  --recover-legacy-adoption\n  --expected-record-sha256 SHA256",
         usage_line()
     );
 }
@@ -732,6 +773,25 @@ mod tests {
         assert_eq!(args.pane.as_deref(), Some("p1"));
         assert_eq!(args.ready_timeout, 0.0);
         assert!(validate(&args).is_ok());
+
+        let ParseResult::Args(stop) = parse(strings(&[
+            "stop",
+            "legacy",
+            "--recover-legacy-adoption",
+            "--expected-token",
+            "generation-1",
+            "--expected-record-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ]))
+        .unwrap() else {
+            panic!("unexpected early exit");
+        };
+        assert!(stop.recover_legacy_adoption);
+        assert_eq!(stop.expected_token.as_deref(), Some("generation-1"));
+        assert_eq!(
+            stop.expected_record_sha256.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
 
         let mut invalid = args;
         invalid.working_timeout = f64::NAN;

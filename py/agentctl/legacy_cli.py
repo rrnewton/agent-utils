@@ -76,6 +76,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--brief", help="initial task after successful launch")
     parser.add_argument("--startup-timeout", type=_ascii_float, default=30.0)
     parser.add_argument("--goal-command-json", help="native Codex goal RPC argv as a JSON string array")
+    parser.add_argument("--expected-token", help="exact current registry generation for stop")
+    parser.add_argument("--recover-legacy-adoption", action="store_true",
+        help="recover an identity-less dead adopted row without mutating its pane")
+    parser.add_argument("--expected-record-sha256",
+        help="exact lowercase SHA-256 of legacy agent.json")
     parser.add_argument("--ready-timeout", type=_ascii_float, default=900.0)
     parser.add_argument("--working-timeout", type=_ascii_float, default=30.0)
     parser.add_argument("--max-attempts", type=_bounded_uint, default=3)
@@ -92,6 +97,11 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
     }
     name = args.name
     command = args.command
+    if command != "stop" and (
+        args.expected_token is not None or args.recover_legacy_adoption
+        or args.expected_record_sha256 is not None
+    ):
+        raise ValueError("legacy recovery options are valid only with stop")
     goal_command: list[str] | None = None
     if args.goal_command_json is not None:
         decoded: object = json.loads(args.goal_command_json)
@@ -123,7 +133,23 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
             working_timeout=args.working_timeout, max_attempts=args.max_attempts,
         )
     elif command == "stop":
-        result = manager.stop(name)
+        if args.recover_legacy_adoption and (
+            args.expected_token is None or args.expected_record_sha256 is None
+        ):
+            raise ValueError(
+                "--recover-legacy-adoption requires --expected-token and "
+                "--expected-record-sha256"
+            )
+        if (not args.recover_legacy_adoption
+                and args.expected_record_sha256 is not None):
+            raise ValueError(
+                "--expected-record-sha256 requires --recover-legacy-adoption"
+            )
+        result = manager.stop(
+            name, expected_token=args.expected_token,
+            recover_legacy_adoption=args.recover_legacy_adoption,
+            expected_record_sha256=args.expected_record_sha256,
+        )
     elif command == "list":
         if args.text or args.name:
             raise ValueError("list does not accept an agent name")

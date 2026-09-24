@@ -74,7 +74,17 @@ while keeping their terminals available for direct inspection.
    exact generation. Unregistration requires that same shell generation before
    and after the final snapshot whether the foreign agent is live or has
    exited; the exited path additionally requires the recorded idle shell.
-   Records without that process identity refuse automatic retirement.
+   Records without that process identity refuse normal retirement. A dead,
+   identity-less adoption has one explicit recovery path, requiring the exact
+   current registry generation and raw record digest. Run
+   `agentctl stop --help` for its required recovery selector, token, and digest
+   options.
+
+   That path requires the exact recorded one-pane tab, an absent agent/session,
+   and the same supported descendant-free idle shell before and after capture;
+   it archives control state without touching the foreign runtime. An owned
+   managed agent that has returned to its shell likewise requires
+   `--expected-token TOKEN` before `stop` can close its exact pane.
    Exiting the CLI or closing its caller does not stop the worker.
 
 State defaults to `.agentctl` in the current directory. Use the same
