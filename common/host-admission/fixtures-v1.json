@@ -1,0 +1,222 @@
+{
+  "schema": "host-admission-fixtures/v1",
+  "cases": [
+    {
+      "name": "grant-at-memory-and-token-boundary",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 700, "swap_total_bytes": 1000, "swap_free_bytes": 500, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {"build": 2}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-boundary", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 700, "named_tokens": {"build": 2}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    },
+    {
+      "name": "grant-with-overflow-safe-derived-boundaries",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 4611686018427387904, "mem_available_bytes": 4611686018427387904, "swap_total_bytes": 4611686018427387904, "swap_free_bytes": 4611686018427387904, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": null, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "floor", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-overflow-boundary", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    },
+    {
+      "name": "refuse-memory-over-budget",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 1000, "swap_free_bytes": 1000, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-too-large", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 701, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "refuse", "code": "request_exceeds_memory_budget"}
+    },
+    {
+      "name": "queue-aggregate-memory",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 1000, "swap_free_bytes": 1000, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-second", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 400, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [{"lease_id": "lease-first", "request": {"request_id": "lease-first", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 400, "named_tokens": {}, "priority": 0, "metadata_digest": "none"}}],
+      "queue": [], "owner_states": {"lease-first": "alive"},
+      "expect": {"verdict": "queue", "code": "aggregate_memory_busy"}
+    },
+    {
+      "name": "unknown-missing-required-memory",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": null, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": null, "memory_psi_full_avg10_micros": null, "errors": ["mem_available_malformed", "memory_psi_some_unreadable", "memory_psi_full_unreadable"]},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-missing", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "unknown", "code": "required_observation_unknown"}
+    },
+    {
+      "name": "unknown-stale-snapshot",
+      "now_unix_ms": 1200,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-stale", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "unknown", "code": "required_observation_unknown"}
+    },
+    {
+      "name": "queue-below-fifteen-percent-swap-floor",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 10000, "mem_available_bytes": 10000, "swap_total_bytes": 1000, "swap_free_bytes": 149, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 9000, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "floor", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 100, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-swap-low", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "queue", "code": "swap_floor_not_met"}
+    },
+    {
+      "name": "grant-at-swap-floor-equality",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 10000, "mem_available_bytes": 10000, "swap_total_bytes": 1000, "swap_free_bytes": 150, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 9000, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "floor", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 100, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-swap-equal", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    },
+    {
+      "name": "queue-largest-leaf-swap-floor",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 10000, "mem_available_bytes": 10000, "swap_total_bytes": 1000, "swap_free_bytes": 199, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 9000, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "floor", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 200, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-leaf-swap", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "queue", "code": "swap_floor_not_met"}
+    },
+    {
+      "name": "grant-explicit-no-swap-with-extra-reserve",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 700, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 100, "token_capacities": {}, "swap_mode": "no_swap", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 100, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-no-swap", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 500, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    },
+    {
+      "name": "refuse-no-swap-policy-on-swap-host",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 1, "swap_free_bytes": 1, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "no_swap", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 100, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-no-swap-wrong", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "refuse", "code": "no_swap_policy_host_has_swap"}
+    },
+    {
+      "name": "grant-with-psi-telemetry-missing-when-disabled",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": null, "swap_free_bytes": null, "memory_psi_some_avg10_micros": null, "memory_psi_full_avg10_micros": null, "errors": ["swap_total_missing", "swap_free_missing", "memory_psi_unreadable"]},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-telemetry", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    },
+    {
+      "name": "unknown-psi-required-but-missing",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": null, "memory_psi_full_avg10_micros": 0, "errors": ["memory_psi_some_unreadable"]},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": 1000, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-psi-missing", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "unknown", "code": "required_observation_unknown"}
+    },
+    {
+      "name": "queue-fifo-within-priority",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-later", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "none"},
+      "leases": [], "queue": [{"sequence": 1, "request": {"request_id": "req-first", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "none"}}, {"sequence": 2, "request": {"request_id": "req-later", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "none"}}], "owner_states": {"req-first": "alive"},
+      "expect": {"verdict": "queue", "code": "queued_behind_prior_request"}
+    },
+    {
+      "name": "higher-priority-may-pass-earlier-lower-priority",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-priority", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 10, "metadata_digest": "none"},
+      "leases": [], "queue": [{"sequence": 1, "request": {"request_id": "req-low", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"}}, {"sequence": 2, "request": {"request_id": "req-priority", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 10, "metadata_digest": "none"}}], "owner_states": {"req-low": "alive"},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    },
+    {
+      "name": "grant-after-dead-earlier-ticket",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-after-dead", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "none"},
+      "leases": [], "queue": [{"sequence": 1, "request": {"request_id": "dead-ticket", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-old", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "none"}}, {"sequence": 2, "request": {"request_id": "req-after-dead", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "none"}}], "owner_states": {"dead-ticket": "absent"},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    },
+    {
+      "name": "unknown-earlier-ticket-fails-closed",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-after-unknown", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "none"},
+      "leases": [], "queue": [{"sequence": 1, "request": {"request_id": "unknown-ticket", "caller": "fixture", "owner": {"host_id": "other-host", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "none"}}, {"sequence": 2, "request": {"request_id": "req-after-unknown", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "none"}}], "owner_states": {"unknown-ticket": "unknown"},
+      "expect": {"verdict": "unknown", "code": "required_observation_unknown"}
+    },
+    {
+      "name": "unknown-same-request-id-conflict",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "same-id", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 5, "metadata_digest": "new"},
+      "leases": [], "queue": [{"sequence": 1, "request": {"request_id": "same-id", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 2, "named_tokens": {}, "priority": 5, "metadata_digest": "old"}}], "owner_states": {},
+      "expect": {"verdict": "unknown", "code": "request_id_conflict"}
+    },
+    {
+      "name": "queue-memory-and-token-request-atomically",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {"build": 1}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-token", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 100, "named_tokens": {"build": 1}, "priority": 0, "metadata_digest": "none"},
+      "leases": [{"lease_id": "lease-token", "request": {"request_id": "lease-token", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 100, "named_tokens": {"build": 1}, "priority": 0, "metadata_digest": "none"}}], "queue": [], "owner_states": {"lease-token": "alive"},
+      "expect": {"verdict": "queue", "code": "named_tokens_busy"}
+    },
+    {
+      "name": "refuse-token-over-capacity",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {"build": 1}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-token-large", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {"build": 2}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "refuse", "code": "request_exceeds_token_capacity"}
+    },
+    {
+      "name": "unknown-owner-retains-capacity",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-owner-unknown", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [{"lease_id": "lease-unknown", "request": {"request_id": "lease-unknown", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {}, "priority": 0, "metadata_digest": "none"}}], "queue": [], "owner_states": {"lease-unknown": "unknown"},
+      "expect": {"verdict": "unknown", "code": "required_observation_unknown"}
+    },
+    {
+      "name": "grant-after-boot-change-proves-old-owner-absent",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-new", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-new-boot", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-new", "pid": 11, "start_ticks": 101}, "memory_bytes": 700, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [{"lease_id": "lease-old-boot", "request": {"request_id": "lease-old-boot", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-old", "pid": 10, "start_ticks": 100}, "memory_bytes": 700, "named_tokens": {}, "priority": 0, "metadata_digest": "none"}}], "queue": [], "owner_states": {"lease-old-boot": "absent"},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    },
+    {
+      "name": "grant-after-pid-reuse-proves-old-owner-absent",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-pid-reuse", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 11, "start_ticks": 101}, "memory_bytes": 700, "named_tokens": {}, "priority": 0, "metadata_digest": "none"},
+      "leases": [{"lease_id": "lease-old-pid", "request": {"request_id": "lease-old-pid", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 99}, "memory_bytes": 700, "named_tokens": {}, "priority": 0, "metadata_digest": "none"}}], "queue": [], "owner_states": {"lease-old-pid": "absent"},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    },
+    {
+      "name": "grant-at-u32-token-boundary",
+      "now_unix_ms": 1010,
+      "snapshot": {"captured_at_unix_ms": 1000, "host_id": "host-a", "boot_id": "boot-a", "mem_total_bytes": 1000, "mem_available_bytes": 1000, "swap_total_bytes": 0, "swap_free_bytes": 0, "memory_psi_some_avg10_micros": 0, "memory_psi_full_avg10_micros": 0, "errors": []},
+      "policy": {"memory_budget_bytes": 700, "memory_reserve_bytes": 0, "token_capacities": {"boundary": 4294967295}, "swap_mode": "disabled", "swap_floor_fraction_ppm": 150000, "largest_leaf_swap_bytes": 0, "no_swap_extra_memory_reserve_bytes": 0, "psi_some_max_micros": null, "psi_full_max_micros": null, "max_snapshot_age_ms": 100},
+      "request": {"request_id": "req-u32-token", "caller": "fixture", "owner": {"host_id": "host-a", "boot_id": "boot-a", "pid": 10, "start_ticks": 100}, "memory_bytes": 1, "named_tokens": {"boundary": 4294967295}, "priority": 0, "metadata_digest": "none"},
+      "leases": [], "queue": [], "owner_states": {},
+      "expect": {"verdict": "grant", "code": "resources_available"}
+    }
+  ]
+}

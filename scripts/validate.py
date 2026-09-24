@@ -173,6 +173,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("py/tests/js/", frozenset({TIMELINE_BROWSER, WORKSPACE, CROSS, PACKAGES})),
     ("py/", frozenset({WORKSPACE, CROSS, PACKAGES})),
     ("cross/", frozenset({CROSS})),
+    ("common/host-admission/", frozenset({WORKSPACE, CROSS, PACKAGES})),
     ("common/docs/", frozenset({DOCS, PACKAGES})),
     ("skills/agentctl/", frozenset({DOCS, PACKAGES})),
     ("examples/", frozenset({CROSS})),

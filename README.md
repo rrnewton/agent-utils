@@ -13,6 +13,7 @@ schema, CLI, output, error, and state-transition drift.
 
 | Command | Purpose | Python distribution | Rust crate |
 |---|---|---|---|
+| Library only | Atomically admit shared-host memory and named-token requests without importing caller policy. | `host-admission` | `host-admission` |
 | `dagrun` | Plan, visualize, and execute resource-aware CI DAGs with Linux cgroup containment and profiling. | `dagrun` | `dagrun` |
 | `cpuset-alloc` | Reserve disjoint CPU sets and hard-pin benchmark process trees. | Companion command in `dagrun` | Companion binary in `dagrun` |
 | `tick-hub` | Evaluate independently cadenced reminders and freshness checks in one deterministic tick. | `tick-hub` | `tick-hub` |

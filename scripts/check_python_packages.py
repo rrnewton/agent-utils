@@ -59,12 +59,22 @@ class Project:
 
 PROJECTS: tuple[Project, ...] = (
     Project(
+        directory="host_admission",
+        distribution="host-admission",
+        package="host_admission",
+        commands=(),
+        resources=("README.md", "USER_GUIDE.md", "py.typed"),
+        required_dependencies=(),
+        package_owned_docs=True,
+    ),
+    Project(
         directory="dagrun",
         distribution="dagrun",
         package="dagrun",
         commands=("dagrun", "cpuset-alloc"),
         resources=("README.md", "USER_GUIDE.md", "py.typed"),
-        required_dependencies=("pyyaml",),
+        required_dependencies=("pyyaml", "host-admission"),
+        sibling_package_exemptions=("host-admission",),
     ),
     Project(
         directory="tick_hub",
@@ -635,8 +645,10 @@ def _entry_points(archive: _WheelArchive, dist_info: str) -> dict[str, str]:
     path = f"{dist_info}entry_points.txt"
     try:
         text = archive.read(path).decode("utf-8")
-    except KeyError as exc:
-        raise CheckError("wheel is missing entry_points.txt") from exc
+    except KeyError:
+        # A library-only distribution correctly has no entry-point metadata. Command-owning
+        # projects are still refused below when this empty result differs from their manifest.
+        return {}
     parser = configparser.ConfigParser(interpolation=None)
     parser.read_string(text)
     return dict(parser.items("console_scripts")) if parser.has_section("console_scripts") else {}

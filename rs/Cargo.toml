@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "host-admission",
     "dagrun",
     "tick-hub",
     "pr-landing-planner",

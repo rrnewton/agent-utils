@@ -25,6 +25,7 @@ pub mod cgroup;
 pub mod cli;
 pub mod cpuset_allocator;
 pub mod estimates;
+pub mod host_admission_adapter;
 pub mod io;
 pub mod memory_feedback;
 pub mod model;

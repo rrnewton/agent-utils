@@ -223,6 +223,7 @@ dependencies = [
 name = "dagrun"
 version = "0.15.0"
 dependencies = [
+ "host-admission",
  "libc",
  "serde",
  "serde_json",
@@ -348,6 +349,16 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "sha2",
+]
+
+[[package]]
+name = "host-admission"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

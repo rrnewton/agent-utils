@@ -6,6 +6,7 @@ own version and documentation, and only the console commands that belong to it.
 
 | Distribution | Import package | Commands | Purpose |
 | --- | --- | --- | --- |
+| `host-admission` | `host_admission` | Library only | Atomically admit shared-host memory and named-token requests. |
 | `dagrun` | `dagrun` | `dagrun`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; the companion allocator reserves isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick_hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr_landing_planner` | `pr-landing-planner` | Produce an advisory, conflict-aware pull-request landing plan. |
@@ -19,6 +20,7 @@ Install a tool from its project directory during development:
 
 ```sh
 python3 -m pip install ./py/dagrun
+python3 -m pip install ./py/host_admission
 python3 -m pip install ./py/tick_hub
 python3 -m pip install ./py/pr_landing_planner
 python3 -m pip install ./py/wrkviz

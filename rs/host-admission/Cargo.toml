@@ -1,0 +1,23 @@
+[package]
+name = "host-admission"
+version = "0.1.0"
+description = "A fail-closed shared-host resource admission ledger"
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+name = "host_admission"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

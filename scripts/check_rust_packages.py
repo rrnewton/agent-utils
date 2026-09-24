@@ -34,6 +34,7 @@ class Crate:
 
 
 CRATES: tuple[Crate, ...] = (
+    Crate("host-admission", (), "host_admission", ()),
     Crate("chat-subscription", (), "chat_subscription", ()),
     Crate("chat-subscription-plugin", (), "chat_subscription_plugin", ()),
     Crate(
@@ -69,6 +70,7 @@ CRATES: tuple[Crate, ...] = (
 LOCAL_PACKAGE_PATCHES: dict[str, tuple[str, ...]] = {
     "chat-subscription-plugin": ("chat-subscription",),
     "agentctl": ("chat-subscription", "chat-subscription-plugin"),
+    "dagrun": ("host-admission",),
 }
 
 _FOREIGN_DOC_TERMS = re.compile(

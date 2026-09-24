@@ -12,6 +12,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+host-admission = { version = "0.1.0", path = "../host-admission" }
 # JSON parsing only (no `#[derive(Deserialize)]`): the strict reader in io.rs applies the format's
 # exact type narrowing by hand, and serialization is hand-rolled to preserve the public wire
 # contract byte-for-byte (key order, 2-space indent, and float formatting), which a derive plus
