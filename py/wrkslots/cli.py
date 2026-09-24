@@ -15650,24 +15650,29 @@ def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
 
 
 def _open_audit_cache_state_parent(config: Config, path: Path) -> int:
-    try:
-        resolved = path.parent.resolve(strict=True)
-    except OSError as exc:
-        raise Refusal(f"audit cache census state parent is unavailable: {exc}") from exc
-    if resolved != path.parent or _path_is_within(resolved, config.root):
-        raise Refusal(
-            "audit cache census state parent changed, crosses a symlink, or entered "
-            "the managed project tree"
-        )
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(Path("/"), flags)
     try:
-        fd = os.open(path.parent, flags)
+        for component in path.parent.parts[1:]:
+            child_fd = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child_fd
     except OSError as exc:
+        os.close(fd)
         raise Refusal(f"cannot bind audit cache census state parent: {exc}") from exc
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISDIR(metadata.st_mode):
             raise Refusal("audit cache census state parent is not a directory")
+        raw_actual = os.readlink(f"/proc/self/fd/{fd}")
+        if raw_actual.endswith(" (deleted)"):
+            raise Refusal("audit cache census state parent was renamed while binding")
+        actual = Path(raw_actual)
+        if actual != path.parent or _path_is_within(actual, config.root):
+            raise Refusal(
+                "audit cache census state parent changed, crosses a symlink, or "
+                "entered the managed project tree"
+            )
     except BaseException:
         os.close(fd)
         raise
@@ -16469,7 +16474,7 @@ def _resume_audit_cache_root(
     return consumed, False
 
 
-def _audit_cache_census(
+def _audit_cache_census_bound(
     config: Config,
     states: Sequence[ActiveState],
     planned: Mapping[str, Sequence[CacheDirectory]],
@@ -16478,33 +16483,10 @@ def _audit_cache_census(
     state_path: Path,
     work_limit: int,
     wall_seconds: float,
+    parent_fd: int,
+    state_key: bytes,
 ) -> tuple[dict[str, _AuditCacheMeasurement], dict[str, int]]:
     registry_revision = _audit_registry_revision(states)
-    parent_fd: int | None = None
-    try:
-        parent_fd = _open_audit_cache_state_parent(config, state_path)
-        state_key = _audit_cache_state_key(state_path, parent_fd)
-    except (OSError, Refusal) as exc:
-        if parent_fd is not None:
-            os.close(parent_fd)
-        detail = f"cannot establish authenticated audit cache census state: {exc}"
-        return {
-            subject: _AuditCacheMeasurement(None, "error", detail)
-            for subject in planned
-        }, {
-            "cache_roots": sum(len(caches) for caches in planned.values()),
-            "directories_visited": 0,
-            "directories_verified": 0,
-            "directories_finalized": 0,
-            "entries_visited": 0,
-            "entries_verified": 0,
-            "entries_finalized": 0,
-            "subjects": len(planned),
-            "work_consumed": 0,
-            "work_limit": work_limit,
-            "work_remaining": work_limit,
-        }
-    assert parent_fd is not None
     stored: dict[str, object] = {
         "schema": _AUDIT_CACHE_CENSUS_SCHEMA,
         "registry_revision": registry_revision,
@@ -16656,8 +16638,6 @@ def _audit_cache_census(
     except OSError as exc:
         state_error = f"cannot persist audit cache census: {exc}"
         errors = {**errors, **{subject: state_error for subject in planned}}
-    finally:
-        os.close(parent_fd)
     results: dict[str, _AuditCacheMeasurement] = {}
     for subject in planned:
         error = errors.get(subject)
@@ -16687,6 +16667,57 @@ def _audit_cache_census(
         "work_limit": work_limit,
         "work_remaining": remaining,
     }
+
+
+def _audit_cache_census(
+    config: Config,
+    states: Sequence[ActiveState],
+    planned: Mapping[str, Sequence[CacheDirectory]],
+    errors: Mapping[str, str],
+    *,
+    state_path: Path,
+    work_limit: int,
+    wall_seconds: float,
+) -> tuple[dict[str, _AuditCacheMeasurement], dict[str, int]]:
+    parent_fd: int | None = None
+    try:
+        parent_fd = _open_audit_cache_state_parent(config, state_path)
+        state_key = _audit_cache_state_key(state_path, parent_fd)
+    except (OSError, Refusal) as exc:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        detail = f"cannot establish authenticated audit cache census state: {exc}"
+        return {
+            subject: _AuditCacheMeasurement(None, "error", detail)
+            for subject in planned
+        }, {
+            "cache_roots": sum(len(caches) for caches in planned.values()),
+            "directories_visited": 0,
+            "directories_verified": 0,
+            "directories_finalized": 0,
+            "entries_visited": 0,
+            "entries_verified": 0,
+            "entries_finalized": 0,
+            "subjects": len(planned),
+            "work_consumed": 0,
+            "work_limit": work_limit,
+            "work_remaining": work_limit,
+        }
+    assert parent_fd is not None
+    try:
+        return _audit_cache_census_bound(
+            config,
+            states,
+            planned,
+            errors,
+            state_path=state_path,
+            work_limit=work_limit,
+            wall_seconds=wall_seconds,
+            parent_fd=parent_fd,
+            state_key=state_key,
+        )
+    finally:
+        os.close(parent_fd)
 
 
 def _clear_open_directory(

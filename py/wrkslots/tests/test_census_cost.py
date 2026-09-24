@@ -9,6 +9,7 @@ never wall time, so they mean the same thing on a loaded box as on an idle one.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import replace
@@ -1023,6 +1024,81 @@ def test_bound_cache_parent_survives_path_swap_without_project_write(
     assert not (config.root / "audit.json.key").exists()
     assert (preserved_parent / "audit.json").is_file()
     assert (preserved_parent / "audit.json.key").is_file()
+
+
+def test_cache_parent_component_swap_refuses_before_project_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    outer = tmp_path / "external"
+    ancestor = outer / "ancestor"
+    state_parent = ancestor / "state"
+    state_parent.mkdir(parents=True)
+    preserved = outer / "ancestor-preserved"
+    original_open = os.open
+    swapped = False
+
+    def swapping_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and path == "ancestor" and dir_fd is not None:
+            ancestor.rename(preserved)
+            ancestor.symlink_to(config.root, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    with pytest.raises(cli.Refusal, match="cannot bind"):
+        cli._open_audit_cache_state_parent(config, state_parent / "audit.json")
+
+    assert swapped is True
+    assert not (config.root / "audit.json").exists()
+    assert not (config.root / "audit.json.key").exists()
+
+
+def test_cache_census_closes_bound_parent_on_prewrite_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+    state_path = tmp_path / "fd-cleanup-state.json"
+    before = len(tuple(Path("/proc/self/fd").iterdir()))
+    monkeypatch.setattr(
+        cli,
+        "_audit_cache_root_identity",
+        lambda _config, _cache: (_ for _ in ()).throw(cli.Refusal("fixture refusal")),
+    )
+
+    with pytest.raises(cli.Refusal, match="fixture refusal"):
+        cli._audit_cache_census(
+            config,
+            (cli.ActiveState("testhost", 22, ()),),
+            {"subject": (directory,)},
+            {},
+            state_path=state_path,
+            work_limit=10,
+            wall_seconds=5,
+        )
+
+    after = len(tuple(Path("/proc/self/fd").iterdir()))
+    assert after == before
 
 
 def test_cache_census_refuses_nonprivate_existing_key(tmp_path: Path) -> None:
