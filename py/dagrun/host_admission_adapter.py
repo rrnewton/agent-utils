@@ -41,9 +41,10 @@ def compare_legacy_memory_decision(
 ) -> ShadowComparison:
     """Compare one current decision without touching either ledger.
 
-    Missing current measurements intentionally grant, while the generic shadow
-    returns ``UNKNOWN``. Reporting that disagreement is the purpose of shadow
-    mode; the adapter still returns the exact existing verdict as authoritative.
+    These inputs do not include a raw timestamped host snapshot. The generic
+    shadow therefore returns ``UNKNOWN`` instead of fabricating physical-memory
+    fields from derived limits; the adapter still returns the exact existing
+    verdict as authoritative.
     """
     if budget_bytes is not None and requested_bytes > budget_bytes:
         legacy = LegacyVerdict.REFUSE
@@ -54,12 +55,14 @@ def compare_legacy_memory_decision(
     else:
         legacy = LegacyVerdict.GRANT
     owner = ProcessOwner("shadow-host", "shadow-boot", 1, 1)
+    # These compatibility inputs are already-derived limits, not raw host
+    # measurements. Do not invent a physical-memory snapshot from them.
     snapshot = HostSnapshot(
         captured_at_unix_ms=1,
         host_id=owner.host_id,
         boot_id=owner.boot_id,
-        mem_total_bytes=budget_bytes,
-        mem_available_bytes=headroom_bytes,
+        mem_total_bytes=None,
+        mem_available_bytes=None,
         swap_total_bytes=None,
         swap_free_bytes=None,
         memory_psi_some_avg10_micros=None,

@@ -9,11 +9,14 @@ use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -323,6 +326,76 @@ impl LedgerData {
     }
 }
 
+fn canonical_owner_value(owner: &ProcessOwner) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("boot_id".to_owned(), Value::String(owner.boot_id.clone()));
+    object.insert("host_id".to_owned(), Value::String(owner.host_id.clone()));
+    object.insert("pid".to_owned(), Value::from(owner.pid));
+    object.insert("start_ticks".to_owned(), Value::from(owner.start_ticks));
+    Value::Object(object)
+}
+
+fn canonical_request_value(request: &ResourceRequest) -> Value {
+    let mut tokens = serde_json::Map::new();
+    for (name, count) in &request.named_tokens {
+        tokens.insert(name.clone(), Value::from(*count));
+    }
+    let mut object = serde_json::Map::new();
+    object.insert("caller".to_owned(), Value::String(request.caller.clone()));
+    object.insert("memory_bytes".to_owned(), Value::from(request.memory_bytes));
+    object.insert(
+        "metadata_digest".to_owned(),
+        Value::String(request.metadata_digest.clone()),
+    );
+    object.insert("named_tokens".to_owned(), Value::Object(tokens));
+    object.insert("owner".to_owned(), canonical_owner_value(&request.owner));
+    object.insert("priority".to_owned(), Value::from(request.priority));
+    object.insert(
+        "request_id".to_owned(),
+        Value::String(request.request_id.clone()),
+    );
+    Value::Object(object)
+}
+
+fn canonical_ledger_value(data: &LedgerData) -> Value {
+    let leases = data
+        .leases
+        .iter()
+        .map(|lease| {
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "granted_at_unix_ms".to_owned(),
+                Value::from(lease.granted_at_unix_ms),
+            );
+            object.insert("lease_id".to_owned(), Value::String(lease.lease_id.clone()));
+            object.insert(
+                "request".to_owned(),
+                canonical_request_value(&lease.request),
+            );
+            Value::Object(object)
+        })
+        .collect();
+    let queue = data
+        .queue
+        .iter()
+        .map(|entry| {
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "request".to_owned(),
+                canonical_request_value(&entry.request),
+            );
+            object.insert("sequence".to_owned(), Value::from(entry.sequence));
+            Value::Object(object)
+        })
+        .collect();
+    let mut object = serde_json::Map::new();
+    object.insert("leases".to_owned(), Value::Array(leases));
+    object.insert("next_sequence".to_owned(), Value::from(data.next_sequence));
+    object.insert("queue".to_owned(), Value::Array(queue));
+    object.insert("schema".to_owned(), Value::String(data.schema.clone()));
+    Value::Object(object)
+}
+
 fn safe_id(value: &str) -> bool {
     let mut chars = value.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
@@ -393,6 +466,14 @@ fn validate_snapshot(snapshot: &HostSnapshot) -> Result<(), AdmissionError> {
             .memory_psi_full_avg10_micros
             .is_some_and(|value| value > 100 * PPM)
         || snapshot.errors.iter().any(|error| !safe_id(error))
+        || matches!(
+            (snapshot.mem_total_bytes, snapshot.mem_available_bytes),
+            (Some(total), Some(available)) if available > total
+        )
+        || matches!(
+            (snapshot.swap_total_bytes, snapshot.swap_free_bytes),
+            (Some(total), Some(free)) if free > total
+        )
     {
         return Err(AdmissionError("invalid host snapshot".to_owned()));
     }
@@ -705,18 +786,12 @@ pub fn decide(
     }
     let ahead: Vec<String> = queue
         .iter()
-        .filter(|(_, queued)| {
+        .filter(|(prior_sequence, queued)| {
             queued.request_id != request.request_id
                 && owner_states.get(&queued.request_id) == Some(&OwnerState::Alive)
                 && (queued.priority > request.priority
                     || queued.priority == request.priority
-                        && sequence.is_none_or(|current| {
-                            queue
-                                .iter()
-                                .find(|(_, candidate)| candidate.request_id == queued.request_id)
-                                .map(|(prior, _)| *prior < current)
-                                .unwrap_or(false)
-                        }))
+                        && sequence.is_none_or(|current| *prior_sequence < current))
         })
         .map(|(_, queued)| queued.request_id.clone())
         .collect();
@@ -1020,7 +1095,7 @@ pub fn sample_host(now_unix_ms: Option<u64>) -> Result<HostSnapshot, AdmissionEr
     };
     errors.extend(psi_errors);
     errors.sort();
-    Ok(HostSnapshot {
+    let snapshot = HostSnapshot {
         captured_at_unix_ms: now,
         host_id: read_identity(Path::new("/etc/machine-id"), "host_id")?,
         boot_id: read_identity(Path::new("/proc/sys/kernel/random/boot_id"), "boot_id")?,
@@ -1031,7 +1106,9 @@ pub fn sample_host(now_unix_ms: Option<u64>) -> Result<HostSnapshot, AdmissionEr
         memory_psi_some_avg10_micros: some,
         memory_psi_full_avg10_micros: full,
         errors,
-    })
+    };
+    validate_snapshot(&snapshot)?;
+    Ok(snapshot)
 }
 
 fn proc_start_ticks(pid: u32) -> Result<Option<u64>, AdmissionError> {
@@ -1068,91 +1145,242 @@ pub fn probe_process_owner(owner: &ProcessOwner, snapshot: &HostSnapshot) -> Own
     }
 }
 
-fn create_temporary_ledger(parent: &Path) -> Result<(PathBuf, File), AdmissionError> {
-    let epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    for attempt in 0..16_u64 {
-        let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".host-admission-{}-{epoch}-{nonce}-{attempt}.tmp",
-            std::process::id()
+fn name_cstring(name: &OsStr) -> Result<CString, AdmissionError> {
+    CString::new(name.as_bytes()).map_err(|_| AdmissionError("path contains NUL".to_owned()))
+}
+
+fn openat_file(
+    directory: &File,
+    name: &OsStr,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> Result<File, io::Error> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode,
+        )
+    };
+    if descriptor < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+fn open_pinned_parent(path: &Path) -> Result<(File, OsString), AdmissionError> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| AdmissionError("admission ledger has no leaf name".to_owned()))?
+        .to_os_string();
+    if name.as_bytes().is_empty() || name.as_bytes().contains(&b'/') {
+        return Err(AdmissionError(
+            "admission ledger has an invalid leaf name".to_owned(),
         ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => {
-                return Err(AdmissionError(
-                    "could not create temporary ledger".to_owned(),
-                ));
+    }
+    let parent = path.parent().filter(|value| !value.as_os_str().is_empty());
+    let absolute = path.is_absolute();
+    let start = if absolute {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(start)
+        .map_err(|_| AdmissionError("could not open admission path root".to_owned()))?;
+    if let Some(parent) = parent {
+        for component in parent.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(part) => {
+                    directory =
+                        openat_file(&directory, part, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+                            .map_err(|_| {
+                                AdmissionError("could not pin admission parent".to_owned())
+                            })?;
+                }
+                Component::ParentDir | Component::Prefix(_) => {
+                    return Err(AdmissionError(
+                        "admission parent contains an unsafe component".to_owned(),
+                    ));
+                }
             }
         }
     }
-    Err(AdmissionError(
-        "could not create unique temporary ledger".to_owned(),
-    ))
+    let metadata = directory
+        .metadata()
+        .map_err(|_| AdmissionError("could not inspect admission parent".to_owned()))?;
+    if !metadata.is_dir() || metadata.uid() != current_uid()? || metadata.mode() & 0o022 != 0 {
+        return Err(AdmissionError(
+            "admission parent is not an owned non-writable directory".to_owned(),
+        ));
+    }
+    Ok((directory, name))
+}
+
+struct LockedLedgerDirectory {
+    directory: File,
+    ledger_name: OsString,
+    lock_name: OsString,
+    lock: File,
+    directory_identity: (u64, u64),
+    lock_identity: (u64, u64),
+}
+
+impl LockedLedgerDirectory {
+    fn open(path: &Path) -> Result<Self, AdmissionError> {
+        let (directory, ledger_name) = open_pinned_parent(path)?;
+        let mut lock_name = ledger_name.clone();
+        lock_name.push(".lock");
+        let lock = openat_file(&directory, &lock_name, libc::O_RDWR | libc::O_CREAT, 0o600)
+            .map_err(|_| AdmissionError("could not open admission lock".to_owned()))?;
+        let directory_metadata = directory
+            .metadata()
+            .map_err(|_| AdmissionError("could not inspect admission parent".to_owned()))?;
+        let lock_metadata = lock
+            .metadata()
+            .map_err(|_| AdmissionError("could not inspect admission lock".to_owned()))?;
+        if !lock_metadata.is_file()
+            || lock_metadata.uid() != current_uid()?
+            || lock_metadata.nlink() != 1
+            || lock_metadata.mode() & 0o077 != 0
+        {
+            return Err(AdmissionError(
+                "admission lock is not an owned single-link private file".to_owned(),
+            ));
+        }
+        lock.lock_exclusive()
+            .map_err(|_| AdmissionError("could not lock admission ledger".to_owned()))?;
+        let pinned = Self {
+            directory,
+            ledger_name,
+            lock_name,
+            lock,
+            directory_identity: (directory_metadata.dev(), directory_metadata.ino()),
+            lock_identity: (lock_metadata.dev(), lock_metadata.ino()),
+        };
+        pinned.verify()?;
+        Ok(pinned)
+    }
+
+    fn verify(&self) -> Result<(), AdmissionError> {
+        let directory = self
+            .directory
+            .metadata()
+            .map_err(|_| AdmissionError("could not reinspect admission parent".to_owned()))?;
+        if self.directory_identity != (directory.dev(), directory.ino())
+            || !directory.is_dir()
+            || directory.uid() != current_uid()?
+            || directory.mode() & 0o022 != 0
+        {
+            return Err(AdmissionError("pinned admission parent changed".to_owned()));
+        }
+        let held = self
+            .lock
+            .metadata()
+            .map_err(|_| AdmissionError("could not reinspect admission lock".to_owned()))?;
+        let named = openat_file(&self.directory, &self.lock_name, libc::O_RDONLY, 0)
+            .map_err(|_| AdmissionError("admission lock name changed".to_owned()))?;
+        let named = named
+            .metadata()
+            .map_err(|_| AdmissionError("could not inspect named admission lock".to_owned()))?;
+        if self.lock_identity != (held.dev(), held.ino())
+            || self.lock_identity != (named.dev(), named.ino())
+            || !held.is_file()
+            || !named.is_file()
+            || held.uid() != current_uid()?
+            || named.uid() != current_uid()?
+            || held.nlink() != 1
+            || named.nlink() != 1
+            || held.mode() & 0o077 != 0
+            || named.mode() & 0o077 != 0
+        {
+            return Err(AdmissionError("admission lock identity changed".to_owned()));
+        }
+        Ok(())
+    }
+
+    fn temporary(&self) -> Result<(OsString, File), AdmissionError> {
+        let epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..128_u64 {
+            let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+            let name = OsString::from(format!(
+                ".host-admission-{}-{epoch}-{nonce}-{attempt}.tmp",
+                std::process::id()
+            ));
+            match openat_file(
+                &self.directory,
+                &name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            ) {
+                Ok(file) => return Ok((name, file)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {
+                    return Err(AdmissionError(
+                        "could not create temporary ledger".to_owned(),
+                    ));
+                }
+            }
+        }
+        Err(AdmissionError(
+            "could not create unique temporary ledger".to_owned(),
+        ))
+    }
+
+    fn rename(&self, source: &OsStr) -> Result<(), AdmissionError> {
+        let source = name_cstring(source)?;
+        let target = name_cstring(&self.ledger_name)?;
+        let result = unsafe {
+            libc::renameat(
+                self.directory.as_raw_fd(),
+                source.as_ptr(),
+                self.directory.as_raw_fd(),
+                target.as_ptr(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(AdmissionError(
+                "could not replace admission ledger".to_owned(),
+            ))
+        }
+    }
+
+    fn unlink(&self, name: &OsStr) {
+        if let Ok(name) = name_cstring(name) {
+            unsafe {
+                libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0);
+            }
+        }
+    }
 }
 
 /// One flock-serialized durable admission ledger.
 #[derive(Clone, Debug)]
 pub struct HostAdmissionLedger {
     path: PathBuf,
-    lock_path: PathBuf,
 }
 
 impl HostAdmissionLedger {
     /// Bind the ledger to one explicit path.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-        Self { path, lock_path }
+        Self { path: path.into() }
     }
 
-    fn lock(&self) -> Result<File, AdmissionError> {
-        let parent = self
-            .lock_path
-            .parent()
-            .ok_or_else(|| AdmissionError("lock has no parent".to_owned()))?;
-        fs::create_dir_all(parent)
-            .map_err(|_| AdmissionError("could not create lock directory".to_owned()))?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&self.lock_path)
-            .map_err(|_| AdmissionError("could not open admission lock".to_owned()))?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| AdmissionError("could not inspect admission lock".to_owned()))?;
-        if !metadata.file_type().is_file()
-            || metadata.uid() != current_uid()?
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o077 != 0
-        {
-            return Err(AdmissionError(
-                "admission lock is not an owned single-link regular file".to_owned(),
-            ));
-        }
-        file.lock_exclusive()
-            .map_err(|_| AdmissionError("could not lock admission ledger".to_owned()))?;
-        Ok(file)
-    }
-
-    fn load(&self) -> Result<LedgerData, AdmissionError> {
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&self.path)
-        {
+    fn load(&self, locked: &LockedLedgerDirectory) -> Result<LedgerData, AdmissionError> {
+        locked.verify()?;
+        let file = match openat_file(&locked.directory, &locked.ledger_name, libc::O_RDONLY, 0) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(LedgerData::empty()),
             Err(_) => return Err(AdmissionError("could not open admission ledger".to_owned())),
@@ -1210,20 +1438,23 @@ impl HostAdmissionLedger {
         Ok(data)
     }
 
-    fn store(&self, data: &LedgerData) -> Result<(), AdmissionError> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| AdmissionError("ledger has no parent".to_owned()))?;
-        fs::create_dir_all(parent)
-            .map_err(|_| AdmissionError("could not create ledger directory".to_owned()))?;
+    fn store(
+        &self,
+        locked: &LockedLedgerDirectory,
+        data: &LedgerData,
+    ) -> Result<(), AdmissionError> {
+        locked.verify()?;
+        if data.leases.len() + data.queue.len() > MAX_RECORDS {
+            return Err(AdmissionError(
+                "admission ledger would exceed its record bound".to_owned(),
+            ));
+        }
         let mut normalized = data.clone();
         normalized
             .leases
             .sort_by(|a, b| a.lease_id.cmp(&b.lease_id));
         normalized.queue.sort_by_key(|entry| entry.sequence);
-        let value = serde_json::to_value(&normalized)
-            .map_err(|_| AdmissionError("could not encode admission ledger".to_owned()))?;
+        let value = canonical_ledger_value(&normalized);
         let mut bytes = serde_json::to_vec(&value)
             .map_err(|_| AdmissionError("could not encode admission ledger".to_owned()))?;
         bytes.push(b'\n');
@@ -1232,26 +1463,30 @@ impl HostAdmissionLedger {
                 "admission ledger would exceed its size bound".to_owned(),
             ));
         }
-        let (temp, mut file) = create_temporary_ledger(parent)?;
+        let (temp, mut file) = locked.temporary()?;
         let result = (|| -> Result<(), AdmissionError> {
             file.write_all(&bytes)
                 .and_then(|()| file.sync_all())
                 .map_err(|_| {
                     AdmissionError("could not durably write admission ledger".to_owned())
                 })?;
-            fs::rename(&temp, &self.path)
-                .map_err(|_| AdmissionError("could not replace admission ledger".to_owned()))?;
-            File::open(parent)
-                .and_then(|dir| dir.sync_all())
-                .map_err(|_| {
-                    AdmissionError("could not sync admission ledger directory".to_owned())
-                })?;
+            locked.verify()?;
+            locked.rename(&temp)?;
+            locked.directory.sync_all().map_err(|_| {
+                AdmissionError("could not sync admission ledger directory".to_owned())
+            })?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp);
+            locked.unlink(&temp);
         }
         result
+    }
+
+    /// Validate the current ledger without modifying it.
+    pub fn validate(&self) -> Result<(), AdmissionError> {
+        let locked = LockedLedgerDirectory::open(&self.path)?;
+        self.load(&locked).map(|_| ())
     }
 
     /// Atomically sweep, queue, decide, and commit one request.
@@ -1267,8 +1502,8 @@ impl HostAdmissionLedger {
         F: Fn(&ProcessOwner, &HostSnapshot) -> OwnerState,
     {
         validate_request(request)?;
-        let _lock = self.lock()?;
-        let mut data = self.load()?;
+        let locked = LockedLedgerDirectory::open(&self.path)?;
+        let mut data = self.load(&locked)?;
         if data
             .leases
             .iter()
@@ -1340,7 +1575,7 @@ impl HostAdmissionLedger {
                 .map(|entry| (entry.sequence, entry.request.clone()))
                 .collect::<Vec<_>>();
             if swept {
-                self.store(&data)?;
+                self.store(&locked, &data)?;
             }
             return Ok((
                 decide(
@@ -1361,7 +1596,7 @@ impl HostAdmissionLedger {
             .find(|lease| lease.lease_id == request.request_id)
         {
             if swept {
-                self.store(&data)?;
+                self.store(&locked, &data)?;
             }
             let decision = answer(
                 Verdict::Grant,
@@ -1397,9 +1632,22 @@ impl HostAdmissionLedger {
             .iter()
             .any(|entry| entry.request.request_id == request.request_id)
         {
+            if data.leases.len() + data.queue.len() >= MAX_RECORDS {
+                if swept {
+                    self.store(&locked, &data)?;
+                }
+                return Ok((
+                    unknown(
+                        request,
+                        "record_capacity_exhausted",
+                        vec!["ledger_full".to_owned()],
+                    ),
+                    None,
+                ));
+            }
             let Some(next_sequence) = data.next_sequence.checked_add(1) else {
                 if swept {
-                    self.store(&data)?;
+                    self.store(&locked, &data)?;
                 }
                 return Ok((
                     unknown(
@@ -1453,7 +1701,7 @@ impl HostAdmissionLedger {
                     lease_id: request.request_id.clone(),
                     request: request.clone(),
                 });
-                self.store(&data)?;
+                self.store(&locked, &data)?;
                 Ok((
                     decision,
                     Some(Lease {
@@ -1467,16 +1715,16 @@ impl HostAdmissionLedger {
             Verdict::Refuse => {
                 data.queue
                     .retain(|entry| entry.request.request_id != request.request_id);
-                self.store(&data)?;
+                self.store(&locked, &data)?;
                 Ok((decision, None))
             }
             Verdict::Queue => {
-                self.store(&data)?;
+                self.store(&locked, &data)?;
                 Ok((decision, None))
             }
             Verdict::Unknown => {
                 if swept {
-                    self.store(&data)?;
+                    self.store(&locked, &data)?;
                 }
                 Ok((decision, None))
             }
@@ -1484,13 +1732,13 @@ impl HostAdmissionLedger {
     }
 
     fn release(&self, lease_id: &str, owner: &ProcessOwner) -> Result<(), AdmissionError> {
-        let _lock = self.lock()?;
-        let mut data = self.load()?;
+        let locked = LockedLedgerDirectory::open(&self.path)?;
+        let mut data = self.load(&locked)?;
         let before = data.leases.len();
         data.leases
             .retain(|lease| lease.lease_id != lease_id || lease.request.owner != *owner);
         if before != data.leases.len() {
-            self.store(&data)?;
+            self.store(&locked, &data)?;
         }
         Ok(())
     }
@@ -1525,8 +1773,11 @@ fn current_uid() -> Result<u32, AdmissionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -1682,6 +1933,25 @@ mod tests {
     }
 
     #[test]
+    fn canonical_ledger_bytes_are_feature_independent() {
+        let record = request("cross-edition", 10, 100);
+        let data = LedgerData {
+            leases: vec![LeaseRecord {
+                granted_at_unix_ms: 1010,
+                lease_id: "cross-edition".to_owned(),
+                request: record,
+            }],
+            next_sequence: 1,
+            queue: Vec::new(),
+            schema: LEDGER_SCHEMA.to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_string(&canonical_ledger_value(&data)).unwrap(),
+            r#"{"leases":[{"granted_at_unix_ms":1010,"lease_id":"cross-edition","request":{"caller":"test","memory_bytes":1,"metadata_digest":"none","named_tokens":{},"owner":{"boot_id":"boot-a","host_id":"host-a","pid":10,"start_ticks":100},"priority":0,"request_id":"cross-edition"}}],"next_sequence":1,"queue":[],"schema":"host-admission-ledger/v1"}"#
+        );
+    }
+
+    #[test]
     fn ledger_preserves_fifo_and_acquires_memory_and_tokens_atomically() {
         let root = temp_path("atomic");
         fs::create_dir_all(&root).unwrap();
@@ -1745,6 +2015,191 @@ mod tests {
             )
             .is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parent_and_final_component_attacks_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("path-attacks");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        let linked = root.join("linked");
+        symlink(&target, &linked).unwrap();
+        let candidate = request("request", 10, 100);
+        assert!(HostAdmissionLedger::new(linked.join("ledger.json"))
+            .request(
+                &candidate,
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1010,
+                |_, _| OwnerState::Alive,
+            )
+            .is_err());
+
+        let writable = root.join("writable");
+        fs::create_dir(&writable).unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(HostAdmissionLedger::new(writable.join("ledger.json"))
+            .request(
+                &candidate,
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1010,
+                |_, _| OwnerState::Alive,
+            )
+            .is_err());
+
+        let final_parent = root.join("final");
+        fs::create_dir(&final_parent).unwrap();
+        fs::set_permissions(&final_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = final_parent.join("payload");
+        fs::write(&payload, b"{}").unwrap();
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&payload, final_parent.join("symlink.json")).unwrap();
+        assert!(HostAdmissionLedger::new(final_parent.join("symlink.json"))
+            .request(
+                &candidate,
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1010,
+                |_, _| OwnerState::Alive,
+            )
+            .is_err());
+        fs::hard_link(&payload, final_parent.join("hardlink.json")).unwrap();
+        assert!(HostAdmissionLedger::new(final_parent.join("hardlink.json"))
+            .request(
+                &candidate,
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1010,
+                |_, _| OwnerState::Alive,
+            )
+            .is_err());
+        let lock_target = final_parent.join("lock-target");
+        fs::write(&lock_target, b"").unwrap();
+        fs::set_permissions(&lock_target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&lock_target, final_parent.join("lock-hardlink.json.lock")).unwrap();
+        assert!(
+            HostAdmissionLedger::new(final_parent.join("lock-hardlink.json"))
+                .request(
+                    &candidate,
+                    &snapshot(),
+                    &policy(BTreeMap::new()),
+                    1010,
+                    |_, _| OwnerState::Alive,
+                )
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn descriptor_binding_detects_lock_unlink_and_contains_parent_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("descriptor-races");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = root.join("parent");
+        let moved = root.join("moved");
+        let attacker = root.join("attacker");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&attacker).unwrap();
+        let ledger = HostAdmissionLedger::new(parent.join("ledger.json"));
+        assert!(ledger
+            .request(
+                &request("unlink", 10, 100),
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1010,
+                |_, _| {
+                    fs::remove_file(parent.join("ledger.json.lock")).unwrap();
+                    OwnerState::Alive
+                },
+            )
+            .is_err());
+        assert!(!parent.join("ledger.json").exists());
+
+        let (decision, lease) = ledger
+            .request(
+                &request("retarget", 10, 100),
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1011,
+                |_, _| {
+                    fs::rename(&parent, &moved).unwrap();
+                    symlink(&attacker, &parent).unwrap();
+                    OwnerState::Alive
+                },
+            )
+            .unwrap();
+        assert_eq!(decision.verdict, Verdict::Grant);
+        assert!(lease.is_some());
+        assert!(moved.join("ledger.json").is_file());
+        assert!(!attacker.join("ledger.json").exists());
+        HostAdmissionLedger::new(moved.join("ledger.json"))
+            .release("retarget", &owner(10, 100))
+            .unwrap();
+        fs::remove_file(&parent).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "launched as an isolated subprocess by the parent test"]
+    fn bare_relative_path_child() {
+        if std::env::var_os("HOST_ADMISSION_RELATIVE_CHILD").is_none() {
+            return;
+        }
+        let ledger = HostAdmissionLedger::new("ledger.json");
+        let (decision, _lease) = ledger
+            .request(
+                &request("relative", 10, 100),
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1010,
+                |_, _| OwnerState::Alive,
+            )
+            .unwrap();
+        assert_eq!(decision.verdict, Verdict::Grant);
+        ledger.validate().unwrap();
+    }
+
+    #[test]
+    fn bare_relative_and_non_utf8_paths_use_the_exact_lock_name() {
+        let root = temp_path("relative-parent");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::bare_relative_path_child")
+            .arg("--ignored")
+            .env("HOST_ADMISSION_RELATIVE_CHILD", "1")
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(root.join("ledger.json").is_file());
+
+        let leaf = OsString::from_vec(b"ledger-\xff.json".to_vec());
+        let path = root.join(&leaf);
+        let ledger = HostAdmissionLedger::new(&path);
+        let (decision, _lease) = ledger
+            .request(
+                &request("non-utf8", 11, 101),
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1011,
+                |_, _| OwnerState::Alive,
+            )
+            .unwrap();
+        assert_eq!(decision.verdict, Verdict::Grant);
+        let mut lock = leaf;
+        lock.push(".lock");
+        assert!(root.join(lock).is_file());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1816,6 +2271,140 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn write_ledger(path: &Path, data: &LedgerData) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&canonical_ledger_value(data)).unwrap();
+        bytes.push(b'\n');
+        fs::write(path, &bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn record_capacity_is_non_mutating_and_recovers_after_sweep() {
+        let root = temp_path("record-capacity");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("ledger.json");
+        let queue = (0..MAX_RECORDS)
+            .map(|index| QueueRecord {
+                request: request(
+                    &format!("queued-{index}"),
+                    100 + u32::try_from(index).unwrap(),
+                    1000 + u64::try_from(index).unwrap(),
+                ),
+                sequence: u64::try_from(index).unwrap(),
+            })
+            .collect();
+        let data = LedgerData {
+            leases: Vec::new(),
+            next_sequence: u64::try_from(MAX_RECORDS).unwrap(),
+            queue,
+            schema: LEDGER_SCHEMA.to_owned(),
+        };
+        let original = write_ledger(&path, &data);
+        assert!((original.len() as u64) < MAX_LEDGER_BYTES);
+        let ledger = HostAdmissionLedger::new(&path);
+        let mut near_data = data.clone();
+        near_data.queue.pop();
+        write_ledger(&path, &near_data);
+        let mut near_current = request("near-current", 10, 100);
+        near_current.priority = 10;
+        let (near_decision, near_lease) = ledger
+            .request(
+                &near_current,
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1009,
+                |_, _| OwnerState::Alive,
+            )
+            .unwrap();
+        assert_eq!(near_decision.verdict, Verdict::Grant);
+        assert!(near_lease.is_some());
+        let near_final = ledger
+            .load(&LockedLedgerDirectory::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            near_final.leases.len() + near_final.queue.len(),
+            MAX_RECORDS
+        );
+
+        fs::write(&path, &original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut current = request("current", 10, 100);
+        current.priority = 10;
+        let (decision, lease) = ledger
+            .request(
+                &current,
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1010,
+                |_, _| OwnerState::Alive,
+            )
+            .unwrap();
+        assert_eq!(decision.verdict, Verdict::Unknown);
+        assert_eq!(decision.code, "record_capacity_exhausted");
+        assert!(lease.is_none());
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        let (decision, _lease) = ledger
+            .request(
+                &current,
+                &snapshot(),
+                &policy(BTreeMap::new()),
+                1011,
+                |owner, _| {
+                    if owner.pid == 100 {
+                        OwnerState::Absent
+                    } else {
+                        OwnerState::Alive
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(decision.verdict, Verdict::Grant);
+        let final_data = ledger
+            .load(&LockedLedgerDirectory::open(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            final_data.leases.len() + final_data.queue.len(),
+            MAX_RECORDS
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn large_queue_decision_is_linear_and_bounded() {
+        let mut current = request("current", 10, 100);
+        current.priority = 0;
+        let mut queue = Vec::with_capacity(MAX_RECORDS);
+        let mut states = BTreeMap::new();
+        for index in 0..MAX_RECORDS - 1 {
+            let mut queued = request(
+                &format!("queued-{index}"),
+                100 + u32::try_from(index).unwrap(),
+                1000 + u64::try_from(index).unwrap(),
+            );
+            queued.priority = 0;
+            states.insert(queued.request_id.clone(), OwnerState::Alive);
+            queue.push((u64::try_from(index).unwrap(), queued));
+        }
+        queue.push((u64::try_from(MAX_RECORDS - 1).unwrap(), current.clone()));
+        let started = Instant::now();
+        let decision = decide(
+            &current,
+            &snapshot(),
+            &policy(BTreeMap::new()),
+            &[],
+            &queue,
+            1010,
+            &states,
+        )
+        .unwrap();
+        assert_eq!(decision.verdict, Verdict::Queue);
+        assert_eq!(decision.blockers.len(), MAX_RECORDS - 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     #[test]
     fn psi_decimal_parser_is_exact_and_rejects_hidden_precision() {
         assert_eq!(parse_percent_micros("0.000001"), Some(1));
@@ -1831,6 +2420,36 @@ mod tests {
         let (_some, _full, errors) =
             parse_psi("some avg10=0.1 avg10=0.2 total=1\nfull avg10=0 total=0\n");
         assert!(errors.contains(&"memory_psi_some_malformed".to_owned()));
+    }
+
+    #[test]
+    fn impossible_snapshot_relations_fail_closed() {
+        let mut impossible_memory = snapshot();
+        impossible_memory.mem_total_bytes = Some(1);
+        impossible_memory.mem_available_bytes = Some(2);
+        assert!(decide(
+            &request("current", 10, 100),
+            &impossible_memory,
+            &policy(BTreeMap::new()),
+            &[],
+            &[],
+            1010,
+            &BTreeMap::new(),
+        )
+        .is_err());
+        let mut impossible_swap = snapshot();
+        impossible_swap.swap_total_bytes = Some(1);
+        impossible_swap.swap_free_bytes = Some(2);
+        assert!(decide(
+            &request("current", 10, 100),
+            &impossible_swap,
+            &policy(BTreeMap::new()),
+            &[],
+            &[],
+            1010,
+            &BTreeMap::new(),
+        )
+        .is_err());
     }
 
     #[test]

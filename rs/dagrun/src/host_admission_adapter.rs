@@ -44,12 +44,14 @@ pub fn compare_legacy_memory_decision(
         pid: 1,
         start_ticks: 1,
     };
+    // These compatibility inputs are already-derived limits, not raw host
+    // measurements. Do not invent a physical-memory snapshot from them.
     let snapshot = HostSnapshot {
         captured_at_unix_ms: 1,
         host_id: owner.host_id.clone(),
         boot_id: owner.boot_id.clone(),
-        mem_total_bytes: budget_bytes,
-        mem_available_bytes: headroom_bytes,
+        mem_total_bytes: None,
+        mem_available_bytes: None,
         swap_total_bytes: None,
         swap_free_bytes: None,
         memory_psi_some_avg10_micros: None,
@@ -122,6 +124,7 @@ mod tests {
             let comparison = compare_legacy_memory_decision(requested, budget, headroom, reserved)
                 .expect("shadow comparison");
             assert_eq!(comparison.authoritative_verdict, expected);
+            assert_eq!(comparison.shadow_verdict, Verdict::Unknown);
         }
         assert_eq!(
             compare_legacy_memory_decision(1 << 40, None, None, 0)

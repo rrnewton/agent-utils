@@ -11,6 +11,11 @@ release it explicitly. Dropping an in-process lease object is not an ownership
 transition: the durable row remains until explicit release or a later census
 positively proves that its exact host, boot, PID, and start ticks are absent.
 
+Create the ledger parent before use with caller ownership and mode `0700` (or
+another mode with no group/world write bits). Parent components and final files
+must not be symlinks. A malformed/unsafe/full ledger fails closed and remains
+unchanged.
+
 The default deployment mode for a new caller is shadow-only: call the pure
 decide function, retain the current admission authority, and compare the
 structured result. Never run two authoritative ledgers for the same resource

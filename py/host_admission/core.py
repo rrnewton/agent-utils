@@ -6,14 +6,14 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import stat
-import tempfile
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
-from typing import IO, Callable
+from typing import Callable
 
 LEDGER_SCHEMA = "host-admission-ledger/v1"
 SNAPSHOT_SCHEMA = "host-admission-snapshot/v1"
@@ -144,6 +144,18 @@ class HostSnapshot:
                 raise ValueError(f"{name} must be a valid PSI percentage or null")
         for error in self.errors:
             _require_id("snapshot error", error)
+        if (
+            self.mem_total_bytes is not None
+            and self.mem_available_bytes is not None
+            and self.mem_available_bytes > self.mem_total_bytes
+        ):
+            raise ValueError("mem_available_bytes cannot exceed mem_total_bytes")
+        if (
+            self.swap_total_bytes is not None
+            and self.swap_free_bytes is not None
+            and self.swap_free_bytes > self.swap_total_bytes
+        ):
+            raise ValueError("swap_free_bytes cannot exceed swap_total_bytes")
 
     @classmethod
     def from_json(cls, raw: object) -> "HostSnapshot":
@@ -253,6 +265,8 @@ class AdmissionPolicy:
     max_snapshot_age_ms: int = 30_000
 
     def __post_init__(self) -> None:
+        if not isinstance(self.swap_mode, SwapMode):
+            raise ValueError("swap_mode must be a SwapMode")
         for name in (
             "memory_budget_bytes",
             "memory_reserve_bytes",
@@ -502,8 +516,19 @@ def decide(
     owner_states: dict[str, OwnerState],
 ) -> Decision:
     """Purely decide one request from an already observed ledger and host snapshot."""
-    if isinstance(now_unix_ms, bool) or not 0 <= now_unix_ms <= _MAX_U64:
+    if (
+        isinstance(now_unix_ms, bool)
+        or not isinstance(now_unix_ms, int)
+        or not 0 <= now_unix_ms <= _MAX_U64
+    ):
         raise ValueError("now_unix_ms must be non-negative and bounded")
+    if any(
+        not isinstance(owner_id, str)
+        or not _SAFE_ID.fullmatch(owner_id)
+        or not isinstance(state, OwnerState)
+        for owner_id, state in owner_states.items()
+    ):
+        raise ValueError("owner_states must contain safe ids and OwnerState values")
     record_ids = [lease.lease_id for lease in leases] + [
         entry.request.request_id for entry in queue
     ]
@@ -734,10 +759,11 @@ def _parse_percent_micros(raw: str | None) -> int | None:
 
 def sample_host(*, now_unix_ms: int | None = None) -> HostSnapshot:
     """Sample memory, swap, PSI, host identity, and boot identity once."""
+    captured_at = now_unix_ms if now_unix_ms is not None else time.time_ns() // 1_000_000
     mem, mem_errors = _read_meminfo()
     some, full, psi_errors = _read_psi()
     return HostSnapshot(
-        captured_at_unix_ms=now_unix_ms if now_unix_ms is not None else time.time_ns() // 1_000_000,
+        captured_at_unix_ms=captured_at,
         host_id=_read_identity(Path("/etc/machine-id"), "host_id"),
         boot_id=_read_identity(Path("/proc/sys/kernel/random/boot_id"), "boot_id"),
         mem_total_bytes=mem.get("MemTotal"),
@@ -779,34 +805,161 @@ def probe_process_owner(owner: ProcessOwner, snapshot: HostSnapshot) -> OwnerSta
     return OwnerState.ALIVE if start_ticks == owner.start_ticks else OwnerState.ABSENT
 
 
-class _Lock:
+def _open_secure_parent(path: Path) -> tuple[int, str]:
+    """Pin an existing symlink-free private parent and return its leaf name."""
+    name = path.name
+    if not name or name in {".", ".."} or "/" in name:
+        raise AdmissionError("admission ledger has an invalid leaf name")
+    parent = path.parent
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        try:
+            current = os.open("/" if parent.is_absolute() else ".", flags)
+        except OSError as exc:
+            raise AdmissionError("could not open admission path root") from exc
+        for component in parent.parts:
+            if component in {"/", ".", ""}:
+                continue
+            if component == "..":
+                raise AdmissionError("admission parent may not contain '..'")
+            try:
+                following = os.open(component, flags, dir_fd=current)
+            except OSError as exc:
+                raise AdmissionError("could not pin admission parent") from exc
+            os.close(current)
+            current = following
+    except BaseException:
+        if "current" in locals():
+            os.close(current)
+        raise
+    metadata = os.fstat(current)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+    ):
+        os.close(current)
+        raise AdmissionError("admission parent is not an owned non-writable directory")
+    return current, name
+
+
+class _LedgerTransaction:
+    """One descriptor-bound ledger transaction holding the stable flock."""
+
     def __init__(self, path: Path):
         self.path = path
-        self.handle: IO[str] | None = None
+        self.directory_fd = -1
+        self.lock_fd = -1
+        self.ledger_name = ""
+        self.lock_name = ""
+        self.directory_identity: tuple[int, int] | None = None
+        self.lock_identity: tuple[int, int] | None = None
 
-    def __enter__(self) -> "_Lock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def __enter__(self) -> "_LedgerTransaction":
+        self.directory_fd, self.ledger_name = _open_secure_parent(self.path)
+        self.lock_name = self.ledger_name + ".lock"
+        directory = os.fstat(self.directory_fd)
+        self.directory_identity = (directory.st_dev, directory.st_ino)
         try:
-            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        except OSError as exc:
-            raise AdmissionError("could not open admission lock") from exc
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_nlink != 1:
-                raise AdmissionError("admission lock is not an owned single-link regular file")
-            if metadata.st_mode & 0o077:
-                raise AdmissionError("admission lock permissions are not private")
-            self.handle = os.fdopen(fd, "r+")
+            try:
+                self.lock_fd = os.open(
+                    self.lock_name,
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=self.directory_fd,
+                )
+            except OSError as exc:
+                raise AdmissionError("could not open admission lock") from exc
+            lock = os.fstat(self.lock_fd)
+            if (
+                not stat.S_ISREG(lock.st_mode)
+                or lock.st_uid != os.geteuid()
+                or lock.st_nlink != 1
+                or lock.st_mode & 0o077
+            ):
+                raise AdmissionError(
+                    "admission lock is not an owned single-link private file"
+                )
+            self.lock_identity = (lock.st_dev, lock.st_ino)
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+            self.verify()
+            return self
         except BaseException:
-            os.close(fd)
+            self.close()
             raise
-        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
-        return self
+
+    def verify(self) -> None:
+        """Require the pinned parent and named lock to retain their identities."""
+        directory = os.fstat(self.directory_fd)
+        if (
+            self.directory_identity != (directory.st_dev, directory.st_ino)
+            or not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != os.geteuid()
+            or directory.st_mode & 0o022
+        ):
+            raise AdmissionError("pinned admission parent changed")
+        lock = os.fstat(self.lock_fd)
+        try:
+            named_fd = os.open(
+                self.lock_name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=self.directory_fd,
+            )
+        except OSError as exc:
+            raise AdmissionError("admission lock name changed") from exc
+        try:
+            named = os.fstat(named_fd)
+        finally:
+            os.close(named_fd)
+        if (
+            self.lock_identity != (lock.st_dev, lock.st_ino)
+            or self.lock_identity != (named.st_dev, named.st_ino)
+            or not stat.S_ISREG(lock.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or lock.st_uid != os.geteuid()
+            or named.st_uid != os.geteuid()
+            or lock.st_nlink != 1
+            or named.st_nlink != 1
+            or lock.st_mode & 0o077
+            or named.st_mode & 0o077
+        ):
+            raise AdmissionError("admission lock identity changed")
+
+    def create_temporary(self) -> tuple[str, int]:
+        """Reserve a private staging file in the pinned parent."""
+        for _attempt in range(128):
+            name = f".host-admission-{os.getpid()}-{secrets.token_hex(12)}.tmp"
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=self.directory_fd,
+                )
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise AdmissionError("could not create temporary ledger") from exc
+            return name, descriptor
+        raise AdmissionError("could not reserve a unique temporary ledger")
+
+    def close(self) -> None:
+        if self.lock_fd >= 0:
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.lock_fd)
+                self.lock_fd = -1
+        if self.directory_fd >= 0:
+            os.close(self.directory_fd)
+            self.directory_fd = -1
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None) -> None:
-        if self.handle is not None:
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-            self.handle.close()
+        self.close()
 
 
 def _strict_json(data: str) -> object:
@@ -863,11 +1016,17 @@ class HostAdmissionLedger:
 
     def __init__(self, path: Path):
         self.path = path
-        self.lock_path = path.with_suffix(path.suffix + ".lock")
 
-    def _load(self) -> tuple[int, list[LeaseView], list[QueueView]]:
+    def _load(
+        self, transaction: _LedgerTransaction
+    ) -> tuple[int, list[LeaseView], list[QueueView]]:
+        transaction.verify()
         try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(
+                transaction.ledger_name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=transaction.directory_fd,
+            )
         except FileNotFoundError:
             return 0, [], []
         except OSError as exc:
@@ -921,8 +1080,16 @@ class HostAdmissionLedger:
             raise AdmissionError("admission ledger contains invalid queue sequences")
         return next_sequence, leases, queue
 
-    def _store(self, next_sequence: int, leases: list[LeaseView], queue: list[QueueView]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _store(
+        self,
+        transaction: _LedgerTransaction,
+        next_sequence: int,
+        leases: list[LeaseView],
+        queue: list[QueueView],
+    ) -> None:
+        transaction.verify()
+        if len(leases) + len(queue) > MAX_RECORDS:
+            raise AdmissionError("admission ledger would exceed its record bound")
         payload = {
             "leases": [lease.to_json() for lease in sorted(leases, key=lambda item: item.lease_id)],
             "next_sequence": next_sequence,
@@ -932,27 +1099,43 @@ class HostAdmissionLedger:
         encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
         if len(encoded) > MAX_LEDGER_BYTES:
             raise AdmissionError("admission ledger would exceed its size bound")
-        fd, temp = tempfile.mkstemp(prefix=".host-admission-", dir=str(self.path.parent))
+        temp, fd = transaction.create_temporary()
+        installed = False
         try:
-            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 fd = -1
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp, self.path)
-            directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            transaction.verify()
             try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+                os.rename(
+                    temp,
+                    transaction.ledger_name,
+                    src_dir_fd=transaction.directory_fd,
+                    dst_dir_fd=transaction.directory_fd,
+                )
+            except OSError as exc:
+                raise AdmissionError("could not replace admission ledger") from exc
+            installed = True
+            try:
+                os.fsync(transaction.directory_fd)
+            except OSError as exc:
+                raise AdmissionError("could not sync admission ledger directory") from exc
+            transaction.verify()
         finally:
             if fd >= 0:
                 os.close(fd)
-            try:
-                os.unlink(temp)
-            except FileNotFoundError:
-                pass
+            if not installed:
+                try:
+                    os.unlink(temp, dir_fd=transaction.directory_fd)
+                except FileNotFoundError:
+                    pass
+
+    def validate(self) -> None:
+        """Validate the current ledger without modifying it."""
+        with _LedgerTransaction(self.path) as transaction:
+            self._load(transaction)
 
     def request(
         self,
@@ -965,8 +1148,8 @@ class HostAdmissionLedger:
     ) -> tuple[Decision, Lease | None]:
         """Atomically sweep, queue, decide, and commit one request."""
         now = time.time_ns() // 1_000_000 if now_unix_ms is None else now_unix_ms
-        with _Lock(self.lock_path):
-            next_sequence, leases, queue = self._load()
+        with _LedgerTransaction(self.path) as transaction:
+            next_sequence, leases, queue = self._load(transaction)
             if any(
                 lease.lease_id == request.request_id and lease.request != request
                 for lease in leases
@@ -977,20 +1160,26 @@ class HostAdmissionLedger:
                 return _unknown(
                     request, "request_id_conflict", ("existing_request_differs",)
                 ), None
-            request_state = owner_probe(request.owner, snapshot)
+            def checked_probe(owner: ProcessOwner) -> OwnerState:
+                state = owner_probe(owner, snapshot)
+                if not isinstance(state, OwnerState):
+                    raise AdmissionError("owner probe returned an invalid state")
+                return state
+
+            request_state = checked_probe(request.owner)
             if request_state is not OwnerState.ALIVE:
                 return _unknown(
                     request, "request_owner_unconfirmed", (request_state.value,)
                 ), None
             states = {
-                lease.lease_id: owner_probe(lease.request.owner, snapshot) for lease in leases
+                lease.lease_id: checked_probe(lease.request.owner) for lease in leases
             }
             states.update(
                 {
                     entry.request.request_id: (
                         request_state
                         if entry.request.request_id == request.request_id
-                        else owner_probe(entry.request.owner, snapshot)
+                        else checked_probe(entry.request.owner)
                     )
                     for entry in queue
                 }
@@ -1009,19 +1198,25 @@ class HostAdmissionLedger:
             swept = original_counts != (len(leases), len(queue))
             if any(state is OwnerState.UNKNOWN for state in states.values()):
                 if swept:
-                    self._store(next_sequence, leases, queue)
+                    self._store(transaction, next_sequence, leases, queue)
                 return decide(request, snapshot, policy, tuple(leases), tuple(queue), now_unix_ms=now, owner_states=states), None
             existing_lease = next((lease for lease in leases if lease.request.request_id == request.request_id), None)
             if existing_lease is not None:
                 if swept:
-                    self._store(next_sequence, leases, queue)
+                    self._store(transaction, next_sequence, leases, queue)
                 decision = Decision(Verdict.GRANT, "already_granted", request.request_id, sum(item.request.memory_bytes for item in leases if item.lease_id != existing_lease.lease_id), policy.memory_budget_bytes, None, None, (), (), None, existing_lease.lease_id)
                 return decision, Lease(existing_lease.lease_id, request, self)
             existing_queue = next((entry for entry in queue if entry.request.request_id == request.request_id), None)
             if existing_queue is None:
+                if len(leases) + len(queue) >= MAX_RECORDS:
+                    if swept:
+                        self._store(transaction, next_sequence, leases, queue)
+                    return _unknown(
+                        request, "record_capacity_exhausted", ("ledger_full",)
+                    ), None
                 if next_sequence == _MAX_U64:
                     if swept:
-                        self._store(next_sequence, leases, queue)
+                        self._store(transaction, next_sequence, leases, queue)
                     return _unknown(
                         request, "queue_sequence_exhausted", ("ledger_counter_exhausted",)
                     ), None
@@ -1036,19 +1231,19 @@ class HostAdmissionLedger:
             if decision.verdict is Verdict.GRANT:
                 queue = [entry for entry in queue if entry.request.request_id != request.request_id]
                 leases.append(LeaseView(request.request_id, request, now))
-                self._store(next_sequence, leases, queue)
+                self._store(transaction, next_sequence, leases, queue)
                 return decision, Lease(request.request_id, request, self)
             if decision.verdict is Verdict.REFUSE:
                 queue = [entry for entry in queue if entry.request.request_id != request.request_id]
             if decision.verdict is not Verdict.UNKNOWN or swept:
-                self._store(next_sequence, leases, queue)
+                self._store(transaction, next_sequence, leases, queue)
             return decision, None
 
     def release(self, lease_id: str, owner: ProcessOwner) -> None:
         """Release one exact lease without affecting peers."""
         _require_id("lease_id", lease_id)
-        with _Lock(self.lock_path):
-            next_sequence, leases, queue = self._load()
+        with _LedgerTransaction(self.path) as transaction:
+            next_sequence, leases, queue = self._load(transaction)
             kept = [lease for lease in leases if not (lease.lease_id == lease_id and lease.request.owner == owner)]
             if len(kept) != len(leases):
-                self._store(next_sequence, kept, queue)
+                self._store(transaction, next_sequence, kept, queue)

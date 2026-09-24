@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -280,6 +282,115 @@ def test_malformed_ledger_is_never_replaced_or_granted(tmp_path: Path) -> None:
     assert path.read_bytes() == original
 
 
+def test_ledger_parent_and_final_components_fail_closed(tmp_path: Path) -> None:
+    request = ResourceRequest("request", "test", _owner(), 1)
+    target = tmp_path / "target"
+    target.mkdir()
+    target.chmod(0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+    with pytest.raises(AdmissionError):
+        HostAdmissionLedger(linked / "ledger.json").request(
+            request, _snapshot(), _policy(), now_unix_ms=1010
+        )
+
+    writable = tmp_path / "writable"
+    writable.mkdir()
+    writable.chmod(0o777)
+    with pytest.raises(AdmissionError):
+        HostAdmissionLedger(writable / "ledger.json").request(
+            request, _snapshot(), _policy(), now_unix_ms=1010
+        )
+
+    final_parent = tmp_path / "final"
+    final_parent.mkdir()
+    final_parent.chmod(0o700)
+    payload = final_parent / "payload"
+    payload.write_text("{}", encoding="utf-8")
+    payload.chmod(0o600)
+    (final_parent / "symlink.json").symlink_to(payload)
+    with pytest.raises(AdmissionError):
+        HostAdmissionLedger(final_parent / "symlink.json").request(
+            request, _snapshot(), _policy(), now_unix_ms=1010
+        )
+    os.link(payload, final_parent / "hardlink.json")
+    with pytest.raises(AdmissionError):
+        HostAdmissionLedger(final_parent / "hardlink.json").request(
+            request, _snapshot(), _policy(), now_unix_ms=1010
+        )
+
+    lock_target = final_parent / "lock-target"
+    lock_target.write_text("", encoding="utf-8")
+    lock_target.chmod(0o600)
+    os.link(lock_target, final_parent / "lock-hardlink.json.lock")
+    with pytest.raises(AdmissionError):
+        HostAdmissionLedger(final_parent / "lock-hardlink.json").request(
+            request, _snapshot(), _policy(), now_unix_ms=1010
+        )
+
+
+def test_descriptor_binding_detects_lock_unlink_and_contains_parent_retarget(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "parent"
+    moved = tmp_path / "moved"
+    attacker = tmp_path / "attacker"
+    parent.mkdir()
+    parent.chmod(0o700)
+    attacker.mkdir()
+    attacker.chmod(0o700)
+    ledger = HostAdmissionLedger(parent / "ledger.json")
+
+    def unlink_lock(_owner: ProcessOwner, _snapshot: HostSnapshot) -> OwnerState:
+        (parent / "ledger.json.lock").unlink()
+        return OwnerState.ALIVE
+
+    with pytest.raises(AdmissionError):
+        ledger.request(
+            ResourceRequest("unlink", "test", _owner(), 1),
+            _snapshot(),
+            _policy(),
+            now_unix_ms=1010,
+            owner_probe=unlink_lock,
+        )
+    assert not (parent / "ledger.json").exists()
+
+    def retarget_parent(_owner: ProcessOwner, _snapshot: HostSnapshot) -> OwnerState:
+        parent.rename(moved)
+        parent.symlink_to(attacker, target_is_directory=True)
+        return OwnerState.ALIVE
+
+    decision, lease = ledger.request(
+        ResourceRequest("retarget", "test", _owner(), 1),
+        _snapshot(),
+        _policy(),
+        now_unix_ms=1011,
+        owner_probe=retarget_parent,
+    )
+    assert decision.verdict is Verdict.GRANT and lease is not None
+    assert (moved / "ledger.json").is_file()
+    assert not (attacker / "ledger.json").exists()
+    HostAdmissionLedger(moved / "ledger.json").release("retarget", _owner())
+
+
+def test_bare_relative_ledger_path_commits_without_ambiguous_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp_path.chmod(0o700)
+    monkeypatch.chdir(tmp_path)
+    ledger = HostAdmissionLedger(Path("ledger.json"))
+    decision, lease = ledger.request(
+        ResourceRequest("relative", "test", _owner(), 1),
+        _snapshot(),
+        _policy(),
+        now_unix_ms=1010,
+        owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
+    )
+    assert decision.verdict is Verdict.GRANT and lease is not None
+    ledger.validate()
+    lease.release()
+
+
 def test_malformed_queue_sequences_and_duplicate_tokens_are_rejected(tmp_path: Path) -> None:
     request = ResourceRequest("queued", "test", _owner(), 1, (("build", 1),))
     base = {
@@ -331,6 +442,86 @@ def test_queue_sequence_exhaustion_is_unknown_without_mutation(tmp_path: Path) -
     assert lease is None and path.read_bytes() == original
 
 
+def test_record_capacity_boundary_is_non_mutating_and_recovers_after_sweep(
+    tmp_path: Path,
+) -> None:
+    from host_admission import core
+
+    path = tmp_path / "host-admission.json"
+    queue = [
+        {
+            "request": ResourceRequest(
+                f"queued-{index}",
+                "test",
+                _owner(100 + index, 1000 + index),
+                0,
+            ).to_json(),
+            "sequence": index,
+        }
+        for index in range(core.MAX_RECORDS)
+    ]
+    payload = {
+        "leases": [],
+        "next_sequence": core.MAX_RECORDS,
+        "queue": queue,
+        "schema": "host-admission-ledger/v1",
+    }
+    original = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    assert len(original) < core.MAX_LEDGER_BYTES
+    near_payload = dict(payload)
+    near_payload["queue"] = queue[:-1]
+    near = (
+        json.dumps(near_payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    path.write_bytes(near)
+    path.chmod(0o600)
+    near_current = ResourceRequest("near-current", "test", _owner(), 1, (), 10)
+    near_decision, near_lease = HostAdmissionLedger(path).request(
+        near_current,
+        _snapshot(),
+        _policy(),
+        now_unix_ms=1009,
+        owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
+    )
+    assert near_decision.verdict is Verdict.GRANT and near_lease is not None
+    near_state = _mapping(json.loads(path.read_text(encoding="utf-8")))
+    assert (
+        len(_sequence(near_state["leases"]))
+        + len(_sequence(near_state["queue"]))
+        == core.MAX_RECORDS
+    )
+
+    path.write_bytes(original)
+    path.chmod(0o600)
+    ledger = HostAdmissionLedger(path)
+    current = ResourceRequest("current", "test", _owner(), 1, (), 10)
+    decision, lease = ledger.request(
+        current,
+        _snapshot(),
+        _policy(),
+        now_unix_ms=1010,
+        owner_probe=lambda _owner, _snapshot: OwnerState.ALIVE,
+    )
+    assert decision.verdict is Verdict.UNKNOWN
+    assert decision.code == "record_capacity_exhausted"
+    assert lease is None and path.read_bytes() == original
+
+    first_pid = 100
+    decision, lease = ledger.request(
+        current,
+        _snapshot(),
+        _policy(),
+        now_unix_ms=1011,
+        owner_probe=lambda owner, _snapshot: (
+            OwnerState.ABSENT if owner.pid == first_pid else OwnerState.ALIVE
+        ),
+    )
+    assert decision.verdict is Verdict.GRANT and lease is not None
+    state = _mapping(json.loads(path.read_text(encoding="utf-8")))
+    assert len(_sequence(state["leases"])) + len(_sequence(state["queue"])) == core.MAX_RECORDS
+    lease.release()
+
+
 def test_psi_decimal_parser_is_exact_and_rejects_hidden_precision() -> None:
     from host_admission import core
 
@@ -365,6 +556,70 @@ def test_python_integer_domains_match_the_wire_types() -> None:
             now_unix_ms=1 << 64,
             owner_states={},
         )
+
+
+def test_python_enums_owner_states_and_snapshot_relations_fail_closed() -> None:
+    with pytest.raises(ValueError):
+        AdmissionPolicy(
+            memory_budget_bytes=700,
+            memory_reserve_bytes=0,
+            swap_mode=cast(SwapMode, "floor"),
+        )
+    peer = ResourceRequest("peer", "test", _owner(), 700)
+    with pytest.raises(ValueError):
+        decide(
+            ResourceRequest("current", "test", _owner(11, 101), 1),
+            _snapshot(),
+            _policy(),
+            (LeaseView("peer", peer, 1),),
+            (),
+            now_unix_ms=1010,
+            owner_states={"peer": cast(OwnerState, "unknown")},
+        )
+    with pytest.raises(ValueError):
+        HostSnapshot(1, "host-a", "boot-a", 1, 2, 0, 0, 0, 0)
+    with pytest.raises(ValueError):
+        HostSnapshot(1, "host-a", "boot-a", 1, 1, 1, 2, 0, 0)
+
+
+def test_invalid_owner_probe_state_fails_closed_without_writing(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.json"
+    with pytest.raises(AdmissionError):
+        HostAdmissionLedger(path).request(
+            ResourceRequest("current", "test", _owner(), 1),
+            _snapshot(),
+            _policy(),
+            now_unix_ms=1010,
+            owner_probe=lambda _owner, _snapshot: cast(OwnerState, "alive"),
+        )
+    assert not path.exists()
+
+
+def test_host_snapshot_timestamp_precedes_all_measurement_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from host_admission import core
+
+    events: list[str] = []
+
+    def fake_time() -> int:
+        events.append("timestamp")
+        return 1_000_000_000
+
+    def fake_read(path: Path, **_kwargs: object) -> str:
+        assert events and events[0] == "timestamp"
+        events.append(str(path))
+        if str(path) == "/proc/meminfo":
+            return "MemTotal: 1 kB\nMemAvailable: 1 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n"
+        if str(path) == "/proc/pressure/memory":
+            return "some avg10=0 total=0\nfull avg10=0 total=0\n"
+        return "host-a" if str(path) == "/etc/machine-id" else "boot-a"
+
+    monkeypatch.setattr(time, "time_ns", fake_time)
+    monkeypatch.setattr(Path, "read_text", fake_read)
+    snapshot = core.sample_host()
+    assert snapshot.captured_at_unix_ms == 1000
+    assert events[0] == "timestamp"
 
 
 def test_measurement_parsers_reject_malformed_and_duplicate_fields(
@@ -422,6 +677,7 @@ def test_dagrun_compatibility_adapter_preserves_legacy_authority() -> None:
     for requested, budget, headroom, reserved, expected in cases:
         comparison = compare_legacy_memory_decision(requested, budget_bytes=budget, headroom_bytes=headroom, reserved_bytes=reserved)
         assert comparison.authoritative_verdict is expected
+        assert comparison.shadow_verdict is Verdict.UNKNOWN
     assert compare_legacy_memory_decision(1 << 40, budget_bytes=None, headroom_bytes=None, reserved_bytes=0).shadow_verdict is Verdict.UNKNOWN
 
 

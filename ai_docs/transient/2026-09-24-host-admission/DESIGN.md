@@ -44,6 +44,11 @@ generic protocol and comparison adapter without changing any current authority.
 The generic library owns exactly these concerns:
 
 1. One versioned, private, bounded JSON ledger protected by one stable flock.
+   Its parent must already exist, be owned by the caller, and deny group/world
+   writes. Every path component is opened without following symlinks; the lock,
+   ledger, temporary file, rename, and directory fsync are relative to one held
+   parent descriptor. The ledger is capped at 16,384 combined leases/tickets
+   before a write can make a valid file unreadable.
 2. A transaction that observes owners, removes only positively absent owners,
    orders tickets, decides, and commits under that lock.
 3. Four outcomes: `GRANT`, `QUEUE`, `REFUSE`, and `UNKNOWN`.
@@ -98,28 +103,33 @@ field meanings, integer units, ordering rules, and fixture corpus. The shared
 corpus covers exact equality, large integer arithmetic, malformed/missing
 measurements, stale snapshots, PID reuse, reboot, dead and unknown queue owners,
 priority/FIFO order, named-token atomicity, no-swap policy, swap-floor formula,
-and request-id conflicts. The differential compares complete canonical decision
-JSON, not just a verdict word.
+and request-id conflicts. The differential compares the raw concatenated
+canonical decision bytes, including framing, not just verdicts or normalized
+lines. It also proves Python-written/Rust-read and Rust-written/Python-read
+ledger interoperability and exact writer bytes.
 
-Ledger writers sort object keys and stable collections so either edition can
+Ledger writers manually construct sorted object keys and stable collections so
+their bytes do not depend on Rust dependency-feature unification and either edition can
 read the same state. Strict readers reject unknown structural fields, unsafe
 files, oversized state, duplicate ids, invalid owner identities, and unsupported
-schema versions. Writes use a private same-directory temporary file, file fsync,
-atomic replacement, and directory fsync.
+schema versions. Writes use descriptor-relative private same-directory temporary
+files, file fsync, atomic replacement, and directory fsync.
 
 ## DAG runner compatibility adapter
 
-The compatibility adapter is intentionally read-only. It translates the
-existing request, budget, headroom, and reserved-byte inputs into a generic
-shadow decision and returns both results. The existing verdict remains the
+The compatibility adapter is intentionally read-only. Its existing budget and
+headroom inputs are derived limits, not raw `MemTotal`/`MemAvailable`; therefore
+the adapter does not fabricate a host snapshot from them. Until a future adapter
+supplies an actual captured snapshot, the generic side conservatively reports
+unknown while returning both results. The existing verdict remains the
 authoritative result. The adapter does not open the generic ledger, reserve a
 token, alter command output, or change exit status.
 
-One expected shadow difference is explicit: when legacy memory measurements are
-missing, the existing authority grants while the generic core returns unknown.
-Shadow telemetry must report this difference; it must not silently change the
-live result. A later authority decision can choose fail-closed behavior only as
-a separately reviewed compatibility change.
+This deliberately limits Phase 1 to wiring and authority-preservation checks.
+Shadow telemetry must report the unknown result; it must not silently change the
+live result. A later adapter can accept a real timestamped host snapshot, and a
+later authority decision can choose fail-closed behavior only as a separately
+reviewed compatibility change.
 
 ## Validation-consumer boundary
 

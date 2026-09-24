@@ -12,3 +12,12 @@ own domain checks succeed.
 The initial API is intended for shadow evaluation and compatibility adapters.
 Callers should not replace an existing authoritative admission controller until
 their old owners have drained or been imported under a reviewed migration.
+
+Ledger parents must already exist, be owned by the caller, and deny group and
+world writes. Lock, temp, rename, and fsync operations are relative to one
+pinned parent descriptor; the library never creates deployment directories.
+
+Ledger parents must already exist, be owned by the caller, and deny group and
+world writes. The implementation pins that directory and performs lock, temp,
+rename, and fsync operations relative to its descriptor. It never creates a
+deployment directory implicitly.
