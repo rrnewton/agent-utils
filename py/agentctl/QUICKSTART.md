@@ -22,6 +22,7 @@ while keeping their terminals available for direct inspection.
      --brief 'Review the current changes and report concrete problems'
    agentctl list
    agentctl status reviewer
+   agentctl health reviewer
    ```
 
    A project can keep owner-specific launch choices in the private, ignored
@@ -45,6 +46,13 @@ while keeping their terminals available for direct inspection.
    `adopt --harness muse` is refused. Start an owned Muse session—for example,
    through a validated profile—so agentctl can pin the exact foreground process
    identity itself.
+
+   `status` keeps the saved lifecycle fields but adds a separate live health
+   verdict. It exits nonzero when the expected harness disappeared or when
+   liveness cannot be confirmed. `list` applies the same rule independently to
+   every record. Use `health` when automation needs only the aggregate verdict;
+   all three write the exact reason and detection times to
+   `.agentctl/NAME/health.json`.
 
 3. Send follow-up work and inspect progress:
 

@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from collections.abc import Sequence
 from importlib.resources import files
 from pathlib import Path
@@ -59,6 +60,15 @@ def _environment_entry(value: str) -> str:
         return environment_entries((value,))[0]
     except HerdrRunError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _positive_pid(value: str) -> int:
+    if not value.isascii() or not value.isdigit():
+        raise argparse.ArgumentTypeError("expected a positive decimal Linux process id")
+    parsed = int(value, 10)
+    if not 1 <= parsed <= 2_147_483_647:
+        raise argparse.ArgumentTypeError("Linux process id must be between 1 and 2147483647")
+    return parsed
 
 
 def parser() -> argparse.ArgumentParser:
@@ -125,9 +135,31 @@ def parser() -> argparse.ArgumentParser:
     adopt.add_argument("--session", metavar="ID",
         help="optional stable native conversation ID already reported by this exact pane")
 
-    command("list", "List every registered session, including unavailable and failed launches.", "agentctl list")
+    recover_start = command(
+        "recover-start",
+        "Recover or reconcile a failed Muse launch by exact saved generation and live PID.",
+        "agentctl recover-start reviewer --expected-token TOKEN --expected-pid 12345",
+        named=True,
+    )
+    recover_start.add_argument("--expected-token", required=True, metavar="TOKEN",
+        help="exact registry generation printed by status (required)")
+    recover_start.add_argument("--expected-pid", required=True, type=_positive_pid, metavar="PID",
+        help="exact live Muse PID whose executable and complete argv must match (required)")
+
+    command("list", "List every session with live health; exit nonzero if any result is non-healthy.", "agentctl list")
     command("capabilities", "Show the adapters and services available in this installation.", "agentctl capabilities")
-    command("status", "Inspect saved identity, runtime state, and supported operations.", "agentctl status reviewer", named=True)
+    command("status", "Inspect saved identity and live health; exit nonzero for a non-healthy result.", "agentctl status reviewer", named=True)
+    health = command(
+        "health",
+        "Check one or more sessions independently and return nonzero unless every check is healthy.",
+        "agentctl health reviewer implementer --watch 300 --interval 5",
+    )
+    health.add_argument("names", nargs="*", metavar="NAME",
+        help="registered session names; omission checks every active registry entry")
+    health.add_argument("--watch", type=_ascii_float, default=0.0, metavar="SECONDS",
+        help="bounded polling duration; exit early on a non-healthy result (default: 0, one check; maximum: 86400)")
+    health.add_argument("--interval", type=_ascii_float, default=5.0, metavar="SECONDS",
+        help="positive delay between watch checks (default: 5 seconds; maximum: 3600)")
     send = command("send", "Submit follow-up work; uncertain delivery is retained for inspection.",
         "agentctl send reviewer 'Please check the cancellation path too'", named=True)
     _message(send)
@@ -215,6 +247,32 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
     return [str(item) for item in value]
 
 
+def _status_with_health(
+    observation: dict[str, object], status: dict[str, object] | None,
+) -> dict[str, object]:
+    """Retain the status schema while adding a machine-actionable live verdict."""
+    name = str(observation["name"])
+    if status is None:
+        status = {
+            "name": name,
+            "token": observation.get("token"),
+            "lifecycle": observation.get("lifecycle"),
+            "agent_status": observation.get("agent_status"),
+            "probe_error": observation.get("probe_error"),
+        }
+    status.update({
+        "health": observation.get("health"),
+        "runtime_state": observation.get("runtime_state"),
+        "health_reason_code": observation.get("reason_code"),
+        "health_reason": observation.get("reason"),
+        "health_first_detected_at": observation.get("first_detected_at"),
+        "health_last_checked_at": observation.get("last_checked_at"),
+        "health_recorded": observation.get("recorded"),
+        "health_record_path": observation.get("record_path"),
+    })
+    return status
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the unified interface with explicit outcome exit statuses."""
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -268,6 +326,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if value is not None and (not math.isfinite(value) or value < 0 or value > 31_536_000
                 or (key in ("working_timeout", "startup_timeout") and value == 0)):
                 raise ValueError(f"{key.replace('_', '-')} must be finite and within its documented range")
+        if args.command == "health":
+            if not math.isfinite(args.watch) or not 0 <= args.watch <= 86_400:
+                raise ValueError("watch must be finite and between 0 and 86400 seconds")
+            if not math.isfinite(args.interval) or not 0 < args.interval <= 3_600:
+                raise ValueError("interval must be finite, positive, and at most 3600 seconds")
         for key in ("max_attempts", "lines"):
             if getattr(args, key, 1) <= 0:
                 raise ValueError(f"{key.replace('_', '-')} must be positive")
@@ -314,7 +377,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             brief = Path(args.file).read_text(encoding="utf-8") if args.file else args.brief
             result = sessions.start_session(name, cwd=args.cwd, mode=mode, backend=args.backend,
                 harness=harness, model=model, brief=brief, resume=args.resume,
-                reasoning_effort=reasoning_effort, harness_args=harness_args,
+                reasoning_effort=reasoning_effort, launch_profile=args.profile,
+                harness_args=harness_args,
                 environment=environment,
                 workspace_id=args.workspace_id,
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
@@ -323,10 +387,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.adopt(name, pane_id=args.pane,
                 expected_workspace=args.workspace, expected_cwd=args.cwd,
                 harness=args.harness, session=args.session)
+        elif args.command == "recover-start":
+            result = sessions.recover_start(
+                name, expected_token=args.expected_token, expected_pid=args.expected_pid,
+            )
         elif args.command == "list":
-            result = sessions.list()
+            aggregate, statuses = sessions.health_snapshot(())
+            observations = aggregate["sessions"]
+            assert isinstance(observations, list)
+            rows = [
+                _status_with_health(observation, status)
+                for observation, status in zip(observations, statuses, strict=True)
+                if isinstance(observation, dict)
+            ]
+            print(json.dumps(rows, indent=2, sort_keys=True))
+            return 0 if aggregate["healthy"] else 1
         elif args.command == "status":
-            result = sessions.status(name)
+            observation, status = sessions.status_health_snapshot(name)
+            result = _status_with_health(observation, status)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if observation["health"] == "healthy" else 1
+        elif args.command == "health":
+            deadline = time.monotonic() + args.watch
+            polls = 0
+            while True:
+                result = sessions.health(args.names)
+                polls += 1
+                if not result["healthy"] or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(args.interval, max(0.0, deadline - time.monotonic())))
+            result["polls"] = polls
+            result["watch_seconds"] = args.watch
+            result["interval_seconds"] = args.interval
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if result["healthy"] else 1
         elif args.command == "send":
             result = sessions.send_session(name, _text(args) or "", message_id=args.message_id, model=args.model, **options)
         elif args.command == "read":

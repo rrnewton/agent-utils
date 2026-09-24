@@ -36,12 +36,21 @@ def _normalize(value: object) -> object:
     if isinstance(value, list):
         return [_normalize(item) for item in value]
     if isinstance(value, dict):
-        return {str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
+        return {str(key): ("<TOKEN>" if key == "token" else 0 if key in {
+                              "created_at", "checked_at", "first_detected_at",
+                              "last_checked_at", "last_unhealthy_at", "last_unknown_at",
+                              "health_first_detected_at", "health_last_checked_at",
+                          }
                           else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
+                          else "<EXECUTABLE_IDENTITY>" if key in {
+                              "launch_executable_device", "launch_executable_inode",
+                          } and item is not None
                           else "<ARCHIVE>" if key == "archive"
                           # Native identity diagnostics use edition-specific quote styles.
                           else re.sub(r'"([a-z][a-z0-9-]*)"', r"'\1'", item)
-                          if key == "probe_error" and isinstance(item, str) else _normalize(item))
+                          if key in {"probe_error", "reason", "health_reason", "last_unhealthy_reason",
+                                     "last_unknown_reason"} and isinstance(item, str)
+                          else _normalize(item))
                 for key, item in value.items()}
     return value
 
@@ -138,6 +147,7 @@ def _orientation(harness: Harness, report: Report) -> None:
     case = harness.case("primary-orientation")
     _pair(harness, report, case, "primary/version", ("--version",))
     for arguments in ((), ("--help",), ("start", "--help"), ("adopt", "--help"),
+                      ("recover-start", "--help"), ("health", "--help"),
                       ("stop", "--help"), ("send", "--help"), ("goal", "--help")):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, arguments), strict=True):
             report.require(f"primary/help/{arguments}/{edition}",
@@ -151,7 +161,13 @@ def _orientation(harness: Harness, report: Report) -> None:
                            and (all(option in outcome.stdout for option in (
                                "--recover-legacy-adoption", "--expected-token",
                                "--expected-record-sha256",
-                           )) if arguments == ("stop", "--help") else True),
+                           )) if arguments == ("stop", "--help") else True)
+                           and (all(option in outcome.stdout for option in (
+                               "--expected-token", "--expected-pid",
+                           )) if arguments == ("recover-start", "--help") else True)
+                           and (all(option in outcome.stdout for option in (
+                               "--watch", "--interval",
+                           )) if arguments == ("health", "--help") else True),
                            f"missing operation help: {outcome!r}")
     for command in ("quickstart", "userguide"):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, (command,)), strict=True):
@@ -180,6 +196,16 @@ def _lifecycle(harness: Harness, report: Report) -> None:
             continue
         for command in (("status", "worker"), ("list",), ("wait", "worker", "--timeout", "0")):
             _pair(harness, report, case, f"primary/{kind}/{command[0]}", (*command, *_COMMON))
+        _pair(
+            harness, report, case, f"primary/{kind}/health",
+            ("health", "worker", *_COMMON),
+        )
+        report.require(
+            f"primary/{kind}/health-record",
+            all((root / "registry/worker/health.json").is_file()
+                for root in (case.python_root, case.rust_root)),
+            "health did not retain its per-generation observation",
+        )
         expected_args = (["resume", "session-1", "--no-alt-screen"] if kind == "codex"
                          else ["--resume", "session-1"]) + ["--model", "chosen-model", "--extra"]
         report.require(f"primary/{kind}/native-launch-presets",
@@ -365,6 +391,22 @@ def _profiles(harness: Harness, report: Report) -> None:
                     ),
                     f"{edition} omitted the pinned custom process identity: {raw_status!r}",
                 )
+                report.require(
+                    f"primary/profile/watermelon/launch-intent/{edition}",
+                    raw_status.get("launch_profile") == "watermelon"
+                    and isinstance(raw_status.get("launch_argv"), list)
+                    and bool(raw_status["launch_argv"])
+                    and raw_status.get("launch_executable")
+                    == raw_status["launch_argv"][0]
+                    and raw_status.get("launch_argv")
+                    == [raw_status.get("launch_executable"), *expected[profile]]
+                    and isinstance(identity, dict)
+                    and raw_status.get("launch_executable_device")
+                    == identity.get("executable_device")
+                    and raw_status.get("launch_executable_inode")
+                    == identity.get("executable_inode"),
+                    f"{edition} did not bind recovery intent to the launched image: {raw_status!r}",
+                )
             report.require("primary/profile/watermelon/effective-effort",
                            isinstance(status, dict)
                            and status.get("effective_reasoning_effort") == "xhigh"
@@ -414,7 +456,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                 _pair(
                     harness, report, case,
                     f"primary/profile/watermelon/refuse-{label}-status",
-                    ("status", "worker", *_COMMON),
+                    ("status", "worker", *_COMMON), 1,
                 )
                 refused = harness.invoke(case, ("stop", "worker", *_COMMON))
                 report.require(
@@ -435,7 +477,7 @@ def _profiles(harness: Harness, report: Report) -> None:
             _pair(
                 harness, report, case,
                 "primary/profile/watermelon/refuse-process-group-status",
-                ("status", "worker", *_COMMON),
+                ("status", "worker", *_COMMON), 1,
             )
             refused = harness.invoke(case, ("stop", "worker", *_COMMON))
             report.require(
@@ -1291,7 +1333,7 @@ def _ownership(harness: Harness, report: Report) -> None:
                                    for root in (case.python_root, case.rust_root)),
                            f"closing the owned pane also closed the human pane: {result!r}")
         else:
-            _pair(harness, report, case, f"primary/ownership/{label}/status", ("status", "worker", *_COMMON))
+            _pair(harness, report, case, f"primary/ownership/{label}/status", ("status", "worker", *_COMMON), 1)
             outcomes = harness.invoke(case, ("stop", "worker", *_COMMON))
             report.require(f"primary/ownership/{label}/stop-refusal", all(outcome.returncode == 69 for outcome in outcomes)
                            and all((root / "registry/worker/agent.json").exists() and not _state(root).get("closed")
@@ -1303,6 +1345,50 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
     if not _start(harness, report, case, "primary/managed-dead/start"):
         return
     _change(case, {"empty_shell": True, "sessionless": True})
+    health_python, _ = _pair(
+        harness,
+        report,
+        case,
+        "primary/managed-dead/health",
+        ("health", "worker", *_COMMON),
+        1,
+    )
+    health = _json(health_python)
+    report.require(
+        "primary/managed-dead/health-classification",
+        isinstance(health, dict)
+        and health.get("healthy") is False
+        and isinstance(health.get("sessions"), list)
+        and len(health["sessions"]) == 1
+        and health["sessions"][0].get("health") == "unhealthy"
+        and health["sessions"][0].get("reason_code") == "expected-harness-missing",
+        f"dead expected harness was not a machine-readable failure: {health!r}",
+    )
+    status_python, _ = _pair(
+        harness, report, case, "primary/managed-dead/status",
+        ("status", "worker", *_COMMON), 1,
+    )
+    status = _json(status_python)
+    report.require(
+        "primary/managed-dead/status-classification",
+        isinstance(status, dict)
+        and status.get("lifecycle") == "running"
+        and status.get("runtime_state") == "dead"
+        and status.get("health") == "unhealthy",
+        f"status did not distinguish saved intent from dead runtime: {status!r}",
+    )
+    listed_python, _ = _pair(
+        harness, report, case, "primary/managed-dead/list",
+        ("list", *_COMMON), 1,
+    )
+    listed = _json(listed_python)
+    report.require(
+        "primary/managed-dead/list-classification",
+        isinstance(listed, list)
+        and len(listed) == 1
+        and listed[0].get("runtime_state") == "dead",
+        f"list did not expose the dead runtime: {listed!r}",
+    )
     refused = harness.invoke(case, ("stop", "worker", *_COMMON))
     report.require(
         "primary/managed-dead/token-required",
@@ -1671,6 +1757,24 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
         ("nonfinite", ("send", "worker", "text", "--ready-timeout", "nan")),
         ("zero-working", ("send", "worker", "text", "--working-timeout", "0")),
         ("zero-startup", ("start", "worker", "--startup-timeout", "0")),
+        ("negative-health-watch", ("health", "--watch", "-1")),
+        ("oversize-health-watch", ("health", "--watch", "86401")),
+        ("zero-health-interval", ("health", "--interval", "0")),
+        ("nonfinite-health-interval", ("health", "--interval", "inf")),
+        ("recover-start-missing-pid", (
+            "recover-start", "worker", "--expected-token", "generation",
+        )),
+        ("recover-start-missing-token", (
+            "recover-start", "worker", "--expected-pid", "123",
+        )),
+        ("recover-start-zero-pid", (
+            "recover-start", "worker", "--expected-token", "generation",
+            "--expected-pid", "0",
+        )),
+        ("recover-start-nonascii-pid", (
+            "recover-start", "worker", "--expected-token", "generation",
+            "--expected-pid", "١٢٣",
+        )),
         ("environment-missing-equals", ("start", "worker", "--env", "MISSING_EQUALS")),
         ("environment-empty-name", ("start", "worker", "--env", "=value")),
         ("environment-invalid-name", ("start", "worker", "--env", "BAD-NAME=value")),

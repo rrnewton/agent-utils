@@ -998,6 +998,7 @@ class HerdrClient:
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
         *, timeout: float = 30.0,
+        on_launch_intent: Callable[[str, int, int, tuple[str, ...]], None] | None = None,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
     ) -> CustomProcessIdentity:
         """Launch and verify a custom TUI through one exact Herdr pane.
@@ -1027,22 +1028,36 @@ class HerdrClient:
                     f"custom harness {kind!r} must be a native ELF executable"
                 )
             launch_image = (metadata.st_dev, metadata.st_ino)
+            if on_launch_intent is not None:
+                on_launch_intent(
+                    executable, metadata.st_dev, metadata.st_ino,
+                    (executable, *arguments),
+                )
             self._call_ok(
                 ["pane", "run", pane_id, shlex.join([executable, *arguments])],
                 f"pane run {kind!r}",
             )
             deadline = time.monotonic() + timeout
             observed: CustomProcessIdentity | None = None
+            last_probe_error: HerdrUnavailable | None = None
             while time.monotonic() < deadline:
-                observed = self._pane_process_identity(
-                    self.process_info(pane_id), executable, launch_image=launch_image
-                )
+                try:
+                    observed = self._pane_process_identity(
+                        self.process_info(pane_id), executable, launch_image=launch_image
+                    )
+                except HerdrUnavailable as exc:
+                    # Herdr can briefly expose a foreground entry before its argv
+                    # snapshot is populated. Startup already owns a deadline, so
+                    # keep polling instead of abandoning a process we just launched.
+                    last_probe_error = exc
+                    observed = None
                 if observed is not None:
                     break
                 self._sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             if observed is None:
+                detail = f"; last process probe: {last_probe_error}" if last_probe_error else ""
                 raise HerdrUnavailable(
-                    f"custom harness {kind!r} was not the foreground process in pane {pane_id}"
+                    f"custom harness {kind!r} was not the foreground process in pane {pane_id}{detail}"
                 )
             if on_observed is not None:
                 on_observed(observed)
@@ -1069,6 +1084,66 @@ class HerdrClient:
         self.verify_custom_harness(pane_id, kind, observed)
         self.report_pane_agent(pane_id, kind, "idle")
         return observed
+
+    def recover_pane_agent(
+        self, pane_id: str, expected_argv: Sequence[str], expected_device: int,
+        expected_inode: int, expected_pid: int,
+    ) -> CustomProcessIdentity:
+        """Pin one unrecorded failed launch by exact pane, PID, image, and argv."""
+        if not 1 <= expected_pid <= _MAX_PROCESS_ID:
+            raise HerdrUnavailable("expected custom harness pid is not a positive Linux process id")
+        if (not expected_argv or any(not isinstance(item, str) or not item or "\0" in item
+                                     for item in expected_argv)
+                or not 1 <= expected_device <= _MAX_U64
+                or not 1 <= expected_inode <= _MAX_U64):
+            raise HerdrUnavailable("saved custom harness launch intent is incomplete")
+
+        def observe() -> CustomProcessIdentity:
+            result = self._call(
+                ["pane", "process-info", "--pane", pane_id],
+                f"pane process-info {pane_id}",
+            )
+            try:
+                info = as_mapping(result.get("process_info"), "pane process-info")
+                if get_str(info, "pane_id", "pane process-info") != pane_id:
+                    raise TypeError("returned a different pane identity")
+                foreground_pgid = _get_process_id(
+                    info, "foreground_process_group_id", "pane process-info"
+                )
+                matches: list[dict[str, object]] = []
+                for entry in as_sequence(
+                    info.get("foreground_processes"), "foreground_processes"
+                ):
+                    process = as_mapping(entry, "foreground process")
+                    if _get_process_id(process, "pid", "foreground process") == expected_pid:
+                        matches.append(process)
+                if len(matches) != 1:
+                    raise TypeError(
+                        f"expected one foreground process with pid {expected_pid}, found {len(matches)}"
+                    )
+                raw_argv = as_sequence(matches[0].get("argv"), "foreground process argv")
+                if list(raw_argv) != list(expected_argv):
+                    raise TypeError(
+                        f"pid {expected_pid} argv does not exactly match the recorded launch arguments"
+                    )
+            except TypeError as exc:
+                raise HerdrUnavailable(
+                    f"pane process-info: cannot recover custom harness identity: {exc}"
+                ) from exc
+            observed = self._process_identity(expected_pid)
+            if (observed is None or observed[1] != foreground_pgid
+                    or (observed[0].executable_device, observed[0].executable_inode)
+                    != (expected_device, expected_inode)):
+                raise HerdrUnavailable(
+                    "custom harness recovery did not match the recorded executable and process group"
+                )
+            return observed[0]
+
+        first = observe()
+        second = observe()
+        if second != first:
+            raise HerdrUnavailable("custom harness identity changed during recovery")
+        return first
 
     def agent_pane(self, name: str) -> str:
         """Resolve an exact live Herdr agent name, rejecting a stale pane occupant."""

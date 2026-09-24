@@ -15,7 +15,9 @@ workspace, agent prompt, agent wait, and session inspection APIs.
 
 The manager itself is a short-lived command. Herdr owns an interactive agent's
 terminal process. There is no manager daemon or hosted coordination service to
-keep alive. The manager is independent of shell-command execution utilities.
+keep alive. The bounded `health --watch` loop is an optional liveness observer,
+not a process supervisor: it never starts an agent or replays a prompt. The
+manager is independent of shell-command execution utilities.
 
 Run `agentctl capabilities` to inspect the modes, backends, harnesses, and
 services present in this installation. **The Python distribution includes the
@@ -356,6 +358,16 @@ fails, its retained status record uses a generic diagnostic so terminal-control
 errors cannot copy a value into later status output; the immediate command still
 reports the launch failure to its caller.
 
+New records retain the selected profile name, resolved literal harness
+arguments, non-secret environment variable names, and explicit owned/foreign
+runtime policy. For custom Muse launches they also retain the executable path
+and pinned device/inode before process creation. Environment values are never
+persisted. Launch argv is retained exactly (as the existing `arguments` field
+already was), so secrets must be supplied through environment policy rather
+than command-line arguments. Native Codex and Claude executable selection is
+still delegated to Herdr, so those records identify the Herdr harness kind and
+argv but do not form a complete unattended restart recipe.
+
 ### Adopt an existing Herdr agent
 
 An agent that is already running in Herdr can join the same named registry
@@ -459,6 +471,7 @@ duplicate work; it is not a recovery operation.
 
 ```sh
 agentctl read reviewer --lines 100
+agentctl health reviewer implementer
 agentctl wait reviewer --timeout 60
 agentctl pause reviewer
 agentctl attach reviewer
@@ -469,6 +482,41 @@ agentctl resume reviewer
 that the snapshot is the final answer. `wait` observes readiness, which can occur
 between steps of an active goal. Neither readiness nor successful delivery
 proves completion of the task.
+
+`status` preserves the saved record fields, including `lifecycle`, and adds a
+separate `runtime_state`, `health`, reason, and detection timestamps. A saved
+`lifecycle: "running"` whose pane has returned to a shell is reported as
+`runtime_state: "dead"`, `health: "unhealthy"`, and exits 1. `list` applies the
+same rule to every entry and exits 1 if any entry is non-healthy. Automation
+that needs only the aggregate health document can use `health` directly.
+`health [NAME ...]` checks every requested name independently, or every active
+registry entry when no name is supplied. One malformed or stale record is
+reported as its own `unknown` result and does not suppress later results.
+The aggregate exits zero only when every result is `healthy`; confirmed pane or
+expected-harness disappearance is `unhealthy`, while an unavailable Herdr
+transport is `unknown`. Both non-healthy outcomes exit 1 and are emitted as
+JSON.
+
+Each check atomically updates `.agentctl/NAME/health.json` with the session
+token, exact reason, `first_detected_at`, and `last_checked_at` Unix timestamps.
+The file also retains the most recent unhealthy and unknown reason/timestamp
+after the current condition changes. A record that cannot be loaded or written
+still appears in aggregate output with `recorded: false`.
+
+Use `--watch SECONDS` for a bounded polling process (0 means one check, maximum
+86,400 seconds) and `--interval SECONDS` for its positive delay (default 5,
+maximum 3,600 seconds). The command exits immediately on a non-healthy result
+or successfully after the watch bound. This shape can run from a systemd user
+timer or another service manager without granting restart authority:
+
+```ini
+[Service]
+Type=oneshot
+ExecStart=/absolute/path/agentctl --registry /work/project/.agentctl health --watch 55 --interval 5
+```
+
+The watcher only probes and records health. It never restarts a harness, changes
+the saved lifecycle, drains a queue, or resubmits a prompt.
 
 `pause` blocks automated input through the session manager; it lets an active
 turn finish. `attach` focuses the terminal and does not itself transfer input
@@ -517,6 +565,26 @@ session, and original shell identity must still match the record. An adopted
 record without the shell's boot ID, PID, start ticks, and executable
 device/inode cannot be retired automatically, whether the agent looks live or
 absent.
+
+A custom Muse launch can become live while an early Herdr process snapshot is
+still missing `argv`. New starts retry that transient response until the existing
+startup deadline. For a `launch_failed` Muse record that has a complete owned
+pane and saved launch intent, inspect the pane and recover only the exact process
+you observed. This also reconciles a retry when the exact process identity was
+already persisted but the subsequent pane report failed:
+
+```sh
+agentctl recover-start NAME --expected-token TOKEN --expected-pid PID
+```
+
+This command accepts only that narrow failed-launch shape. It requires the saved
+pane, tab, workspace, and canonical working directory; the supplied PID; the
+complete saved launch argv; and the saved pinned Muse executable image to
+match twice before persisting identity. It then re-verifies that identity before
+reporting the pane and changing lifecycle to `running`. A failure after identity
+persistence remains `launch_failed` but becomes safely stoppable through the
+normal exact-identity path. The command never launches a replacement process or
+replays the initial brief.
 
 A narrowly scoped recovery command exists only for an identity-less
 `herdr-foreign` record whose raw JSON omits `foreign_shell_identity`. Run

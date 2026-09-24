@@ -163,6 +163,38 @@ def test_custom_muse_launch_uses_literal_shell_quoting_and_exact_pane_report() -
     ]
 
 
+def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
+    executable = os.path.realpath("/bin/true")
+    process_probes = 0
+
+    def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal process_probes
+        argv = list(command)
+        if argv[1:3] == ["pane", "process-info"]:
+            process_probes += 1
+            process_argv: object = None if process_probes == 1 else [executable]
+            output = {"result": {"process_info": {
+                "pane_id": "p1", "shell_pid": 10,
+                "foreground_process_group_id": 11,
+                "foreground_processes": [{
+                    "pid": 2_147_483_647, "name": "true", "cmdline": executable,
+                    "argv": process_argv, "executable": executable,
+                }],
+            }}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(output), "")
+        if argv[1:3] == ["pane", "read"]:
+            return subprocess.CompletedProcess(
+                argv, 0, "────────────────\n❯\n────────────────\nAuto-review\n", "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    client = HerdrClient(herdr_bin="fixture-herdr", run=run)
+    client._harness_executable = lambda _kind: executable  # type: ignore[assignment]
+    identity = client.start_pane_agent("worker", "muse", "p1", (), timeout=1)
+    assert identity.pid == 2_147_483_647
+    assert process_probes >= 2
+
+
 def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     prompt = "literal $(unexpanded) delivery\nsecond line"
     header = "Muse Code 1.3.0\n"

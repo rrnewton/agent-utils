@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,11 +15,12 @@ from typing import cast
 
 import pytest
 
-from agentctl import agent
+from agentctl import agent, cli
 import agentctl.subagents as subagents_module
 from agentctl.client import AgentPaneInfo, HerdrClient, Pane, PaneShellProof
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 from agentctl.subagents import ManagedAgents
+from agentctl.sessions import Sessions
 from .test_agentctl_adopt import prepare_legacy_dead, setup_foreign
 from .test_herdr_subagents import FakeManagedClient, setup
 
@@ -40,6 +42,107 @@ def test_start_holds_its_generation_lock_through_brief_and_returned_status(tmp_p
     result = manager.start("worker", cwd=str(tmp_path), brief="this generation's task")
     assert result["lifecycle"] == "running"
     assert fake.submitted == ["this generation's task"]
+
+
+def test_status_output_and_exit_share_one_probe_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    status = {"name": "worker", "lifecycle": "running", "agent_status": "idle"}
+    observation = {
+        "name": "worker", "token": "generation", "lifecycle": "running",
+        "agent_status": "idle", "probe_error": None, "health": "healthy",
+        "runtime_state": "live", "reason_code": "ok", "reason": "live",
+        "first_detected_at": 1.0, "last_checked_at": 1.0,
+        "recorded": True, "record_path": str(tmp_path / "health.json"),
+    }
+    monkeypatch.setattr(
+        Sessions, "status_health_snapshot",
+        lambda self, name: (observation, status),
+    )
+    monkeypatch.setattr(
+        Sessions, "status",
+        lambda self, name: (_ for _ in ()).throw(AssertionError("second probe")),
+    )
+    assert cli.main(["status", "worker", "--registry", str(tmp_path / "registry")]) == 0
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["agent_status"] == "idle"
+    assert rendered["runtime_state"] == "live"
+
+
+def test_list_output_and_exit_share_one_probe_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    observations = [
+        {
+            "name": "alive", "token": "one", "lifecycle": "running",
+            "agent_status": "idle", "probe_error": None, "health": "healthy",
+            "runtime_state": "live", "reason_code": "ok", "reason": "live",
+            "first_detected_at": 1.0, "last_checked_at": 1.0,
+            "recorded": True, "record_path": str(tmp_path / "alive-health.json"),
+        },
+        {
+            "name": "dead", "token": "two", "lifecycle": "running",
+            "agent_status": "unknown", "probe_error": "shell fallback",
+            "health": "unhealthy", "runtime_state": "dead",
+            "reason_code": "expected-harness-missing", "reason": "shell fallback",
+            "first_detected_at": 2.0, "last_checked_at": 2.0,
+            "recorded": True, "record_path": str(tmp_path / "dead-health.json"),
+        },
+    ]
+    statuses = [
+        {"name": "alive", "lifecycle": "running", "agent_status": "idle"},
+        {"name": "dead", "lifecycle": "running", "agent_status": "unknown"},
+    ]
+    monkeypatch.setattr(
+        Sessions, "health_snapshot",
+        lambda self, names: ({"healthy": False, "sessions": observations}, statuses),
+    )
+    monkeypatch.setattr(
+        Sessions, "status",
+        lambda self, name: (_ for _ in ()).throw(AssertionError("second probe")),
+    )
+    assert cli.main(["list", "--registry", str(tmp_path / "registry")]) == 1
+    rendered = json.loads(capsys.readouterr().out)
+    assert [(row["name"], row["runtime_state"]) for row in rendered] == [
+        ("alive", "live"), ("dead", "dead"),
+    ]
+
+
+def test_health_watch_is_bounded_and_stops_at_first_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    now = 0.0
+    calls = 0
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    def health(self: Sessions, names: list[str]) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        unhealthy = calls == 2
+        return {
+            "schema": "agentctl-health/v1", "checked_at": now,
+            "healthy": not unhealthy, "registry_error": None,
+            "sessions": [{"name": names[0], "health": "unhealthy" if unhealthy else "healthy"}],
+        }
+
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    monkeypatch.setattr(time, "sleep", sleep)
+    monkeypatch.setattr(Sessions, "health", health)
+    assert cli.main([
+        "health", "worker", "--watch", "60", "--interval", "5",
+        "--registry", str(tmp_path / "registry"),
+    ]) == 1
+    rendered = json.loads(capsys.readouterr().out)
+    assert calls == 2
+    assert now == 5.0
+    assert rendered["polls"] == 2
+    assert rendered["watch_seconds"] == 60.0
 
 
 def test_start_holds_registry_identity_lock_through_native_session_commit(

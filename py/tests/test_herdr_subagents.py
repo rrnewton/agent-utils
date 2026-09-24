@@ -96,11 +96,18 @@ class FakeManagedClient:
 
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
+        on_launch_intent: Callable[[str, int, int, tuple[str, ...]], None] | None = None,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
     ) -> CustomProcessIdentity:
         assert timeout > 0
         self.launched.append((name, kind, pane_id, arguments))
         self.custom_running = True
+        if on_launch_intent is not None:
+            on_launch_intent(
+                "/opt/agentctl/muse", self.custom_identity.executable_device,
+                self.custom_identity.executable_inode,
+                ("/opt/agentctl/muse", *arguments),
+            )
         if on_observed is not None:
             on_observed(self.custom_identity)
         if self.custom_fails_after_observation:
@@ -110,6 +117,23 @@ class FakeManagedClient:
         )
         self.custom_running = not self.custom_dies_after_report
         return self.custom_identity
+
+    def recover_pane_agent(
+        self, pane_id: str, expected_argv: tuple[str, ...], expected_device: int,
+        expected_inode: int, expected_pid: int,
+    ) -> CustomProcessIdentity:
+        assert pane_id in self.infos
+        assert tuple(expected_argv) == ("/opt/agentctl/muse", *self.launched[-1][3])
+        if (expected_pid != self.custom_identity.pid
+                or expected_device != self.custom_identity.executable_device
+                or expected_inode != self.custom_identity.executable_inode
+                or not self.custom_running):
+            raise HerdrUnavailable("custom harness recovery did not match")
+        return self.custom_identity
+
+    def report_pane_agent(self, pane_id: str, kind: str, state: str) -> None:
+        assert state == "idle"
+        self.infos[pane_id] = replace(self.infos[pane_id], agent=kind, status=state)
 
     def verify_custom_harness(
         self, pane_id: str, kind: str,
@@ -217,6 +241,132 @@ def test_named_workers_share_workspace_but_never_reuse_tabs(tmp_path: Path, monk
     assert len(fake.launched) == 2
 
 
+def test_health_isolates_dead_and_malformed_records_and_persists_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    first = manager.start("dead", cwd=str(tmp_path))
+    manager.start("live", cwd=str(tmp_path), harness="claude")
+    pane = str(first["pane_id"])
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    malformed = manager.registry / "stale"
+    malformed.mkdir(mode=0o700)
+    (malformed / "agent.json").write_text("{}\n", encoding="utf-8")
+    (malformed / "agent.json").chmod(0o600)
+
+    first_check = manager.health(checked_at=100.25)
+    first_sessions = cast(list[dict[str, object]], first_check["sessions"])
+    by_name = {str(item["name"]): item for item in first_sessions}
+    assert first_check["healthy"] is False
+    assert by_name["dead"]["health"] == "unhealthy"
+    assert by_name["dead"]["reason_code"] == "expected-harness-missing"
+    assert "reports agent None, expected 'codex'" in str(by_name["dead"]["reason"])
+    assert by_name["live"]["health"] == "healthy"
+    assert by_name["stale"]["health"] == "unknown"
+    assert by_name["stale"]["recorded"] is False
+
+    second_check = manager.health(["dead", "live"], checked_at=200.5)
+    second_sessions = cast(list[dict[str, object]], second_check["sessions"])
+    second = {str(item["name"]): item for item in second_sessions}["dead"]
+    assert second["first_detected_at"] == 100.25
+    assert second["last_checked_at"] == 200.5
+    durable = json.loads((manager.registry / "dead/health.json").read_text())
+    assert durable["last_unhealthy_at"] == 200.5
+    assert durable["last_unhealthy_reason"] == second["reason"]
+
+
+def test_health_transport_failure_is_unknown_not_proof_of_death(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    fake.offline = True
+    result = manager.health(["worker"], checked_at=123.0)
+    assert result["healthy"] is False
+    session = cast(list[dict[str, object]], result["sessions"])[0]
+    assert session["health"] == "unknown"
+    assert session["reason_code"] == "runtime-probe-failed"
+
+
+def test_health_does_not_call_transient_agent_detector_failure_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path))
+    pane = str(started["pane_id"])
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    fake.custom_at_idle_shell = False
+    result = manager.health(["worker"], checked_at=123.0)
+    session = cast(list[dict[str, object]], result["sessions"])[0]
+    assert session["health"] == "unknown"
+    assert session["runtime_state"] == "unknown"
+    assert session["reason_code"] == "agent-report-missing"
+
+
+def test_health_does_not_call_live_muse_process_probe_failure_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    original_verify = fake.verify_custom_harness
+    calls = 0
+
+    def fail_first_verification(
+        pane_id: str, kind: str,
+        expected_identity: CustomProcessIdentity | None = None,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise HerdrUnavailable("transient process-info response")
+        original_verify(pane_id, kind, expected_identity)
+
+    monkeypatch.setattr(fake, "verify_custom_harness", fail_first_verification)
+    result = manager.health(["worker"], checked_at=123.0)
+    session = cast(list[dict[str, object]], result["sessions"])[0]
+    assert fake.custom_running is True
+    assert fake.infos["w1:p1"].agent == "muse"
+    assert session["health"] == "unknown"
+    assert session["runtime_state"] == "unknown"
+    assert session["reason_code"] == "custom-harness-verification-unconfirmed"
+
+
+@pytest.mark.parametrize("mutation", ["workspace", "tab", "cwd", "session"])
+def test_health_does_not_call_reused_idle_shell_pane_this_generation_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path))
+    pane = str(started["pane_id"])
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    if mutation == "workspace":
+        fake.presentations[0] = replace(fake.presentations[0], workspace_id="replacement")
+        fake.infos[pane] = replace(fake.infos[pane], workspace_id="replacement")
+    elif mutation == "tab":
+        fake.presentations[0] = replace(fake.presentations[0], tab_id="replacement")
+    elif mutation == "cwd":
+        fake.infos[pane] = replace(fake.infos[pane], cwd=str(tmp_path / "replacement"))
+    else:
+        fake.infos[pane] = replace(
+            fake.infos[pane], session_agent="codex", session_value="replacement",
+        )
+
+    result = manager.health(["worker"], checked_at=123.0)
+    session = cast(list[dict[str, object]], result["sessions"])[0]
+    assert session["health"] == "unhealthy"
+    assert session["runtime_state"] == "unknown"
+    assert session["reason_code"] == "runtime-identity-mismatch"
+
+
 def test_harness_arguments_preserve_literals_without_implicit_permission_changes() -> None:
     assert harness_arguments("codex", resume="session", extra=("--config", 'value="$(literal)"')) == (
         "resume", "session", "--no-alt-screen", "--config", 'value="$(literal)"')
@@ -263,6 +413,8 @@ def test_start_sets_environment_only_on_the_created_tab(
     status = manager.start("worker", cwd=str(tmp_path), environment=entries)
     assert fake.environments == [entries]
     assert "environment" not in status
+    assert status["launch_environment_names"] == ["META_CODEX_AI_GATEWAY", "LITERAL"]
+    assert status["runtime_ownership"] == "owned"
     assert all(value not in json.dumps(status) for value in entries)
     saved = json.loads((tmp_path / "registry/worker/agent.json").read_text())
     assert "environment" not in saved
@@ -455,6 +607,66 @@ def test_muse_process_identity_is_saved_before_trust_failure_and_permits_stop(
     assert failed.pane_reported_by_agentctl is False
     assert failed.custom_process_identity == fake.custom_identity
     assert manager.stop("failed")["pane_closed"] is True
+
+
+def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start(
+        "worker", cwd=str(tmp_path), harness="muse", harness_args=("--literal",),
+    )
+    assert started["launch_executable"] == "/opt/agentctl/muse"
+    assert started["launch_argv"] == ["/opt/agentctl/muse", "--literal"]
+    assert started["runtime_ownership"] == "owned"
+    record = replace(
+        manager.get("worker"), lifecycle="launch_failed",
+        custom_process_identity=None, pane_reported_by_agentctl=False,
+        error="transient process-info response",
+    )
+    manager._save(record)
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], agent=None, status="unknown")
+
+    with pytest.raises(AgentDeliveryError, match="replaced"):
+        manager.recover_start(
+            "worker", expected_token="wrong-generation",
+            expected_pid=fake.custom_identity.pid,
+        )
+    with pytest.raises(HerdrUnavailable, match="did not match"):
+        manager.recover_start(
+            "worker", expected_token=str(started["token"]), expected_pid=201,
+        )
+
+    original_report = fake.report_pane_agent
+    report_calls = 0
+
+    def fail_first_report(pane_id: str, kind: str, state: str) -> None:
+        nonlocal report_calls
+        report_calls += 1
+        if report_calls == 1:
+            raise HerdrUnavailable("transient report failure")
+        original_report(pane_id, kind, state)
+
+    monkeypatch.setattr(fake, "report_pane_agent", fail_first_report)
+    with pytest.raises(AgentDeliveryError, match="after identity persistence"):
+        manager.recover_start(
+            "worker", expected_token=str(started["token"]),
+            expected_pid=fake.custom_identity.pid,
+        )
+    partially_recovered = manager.get("worker")
+    assert partially_recovered.lifecycle == "launch_failed"
+    assert partially_recovered.custom_process_identity == fake.custom_identity
+
+    recovered = manager.recover_start(
+        "worker", expected_token=str(started["token"]),
+        expected_pid=fake.custom_identity.pid,
+    )
+    assert recovered["lifecycle"] == "running"
+    assert recovered["probe_error"] is None
+    recovered_identity = cast(dict[str, object], recovered["custom_process_identity"])
+    assert recovered_identity["pid"] == fake.custom_identity.pid
+    assert manager.get("worker").error is None
+    assert fake.submitted == []
 
 
 def test_unreported_starting_muse_without_identity_is_not_assumed_to_own_idle_shell(

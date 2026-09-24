@@ -63,6 +63,24 @@ pub struct CustomProcessIdentity {
     pub executable_inode: u64,
 }
 
+/// Durable custom-launch information emitted before and after process creation.
+#[derive(Clone, Debug)]
+pub enum CustomLaunchObservation {
+    /// Executable and complete argv pinned before the pane launch request.
+    Intent {
+        /// Canonical executable pathname used in argv zero.
+        executable: PathBuf,
+        /// Device number of the opened executable image.
+        device: u64,
+        /// Inode number of the opened executable image.
+        inode: u64,
+        /// Complete literal argv submitted to the pane.
+        argv: Vec<String>,
+    },
+    /// Kernel process generation observed after launch.
+    Process(CustomProcessIdentity),
+}
+
 /// Exact supported idle-shell process generation and kernel executable path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneShellProof {
@@ -1221,6 +1239,55 @@ impl HerdrClient {
             .then_some(observed.identity))
     }
 
+    fn recoverable_custom_harness_observed(
+        &self,
+        pane_id: &str,
+        expected_argv: &[String],
+        expected_device: u64,
+        expected_inode: u64,
+        expected_pid: u64,
+    ) -> Result<CustomProcessIdentity> {
+        let (foreground_process_group_id, processes) =
+            self.foreground_processes(pane_id, &|| false)?;
+        let mut matches = processes
+            .into_iter()
+            .filter(|process| process.get("pid").and_then(Value::as_u64) == Some(expected_pid));
+        let process = matches.next().ok_or_else(|| {
+            AdapterError::unavailable(format!(
+                "expected one foreground process with pid {expected_pid}, found 0"
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(AdapterError::unavailable(format!(
+                "expected one foreground process with pid {expected_pid}, found more than one"
+            )));
+        }
+        let argv = process
+            .get("argv")
+            .and_then(Value::as_array)
+            .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+            .ok_or_else(|| {
+                AdapterError::unavailable(
+                    "foreground process argv is absent or contains a non-string value",
+                )
+            })?;
+        if argv != expected_argv.iter().map(String::as_str).collect::<Vec<_>>() {
+            return Err(AdapterError::unavailable(format!(
+                "pid {expected_pid} argv does not exactly match the recorded launch arguments"
+            )));
+        }
+        let observed = live_custom_process(expected_pid)?;
+        if observed.process_group_id != foreground_process_group_id
+            || observed.identity.executable_device != expected_device
+            || observed.identity.executable_inode != expected_inode
+        {
+            return Err(AdapterError::unavailable(
+                "custom harness recovery did not match the pinned executable and process group",
+            ));
+        }
+        Ok(observed.identity)
+    }
+
     fn recorded_custom_harness_observed(
         &self,
         pane_id: &str,
@@ -1401,7 +1468,7 @@ impl HerdrClient {
         pane_id: &str,
         arguments: &[String],
         timeout: Duration,
-        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
+        persist: &mut dyn FnMut(CustomLaunchObservation) -> Result<()>,
     ) -> Result<()> {
         if timeout.is_zero() || timeout > Duration::from_secs(300) {
             return Err(AdapterError::unavailable(
@@ -1421,6 +1488,12 @@ impl HerdrClient {
         let executable = pin_harness_executable(resolve_harness_executable(kind)?)?;
         let mut command = vec![executable.path.display().to_string()];
         command.extend_from_slice(arguments);
+        persist(CustomLaunchObservation::Intent {
+            executable: executable.path.clone(),
+            device: executable.device,
+            inode: executable.inode,
+            argv: command.clone(),
+        })?;
         let line = shell_join(&command)?;
         self.call_ok(
             &[
@@ -1449,7 +1522,7 @@ impl HerdrClient {
         })?;
         // Persist before trust/readiness/report checks. If any later step fails, stop still has
         // enough kernel identity to close only this observed process's pane.
-        persist_identity(observed.clone())?;
+        persist(CustomLaunchObservation::Process(observed.clone()))?;
         let mut ready = false;
         while Instant::now() < deadline {
             if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
@@ -1500,6 +1573,73 @@ impl HerdrClient {
             &format!("report custom agent {pane_id}"),
         )?;
         Ok(())
+    }
+
+    /// Recover one launch that became live before its first process snapshot was usable.
+    pub fn recover_pane_agent(
+        &self,
+        pane_id: &str,
+        expected_argv: &[String],
+        expected_device: u64,
+        expected_inode: u64,
+        expected_pid: u64,
+    ) -> Result<CustomProcessIdentity> {
+        if expected_pid == 0 || expected_pid > i32::MAX as u64 {
+            return Err(AdapterError::unavailable(
+                "expected custom harness pid is not a positive Linux process id",
+            ));
+        }
+        if expected_argv.is_empty()
+            || expected_argv
+                .iter()
+                .any(|value| value.is_empty() || value.contains('\0'))
+            || expected_device == 0
+            || expected_inode == 0
+        {
+            return Err(AdapterError::unavailable(
+                "saved custom harness launch intent is incomplete",
+            ));
+        }
+        let first = self.recoverable_custom_harness_observed(
+            pane_id,
+            expected_argv,
+            expected_device,
+            expected_inode,
+            expected_pid,
+        )?;
+        let second = self.recoverable_custom_harness_observed(
+            pane_id,
+            expected_argv,
+            expected_device,
+            expected_inode,
+            expected_pid,
+        )?;
+        if second != first {
+            return Err(AdapterError::unavailable(
+                "custom harness identity changed during recovery",
+            ));
+        }
+        Ok(first)
+    }
+
+    /// Publish the pane-local custom harness report after recovery verification.
+    pub fn report_pane_agent(&self, pane_id: &str, kind: &str, state: &str) -> Result<()> {
+        self.call_ok(
+            &strings(&[
+                "pane",
+                "report-agent",
+                pane_id,
+                "--source",
+                "agentctl",
+                "--agent",
+                kind,
+                "--state",
+                state,
+                "--message",
+                "agentctl custom harness",
+            ]),
+            &format!("report custom agent {pane_id}"),
+        )
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn agent_pane(&self, name: &str) -> Result<String> {

@@ -53,6 +53,7 @@ _MAX_U64 = (1 << 64) - 1
 _MAX_AGENT_RECORD_BYTES = 1 << 20
 _MAX_SNAPSHOT_BYTES = 16 << 20
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_HEALTH_SCHEMA = "agentctl-health/v1"
 
 
 def _rename_directory_noreplace_at(
@@ -225,6 +226,13 @@ class AgentRecord:
     pane_reported_by_agentctl: bool = False
     custom_process_identity: CustomProcessIdentity | None = None
     foreign_shell_identity: CustomProcessIdentity | None = None
+    launch_profile: str | None = None
+    launch_executable: str | None = None
+    launch_executable_device: int | None = None
+    launch_executable_inode: int | None = None
+    launch_argv: list[str] = field(default_factory=list)
+    launch_environment_names: list[str] = field(default_factory=list)
+    runtime_ownership: str | None = None
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
     def to_document(self) -> dict[str, object]:
@@ -251,18 +259,46 @@ class AgentRecord:
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
-        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id"):
+        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "launch_profile", "launch_executable", "runtime_ownership"):
             if document.get(key) is not None and not isinstance(document[key], str):
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
         created = document.get("created_at")
         args = document.get("arguments")
         goal_command = document.get("goal_command")
+        launch_argv = document.get("launch_argv", [])
+        launch_environment_names = document.get("launch_environment_names", [])
         if (document.get("schema") != 1 or isinstance(document.get("schema"), bool)
             or document["name"] != name or not isinstance(created, (int, float))
             or isinstance(created, bool) or not math.isfinite(created)
             or re.fullmatch(r"[a-z0-9-]{1,80}", str(document["token"])) is None
-            or not isinstance(args, list) or any(not isinstance(item, str) for item in args)):
+            or not isinstance(args, list) or any(not isinstance(item, str) for item in args)
+            or not isinstance(launch_argv, list)
+            or any(not isinstance(item, str) or not item or "\0" in item for item in launch_argv)
+            or not isinstance(launch_environment_names, list)
+            or any(not isinstance(item, str) or _ENVIRONMENT_NAME.fullmatch(item) is None
+                   for item in launch_environment_names)):
             raise AgentDeliveryError(f"invalid agent record: {path}")
+        for key in ("launch_executable_device", "launch_executable_inode"):
+            value = document.get(key)
+            if (value is not None
+                    and (not isinstance(value, int) or isinstance(value, bool)
+                         or not 1 <= value <= _MAX_U64)):
+                raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
+        if document.get("runtime_ownership") not in (None, "owned", "foreign"):
+            raise AgentDeliveryError(f"invalid runtime ownership in {path}")
+        if ((document.get("launch_executable_device") is None)
+                != (document.get("launch_executable_inode") is None)):
+            raise AgentDeliveryError(f"incomplete launch executable identity in {path}")
+        launch_executable = document.get("launch_executable")
+        if ((launch_executable is None)
+                != (document.get("launch_executable_device") is None)):
+            raise AgentDeliveryError(f"incomplete launch executable intent in {path}")
+        if (launch_executable is not None
+                and (not isinstance(launch_executable, str)
+                     or not os.path.isabs(launch_executable)
+                     or not launch_argv or launch_argv[0] != launch_executable
+                     or document.get("launch_executable_device") is None)):
+            raise AgentDeliveryError(f"invalid launch executable intent in {path}")
         if goal_command is not None and (not isinstance(goal_command, list) or not goal_command
             or any(not isinstance(item, str) or not item or "\0" in item for item in goal_command)):
             raise AgentDeliveryError(f"invalid goal command in agent record: {path}")
@@ -953,6 +989,7 @@ class ManagedAgents:
         brief: str | None = None,
         startup_timeout: float = 30.0, ready_timeout: float = 900.0,
         working_timeout: float = 30.0, max_attempts: int = 3,
+        launch_profile: str | None = None,
     ) -> dict[str, object]:
         """Create one new tab and start its interactive harness without stealing focus.
 
@@ -1002,19 +1039,37 @@ class ManagedAgents:
                 agent._fsync_dir(str(self.registry))
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(),
                                      model=model, resume=resume, arguments=list(arguments),
-                                     adapter="herdr-pane" if harness == "muse" else "herdr")
+                                     adapter="herdr-pane" if harness == "muse" else "herdr",
+                                     launch_profile=launch_profile,
+                                     launch_argv=[harness, *arguments],
+                                     launch_environment_names=[
+                                         entry.partition("=")[0] for entry in environment
+                                     ],
+                                     runtime_ownership="owned")
                 self._save(record)
                 try:
                     self._create_presentation(record, workspace_id, environment)
                     assert record.pane_id is not None
                     if record.adapter == "herdr-pane":
+                        def persist_launch_intent(
+                            executable: str, device: int, inode: int,
+                            argv: tuple[str, ...],
+                        ) -> None:
+                            record.launch_executable = executable
+                            record.launch_executable_device = device
+                            record.launch_executable_inode = inode
+                            record.launch_argv = list(argv)
+                            self._save(record)
+
                         def persist_identity(identity: CustomProcessIdentity) -> None:
                             record.custom_process_identity = identity
                             self._save(record)
 
                         self.client.start_pane_agent(
                             name, harness, record.pane_id, arguments,
-                            timeout=startup_timeout, on_observed=persist_identity,
+                            timeout=startup_timeout,
+                            on_launch_intent=persist_launch_intent,
+                            on_observed=persist_identity,
                         )
                         record.pane_reported_by_agentctl = True
                         self._save(record)
@@ -1144,6 +1199,73 @@ class ManagedAgents:
                 finally:
                     os.close(target_lock)
 
+    def recover_start(
+        self, name: str, *, expected_token: str, expected_pid: int,
+    ) -> dict[str, object]:
+        """Recover or reconcile one exactly identified live Muse process."""
+        with self._lock(name):
+            record = self._load_expected(name, expected_token)
+            if (record.lifecycle != "launch_failed" or record.adapter != "herdr-pane"
+                    or record.harness != "muse" or record.mode != "interactive"
+                    or record.backend != "herdr" or record.runtime_ownership != "owned"
+                    or record.pane_id is None
+                    or record.tab_id is None or record.workspace_id is None
+                    or record.launch_executable is None
+                    or record.launch_executable_device is None
+                    or record.launch_executable_inode is None
+                    or not record.launch_argv
+                    or record.session_agent is not None or record.session_value is not None):
+                raise AgentDeliveryError(
+                    "start recovery requires a launch_failed Muse interactive Herdr "
+                    "record with complete launch intent and pane ownership"
+                )
+            presentations = [
+                pane for pane in self.client.panes()
+                if pane.pane_id == record.pane_id
+            ]
+            if (len(presentations) != 1
+                    or presentations[0].tab_id != record.tab_id
+                    or presentations[0].workspace_id != record.workspace_id):
+                raise AgentDeliveryError(
+                    "refusing start recovery: recorded pane, tab, or workspace ownership changed"
+                )
+            info = self.client.pane_info(record.pane_id)
+            if (info.pane_id != record.pane_id
+                    or info.workspace_id != record.workspace_id
+                    or os.path.realpath(info.cwd) != os.path.realpath(record.cwd)
+                    or info.agent not in (None, record.harness)):
+                raise AgentDeliveryError(
+                    "refusing start recovery: live pane identity or agent report changed"
+                )
+            identity = self.client.recover_pane_agent(
+                record.pane_id, record.launch_argv,
+                record.launch_executable_device, record.launch_executable_inode,
+                expected_pid,
+            )
+            if (record.custom_process_identity is not None
+                    and record.custom_process_identity != identity):
+                raise AgentDeliveryError(
+                    "refusing start recovery: persisted custom process identity changed"
+                )
+            record.custom_process_identity = identity
+            self._save(record)
+            try:
+                self.client.verify_custom_harness(
+                    record.pane_id, record.harness, identity,
+                )
+                self.client.report_pane_agent(record.pane_id, record.harness, "idle")
+                record.pane_reported_by_agentctl = True
+                self._save(record)
+                self._checked(record)
+            except HerdrRunError as exc:
+                record.error = f"start recovery failed after identity persistence: {exc}"
+                self._save(record)
+                raise AgentDeliveryError(record.error) from exc
+            record.lifecycle = "running"
+            record.error = None
+            self._save(record)
+            return self.status(name)
+
     def _adopt_locked(
         self, name: str, directory: Path, root: str, harness: str,
         pane_id: str, info: AgentPaneInfo,
@@ -1236,6 +1358,7 @@ class ManagedAgents:
             session_value=info.session_value,
             adapter="herdr-foreign", mode="interactive", backend="herdr",
             foreign_shell_identity=shell_identity,
+            runtime_ownership="foreign",
         )
         self._save(record)
         try:
@@ -1381,6 +1504,248 @@ class ManagedAgents:
         except HerdrRunError as exc:
             result["agent_status"], result["probe_error"] = "unknown", str(exc)
         return result
+
+    def _classify_health(
+        self, record: AgentRecord, status: dict[str, object],
+    ) -> tuple[str, str, str]:
+        """Classify one status probe without turning control loss into proof of death."""
+        if record.lifecycle != "running":
+            return (
+                "unhealthy",
+                "lifecycle-not-running",
+                f"saved lifecycle is {record.lifecycle!r}, expected 'running'",
+            )
+        probe_error = status.get("probe_error")
+        if probe_error is None:
+            return "healthy", "ok", "expected harness and runtime identity are live"
+        reason = str(probe_error)
+        if record.pane_id is None:
+            return "unhealthy", "pane-identity-missing", reason
+        try:
+            presentations = [
+                pane for pane in self.client.panes()
+                if pane.pane_id == record.pane_id
+            ]
+        except HerdrRunError:
+            return "unknown", "runtime-probe-failed", reason
+        if not presentations:
+            return "unhealthy", "pane-missing", reason
+        if len(presentations) != 1:
+            return "unhealthy", "pane-identity-ambiguous", reason
+        try:
+            info = self.client.pane_info(record.pane_id)
+        except HerdrRunError:
+            return "unknown", "runtime-probe-failed", reason
+        presentation = presentations[0]
+        session_agent_matches = (
+            record.session_agent is None
+            or info.session_agent == record.session_agent
+            or (info.agent is None and info.session_agent is None)
+        )
+        session_value_matches = (
+            record.session_value is None
+            or info.session_value == record.session_value
+            or (info.agent is None and info.session_value is None)
+        )
+        if (presentation.workspace_id != record.workspace_id
+                or presentation.tab_id != record.tab_id
+                or info.pane_id != record.pane_id
+                or info.workspace_id != record.workspace_id
+                or os.path.realpath(info.cwd) != os.path.realpath(record.cwd)
+                or not session_agent_matches or not session_value_matches):
+            return "unhealthy", "runtime-identity-mismatch", reason
+        if info.agent != record.harness:
+            if info.agent is None:
+                if record.adapter == "herdr-pane" and record.custom_process_identity is not None:
+                    try:
+                        self.client.verify_custom_harness(
+                            record.pane_id, record.harness, record.custom_process_identity,
+                        )
+                    except HerdrRunError:
+                        pass
+                    else:
+                        return "unknown", "agent-report-missing", reason
+                try:
+                    if record.adapter == "herdr-foreign" and record.foreign_shell_identity is not None:
+                        shell_fallback = self.client.pane_is_same_idle_shell(
+                            record.pane_id, record.foreign_shell_identity,
+                        )
+                    else:
+                        shell_fallback = self.client.pane_idle_shell_identity(record.pane_id) is not None
+                except HerdrRunError:
+                    return "unknown", "runtime-probe-failed", reason
+                if not shell_fallback:
+                    return "unknown", "agent-report-missing", reason
+            return (
+                "unhealthy",
+                "expected-harness-missing",
+                f"pane {record.pane_id!r} reports agent {info.agent!r}, "
+                f"expected {record.harness!r}; status probe: {reason}",
+            )
+        if record.adapter == "herdr-pane":
+            # The saved process identity may still be live when one process-info
+            # response is incomplete or transport fails. Without positive shell
+            # or alternate-agent proof, this is uncertainty rather than death.
+            return "unknown", "custom-harness-verification-unconfirmed", reason
+        return "unknown", "runtime-probe-failed", reason
+
+    def _persist_health(
+        self, record: AgentRecord, health: str, reason_code: str,
+        reason: str, checked_at: float,
+    ) -> dict[str, object]:
+        """Durably retain the current condition and the last confirmed failure."""
+        path = self._directory(record.name) / "health.json"
+        previous: dict[str, object] = {}
+        if path.exists():
+            try:
+                value = agent._read_queue_json(
+                    str(path), "agent health record", require_private=True,
+                    max_artifact_bytes=64 << 10,
+                )
+                if isinstance(value, dict) and value.get("schema") == _HEALTH_SCHEMA:
+                    previous = cast(dict[str, object], value)
+            except HerdrRunError:
+                # This file is derived health state, not session authority. Replace a
+                # malformed prior observation with the new verified observation.
+                previous = {}
+        same_condition = (
+            previous.get("token") == record.token
+            and previous.get("health") == health
+            and previous.get("reason_code") == reason_code
+            and previous.get("reason") == reason
+        )
+        first_detected_at = previous.get("first_detected_at") if same_condition else checked_at
+        if not isinstance(first_detected_at, (int, float)) or isinstance(first_detected_at, bool):
+            first_detected_at = checked_at
+        runtime_state = (
+            "live" if health == "healthy" else
+            "dead" if reason_code in {
+                "expected-harness-missing", "pane-missing",
+                "runner-not-live",
+            } else
+            "inactive" if reason_code == "lifecycle-not-running" else
+            "unknown"
+        )
+        document: dict[str, object] = {
+            "schema": _HEALTH_SCHEMA,
+            "name": record.name,
+            "token": record.token,
+            "health": health,
+            "runtime_state": runtime_state,
+            "reason_code": reason_code,
+            "reason": reason,
+            "first_detected_at": first_detected_at,
+            "last_checked_at": checked_at,
+        }
+        for key in (
+            "last_unhealthy_at", "last_unhealthy_reason_code", "last_unhealthy_reason",
+            "last_unknown_at", "last_unknown_reason_code", "last_unknown_reason",
+        ):
+            if key in previous:
+                document[key] = previous[key]
+        if health == "unhealthy":
+            document.update(
+                last_unhealthy_at=checked_at,
+                last_unhealthy_reason_code=reason_code,
+                last_unhealthy_reason=reason,
+            )
+        elif health == "unknown":
+            document.update(
+                last_unknown_at=checked_at,
+                last_unknown_reason_code=reason_code,
+                last_unknown_reason=reason,
+            )
+        agent._atomic_json(str(path), document, max_artifact_bytes=64 << 10)
+        return {**document, "recorded": True, "record_path": str(path)}
+
+    def _health_one_result(
+        self, name: str, checked_at: float,
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        """Check and record one name, propagating registry/probe setup errors."""
+        initial = self._load(name)
+        with self._lock(name):
+            record = self._load_expected(name, initial.token)
+            status = self._status_record(record)
+            health, reason_code, reason = self._classify_health(record, status)
+            observation = self._persist_health(
+                record, health, reason_code, reason, checked_at,
+            )
+            observation["lifecycle"] = record.lifecycle
+            observation["agent_status"] = status.get("agent_status")
+            observation["probe_error"] = status.get("probe_error")
+            return observation, status
+
+    def _health_one(
+        self, name: str, checked_at: float,
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        """Check and record one name while isolating it from every other name."""
+        try:
+            return self._health_one_result(name, checked_at)
+        except (HerdrRunError, OSError, ValueError, TypeError) as exc:
+            return {
+                "schema": _HEALTH_SCHEMA,
+                "name": name,
+                "token": None,
+                "health": "unknown",
+                "runtime_state": "unknown",
+                "reason_code": "registry-or-health-error",
+                "reason": str(exc),
+                "first_detected_at": checked_at,
+                "last_checked_at": checked_at,
+                "recorded": False,
+                "record_path": None,
+                "lifecycle": None,
+                "agent_status": None,
+                "probe_error": str(exc),
+            }, None
+
+    def status_health_snapshot(
+        self, name: str, *, checked_at: float | None = None,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        """Return one strict status and its health verdict from the same probe."""
+        observation, status = self._health_one_result(
+            name, time.time() if checked_at is None else checked_at,
+        )
+        assert status is not None
+        return observation, status
+
+    def health_snapshot(
+        self, names: Sequence[str] = (), *, checked_at: float | None = None,
+    ) -> tuple[dict[str, object], list[dict[str, object] | None]]:
+        """Return one aggregate and the exact status snapshot behind each verdict."""
+        now = time.time() if checked_at is None else checked_at
+        requested = sorted(dict.fromkeys(names))
+        registry_error: str | None = None
+        if not requested:
+            if self.registry.exists():
+                try:
+                    agent._validate_private_directory(str(self.registry), "agent registry")
+                    requested = sorted(
+                        path.name for path in self.registry.iterdir()
+                        if _NAME.fullmatch(path.name) and path.name != "archive"
+                    )
+                except (HerdrRunError, OSError) as exc:
+                    registry_error = str(exc)
+        checked = [self._health_one(name, now) for name in requested]
+        sessions = [observation for observation, _status in checked]
+        statuses = [status for _observation, status in checked]
+        healthy = registry_error is None and all(
+            item.get("health") == "healthy" and item.get("recorded") is True
+            for item in sessions
+        )
+        return {
+            "schema": _HEALTH_SCHEMA,
+            "checked_at": now,
+            "healthy": healthy,
+            "registry_error": registry_error,
+            "sessions": sessions,
+        }, statuses
+
+    def health(
+        self, names: Sequence[str] = (), *, checked_at: float | None = None,
+    ) -> dict[str, object]:
+        """Check several names independently and return one machine-readable verdict."""
+        return self.health_snapshot(names, checked_at=checked_at)[0]
 
     def list(self) -> list[dict[str, object]]:
         """List every registered agent; unavailable Herdr is not evidence of death."""

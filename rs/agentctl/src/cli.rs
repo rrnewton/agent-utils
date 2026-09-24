@@ -3,7 +3,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -65,15 +66,25 @@ enum Commands {
         after_help = "Example: agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"
     )]
     Adopt(Adopt),
+    /// Recover or reconcile a failed Muse launch by exact generation and live PID
+    #[command(
+        after_help = "Example: agentctl recover-start reviewer --expected-token TOKEN --expected-pid 12345"
+    )]
+    RecoverStart(RecoverStart),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(after_help = "Example: agentctl stop reviewer")]
     Stop(Stop),
-    /// List registered agents with live status or an explicit probe error
+    /// List registered agents with live health; exit nonzero if any result is non-healthy
     #[command(after_help = "Example: agentctl list --registry .agentctl")]
     List,
-    /// Show durable metadata, queue state, and the live runtime probe
+    /// Show durable metadata and live health; exit nonzero for a non-healthy result
     #[command(after_help = "Example: agentctl status reviewer")]
     Status(Named),
+    /// Check sessions independently; return nonzero unless every result is healthy
+    #[command(
+        after_help = "Example: agentctl health reviewer implementer --watch 300 --interval 5"
+    )]
+    Health(Health),
     /// Persist and deliver a prompt when the agent is ready
     #[command(
         after_help = "Examples:\n  agentctl send reviewer 'Review the diff'\n  agentctl send reviewer --file task.txt --message-id review-1"
@@ -123,6 +134,19 @@ struct Named {
 }
 
 #[derive(Args)]
+struct Health {
+    /// Registered session names; omission checks every active registry entry
+    #[arg(value_name = "NAME")]
+    names: Vec<String>,
+    /// Bounded polling duration in seconds; 0 performs one check
+    #[arg(long, default_value = "0", value_parser = health_watch_seconds)]
+    watch: f64,
+    /// Positive seconds between watch checks
+    #[arg(long, default_value = "5", value_parser = health_interval_seconds)]
+    interval: f64,
+}
+
+#[derive(Args)]
 struct Stop {
     #[command(flatten)]
     agent: Named,
@@ -135,6 +159,18 @@ struct Stop {
     /// Exact lowercase SHA-256 of the identity-less agent.json bytes
     #[arg(long, value_name = "SHA256")]
     expected_record_sha256: Option<String>,
+}
+
+#[derive(Args)]
+struct RecoverStart {
+    #[command(flatten)]
+    agent: Named,
+    /// Exact registry generation printed by status (required)
+    #[arg(long, required = true, value_name = "TOKEN")]
+    expected_token: String,
+    /// Exact live Muse PID whose executable and complete argv must match (required)
+    #[arg(long, required = true, value_name = "PID", value_parser = positive_pid)]
+    expected_pid: u64,
 }
 
 #[derive(Args)]
@@ -537,6 +573,32 @@ fn startup_seconds(value: &str) -> Result<f64, String> {
     }
     Ok(value)
 }
+fn health_watch_seconds(value: &str) -> Result<f64, String> {
+    let value = seconds(value)?;
+    if value > 86_400.0 {
+        return Err("health watch seconds must be at most 86400".to_owned());
+    }
+    Ok(value)
+}
+fn health_interval_seconds(value: &str) -> Result<f64, String> {
+    let value = positive_seconds(value)?;
+    if value > 3_600.0 {
+        return Err("health interval seconds must be at most 3600".to_owned());
+    }
+    Ok(value)
+}
+fn positive_pid(value: &str) -> Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("expected a positive decimal Linux process id".to_owned());
+    }
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "expected a positive decimal Linux process id".to_owned())?;
+    if parsed == 0 || parsed > i32::MAX as u64 {
+        return Err("Linux process id must be between 1 and 2147483647".to_owned());
+    }
+    Ok(parsed)
+}
 fn chat_delivery_seconds(value: &str) -> Result<f64, String> {
     let value = seconds(value)?;
     if value > 30.0 {
@@ -634,6 +696,35 @@ fn write_json(value: &impl Serialize) -> io::Result<()> {
     output.write_all(b"\n")
 }
 
+fn status_with_health(
+    observation: &serde_json::Value,
+    status: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let name = observation["name"].as_str().unwrap_or_default();
+    let mut status = status.cloned().unwrap_or_else(|| {
+        json!({
+            "name": name,
+            "token": observation["token"],
+            "lifecycle": observation["lifecycle"],
+            "agent_status": observation["agent_status"],
+            "probe_error": observation["probe_error"],
+        })
+    });
+    for (destination, source) in [
+        ("health", "health"),
+        ("runtime_state", "runtime_state"),
+        ("health_reason_code", "reason_code"),
+        ("health_reason", "reason"),
+        ("health_first_detected_at", "first_detected_at"),
+        ("health_last_checked_at", "last_checked_at"),
+        ("health_recorded", "recorded"),
+        ("health_record_path", "record_path"),
+    ] {
+        status[destination] = observation[source].clone();
+    }
+    status
+}
+
 fn plugin_discovery_required(command: &Commands) -> bool {
     matches!(command, Commands::Capabilities)
 }
@@ -702,6 +793,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
     let manager = ManagedAgents::new(&client, &args.registry)?;
     let mut result = match command {
         Commands::Start(value) => {
+            let launch_profile = value.profile.clone();
             let (harness, mode, model, reasoning_effort, harness_args, environment) =
                 if let Some(profile_name) = value.profile.as_deref() {
                     let mut overlaps = Vec::new();
@@ -776,6 +868,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 None => value.brief,
             };
             let options = StartOptions {
+                launch_profile,
                 workspace_id: value.workspace_id,
                 harness,
                 model,
@@ -807,6 +900,9 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 session: value.session,
             },
         )?,
+        Commands::RecoverStart(value) => {
+            manager.recover_start(&value.agent.name, &value.expected_token, value.expected_pid)?
+        }
         Commands::Stop(value) => {
             if value.recover_legacy_adoption
                 && (value.expected_token.is_none() || value.expected_record_sha256.is_none())
@@ -830,8 +926,51 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 },
             )?
         }
-        Commands::List => json!(manager.list()?),
-        Commands::Status(value) => manager.status(&value.name)?,
+        Commands::List => {
+            let (aggregate, statuses) = manager.health_snapshot(&[]);
+            let rows = aggregate["sessions"]
+                .as_array()
+                .expect("health sessions array")
+                .iter()
+                .zip(statuses.iter())
+                .map(|(observation, status)| status_with_health(observation, status.as_ref()))
+                .collect::<Vec<_>>();
+            let healthy = aggregate["healthy"] == true;
+            let mut result = json!(rows);
+            add_capabilities(&mut result);
+            write_json(&result).map_err(Failure::Output)?;
+            return Ok(if healthy { 0 } else { 1 });
+        }
+        Commands::Status(value) => {
+            let (observation, status) = manager.status_health_snapshot(&value.name)?;
+            let mut result = status_with_health(&observation, Some(&status));
+            add_capabilities(&mut result);
+            let healthy = observation["health"] == "healthy";
+            write_json(&result).map_err(Failure::Output)?;
+            return Ok(if healthy { 0 } else { 1 });
+        }
+        Commands::Health(value) => {
+            let deadline = Instant::now() + Duration::from_secs_f64(value.watch);
+            let mut polls = 0_u64;
+            let mut health;
+            loop {
+                health = manager.health(&value.names);
+                polls += 1;
+                if health["healthy"] != true || Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(
+                    Duration::from_secs_f64(value.interval)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            health["polls"] = json!(polls);
+            health["watch_seconds"] = json!(value.watch);
+            health["interval_seconds"] = json!(value.interval);
+            let healthy = health["healthy"] == true;
+            write_json(&health).map_err(Failure::Output)?;
+            return Ok(if healthy { 0 } else { 1 });
+        }
         Commands::Send(value) => {
             if value.model.is_some() {
                 return Err(Failure::Usage(

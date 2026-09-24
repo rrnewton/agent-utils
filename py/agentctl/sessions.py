@@ -67,6 +67,7 @@ class Sessions(ManagedAgents):
     def start_session(self, name: str, *, cwd: str, mode: str = "interactive",
                       backend: str = "herdr", harness: str = "codex", model: str | None = None,
                       reasoning_effort: str | None = None,
+                      launch_profile: str | None = None,
                       resume: str | None = None, harness_args: Sequence[str] = (),
                       environment: Sequence[str] = (), brief: str | None = None,
                       workspace_id: str | None = None, startup_timeout: float = 30.0,
@@ -80,6 +81,7 @@ class Sessions(ManagedAgents):
             return super().start(
                 name, cwd=cwd, harness=harness, model=model,
                 reasoning_effort=reasoning_effort, resume=resume,
+                launch_profile=launch_profile,
                 harness_args=harness_args, environment=environment, brief=brief,
                 workspace_id=workspace_id, startup_timeout=startup_timeout,
                 ready_timeout=ready_timeout, working_timeout=working_timeout,
@@ -121,7 +123,10 @@ class Sessions(ManagedAgents):
                     raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
                 directory.mkdir(mode=0o700)
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(), model=model,
-                    adapter="turn-runner", mode=mode, backend=backend, runtime_home=str(directory / "runtime"))
+                    adapter="turn-runner", mode=mode, backend=backend,
+                    runtime_home=str(directory / "runtime"), launch_profile=launch_profile,
+                    launch_argv=[harness, *arguments], launch_environment_names=[],
+                    runtime_ownership="owned")
                 self._save(record)
                 try:
                     response = self._worker(record, "start", cwd=root, harness=harness,
@@ -192,6 +197,39 @@ class Sessions(ManagedAgents):
                 result.update(probe_error=str(exc), agent_status="unknown")
         result["capabilities"] = self._capabilities(record)
         return result
+
+    def _classify_health(
+        self, record: AgentRecord, status: dict[str, object],
+    ) -> tuple[str, str, str]:
+        if record.adapter != "turn-runner":
+            return super()._classify_health(record, status)
+        if record.lifecycle != "running":
+            return (
+                "unhealthy",
+                "lifecycle-not-running",
+                f"saved lifecycle is {record.lifecycle!r}, expected 'running'",
+            )
+        probe_error = status.get("probe_error")
+        if probe_error is not None:
+            reason = str(probe_error)
+            if any(marker in reason.lower() for marker in ("not alive", "dead", "stopped")):
+                return "unhealthy", "runner-not-live", reason
+            return "unknown", "runtime-probe-failed", reason
+        runtime = status.get("runtime")
+        if isinstance(runtime, dict):
+            agents = runtime.get("agents")
+            if isinstance(agents, list) and len(agents) == 1 and isinstance(agents[0], dict):
+                live = agents[0]
+                state = live.get("status")
+                if live.get("runner_alive") is False or state in ("dead", "stopped", "error"):
+                    return (
+                        "unhealthy",
+                        "runner-not-live",
+                        f"runner reports status {state!r} and runner_alive={live.get('runner_alive')!r}",
+                    )
+                if live.get("runner_alive") is True:
+                    return "healthy", "ok", "worker runner is live"
+        return "unknown", "runtime-liveness-unconfirmed", "worker status did not confirm runner liveness"
 
     def send_session(self, name: str, text: str, *, message_id: str | None = None,
                      model: str | None = None, **options: object) -> dict[str, object]:

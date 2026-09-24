@@ -23,14 +23,15 @@ use sha2::{Digest, Sha256};
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
     muse_idle_composer, muse_prompt_in_composer, muse_prompt_transcript_count,
-    muse_startup_metadata, muse_trust_prompt, AgentPaneInfo, CustomProcessIdentity, HerdrClient,
-    Pane, PaneShellProof,
+    muse_startup_metadata, muse_trust_prompt, AgentPaneInfo, CustomLaunchObservation,
+    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 };
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+const HEALTH_SCHEMA: &str = "agentctl-health/v1";
 
 fn rename_directory_noreplace_at(
     source_parent: &File,
@@ -603,10 +604,34 @@ pub trait ManagedApi: AgentApi {
         _pane: &str,
         _args: &[String],
         _timeout: Duration,
-        _persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+        _persist: &mut dyn FnMut(CustomLaunchObservation) -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
         Err(crate::error::AdapterError::unavailable(
             "custom pane harness launch is unavailable",
+        ))
+    }
+    /// Recover or reconcile a custom launch by exact saved argv and live PID.
+    fn recover_pane_agent(
+        &self,
+        _pane: &str,
+        _expected_argv: &[String],
+        _expected_device: u64,
+        _expected_inode: u64,
+        _expected_pid: u64,
+    ) -> crate::error::Result<CustomProcessIdentity> {
+        Err(crate::error::AdapterError::unavailable(
+            "custom pane harness recovery is unavailable",
+        ))
+    }
+    /// Publish one pane-local custom harness status after identity verification.
+    fn report_pane_agent(
+        &self,
+        _pane: &str,
+        _harness: &str,
+        _state: &str,
+    ) -> crate::error::Result<()> {
+        Err(crate::error::AdapterError::unavailable(
+            "custom pane harness reporting is unavailable",
         ))
     }
     /// Require the configured custom harness in one exact foreground pane.
@@ -816,9 +841,34 @@ impl ManagedApi for HerdrClient {
         pane: &str,
         args: &[String],
         timeout: Duration,
-        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+        persist: &mut dyn FnMut(CustomLaunchObservation) -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
-        HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist_identity)
+        HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist)
+    }
+    fn recover_pane_agent(
+        &self,
+        pane: &str,
+        expected_argv: &[String],
+        expected_device: u64,
+        expected_inode: u64,
+        expected_pid: u64,
+    ) -> crate::error::Result<CustomProcessIdentity> {
+        HerdrClient::recover_pane_agent(
+            self,
+            pane,
+            expected_argv,
+            expected_device,
+            expected_inode,
+            expected_pid,
+        )
+    }
+    fn report_pane_agent(
+        &self,
+        pane: &str,
+        harness: &str,
+        state: &str,
+    ) -> crate::error::Result<()> {
+        HerdrClient::report_pane_agent(self, pane, harness, state)
     }
     fn verify_custom_harness(
         &self,
@@ -889,6 +939,20 @@ struct AgentRecord {
     custom_process_identity: Option<CustomProcessIdentity>,
     #[serde(default)]
     foreign_shell_identity: Option<CustomProcessIdentity>,
+    #[serde(default)]
+    launch_profile: Option<String>,
+    #[serde(default)]
+    launch_executable: Option<String>,
+    #[serde(default)]
+    launch_executable_device: Option<u64>,
+    #[serde(default)]
+    launch_executable_inode: Option<u64>,
+    #[serde(default)]
+    launch_argv: Vec<String>,
+    #[serde(default)]
+    launch_environment_names: Vec<String>,
+    #[serde(default)]
+    runtime_ownership: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
     name: String,
@@ -1043,6 +1107,35 @@ impl AgentRecord {
                         || self.pane_id.as_deref().is_none_or(str::is_empty)
                         || !identity.valid()
                 })
+            || self
+                .runtime_ownership
+                .as_deref()
+                .is_some_and(|ownership| !matches!(ownership, "owned" | "foreign"))
+            || self
+                .launch_argv
+                .iter()
+                .any(|value| value.is_empty() || value.contains('\0'))
+            || self.launch_environment_names.iter().any(|value| {
+                value.is_empty()
+                    || !value
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+            || self.launch_executable_device.is_some() != self.launch_executable_inode.is_some()
+            || self.launch_executable.is_some() != self.launch_executable_device.is_some()
+            || self
+                .launch_executable_device
+                .is_some_and(|value| value == 0)
+            || self.launch_executable_inode.is_some_and(|value| value == 0)
+            || self.launch_executable.as_ref().is_some_and(|executable| {
+                !Path::new(executable).is_absolute()
+                    || self.launch_argv.first() != Some(executable)
+                    || self.launch_executable_device.is_none()
+            })
         {
             return Err(fail(format!("invalid agent record: {}", path.display())));
         }
@@ -1643,6 +1736,8 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
 /// Options for a new visible subagent; the working directory is always explicit.
 #[derive(Clone, Debug)]
 pub struct StartOptions {
+    /// Owner-selected launch profile name, without its secret values.
+    pub launch_profile: Option<String>,
     /// Existing workspace ID, or the current workspace / shared `subagents` default.
     pub workspace_id: Option<String>,
     /// Herdr agent kind.
@@ -1666,6 +1761,7 @@ pub struct StartOptions {
 impl Default for StartOptions {
     fn default() -> Self {
         Self {
+            launch_profile: None,
             workspace_id: None,
             harness: "codex".to_owned(),
             model: None,
@@ -2270,6 +2366,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
             foreign_shell_identity: None,
+            launch_profile: options.launch_profile.clone(),
+            launch_executable: None,
+            launch_executable_device: None,
+            launch_executable_inode: None,
+            launch_argv: std::iter::once(options.harness.clone())
+                .chain(arguments.iter().cloned())
+                .collect(),
+            launch_environment_names: options
+                .environment
+                .iter()
+                .filter_map(|entry| entry.split_once('=').map(|(name, _)| name.to_owned()))
+                .collect(),
+            runtime_ownership: Some("owned".to_owned()),
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -2315,6 +2424,116 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if let Some(brief) = options.brief {
             self.send_record(&record, &brief, options.delivery, None)?;
         }
+        self.status(agent_name)
+    }
+
+    /// Recover or reconcile one exactly identified live Muse process.
+    pub fn recover_start(
+        &self,
+        agent_name: &str,
+        expected_token: &str,
+        expected_pid: u64,
+    ) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let mut record = self.load(agent_name)?;
+        if record.token != expected_token {
+            return Err(fail(format!(
+                "agent {agent_name:?} was replaced before start recovery"
+            )));
+        }
+        if record.lifecycle != "launch_failed"
+            || record.adapter != "herdr-pane"
+            || record.harness != "muse"
+            || record.mode != "interactive"
+            || record.backend != "herdr"
+            || record.runtime_ownership.as_deref() != Some("owned")
+            || record.pane_id.is_none()
+            || record.tab_id.is_none()
+            || record.workspace_id.is_none()
+            || record.launch_executable.is_none()
+            || record.launch_executable_device.is_none()
+            || record.launch_executable_inode.is_none()
+            || record.launch_argv.is_empty()
+            || record.session_agent.is_some()
+            || record.session_value.is_some()
+        {
+            return Err(fail(
+                "start recovery requires a launch_failed Muse interactive Herdr record with complete launch intent and pane ownership",
+            ));
+        }
+        let pane_id = record.pane_id.clone().expect("checked pane identity");
+        let presentations = self
+            .client
+            .panes()?
+            .into_iter()
+            .filter(|pane| pane.pane_id == pane_id)
+            .collect::<Vec<_>>();
+        if presentations.len() != 1
+            || Some(&presentations[0].tab_id) != record.tab_id.as_ref()
+            || Some(&presentations[0].workspace_id) != record.workspace_id.as_ref()
+        {
+            return Err(fail(
+                "refusing start recovery: recorded pane, tab, or workspace ownership changed",
+            ));
+        }
+        let info = self.client.pane_info(&pane_id)?;
+        let cwd_matches = fs::canonicalize(&info.cwd)
+            .ok()
+            .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+        if info.pane_id != pane_id
+            || Some(&info.workspace_id) != record.workspace_id.as_ref()
+            || !cwd_matches
+            || info
+                .agent
+                .as_deref()
+                .is_some_and(|agent| agent != record.harness)
+        {
+            return Err(fail(
+                "refusing start recovery: live pane identity or agent report changed",
+            ));
+        }
+        let identity = self.client.recover_pane_agent(
+            &pane_id,
+            &record.launch_argv,
+            record
+                .launch_executable_device
+                .expect("checked launch executable device"),
+            record
+                .launch_executable_inode
+                .expect("checked launch executable inode"),
+            expected_pid,
+        )?;
+        if record
+            .custom_process_identity
+            .as_ref()
+            .is_some_and(|persisted| persisted != &identity)
+        {
+            return Err(fail(
+                "refusing start recovery: persisted custom process identity changed",
+            ));
+        }
+        record.custom_process_identity = Some(identity.clone());
+        self.save(&record)?;
+        let final_check = (|| -> Result<()> {
+            self.client
+                .verify_custom_harness(&pane_id, &record.harness, Some(&identity))?;
+            self.client
+                .report_pane_agent(&pane_id, &record.harness, "idle")?;
+            record.pane_reported_by_agentctl = true;
+            self.save(&record)?;
+            self.checked(&record)?;
+            Ok(())
+        })();
+        if let Err(error) = final_check {
+            record.error = Some(format!(
+                "start recovery failed after identity persistence: {error}"
+            ));
+            self.save(&record)?;
+            return Err(fail(record.error.clone().expect("saved recovery error")));
+        }
+        record.lifecycle = "running".to_owned();
+        record.error = None;
+        self.save(&record)?;
         self.status(agent_name)
     }
 
@@ -2510,6 +2729,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
             foreign_shell_identity: Some(shell_identity.clone()),
+            launch_profile: None,
+            launch_executable: None,
+            launch_executable_device: None,
+            launch_executable_inode: None,
+            launch_argv: Vec::new(),
+            launch_environment_names: Vec::new(),
+            runtime_ownership: Some("foreign".to_owned()),
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -2609,11 +2835,26 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 &pane_id,
                 &arguments,
                 options.startup_timeout,
-                &mut |identity| {
-                    record.custom_process_identity = Some(identity);
+                &mut |observation| {
+                    match observation {
+                        CustomLaunchObservation::Intent {
+                            executable,
+                            device,
+                            inode,
+                            argv,
+                        } => {
+                            record.launch_executable = Some(executable.display().to_string());
+                            record.launch_executable_device = Some(device);
+                            record.launch_executable_inode = Some(inode);
+                            record.launch_argv = argv;
+                        }
+                        CustomLaunchObservation::Process(identity) => {
+                            record.custom_process_identity = Some(identity);
+                        }
+                    }
                     self.save(record).map_err(|error| {
                         crate::error::AdapterError::unavailable(format!(
-                            "cannot persist custom process identity: {error}"
+                            "cannot persist custom launch identity: {error}"
                         ))
                     })
                 },
@@ -2915,6 +3156,360 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         Ok(result)
+    }
+
+    fn classify_health(&self, record: &AgentRecord, status: &Value) -> (String, String, String) {
+        if record.lifecycle != "running" {
+            return (
+                "unhealthy".to_owned(),
+                "lifecycle-not-running".to_owned(),
+                format!(
+                    "saved lifecycle is {:?}, expected 'running'",
+                    record.lifecycle
+                ),
+            );
+        }
+        let Some(reason) = status.get("probe_error").and_then(Value::as_str) else {
+            return (
+                "healthy".to_owned(),
+                "ok".to_owned(),
+                "expected harness and runtime identity are live".to_owned(),
+            );
+        };
+        let reason = reason.to_owned();
+        let Some(pane_id) = record.pane_id.as_deref() else {
+            return (
+                "unhealthy".to_owned(),
+                "pane-identity-missing".to_owned(),
+                reason,
+            );
+        };
+        let presentations = match self.client.panes() {
+            Ok(panes) => panes
+                .into_iter()
+                .filter(|pane| pane.pane_id == pane_id)
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                return (
+                    "unknown".to_owned(),
+                    "runtime-probe-failed".to_owned(),
+                    reason,
+                )
+            }
+        };
+        if presentations.is_empty() {
+            return ("unhealthy".to_owned(), "pane-missing".to_owned(), reason);
+        }
+        if presentations.len() != 1 {
+            return (
+                "unhealthy".to_owned(),
+                "pane-identity-ambiguous".to_owned(),
+                reason,
+            );
+        }
+        let info = match self.client.pane_info(pane_id) {
+            Ok(info) => info,
+            Err(_) => {
+                return (
+                    "unknown".to_owned(),
+                    "runtime-probe-failed".to_owned(),
+                    reason,
+                )
+            }
+        };
+        let presentation = &presentations[0];
+        let session_agent_matches = record.session_agent.as_ref().is_none_or(|expected| {
+            info.session_agent.as_ref() == Some(expected)
+                || (info.agent.is_none() && info.session_agent.is_none())
+        });
+        let session_value_matches = record.session_value.as_ref().is_none_or(|expected| {
+            info.session_value.as_ref() == Some(expected)
+                || (info.agent.is_none() && info.session_value.is_none())
+        });
+        let cwd_matches = fs::canonicalize(&info.cwd)
+            .ok()
+            .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+        if Some(&presentation.workspace_id) != record.workspace_id.as_ref()
+            || Some(&presentation.tab_id) != record.tab_id.as_ref()
+            || info.pane_id != pane_id
+            || Some(&info.workspace_id) != record.workspace_id.as_ref()
+            || !cwd_matches
+            || !session_agent_matches
+            || !session_value_matches
+        {
+            return (
+                "unhealthy".to_owned(),
+                "runtime-identity-mismatch".to_owned(),
+                reason,
+            );
+        }
+        if info.agent.as_deref() != Some(record.harness.as_str()) {
+            if info.agent.is_none() {
+                if record.adapter == "herdr-pane"
+                    && record.custom_process_identity.is_some()
+                    && self
+                        .client
+                        .verify_custom_harness(
+                            pane_id,
+                            &record.harness,
+                            record.custom_process_identity.as_ref(),
+                        )
+                        .is_ok()
+                {
+                    return (
+                        "unknown".to_owned(),
+                        "agent-report-missing".to_owned(),
+                        reason,
+                    );
+                }
+                let shell_fallback = if record.adapter == "herdr-foreign" {
+                    match record.foreign_shell_identity.as_ref() {
+                        Some(identity) => {
+                            self.client.pane_is_same_idle_shell(pane_id, identity).ok()
+                        }
+                        None => None,
+                    }
+                } else {
+                    self.client
+                        .pane_idle_shell_identity(pane_id)
+                        .ok()
+                        .map(|proof| proof.is_some())
+                };
+                if shell_fallback != Some(true) {
+                    return (
+                        "unknown".to_owned(),
+                        "agent-report-missing".to_owned(),
+                        reason,
+                    );
+                }
+            }
+            let reported = info
+                .agent
+                .as_deref()
+                .map_or_else(|| "None".to_owned(), |agent| format!("'{agent}'"));
+            return (
+                "unhealthy".to_owned(),
+                "expected-harness-missing".to_owned(),
+                format!(
+                    "pane '{pane_id}' reports agent {reported}, expected '{}'; status probe: {reason}",
+                    record.harness
+                ),
+            );
+        }
+        if record.adapter == "herdr-pane" {
+            // The saved process identity may still be live when one process-info
+            // response is incomplete or transport fails. Without positive shell
+            // or alternate-agent proof, this is uncertainty rather than death.
+            return (
+                "unknown".to_owned(),
+                "custom-harness-verification-unconfirmed".to_owned(),
+                reason,
+            );
+        }
+        (
+            "unknown".to_owned(),
+            "runtime-probe-failed".to_owned(),
+            reason,
+        )
+    }
+
+    fn persist_health(
+        &self,
+        record: &AgentRecord,
+        health: &str,
+        reason_code: &str,
+        reason: &str,
+        checked_at: f64,
+    ) -> Result<Value> {
+        let path = self.directory(&record.name)?.join("health.json");
+        let previous = if path.exists() {
+            agent::read_private_json(&path)
+                .ok()
+                .filter(|value| value["schema"] == HEALTH_SCHEMA)
+                .unwrap_or_else(|| json!({}))
+        } else {
+            json!({})
+        };
+        let same_condition = previous["token"] == record.token
+            && previous["health"] == health
+            && previous["reason_code"] == reason_code
+            && previous["reason"] == reason;
+        let first_detected_at = if same_condition {
+            previous["first_detected_at"].as_f64().unwrap_or(checked_at)
+        } else {
+            checked_at
+        };
+        let runtime_state = if health == "healthy" {
+            "live"
+        } else if matches!(
+            reason_code,
+            "expected-harness-missing" | "pane-missing" | "runner-not-live"
+        ) {
+            "dead"
+        } else if reason_code == "lifecycle-not-running" {
+            "inactive"
+        } else {
+            "unknown"
+        };
+        let mut document = json!({
+            "schema": HEALTH_SCHEMA,
+            "name": record.name,
+            "token": record.token,
+            "health": health,
+            "runtime_state": runtime_state,
+            "reason_code": reason_code,
+            "reason": reason,
+            "first_detected_at": first_detected_at,
+            "last_checked_at": checked_at,
+        });
+        for key in [
+            "last_unhealthy_at",
+            "last_unhealthy_reason_code",
+            "last_unhealthy_reason",
+            "last_unknown_at",
+            "last_unknown_reason_code",
+            "last_unknown_reason",
+        ] {
+            if !previous[key].is_null() {
+                document[key] = previous[key].clone();
+            }
+        }
+        if health == "unhealthy" {
+            document["last_unhealthy_at"] = json!(checked_at);
+            document["last_unhealthy_reason_code"] = json!(reason_code);
+            document["last_unhealthy_reason"] = json!(reason);
+        } else if health == "unknown" {
+            document["last_unknown_at"] = json!(checked_at);
+            document["last_unknown_reason_code"] = json!(reason_code);
+            document["last_unknown_reason"] = json!(reason);
+        }
+        agent::atomic_json(&path, &document)?;
+        document["recorded"] = json!(true);
+        document["record_path"] = json!(path);
+        Ok(document)
+    }
+
+    fn health_one_result(
+        &self,
+        agent_name: &str,
+        checked_at: f64,
+    ) -> Result<(Value, Option<Value>)> {
+        let initial = self.load(agent_name)?;
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        if record.token != initial.token {
+            return Err(fail(format!(
+                "agent {agent_name:?} was replaced before health check"
+            )));
+        }
+        let status = self.status_record(&record)?;
+        let (health, reason_code, reason) = self.classify_health(&record, &status);
+        let mut observation =
+            self.persist_health(&record, &health, &reason_code, &reason, checked_at)?;
+        observation["lifecycle"] = json!(record.lifecycle);
+        observation["agent_status"] = status["agent_status"].clone();
+        observation["probe_error"] = status["probe_error"].clone();
+        Ok((observation, Some(status)))
+    }
+
+    fn health_one(&self, agent_name: &str, checked_at: f64) -> (Value, Option<Value>) {
+        self.health_one_result(agent_name, checked_at)
+            .unwrap_or_else(|error| {
+                (
+                    json!({
+                        "schema": HEALTH_SCHEMA,
+                        "name": agent_name,
+                        "token": Value::Null,
+                        "health": "unknown",
+                        "runtime_state": "unknown",
+                        "reason_code": "registry-or-health-error",
+                        "reason": error.to_string(),
+                        "first_detected_at": checked_at,
+                        "last_checked_at": checked_at,
+                        "recorded": false,
+                        "record_path": Value::Null,
+                        "lifecycle": Value::Null,
+                        "agent_status": Value::Null,
+                        "probe_error": error.to_string(),
+                    }),
+                    None,
+                )
+            })
+    }
+
+    /// Return one strict status and its health verdict from the same probe.
+    pub(crate) fn status_health_snapshot(&self, agent_name: &str) -> Result<(Value, Value)> {
+        let checked_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let (observation, status) = self.health_one_result(agent_name, checked_at)?;
+        Ok((
+            observation,
+            status.expect("successful health probe always includes its status snapshot"),
+        ))
+    }
+
+    /// Return one aggregate and the exact status snapshot behind each verdict.
+    pub(crate) fn health_snapshot(&self, requested: &[String]) -> (Value, Vec<Option<Value>>) {
+        let checked_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut names = requested.to_vec();
+        names.sort();
+        names.dedup();
+        let mut registry_error = None;
+        if names.is_empty() && self.registry.exists() {
+            let discovered = (|| -> Result<Vec<String>> {
+                agent::validate_private_directory(&self.registry, "agent registry", false)?;
+                let mut names = fs::read_dir(&self.registry)
+                    .map_err(|error| fail(error.to_string()))?
+                    .map(|entry| {
+                        entry.map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|error| fail(error.to_string()))?;
+                names.retain(|value| name(value).is_ok());
+                names.sort();
+                Ok(names)
+            })();
+            match discovered {
+                Ok(discovered) => names = discovered,
+                Err(error) => registry_error = Some(error.to_string()),
+            }
+        }
+        let checked = names
+            .iter()
+            .map(|name| self.health_one(name, checked_at))
+            .collect::<Vec<_>>();
+        let sessions = checked
+            .iter()
+            .map(|(observation, _status)| observation.clone())
+            .collect::<Vec<_>>();
+        let statuses = checked
+            .into_iter()
+            .map(|(_observation, status)| status)
+            .collect::<Vec<_>>();
+        let healthy = registry_error.is_none()
+            && sessions
+                .iter()
+                .all(|session| session["health"] == "healthy" && session["recorded"] == true);
+        (
+            json!({
+                "schema": HEALTH_SCHEMA,
+                "checked_at": checked_at,
+                "healthy": healthy,
+                "registry_error": registry_error,
+                "sessions": sessions,
+            }),
+            statuses,
+        )
+    }
+
+    /// Independently check selected names, or every active registry entry when empty.
+    pub fn health(&self, requested: &[String]) -> Value {
+        self.health_snapshot(requested).0
     }
 
     /// List every registered agent, preserving records when Herdr is unavailable.
@@ -4688,6 +5283,8 @@ mod tests {
                     custom_alive: AtomicBool::new(false),
                     custom_dies_after_report: AtomicBool::new(false),
                     custom_fails_after_identity: AtomicBool::new(false),
+                    fail_custom_report_once: AtomicBool::new(false),
+                    fail_custom_verify_once: AtomicBool::new(false),
                     custom_at_idle_shell: AtomicBool::new(true),
                     foreign_shell_identity: Mutex::new(Fake::foreign_shell_identity()),
                     foreign_shell_path: Mutex::new(PathBuf::from("/bin/bash")),
@@ -4822,6 +5419,8 @@ mod tests {
         custom_alive: AtomicBool,
         custom_dies_after_report: AtomicBool,
         custom_fails_after_identity: AtomicBool,
+        fail_custom_report_once: AtomicBool,
+        fail_custom_verify_once: AtomicBool,
         custom_at_idle_shell: AtomicBool,
         foreign_shell_identity: Mutex<CustomProcessIdentity>,
         foreign_shell_path: Mutex<PathBuf>,
@@ -5122,13 +5721,21 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
-            _: &[String],
+            args: &[String],
             _: Duration,
-            persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> AdapterResult<()>,
+            persist: &mut dyn FnMut(CustomLaunchObservation) -> AdapterResult<()>,
         ) -> AdapterResult<()> {
             self.started.store(true, Ordering::Relaxed);
             self.custom_alive.store(true, Ordering::Relaxed);
-            persist_identity(Self::custom_identity())?;
+            persist(CustomLaunchObservation::Intent {
+                executable: PathBuf::from("/opt/agentctl/muse"),
+                device: Self::custom_identity().executable_device,
+                inode: Self::custom_identity().executable_inode,
+                argv: std::iter::once("/opt/agentctl/muse".to_owned())
+                    .chain(args.iter().cloned())
+                    .collect(),
+            })?;
+            persist(CustomLaunchObservation::Process(Self::custom_identity()))?;
             if self.custom_fails_after_identity.load(Ordering::Relaxed) {
                 let record =
                     agent::read_private_json(&self.root.join("registry/worker/agent.json"))
@@ -5146,12 +5753,47 @@ mod tests {
             );
             Ok(())
         }
+        fn recover_pane_agent(
+            &self,
+            _: &str,
+            expected_argv: &[String],
+            expected_device: u64,
+            expected_inode: u64,
+            expected_pid: u64,
+        ) -> AdapterResult<CustomProcessIdentity> {
+            if expected_argv.first().map(String::as_str) == Some("/opt/agentctl/muse")
+                && expected_device == Self::custom_identity().executable_device
+                && expected_inode == Self::custom_identity().executable_inode
+                && expected_pid == Self::custom_identity().pid
+                && self.custom_alive.load(Ordering::Relaxed)
+            {
+                Ok(Self::custom_identity())
+            } else {
+                Err(AdapterError::unavailable(
+                    "custom harness recovery did not match",
+                ))
+            }
+        }
+        fn report_pane_agent(&self, _: &str, harness: &str, state: &str) -> AdapterResult<()> {
+            if self.fail_custom_report_once.swap(false, Ordering::Relaxed) {
+                return Err(AdapterError::unavailable("transient report failure"));
+            }
+            if harness != "muse" || state != "idle" {
+                return Err(AdapterError::unavailable("invalid custom harness report"));
+            }
+            self.custom_reported.store(true, Ordering::Relaxed);
+            self.started.store(true, Ordering::Relaxed);
+            Ok(())
+        }
         fn verify_custom_harness(
             &self,
             _: &str,
             _: &str,
             identity: Option<&CustomProcessIdentity>,
         ) -> AdapterResult<()> {
+            if self.fail_custom_verify_once.swap(false, Ordering::Relaxed) {
+                return Err(AdapterError::unavailable("transient process-info response"));
+            }
             if self.custom_alive.load(Ordering::Relaxed)
                 && identity.is_none_or(|identity| identity == &Self::custom_identity())
             {
@@ -5230,6 +5872,229 @@ mod tests {
     }
 
     #[test]
+    fn health_isolates_dead_and_malformed_records_and_persists_detection() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let stale = fixture.root.join("registry/stale");
+        fs::create_dir(&stale).unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(stale.join("agent.json"), b"{}\n").unwrap();
+        fs::set_permissions(stale.join("agent.json"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let health = fixture
+            .manager()
+            .health(&["stale".to_owned(), "worker".to_owned()]);
+        assert_eq!(health["healthy"], false);
+        let sessions = health["sessions"].as_array().unwrap();
+        let dead = sessions
+            .iter()
+            .find(|value| value["name"] == "worker")
+            .unwrap();
+        let stale = sessions
+            .iter()
+            .find(|value| value["name"] == "stale")
+            .unwrap();
+        assert_eq!(dead["health"], "unhealthy");
+        assert_eq!(dead["reason_code"], "expected-harness-missing");
+        assert!(dead["reason"]
+            .as_str()
+            .unwrap()
+            .contains("reports agent None, expected 'codex'"));
+        assert_eq!(stale["health"], "unknown");
+        assert_eq!(stale["recorded"], false);
+        let durable =
+            agent::read_private_json(&fixture.root.join("registry/worker/health.json")).unwrap();
+        assert_eq!(durable["schema"], HEALTH_SCHEMA);
+        assert_eq!(durable["last_unhealthy_reason"], dead["reason"]);
+    }
+
+    #[test]
+    fn health_transport_failure_is_unknown_not_proof_of_death() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture.client.fail_panes.store(true, Ordering::Relaxed);
+        let health = fixture.manager().health(&["worker".to_owned()]);
+        assert_eq!(health["healthy"], false);
+        assert_eq!(health["sessions"][0]["health"], "unknown");
+        assert_eq!(health["sessions"][0]["reason_code"], "runtime-probe-failed");
+    }
+
+    #[test]
+    fn health_does_not_call_transient_agent_detector_failure_dead() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .custom_at_idle_shell
+            .store(false, Ordering::Relaxed);
+        let health = fixture.manager().health(&["worker".to_owned()]);
+        assert_eq!(health["healthy"], false);
+        assert_eq!(health["sessions"][0]["health"], "unknown");
+        assert_eq!(health["sessions"][0]["runtime_state"], "unknown");
+        assert_eq!(health["sessions"][0]["reason_code"], "agent-report-missing");
+    }
+
+    #[test]
+    fn health_does_not_call_live_muse_process_probe_failure_dead() {
+        let fixture = Fixture::new();
+        fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        fixture
+            .client
+            .fail_custom_verify_once
+            .store(true, Ordering::Relaxed);
+        let health = fixture.manager().health(&["worker".to_owned()]);
+        assert!(fixture.client.custom_alive.load(Ordering::Relaxed));
+        assert!(fixture.client.custom_reported.load(Ordering::Relaxed));
+        assert_eq!(health["sessions"][0]["health"], "unknown");
+        assert_eq!(health["sessions"][0]["runtime_state"], "unknown");
+        assert_eq!(
+            health["sessions"][0]["reason_code"],
+            "custom-harness-verification-unconfirmed"
+        );
+    }
+
+    #[test]
+    fn health_does_not_call_reused_idle_shell_pane_this_generation_dead() {
+        for mutation in ["workspace", "tab", "cwd", "session"] {
+            let fixture = Fixture::new();
+            fixture.start(None);
+            fixture.client.started.store(false, Ordering::Relaxed);
+            fixture
+                .client
+                .report_session
+                .store(false, Ordering::Relaxed);
+            match mutation {
+                "workspace" => {
+                    fixture.client.panes.lock().unwrap()[0].workspace_id = "replacement".to_owned();
+                }
+                "tab" => {
+                    fixture.client.panes.lock().unwrap()[0].tab_id = "replacement".to_owned();
+                }
+                "cwd" => {
+                    fs::create_dir(fixture.root.join("other")).unwrap();
+                    fixture
+                        .client
+                        .wrong_foreign_cwd
+                        .store(true, Ordering::Relaxed);
+                }
+                "session" => {
+                    fixture
+                        .client
+                        .change_owned_session_after_save
+                        .store(true, Ordering::Relaxed);
+                }
+                _ => unreachable!(),
+            }
+            let health = fixture.manager().health(&["worker".to_owned()]);
+            assert_eq!(health["sessions"][0]["health"], "unhealthy", "{mutation}");
+            assert_eq!(
+                health["sessions"][0]["runtime_state"], "unknown",
+                "{mutation}"
+            );
+            assert_eq!(
+                health["sessions"][0]["reason_code"], "runtime-identity-mismatch",
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    harness_args: vec!["--literal".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(started["launch_executable"], "/opt/agentctl/muse");
+        assert_eq!(
+            started["launch_argv"],
+            json!(["/opt/agentctl/muse", "--literal"])
+        );
+        assert_eq!(started["runtime_ownership"], "owned");
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut record = agent::read_private_json(&path).unwrap();
+        record["lifecycle"] = json!("launch_failed");
+        record["custom_process_identity"] = Value::Null;
+        record["pane_reported_by_agentctl"] = json!(false);
+        record["session_agent"] = Value::Null;
+        record["session_value"] = Value::Null;
+        record["error"] = json!("transient process-info response");
+        agent::atomic_json(&path, &record).unwrap();
+        fixture
+            .client
+            .custom_reported
+            .store(false, Ordering::Relaxed);
+        fixture.client.started.store(false, Ordering::Relaxed);
+
+        assert!(manager
+            .recover_start(
+                "worker",
+                started["token"].as_str().unwrap(),
+                Fake::custom_identity().pid + 1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("did not match"));
+        fixture
+            .client
+            .fail_custom_report_once
+            .store(true, Ordering::Relaxed);
+        assert!(manager
+            .recover_start(
+                "worker",
+                started["token"].as_str().unwrap(),
+                Fake::custom_identity().pid,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("after identity persistence"));
+        let partial = agent::read_private_json(&path).unwrap();
+        assert_eq!(partial["lifecycle"], "launch_failed");
+        assert_eq!(partial["custom_process_identity"]["pid"], 4242);
+        let recovered = manager
+            .recover_start(
+                "worker",
+                started["token"].as_str().unwrap(),
+                Fake::custom_identity().pid,
+            )
+            .unwrap();
+        assert_eq!(recovered["lifecycle"], "running");
+        assert!(recovered["probe_error"].is_null());
+        assert_eq!(recovered["custom_process_identity"]["pid"], 4242);
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn environment_entries_preserve_literals_and_reject_invalid_input() {
         let entries = vec![
             "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai".to_owned(),
@@ -5276,6 +6141,11 @@ mod tests {
         assert_eq!(observed.as_slice(), std::slice::from_ref(&entries));
         drop(observed);
         assert!(status.get("environment").is_none());
+        assert_eq!(
+            status["launch_environment_names"],
+            json!(["META_CODEX_AI_GATEWAY", "LITERAL"])
+        );
+        assert_eq!(status["runtime_ownership"], "owned");
         for entry in entries {
             assert!(!status.to_string().contains(&entry));
         }
