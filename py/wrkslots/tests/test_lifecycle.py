@@ -23207,6 +23207,7 @@ def test_abort_create_refuses_source_hidden_inside_submodule(
             "unfetched-configured-remote-ref",
             "repository-local ref refs/remotes/origin/preserve-local",
         ),
+        ("local-tag", "repository-local ref refs/tags/preserve-local"),
     ),
 )
 def test_abort_create_refuses_submodule_repository_only_authored_state(
@@ -23233,8 +23234,6 @@ def test_abort_create_refuses_submodule_repository_only_authored_state(
     assert refused.returncode == 3
     tree = checkout(project)
     component = tree / "component"
-    git(component, "config", "user.name", "Wrkslots Test")
-    git(component, "config", "user.email", "wrkslots@example.invalid")
     original_head = git(component, "rev-parse", "HEAD").stdout.strip()
     preserved_head: str | None = None
     external = tmp_path / "external-component-worktree"
@@ -23252,7 +23251,16 @@ def test_abort_create_refuses_submodule_repository_only_authored_state(
             "unreachable authored source\n", encoding="utf-8"
         )
         git(component, "add", "component.txt")
-        git(component, "commit", "-m", "preserve unreachable source")
+        git(
+            component,
+            "-c",
+            "user.name=Wrkslots Test",
+            "-c",
+            "user.email=wrkslots@example.invalid",
+            "commit",
+            "-m",
+            "preserve unreachable source",
+        )
         git(component, "reset", "--hard", original_head)
     elif repository_state in {
         "unconfigured-remote-ref",
@@ -23262,7 +23270,16 @@ def test_abort_create_refuses_submodule_repository_only_authored_state(
             "remote-looking authored source\n", encoding="utf-8"
         )
         git(component, "add", "component.txt")
-        git(component, "commit", "-m", "preserve remote-looking source")
+        git(
+            component,
+            "-c",
+            "user.name=Wrkslots Test",
+            "-c",
+            "user.email=wrkslots@example.invalid",
+            "commit",
+            "-m",
+            "preserve remote-looking source",
+        )
         preserved_head = git(component, "rev-parse", "HEAD").stdout.strip()
         git(component, "reset", "--hard", original_head)
         remote_ref = (
@@ -23270,10 +23287,44 @@ def test_abort_create_refuses_submodule_repository_only_authored_state(
             if repository_state == "unconfigured-remote-ref"
             else "refs/remotes/origin/preserve-local"
         )
-        git(component, "update-ref", remote_ref, preserved_head)
+        git(
+            component,
+            "update-ref",
+            "-m",
+            "fetch: storing head",
+            remote_ref,
+            preserved_head,
+        )
+        if repository_state == "unfetched-configured-remote-ref":
+            assert git(
+                component,
+                "reflog",
+                "show",
+                "-1",
+                "--format=%gs",
+                remote_ref,
+            ).stdout.strip() == "fetch: storing head"
         assert git(
             component, "fsck", "--unreachable", "--no-reflogs", "--no-progress"
         ).stdout == ""
+    elif repository_state == "local-tag":
+        (component / "component.txt").write_text(
+            "tagged authored source\n", encoding="utf-8"
+        )
+        git(component, "add", "component.txt")
+        git(
+            component,
+            "-c",
+            "user.name=Wrkslots Test",
+            "-c",
+            "user.email=wrkslots@example.invalid",
+            "commit",
+            "-m",
+            "preserve tagged source",
+        )
+        preserved_head = git(component, "rev-parse", "HEAD").stdout.strip()
+        git(component, "tag", "preserve-local")
+        git(component, "reset", "--hard", original_head)
     else:
         raise AssertionError(repository_state)
     assert git(component, "status", "--porcelain").stdout == ""
@@ -23329,7 +23380,10 @@ def test_abort_create_refuses_submodule_repository_only_authored_state(
         assert "unreachable commit" in git(
             component, "fsck", "--unreachable", "--no-reflogs", "--no-progress"
         ).stdout
-    else:
+    elif repository_state in {
+        "unconfigured-remote-ref",
+        "unfetched-configured-remote-ref",
+    }:
         assert preserved_head is not None
         remote_ref = (
             "refs/remotes/local-only/preserve"
@@ -23341,6 +23395,240 @@ def test_abort_create_refuses_submodule_repository_only_authored_state(
             git(component, "show", f"{preserved_head}:component.txt").stdout
             == "remote-looking authored source\n"
         )
+    else:
+        assert preserved_head is not None
+        assert git(component, "rev-parse", "refs/tags/preserve-local").stdout.strip() == preserved_head
+        assert git(component, "show", f"{preserved_head}:component.txt").stdout == "tagged authored source\n"
+
+
+@pytest.mark.parametrize("metadata", ("config", "hook", "pseudoref"))
+def test_abort_create_refuses_changed_submodule_private_git_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    metadata: str,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component",
+            "exit 9",
+        ],
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    component = tree / "component"
+    if metadata == "config":
+        git(component, "config", "review.sentinel", "preserve-me")
+    elif metadata == "hook":
+        common = Path(
+            git(
+                component,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ).stdout.strip()
+        )
+        hook = common / "hooks" / "post-checkout"
+        hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        hook.chmod(0o755)
+    else:
+        git(component, "update-ref", "ORIG_HEAD", "HEAD")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 3
+    assert "private Git metadata changed after provisioning" in output.err
+    assert tree.is_dir()
+    if metadata == "config":
+        assert git(component, "config", "review.sentinel").stdout.strip() == "preserve-me"
+    elif metadata == "hook":
+        assert hook.read_text(encoding="utf-8") == "#!/bin/sh\nexit 0\n"
+    else:
+        assert git(component, "rev-parse", "ORIG_HEAD").returncode == 0
+
+
+def test_abort_create_accepts_freshly_verified_ordinary_submodule_tag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component",
+            "exit 9",
+        ],
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    component = tree / "component"
+    component_source = tmp_path / "component-source"
+    git(component_source, "tag", "release-v1")
+    git(component_source, "push", "origin", "refs/tags/release-v1")
+    git(
+        component,
+        "fetch",
+        "--no-write-fetch-head",
+        "origin",
+        "refs/tags/release-v1:refs/tags/release-v1",
+    )
+    assert git(component, "show-ref", "--verify", "refs/tags/release-v1").returncode == 0
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 0, output.err
+    assert not tree.exists()
+
+
+def test_abort_create_path_fence_preserves_post_proof_canonical_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component",
+            "exit 9",
+        ],
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    late = tree / "late-authored.txt"
+
+    def interrupt(stage: str) -> None:
+        if stage != "after-create-abort-final-proof":
+            return
+        assert not tree.exists()
+        tree.mkdir()
+        late.write_text("preserve me\n", encoding="utf-8")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 3
+    assert "canonical slot path reappeared" in output.err
+    assert late.read_text(encoding="utf-8") == "preserve me\n"
+    assert create_journal_path(project).is_file()
+
+
+def test_abort_create_resumes_after_path_fence_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component",
+            "exit 9",
+        ],
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    fenced = tree.with_name(".slot01.abort-create")
+
+    def interrupt(stage: str) -> None:
+        if stage == "after-create-abort-path-fence":
+            raise RuntimeError("simulated create-abort crash")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    with pytest.raises(RuntimeError, match="simulated create-abort crash"):
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--abort-create",
+                "--coordinator-authorized",
+            ]
+        )
+    assert not tree.exists()
+    assert fenced.is_dir()
+    assert create_journal_path(project).is_file()
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _stage: None)
+    resumed = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert resumed == 0, output.err
+    assert not fenced.exists()
+    assert not create_journal_path(project).exists()
 
 
 def test_abort_create_accepts_a_configured_fetched_submodule_remote_ref(
@@ -30488,6 +30776,84 @@ def test_excluded_same_uid_census_retries_pid_reuse_three_times(
             (target,), budget=budget
         )
     assert reads == 3
+
+
+def test_excluded_same_uid_census_retries_generation_change_in_second_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    target = Path("/excluded/validation/payload")
+    snapshots = 0
+    scans = 0
+
+    def snapshot(
+        _budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        nonlocal snapshots
+        snapshots += 1
+        if snapshots == 2:
+            raise wrkslots._ProcessEvidenceChanged("generation changed in snapshot")
+        return (process,)
+
+    def scan(
+        _processes: Sequence[wrkslots._AbsentProcessObservation],
+        _targets: Mapping[Path, str],
+        _budget: wrkslots._ReadOnlyCommandBudget,
+        *,
+        match_sink: list[tuple[int, str, str, str]] | None = None,
+    ) -> tuple[
+        tuple[tuple[int, str, str, str], ...],
+        tuple[wrkslots._AbsentProcessObservation, ...],
+    ]:
+        nonlocal scans
+        scans += 1
+        assert match_sink is not None
+        return (), ()
+
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", snapshot)
+    monkeypatch.setattr(
+        wrkslots, "_excluded_same_uid_live_processes", lambda rows, _budget: tuple(rows)
+    )
+    monkeypatch.setattr(wrkslots, "_same_uid_batched_path_matches", scan)
+    monkeypatch.setattr(wrkslots, "_absent_validate_find_matches", lambda *_args: ())
+    monkeypatch.setattr(wrkslots, "_absent_validate_maps_matches", lambda *_args: ())
+    monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", lambda *_args: ())
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+    )
+
+    census = wrkslots._capture_excluded_same_uid_process_path_census(
+        (target,), budget=budget
+    )
+
+    assert census.matches == ()
+    assert snapshots == 4
+    assert scans == 2
+
+
+def test_excluded_same_uid_census_bounds_generation_changes_in_initial_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path("/excluded/validation/payload")
+    snapshots = 0
+
+    def changed(
+        _budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        nonlocal snapshots
+        snapshots += 1
+        raise wrkslots._ProcessEvidenceChanged("generation changed in snapshot")
+
+    monkeypatch.setattr(wrkslots, "_same_uid_process_observations", changed)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024
+    )
+
+    with pytest.raises(wrkslots.Refusal, match="16 bounded attempts"):
+        wrkslots._capture_excluded_same_uid_process_path_census(
+            (target,), budget=budget
+        )
+    assert snapshots == 16
 
 
 def test_excluded_same_uid_census_rescans_new_process_before_acceptance(

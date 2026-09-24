@@ -183,6 +183,7 @@ _CREATE_JOURNAL_OPTIONAL = frozenset(
         "hook_progress",
         "hook_failure",
         "failure_policy",
+        "submodule_baselines",
     }
 )
 _IMPORT_JOURNAL_REQUIRED = frozenset(
@@ -390,6 +391,9 @@ _AUDIT_CACHE_KEY_BYTES = 32
 _AUDIT_CACHE_STATE_BYTES_LIMIT = 64 * 1024 * 1024
 _AUDIT_CACHE_WORK_LIMIT = 100_000
 _AUDIT_CACHE_WALL_SECONDS = 5.0
+_SUBMODULE_ADMIN_METADATA_BYTES_LIMIT = 16 * 1024 * 1024
+_SUBMODULE_ADMIN_METADATA_ENTRY_LIMIT = 4096
+_POST_EXCLUSION_SNAPSHOT_RETRY_LIMIT = 16
 
 
 class Refusal(RuntimeError):
@@ -6599,6 +6603,15 @@ def _validate_journal_shape(
             _as_mapping(failure, "create journal.hook_failure")
         if "failure_policy" in raw:
             _as_str(raw["failure_policy"], "create journal.failure_policy")
+        baselines = _create_submodule_baselines(raw)
+        created_names = {
+            _checkout_from_obj(item, f"create journal.created[{index}]").name
+            for index, item in enumerate(created)
+        }
+        if set(baselines) - created_names:
+            raise StateError(
+                "create journal has a submodule baseline for an unrecorded checkout"
+            )
     elif kind == "import-existing":
         _exact_keys(raw, _IMPORT_JOURNAL_REQUIRED, set(), "import journal")
         record = _record_from_obj(raw["record"], "import journal.record")
@@ -7095,13 +7108,28 @@ def _create_journal_items(
                 "failed-to-start create hook has invalid completion details"
             )
     slot_path = _slot_directory(config, slot, slot_type)
+    fenced_slot = _create_abort_fenced_slot(config, slot, slot_type)
+    slot_present = slot_path.exists() or slot_path.is_symlink()
+    fenced_present = fenced_slot.exists() or fenced_slot.is_symlink()
+    if slot_present and fenced_present:
+        raise StateError(
+            f"create journal has both canonical and abort-fenced storage for slot {slot!r}"
+        )
+    active_slot = fenced_slot if fenced_present else slot_path
     created_by_name = {item.name: item for item in created}
     observed: list[Checkout] = []
     dirty: list[str] = []
     expected_entries: set[str] = set()
     vcs = _GitVcs()
     for item in planned:
-        expected_path, destination = _checkout_path(config, slot, item.name, slot_type)
+        expected_path, _canonical_destination = _checkout_path(
+            config, slot, item.name, slot_type
+        )
+        destination = (
+            active_slot
+            if config.layout == "flat"
+            else active_slot / item.name
+        )
         if item.destination != expected_path:
             raise StateError(
                 f"create journal destination for {item.name} does not match slot {slot}"
@@ -7172,11 +7200,11 @@ def _create_journal_items(
         ):
             dirty.append(item.name)
         expected_entries.add(item.name)
-    if slot_path.exists() or slot_path.is_symlink():
-        if slot_path.is_symlink() or not slot_path.is_dir():
-            raise StateError(f"create journal slot path is unsafe: {slot_path}")
+    if active_slot.exists() or active_slot.is_symlink():
+        if active_slot.is_symlink() or not active_slot.is_dir():
+            raise StateError(f"create journal slot path is unsafe: {active_slot}")
         if config.layout == "nested" and {
-            entry.name for entry in slot_path.iterdir()
+            entry.name for entry in active_slot.iterdir()
         } != expected_entries:
             raise StateError(f"create journal slot {slot!r} contains unrecorded paths")
     elif created:
@@ -7186,8 +7214,8 @@ def _create_journal_items(
             if completed and state.machine == machine and record.slot == slot:
                 continue
             active_path = _slot_directory(config, record.slot, record.slot_type)
-            if _path_is_within(slot_path, active_path) or _path_is_within(
-                active_path, slot_path
+            if _path_is_within(active_slot, active_path) or _path_is_within(
+                active_path, active_slot
             ):
                 raise StateError(
                     f"create journal slot {slot!r} overlaps active slot "
@@ -7198,7 +7226,7 @@ def _create_journal_items(
         slot,
         agent,
         slot_type,
-        slot_path,
+        active_slot,
         planned,
         created,
         tuple(observed),
@@ -12922,6 +12950,7 @@ def _create_journal_payload(
     created_at: str,
     heartbeat_at: str,
     hook_progress: int,
+    submodule_baselines: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "schema": SCHEMA,
@@ -12943,6 +12972,7 @@ def _create_journal_payload(
         "hook_progress": hook_progress,
         "hook_failure": None,
         "failure_policy": "leave-for-inspection",
+        "submodule_baselines": dict(submodule_baselines or {}),
     }
 
 
@@ -13019,6 +13049,11 @@ def _run_post_provision_hooks(
                 f"failed with rc {completed.returncode}; slot was left for inspection "
                 f"with journal {journal_path}. Fix the cause and run 'wrkslots recover'"
             )
+        baselines = dict(_create_submodule_baselines(journal))
+        baselines[checkout.name] = _capture_abort_create_submodule_baseline(
+            path, checkout.name, _GitVcs()
+        )
+        journal["submodule_baselines"] = baselines
         journal["hook_progress"] = step + 1
         journal["hook_failure"] = None
         _write_journal(config, journal, journal_path=journal_path)
@@ -13184,6 +13219,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 created_at=created_at,
                 heartbeat_at=heartbeat_at,
                 hook_progress=hook_progress,
+                submodule_baselines=_create_submodule_baselines(hook_journal),
             ),
             journal_path=journal_path,
         )
@@ -21659,8 +21695,319 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
     return True
 
 
-def _assert_abort_create_submodules_pristine(
+def _submodule_ref_inventory(
+    repository: Path, submodule_name: str, checkout_name: str, vcs: _GitVcs
+) -> tuple[dict[str, str], ...]:
+    raw_refs = vcs._run(
+        repository,
+        ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"],
+    ).stdout
+    refs: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for line in raw_refs.splitlines():
+        fields = line.split("\x00")
+        if len(fields) != 3 or not SHA_RE.fullmatch(fields[1]):
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} returned an invalid ref inventory"
+            )
+        ref, sha, symref = fields
+        for value, label in ((ref, "ref"), (symref, "symbolic ref")):
+            if not value:
+                if label == "symbolic ref":
+                    continue
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{submodule_name} returned an empty ref"
+                )
+            if vcs._run(
+                repository, ["check-ref-format", value], check=False
+            ).returncode != 0:
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{submodule_name} returned an invalid {label}"
+                )
+        if ref in seen:
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} returned a duplicate ref"
+            )
+        seen.add(ref)
+        refs.append({"ref": ref, "sha": sha, "symref": symref})
+    return tuple(sorted(refs, key=lambda item: item["ref"]))
+
+
+def _submodule_admin_metadata_sha256(
+    repository: Path, submodule_name: str, checkout_name: str, vcs: _GitVcs
+) -> str:
+    """Digest private Git administration, excluding separately proved state."""
+
+    result = vcs._run(
+        repository,
+        ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+    )
+    values = result.stdout.splitlines()
+    if len(values) != 2:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} returned an invalid Git administration inventory"
+        )
+    roots: list[tuple[str, Path]] = []
+    for label, value in (("git", values[0]), ("common", values[1])):
+        root = Path(value).absolute()
+        if root.is_symlink() or not root.is_dir():
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} has unsafe {label} administration"
+            )
+        if all(root != existing for _existing_label, existing in roots):
+            roots.append((label, root))
+
+    digest = hashlib.sha256()
+    entries = 0
+    bytes_read = 0
+
+    def excluded(relative: Path) -> bool:
+        first = relative.parts[0]
+        return (
+            first
+            in {
+                "objects",
+                "refs",
+                "logs",
+                "modules",
+                "packed-refs",
+                "index",
+                "config",
+                "config.worktree",
+                "FETCH_HEAD",
+            }
+            or first.startswith("sharedindex.")
+        )
+
+    def visit(label: str, root: Path, relative: Path = Path()) -> None:
+        nonlocal entries, bytes_read
+        directory = root / relative
+        try:
+            children = sorted(directory.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot inspect private Git metadata for submodule {submodule_name}: {exc}"
+            ) from exc
+        for child in children:
+            child_relative = relative / child.name
+            if excluded(child_relative):
+                continue
+            entries += 1
+            if entries > _SUBMODULE_ADMIN_METADATA_ENTRY_LIMIT:
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{submodule_name} private Git metadata exceeds the entry bound"
+                )
+            try:
+                metadata = child.lstat()
+            except OSError as exc:
+                raise Refusal(
+                    f"cannot inspect private Git metadata for submodule "
+                    f"{submodule_name}: {exc}"
+                ) from exc
+            mode = stat.S_IMODE(metadata.st_mode)
+            prefix = f"{label}\x00{child_relative.as_posix()}\x00{mode:o}\x00"
+            if stat.S_ISDIR(metadata.st_mode):
+                digest.update((prefix + "directory\x00").encode("utf-8"))
+                visit(label, root, child_relative)
+            elif stat.S_ISREG(metadata.st_mode):
+                remaining = _SUBMODULE_ADMIN_METADATA_BYTES_LIMIT - bytes_read
+                if remaining < 0 or metadata.st_size > remaining:
+                    raise Refusal(
+                        f"cannot abort changed checkout {checkout_name}: submodule "
+                        f"{submodule_name} private Git metadata exceeds the byte bound"
+                    )
+                contents = _read_bounded_regular_file(
+                    child,
+                    f"submodule {submodule_name} private Git metadata",
+                    remaining,
+                )
+                bytes_read += len(contents)
+                digest.update((prefix + "file\x00").encode("utf-8"))
+                digest.update(hashlib.sha256(contents).digest())
+            elif stat.S_ISLNK(metadata.st_mode):
+                try:
+                    target = os.readlink(child)
+                except OSError as exc:
+                    raise Refusal(
+                        f"cannot inspect private Git metadata for submodule "
+                        f"{submodule_name}: {exc}"
+                    ) from exc
+                digest.update((prefix + f"symlink\x00{target}\x00").encode("utf-8"))
+            else:
+                raise Refusal(
+                    f"cannot abort changed checkout {checkout_name}: submodule "
+                    f"{submodule_name} has special private Git metadata at "
+                    f"{child_relative}"
+                )
+
+    for label, root in roots:
+        visit(label, root)
+    config = vcs._run(repository, ["config", "--local", "--null", "--list"])
+    config_entries: list[tuple[str, str]] = []
+    fields = config.stdout.split("\x00")
+    if fields and fields[-1] == "":
+        fields.pop()
+    for field in fields:
+        key, separator, value = field.partition("\n")
+        if not separator or not key:
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} returned malformed private Git config"
+            )
+        if key == "core.worktree":
+            value = "<worktree-path>"
+        config_entries.append((key, value))
+    digest.update(b"config\x00")
+    digest.update(
+        json.dumps(
+            sorted(config_entries),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    )
+    return digest.hexdigest()
+
+
+def _submodule_remote_config_sha256(
+    repository: Path, submodule_name: str, checkout_name: str, vcs: _GitVcs
+) -> str:
+    result = vcs._run(
+        repository,
+        ["config", "--local", "--null", "--get-regexp", r"^remote\."],
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise Refusal(
+            f"cannot inspect remote configuration for submodule {submodule_name} "
+            f"in checkout {checkout_name}"
+        )
+    return hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
+
+
+def _capture_abort_create_submodule_baseline(
     checkout: Path, checkout_name: str, vcs: _GitVcs
+) -> list[dict[str, object]]:
+    initialized = tuple(sorted(vcs.initialized_submodules(checkout)))
+    declared = tuple(
+        sorted(
+            path.relative_to(checkout).as_posix()
+            for path in _declared_initialized_submodules(checkout)
+        )
+    )
+    if initialized != declared:
+        raise Refusal(
+            f"cannot record provisioning baseline for {checkout_name}: initialized "
+            "submodule declarations disagree"
+        )
+    baseline: list[dict[str, object]] = []
+    for relative in initialized:
+        repository = checkout / relative
+        if vcs.repository_root(repository) != repository.absolute():
+            raise Refusal(
+                f"cannot record provisioning baseline for {checkout_name}: submodule "
+                f"{relative} is not its exact Git root"
+            )
+        baseline.append(
+            {
+                "path": relative,
+                "head": vcs.head(repository),
+                "refs": list(
+                    _submodule_ref_inventory(
+                        repository, relative, checkout_name, vcs
+                    )
+                ),
+                "admin_metadata_sha256": _submodule_admin_metadata_sha256(
+                    repository, relative, checkout_name, vcs
+                ),
+                "remote_config_sha256": _submodule_remote_config_sha256(
+                    repository, relative, checkout_name, vcs
+                ),
+            }
+        )
+    return baseline
+
+
+def _parse_abort_create_submodule_baseline(
+    value: object, checkout_name: str
+) -> dict[str, tuple[str, tuple[dict[str, str], ...], str, str]]:
+    baseline: dict[str, tuple[str, tuple[dict[str, str], ...], str, str]] = {}
+    for index, raw_item in enumerate(
+        _as_list(value, f"create journal.submodule_baselines.{checkout_name}")
+    ):
+        label = f"create journal.submodule_baselines.{checkout_name}[{index}]"
+        item = _as_mapping(raw_item, label)
+        _exact_keys(
+            item,
+            {
+                "path",
+                "head",
+                "refs",
+                "admin_metadata_sha256",
+                "remote_config_sha256",
+            },
+            set(),
+            label,
+        )
+        path = _as_str(item["path"], f"{label}.path")
+        relative = Path(path)
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise StateError(f"{label}.path is unsafe")
+        head = _as_str(item["head"], f"{label}.head")
+        metadata_sha = _as_str(
+            item["admin_metadata_sha256"], f"{label}.admin_metadata_sha256"
+        )
+        remote_config_sha = _as_str(
+            item["remote_config_sha256"], f"{label}.remote_config_sha256"
+        )
+        if (
+            not SHA_RE.fullmatch(head)
+            or not DIGEST_RE.fullmatch(metadata_sha)
+            or not DIGEST_RE.fullmatch(remote_config_sha)
+        ):
+            raise StateError(f"{label} contains an invalid object or metadata digest")
+        refs: list[dict[str, str]] = []
+        seen_refs: set[str] = set()
+        for ref_index, raw_ref in enumerate(_as_list(item["refs"], f"{label}.refs")):
+            ref_label = f"{label}.refs[{ref_index}]"
+            ref_item = _as_mapping(raw_ref, ref_label)
+            _exact_keys(ref_item, {"ref", "sha", "symref"}, set(), ref_label)
+            ref = _as_str(ref_item["ref"], f"{ref_label}.ref")
+            sha = _as_str(ref_item["sha"], f"{ref_label}.sha")
+            symref = _as_str(ref_item["symref"], f"{ref_label}.symref")
+            _validate_full_ref(ref, f"{ref_label}.ref")
+            if symref:
+                _validate_full_ref(symref, f"{ref_label}.symref")
+            if not SHA_RE.fullmatch(sha) or ref in seen_refs:
+                raise StateError(f"{ref_label} is invalid or duplicated")
+            seen_refs.add(ref)
+            refs.append({"ref": ref, "sha": sha, "symref": symref})
+        if path in baseline:
+            raise StateError(f"{label}.path is duplicated")
+        baseline[path] = (head, tuple(refs), metadata_sha, remote_config_sha)
+    return baseline
+
+
+def _create_submodule_baselines(raw: Mapping[str, object]) -> Mapping[str, object]:
+    value = raw.get("submodule_baselines", {})
+    baselines = _as_mapping(value, "create journal.submodule_baselines")
+    for checkout_name, baseline in baselines.items():
+        _validate_name(checkout_name, "submodule baseline checkout")
+        _parse_abort_create_submodule_baseline(baseline, checkout_name)
+    return baselines
+
+
+def _assert_abort_create_submodules_pristine(
+    checkout: Path,
+    checkout_name: str,
+    vcs: _GitVcs,
+    baseline_value: object | None,
 ) -> None:
     """Prove force-removable submodules contain no authored state."""
 
@@ -21675,6 +22022,19 @@ def _assert_abort_create_submodules_pristine(
         raise Refusal(
             f"cannot abort changed checkout {checkout_name}: initialized submodule "
             "declarations disagree; preserve it for inspection"
+        )
+    if initialized and baseline_value is None:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: initialized submodules "
+            "have no trusted provisioning baseline; preserve it for inspection"
+        )
+    baseline = _parse_abort_create_submodule_baseline(
+        [] if baseline_value is None else baseline_value, checkout_name
+    )
+    if set(initialized) != set(baseline):
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: initialized submodules "
+            "differ from their trusted provisioning baseline"
         )
     remaining = set(initialized)
     repositories: list[tuple[Path, Path]] = [(Path(), checkout)]
@@ -21754,7 +22114,7 @@ def _assert_abort_create_submodules_pristine(
                     "preserve it for inspection"
                 )
             _assert_abort_create_submodule_repository_pristine(
-                child, child_name, checkout_name, vcs
+                child, child_name, checkout_name, baseline[child_name], vcs
             )
             remaining.discard(child_name)
             repositories.append((child_relative, child))
@@ -21766,7 +22126,11 @@ def _assert_abort_create_submodules_pristine(
 
 
 def _assert_abort_create_submodule_repository_pristine(
-    repository: Path, submodule_name: str, checkout_name: str, vcs: _GitVcs
+    repository: Path,
+    submodule_name: str,
+    checkout_name: str,
+    baseline: tuple[str, tuple[dict[str, str], ...], str, str],
+    vcs: _GitVcs,
 ) -> None:
     """Refuse repository-only submodule state that force removal would discard."""
 
@@ -21776,62 +22140,52 @@ def _assert_abort_create_submodule_repository_pristine(
             f"cannot abort changed checkout {checkout_name}: submodule "
             f"{submodule_name} has an external linked worktree; preserve it for inspection"
         )
-    raw_refs = vcs._run(
-        repository,
-        ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"],
-    ).stdout
-    refs: dict[str, tuple[str, str]] = {}
-    for line in raw_refs.splitlines():
-        fields = line.split("\x00")
-        if len(fields) != 3 or not SHA_RE.fullmatch(fields[1]):
-            raise Refusal(
-                f"cannot abort changed checkout {checkout_name}: submodule "
-                f"{submodule_name} returned an invalid ref inventory"
-            )
-        ref, sha, symref = fields
-        for value, label in ((ref, "ref"), (symref, "symbolic ref")):
-            if not value:
-                if label == "symbolic ref":
-                    continue
-                raise Refusal(
-                    f"cannot abort changed checkout {checkout_name}: submodule "
-                    f"{submodule_name} returned an empty ref"
-                )
-            valid = vcs._run(
-                repository, ["check-ref-format", value], check=False
-            )
-            if valid.returncode != 0:
-                raise Refusal(
-                    f"cannot abort changed checkout {checkout_name}: submodule "
-                    f"{submodule_name} returned an invalid {label}"
-                )
-        if ref in refs:
-            raise Refusal(
-                f"cannot abort changed checkout {checkout_name}: submodule "
-                f"{submodule_name} returned a duplicate ref"
-            )
-        refs[ref] = (sha, symref)
-    allowed_remote_refs = _abort_create_fetched_remote_refs(
-        repository, refs, submodule_name, checkout_name, vcs
+    baseline_head, baseline_refs_raw, baseline_metadata, baseline_remote_config = baseline
+    if vcs.head(repository) != baseline_head:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} HEAD differs from its trusted provisioning baseline"
+        )
+    if (
+        _submodule_remote_config_sha256(
+            repository, submodule_name, checkout_name, vcs
+        )
+        != baseline_remote_config
+    ):
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} remote configuration changed after provisioning; "
+            "preserve it for inspection"
+        )
+    current_refs_raw = _submodule_ref_inventory(
+        repository, submodule_name, checkout_name, vcs
     )
-    allowed_local_heads: set[str] = set()
-    for ref, (sha, symref) in refs.items():
-        if ref not in allowed_remote_refs or not ref.endswith("/HEAD"):
-            continue
-        remote_prefix = ref.removesuffix("HEAD")
-        if not symref.startswith(remote_prefix):
-            raise Refusal(
-                f"cannot abort changed checkout {checkout_name}: submodule "
-                f"{submodule_name} has an invalid remote HEAD"
-            )
-        local = f"refs/heads/{symref.removeprefix(remote_prefix)}"
-        remote = refs.get(symref)
-        if refs.get(local) == (sha, "") and remote == (sha, ""):
-            allowed_local_heads.add(local)
+    baseline_refs = {
+        item["ref"]: (item["sha"], item["symref"])
+        for item in baseline_refs_raw
+    }
+    refs = {
+        item["ref"]: (item["sha"], item["symref"])
+        for item in current_refs_raw
+    }
+    missing = sorted(set(baseline_refs) - set(refs))
+    if missing:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} lost provisioned ref {missing[0]}; preserve it for inspection"
+        )
+    allowed_remote_refs = _abort_create_fresh_remote_refs(
+        repository,
+        refs,
+        baseline_refs,
+        submodule_name,
+        checkout_name,
+        vcs,
+    )
     authored_refs = sorted(
         ref
-        for ref in refs
-        if ref not in allowed_remote_refs and ref not in allowed_local_heads
+        for ref, value in refs.items()
+        if value != baseline_refs.get(ref) and ref not in allowed_remote_refs
     )
     if authored_refs:
         raise Refusal(
@@ -21839,6 +22193,9 @@ def _assert_abort_create_submodule_repository_pristine(
             f"{submodule_name} has repository-local ref {authored_refs[0]}; "
             "preserve it for inspection"
         )
+    _assert_abort_create_fetch_head_reproducible(
+        repository, refs, submodule_name, checkout_name, vcs
+    )
     unreachable = vcs._run(
         repository,
         ["fsck", "--unreachable", "--no-reflogs", "--no-progress"],
@@ -21850,16 +22207,59 @@ def _assert_abort_create_submodule_repository_pristine(
             f"{submodule_name} has unreachable repository state "
             f"({evidence.splitlines()[0]}); preserve it for inspection"
         )
+    observed_metadata = _submodule_admin_metadata_sha256(
+        repository, submodule_name, checkout_name, vcs
+    )
+    if observed_metadata != baseline_metadata:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} private Git metadata changed after provisioning; "
+            "preserve it for inspection"
+        )
 
 
-def _abort_create_fetched_remote_refs(
+def _assert_abort_create_fetch_head_reproducible(
     repository: Path,
     refs: Mapping[str, tuple[str, str]],
     submodule_name: str,
     checkout_name: str,
     vcs: _GitVcs,
+) -> None:
+    result = vcs._run(repository, ["rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"])
+    fetch_head = Path(result.stdout.strip())
+    if not fetch_head.exists() and not fetch_head.is_symlink():
+        return
+    contents = _read_bounded_regular_file(
+        fetch_head,
+        f"submodule {submodule_name} FETCH_HEAD",
+        _SUBMODULE_ADMIN_METADATA_BYTES_LIMIT,
+    )
+    try:
+        lines = contents.decode("utf-8").splitlines()
+    except UnicodeError as exc:
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: submodule "
+            f"{submodule_name} has malformed FETCH_HEAD metadata"
+        ) from exc
+    reproducible = {sha for sha, symref in refs.values() if not symref}
+    for line in lines:
+        sha, separator, _description = line.partition("\t")
+        if not separator or not SHA_RE.fullmatch(sha) or sha not in reproducible:
+            raise Refusal(
+                f"cannot abort changed checkout {checkout_name}: submodule "
+                f"{submodule_name} has unproved FETCH_HEAD state; preserve it for inspection"
+            )
+
+
+def _abort_create_fresh_remote_refs(
+    repository: Path,
+    refs: Mapping[str, tuple[str, str]],
+    baseline_refs: Mapping[str, tuple[str, str]],
+    submodule_name: str,
+    checkout_name: str,
+    vcs: _GitVcs,
 ) -> set[str]:
-    """Return remote refs with local evidence that Git cloned or fetched them."""
+    """Return changed refs whose exact values are freshly advertised remotely."""
 
     raw_remotes = vcs._run(repository, ["remote"]).stdout.splitlines()
     if len(raw_remotes) != len(set(raw_remotes)):
@@ -21906,109 +22306,103 @@ def _abort_create_fetched_remote_refs(
     direct_remote_refs = {
         ref
         for ref, (_sha, symref) in refs.items()
-        if ref.startswith("refs/remotes/") and not symref
+        if ref.startswith("refs/remotes/")
+        and not symref
+        and refs[ref] != baseline_refs.get(ref)
     }
     allowed: set[str] = set()
+    advertised: dict[tuple[str, str], str | None] = {}
+
+    def remote_sha(remote: str, source_ref: str) -> str | None:
+        key = (remote, source_ref)
+        if key not in advertised:
+            inventory = vcs._ls_remote_inventory(
+                repository, remotes[remote][0], refs=(source_ref,)
+            )
+            if set(inventory) - {source_ref}:
+                raise Refusal(
+                    f"remote {remote} returned ambiguous evidence for {source_ref}"
+                )
+            advertised[key] = inventory.get(source_ref)
+        return advertised[key]
+
     for ref in sorted(direct_remote_refs):
         candidates = [
-            remote
+            (remote, source)
             for remote, (_url, fetches) in remotes.items()
-            if any(
-                _fetch_refspec_maps_remote_ref(fetch, remote, ref)
-                for fetch in fetches
-            )
+            for fetch in fetches
+            if (source := _fetch_refspec_source_for_remote_ref(fetch, remote, ref))
+            is not None
         ]
-        if len(candidates) == 1 and _remote_ref_has_fetch_reflog(
-            repository,
-            ref,
-            refs[ref][0],
-            candidates[0],
-            remotes[candidates[0]][0],
-            vcs,
-        ):
+        if len(candidates) == 1 and remote_sha(*candidates[0]) == refs[ref][0]:
             allowed.add(ref)
 
     for ref, (sha, symref) in refs.items():
-        if not symref:
-            continue
-        candidates = [
-            remote
-            for remote in remotes
-            if ref == f"refs/remotes/{remote}/HEAD"
-            and symref.startswith(f"refs/remotes/{remote}/")
-            and symref != ref
-        ]
-        if len(candidates) != 1 or refs.get(symref) != (sha, ""):
-            continue
-        remote = candidates[0]
-        if not any(
-            _fetch_refspec_maps_remote_ref(fetch, remote, symref)
-            for fetch in remotes[remote][1]
+        if (
+            ref.startswith("refs/tags/")
+            and not symref
+            and (sha, symref) != baseline_refs.get(ref)
+            and any(remote_sha(remote, ref) == sha for remote in remotes)
         ):
-            continue
-        if symref in allowed or _remote_ref_has_fetch_reflog(
-            repository, ref, sha, remote, remotes[remote][0], vcs
-        ):
-            allowed.update((ref, symref))
+            allowed.add(ref)
+
     return allowed
 
 
-def _fetch_refspec_maps_remote_ref(refspec: str, remote: str, ref: str) -> bool:
-    """Recognize conventional positive fetch mappings without widening them."""
+def _fetch_refspec_source_for_remote_ref(
+    refspec: str, remote: str, ref: str
+) -> str | None:
+    """Map one conventional destination ref back to its advertised source."""
 
     value = refspec.removeprefix("+")
     if value.startswith("^") or value.count(":") != 1:
-        return False
+        return None
     source, destination = value.split(":", 1)
     prefix = f"refs/remotes/{remote}/"
     if not source.startswith("refs/heads/") or not destination.startswith(prefix):
-        return False
+        return None
     if source.count("*") != destination.count("*") or source.count("*") > 1:
-        return False
+        return None
     if "*" not in destination:
-        return destination == ref
+        return source if destination == ref else None
     before, after = destination.split("*", 1)
     if not ref.startswith(before) or not ref.endswith(after):
-        return False
+        return None
     middle = ref[len(before) : len(ref) - len(after) if after else None]
     if not middle:
-        return False
+        return None
     expanded_source = source.replace("*", middle)
     try:
         _validate_full_ref(expanded_source, "fetched source ref")
     except Refusal:
-        return False
-    return True
+        return None
+    return expanded_source
 
 
-def _remote_ref_has_fetch_reflog(
-    repository: Path,
-    ref: str,
-    sha: str,
-    remote: str,
-    remote_url: str,
+def _create_abort_fenced_slot(config: Config, slot: str, slot_type: str) -> Path:
+    canonical = _slot_directory(config, slot, slot_type)
+    return canonical.with_name(f".{slot}.abort-create")
+
+
+def _create_abort_checkout_path(
+    config: Config, active_slot: Path, checkout_name: str
+) -> Path:
+    return active_slot if config.layout == "flat" else active_slot / checkout_name
+
+
+def _repair_create_abort_registrations(
+    config: Config,
+    plan: Sequence[PlannedCheckout],
+    active_slot: Path,
     vcs: _GitVcs,
-) -> bool:
-    result = vcs._run(
-        repository,
-        ["reflog", "show", "-1", "--format=%H%x00%gs", ref],
-        check=False,
-    )
-    if result.returncode not in (0, 1):
-        raise Refusal(f"cannot inspect reflog evidence for {ref}")
-    if not result.stdout:
-        return False
-    fields = result.stdout.rstrip("\n").split("\x00")
-    if len(fields) != 2 or not SHA_RE.fullmatch(fields[0]):
-        raise Refusal(f"Git returned malformed reflog evidence for {ref}")
-    message = fields[1]
-    fetched = (
-        message.startswith(f"fetch {remote}:")
-        or message.startswith(f"fetch {remote} ")
-        or message.startswith("fetch:")
-    )
-    cloned = message == f"clone: from {remote_url}"
-    return fields[0] == sha and (fetched or cloned)
+) -> None:
+    for item in plan:
+        destination = _create_abort_checkout_path(config, active_slot, item.name)
+        if not destination.exists() and not destination.is_symlink():
+            continue
+        _relative, repository = _stored_repository_path(config, item.repository)
+        vcs.repair_worktree(repository, destination)
+        _repair_nested_repositories(destination, vcs)
 
 
 def _abort_create(
@@ -22018,19 +22412,29 @@ def _abort_create(
     slot_type: str,
     plan: Sequence[PlannedCheckout],
     recorded_created: Sequence[Checkout],
+    submodule_baselines: Mapping[str, object],
 ) -> None:
     slot_path = _slot_directory(config, slot, slot_type)
+    fenced_slot = _create_abort_fenced_slot(config, slot, slot_type)
+    canonical_present = slot_path.exists() or slot_path.is_symlink()
+    fenced_present = fenced_slot.exists() or fenced_slot.is_symlink()
+    if canonical_present and fenced_present:
+        raise Refusal(
+            f"cannot abort slot {slot}: both canonical and abort-fenced paths exist; "
+            "preserve both for inspection"
+        )
+    active_slot = fenced_slot if fenced_present else slot_path
     vcs = _GitVcs()
     recorded_by_name = {checkout.name: checkout for checkout in recorded_created}
-    if config.layout == "nested" and slot_path.exists():
-        if not slot_path.is_dir() or slot_path.is_symlink():
-            raise Refusal(f"cannot abort unsafe slot path: {slot_path}")
+    if config.layout == "nested" and active_slot.exists():
+        if not active_slot.is_dir() or active_slot.is_symlink():
+            raise Refusal(f"cannot abort unsafe slot path: {active_slot}")
         expected_entries = {
             item.name
             for item in plan
-            if _stored_path(config, item.destination, "checkout destination").exists()
+            if _create_abort_checkout_path(config, active_slot, item.name).exists()
         }
-        actual_entries = {entry.name for entry in slot_path.iterdir()}
+        actual_entries = {entry.name for entry in active_slot.iterdir()}
         if actual_entries != expected_entries:
             raise Refusal(
                 f"cannot abort slot with unexpected root contents: expected "
@@ -22040,7 +22444,6 @@ def _abort_create(
         tuple[
             PlannedCheckout,
             Path,
-            Path,
             str,
             bool,
             Checkout | None,
@@ -22049,7 +22452,7 @@ def _abort_create(
     ] = []
     for item in plan:
         _relative, repository = _stored_repository_path(config, item.repository)
-        destination = _stored_path(config, item.destination, "checkout destination")
+        destination = _create_abort_checkout_path(config, active_slot, item.name)
         recorded = recorded_by_name.get(item.name)
         expected_head = item.start_point if recorded is None else recorded.head
         if destination.exists() or destination.is_symlink():
@@ -22081,7 +22484,10 @@ def _abort_create(
                 landed_ref=item.landed_ref,
                 head=expected_head,
             )
-            _assert_cache_policy_untracked(config, checkout, vcs)
+            active_checkout = dataclasses.replace(
+                checkout, path=destination.relative_to(config.root).as_posix()
+            )
+            _assert_cache_policy_untracked(config, active_checkout, vcs)
             status = vcs.status(destination, _cache_globs_for(config, checkout.name))
             if status:
                 first = status.splitlines()[0]
@@ -22089,9 +22495,14 @@ def _abort_create(
                     f"cannot abort changed checkout {item.name}: source state is dirty "
                     f"({first}); preserve it for inspection"
                 )
-            _assert_abort_create_submodules_pristine(destination, item.name, vcs)
+            _assert_abort_create_submodules_pristine(
+                destination,
+                item.name,
+                vcs,
+                submodule_baselines.get(item.name),
+            )
             present = True
-            caches = _cache_directories_for_checkout(config, checkout)
+            caches = _cache_directories_for_checkout(config, active_checkout)
         elif destination.absolute() in vcs.listed_worktrees(repository):
             raise Refusal(
                 f"cannot abort missing checkout still registered by Git: {destination}"
@@ -22110,13 +22521,47 @@ def _abort_create(
                     f"{branch_head}; preserve it instead of aborting provisioning"
                 )
         preflight.append(
-            (item, repository, destination, expected_head, present, checkout, caches)
+            (item, repository, expected_head, present, checkout, caches)
         )
-    if slot_path.exists():
-        _assert_slot_unused(slot_path)
-    for item, repository, destination, expected_head, present, checkout, caches in preflight:
+    if active_slot.exists():
+        _assert_slot_unused(active_slot)
+    for _item, _repository, _expected_head, present, _checkout, caches in preflight:
         if present:
+            for cache in caches:
+                _remove_cache_directory(config, cache)
+
+    fence_created = False
+    removed_any = False
+    original_mode: int | None = None
+    try:
+        if active_slot == slot_path and (slot_path.exists() or slot_path.is_symlink()):
+            if slot_path.is_symlink() or not slot_path.is_dir():
+                raise Refusal(f"cannot abort unsafe slot path: {slot_path}")
+            original_mode = stat.S_IMODE(slot_path.stat(follow_symlinks=False).st_mode)
+            if fenced_slot.exists() or fenced_slot.is_symlink():
+                raise Refusal(
+                    f"cannot establish abort path fence because it already exists: {fenced_slot}"
+                )
+            try:
+                os.rename(slot_path, fenced_slot)
+                _fsync_directory(slot_path.parent)
+            except OSError as exc:
+                raise Refusal(
+                    f"cannot establish create-abort path fence {slot_path} -> "
+                    f"{fenced_slot}: {exc}"
+                ) from exc
+            fence_created = True
+            active_slot = fenced_slot
+            _seal_cleanup_path_private(config, fenced_slot)
+            _repair_create_abort_registrations(config, plan, active_slot, vcs)
+            _interrupt_for_test("after-create-abort-path-fence")
+
+        final: list[tuple[PlannedCheckout, Path, Path]] = []
+        for item, repository, expected_head, present, checkout, _caches in preflight:
+            if not present:
+                continue
             assert checkout is not None
+            destination = _create_abort_checkout_path(config, active_slot, item.name)
             head = vcs.verify_existing_worktree(repository, destination)
             branch = vcs.branch(destination)
             if head != expected_head or branch != item.branch:
@@ -22132,7 +22577,10 @@ def _abort_create(
                 )
             vcs.assert_ordinary_history(destination)
             vcs.assert_ordinary_index(destination)
-            _assert_cache_policy_untracked(config, checkout, vcs)
+            active_checkout = dataclasses.replace(
+                checkout, path=destination.relative_to(config.root).as_posix()
+            )
+            _assert_cache_policy_untracked(config, active_checkout, vcs)
             status = vcs.status(destination, _cache_globs_for(config, checkout.name))
             if status:
                 first = status.splitlines()[0]
@@ -22140,24 +22588,69 @@ def _abort_create(
                     f"cannot abort changed checkout {item.name}: source state is dirty "
                     f"({first}); preserve it for inspection"
                 )
-            _assert_abort_create_submodules_pristine(destination, item.name, vcs)
-            for cache in caches:
-                _remove_cache_directory(config, cache)
+            _assert_abort_create_submodules_pristine(
+                destination,
+                item.name,
+                vcs,
+                submodule_baselines.get(item.name),
+            )
+            final.append((item, repository, destination))
+
+        if active_slot.exists():
+            _assert_slot_unused(active_slot)
+        _interrupt_for_test("after-create-abort-final-proof")
+        if slot_path.exists() or slot_path.is_symlink():
+            raise Refusal(
+                f"canonical slot path reappeared behind the create-abort fence: "
+                f"{slot_path}; preserve it for inspection"
+            )
+        for _item, repository, destination in final:
+            if slot_path.exists() or slot_path.is_symlink():
+                raise Refusal(
+                    f"canonical slot path reappeared before forced removal: {slot_path}; "
+                    "preserve it for inspection"
+                )
             # Git requires --force even for a clean linked worktree when any
-            # submodule is initialized.  This does not relax the abort policy:
-            # the exact worktree, branch, HEAD, ordinary index/history, clean
-            # source state, and unused slot were all checked above and then
-            # rechecked immediately before this removal.
+            # submodule is initialized. The canonical namespace is absent, and
+            # the fenced tree was re-proved clean and unused immediately above.
             vcs.remove_worktree(repository, destination, force=True)
+            removed_any = True
+            if slot_path.exists() or slot_path.is_symlink():
+                raise Refusal(
+                    f"canonical slot path reappeared during forced removal: {slot_path}; "
+                    "the new path was preserved"
+                )
+            _fsync_directory(active_slot.parent)
+    except Refusal:
+        if (
+            fence_created
+            and not removed_any
+            and not slot_path.exists()
+            and not slot_path.is_symlink()
+            and fenced_slot.is_dir()
+            and not fenced_slot.is_symlink()
+        ):
+            if original_mode is not None:
+                fenced_slot.chmod(original_mode)
+            os.rename(fenced_slot, slot_path)
             _fsync_directory(slot_path.parent)
-    for item, repository, _destination, expected_head, _present, _checkout, _caches in preflight:
+            _repair_create_abort_registrations(config, plan, slot_path, vcs)
+        raise
+    for item, repository, expected_head, _present, _checkout, _caches in preflight:
         vcs.delete_branch_at(repository, item.branch, expected_head)
-    if slot_path.exists():
+    if slot_path.exists() or slot_path.is_symlink():
+        raise Refusal(
+            f"canonical slot path reappeared after create-abort removal: {slot_path}; "
+            "preserve it for inspection"
+        )
+    if fenced_slot.exists():
         try:
-            slot_path.rmdir()
+            fenced_slot.rmdir()
         except OSError as exc:
-            raise Refusal(f"cannot remove aborted slot directory {slot_path}: {exc}") from exc
-        _fsync_directory(slot_path.parent)
+            raise Refusal(
+                f"cannot remove aborted slot directory {fenced_slot}: {exc}"
+            ) from exc
+        _fsync_directory(fenced_slot.parent)
     _clear_journal(
         config,
         _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
@@ -22427,7 +22920,15 @@ def _recover_create(
         print(f"recovered create: active state was durable; cleared journal for {slot}")
         return
     if abort_create:
-        _abort_create(config, path, slot, slot_type, plan, recorded_created)
+        _abort_create(
+            config,
+            path,
+            slot,
+            slot_type,
+            plan,
+            recorded_created,
+            _create_submodule_baselines(raw),
+        )
         return
     _assert_agent_and_slot_free(config, slot, agent, slot_type)
     slot_path = _slot_directory(config, slot, slot_type)
@@ -29633,15 +30134,23 @@ def _capture_excluded_same_uid_process_path_census(
     targets = {path: str(path) for path in slot_paths}
     if not targets:
         return _ProcessPathCensus((), (), owner_cgroup_complete=False)
-    processes = _same_uid_process_observations(budget)
+    processes: tuple[_AbsentProcessObservation, ...] | None = None
     motion_attempts = 0
+    snapshot_attempts = 0
     while True:
         budget.remaining_seconds()
         observed_matches: list[tuple[int, str, str, str]] = []
+        snapshot_stage = False
         try:
+            if processes is None:
+                snapshot_stage = True
+                processes = _same_uid_process_observations(budget)
+                snapshot_stage = False
             active = _excluded_same_uid_live_processes(processes, budget)
             if not active:
+                snapshot_stage = True
                 refreshed = _same_uid_process_observations(budget)
+                snapshot_stage = False
                 if not refreshed:
                     return _ProcessPathCensus(
                         (), (), owner_cgroup_complete=False
@@ -29662,45 +30171,36 @@ def _capture_excluded_same_uid_process_path_census(
             observed_matches.extend(privileged_maps)
             mount_matches = _absent_validate_mount_matches(active, targets, budget)
             observed_matches.extend(mount_matches)
+            if observed_matches:
+                return _ProcessPathCensus(
+                    active, tuple(observed_matches), owner_cgroup_complete=False
+                )
+            snapshot_stage = True
+            refreshed = _same_uid_process_observations(budget)
+            snapshot_stage = False
         except _ProcessEvidenceChanged:
             if any(match[0] != os.getpid() for match in observed_matches):
                 return _ProcessPathCensus(
-                    processes,
+                    () if processes is None else processes,
                     tuple(observed_matches),
                     owner_cgroup_complete=False,
                 )
-            try:
-                refreshed = _same_uid_process_observations(budget)
-            except _ProcessEvidenceChanged:
-                refreshed = processes
-            previous_by_pid = {process.pid: process for process in processes}
-            refreshed_by_pid = {process.pid: process for process in refreshed}
-            reused = any(
-                pid in refreshed_by_pid
-                and refreshed_by_pid[pid].start_ticks != process.start_ticks
-                for pid, process in previous_by_pid.items()
-            )
-            previous_generations = {
-                (process.pid, process.start_ticks) for process in processes
-            }
-            refreshed_generations = {
-                (process.pid, process.start_ticks) for process in refreshed
-            }
-            processes = refreshed
-            if not reused and refreshed_generations != previous_generations:
+            processes = None
+            if snapshot_stage:
+                snapshot_attempts += 1
+                if snapshot_attempts >= _POST_EXCLUSION_SNAPSHOT_RETRY_LIMIT:
+                    raise Refusal(
+                        "post-exclusion same-UID process snapshot changed during "
+                        f"{_POST_EXCLUSION_SNAPSHOT_RETRY_LIMIT} bounded attempts"
+                    )
                 continue
             motion_attempts += 1
-            if motion_attempts < 3:
-                continue
-            raise Refusal(
-                "post-exclusion same-UID process evidence changed during three "
-                "liveness attempts"
-            )
-        if observed_matches:
-            return _ProcessPathCensus(
-                active, tuple(observed_matches), owner_cgroup_complete=False
-            )
-        refreshed = _same_uid_process_observations(budget)
+            if motion_attempts >= 3:
+                raise Refusal(
+                    "post-exclusion same-UID process evidence changed during three "
+                    "liveness attempts"
+                )
+            continue
         active_generations = {
             (process.pid, process.start_ticks) for process in active
         }
