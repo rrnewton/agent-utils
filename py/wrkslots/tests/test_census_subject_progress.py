@@ -392,10 +392,10 @@ def test_root_binding_remains_inside_the_unchanged_wall_allowance(
     bindings = 0
 
     def slow_identity(
-        config: cli.Config, cache: cli.CacheDirectory
+        config: cli.Config, cache: cli.CacheDirectory, *, deadline: float | None = None
     ) -> tuple[int, int, int, int, int] | None:
         nonlocal now, bindings
-        identity = original_identity(config, cache)
+        identity = original_identity(config, cache, deadline=deadline)
         now += 2.0
         bindings += 1
         return identity

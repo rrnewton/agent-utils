@@ -108,10 +108,16 @@ registry, worktree, hold, journal, handoff, or Git repository. `--cache-work-lim
 (default 100000 work units) and `--cache-wall-seconds` (default 5 seconds) bound the
 cache binding and traversal phase, not the end-to-end audit: registry/cache planning,
 bounded state decoding/authentication, and persistence occur outside that allowance.
+Root binding runs in an isolated worker with the remaining deadline enforced even
+if a filesystem open blocks. Expiry starts no further root binding and cancels
+the worker, with at most one additional second allowed for reaping it.
 Until the census has visited and reverified every directory and entry, JSON reports
 `cache_bytes: null` and `cache_status: "partial"`, keeping the row out of `DELETABLE`.
 An authenticated subject cursor gives lifecycle subjects fair turns, including subjects
-with multiple cache roots. Measurement and recursive verification resume across calls;
+with multiple cache roots. Each turn includes binding and deadline-checked structural
+validation, so an expensive peer cannot consume every call before a cheap subject runs.
+Deferred subjects retain authenticated progress but report null bytes until checked.
+Measurement and recursive verification resume across calls;
 finalization reserves a fresh sweep of every directory and file of all roots belonging
 to that subject in one invocation. No persisted completed total supplies current evidence.
 
@@ -128,7 +134,10 @@ is authenticated by a sibling 0600 key; missing, malformed, too deeply nested, o
 altered state restarts the bounded census. Both writer and reader enforce a 64 MiB state
 limit. A state too large to persist produces null/error accounting instead of repeatedly
 writing unreadable progress. Unavailable default cache storage also produces null/error
-accounting while preserving lifecycle rows, holds, and other refusal reasons. Invalid
+accounting while preserving lifecycle rows, holds, and other refusal reasons. Interrupted
+first key writes remain in one private pending file that a later census can rebuild;
+only a complete, synced key is published atomically. Unsafe pending files and malformed
+published keys remain refusals. Invalid
 explicit state-path arguments remain CLI refusals. JSON reports typed CPU seconds, wall
 seconds, and work counters for the registry, liveness, process-census, cache-census,
 registered-row, and storage phases.

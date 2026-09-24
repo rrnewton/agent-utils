@@ -24269,10 +24269,11 @@ def test_audit_cache_ancestor_swap_stays_blocked(
     swapped = False
 
     def swap_after_binding(
-        config: wrkslots.Config, directory: wrkslots.CacheDirectory
+        config: wrkslots.Config, directory: wrkslots.CacheDirectory,
+        *, deadline: float | None = None,
     ) -> tuple[int, int, int, int, int] | None:
         nonlocal swapped
-        identity = original_identity(config, directory)
+        identity = original_identity(config, directory, deadline=deadline)
         if not swapped:
             ancestor.rename(preserved)
             ancestor.symlink_to(outside, target_is_directory=True)

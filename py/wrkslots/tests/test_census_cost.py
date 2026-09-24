@@ -1276,7 +1276,7 @@ def test_cache_census_closes_bound_parent_on_prewrite_exception(
     monkeypatch.setattr(
         cli,
         "_audit_cache_root_identity",
-        lambda _config, _cache: (_ for _ in ()).throw(cli.Refusal("fixture refusal")),
+        lambda _config, _cache, **_kwargs: (_ for _ in ()).throw(cli.Refusal("fixture refusal")),
     )
 
     measured, _counters = cli._audit_cache_census(
@@ -1311,11 +1311,11 @@ def test_cache_root_binding_refusal_is_local_to_its_subject(
     original = cli._audit_cache_root_identity
 
     def bind(
-        bound_config: cli.Config, cache: cli.CacheDirectory
+        bound_config: cli.Config, cache: cli.CacheDirectory, *, deadline: float | None = None
     ) -> tuple[int, int, int, int, int] | None:
         if cache.checkout_root.name == "refused":
             raise cli.Refusal("fixture binding refusal")
-        return original(bound_config, cache)
+        return original(bound_config, cache, deadline=deadline)
 
     monkeypatch.setattr(cli, "_audit_cache_root_identity", bind)
 
