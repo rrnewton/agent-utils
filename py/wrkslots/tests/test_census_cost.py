@@ -405,7 +405,7 @@ def test_batch_liveness_malformed_response_makes_every_subject_unverifiable(
     assert all("not JSON" in detail for _state, detail in observed.values())
 
 
-def test_cache_census_is_partial_then_resumes_exactly(
+def test_cache_census_partial_progress_is_bounded_then_exactly_finalized(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -446,18 +446,18 @@ def test_cache_census_is_partial_then_resumes_exactly(
         if measured["subject"].status == "complete":
             break
 
-    if measured["subject"].status != "complete":
-        measured, final_counters = cli._audit_cache_census(
-            config,
-            states,
-            planned,
-            {},
-            state_path=state_path,
-            work_limit=100,
-            wall_seconds=5,
-        )
-        assert final_counters["work_consumed"] <= 100
-        statuses.append(measured["subject"].status)
+    assert measured["subject"].status == "partial"
+    measured, final_counters = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+    assert final_counters["work_consumed"] <= 100
+    statuses.append(measured["subject"].status)
 
     expected = sum(path.stat().st_blocks * 512 for path in (cache, *cache.iterdir()))
     assert statuses[0] == "partial"
@@ -580,7 +580,7 @@ def test_cache_census_refuses_mutated_resume_path_outside_root(
     )
 
 
-def test_cache_census_single_large_directory_makes_bounded_progress(
+def test_cache_census_large_directory_requires_one_bounded_final_sweep(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -619,17 +619,17 @@ def test_cache_census_single_large_directory_makes_bounded_progress(
         if measured["subject"].status == "complete":
             break
 
-    if measured["subject"].status != "complete":
-        measured, final_counters = cli._audit_cache_census(
-            config,
-            states,
-            planned,
-            {},
-            state_path=state_path,
-            work_limit=2048,
-            wall_seconds=5,
-        )
-        assert final_counters["work_consumed"] <= 2048
+    assert measured["subject"].status == "partial"
+    measured, final_counters = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=2048,
+        wall_seconds=5,
+    )
+    assert final_counters["work_consumed"] <= 2048
 
     assert measured["subject"].status == "complete"
     assert all(0 < work <= 64 for work in consumed)
@@ -957,6 +957,72 @@ def test_cache_census_state_path_refuses_external_symlink_into_project(
 
     assert not (config.root / "census.json").exists()
     assert not (config.root / "census.json.key").exists()
+
+
+def test_default_cache_parent_creation_refuses_intermediate_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    cache_home = tmp_path / "cache-home"
+    cache_home.mkdir()
+    (cache_home / "wrkslots").symlink_to(config.root, target_is_directory=True)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+
+    with pytest.raises(cli.Refusal, match="symlink-free"):
+        cli._audit_cache_state_path(config, None)
+
+    assert not (config.root / "audit-cache").exists()
+
+
+def test_bound_cache_parent_survives_path_swap_without_project_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    (cache / "artifact").write_bytes(b"artifact")
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+    state_parent = tmp_path / "state-parent"
+    state_parent.mkdir()
+    preserved_parent = tmp_path / "state-parent-bound"
+    state_path = state_parent / "audit.json"
+    original_key = cli._audit_cache_state_key
+    swapped = False
+
+    def swap_then_key(path: Path, parent_fd: int) -> bytes:
+        nonlocal swapped
+        state_parent.rename(preserved_parent)
+        state_parent.symlink_to(config.root, target_is_directory=True)
+        swapped = True
+        return original_key(path, parent_fd)
+
+    monkeypatch.setattr(cli, "_audit_cache_state_key", swap_then_key)
+    measured, _work = cli._audit_cache_census(
+        config,
+        (cli.ActiveState("testhost", 21, ()),),
+        {"subject": (directory,)},
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert swapped is True
+    assert measured["subject"].status == "complete"
+    assert not (config.root / "audit.json").exists()
+    assert not (config.root / "audit.json.key").exists()
+    assert (preserved_parent / "audit.json").is_file()
+    assert (preserved_parent / "audit.json.key").is_file()
 
 
 def test_cache_census_refuses_nonprivate_existing_key(tmp_path: Path) -> None:

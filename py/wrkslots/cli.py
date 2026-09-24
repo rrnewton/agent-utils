@@ -15603,8 +15603,32 @@ def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
             raise Refusal(f"audit cache home is unavailable: {cache_home}: {exc}") from exc
         if _path_is_within(cache_home, config.root):
             raise Refusal("audit cache home must be outside the managed project tree")
-        cache_parent = cache_home / "wrkslots" / "audit-cache"
-        cache_parent.mkdir(parents=True, exist_ok=True)
+        parent_fd = os.open(
+            cache_home,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        cache_parent = cache_home
+        try:
+            for component in ("wrkslots", "audit-cache"):
+                try:
+                    os.mkdir(component, 0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                os.close(parent_fd)
+                parent_fd = child_fd
+                cache_parent /= component
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot prepare symlink-free audit cache state directory: {exc}"
+            ) from exc
+        finally:
+            os.close(parent_fd)
         project = hashlib.sha256(str(config.root).encode("utf-8")).hexdigest()
         candidate = cache_parent / f"{project}.json"
     if not candidate.is_absolute() or _path_is_within(candidate, config.root):
@@ -15625,11 +15649,7 @@ def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
     return candidate
 
 
-def _audit_cache_parent_identity(
-    config: Config,
-    path: Path,
-    expected: tuple[int, int] | None = None,
-) -> tuple[int, int]:
+def _open_audit_cache_state_parent(config: Config, path: Path) -> int:
     try:
         resolved = path.parent.resolve(strict=True)
     except OSError as exc:
@@ -15646,12 +15666,12 @@ def _audit_cache_parent_identity(
         raise Refusal(f"cannot bind audit cache census state parent: {exc}") from exc
     try:
         metadata = os.fstat(fd)
-        observed = metadata.st_dev, metadata.st_ino
-    finally:
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise Refusal("audit cache census state parent is not a directory")
+    except BaseException:
         os.close(fd)
-    if expected is not None and observed != expected:
-        raise Refusal("audit cache census state parent identity changed")
-    return observed
+        raise
+    return fd
 
 
 def _audit_cache_state_mac(
@@ -15663,11 +15683,36 @@ def _audit_cache_state_mac(
     return hmac.new(key, canonical, hashlib.sha256).hexdigest()
 
 
-def _read_audit_cache_key(path: Path) -> bytes:
+def _read_bounded_regular_file_at(
+    parent_fd: int, name: str, label: str, limit: int
+) -> bytes:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags)
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            raise Refusal(f"{label} is not one bounded regular file")
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(fd, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    contents = b"".join(chunks)
+    if len(contents) > limit:
+        raise Refusal(f"{label} exceeds its {limit}-byte safety bound")
+    return contents
+
+
+def _read_audit_cache_key(parent_fd: int, name: str) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+    fd = os.open(name, flags, dir_fd=parent_fd)
     try:
         metadata = os.fstat(fd)
         if (
@@ -15679,7 +15724,7 @@ def _read_audit_cache_key(path: Path) -> bytes:
         ):
             raise Refusal(
                 "audit cache census key must be one owner-bound 0600 regular file "
-                f"of exactly {_AUDIT_CACHE_KEY_BYTES} bytes: {path}"
+                f"of exactly {_AUDIT_CACHE_KEY_BYTES} bytes"
             )
         key = os.read(fd, _AUDIT_CACHE_KEY_BYTES + 1)
     finally:
@@ -15692,26 +15737,21 @@ def _read_audit_cache_key(path: Path) -> bytes:
 
 
 def _audit_cache_state_key(
-    config: Config,
     path: Path,
-    parent_identity: tuple[int, int],
+    parent_fd: int,
 ) -> bytes:
-    key_path = path.with_name(f"{path.name}.key")
+    key_name = f"{path.name}.key"
     try:
-        _audit_cache_parent_identity(config, path, parent_identity)
-        key = _read_audit_cache_key(key_path)
+        key = _read_audit_cache_key(parent_fd, key_name)
     except FileNotFoundError:
-        if key_path.exists() or key_path.is_symlink():
-            raise Refusal(f"audit cache census key changed while opening: {key_path}")
-        _audit_cache_parent_identity(config, path, parent_identity)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         generated = os.urandom(_AUDIT_CACHE_KEY_BYTES)
         try:
-            fd = os.open(key_path, flags, 0o600)
+            fd = os.open(key_name, flags, 0o600, dir_fd=parent_fd)
         except FileExistsError:
-            key = _read_audit_cache_key(key_path)
+            key = _read_audit_cache_key(parent_fd, key_name)
         else:
             try:
                 offset = 0
@@ -15723,23 +15763,20 @@ def _audit_cache_state_key(
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            _fsync_directory(path.parent)
+            os.fsync(parent_fd)
             key = generated
-    _audit_cache_parent_identity(config, path, parent_identity)
     return key
 
 
 def _write_audit_cache_state(
-    config: Config,
     path: Path,
     payload: Mapping[str, object],
     key: bytes,
-    parent_identity: tuple[int, int],
+    parent_fd: int,
 ) -> None:
-    _audit_cache_parent_identity(config, path, parent_identity)
-    temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    temporary = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    fd = os.open(temporary, flags, 0o600)
+    fd = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as handle:
             envelope = {**payload, "hmac_sha256": _audit_cache_state_mac(key, payload)}
@@ -15747,13 +15784,16 @@ def _write_audit_cache_state(
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        _audit_cache_parent_identity(config, path, parent_identity)
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-        _audit_cache_parent_identity(config, path, parent_identity)
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
+            os.unlink(temporary, dir_fd=parent_fd)
         raise
 
 
@@ -16440,10 +16480,13 @@ def _audit_cache_census(
     wall_seconds: float,
 ) -> tuple[dict[str, _AuditCacheMeasurement], dict[str, int]]:
     registry_revision = _audit_registry_revision(states)
+    parent_fd: int | None = None
     try:
-        parent_identity = _audit_cache_parent_identity(config, state_path)
-        state_key = _audit_cache_state_key(config, state_path, parent_identity)
+        parent_fd = _open_audit_cache_state_parent(config, state_path)
+        state_key = _audit_cache_state_key(state_path, parent_fd)
     except (OSError, Refusal) as exc:
+        if parent_fd is not None:
+            os.close(parent_fd)
         detail = f"cannot establish authenticated audit cache census state: {exc}"
         return {
             subject: _AuditCacheMeasurement(None, "error", detail)
@@ -16461,6 +16504,7 @@ def _audit_cache_census(
             "work_limit": work_limit,
             "work_remaining": work_limit,
         }
+    assert parent_fd is not None
     stored: dict[str, object] = {
         "schema": _AUDIT_CACHE_CENSUS_SCHEMA,
         "registry_revision": registry_revision,
@@ -16468,13 +16512,14 @@ def _audit_cache_census(
     }
     try:
         decoded = json.loads(
-            _read_bounded_regular_file(
-                state_path,
+            _read_bounded_regular_file_at(
+                parent_fd,
+                state_path.name,
                 "audit cache census",
                 _AUDIT_CACHE_STATE_BYTES_LIMIT,
             ).decode("utf-8")
         )
-    except (Refusal, UnicodeError, json.JSONDecodeError):
+    except (OSError, Refusal, UnicodeError, json.JSONDecodeError):
         decoded = None
     if isinstance(decoded, Mapping):
         envelope = dict(decoded)
@@ -16607,12 +16652,12 @@ def _audit_cache_census(
         "roots": roots,
     }
     try:
-        _write_audit_cache_state(
-            config, state_path, stored, state_key, parent_identity
-        )
+        _write_audit_cache_state(state_path, stored, state_key, parent_fd)
     except OSError as exc:
         state_error = f"cannot persist audit cache census: {exc}"
         errors = {**errors, **{subject: state_error for subject in planned}}
+    finally:
+        os.close(parent_fd)
     results: dict[str, _AuditCacheMeasurement] = {}
     for subject in planned:
         error = errors.get(subject)
