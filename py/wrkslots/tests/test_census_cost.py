@@ -485,10 +485,12 @@ def test_cache_census_partial_progress_is_bounded_then_exactly_finalized(
         )
         statuses.append(measured["subject"].status)
         work.append(counters["work_consumed"])
-        if measured["subject"].status == "complete":
+        if measured["subject"].status != "partial":
             break
 
-    assert measured["subject"].status == "partial"
+    assert measured["subject"].status == "error"
+    assert measured["subject"].bytes is None
+    assert "exceeding the fixed allowance" in (measured["subject"].error or "")
     measured, final_counters = cli._audit_cache_census(
         config,
         states,
@@ -658,10 +660,12 @@ def test_cache_census_large_directory_requires_one_bounded_final_sweep(
             wall_seconds=5,
         )
         consumed.append(counters["work_consumed"])
-        if measured["subject"].status == "complete":
+        if measured["subject"].status != "partial":
             break
 
-    assert measured["subject"].status == "partial"
+    assert measured["subject"].status == "error"
+    assert measured["subject"].bytes is None
+    assert "exceeding the fixed allowance" in (measured["subject"].error or "")
     measured, final_counters = cli._audit_cache_census(
         config,
         states,
@@ -776,7 +780,7 @@ def test_cache_census_persisted_cursor_prevents_stable_root_starvation(
         completed.update(
             subject for subject, item in measured.items() if item.status == "complete"
         )
-        cursors.append(json.loads(state_path.read_text(encoding="utf-8"))["next_root"])
+        cursors.append(json.loads(state_path.read_text(encoding="utf-8"))["next_subject"])
 
     assert completed == set(planned)
     assert len(set(cursors)) == 3
@@ -1541,3 +1545,118 @@ def test_cache_census_finalization_rechecks_earlier_file_allocation(
     assert observed["subject"].bytes is None
     assert observed["subject"].error is not None
     assert "entry changed before final publication" in observed["subject"].error
+
+
+def test_batch_provider_deep_json_transport_preserves_every_unverifiable_subject(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, batch=True)
+    assert config.liveness_batch_command is not None
+    config.liveness_batch_command.write_text(
+        "import sys\n"
+        "sys.stdin.buffer.read()\n"
+        "sys.stdout.write('{\"results\":' + '[' * 10000 + '0' + ']' * 10000 + '}')\n",
+        encoding="utf-8",
+    )
+    legacy_marker = config.root / "legacy-was-called"
+    config.liveness_command.write_text(
+        f"from pathlib import Path\nPath({str(legacy_marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    records = _records(3)
+
+    observed = cli._registered_liveness_states(config, records)
+
+    assert set(observed) == {
+        ("testhost", f"slot-{index:03d}", 1) for index in range(3)
+    }
+    assert {state for state, _detail in observed.values()} == {"unverifiable"}
+    assert all("not JSON" in detail for _state, detail in observed.values())
+    assert not legacy_marker.exists()
+
+
+@pytest.mark.parametrize("stream", ("stdout", "stderr"))
+def test_batch_provider_failed_transport_caps_shared_diagnostic(
+    tmp_path: Path,
+    stream: str,
+) -> None:
+    config = _config(tmp_path, batch=True)
+    assert config.liveness_batch_command is not None
+    size = 512 * 1024 if stream == "stdout" else 60 * 1024
+    payload = "provider failure\x1b[31m\r\n\x00\u202e\t" + "x" * size
+    config.liveness_batch_command.write_text(
+        "import sys\n"
+        "sys.stdin.buffer.read()\n"
+        f"sys.{stream}.write({payload!r})\n"
+        "raise SystemExit(7)\n",
+        encoding="utf-8",
+    )
+
+    observed = cli._registered_liveness_states(config, _records(256))
+
+    assert set(observed) == {
+        ("testhost", f"slot-{index:03d}", 1) for index in range(256)
+    }
+    assert {state for state, _detail in observed.values()} == {"unverifiable"}
+    details = [detail for _state, detail in observed.values()]
+    assert len(set(details)) == 1
+    detail = details[0]
+    assert "command exited 7: provider failure" in detail
+    assert detail.endswith("[truncated]")
+    assert detail == " ".join(detail.split())
+    assert all(char.isprintable() for char in detail)
+    assert len(detail.encode("utf-8")) <= 4096
+    assert sum(len(value.encode("utf-8")) for value in details) <= 256 * 4096
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("unknown-field", "unknown-subject", "misbound-agent", "invalid-state", "duplicate-field"),
+)
+def test_batch_provider_malformed_fields_cap_shared_parser_diagnostic(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config = _config(tmp_path, batch=True)
+    assert config.liveness_batch_command is not None
+    config.liveness_batch_command.write_text(
+        "import json\n"
+        "import sys\n"
+        "request = json.load(sys.stdin)\n"
+        "results = [dict(subject_id=subject['subject_id'], agent=subject['agent'], "
+        "state='dead', detail='fixture dead') for subject in request['subjects']]\n"
+        f"response = dict(schema={cli._LIVENESS_BATCH_RESPONSE_SCHEMA!r}, "
+        "request_sha256=request['request_sha256'], results=results)\n"
+        "payload = 'untrusted\\x1b[31m\\r\\n\\x00\\u202e\\t' + '\\u754c' * 20000\n"
+        f"mutation = {mutation!r}\n"
+        "if mutation == 'unknown-field':\n"
+        "    response[payload] = None\n"
+        "elif mutation == 'unknown-subject':\n"
+        "    results[0]['subject_id'] = payload\n"
+        "elif mutation == 'misbound-agent':\n"
+        "    results[0]['agent'] = payload\n"
+        "elif mutation == 'invalid-state':\n"
+        "    results[0]['state'] = payload\n"
+        "encoded = json.dumps(response)\n"
+        "if mutation == 'duplicate-field':\n"
+        "    member = json.dumps(payload) + ':null'\n"
+        "    encoded = encoded[:-1] + ',' + member + ',' + member + '}'\n"
+        "sys.stdout.write(encoded)\n",
+        encoding="utf-8",
+    )
+
+    observed = cli._registered_liveness_states(config, _records(256))
+
+    assert set(observed) == {
+        ("testhost", f"slot-{index:03d}", 1) for index in range(256)
+    }
+    assert {state for state, _detail in observed.values()} == {"unverifiable"}
+    details = [detail for _state, detail in observed.values()]
+    assert len(set(details)) == 1
+    detail = details[0]
+    assert detail.startswith("registered batch liveness authority is unverifiable: ")
+    assert detail.endswith("[truncated]")
+    assert detail == " ".join(detail.split())
+    assert all(char.isprintable() for char in detail)
+    assert len(detail.encode("utf-8")) <= 4096
+    assert sum(len(value.encode("utf-8")) for value in details) <= 256 * 4096

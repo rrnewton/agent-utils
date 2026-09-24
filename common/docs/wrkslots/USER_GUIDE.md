@@ -104,15 +104,33 @@ affected slots and the next command. It never converts an unknown result into pe
 Audit may update only its regenerable, project-keyed cache-accounting census below
 `XDG_CACHE_HOME` (or a canonical absolute path beneath an existing symlink-free parent outside the
 managed project supplied with `--cache-census-state`); it does not change a
-registry, worktree, hold, journal, handoff, or Git repository. `--cache-work-limit` and
-`--cache-wall-seconds` bound each invocation. Until the census has visited and reverified every
-directory, JSON reports `cache_bytes: null` and `cache_status: "partial"`, and that incomplete
-evidence keeps the row out of `DELETABLE`. The state is keyed by the active-registry revision and
-cache-root identity. Persisted progress is authenticated by a sibling 0600 key; missing or altered
-authentication restarts the bounded census instead of accepting claimed progress. Completion still
-requires a recursive verification pass and a final directory-identity sweep in the publishing
-invocation, so the progress file alone carries no lifecycle authority. JSON also reports typed CPU
-seconds, wall seconds, and work counters for the registry, liveness, process-census, cache-census,
+registry, worktree, hold, journal, handoff, or Git repository. `--cache-work-limit`
+(default 100000 work units) and `--cache-wall-seconds` (default 5 seconds) bound the
+cache binding and traversal phase, not the end-to-end audit: registry/cache planning,
+bounded state decoding/authentication, and persistence occur outside that allowance.
+Until the census has visited and reverified every directory and entry, JSON reports
+`cache_bytes: null` and `cache_status: "partial"`, keeping the row out of `DELETABLE`.
+An authenticated subject cursor gives lifecycle subjects fair turns, including subjects
+with multiple cache roots. Measurement and recursive verification resume across calls;
+finalization reserves a fresh sweep of every directory and file of all roots belonging
+to that subject in one invocation. No persisted completed total supplies current evidence.
+
+If that subject's final sweep needs more work than the fixed allowance, or exhausts an
+entire fresh binding/traversal wall allowance, the result is `cache_status: "error"` with null
+bytes and a specific capacity error. It never cycles indefinitely as partial or publishes
+a stale total. Root binding that alone exhausts that wall allowance also reports a capacity
+error. Stable subjects whose fresh sweep fits can finish at an unchanged budget,
+even when measurement and verification together require several invocations. Partial
+finalization restarts for the whole subject; previous calls' final checks are never reused.
+
+The state is keyed by active-registry revision and cache-root identity. Persisted progress
+is authenticated by a sibling 0600 key; missing, malformed, too deeply nested, obsolete, or
+altered state restarts the bounded census. Both writer and reader enforce a 64 MiB state
+limit. A state too large to persist produces null/error accounting instead of repeatedly
+writing unreadable progress. Unavailable default cache storage also produces null/error
+accounting while preserving lifecycle rows, holds, and other refusal reasons. Invalid
+explicit state-path arguments remain CLI refusals. JSON reports typed CPU seconds, wall
+seconds, and work counters for the registry, liveness, process-census, cache-census,
 registered-row, and storage phases.
 
 ## Time-to-live and process evidence

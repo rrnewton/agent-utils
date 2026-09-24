@@ -24154,6 +24154,80 @@ def test_audit_partial_cache_census_cannot_upgrade_deletion_eligibility(
     assert complete["reasons"] == []
 
 
+@pytest.mark.parametrize("failure", ("file-component", "no-space"))
+def test_audit_default_cache_setup_failure_preserves_lifecycle_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    for slot in ("cached", "held", "empty"):
+        made = create(project, slot=slot, agent=f"agent-{slot}", branch=f"test/{slot}")
+        assert made.returncode == 0, made.stderr
+        tree = checkout(project, slot)
+        commit_task(repository, tree, f"test/{slot}")
+        finished = finish(project, slot=slot, agent=f"agent-{slot}")
+        assert finished.returncode == 0, finished.stderr
+        if slot != "empty":
+            (tree / "target").mkdir()
+            (tree / "target" / "artifact").write_bytes(b"cache")
+    held = command(project, "hold", "held", "--reason", "retain evidence")
+    assert held.returncode == 0, held.stderr
+    for slot in ("cached", "held", "empty"):
+        mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(
+        wrkslots, "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    cache_home = tmp_path / "unavailable-cache-home"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    if failure == "file-component":
+        cache_home.write_text("ordinary file", encoding="utf-8")
+    else:
+        original_mkdir = os.mkdir
+
+        def no_space(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            mode: int = 0o777, *, dir_fd: int | None = None,
+        ) -> None:
+            if path == cache_home.name and dir_fd is not None:
+                raise OSError(errno.ENOSPC, "injected cache-home creation failure")
+            original_mkdir(path, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "mkdir", no_space)
+    registry = control_directory(project) / "ACTIVE.testhost.json"
+    before = registry.read_bytes()
+    arguments = ["--project-root", str(project), "audit", "--format", "json"]
+
+    assert wrkslots.main(arguments) == 0
+    captured = capsys.readouterr()
+    rows = {row["slot"]: row for row in json.loads(captured.out)["slots"]}
+    assert set(rows) == {"cached", "held", "empty"}
+    for slot in ("cached", "held"):
+        assert rows[slot]["cache_bytes"] is None
+        assert rows[slot]["cache_status"] == "error"
+        assert "default audit cache storage is unavailable" in rows[slot]["cache_error"]
+    assert rows["cached"]["verdict"] == "BLOCKED"
+    assert rows["held"]["verdict"] == "HELD"
+    assert any("retain evidence" in reason for reason in rows["held"]["reasons"])
+    assert rows["empty"]["verdict"] == "DELETABLE"
+    assert rows["empty"]["cache_status"] == "complete"
+    assert rows["empty"]["cache_bytes"] == 0
+    assert wrkslots.main([*arguments, "--gate"]) == 1
+    gated = json.loads(capsys.readouterr().out)
+    assert gated["state"] == "actionable"
+    assert gated["attention_slots"] == ["empty"]
+    assert gated["unknown_slots"] == ["cached"]
+    for invalid in ("relative.json", str(project / "forbidden.json")):
+        assert wrkslots.main([*arguments, "--cache-census-state", invalid]) == 3
+        explicit = capsys.readouterr()
+        assert explicit.out == ""
+        assert "cache" in explicit.err
+    assert registry.read_bytes() == before
+
+
 def test_audit_cache_ancestor_swap_stays_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -384,7 +384,7 @@ _LIVENESS_BATCH_REQUEST_SCHEMA = "wrkslots-liveness-batch-request/v1"
 _LIVENESS_BATCH_RESPONSE_SCHEMA = "wrkslots-liveness-batch-response/v1"
 _LIVENESS_BATCH_BYTES_LIMIT = 4 * 1024 * 1024
 _AUDIT_METRICS_SCHEMA = "wrkslots-audit-metrics/v1"
-_AUDIT_CACHE_CENSUS_SCHEMA = "wrkslots-audit-cache-census/v5"
+_AUDIT_CACHE_CENSUS_SCHEMA = "wrkslots-audit-cache-census/v6"
 _AUDIT_CACHE_KEY_BYTES = 32
 _AUDIT_CACHE_STATE_BYTES_LIMIT = 64 * 1024 * 1024
 _AUDIT_CACHE_WORK_LIMIT = 100_000
@@ -1256,7 +1256,7 @@ def _strict_json_object(contents: bytes, label: str) -> Mapping[str, object]:
 
     try:
         value = json.loads(contents, object_pairs_hook=unique_object)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise Refusal(f"{label} is malformed JSON: {exc}") from exc
     return _as_mapping(value, label)
 
@@ -9756,6 +9756,27 @@ def _parse_liveness_batch_response(
     return parsed
 
 
+def _liveness_batch_diagnostic(value: str) -> str:
+    """Bound one untrusted diagnostic before it is shared by every subject.
+
+    Limit the input inspected as well as the UTF-8 output. Nonprinting text,
+    including terminal controls and Unicode direction controls, becomes spaces.
+    The final byte bound includes the truncation marker.
+    """
+
+    limit = 4096
+    marker = b" [truncated]"
+    excerpt = value[:limit]
+    printable = "".join(char if char.isprintable() else " " for char in excerpt)
+    encoded = " ".join(printable.split()).encode("utf-8")
+    if len(value) > limit or len(encoded) > limit:
+        return (
+            encoded[:limit - len(marker)].decode("utf-8", errors="ignore").rstrip()
+            + marker.decode("ascii")
+        )
+    return encoded.decode("utf-8") or "no detail"
+
+
 def _registered_liveness_states(
     config: Config, records: Sequence[ActiveRecord]
 ) -> dict[tuple[str, str, int], tuple[str, str]]:
@@ -9801,14 +9822,15 @@ def _registered_liveness_states(
         stdout = stdout_bytes.decode("utf-8")
         stderr = stderr_bytes.decode("utf-8")
         if returncode != 0:
-            first = (stderr or stdout).strip().splitlines()
-            detail = first[0] if first else "no detail"
+            detail = _liveness_batch_diagnostic(stderr or stdout)
             raise Refusal(
                 f"batch liveness command exited {returncode}: {detail}"
             )
         parsed = _parse_liveness_batch_response(stdout, request)
     except (OSError, UnicodeError, subprocess.TimeoutExpired, Refusal, StateError) as exc:
-        detail = f"registered batch liveness authority is unverifiable: {exc}"
+        detail = _liveness_batch_diagnostic(
+            f"registered batch liveness authority is unverifiable: {exc}"
+        )
         return {
             (record.machine, record.slot, record.generation):
             ("unverifiable", detail)
@@ -15735,13 +15757,116 @@ def _open_audit_cache_state_parent(config: Config, path: Path) -> int:
     return fd
 
 
+def _audit_cache_state_json_chunks(
+    payload: Mapping[str, object],
+) -> Iterator[bytes]:
+    """Bound both canonical encoding work and the eventual on-disk encoding.
+
+    State has a shallow fixed schema. A modest nesting ceiling also rejects
+    cyclic or hostile decoded values before the recursive JSON encoder runs.
+    The preliminary lower bound prevents one oversized string/container from
+    being encoded before the exact byte limit is checked below.
+    """
+
+    lower_bound = 0
+
+    def visit(value: object, depth: int) -> None:
+        nonlocal lower_bound
+        if depth > 32:
+            raise Refusal("audit cache census state exceeds its nesting bound")
+        if isinstance(value, str):
+            lower_bound += len(value) + 2
+        elif isinstance(value, Mapping):
+            lower_bound += 2
+            for name, child in value.items():
+                if not isinstance(name, str):
+                    raise Refusal("audit cache census state has a non-string member")
+                visit(name, depth + 1)
+                visit(child, depth + 1)
+        elif isinstance(value, list):
+            lower_bound += 2
+            for child in value:
+                visit(child, depth + 1)
+        elif value is None or isinstance(value, (int, float)):
+            lower_bound += 1
+        else:
+            raise Refusal("audit cache census state contains an unsupported value")
+        if lower_bound > _AUDIT_CACHE_STATE_BYTES_LIMIT:
+            raise Refusal(
+                "audit cache census state exceeds its "
+                f"{_AUDIT_CACHE_STATE_BYTES_LIMIT}-byte safety bound"
+            )
+
+    visit(payload, 0)
+    encoder = json.JSONEncoder(
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+    )
+    encoded_bytes = 0
+    try:
+        for chunk in encoder.iterencode(payload):
+            encoded = chunk.encode("ascii")
+            encoded_bytes += len(encoded)
+            if encoded_bytes > _AUDIT_CACHE_STATE_BYTES_LIMIT:
+                raise Refusal(
+                    "audit cache census state exceeds its "
+                    f"{_AUDIT_CACHE_STATE_BYTES_LIMIT}-byte safety bound"
+                )
+            yield encoded
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise Refusal("audit cache census state cannot be safely encoded") from exc
+
+
 def _audit_cache_state_mac(
     key: bytes, payload: Mapping[str, object]
 ) -> str:
-    canonical = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("utf-8")
-    return hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    digest = hmac.new(key, digestmod=hashlib.sha256)
+    for chunk in _audit_cache_state_json_chunks(payload):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_audit_cache_state(
+    path: Path,
+    parent_fd: int,
+    key: bytes,
+    registry_revision: str,
+) -> dict[str, object] | None:
+    """Malformed regenerable progress must never abort the lifecycle report."""
+
+    try:
+        decoded = json.loads(
+            _read_bounded_regular_file_at(
+                parent_fd,
+                path.name,
+                "audit cache census",
+                _AUDIT_CACHE_STATE_BYTES_LIMIT,
+            ).decode("utf-8")
+        )
+        if not isinstance(decoded, Mapping):
+            return None
+        envelope = dict(decoded)
+        mac = envelope.pop("hmac_sha256", None)
+        if (
+            isinstance(mac, str)
+            and DIGEST_RE.fullmatch(mac) is not None
+            and envelope.get("schema") == _AUDIT_CACHE_CENSUS_SCHEMA
+            and envelope.get("registry_revision") == registry_revision
+            and isinstance(envelope.get("roots"), dict)
+            and (
+                envelope.get("next_subject") is None
+                or isinstance(envelope.get("next_subject"), str)
+            )
+            and set(envelope)
+            == {"schema", "registry_revision", "roots", "next_subject"}
+            and hmac.compare_digest(mac, _audit_cache_state_mac(key, envelope))
+        ):
+            return envelope
+    except (OSError, Refusal, UnicodeError, ValueError, RecursionError):
+        # ValueError includes JSONDecodeError and bounded integer conversion
+        # failures; deeply nested JSON can instead fail with RecursionError.
+        # Authentication encoding uses the same bounded rejection path.
+        pass
+    return None
 
 
 def _read_bounded_regular_file_at(
@@ -15835,14 +15960,19 @@ def _write_audit_cache_state(
     key: bytes,
     parent_fd: int,
 ) -> None:
+    envelope = {**payload, "hmac_sha256": _audit_cache_state_mac(key, payload)}
+    encoded = bytearray()
+    for chunk in _audit_cache_state_json_chunks(envelope):
+        encoded.extend(chunk)
+    # Use exactly the compact encoding that was size-checked. In particular,
+    # indentation or a trailing newline must not make our own state unreadable.
+    # Preflight finishes before any temporary file is created.
     temporary = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     fd = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as handle:
-            envelope = {**payload, "hmac_sha256": _audit_cache_state_mac(key, payload)}
-            json.dump(envelope, handle, indent=2, sort_keys=True, ensure_ascii=True)
-            handle.write("\n")
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(
@@ -16303,6 +16433,7 @@ def _resume_audit_cache_root(
     *,
     budget: _AuditWorkBudget,
     deadline: float,
+    finalize: bool = True,
 ) -> bool:
     """Advance one exact root without turning an incomplete count into zero."""
 
@@ -16311,6 +16442,8 @@ def _resume_audit_cache_root(
         if phase not in {"measure", "verify", "finalize"}:
             raise StateError(f"cache census has invalid phase {phase!r}")
         if phase == "finalize":
+            if not finalize:
+                return False
             verified_directories = _as_list(
                 root.get("verified_directories"),
                 "cache census verified directories",
@@ -16362,6 +16495,11 @@ def _resume_audit_cache_root(
                     "cache census directories finalized",
                     minimum=0,
                 ) + 1
+                if finalize_index + 1 == len(verified_directories) and not _as_list(
+                    root.get("verified_entries"), "cache census verified entries"
+                ):
+                    root["status"] = "complete"
+                    return True
                 continue
             verified_entries = _as_list(
                 root.get("verified_entries"), "cache census verified entries"
@@ -16643,37 +16781,13 @@ def _audit_cache_census_bound(
         "schema": _AUDIT_CACHE_CENSUS_SCHEMA,
         "registry_revision": registry_revision,
         "roots": {},
-        "next_root": None,
+        "next_subject": None,
     }
-    try:
-        decoded = json.loads(
-            _read_bounded_regular_file_at(
-                parent_fd,
-                state_path.name,
-                "audit cache census",
-                _AUDIT_CACHE_STATE_BYTES_LIMIT,
-            ).decode("utf-8")
-        )
-    except (OSError, Refusal, UnicodeError, json.JSONDecodeError):
-        decoded = None
-    if isinstance(decoded, Mapping):
-        envelope = dict(decoded)
-        mac = envelope.pop("hmac_sha256", None)
-        if (
-            isinstance(mac, str)
-            and DIGEST_RE.fullmatch(mac) is not None
-            and hmac.compare_digest(mac, _audit_cache_state_mac(state_key, envelope))
-            and envelope.get("schema") == _AUDIT_CACHE_CENSUS_SCHEMA
-            and envelope.get("registry_revision") == registry_revision
-            and isinstance(envelope.get("roots"), dict)
-            and (
-                envelope.get("next_root") is None
-                or isinstance(envelope.get("next_root"), str)
-            )
-            and set(envelope)
-            == {"schema", "registry_revision", "roots", "next_root"}
-        ):
-            stored = envelope
+    loaded = _read_audit_cache_state(
+        state_path, parent_fd, state_key, registry_revision
+    )
+    if loaded is not None:
+        stored = loaded
     previous_roots = dict(
         _as_mapping(stored.get("roots"), "audit cache census roots")
     )
@@ -16747,17 +16861,10 @@ def _audit_cache_census_bound(
             root_items[key] = (cache, identity, root)
         root_keys[subject] = subject_keys
 
-    ordered_keys = sorted(root_items)
-    requested_next = stored.get("next_root")
-    if isinstance(requested_next, str) and requested_next in root_items:
-        start = ordered_keys.index(requested_next)
-        ordered_keys = ordered_keys[start:] + ordered_keys[:start]
-    next_root = ordered_keys[0] if ordered_keys else None
-    for index, key in enumerate(ordered_keys):
+    def advance(key: str, *, finalize: bool) -> None:
+        nonlocal directories, entries, verified, verified_entries, finalized
+        nonlocal finalized_entries
         cache, identity, root = root_items[key]
-        if budget.remaining <= 0 or time.monotonic() >= deadline:
-            continue
-        next_root = ordered_keys[(index + 1) % len(ordered_keys)]
         before_dirs = _as_int(root.get("directories_visited"), "cache census directories")
         before_entries = _as_int(root.get("entries_visited"), "cache census entries")
         before_verified = _as_int(
@@ -16784,6 +16891,7 @@ def _audit_cache_census_bound(
                     root,
                     budget=budget,
                     deadline=deadline,
+                    finalize=finalize,
                 )
             if root.get("status") == "complete":
                 root_results[key] = _AuditCacheMeasurement(
@@ -16820,17 +16928,100 @@ def _audit_cache_census_bound(
                 root.get("entries_finalized"),
                 "cache census entries finalized",
             ) - before_finalized_entries
+
+    # Progress belongs to a lifecycle subject, which may contain several roots.
+    # Stage every root before reserving one fresh, indivisible publication sweep.
+    # No completed subset may force its peers back through verification forever.
+    if time.monotonic() >= deadline:
+        # Binding already belongs to the fixed wall allowance. If it consumes
+        # that whole opportunity, report a capacity refusal rather than leave
+        # every subject partial forever without ever starting traversal.
+        for subject, keys in root_keys.items():
+            if keys:
+                subject_errors.setdefault(
+                    subject,
+                    "cache census root binding exhausted the fixed wall allowance "
+                    f"of {wall_seconds:g} seconds; no cache total can be published "
+                    "within this allowance",
+                )
+    ordered_subjects = sorted(root_keys)
+    requested_next = stored.get("next_subject")
+    if isinstance(requested_next, str) and requested_next in root_keys:
+        start = ordered_subjects.index(requested_next)
+        ordered_subjects = ordered_subjects[start:] + ordered_subjects[:start]
+    next_subject = ordered_subjects[0] if ordered_subjects else None
+    for index, subject in enumerate(ordered_subjects):
+        if budget.remaining <= 0 or time.monotonic() >= deadline:
+            break
+        next_subject = ordered_subjects[(index + 1) % len(ordered_subjects)]
+        keys = root_keys[subject]
+        if subject in subject_errors or not keys:
+            continue
+        for key in keys:
+            if root_items[key][2]["phase"] != "finalize":
+                advance(key, finalize=False)
+            if root_results[key].error is not None:
+                break
+        if any(root_results[key].error is not None for key in keys):
+            continue
+        if any(root_items[key][2]["phase"] != "finalize" for key in keys):
+            continue
+        required_work = sum(
+            len(_as_list(root_items[key][2][field], f"cache census {field}"))
+            for key in keys
+            for field in ("verified_directories", "verified_entries")
+        )
+        if required_work > work_limit:
+            subject_errors[subject] = (
+                f"fresh cache finalization requires {required_work} work units for "
+                f"this subject, exceeding the fixed allowance of {work_limit}; "
+                "no cache total can be published within this allowance"
+            )
+            continue
+        if required_work > budget.remaining:
+            # Reserve a full turn rather than retrying behind other subjects.
+            next_subject = subject
+            break
+        full_attempt = budget.consumed == 0
+        for key in keys:
+            advance(key, finalize=True)
+            if root_results[key].status != "complete":
+                break
+        completed = (
+            all(root_results[key].status == "complete" for key in keys)
+            and time.monotonic() < deadline
+        )
+        if not completed:
+            # Even roots which passed are only staged until this subject's whole
+            # sweep passes together. Their finalization is restarted next time.
+            for key in keys:
+                root_items[key][2]["status"] = "partial"
+                if root_results[key].error is None:
+                    root_results[key] = _AuditCacheMeasurement(None, "partial")
+            if any(root_results[key].error is not None for key in keys):
+                continue
+            if full_attempt:
+                subject_errors[subject] = (
+                    "fresh cache finalization exceeded the fixed wall allowance "
+                    f"of {wall_seconds:g} seconds; no cache total can be published "
+                    "within this allowance"
+                )
+            else:
+                next_subject = subject
+                break
     stored = {
         "schema": _AUDIT_CACHE_CENSUS_SCHEMA,
         "registry_revision": registry_revision,
         "roots": roots,
-        "next_root": next_root,
+        "next_subject": next_subject,
     }
     try:
         _write_audit_cache_state(state_path, stored, state_key, parent_fd)
-    except OSError as exc:
+    except (OSError, Refusal) as exc:
         state_error = f"cannot persist audit cache census: {exc}"
-        subject_errors.update({subject: state_error for subject in planned})
+        for subject, caches in planned.items():
+            if caches:
+                subject_errors.setdefault(subject, state_error)
     results: dict[str, _AuditCacheMeasurement] = {}
     for subject in planned:
         error = subject_errors.get(subject)
@@ -16862,6 +17053,35 @@ def _audit_cache_census_bound(
     }
 
 
+def _unavailable_audit_cache_census(
+    planned: Mapping[str, Sequence[CacheDirectory]],
+    errors: Mapping[str, str],
+    *,
+    work_limit: int,
+    detail: str | None,
+) -> tuple[dict[str, _AuditCacheMeasurement], dict[str, int]]:
+    results: dict[str, _AuditCacheMeasurement] = {}
+    for subject, caches in planned.items():
+        error = errors.get(subject) or (detail if caches else None)
+        if error is not None:
+            results[subject] = _AuditCacheMeasurement(None, "error", error)
+        else:
+            results[subject] = _AuditCacheMeasurement(0, "complete")
+    return results, {
+        "cache_roots": sum(len(caches) for caches in planned.values()),
+        "directories_visited": 0,
+        "directories_verified": 0,
+        "directories_finalized": 0,
+        "entries_visited": 0,
+        "entries_verified": 0,
+        "entries_finalized": 0,
+        "subjects": len(planned),
+        "work_consumed": 0,
+        "work_limit": work_limit,
+        "work_remaining": work_limit,
+    }
+
+
 def _audit_cache_census(
     config: Config,
     states: Sequence[ActiveState],
@@ -16871,29 +17091,12 @@ def _audit_cache_census(
     state_path: Path | None,
     work_limit: int,
     wall_seconds: float,
+    storage_error: str | None = None,
 ) -> tuple[dict[str, _AuditCacheMeasurement], dict[str, int]]:
-    cache_roots = sum(len(caches) for caches in planned.values())
-    if cache_roots == 0:
-        return {
-            subject: (
-                _AuditCacheMeasurement(None, "error", errors[subject])
-                if subject in errors
-                else _AuditCacheMeasurement(0, "complete")
-            )
-            for subject in planned
-        }, {
-            "cache_roots": 0,
-            "directories_visited": 0,
-            "directories_verified": 0,
-            "directories_finalized": 0,
-            "entries_visited": 0,
-            "entries_verified": 0,
-            "entries_finalized": 0,
-            "subjects": len(planned),
-            "work_consumed": 0,
-            "work_limit": work_limit,
-            "work_remaining": work_limit,
-        }
+    if storage_error is not None or not any(planned.values()):
+        return _unavailable_audit_cache_census(
+            planned, errors, work_limit=work_limit, detail=storage_error
+        )
     if state_path is None:
         raise StateError("cache census storage is absent despite planned cache work")
     parent_fd: int | None = None
@@ -16903,22 +17106,9 @@ def _audit_cache_census(
             state_key = _audit_cache_state_key(state_path, parent_fd)
         except (OSError, Refusal) as exc:
             detail = f"cannot establish authenticated audit cache census state: {exc}"
-            return {
-                subject: _AuditCacheMeasurement(None, "error", detail)
-                for subject in planned
-            }, {
-                "cache_roots": cache_roots,
-                "directories_visited": 0,
-                "directories_verified": 0,
-                "directories_finalized": 0,
-                "entries_visited": 0,
-                "entries_verified": 0,
-                "entries_finalized": 0,
-                "subjects": len(planned),
-                "work_consumed": 0,
-                "work_limit": work_limit,
-                "work_remaining": work_limit,
-            }
+            return _unavailable_audit_cache_census(
+                planned, errors, work_limit=work_limit, detail=detail
+            )
         assert parent_fd is not None
         return _audit_cache_census_bound(
             config,
@@ -17588,11 +17778,17 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 cache_planned[subject] = ()
                 cache_errors[subject] = str(exc)
         cache_started = metrics.start()
-        cache_state_path = (
-            _audit_cache_state_path(config, args.cache_census_state)
-            if any(cache_planned.values())
-            else None
-        )
+        cache_state_path = None
+        cache_storage_error = None
+        if any(cache_planned.values()):
+            try:
+                cache_state_path = _audit_cache_state_path(config, args.cache_census_state)
+            except (OSError, Refusal) as exc:
+                if args.cache_census_state is not None:
+                    # Explicit path errors are CLI refusals. An unavailable
+                    # default cache is only unavailable accounting evidence.
+                    raise
+                cache_storage_error = f"default audit cache storage is unavailable: {exc}"
         cache_measurements, cache_work = _audit_cache_census(
             config,
             states,
@@ -17601,6 +17797,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             state_path=cache_state_path,
             work_limit=args.cache_work_limit,
             wall_seconds=args.cache_wall_seconds,
+            storage_error=cache_storage_error,
         )
         metrics.finish("cache-census", cache_started, cache_work)
         records_started = metrics.start()
@@ -31549,7 +31746,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         default=_AUDIT_CACHE_WORK_LIMIT,
         metavar="ENTRIES",
         help=(
-            f"maximum cache entries visited per invocation (default: {_AUDIT_CACHE_WORK_LIMIT})"
+            "maximum cache traversal work units per invocation; oversized subject "
+            f"finalization reports null/error (default: {_AUDIT_CACHE_WORK_LIMIT})"
         ),
     )
     audit.add_argument(
@@ -31558,7 +31756,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         default=_AUDIT_CACHE_WALL_SECONDS,
         metavar="SECONDS",
         help=(
-            "cache-accounting wall budget before publishing null/partial "
+            "cache binding/traversal wall budget in seconds, excluding planning and state I/O; "
+            "unfinished work is null/partial, a full finalization timeout is null/error "
             f"(default: {_AUDIT_CACHE_WALL_SECONDS:g})"
         ),
     )
