@@ -857,8 +857,9 @@ def main() -> int:
     if stage_token is None:
         old = lib.read_registry().get(name)
         if old is not None and old.runner_pid is not None:
-            if lib.runner_identity_alive(old) and old.runner_pid != os.getpid():
-                lib.die(f"worker {name!r} already has a live runner")
+            if (lib.runner_identity_alive(old) is not False
+                    and old.runner_pid != os.getpid()):
+                lib.die(f"worker {name!r} already has a live or unverified runner")
             lib.terminate_active_harness(old)
     _record_runner_pid(name, stage_token)
     if stage_token is not None:

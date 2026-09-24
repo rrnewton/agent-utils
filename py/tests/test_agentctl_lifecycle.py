@@ -108,41 +108,35 @@ def test_list_output_and_exit_share_one_probe_snapshot(
     ]
 
 
-def test_health_watch_is_bounded_and_stops_at_first_failure(
+def test_health_watch_skips_contended_first_lock_and_probes_later_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    now = 0.0
-    calls = 0
-
-    def monotonic() -> float:
-        return now
-
-    def sleep(seconds: float) -> None:
-        nonlocal now
-        now += seconds
-
-    def health(self: Sessions, names: list[str]) -> dict[str, object]:
-        nonlocal calls
-        calls += 1
-        unhealthy = calls == 2
-        return {
-            "schema": "agentctl-health/v1", "checked_at": now,
-            "healthy": not unhealthy, "registry_error": None,
-            "sessions": [{"name": names[0], "health": "unhealthy" if unhealthy else "healthy"}],
-        }
-
-    monkeypatch.setattr(time, "monotonic", monotonic)
-    monkeypatch.setattr(time, "sleep", sleep)
-    monkeypatch.setattr(Sessions, "health", health)
-    assert cli.main([
-        "health", "worker", "--watch", "60", "--interval", "5",
-        "--registry", str(tmp_path / "registry"),
-    ]) == 1
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("alpha", cwd=str(tmp_path))
+    manager.start("beta", cwd=str(tmp_path))
+    fake.pane_info_calls = fake.panes_calls = 0
+    descriptor = os.open(manager.registry / ".alpha.lock", os.O_RDONLY)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: manager)
+    started = time.monotonic()
+    try:
+        assert cli.main([
+            "health", "alpha", "beta", "--watch", "60", "--interval", "5",
+            "--registry", str(manager.registry),
+        ]) == 1
+    finally:
+        os.close(descriptor)
+    elapsed = time.monotonic() - started
     rendered = json.loads(capsys.readouterr().out)
-    assert calls == 2
-    assert now == 5.0
-    assert rendered["polls"] == 2
+    rows = {row["name"]: row for row in rendered["sessions"]}
+    assert elapsed < 1.0
+    assert rendered["polls"] == 1
     assert rendered["watch_seconds"] == 60.0
+    assert rows["alpha"]["health"] == "unknown"
+    assert rows["alpha"]["reason_code"] == "lifecycle-lock-contended"
+    assert rows["alpha"]["recorded"] is False
+    assert rows["beta"]["health"] == "healthy"
+    assert fake.pane_info_calls > 0 and fake.panes_calls > 0
 
 
 def test_start_holds_registry_identity_lock_through_native_session_commit(

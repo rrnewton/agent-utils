@@ -1354,10 +1354,14 @@ def test_wrong_reply_resource_remains_pending_and_keeps_retry_id(tmp_path: Path)
 
 def test_restart_rejects_replacement_session_before_any_chat_access(tmp_path: Path) -> None:
     class ReplacementHarness(HerdrClient):
-        def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
+        def panes(
+            self, workspace_id: str | None = None, *, timeout: float = 30.0,
+        ) -> tuple[Pane, ...]:
+            del workspace_id, timeout
             return (Pane("w1:p1", "w1:t1", "w1"),)
 
-        def pane_info(self, pane_id: str) -> AgentPaneInfo:
+        def pane_info(self, pane_id: str, *, timeout: float = 30.0) -> AgentPaneInfo:
+            del timeout
             return AgentPaneInfo(pane_id, "w1", "/work/project", "codex", "idle", "codex", "replacement")
 
     pages = Pages()
@@ -1377,17 +1381,20 @@ class NamedHarness(HerdrClient):
         self.replace_on_probe: int | None = None
         self.prompts: list[str] = []
 
-    def agent_pane(self, name: str) -> str:
+    def agent_pane(self, name: str, *, timeout: float = 30.0) -> str:
+        del timeout
         assert name == "coordinator"
         return self.named_pane
 
-    def pane_info(self, pane_id: str) -> AgentPaneInfo:
+    def pane_info(self, pane_id: str, *, timeout: float = 30.0) -> AgentPaneInfo:
+        del timeout
         self.probes += 1
         if self.probes == self.replace_on_probe:
             self.named_pane = "w1:p2"
         return AgentPaneInfo(pane_id, "w1", "/work/project", "codex", "idle", None, None)
 
-    def workspace_label(self, workspace_id: str) -> str:
+    def workspace_label(self, workspace_id: str, *, timeout: float = 30.0) -> str:
+        del workspace_id, timeout
         return "project"
 
     def prompt_agent(self, pane_id: str, command: str) -> None:

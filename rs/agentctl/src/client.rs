@@ -1016,6 +1016,11 @@ impl HerdrClient {
         timeout: Duration,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<CommandOutput> {
+        if cancelled() {
+            return Err(AdapterError::unavailable(
+                "Herdr control operation was cancelled before invocation",
+            ));
+        }
         let executable = resolve_executable(&self.executable)?;
         let mut command = Command::new(executable);
         command.args(args);
@@ -1390,11 +1395,19 @@ impl HerdrClient {
 
     /// Capture one stable supported idle-shell generation with no descendants.
     pub fn pane_idle_shell_identity(&self, pane_id: &str) -> Result<Option<PaneShellProof>> {
-        let before = self.pane_process_state(pane_id, &|| false)?;
+        self.pane_idle_shell_identity_with_cancellation(pane_id, &|| false)
+    }
+
+    pub(crate) fn pane_idle_shell_identity_with_cancellation(
+        &self,
+        pane_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<PaneShellProof>> {
+        let before = self.pane_process_state(pane_id, cancelled)?;
         let Some(proof) = self.idle_shell_proof(&before)? else {
             return Ok(None);
         };
-        let after = self.pane_process_state(pane_id, &|| false)?;
+        let after = self.pane_process_state(pane_id, cancelled)?;
         if after != before || self.idle_shell_proof(&after)?.as_ref() != Some(&proof) {
             return Ok(None);
         }
@@ -1420,13 +1433,22 @@ impl HerdrClient {
         pane_id: &str,
         expected: &CustomProcessIdentity,
     ) -> Result<bool> {
+        self.pane_is_same_idle_shell_with_cancellation(pane_id, expected, &|| false)
+    }
+
+    pub(crate) fn pane_is_same_idle_shell_with_cancellation(
+        &self,
+        pane_id: &str,
+        expected: &CustomProcessIdentity,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<bool> {
         if !expected.valid() {
             return Err(AdapterError::unavailable(
                 "recorded pane shell identity is invalid",
             ));
         }
         Ok(self
-            .pane_idle_shell_identity(pane_id)?
+            .pane_idle_shell_identity_with_cancellation(pane_id, cancelled)?
             .is_some_and(|proof| proof.identity == *expected))
     }
 
@@ -1475,6 +1497,8 @@ impl HerdrClient {
                 "agent startup timeout must be between 0 and 300 seconds",
             ));
         }
+        let deadline = Instant::now() + timeout;
+        let cancelled = || Instant::now() >= deadline;
         if kind.is_empty()
             || !kind.as_bytes()[0].is_ascii_lowercase()
             || !kind
@@ -1495,7 +1519,7 @@ impl HerdrClient {
             argv: command.clone(),
         })?;
         let line = shell_join(&command)?;
-        self.call_ok(
+        self.call_ok_with_cancellation(
             &[
                 "pane".to_owned(),
                 "run".to_owned(),
@@ -1503,19 +1527,21 @@ impl HerdrClient {
                 line,
             ],
             &format!("pane run {kind:?}"),
+            &cancelled,
         )?;
-        let deadline = Instant::now() + timeout;
         let mut observed = None;
         let mut last_probe_error = None;
         while Instant::now() < deadline {
-            match self.custom_harness_observed(pane_id, &executable, &|| false) {
+            match self.custom_harness_observed(pane_id, &executable, &cancelled) {
                 Ok(value) => observed = value,
                 Err(error) => {
                     // Herdr can briefly expose an incomplete process snapshot or
                     // fail one control request while the process is coming up.
                     // Startup already owns a deadline, so preserve the last error
                     // and retry within that existing bound.
-                    last_probe_error = Some(error.to_string());
+                    if Instant::now() < deadline || last_probe_error.is_none() {
+                        last_probe_error = Some(error.to_string());
+                    }
                     observed = None;
                 }
             }
@@ -1541,12 +1567,12 @@ impl HerdrClient {
         persist(CustomLaunchObservation::Process(observed.clone()))?;
         let mut ready = false;
         while Instant::now() < deadline {
-            if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
+            if !self.recorded_custom_harness_observed(pane_id, &observed, &cancelled)? {
                 return Err(AdapterError::unavailable(format!(
                     "custom harness {kind:?} identity changed before readiness in pane {pane_id}"
                 )));
             }
-            let screen = self.read(pane_id, "visible", Some(200))?;
+            let screen = self.read_with_cancellation(pane_id, "visible", Some(200), &cancelled)?;
             if muse_trust_prompt(&screen)
                 && !arguments.iter().any(|value| value == "--trust-workspace")
             {
@@ -1567,12 +1593,12 @@ impl HerdrClient {
                 "custom harness {kind:?} did not reach a verified idle composer in pane {pane_id}"
             )));
         }
-        if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
+        if !self.recorded_custom_harness_observed(pane_id, &observed, &cancelled)? {
             return Err(AdapterError::unavailable(format!(
                 "custom harness {kind:?} identity changed before report in pane {pane_id}"
             )));
         }
-        self.call_ok(
+        self.call_ok_with_cancellation(
             &strings(&[
                 "pane",
                 "report-agent",
@@ -1587,6 +1613,7 @@ impl HerdrClient {
                 "agentctl custom harness",
             ]),
             &format!("report custom agent {pane_id}"),
+            &cancelled,
         )?;
         Ok(())
     }

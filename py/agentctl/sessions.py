@@ -42,7 +42,9 @@ class Sessions(ManagedAgents):
     def __init__(self, client: HerdrClient | None = None, registry: str | Path = ".agentctl") -> None:
         super().__init__(client or HerdrClient(), registry)
 
-    def _worker(self, record: AgentRecord, action: str, **options: object) -> dict[str, object]:
+    def _worker(
+        self, record: AgentRecord, action: str, **options: object,
+    ) -> dict[str, object]:
         if record.runtime_home is None:
             raise AgentDeliveryError("turn-runner session has no runtime directory")
         environment = dict(os.environ)
@@ -50,11 +52,21 @@ class Sessions(ManagedAgents):
         command = [sys.executable, str(Path(__file__).with_name("worker_rpc.py"))]
         # The adapter process may be interrupted after committing a request. Keep
         # its canonical record and report uncertainty rather than retrying it.
+        raw_deadline = options.pop("_deadline", None)
+        if raw_deadline is not None and not isinstance(raw_deadline, float):
+            raise WorkerRpcError("deadline", "runtime probe deadline is invalid")
+        deadline = raw_deadline
+        timeout = 900.0 if action == "migrate" else 90.0
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WorkerRpcError("deadline", f"runtime {action} probe deadline expired")
+            timeout = min(timeout, remaining)
         try:
             completed = subprocess.run(command,
                 input=json.dumps({"action": action, "name": record.name, **options}),
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                env=environment, timeout=900 if action == "migrate" else 90)
+                env=environment, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             raise WorkerRpcError(
                 "timeout", f"runtime {action} timed out; inspect session state before retrying",
@@ -200,7 +212,7 @@ class Sessions(ManagedAgents):
                     record.lifecycle, record.error = "launch_failed", str(exc)
                     self._save(record)
                     raise
-            return self.status(name)
+            return self._status_record(record)
 
     def _sync_worker_record(
         self, record: AgentRecord, response: dict[str, object], *, save: bool = True,
@@ -230,12 +242,10 @@ class Sessions(ManagedAgents):
             self._save(record)
 
     @staticmethod
-    def _runner_liveness(
+    def _runner_observation(
         record: AgentRecord, response: dict[str, object],
-    ) -> tuple[dict[str, object] | None, str | None]:
-        """Bind one typed liveness observation to the saved runner generation."""
-        if record.runner_pid is None or record.runner_started_at is None:
-            return None, "saved runner identity is unavailable"
+    ) -> tuple[tuple[int, str, bool | None] | None, str | None]:
+        """Parse one internally consistent worker identity and liveness observation."""
         try:
             runtime_record = as_mapping(response.get("record"), "worker runtime record")
             result = as_mapping(response.get("result"), "worker status result")
@@ -244,41 +254,79 @@ class Sessions(ManagedAgents):
                     or not isinstance(agents[0], dict)):
                 raise TypeError("worker status result must contain exactly one agent")
             row = as_mapping(agents[0], "worker status row")
-            identities = (runtime_record, row)
-            for value in identities:
+            parsed: list[tuple[int, str]] = []
+            for value in (runtime_record, row):
                 if value.get("name") != record.name:
                     raise TypeError("worker status identity has a different name")
                 observed_pid = value.get("runner_pid")
                 observed_start = value.get("runner_started_at")
                 if (not isinstance(observed_pid, int) or isinstance(observed_pid, bool)
+                        or not 1 <= observed_pid <= 2_147_483_647
                         or not isinstance(observed_start, str)
-                        or observed_pid != record.runner_pid
-                        or observed_start != record.runner_started_at):
-                    raise TypeError("worker status identity does not match the saved runner")
+                        or not observed_start.isascii() or not observed_start.isdigit()
+                        or not any(character != "0" for character in observed_start)):
+                    raise TypeError("worker status identity is invalid")
+                parsed.append((observed_pid, observed_start))
+            if parsed[0] != parsed[1]:
+                raise TypeError("worker status identities disagree")
             runner_alive = row.get("runner_alive")
-            if not isinstance(runner_alive, bool):
-                raise TypeError("worker status row has no boolean runner_alive evidence")
+            if runner_alive is not None and not isinstance(runner_alive, bool):
+                raise TypeError("worker status row has invalid runner_alive evidence")
         except TypeError as exc:
             return None, str(exc)
+        return (parsed[0][0], parsed[0][1], runner_alive), None
+
+    @classmethod
+    def _runner_liveness(
+        cls, record: AgentRecord, response: dict[str, object],
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """Bind one typed liveness observation to the saved runner generation."""
+        if record.runner_pid is None or record.runner_started_at is None:
+            return None, "saved runner identity is unavailable"
+        observation, error = cls._runner_observation(record, response)
+        if observation is None:
+            return None, error
+        runner_pid, runner_started_at, runner_alive = observation
+        if (runner_pid != record.runner_pid
+                or runner_started_at != record.runner_started_at):
+            return None, "worker status identity does not match the saved runner"
+        if runner_alive is None:
+            return None, "worker status could not determine exact runner liveness"
         return {
             "schema": _RUNNER_LIVENESS_SCHEMA,
             "name": record.name,
-            "runner_pid": record.runner_pid,
-            "runner_started_at": record.runner_started_at,
+            "runner_pid": runner_pid,
+            "runner_started_at": runner_started_at,
             "runner_alive": runner_alive,
         }, None
 
     def status(self, name: str) -> dict[str, object]:
         """Distinguish saved lifecycle, runtime liveness, and supported operations."""
-        return self._status_record(self._load(name))
+        with self._lock(name):
+            return self._status_record(self._load(name))
 
-    def _status_record(self, record: AgentRecord) -> dict[str, object]:
+    def _status_record(
+        self, record: AgentRecord, *, deadline: float | None = None,
+    ) -> dict[str, object]:
         if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
-            result = super()._status_record(record)
+            result = super()._status_record(record, deadline=deadline)
         else:
             result = record.to_document()
             try:
-                response = self._worker(record, "status")
+                response = self._worker(record, "status", _deadline=deadline)
+                observation, observation_error = self._runner_observation(record, response)
+                expected_runtime_home = str(self._directory(record.name) / "runtime")
+                if (record.lifecycle == "running"
+                        and record.runtime_ownership == "owned"
+                        and record.runtime_home == expected_runtime_home
+                        and record.runner_pid is None
+                        and record.runner_started_at is None
+                        and observation is not None and observation[2] is True):
+                    record.runner_pid = observation[0]
+                    record.runner_started_at = observation[1]
+                    self._save(record)
+                    result["runner_pid"] = record.runner_pid
+                    result["runner_started_at"] = record.runner_started_at
                 result["runtime"] = response.get("result")
                 runtime_record = response.get("record")
                 if isinstance(runtime_record, dict):
@@ -289,6 +337,8 @@ class Sessions(ManagedAgents):
                     if isinstance(live_pane, str):
                         result["pane_id"] = live_pane
                 liveness, liveness_error = self._runner_liveness(record, response)
+                if liveness_error is None and observation_error is not None:
+                    liveness_error = observation_error
                 result["runtime_liveness"] = liveness
                 result["runtime_liveness_error"] = liveness_error
                 result["probe_error"] = None
@@ -310,10 +360,11 @@ class Sessions(ManagedAgents):
         return result
 
     def _classify_health(
-        self, record: AgentRecord, status: dict[str, object],
+        self, record: AgentRecord, status: dict[str, object], *,
+        deadline: float | None = None,
     ) -> tuple[str, str, str]:
         if record.adapter != "turn-runner":
-            return super()._classify_health(record, status)
+            return super()._classify_health(record, status, deadline=deadline)
         if record.lifecycle != "running":
             return (
                 "unhealthy",

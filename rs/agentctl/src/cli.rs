@@ -943,7 +943,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
         }
         Commands::Status(value) => {
             let (observation, status) = manager.status_health_snapshot(&value.name)?;
-            let mut result = status_with_health(&observation, Some(&status));
+            let mut result = status_with_health(&observation, status.as_ref());
             add_capabilities(&mut result);
             let healthy = observation["health"] == "healthy";
             write_json(&result).map_err(Failure::Output)?;
@@ -954,7 +954,12 @@ fn run(args: Cli) -> Result<i32, Failure> {
             let mut polls = 0_u64;
             let mut health;
             loop {
-                health = manager.health(&value.names);
+                let probe_deadline = if value.watch > 0.0 {
+                    deadline
+                } else {
+                    Instant::now() + Duration::from_secs(60)
+                };
+                health = manager.health_until(&value.names, probe_deadline);
                 polls += 1;
                 if health["healthy"] != true || Instant::now() >= deadline {
                     break;
@@ -963,6 +968,9 @@ fn run(args: Cli) -> Result<i32, Failure> {
                     Duration::from_secs_f64(value.interval)
                         .min(deadline.saturating_duration_since(Instant::now())),
                 );
+                if Instant::now() >= deadline {
+                    break;
+                }
             }
             health["polls"] = json!(polls);
             health["watch_seconds"] = json!(value.watch);

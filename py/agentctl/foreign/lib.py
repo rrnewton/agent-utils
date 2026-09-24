@@ -506,7 +506,7 @@ class AgentStatus:
     created_at: str
     last_turn_at: Optional[str]
     window_alive: bool
-    runner_alive: bool
+    runner_alive: Optional[bool]
     presentation_degraded: bool
     pending: int
     transcript: str
@@ -1287,31 +1287,45 @@ def pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _read_process_state_start(pid: int) -> tuple[str, str]:
+    """Read one Linux process state/starttime pair or raise on ambiguity."""
+    text = Path(f"/proc/{pid}/stat").read_text()
+    try:
+        fields = text.rsplit(")", 1)[1].strip().split()
+    except IndexError as exc:
+        raise ValueError("process stat has no command terminator") from exc
+    if len(fields) <= 19 or fields[0] not in "RSDZTtXxKWPI":
+        raise ValueError("process stat is incomplete")
+    started_at = fields[19]
+    if not started_at.isascii() or not started_at.isdigit() or not started_at.strip("0"):
+        raise ValueError("process stat has an invalid start time")
+    return fields[0], started_at
+
+
 def pid_start_time(pid: int) -> Optional[str]:
     """Return Linux /proc starttime ticks for PID identity checks."""
-    stat = Path(f"/proc/{pid}/stat")
     try:
-        text = stat.read_text()
-    except OSError:
+        _state, started_at = _read_process_state_start(pid)
+    except (OSError, UnicodeError, ValueError):
         return None
-    try:
-        rest = text.rsplit(")", 1)[1].strip().split()
-    except IndexError:
-        return None
-    if len(rest) <= 19:
-        return None
-    return rest[19]
+    return started_at
 
 
-def runner_identity_alive(rec: AgentRecord) -> bool:
-    """True only when the registry's runner PID still names the same process."""
-    if rec.runner_pid is None or not pid_alive(rec.runner_pid):
+def runner_identity_alive(rec: AgentRecord) -> Optional[bool]:
+    """Observe exact runner liveness; ``None`` means the procfs proof is ambiguous."""
+    if rec.runner_pid is None or rec.runner_started_at is None:
+        return None
+    try:
+        state, current_start = _read_process_state_start(rec.runner_pid)
+    except (FileNotFoundError, ProcessLookupError):
         return False
-    if rec.runner_started_at is None:
-        # Backward-compatible for rows created before runner starttime existed.
-        return True
-    current = pid_start_time(rec.runner_pid)
-    return current is None or current == rec.runner_started_at
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if state in ("Z", "X", "x"):
+        return False
+    if state not in "RSDTtKWPI":
+        return None
+    return current_start == rec.runner_started_at
 
 
 def wait_for_pause_ack(name: str, old: RunnerIdentity) -> bool:
@@ -1921,7 +1935,7 @@ def terminate_runner_identity(identity: RunnerIdentity, grace: float = 2.0) -> b
     if not pid_alive(identity.pid):
         return False
     current_start = pid_start_time(identity.pid)
-    if identity.started_at is not None and current_start is not None and current_start != identity.started_at:
+    if identity.started_at is not None and current_start != identity.started_at:
         return False
     try:
         os.kill(identity.pid, signal.SIGTERM)
@@ -2045,10 +2059,16 @@ def gc() -> list[str]:
                         )
                         continue
                     if not exists:
-                        process_alive = (
-                            rec.mode == HEADLESS_MODE and runner_identity_alive(rec)
+                        process_liveness = (
+                            runner_identity_alive(rec) if rec.mode == HEADLESS_MODE else False
                         )
-                        if process_alive:
+                        if process_liveness is None:
+                            notes.append(
+                                f"{name} runner liveness is ambiguous while Herdr workspace "
+                                f"{workspace_id} is gone; preserving state"
+                            )
+                            continue
+                        if process_liveness:
                             notes.append(
                                 f"{name} degraded: Herdr workspace {workspace_id} is gone but runner pid "
                                 f"{rec.runner_pid} remains alive; recover its presentation before sending work"
@@ -2089,6 +2109,12 @@ def gc() -> list[str]:
                 continue
             win = window_exists(rec)
             runner_alive = runner_identity_alive(rec)
+            if runner_alive is None:
+                notes.append(
+                    f"{name} runner pid {rec.runner_pid} liveness probe is ambiguous; "
+                    "preserving state"
+                )
+                continue
             if runner_alive:
                 if not win:
                     notes.append(
@@ -2182,7 +2208,7 @@ def _agent_status(rec: AgentRecord) -> AgentStatus:
         last_turn_at=rec.last_turn_at,
         window_alive=win,
         runner_alive=runner_alive,
-        presentation_degraded=runner_alive and not win,
+        presentation_degraded=runner_alive is True and not win,
         pending=pending_count(rec.name),
         transcript=str(transcript_path(rec.name)),
         last_message_preview=last_message_preview(rec.name),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shlex
@@ -358,6 +359,31 @@ def _tui_record(name: str, cwd: Path) -> lib.AgentRecord:
         mode=lib.TUI_MODE,
         presentation_pane="wT:p2",
     )
+
+
+@pytest.mark.parametrize(
+    "observation, expected",
+    [(("R", "9001"), True), (("Z", "9001"), False),
+     (("x", "9001"), False), (("?", "9001"), None),
+     (("R", "9002"), False), (FileNotFoundError(), False),
+     (PermissionError(), None), (ValueError("malformed stat"), None)],
+)
+def test_runner_identity_liveness_is_exact_and_tristate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    observation: tuple[str, str] | BaseException, expected: bool | None,
+) -> None:
+    record = dataclasses.replace(
+        _tui_record("worker", tmp_path), mode=lib.HEADLESS_MODE,
+        runner_pid=4242, runner_started_at="9001",
+    )
+
+    def read(_pid: int) -> tuple[str, str]:
+        if isinstance(observation, BaseException):
+            raise observation
+        return observation
+
+    monkeypatch.setattr(lib, "_read_process_state_start", read)
+    assert lib.runner_identity_alive(record) is expected
 
 
 class _FakeSharedAgentClient:

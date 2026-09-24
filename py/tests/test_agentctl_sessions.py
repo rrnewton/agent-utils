@@ -13,9 +13,10 @@ from typing import cast
 
 import pytest
 
-from agentctl import cli, mcp
+from agentctl import cli, mcp, worker_rpc
 from agentctl.client import HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError
+from agentctl.foreign import lib as worker_lib
 from agentctl.profiles import validate_muse_headless_arguments
 from agentctl.sessions import Sessions, WorkerRpcError
 from agentctl.subagents import AgentRecord
@@ -30,15 +31,38 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, Fa
 
     def worker(record: AgentRecord, action: str, **options: object) -> dict[str, object]:
         calls.append(action)
+        # Starting the detached runner is asynchronous: its first legitimate
+        # response can precede publication of the child PID/starttime.
+        identity: dict[str, object] = {} if action == "start" else {
+            "runner_pid": 4242, "runner_started_at": "9001",
+        }
+        if action == "status":
+            descriptor = os.open(sessions.registry / f".{record.name}.lock", os.O_RDONLY)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
         return {"record": {"name": record.name, "mode": "headless", "backend": record.backend,
                 "session_id": "native-thread", "tmux_target": "workers:worker",
-                "presentation_pane": "w1:headless", "runner_pid": 4242,
-                "runner_started_at": "9001"},
+                "presentation_pane": "w1:headless", **identity},
             "result": {"agents": [{"name": record.name, "status": "idle", "pending": 0,
-                "runner_pid": 4242, "runner_started_at": "9001", "runner_alive": True}]}}
+                **identity, "runner_alive": True if identity else None}]}}
 
     monkeypatch.setattr(sessions, "_worker", worker)
     return sessions, fake, calls
+
+
+def test_headless_start_binds_first_later_exact_runner_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, calls = setup(tmp_path, monkeypatch)
+    status = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    saved = sessions.get("worker")
+    assert calls[:2] == ["start", "status"]
+    assert saved.lifecycle == "running"
+    assert (saved.runner_pid, saved.runner_started_at) == (4242, "9001")
+    assert cast(dict[str, object], status["runtime_liveness"])["runner_alive"] is True
 
 
 @pytest.mark.parametrize("first,second", [("interactive", "headless"), ("headless", "interactive"), ("headless", "headless")])
@@ -454,6 +478,56 @@ def test_headless_health_requires_identity_bound_typed_liveness(
     assert row["health"] == ("healthy" if alive else "unhealthy")
     assert row["runtime_state"] == ("live" if alive else "dead")
     assert row["reason_code"] == ("ok" if alive else "runner-not-live")
+
+
+@pytest.mark.parametrize(
+    "process_observation, expected_health, expected_reason",
+    [
+        (("R", "9001"), "healthy", "ok"),
+        (("Z", "9001"), "unhealthy", "runner-not-live"),
+        (PermissionError("procfs denied"), "unknown", "runtime-liveness-unconfirmed"),
+    ],
+)
+def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    process_observation: tuple[str, str] | BaseException,
+    expected_health: str, expected_reason: str,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    inner = worker_lib.AgentRecord(
+        name="worker", harness="codex", backend="tmux",
+        tmux_target="workers:worker", cwd=str(tmp_path), model=None,
+        session_id="native-thread", status="idle", runner_pid=4242,
+        runner_started_at="9001", next_seq=0,
+        created_at="2026-09-24T00:00:00+00:00", last_turn_at=None,
+    )
+    monkeypatch.setattr(worker_lib, "read_registry", lambda: {"worker": inner})
+    monkeypatch.setattr(worker_lib, "window_exists", lambda _record: True)
+    monkeypatch.setattr(worker_lib, "pending_count", lambda _name: 0)
+    monkeypatch.setattr(worker_lib, "transcript_path", lambda _name: tmp_path / "turn.log")
+    monkeypatch.setattr(worker_lib, "last_message_preview", lambda _name: "")
+
+    def read_process(_pid: int) -> tuple[str, str]:
+        if isinstance(process_observation, BaseException):
+            raise process_observation
+        return process_observation
+
+    monkeypatch.setattr(worker_lib, "_read_process_state_start", read_process)
+
+    def dispatch(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        assert record.name == "worker" and action == "status"
+        return worker_rpc.dispatch({"action": action, "name": record.name})
+
+    monkeypatch.setattr(sessions, "_worker", dispatch)
+    health = sessions.health(["worker"], checked_at=123.0)
+    row = cast(list[dict[str, object]], health["sessions"])[0]
+    assert row["health"] == expected_health
+    assert row["reason_code"] == expected_reason
+    assert row["runtime_state"] == (
+        "live" if expected_health == "healthy"
+        else "dead" if expected_health == "unhealthy" else "unknown"
+    )
 
 
 def test_headless_dead_receipt_for_another_runner_is_unknown(

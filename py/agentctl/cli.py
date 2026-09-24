@@ -411,11 +411,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             deadline = time.monotonic() + args.watch
             polls = 0
             while True:
-                result = sessions.health(args.names)
+                probe_deadline = (
+                    deadline if args.watch > 0
+                    else time.monotonic() + 60.0
+                )
+                result = sessions.health(args.names, deadline=probe_deadline)
                 polls += 1
                 if not result["healthy"] or time.monotonic() >= deadline:
                     break
                 time.sleep(min(args.interval, max(0.0, deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    break
             result["polls"] = polls
             result["watch_seconds"] = args.watch
             result["interval_seconds"] = args.interval

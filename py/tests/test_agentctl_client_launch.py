@@ -195,6 +195,28 @@ def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
     assert process_probes >= 2
 
 
+def test_custom_muse_process_probe_honors_remaining_startup_deadline(
+    tmp_path: Path,
+) -> None:
+    herdr = tmp_path / "blocking-herdr"
+    herdr.write_text(
+        "#!/usr/bin/python3\n"
+        "import sys, time\n"
+        "if sys.argv[1:3] == ['pane', 'process-info']:\n"
+        "    time.sleep(5)\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    herdr.chmod(0o700)
+    client = HerdrClient(
+        herdr_bin=str(herdr), environ={"AGENTCTL_MUSE_BIN": "/bin/true"},
+    )
+    started = time.monotonic()
+    with pytest.raises(HerdrUnavailable, match="timed out|deadline"):
+        client.start_pane_agent("worker", "muse", "p1", (), timeout=0.1)
+    assert time.monotonic() - started < 1.0
+
+
 def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     prompt = "literal $(unexpanded) delivery\nsecond line"
     header = "Muse Code 1.3.0\n"

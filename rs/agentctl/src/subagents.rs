@@ -32,6 +32,7 @@ const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const HEALTH_SCHEMA: &str = "agentctl-health/v1";
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn rename_directory_noreplace_at(
     source_parent: &File,
@@ -676,6 +677,33 @@ pub trait ManagedApi: AgentApi {
             "idle shell identity proof is unavailable",
         ))
     }
+    /// Cancellation-aware exact idle-shell proof.
+    fn pane_idle_shell_identity_with_runtime(
+        &self,
+        pane: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Option<PaneShellProof>> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "Herdr control operation was cancelled",
+            ));
+        }
+        self.pane_idle_shell_identity(pane)
+    }
+    /// Cancellation-aware identity-bound idle-shell proof.
+    fn pane_is_same_idle_shell_with_runtime(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<bool> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "Herdr control operation was cancelled",
+            ));
+        }
+        self.pane_is_same_idle_shell(pane, expected)
+    }
     /// Cancellation-aware custom harness verification.
     fn verify_custom_harness_with_runtime(
         &self,
@@ -893,6 +921,23 @@ impl ManagedApi for HerdrClient {
     }
     fn pane_idle_shell_identity(&self, pane: &str) -> crate::error::Result<Option<PaneShellProof>> {
         HerdrClient::pane_idle_shell_identity(self, pane)
+    }
+    fn pane_idle_shell_identity_with_runtime(
+        &self,
+        pane: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Option<PaneShellProof>> {
+        HerdrClient::pane_idle_shell_identity_with_cancellation(self, pane, &|| runtime.cancelled())
+    }
+    fn pane_is_same_idle_shell_with_runtime(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<bool> {
+        HerdrClient::pane_is_same_idle_shell_with_cancellation(self, pane, expected, &|| {
+            runtime.cancelled()
+        })
     }
     fn verify_custom_harness_with_runtime(
         &self,
@@ -1823,6 +1868,35 @@ pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     inherited_workspace: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DeadlineRuntime {
+    origin: Instant,
+    deadline: Instant,
+}
+
+impl DeadlineRuntime {
+    fn until(deadline: Instant) -> Self {
+        Self {
+            origin: Instant::now(),
+            deadline,
+        }
+    }
+}
+
+impl agent::AgentRuntime for DeadlineRuntime {
+    fn monotonic(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration.min(self.deadline.saturating_duration_since(Instant::now())));
+    }
+
+    fn cancelled(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+}
+
 impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// Use an explicit registry, independent of the agents' working directories.
     pub fn new(client: &'a A, registry: &Path) -> Result<Self> {
@@ -1856,6 +1930,38 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     fn lock(&self, agent_name: &str) -> Result<File> {
         self.lock_with_runtime(agent_name, &agent::SystemRuntime::default())
+    }
+
+    fn try_lock_with_runtime(
+        &self,
+        agent_name: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<Option<File>> {
+        name(agent_name)?;
+        agent::create_private_directory(&self.registry, "agent registry", true, true)?;
+        let path = self.registry.join(format!(".{agent_name}.lock"));
+        let file = agent::open_private_lock(&path, "agent lifecycle lock")?;
+        let lock_deadline = Instant::now() + Duration::from_millis(50);
+        loop {
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Some(file)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if runtime.cancelled() || Instant::now() >= lock_deadline {
+                        return Ok(None);
+                    }
+                    runtime.sleep(
+                        Duration::from_millis(5)
+                            .min(lock_deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => {
+                    return Err(fail(format!(
+                        "cannot lock agent lifecycle {}: {error}",
+                        path.display()
+                    )))
+                }
+            }
+        }
     }
 
     fn lock_with_runtime(
@@ -3145,6 +3251,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn status_record(&self, record: &AgentRecord) -> Result<Value> {
+        self.status_record_with_runtime(record, &agent::SystemRuntime::default())
+    }
+
+    fn status_record_with_runtime(
+        &self,
+        record: &AgentRecord,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Result<Value> {
         let agent_name = &record.name;
         let mut result = json!(record);
         result["queue"] = json!(self.queue(agent_name)?);
@@ -3164,8 +3278,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             check_prompt: false,
         };
         let probe = record.target().and_then(|target| {
-            agent::resolve_target(&client, &target)
-                .and_then(|_| agent::status(&client, &target, &self.queue(agent_name)?))
+            agent::resolve_target_with_runtime(&client, &target, runtime).and_then(|_| {
+                agent::status_with_runtime(&client, &target, &self.queue(agent_name)?, runtime)
+            })
         });
         match probe {
             Ok(status) => {
@@ -3183,7 +3298,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(result)
     }
 
-    fn classify_health(&self, record: &AgentRecord, status: &Value) -> (String, String, String) {
+    fn classify_health(
+        &self,
+        record: &AgentRecord,
+        status: &Value,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> (String, String, String) {
         if record.lifecycle != "running" {
             return (
                 "unhealthy".to_owned(),
@@ -3209,7 +3329,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 reason,
             );
         };
-        let presentations = match self.client.panes() {
+        let presentations = match self.client.panes_with_runtime(runtime) {
             Ok(panes) => panes
                 .into_iter()
                 .filter(|pane| pane.pane_id == pane_id)
@@ -3232,7 +3352,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 reason,
             );
         }
-        let info = match self.client.pane_info(pane_id) {
+        let info = match self.client.pane_info_with_runtime(pane_id, runtime) {
             Ok(info) => info,
             Err(_) => {
                 return (
@@ -3272,10 +3392,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             if record.custom_process_identity.is_some()
                 && self
                     .client
-                    .verify_custom_harness(
+                    .verify_custom_harness_with_runtime(
                         pane_id,
                         &record.harness,
                         record.custom_process_identity.as_ref(),
+                        runtime,
                     )
                     .is_ok()
             {
@@ -3285,7 +3406,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     reason,
                 );
             }
-            let shell_fallback = match self.client.pane_idle_shell_identity(pane_id) {
+            let shell_fallback = match self
+                .client
+                .pane_idle_shell_identity_with_runtime(pane_id, runtime)
+            {
                 Ok(proof) => proof,
                 Err(_) => {
                     return (
@@ -3319,14 +3443,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             if info.agent.is_none() {
                 let shell_fallback = if record.adapter == "herdr-foreign" {
                     match record.foreign_shell_identity.as_ref() {
-                        Some(identity) => {
-                            self.client.pane_is_same_idle_shell(pane_id, identity).ok()
-                        }
+                        Some(identity) => self
+                            .client
+                            .pane_is_same_idle_shell_with_runtime(pane_id, identity, runtime)
+                            .ok(),
                         None => None,
                     }
                 } else {
                     self.client
-                        .pane_idle_shell_identity(pane_id)
+                        .pane_idle_shell_identity_with_runtime(pane_id, runtime)
                         .ok()
                         .map(|proof| proof.is_some())
                 };
@@ -3438,17 +3563,77 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         &self,
         agent_name: &str,
         checked_at: f64,
+        runtime: &dyn agent::AgentRuntime,
     ) -> Result<(Value, Option<Value>)> {
         let initial = self.load(agent_name)?;
-        let _lock = self.lock(agent_name)?;
+        if runtime.cancelled() {
+            return Ok((
+                Self::unrecorded_health(
+                    agent_name,
+                    checked_at,
+                    "probe-deadline-exceeded",
+                    "health probe deadline expired before this session was checked",
+                    Some(&initial),
+                ),
+                None,
+            ));
+        }
+        let Some(_lock) = self.try_lock_with_runtime(agent_name, runtime)? else {
+            return Ok((
+                Self::unrecorded_health(
+                    agent_name,
+                    checked_at,
+                    "lifecycle-lock-contended",
+                    &format!("agent {agent_name:?} lifecycle lock is held by another operation"),
+                    Some(&initial),
+                ),
+                None,
+            ));
+        };
         let record = self.load(agent_name)?;
         if record.token != initial.token {
             return Err(fail(format!(
                 "agent {agent_name:?} was replaced before health check"
             )));
         }
-        let status = self.status_record(&record)?;
-        let (health, reason_code, reason) = self.classify_health(&record, &status);
+        if runtime.cancelled() {
+            return Ok((
+                Self::unrecorded_health(
+                    agent_name,
+                    checked_at,
+                    "probe-deadline-exceeded",
+                    "health probe deadline expired before runtime inspection",
+                    Some(&record),
+                ),
+                None,
+            ));
+        }
+        let status = self.status_record_with_runtime(&record, runtime)?;
+        if runtime.cancelled() {
+            let mut observation = Self::unrecorded_health(
+                agent_name,
+                checked_at,
+                "probe-deadline-exceeded",
+                "health probe deadline expired during runtime inspection",
+                Some(&record),
+            );
+            observation["agent_status"] = status["agent_status"].clone();
+            observation["probe_error"] = status["probe_error"].clone();
+            return Ok((observation, Some(status)));
+        }
+        let (health, reason_code, reason) = self.classify_health(&record, &status, runtime);
+        if runtime.cancelled() {
+            let mut observation = Self::unrecorded_health(
+                agent_name,
+                checked_at,
+                "probe-deadline-exceeded",
+                "health probe deadline expired during liveness classification",
+                Some(&record),
+            );
+            observation["agent_status"] = status["agent_status"].clone();
+            observation["probe_error"] = status["probe_error"].clone();
+            return Ok((observation, Some(status)));
+        }
         let mut observation =
             self.persist_health(&record, &health, &reason_code, &reason, checked_at)?;
         observation["lifecycle"] = json!(record.lifecycle);
@@ -3457,46 +3642,79 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok((observation, Some(status)))
     }
 
-    fn health_one(&self, agent_name: &str, checked_at: f64) -> (Value, Option<Value>) {
-        self.health_one_result(agent_name, checked_at)
+    fn unrecorded_health(
+        agent_name: &str,
+        checked_at: f64,
+        reason_code: &str,
+        reason: &str,
+        record: Option<&AgentRecord>,
+    ) -> Value {
+        json!({
+            "schema": HEALTH_SCHEMA,
+            "name": agent_name,
+            "token": record.map(|record| record.token.as_str()),
+            "health": "unknown",
+            "runtime_state": "unknown",
+            "reason_code": reason_code,
+            "reason": reason,
+            "first_detected_at": checked_at,
+            "last_checked_at": checked_at,
+            "recorded": false,
+            "record_path": Value::Null,
+            "lifecycle": record.map(|record| record.lifecycle.as_str()),
+            "agent_status": Value::Null,
+            "probe_error": reason,
+        })
+    }
+
+    fn health_one(
+        &self,
+        agent_name: &str,
+        checked_at: f64,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> (Value, Option<Value>) {
+        self.health_one_result(agent_name, checked_at, runtime)
             .unwrap_or_else(|error| {
                 (
-                    json!({
-                        "schema": HEALTH_SCHEMA,
-                        "name": agent_name,
-                        "token": Value::Null,
-                        "health": "unknown",
-                        "runtime_state": "unknown",
-                        "reason_code": "registry-or-health-error",
-                        "reason": error.to_string(),
-                        "first_detected_at": checked_at,
-                        "last_checked_at": checked_at,
-                        "recorded": false,
-                        "record_path": Value::Null,
-                        "lifecycle": Value::Null,
-                        "agent_status": Value::Null,
-                        "probe_error": error.to_string(),
-                    }),
+                    Self::unrecorded_health(
+                        agent_name,
+                        checked_at,
+                        if runtime.cancelled() {
+                            "probe-deadline-exceeded"
+                        } else {
+                            "registry-or-health-error"
+                        },
+                        &error.to_string(),
+                        None,
+                    ),
                     None,
                 )
             })
     }
 
-    /// Return one strict status and its health verdict from the same probe.
-    pub(crate) fn status_health_snapshot(&self, agent_name: &str) -> Result<(Value, Value)> {
+    /// Return one bounded status and its health verdict from the same probe.
+    pub(crate) fn status_health_snapshot(
+        &self,
+        agent_name: &str,
+    ) -> Result<(Value, Option<Value>)> {
         let checked_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let (observation, status) = self.health_one_result(agent_name, checked_at)?;
-        Ok((
-            observation,
-            status.expect("successful health probe always includes its status snapshot"),
-        ))
+        let runtime = DeadlineRuntime::until(Instant::now() + HEALTH_PROBE_TIMEOUT);
+        self.health_one_result(agent_name, checked_at, &runtime)
     }
 
     /// Return one aggregate and the exact status snapshot behind each verdict.
     pub(crate) fn health_snapshot(&self, requested: &[String]) -> (Value, Vec<Option<Value>>) {
+        self.health_snapshot_until(requested, Instant::now() + HEALTH_PROBE_TIMEOUT)
+    }
+
+    pub(crate) fn health_snapshot_until(
+        &self,
+        requested: &[String],
+        deadline: Instant,
+    ) -> (Value, Vec<Option<Value>>) {
         let checked_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -3524,9 +3742,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 Err(error) => registry_error = Some(error.to_string()),
             }
         }
+        let runtime = DeadlineRuntime::until(deadline);
         let checked = names
             .iter()
-            .map(|name| self.health_one(name, checked_at))
+            .map(|name| self.health_one(name, checked_at, &runtime))
             .collect::<Vec<_>>();
         let sessions = checked
             .iter()
@@ -3555,6 +3774,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// Independently check selected names, or every active registry entry when empty.
     pub fn health(&self, requested: &[String]) -> Value {
         self.health_snapshot(requested).0
+    }
+
+    /// Check selected names within one caller-owned absolute deadline.
+    pub(crate) fn health_until(&self, requested: &[String], deadline: Instant) -> Value {
+        self.health_snapshot_until(requested, deadline).0
     }
 
     /// List every registered agent, preserving records when Herdr is unavailable.
@@ -5975,6 +6199,46 @@ mod tests {
     }
 
     #[test]
+    fn health_skips_contended_first_lock_and_probes_later_row() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let mut alpha = manager.load("worker").unwrap();
+        alpha.name = "alpha".to_owned();
+        alpha.token = "alpha-generation".to_owned();
+        fs::create_dir(fixture.root.join("registry/alpha")).unwrap();
+        fs::set_permissions(
+            fixture.root.join("registry/alpha"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        manager.save(&alpha).unwrap();
+        let held = agent::open_private_lock(
+            &fixture.root.join("registry/.alpha.lock"),
+            "held lifecycle lock",
+        )
+        .unwrap();
+        held.lock_exclusive().unwrap();
+        fixture.client.pane_info_calls.store(0, Ordering::Relaxed);
+        fixture.client.panes_calls.store(0, Ordering::Relaxed);
+        let started = Instant::now();
+        let (health, _statuses) = manager.health_snapshot_until(
+            &["alpha".to_owned(), "worker".to_owned()],
+            Instant::now() + Duration::from_millis(250),
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(health["sessions"][0]["health"], "unknown");
+        assert_eq!(
+            health["sessions"][0]["reason_code"],
+            "lifecycle-lock-contended"
+        );
+        assert_eq!(health["sessions"][0]["recorded"], false);
+        assert_eq!(health["sessions"][1]["health"], "healthy");
+        assert!(fixture.client.pane_info_calls.load(Ordering::Relaxed) > 0);
+        assert!(fixture.client.panes_calls.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
     fn health_transport_failure_is_unknown_not_proof_of_death() {
         let fixture = Fixture::new();
         fixture.start(None);
@@ -6066,7 +6330,7 @@ mod tests {
             .store(true, Ordering::Relaxed);
         let health = fixture.manager().health(&["worker".to_owned()]);
         assert!(fixture.client.custom_reported.load(Ordering::Relaxed));
-        assert_eq!(health["sessions"][0]["health"], "unhealthy");
+        assert_eq!(health["sessions"][0]["health"], "unhealthy", "{health}");
         assert_eq!(health["sessions"][0]["runtime_state"], "dead");
         assert_eq!(
             health["sessions"][0]["reason_code"],

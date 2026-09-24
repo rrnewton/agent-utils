@@ -134,6 +134,10 @@ elif args[:2] == ["pane", "get"]:
     }})
 elif args[:2] == ["pane", "process-info"]:
     state["process_info_calls"] = int(state.get("process_info_calls", 0)) + 1
+    save()
+    process_info_delay = float(state.get("process_info_delay", 0))
+    if process_info_delay > 0:
+        time.sleep(process_info_delay)
     transient_failures = int(state.get("process_info_failures_remaining", 0))
     if transient_failures > 0:
         state["process_info_failures_remaining"] = transient_failures - 1
@@ -280,6 +284,10 @@ elif args[:2] == ["agent", "wait"]:
         raise SystemExit(1)
     print(json.dumps({"result": {"agent": {"pane_id": args[2], "agent_status": "working"}}}, sort_keys=True))
 elif args[:2] == ["pane", "read"]:
+    read_delay = float(state.get("read_delay", 0))
+    if read_delay > 0:
+        save()
+        time.sleep(read_delay)
     if state.get("fail_read"):
         print("injected pane read failure", file=sys.stderr)
         save()

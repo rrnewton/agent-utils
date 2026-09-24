@@ -461,9 +461,23 @@ class HerdrClient:
         ) as exc:  # pragma: no cover - _execute already narrows production failures
             raise HerdrUnavailable(f"cannot invoke Herdr: {exc}") from exc
 
-    def _call(self, args: Sequence[str], purpose: str) -> dict[str, object]:
+    @staticmethod
+    def _remaining_timeout(deadline: float, purpose: str) -> float:
+        """Return the positive time left in one caller-owned operation."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HerdrUnavailable(f"{purpose} deadline expired")
+        return remaining
+
+    def _call(
+        self,
+        args: Sequence[str],
+        purpose: str,
+        *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> dict[str, object]:
         """Invoke a socket-API subcommand and return its ``result`` object."""
-        completed = self._invoke(args)
+        completed = self._invoke(args, timeout=timeout)
         if completed.returncode != 0:
             detail = (
                 completed.stderr or completed.stdout or ""
@@ -668,7 +682,10 @@ class HerdrClient:
             )
         return _validated_executable(candidate, kind)
 
-    def report_pane_agent(self, pane_id: str, kind: str, state: str) -> None:
+    def report_pane_agent(
+        self, pane_id: str, kind: str, state: str, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
         """Label one exact custom-harness pane without registering an agent name."""
         self._call_ok(
             [
@@ -677,6 +694,7 @@ class HerdrClient:
                 "--message", "agentctl custom harness",
             ],
             f"report custom agent {pane_id}",
+            timeout=timeout,
         )
 
     @staticmethod
@@ -902,13 +920,20 @@ class HerdrClient:
             return None
         return PaneShellProof(observed[0], executable_path)
 
-    def pane_idle_shell_identity(self, pane_id: str) -> PaneShellProof | None:
+    def pane_idle_shell_identity(
+        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> PaneShellProof | None:
         """Return one stable idle-shell proof, including absence of descendants."""
-        before = self.process_info(pane_id)
+        deadline = time.monotonic() + timeout
+        before = self.process_info(
+            pane_id, timeout=self._remaining_timeout(deadline, "idle-shell proof")
+        )
         proof = self._idle_shell_proof(before)
         if proof is None:
             return None
-        after = self.process_info(pane_id)
+        after = self.process_info(
+            pane_id, timeout=self._remaining_timeout(deadline, "idle-shell proof")
+        )
         if after != before or self._idle_shell_proof(after) != proof:
             return None
         return proof
@@ -964,19 +989,22 @@ class HerdrClient:
     def verify_custom_harness(
         self, pane_id: str, kind: str,
         expected_identity: CustomProcessIdentity | None = None,
+        *, timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> None:
         """Require the recorded custom process or strict current-path identity."""
         executable = None if expected_identity is not None else self._harness_executable(kind)
         if self._pane_process_identity(
-            self.process_info(pane_id), executable, expected_identity
+            self.process_info(pane_id, timeout=timeout), executable, expected_identity
         ) is None:
             raise HerdrUnavailable(
                 f"custom harness {kind!r} is not the foreground process in pane {pane_id}"
             )
 
-    def pane_is_idle_shell(self, pane_id: str) -> bool:
+    def pane_is_idle_shell(
+        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> bool:
         """Prove the pane has returned to Herdr's original shell process group."""
-        return self.pane_idle_shell_identity(pane_id) is not None
+        return self.pane_idle_shell_identity(pane_id, timeout=timeout) is not None
 
     def pane_shell_identity(self, pane_id: str) -> CustomProcessIdentity:
         """Capture the kernel identity of the shell process Herdr owns for one pane."""
@@ -989,10 +1017,11 @@ class HerdrClient:
         return observed[0]
 
     def pane_is_same_idle_shell(
-        self, pane_id: str, expected: CustomProcessIdentity,
+        self, pane_id: str, expected: CustomProcessIdentity, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> bool:
         """Prove both idle-shell state and the exact shell generation captured earlier."""
-        proof = self.pane_idle_shell_identity(pane_id)
+        proof = self.pane_idle_shell_identity(pane_id, timeout=timeout)
         return proof is not None and proof.identity == expected
 
     def start_pane_agent(
@@ -1009,6 +1038,7 @@ class HerdrClient:
         del name
         if not 0 < timeout <= 300:
             raise ValueError("agent startup timeout must be between 0 and 300 seconds")
+        deadline = time.monotonic() + timeout
         executable = self._harness_executable(kind)
         try:
             descriptor = os.open(executable, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -1036,14 +1066,21 @@ class HerdrClient:
             self._call_ok(
                 ["pane", "run", pane_id, shlex.join([executable, *arguments])],
                 f"pane run {kind!r}",
+                timeout=self._remaining_timeout(deadline, "custom harness startup"),
             )
-            deadline = time.monotonic() + timeout
             observed: CustomProcessIdentity | None = None
             last_probe_error: HerdrUnavailable | None = None
             while time.monotonic() < deadline:
                 try:
                     observed = self._pane_process_identity(
-                        self.process_info(pane_id), executable, launch_image=launch_image
+                        self.process_info(
+                            pane_id,
+                            timeout=self._remaining_timeout(
+                                deadline, "custom harness process probe"
+                            ),
+                        ),
+                        executable,
+                        launch_image=launch_image,
                     )
                 except HerdrUnavailable as exc:
                     # Herdr can briefly expose a foreground entry before its argv
@@ -1065,8 +1102,14 @@ class HerdrClient:
             os.close(descriptor)
         ready = False
         while time.monotonic() < deadline:
-            self.verify_custom_harness(pane_id, kind, observed)
-            screen = self.read(pane_id, source="visible", lines=200)
+            self.verify_custom_harness(
+                pane_id, kind, observed,
+                timeout=self._remaining_timeout(deadline, "custom harness readiness"),
+            )
+            screen = self.read(
+                pane_id, source="visible", lines=200,
+                timeout=self._remaining_timeout(deadline, "custom harness readiness"),
+            )
             if muse_trust_prompt(screen) and "--trust-workspace" not in arguments:
                 raise HerdrUnavailable(
                     f"{kind} workspace trust prompt requires human attention; no input was submitted"
@@ -1081,8 +1124,14 @@ class HerdrClient:
             raise HerdrUnavailable(
                 f"custom harness {kind!r} did not reach a verified idle composer in pane {pane_id}"
             )
-        self.verify_custom_harness(pane_id, kind, observed)
-        self.report_pane_agent(pane_id, kind, "idle")
+        self.verify_custom_harness(
+            pane_id, kind, observed,
+            timeout=self._remaining_timeout(deadline, "custom harness final verification"),
+        )
+        self.report_pane_agent(
+            pane_id, kind, "idle",
+            timeout=self._remaining_timeout(deadline, "custom harness report"),
+        )
         return observed
 
     def recover_pane_agent(
@@ -1145,9 +1194,13 @@ class HerdrClient:
             raise HerdrUnavailable("custom harness identity changed during recovery")
         return first
 
-    def agent_pane(self, name: str) -> str:
+    def agent_pane(
+        self, name: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> str:
         """Resolve an exact live Herdr agent name, rejecting a stale pane occupant."""
-        result = self._call(["agent", "get", name], f"agent get {name!r}")
+        result = self._call(
+            ["agent", "get", name], f"agent get {name!r}", timeout=timeout
+        )
         try:
             info = as_mapping(result.get("agent"), "agent get")
             if get_str(info, "name", "agent get") != name:
@@ -1166,12 +1219,15 @@ class HerdrClient:
             "report managed agent session",
         )
 
-    def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
+    def panes(
+        self, workspace_id: str | None = None, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> tuple[Pane, ...]:
         """Every pane, optionally restricted to one workspace."""
         args = ["pane", "list"]
         if workspace_id is not None:
             args += ["--workspace", workspace_id]
-        result = self._call(args, "pane list")
+        result = self._call(args, "pane list", timeout=timeout)
         out: list[Pane] = []
         try:
             for entry in as_sequence(result.get("panes"), "pane list"):
@@ -1199,9 +1255,13 @@ class HerdrClient:
             return False
         return True
 
-    def pane_info(self, pane_id: str) -> AgentPaneInfo:
+    def pane_info(
+        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> AgentPaneInfo:
         """Return validated identity/readiness data for an interactive pane."""
-        result = self._call(["pane", "get", pane_id], f"pane get {pane_id}")
+        result = self._call(
+            ["pane", "get", pane_id], f"pane get {pane_id}", timeout=timeout
+        )
         try:
             pane = as_mapping(result.get("pane"), "pane get")
             returned = get_str(pane, "pane_id", "pane get")
@@ -1228,9 +1288,13 @@ class HerdrClient:
         except TypeError as exc:
             raise HerdrUnavailable(f"pane get: invalid Herdr response: {exc}") from exc
 
-    def workspace_label(self, workspace_id: str) -> str:
+    def workspace_label(
+        self, workspace_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> str:
         """Return the label for one exact workspace id."""
-        result = self._call(["workspace", "get", workspace_id], "workspace get")
+        result = self._call(
+            ["workspace", "get", workspace_id], "workspace get", timeout=timeout
+        )
         try:
             workspace = as_mapping(result.get("workspace"), "workspace get")
             returned = get_str(workspace, "workspace_id", "workspace get")
@@ -1281,10 +1345,14 @@ class HerdrClient:
         except (TypeError, ValueError) as exc:
             raise HerdrUnavailable(f"invalid Herdr server status: {exc}") from exc
 
-    def process_info(self, pane_id: str) -> ProcessInfo:
+    def process_info(
+        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> ProcessInfo:
         """The pane's live shell pid and foreground process group — the readiness signal."""
         result = self._call(
-            ["pane", "process-info", "--pane", pane_id], f"pane process-info {pane_id}"
+            ["pane", "process-info", "--pane", pane_id],
+            f"pane process-info {pane_id}",
+            timeout=timeout,
         )
         try:
             info = as_mapping(result.get("process_info"), "pane process-info")
@@ -1329,6 +1397,7 @@ class HerdrClient:
         *,
         source: str = "recent-unwrapped",
         lines: int | None = None,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> str:
         """Read the pane's rendered text. ANSI is stripped (no ``--raw``), trailing spaces included.
 
@@ -1338,19 +1407,22 @@ class HerdrClient:
         args = ["pane", "read", pane_id, "--source", source]
         if lines is not None:
             args += ["--lines", str(lines)]
-        completed = self._invoke(args)
+        completed = self._invoke(args, timeout=timeout)
         if completed.returncode != 0:
             detail = (completed.stderr or "").strip() or f"exit {completed.returncode}"
             raise HerdrUnavailable(f"pane read {pane_id}: {detail}")
         return completed.stdout
 
-    def _call_ok(self, args: Sequence[str], purpose: str) -> None:
+    def _call_ok(
+        self, args: Sequence[str], purpose: str, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
         """Invoke a subcommand that reports success only through its exit status.
 
         ``pane run`` and ``pane send-keys`` write NOTHING on success — they are input-injection
         calls, not queries — so requiring a JSON envelope here would fail every successful call.
         """
-        completed = self._invoke(args)
+        completed = self._invoke(args, timeout=timeout)
         if completed.returncode != 0:
             detail = (
                 completed.stderr or completed.stdout or ""

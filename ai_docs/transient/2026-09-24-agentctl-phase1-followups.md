@@ -12,14 +12,18 @@ deliberately detection-first: it does not restart a harness or replay input.
   expected Muse label cannot suppress an exact-process absence plus stable
   descendant-free idle-shell proof.
 - Each name is checked independently. The aggregate result cannot lose later
-  sessions because an earlier record is malformed or stale.
+  sessions because an earlier record is malformed, stale, or has a contended
+  lifecycle lock. Lock contention is a non-durable `unknown` row and every
+  runtime call is cancellation-bound by the one-shot or overall watch deadline.
 - Per-generation observations retain exact reasons, first/current detection
   times, and the last unhealthy/unknown event in `health.json`.
 - `health --watch SECONDS --interval SECONDS` polls for a bounded duration and
   exits immediately on a non-healthy result. It does not start, stop, or send.
 - Custom Muse startup retries transient incomplete process snapshots within the
   existing startup deadline, including command and malformed-response failures,
-  and preserves the last probe diagnostic if the deadline expires.
+  and preserves the last probe diagnostic if the deadline expires. Pane launch,
+  process inspection, readiness reads, final verification, and reporting share
+  that deadline rather than receiving independent control timeouts.
 - Before launching Muse, the record durably captures the canonical executable
   path, executable device/inode, and complete argv. `recover-start` requires the
   saved generation plus an operator-observed PID, matches those facts twice,
@@ -31,7 +35,11 @@ deliberately detection-first: it does not restart a harness or replay input.
 - Headless health stores the runner PID and Linux start time and accepts a dead
   result only from a typed `runner_alive: false` receipt bound to that exact
   saved generation. Transport, decoding, and runtime errors remain `unknown`
-  regardless of diagnostic wording.
+  regardless of diagnostic wording. Exact positive liveness additionally
+  requires a readable matching start time and non-zombie state; procfs
+  ambiguity is typed `null` and maps to `unknown`. When asynchronous start first
+  returns without a PID, the first later exact positive worker receipt is
+  persisted only under the same private outer generation lock.
 
 ## Launch-intent gaps
 

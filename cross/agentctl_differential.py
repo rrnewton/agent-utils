@@ -342,6 +342,10 @@ def _profiles(harness: Harness, report: Report) -> None:
         calls = _state(root).get("process_info_calls")
         return isinstance(calls, int) and not isinstance(calls, bool) and calls >= 2
 
+    def process_info_called(root: Path) -> bool:
+        calls = _state(root).get("process_info_calls")
+        return isinstance(calls, int) and not isinstance(calls, bool) and calls >= 1
+
     for profile in ("astra-ultra", "sol", "watermelon", "muse-literal", "codex-safe-config"):
         case = harness.case(f"primary-profile-{profile}")
         configure(case)
@@ -606,7 +610,7 @@ def _profiles(harness: Harness, report: Report) -> None:
         "--profile", "watermelon", "--startup-timeout", "0.15", *_COMMON,
     ))
     report.require(
-        "primary/profile/watermelon/permanent-process-info-failure",
+        "primary/profile/watermelon/permanent-process-info-retried",
         all(
             outcome.returncode == 75
             and "last process probe" in outcome.stderr
@@ -615,9 +619,83 @@ def _profiles(harness: Harness, report: Report) -> None:
         )
         and all(process_info_retried(root)
                 for root in (permanent.python_root, permanent.rust_root)),
-        f"permanent process-info failure was not retried to the deadline: {outcomes!r}",
+        f"permanent process-info failure was not retried: {outcomes!r}",
     )
     _retire_fixture_processes(permanent)
+
+    for blocked_stage, injected in (
+        ("process-info", {"process_info_delay": 5}),
+        ("post-observation-read", {"read_delay": 5}),
+    ):
+        blocking = harness.case(
+            f"primary-profile-watermelon-blocking-{blocked_stage}", injected,
+        )
+        configure(blocking)
+        blocking_outcomes: list[Outcome] = []
+        elapsed: list[float] = []
+        for command, root in zip(
+            (harness.python, harness.rust),
+            (blocking.python_root, blocking.rust_root),
+            strict=True,
+        ):
+            started_at = time.monotonic()
+            blocking_outcomes.append(harness._invoke_one(command, root, (
+                "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+                "--profile", "watermelon", "--startup-timeout", "0.15", *_COMMON,
+            )))
+            elapsed.append(time.monotonic() - started_at)
+        report.require(
+            f"primary/profile/watermelon/blocking-{blocked_stage}-deadline",
+            all(outcome.returncode == 75 for outcome in blocking_outcomes)
+            and all(duration < 1.0 for duration in elapsed)
+            and all(process_info_called(root)
+                    for root in (blocking.python_root, blocking.rust_root)),
+            f"blocking {blocked_stage} escaped startup deadline: elapsed={elapsed!r}; "
+            f"outcomes={blocking_outcomes!r}",
+        )
+        _retire_fixture_processes(blocking)
+
+    health_bound = harness.case("primary-health-blocking-runtime-probe")
+    configure(health_bound)
+    _pair(harness, report, health_bound, "primary/health/blocking-probe-start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--profile", "watermelon", "--startup-timeout", "1", *_COMMON,
+    ))
+    _change(health_bound, {"process_info_delay": 5})
+    health_outcomes: list[Outcome] = []
+    health_elapsed: list[float] = []
+
+    def deadline_health(outcome: Outcome) -> bool:
+        value = _json(outcome)
+        if not isinstance(value, dict) or value.get("healthy") is not False:
+            return False
+        sessions = value.get("sessions")
+        return (
+            isinstance(sessions, list) and len(sessions) == 1
+            and isinstance(sessions[0], dict)
+            and sessions[0].get("reason_code") == "probe-deadline-exceeded"
+        )
+
+    for command, root in zip(
+        (harness.python, harness.rust),
+        (health_bound.python_root, health_bound.rust_root),
+        strict=True,
+    ):
+        started_at = time.monotonic()
+        health_outcomes.append(harness._invoke_one(command, root, (
+            "health", "worker", "--watch", "0.15", "--interval", "0.05", *_COMMON,
+        )))
+        health_elapsed.append(time.monotonic() - started_at)
+    report.require(
+        "primary/health/blocking-runtime-probe-deadline",
+        all(outcome.returncode == 1 for outcome in health_outcomes)
+        and all(duration < 1.0 for duration in health_elapsed)
+        and all(deadline_health(outcome) for outcome in health_outcomes),
+        f"blocking health probe escaped watch deadline: elapsed={health_elapsed!r}; "
+        f"outcomes={health_outcomes!r}",
+    )
+    _change(health_bound, {"process_info_delay": 0})
+    _retire_fixture_processes(health_bound)
 
 
 def _skill_install(harness: Harness, report: Report) -> None:

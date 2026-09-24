@@ -240,23 +240,38 @@ pub trait AgentApi: Send + Sync {
     ) -> crate::error::Result<String>;
 
     /// Cancellation-aware pane enumeration used by long-running service owners.
-    fn panes_with_runtime(&self, _runtime: &dyn AgentRuntime) -> crate::error::Result<Vec<Pane>> {
+    fn panes_with_runtime(&self, runtime: &dyn AgentRuntime) -> crate::error::Result<Vec<Pane>> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "agent control operation was cancelled",
+            ));
+        }
         self.panes()
     }
     /// Cancellation-aware pane inspection used by long-running service owners.
     fn pane_info_with_runtime(
         &self,
         pane_id: &str,
-        _runtime: &dyn AgentRuntime,
+        runtime: &dyn AgentRuntime,
     ) -> crate::error::Result<AgentPaneInfo> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "agent control operation was cancelled",
+            ));
+        }
         self.pane_info(pane_id)
     }
     /// Cancellation-aware workspace inspection used by long-running service owners.
     fn workspace_label_with_runtime(
         &self,
         workspace_id: &str,
-        _runtime: &dyn AgentRuntime,
+        runtime: &dyn AgentRuntime,
     ) -> crate::error::Result<String> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "agent control operation was cancelled",
+            ));
+        }
         self.workspace_label(workspace_id)
     }
     /// Cancellation-aware prompt submission used by long-running service owners.
@@ -284,8 +299,13 @@ pub trait AgentApi: Send + Sync {
         pane_id: &str,
         source: &str,
         lines: Option<usize>,
-        _runtime: &dyn AgentRuntime,
+        runtime: &dyn AgentRuntime,
     ) -> crate::error::Result<String> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "agent control operation was cancelled",
+            ));
+        }
         self.read(pane_id, source, lines)
     }
 }
@@ -902,9 +922,19 @@ pub fn status<A: AgentApi + ?Sized>(
     target: &Target,
     root: &Path,
 ) -> AgentResult<QueueStatus> {
+    status_with_runtime(client, target, root, &SystemRuntime::default())
+}
+
+/// Read validated live-agent and queue state with caller-owned cancellation.
+pub(crate) fn status_with_runtime<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<QueueStatus> {
     validate_existing_queue(root)?;
     validate_existing_binding(root, target)?;
-    let info = resolve_target(client, target)?;
+    let info = resolve_target_with_runtime(client, target, runtime)?;
     let directories = QueueDirectories::new(root);
     Ok(QueueStatus {
         pane_id: info.pane_id,

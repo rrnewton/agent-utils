@@ -49,7 +49,7 @@ from agentctl.agent import (
     _validate_existing_queue, _validate_private_directory, drain, enqueue, resolve_target,
     queue_artifact_reservation_bytes,
 )
-from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.client import AgentPaneInfo, CONTROL_TIMEOUT_SECONDS, HerdrClient, Pane
 from agentctl.chat_output import PaneAgentStatus, PaneOutputSnapshot, PaneOutputStream
 from agentctl.chat_storage import (
     CONFIG, LEGACY_REPLY, REPLY_INPUT, REQUEST, REST_RESPONSE, ArtifactClass,
@@ -765,17 +765,27 @@ class _NamedClient(HerdrClient):
     def __init__(self, client: HerdrClient, name: str) -> None:
         self._delegate, self._name = client, name
 
-    def pane_info(self, pane_id: str) -> AgentPaneInfo:
-        if self._delegate.agent_pane(self._name) != pane_id:
+    def pane_info(
+        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> AgentPaneInfo:
+        if self._delegate.agent_pane(self._name, timeout=timeout) != pane_id:
             raise HerdrUnavailable(f"named coordinator {self._name!r} no longer owns pane {pane_id!r}")
-        return self._delegate.pane_info(pane_id)
+        return self._delegate.pane_info(pane_id, timeout=timeout)
 
-    def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
-        pane_id = self._delegate.agent_pane(self._name)
-        return tuple(pane for pane in self._delegate.panes(workspace_id) if pane.pane_id == pane_id)
+    def panes(
+        self, workspace_id: str | None = None, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> tuple[Pane, ...]:
+        pane_id = self._delegate.agent_pane(self._name, timeout=timeout)
+        return tuple(
+            pane for pane in self._delegate.panes(workspace_id, timeout=timeout)
+            if pane.pane_id == pane_id
+        )
 
-    def workspace_label(self, workspace_id: str) -> str:
-        return self._delegate.workspace_label(workspace_id)
+    def workspace_label(
+        self, workspace_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> str:
+        return self._delegate.workspace_label(workspace_id, timeout=timeout)
 
     def prompt_agent(self, pane_id: str, command: str) -> None:
         self.pane_info(pane_id)
@@ -786,9 +796,14 @@ class _NamedClient(HerdrClient):
         self._delegate.wait_agent_status(pane_id, status, timeout_ms)
         self.pane_info(pane_id)
 
-    def read(self, pane_id: str, *, source: str = "recent-unwrapped", lines: int | None = None) -> str:
-        self.pane_info(pane_id)
-        return self._delegate.read(pane_id, source=source, lines=lines)
+    def read(
+        self, pane_id: str, *, source: str = "recent-unwrapped",
+        lines: int | None = None, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> str:
+        self.pane_info(pane_id, timeout=timeout)
+        return self._delegate.read(
+            pane_id, source=source, lines=lines, timeout=timeout,
+        )
 
     def event_socket(self) -> str:
         return self._delegate.event_socket()

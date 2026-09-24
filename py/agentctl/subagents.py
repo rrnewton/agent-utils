@@ -55,6 +55,7 @@ _MAX_AGENT_RECORD_BYTES = 1 << 20
 _MAX_SNAPSHOT_BYTES = 16 << 20
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _HEALTH_SCHEMA = "agentctl-health/v1"
+_HEALTH_PROBE_SECONDS = 60.0
 
 
 def _rename_directory_noreplace_at(
@@ -517,12 +518,24 @@ def _goal_replacement_selected(screen: str, objective: str) -> bool:
 class _WorkspaceClient:
     """Add exact workspace checks to every queue readiness probe, after enqueue."""
 
-    def __init__(self, client: HerdrClient, record: AgentRecord, *, queue: str | None = None, check_prompt: bool = True) -> None:
+    def __init__(
+        self, client: HerdrClient, record: AgentRecord, *,
+        queue: str | None = None, check_prompt: bool = True,
+        deadline: float | None = None,
+    ) -> None:
         self.client, self.record = client, record
         self.goal_objective: str | None = None
         self.queue = queue
         self.check_prompt = check_prompt
         self.custom_submission: tuple[str, str, int] | None = None
+        self.deadline = deadline
+
+    def _timeout(self, purpose: str) -> float:
+        assert self.deadline is not None
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise HerdrUnavailable(f"{purpose} deadline expired")
+        return remaining
 
     def pane_info(self, pane_id: str) -> AgentPaneInfo:
         # Sessions started by this manager have a second lifecycle identity in
@@ -530,25 +543,59 @@ class _WorkspaceClient:
         # assigning or replacing a native name would mutate a runtime this
         # registry does not own.  Their exact pane/session/workspace/cwd/harness
         # assertions remain the authority instead.
-        if (self.record.adapter == "herdr"
-                and self.client.agent_pane(self.record.name) != self.record.pane_id):
+        owned_pane: str | None
+        if self.record.adapter == "herdr":
+            owned_pane = (
+                self.client.agent_pane(
+                    self.record.name, timeout=self._timeout("agent identity probe")
+                )
+                if self.deadline is not None and isinstance(self.client, HerdrClient)
+                else self.client.agent_pane(self.record.name)
+            )
+        else:
+            owned_pane = self.record.pane_id
+        if owned_pane != self.record.pane_id:
             raise HerdrUnavailable(f"agent {self.record.name!r} no longer owns its recorded pane")
-        info = self.client.pane_info(pane_id)
+        info = (
+            self.client.pane_info(
+                pane_id, timeout=self._timeout("pane identity probe")
+            )
+            if self.deadline is not None and isinstance(self.client, HerdrClient)
+            else self.client.pane_info(pane_id)
+        )
         if info.workspace_id != self.record.workspace_id:
             raise HerdrUnavailable(f"agent {self.record.name!r} workspace identity changed")
         if pane_id == self.record.pane_id:
             if self.record.goal_session_id is not None and info.session_value is not None and info.session_value != self.record.goal_session_id:
                 raise HerdrUnavailable(f"agent {self.record.name!r} native session identity changed")
             if self.check_prompt and info.status in ("idle", "done") and info.agent == "claude":
-                screen = self.client.read(pane_id, source="visible", lines=200)
+                screen = (
+                    self.client.read(
+                        pane_id, source="visible", lines=200,
+                        timeout=self._timeout("pane readiness probe"),
+                    )
+                    if self.deadline is not None and isinstance(self.client, HerdrClient)
+                    else self.client.read(pane_id, source="visible", lines=200)
+                )
                 if ("Quick safety check: Is this a project you created or one you trust?" in screen
                     and "No, exit" in screen and "Yes, I trust this folder" in screen):
                     raise HerdrUnavailable("Claude workspace trust prompt requires human attention; no input was submitted")
             if self.record.adapter == "herdr-pane":
-                self.client.verify_custom_harness(
-                    pane_id, self.record.harness, self.record.custom_process_identity
-                )
-                screen = self.client.read(pane_id, source="visible", lines=200)
+                if self.deadline is not None and isinstance(self.client, HerdrClient):
+                    self.client.verify_custom_harness(
+                        pane_id, self.record.harness,
+                        self.record.custom_process_identity,
+                        timeout=self._timeout("custom harness probe"),
+                    )
+                    screen = self.client.read(
+                        pane_id, source="visible", lines=200,
+                        timeout=self._timeout("custom harness readiness probe"),
+                    )
+                else:
+                    self.client.verify_custom_harness(
+                        pane_id, self.record.harness, self.record.custom_process_identity,
+                    )
+                    screen = self.client.read(pane_id, source="visible", lines=200)
                 if muse_trust_prompt(screen):
                     raise HerdrUnavailable(
                         "Muse workspace trust prompt requires human attention; no input was submitted"
@@ -566,9 +613,17 @@ class _WorkspaceClient:
 
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
         del workspace_id
+        if self.deadline is not None and isinstance(self.client, HerdrClient):
+            return self.client.panes(
+                self.record.workspace_id, timeout=self._timeout("pane list probe")
+            )
         return self.client.panes(self.record.workspace_id)
 
     def workspace_label(self, workspace_id: str) -> str:
+        if self.deadline is not None and isinstance(self.client, HerdrClient):
+            return self.client.workspace_label(
+                workspace_id, timeout=self._timeout("workspace identity probe")
+            )
         return self.client.workspace_label(workspace_id)
 
     def prompt_agent(self, pane_id: str, command: str) -> None:
@@ -657,6 +712,11 @@ class _WorkspaceClient:
             self.client.wait_agent_status(pane_id, status, remaining)
 
     def read(self, pane_id: str, *, source: str, lines: int) -> str:
+        if self.deadline is not None and isinstance(self.client, HerdrClient):
+            return self.client.read(
+                pane_id, source=source, lines=lines,
+                timeout=self._timeout("pane read probe"),
+            )
         return self.client.read(pane_id, source=source, lines=lines)
 
 
@@ -680,6 +740,29 @@ class ManagedAgents:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             yield
+        finally:
+            os.close(descriptor)
+
+    @contextmanager
+    def _try_lock(self, name: str, deadline: float) -> Iterator[bool]:
+        """Briefly try one lock without letting a busy row block health scans."""
+        self._prepare()
+        path = self.registry / f".{_name(name)}.lock"
+        descriptor = agent._open_private_lock(str(path), "agent lifecycle lock")
+        acquired = False
+        lock_deadline = min(deadline, time.monotonic() + 0.05)
+        try:
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    remaining = lock_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.005, remaining))
+            yield acquired
         finally:
             os.close(descriptor)
 
@@ -1160,7 +1243,7 @@ class ManagedAgents:
                            max_attempts=max_attempts)
             # Keep the generation lock until its initial instruction and result
             # are captured; a replacement must never receive this launch's brief.
-            return self.status(name)
+            return self._status_record(record)
 
     def adopt(
         self, name: str, *, pane_id: str, expected_workspace: str,
@@ -1290,7 +1373,7 @@ class ManagedAgents:
             record.lifecycle = "running"
             record.error = None
             self._save(record)
-            return self.status(name)
+            return self._status_record(record)
 
     def _adopt_locked(
         self, name: str, directory: Path, root: str, harness: str,
@@ -1511,7 +1594,72 @@ class ManagedAgents:
         """Report live state or a visible probe error, preserving every durable record."""
         return self._status_record(self._load(name))
 
-    def _status_record(self, record: AgentRecord) -> dict[str, object]:
+    @staticmethod
+    def _remaining_timeout(deadline: float, purpose: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HerdrUnavailable(f"{purpose} deadline expired")
+        return remaining
+
+    def _health_panes(self, deadline: float | None) -> tuple[Pane, ...]:
+        if deadline is not None and isinstance(self.client, HerdrClient):
+            return self.client.panes(
+                timeout=self._remaining_timeout(deadline, "health pane list")
+            )
+        return self.client.panes()
+
+    def _health_pane_info(
+        self, pane_id: str, deadline: float | None,
+    ) -> AgentPaneInfo:
+        if deadline is not None and isinstance(self.client, HerdrClient):
+            return self.client.pane_info(
+                pane_id,
+                timeout=self._remaining_timeout(deadline, "health pane identity"),
+            )
+        return self.client.pane_info(pane_id)
+
+    def _health_verify_custom(
+        self, record: AgentRecord, deadline: float | None,
+    ) -> None:
+        assert record.pane_id is not None
+        if deadline is not None and isinstance(self.client, HerdrClient):
+            self.client.verify_custom_harness(
+                record.pane_id, record.harness, record.custom_process_identity,
+                timeout=self._remaining_timeout(
+                    deadline, "health custom harness verification"
+                ),
+            )
+            return
+        self.client.verify_custom_harness(
+            record.pane_id, record.harness, record.custom_process_identity,
+        )
+
+    def _health_idle_shell(
+        self, pane_id: str, deadline: float | None,
+    ) -> PaneShellProof | None:
+        if deadline is not None and isinstance(self.client, HerdrClient):
+            return self.client.pane_idle_shell_identity(
+                pane_id,
+                timeout=self._remaining_timeout(deadline, "health idle-shell proof"),
+            )
+        return self.client.pane_idle_shell_identity(pane_id)
+
+    def _health_same_idle_shell(
+        self, pane_id: str, identity: CustomProcessIdentity,
+        deadline: float | None,
+    ) -> bool:
+        if deadline is not None and isinstance(self.client, HerdrClient):
+            return self.client.pane_is_same_idle_shell(
+                pane_id, identity,
+                timeout=self._remaining_timeout(
+                    deadline, "health idle-shell identity proof"
+                ),
+            )
+        return self.client.pane_is_same_idle_shell(pane_id, identity)
+
+    def _status_record(
+        self, record: AgentRecord, *, deadline: float | None = None,
+    ) -> dict[str, object]:
         """Probe one pinned record without resolving its name a second time."""
         name = record.name
         result: dict[str, object] = record.to_document()
@@ -1522,7 +1670,9 @@ class ManagedAgents:
         try:
             client = cast(
                 HerdrClient,
-                _WorkspaceClient(self.client, record, check_prompt=False),
+                _WorkspaceClient(
+                    self.client, record, check_prompt=False, deadline=deadline,
+                ),
             )
             agent.resolve_target(client, record.target())
             result.update(agent.status(client, record.target(), self._queue(name)))
@@ -1532,7 +1682,8 @@ class ManagedAgents:
         return result
 
     def _classify_health(
-        self, record: AgentRecord, status: dict[str, object],
+        self, record: AgentRecord, status: dict[str, object], *,
+        deadline: float | None = None,
     ) -> tuple[str, str, str]:
         """Classify one status probe without turning control loss into proof of death."""
         if record.lifecycle != "running":
@@ -1549,7 +1700,7 @@ class ManagedAgents:
             return "unhealthy", "pane-identity-missing", reason
         try:
             presentations = [
-                pane for pane in self.client.panes()
+                pane for pane in self._health_panes(deadline)
                 if pane.pane_id == record.pane_id
             ]
         except HerdrRunError:
@@ -1559,7 +1710,7 @@ class ManagedAgents:
         if len(presentations) != 1:
             return "unhealthy", "pane-identity-ambiguous", reason
         try:
-            info = self.client.pane_info(record.pane_id)
+            info = self._health_pane_info(record.pane_id, deadline)
         except HerdrRunError:
             return "unknown", "runtime-probe-failed", reason
         presentation = presentations[0]
@@ -1583,16 +1734,13 @@ class ManagedAgents:
         if record.adapter == "herdr-pane":
             if record.custom_process_identity is not None:
                 try:
-                    self.client.verify_custom_harness(
-                        record.pane_id, record.harness,
-                        record.custom_process_identity,
-                    )
+                    self._health_verify_custom(record, deadline)
                 except HerdrRunError:
                     pass
                 else:
                     return "unknown", "custom-harness-verification-unconfirmed", reason
             try:
-                custom_shell_proof = self.client.pane_idle_shell_identity(record.pane_id)
+                custom_shell_proof = self._health_idle_shell(record.pane_id, deadline)
             except HerdrRunError:
                 return "unknown", "runtime-probe-failed", reason
             if custom_shell_proof is not None:
@@ -1608,11 +1756,13 @@ class ManagedAgents:
             if info.agent is None:
                 try:
                     if record.adapter == "herdr-foreign" and record.foreign_shell_identity is not None:
-                        shell_fallback = self.client.pane_is_same_idle_shell(
-                            record.pane_id, record.foreign_shell_identity,
+                        shell_fallback = self._health_same_idle_shell(
+                            record.pane_id, record.foreign_shell_identity, deadline,
                         )
                     else:
-                        shell_fallback = self.client.pane_idle_shell_identity(record.pane_id) is not None
+                        shell_fallback = (
+                            self._health_idle_shell(record.pane_id, deadline) is not None
+                        )
                 except HerdrRunError:
                     return "unknown", "runtime-probe-failed", reason
                 if not shell_fallback:
@@ -1695,14 +1845,52 @@ class ManagedAgents:
         return {**document, "recorded": True, "record_path": str(path)}
 
     def _health_one_result(
-        self, name: str, checked_at: float,
+        self, name: str, checked_at: float, deadline: float,
     ) -> tuple[dict[str, object], dict[str, object] | None]:
         """Check and record one name, propagating registry/probe setup errors."""
         initial = self._load(name)
-        with self._lock(name):
+        if time.monotonic() >= deadline:
+            return self._unrecorded_health(
+                name, checked_at, "probe-deadline-exceeded",
+                "health probe deadline expired before this session was checked",
+                record=initial,
+            ), None
+        with self._try_lock(name, deadline) as acquired:
+            if not acquired:
+                return self._unrecorded_health(
+                    name, checked_at, "lifecycle-lock-contended",
+                    f"agent {name!r} lifecycle lock is held by another operation",
+                    record=initial,
+                ), None
             record = self._load_expected(name, initial.token)
-            status = self._status_record(record)
-            health, reason_code, reason = self._classify_health(record, status)
+            if time.monotonic() >= deadline:
+                return self._unrecorded_health(
+                    name, checked_at, "probe-deadline-exceeded",
+                    "health probe deadline expired before runtime inspection",
+                    record=record,
+                ), None
+            status = self._status_record(record, deadline=deadline)
+            if time.monotonic() >= deadline:
+                observation = self._unrecorded_health(
+                    name, checked_at, "probe-deadline-exceeded",
+                    "health probe deadline expired during runtime inspection",
+                    record=record,
+                )
+                observation["agent_status"] = status.get("agent_status")
+                observation["probe_error"] = status.get("probe_error")
+                return observation, status
+            health, reason_code, reason = self._classify_health(
+                record, status, deadline=deadline,
+            )
+            if time.monotonic() >= deadline:
+                observation = self._unrecorded_health(
+                    name, checked_at, "probe-deadline-exceeded",
+                    "health probe deadline expired during liveness classification",
+                    record=record,
+                )
+                observation["agent_status"] = status.get("agent_status")
+                observation["probe_error"] = status.get("probe_error")
+                return observation, status
             observation = self._persist_health(
                 record, health, reason_code, reason, checked_at,
             )
@@ -1711,45 +1899,63 @@ class ManagedAgents:
             observation["probe_error"] = status.get("probe_error")
             return observation, status
 
+    @staticmethod
+    def _unrecorded_health(
+        name: str, checked_at: float, reason_code: str, reason: str, *,
+        record: AgentRecord | None = None,
+    ) -> dict[str, object]:
+        return {
+            "schema": _HEALTH_SCHEMA,
+            "name": name,
+            "token": record.token if record is not None else None,
+            "health": "unknown",
+            "runtime_state": "unknown",
+            "reason_code": reason_code,
+            "reason": reason,
+            "first_detected_at": checked_at,
+            "last_checked_at": checked_at,
+            "recorded": False,
+            "record_path": None,
+            "lifecycle": record.lifecycle if record is not None else None,
+            "agent_status": None,
+            "probe_error": reason,
+        }
+
     def _health_one(
-        self, name: str, checked_at: float,
+        self, name: str, checked_at: float, deadline: float,
     ) -> tuple[dict[str, object], dict[str, object] | None]:
         """Check and record one name while isolating it from every other name."""
         try:
-            return self._health_one_result(name, checked_at)
+            return self._health_one_result(name, checked_at, deadline)
         except (HerdrRunError, OSError, ValueError, TypeError) as exc:
-            return {
-                "schema": _HEALTH_SCHEMA,
-                "name": name,
-                "token": None,
-                "health": "unknown",
-                "runtime_state": "unknown",
-                "reason_code": "registry-or-health-error",
-                "reason": str(exc),
-                "first_detected_at": checked_at,
-                "last_checked_at": checked_at,
-                "recorded": False,
-                "record_path": None,
-                "lifecycle": None,
-                "agent_status": None,
-                "probe_error": str(exc),
-            }, None
+            code = (
+                "probe-deadline-exceeded"
+                if time.monotonic() >= deadline else "registry-or-health-error"
+            )
+            return self._unrecorded_health(
+                name, checked_at, code, str(exc),
+            ), None
 
     def status_health_snapshot(
         self, name: str, *, checked_at: float | None = None,
-    ) -> tuple[dict[str, object], dict[str, object]]:
-        """Return one strict status and its health verdict from the same probe."""
+        deadline: float | None = None,
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        """Return one status and its health verdict from one bounded probe."""
         observation, status = self._health_one_result(
             name, time.time() if checked_at is None else checked_at,
+            time.monotonic() + _HEALTH_PROBE_SECONDS if deadline is None else deadline,
         )
-        assert status is not None
         return observation, status
 
     def health_snapshot(
         self, names: Sequence[str] = (), *, checked_at: float | None = None,
+        deadline: float | None = None,
     ) -> tuple[dict[str, object], list[dict[str, object] | None]]:
         """Return one aggregate and the exact status snapshot behind each verdict."""
         now = time.time() if checked_at is None else checked_at
+        probe_deadline = (
+            time.monotonic() + _HEALTH_PROBE_SECONDS if deadline is None else deadline
+        )
         requested = sorted(dict.fromkeys(names))
         registry_error: str | None = None
         if not requested:
@@ -1762,7 +1968,9 @@ class ManagedAgents:
                     )
                 except (HerdrRunError, OSError) as exc:
                     registry_error = str(exc)
-        checked = [self._health_one(name, now) for name in requested]
+        checked = [
+            self._health_one(name, now, probe_deadline) for name in requested
+        ]
         sessions = [observation for observation, _status in checked]
         statuses = [status for _observation, status in checked]
         healthy = registry_error is None and all(
@@ -1779,9 +1987,12 @@ class ManagedAgents:
 
     def health(
         self, names: Sequence[str] = (), *, checked_at: float | None = None,
+        deadline: float | None = None,
     ) -> dict[str, object]:
         """Check several names independently and return one machine-readable verdict."""
-        return self.health_snapshot(names, checked_at=checked_at)[0]
+        return self.health_snapshot(
+            names, checked_at=checked_at, deadline=deadline,
+        )[0]
 
     def list(self) -> list[dict[str, object]]:
         """List every registered agent; unavailable Herdr is not evidence of death."""

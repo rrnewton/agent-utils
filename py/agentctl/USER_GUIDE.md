@@ -491,7 +491,10 @@ same rule to every entry and exits 1 if any entry is non-healthy. Automation
 that needs only the aggregate health document can use `health` directly.
 `health [NAME ...]` checks every requested name independently, or every active
 registry entry when no name is supplied. One malformed or stale record is
-reported as its own `unknown` result and does not suppress later results.
+reported as its own `unknown` result and does not suppress later results. A
+lifecycle lock held by `start`, `send`, recovery, or another controller is also
+a bounded `unknown` / `lifecycle-lock-contended` row with `recorded: false`;
+the scan continues to later names instead of waiting behind that operation.
 The aggregate exits zero only when every result is `healthy`; confirmed pane or
 expected-harness disappearance is `unhealthy`, while an unavailable Herdr
 transport is `unknown`. Both non-healthy outcomes exit 1 and are emitted as
@@ -501,7 +504,12 @@ For headless workers, a dead result requires an explicit `runner_alive: false`
 observation whose name, PID, and Linux process start time all match the saved
 runner generation. Transport, decoding, and runtime errors remain `unknown`
 regardless of their wording, as does a liveness receipt for another process
-generation.
+generation. A positive receipt requires a readable matching `/proc` start time
+and a non-zombie process. Missing, mismatched, or zombie processes are false;
+permission and parse uncertainty is `null` and therefore `unknown`, never
+healthy. Because detached startup may return before the runner publishes its
+PID, the first later exact positive receipt is bound to the still-current outer
+generation while its private lifecycle lock is held.
 
 Each check atomically updates `.agentctl/NAME/health.json` with the session
 token, exact reason, `first_detected_at`, and `last_checked_at` Unix timestamps.
@@ -512,7 +520,9 @@ still appears in aggregate output with `recorded: false`.
 Use `--watch SECONDS` for a bounded polling process (0 means one check, maximum
 86,400 seconds) and `--interval SECONDS` for its positive delay (default 5,
 maximum 3,600 seconds). The command exits immediately on a non-healthy result
-or successfully after the watch bound. This shape can run from a systemd user
+or successfully after the watch bound. One-shot status/list/health probes have
+a 60-second control bound, and every lock and runtime request receives only
+the time remaining in the overall watch bound. This shape can run from a systemd user
 timer or another service manager without granting restart authority:
 
 ```ini
@@ -574,7 +584,9 @@ absent.
 
 A custom Muse launch can become live while an early Herdr process snapshot is
 still missing `argv`. New starts retry that transient response until the existing
-startup deadline. For a `launch_failed` Muse record that has a complete owned
+startup deadline. The pane launch, every process snapshot, readiness read, final
+identity check, and pane report all share that one deadline; no individual
+control request gets a fresh 30-second allowance. For a `launch_failed` Muse record that has a complete owned
 pane and saved launch intent, inspect the pane and recover only the exact process
 you observed. This also reconciles a retry when the exact process identity was
 already persisted but the subsequent pane report failed:
