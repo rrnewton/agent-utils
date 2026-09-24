@@ -312,7 +312,8 @@ const FIXTURE_TREE = {
   // third button one list entry rather than a new code path. So the fixture has to really nest
   // them, or that loop runs over nothing and every test of it certifies an empty set.
   //
-  // The channel picker is FIRST, and its being here at all is `#83 channel-selector-in-bar`: it
+  // The audio source is first, directly beside the gear; the channel picker follows it. The
+  // picker's being here at all is `#83 channel-selector-in-bar`: it
   // used to sit inside #scroll-area above the log, where reading anything scrolled it away and
   // scrolling back toward it loaded more history. `assertMarkupContains` below is what stops this
   // list from describing a page that put it back.
@@ -324,7 +325,7 @@ const FIXTURE_TREE = {
   // `read-new` is last, and it is on the strip at all because the tray gave a slot back. It is a
   // BUTTON rather than a select for the same reason: see `memberPx` — a `.bar-select` is 5rem
   // before its own padding, which the call view does not have once Type and Prompts are on it.
-  "bar-pack": ["discord-channel", "text-entry", "prompts-open", "read-new"],
+  "bar-pack": ["audio-source", "discord-channel", "text-entry", "prompts-open", "read-new"],
   // The tray of canned prompts. A child of the BAR and not of the pack, and both halves of that
   // matter: of the bar because the bar is what moves between the two mounts, and not of the pack
   // because the pack scrolls sideways and a menu that can scroll out from under its own opener is
@@ -2201,6 +2202,18 @@ test("the page starts with no error showing", () => {
   // From the markup: the panel ships hidden, so its appearance later is itself the signal.
   const page = newPage();
   assert.equal(page.el("error").hidden, true, "web/voice.html must ship the panel hidden");
+  assert.equal(page.el("error").textContent, "");
+});
+
+test("an error can be dismissed without waiting for another request", async () => {
+  const page = newPage();
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  page.clientConfig = async () => { throw new TypeError("Failed to fetch"); };
+  await page.el("save-token").click();
+  await page.settle();
+  assert.match(page.el("error").textContent, /Could not reach vibe-talk while loading data/);
+  await page.el("dismiss-error").click();
+  assert.equal(page.el("error").hidden, true);
   assert.equal(page.el("error").textContent, "");
 });
 
@@ -5677,6 +5690,26 @@ test("a configured audio speech backend keeps using server audio even when devic
   assert.ok(page.prepareCalls.length > 0);
   assert.equal(page.players.length, 1);
   assert.equal(page.deviceSpeech.utterances.length, 0);
+});
+
+test("the channel bar switches between configured agent audio and device audio locally", async () => {
+  const page = devicePage();
+  page.readAloud = { backend: "conversation", label: "Internal voice preview", playback: "audio", local_only: false };
+  await signIn(page);
+  const rows = await showDiscord(page, [message({ content: "read this locally" })]);
+  const toggle = page.el("audio-source");
+  assert.equal(toggle.hidden, false);
+  assert.equal(toggle.getAttribute("aria-checked"), "true");
+  assert.match(toggle.title, /Internal voice preview/);
+  const requests = page.prepareCalls.length;
+  await toggle.click();
+  assert.equal(toggle.getAttribute("aria-checked"), "false");
+  assert.equal(page.prepareCalls.length, requests, "changing the source issued a network request");
+  await readButton(page).click();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, 1);
+  assert.deepEqual(page.speakCalls, []);
 });
 
 test("READ REPLACES TALK IN THE CHANNEL VIEW, and Talk comes back in the transcript", async () => {
@@ -15763,6 +15796,25 @@ test("thread views show roots in Main and expose the selector only when threads 
   await signIn(empty);
   await showDiscord(empty, [message({ content: "no threads yet" })]);
   assert.equal(empty.el("channel-view-tabs").hidden, true);
+});
+
+test("Hide read reprojects a cached threaded timeline without fetching", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  const first = message({ id: "301", content: "already handled" });
+  const second = message({ id: "302", content: "still unread" });
+  page.dealtWith.add("301");
+  await signIn(page);
+  await showDiscord(page, [first, second]);
+  const fetched = page.timelineCalls.length;
+  assert.equal(page.el("discord-log").children.length, 2);
+  await page.el("todo-filter").click();
+  assert.equal(page.el("discord-log").children.length, 1);
+  assert.equal(page.el("discord-log").children[0].getAttribute("data-id"), "302");
+  assert.equal(page.timelineCalls.length, fetched, "Hide read refetched an already cached timeline");
+  await page.el("todo-filter").click();
+  assert.equal(page.el("discord-log").children.length, 2);
+  assert.equal(page.timelineCalls.length, fetched, "Showing read messages refetched the timeline");
 });
 
 test("Threads is ordered oldest to newest, opens at bottom and returns to its saved place", async () => {

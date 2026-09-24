@@ -142,6 +142,25 @@ button.secondary {
   overflow-wrap: anywhere;
 }
 
+#error-wrap {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+#error-wrap[hidden] {
+  display: none;
+}
+
+#error {
+  min-width: 0;
+}
+
+#dismiss-error {
+  flex: 0 0 auto;
+}
+
 button.ok {
   background: var(--panel);
   color: var(--ink);

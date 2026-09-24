@@ -39,7 +39,7 @@ impl SpeechProvider for ElevenLabsSpeech {
     fn describe(&self) -> Description {
         Description {
             backend: "elevenlabs",
-            label: "ElevenLabs",
+            label: "ElevenLabs".to_owned(),
             playback: Playback::Audio,
             local_only: false,
         }

@@ -278,9 +278,9 @@ async fn dismissing_the_same_message_twice_is_not_an_error_and_changes_nothing()
 }
 
 #[tokio::test]
-async fn a_message_outside_the_window_or_the_allowlist_cannot_grow_the_store() {
-    // The same guard `ops::allowed` puts on every channel operation, one level down: an invented
-    // snowflake must not be able to add a row per request to a durable table.
+async fn an_unknown_channel_and_an_unbounded_batch_cannot_grow_the_store() {
+    // Explicit dismissals are intentionally local and do not re-read the provider. The channel
+    // allowlist and one-page batch ceiling are therefore the two synchronous bounds.
     let server = Server::with(2);
     assert_eq!(
         ops::dismiss(
@@ -293,16 +293,15 @@ async fn a_message_outside_the_window_or_the_allowlist_cannot_grow_the_store() {
         .code(),
         "unknown_channel"
     );
+    let too_many = (0..=usize::from(ops::MAX_PAGE))
+        .map(|n| MessageId(format!("1000000000001{n:06}")))
+        .collect::<Vec<_>>();
     assert_eq!(
-        ops::dismiss(
-            &server.state,
-            READ_CHANNEL,
-            &[MessageId("1000000000000009999".to_owned())]
-        )
-        .await
-        .expect_err("must refuse")
-        .code(),
-        "unknown_message"
+        ops::dismiss(&server.state, READ_CHANNEL, &too_many)
+            .await
+            .expect_err("must refuse")
+            .code(),
+        "invalid_range"
     );
     assert_eq!(
         ops::declare_bankruptcy(
@@ -328,24 +327,25 @@ async fn a_message_outside_the_window_or_the_allowlist_cannot_grow_the_store() {
 }
 
 #[tokio::test]
-async fn one_unknown_id_refuses_the_whole_batch_rather_than_dismissing_the_rest() {
-    // Partial success is the worst answer available here: the caller is told it worked, its undo
-    // describes a set that was never dismissed, and the difference is invisible until the reader
-    // presses undo and part of the backlog stays gone.
+async fn explicit_dismissal_does_not_reread_the_chat_provider() {
+    // A message can scroll out between the read and the tap. The authenticated local operation
+    // still succeeds without asking the provider to find it again.
     let server = Server::with(3);
-    let error = ops::dismiss(
+    let outside = MessageId("1000000000000009999".to_owned());
+    let change = ops::dismiss(
         &server.state,
         READ_CHANNEL,
-        &[server.id(0), MessageId("1000000000000009999".to_owned())],
+        &[server.id(0), outside.clone()],
     )
     .await
-    .expect_err("must refuse");
-    assert_eq!(error.code(), "unknown_message");
-    assert_eq!(
-        server.left().await.len(),
-        3,
-        "a refused batch dismissed part of itself"
-    );
+    .expect("local dismissal");
+    assert_eq!(change.messages, vec![server.id(0), outside.clone()]);
+    let stored = server
+        .store
+        .dismissals(&server.channel)
+        .await
+        .expect("reads");
+    assert!(stored.contains(&outside));
 }
 
 #[tokio::test]

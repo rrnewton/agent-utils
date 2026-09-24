@@ -230,6 +230,12 @@ fn state_pieces_with(
     );
     let speech: Arc<dyn crate::speech::SpeechProvider> = match config.read_aloud.backend {
         crate::config::ReadAloudBackend::Browser => Arc::new(crate::speech::BrowserSpeech),
+        crate::config::ReadAloudBackend::Conversation => {
+            Arc::new(crate::speech::ConversationSpeech::new(
+                &config.conversation,
+                config.read_aloud.websocket_url.as_deref(),
+            ))
+        }
         crate::config::ReadAloudBackend::ElevenLabs => {
             Arc::new(crate::elevenlabs::speech::ElevenLabsSpeech::new(
                 elevenlabs.clone(),

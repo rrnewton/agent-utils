@@ -1031,30 +1031,31 @@ pub struct InboxChange {
 
 /// Mark messages as dealt with here. Write scope.
 ///
-/// Every id is checked against the fetched window first, so this cannot be used to grow the store
-/// one invented snowflake at a time — the same reason [`allowed`] guards the channel. An id that
-/// is not in the window is a refusal for the WHOLE batch rather than a silent omission: a partial
-/// bulk action that reported success would leave the caller's undo describing a set that was
-/// never dismissed.
+/// The configured-channel allowlist is checked without fetching the provider. The ids came from
+/// an authenticated page's loaded snapshot and are bounded to one maximum page per request. This
+/// keeps a local archive action local even when the source provider is slow or unavailable.
 ///
 /// # Errors
 ///
-/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::UnknownMessage`] when an id is
-/// not in the window; [`OpError::Chat`]; [`OpError::Store`].
+/// [`OpError::UnknownChannel`] outside the allowlist, [`OpError::InvalidRange`] for an oversized
+/// batch, or [`OpError::Store`].
 pub async fn dismiss(
     state: &AppState,
     channel_id: &str,
     wanted: &[MessageId],
 ) -> Result<InboxChange, OpError> {
-    let window = messages(state, channel_id, None).await?;
-    let known: std::collections::HashSet<&str> =
-        window.messages.iter().map(|m| m.id.as_str()).collect();
-    if wanted.iter().any(|id| !known.contains(id.as_str())) {
-        return Err(OpError::UnknownMessage);
+    // This is local inbox state. Re-reading the chat provider merely to prove that ids which the
+    // authenticated browser just received still exist made a Done tap cost a full provider round
+    // trip. Several taps then occupied every adapter worker and turned a local archive into a
+    // burst of 20-second 502s. The channel allowlist remains the authority boundary; the batch
+    // ceiling bounds storage growth from a malformed authenticated client.
+    let channel = allowed(state, channel_id).await?;
+    if wanted.len() > usize::from(MAX_PAGE) {
+        return Err(OpError::InvalidRange);
     }
-    state.store.dismiss(&window.channel.id, wanted).await?;
+    state.store.dismiss(&channel.id, wanted).await?;
     Ok(InboxChange {
-        channel: window.channel,
+        channel,
         messages: wanted.to_vec(),
     })
 }

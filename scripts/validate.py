@@ -110,7 +110,13 @@ GROUPS: dict[str, tuple[Check, ...]] = {
         # and naming one of them here is how the second suite comes to exist without ever running.
         # The pattern is expanded by node, not by a shell, so there is no glob for a shell to eat.
         # `cargo test` runs both through their own harnesses too; this keeps the fast loop honest.
-        Check("vibe-talk-page", ("node", "--test", "tests/js/*.test.mjs"), cwd="vibe-talk"),
+        # subprocess does not expand globs, and Node 16 does not expand this one itself. Keep the
+        # two browser suites explicit so the selected validator runs on deployment hosts too.
+        Check(
+            "vibe-talk-page",
+            ("node", "--test", "tests/js/app_page.test.mjs", "tests/js/voice_page.test.mjs"),
+            cwd="vibe-talk",
+        ),
         # The boxed graph, CHECKED but not run -- offline and instant. Running it here would be
         # running the same suites a second time.
         #

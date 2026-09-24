@@ -174,7 +174,7 @@ body {
   grid-row: 3;
 }
 
-#error {
+#error-wrap {
   grid-row: 1;
 }
 
@@ -1199,7 +1199,7 @@ body {
   mask-image: linear-gradient(to bottom, transparent 0, #000 1.1rem);
 }
 
-#error {
+#error-wrap {
   margin: 0.5rem 0.75rem;
 }
 
@@ -2601,7 +2601,7 @@ textarea {
   /* And so do the two notices. A full-width strip over a narrow column is the same "phone layout
      stretched sideways" this whole block exists to remove — it was there in the first capture of
      it, which is what these review rounds are for. */
-  #error,
+  #error-wrap,
   #connection-banner {
     max-width: var(--reading-width);
     margin-inline: auto;

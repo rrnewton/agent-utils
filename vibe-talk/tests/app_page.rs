@@ -27,7 +27,9 @@ fn the_phone_app_suite_passes() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new("node")
         .current_dir(&root)
-        .args(["--test", "--test-reporter=tap", SUITE])
+        // Importing `node:test` runs the suite and emits TAP. Calling the file directly works on
+        // Node 16 too; its experimental `--test` mode otherwise reports the whole file as one test.
+        .arg(SUITE)
         .output()
         .unwrap_or_else(|error| {
             panic!(
@@ -46,8 +48,9 @@ fn the_phone_app_suite_passes() {
     // suite that silently collected NOTHING would exit zero with `# pass 0`.
     let count = |label: &str| -> Option<u32> {
         text.lines()
-            .find_map(|line| line.strip_prefix(&format!("# {label} ")))
-            .and_then(|n| n.trim().parse().ok())
+            .filter_map(|line| line.trim_start().strip_prefix(&format!("# {label} ")))
+            .filter_map(|n| n.trim().parse().ok())
+            .max()
     };
     let passed = count("pass").unwrap_or_else(|| panic!("node reported no pass count:\n{text}"));
     let failed = count("fail").unwrap_or_else(|| panic!("node reported no fail count:\n{text}"));

@@ -94,10 +94,14 @@ distinction matters. Browser automation verifies the interaction with a simulate
 audible output on a physical phone remains a device check.
 
 Omitting `[read_aloud]`, or setting `backend = "elevenlabs"`, preserves server-generated ElevenLabs
-audio and its existing voice configuration. `GET /api/v1/client-config` reports the selected
-backend and playback mode. Rust handlers depend on `speech::SpeechProvider`; vendor credentials
-and API details stay in its adapter. Additional private providers can implement that interface
-outside this repository.
+audio and its existing voice configuration. A deployment whose conversational backend speaks the
+public `vibe-talk-v1` WebSocket protocol can set `backend = "conversation"`; the server sends the
+message as a text turn, collects the agent's 24 kHz PCM response, and returns WAV audio. When a
+server-audio backend is available, the channel bar offers an instant device/agent selector.
+`read_aloud.websocket_url` may name a server-only route to that same agent when the browser-facing
+conversation URL goes through a different ingress.
+`GET /api/v1/client-config` reports the selected backend and playback mode. Rust handlers depend on
+`speech::SpeechProvider`; vendor credentials and API details stay in its adapter.
 
 ## Setting it up
 
@@ -718,7 +722,7 @@ code path the startup probe uses, which is itself in the same position — see *
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
 | Channels | `[[channels]]` | `VIBE_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated |
 | ElevenLabs agent id | `elevenlabs.agent_id` | `VIBE_TALK_ELEVENLABS_AGENT_ID` | public |
-| Read-aloud backend | `read_aloud.backend` | `VIBE_TALK_READ_ALOUD_BACKEND` | `elevenlabs` (default) or `browser` for the device speech engine; independent of conversational voice mode |
+| Read-aloud backend | `read_aloud.backend` | `VIBE_TALK_READ_ALOUD_BACKEND` | `elevenlabs` (default), `browser` for the device speech engine, or `conversation` to use the configured `vibe-talk-v1` agent |
 | Conversation backend | `conversation.backend` | — | `elevenlabs` (default) or `websocket` for a deployment-managed `vibe-talk-v1` endpoint |
 | Conversation WebSocket | `conversation.websocket_url` | — | required for the `websocket` backend; keep private endpoints in deployment configuration |
 | Conversation label | `conversation.label` | — | provider name shown in the UI and its connection errors |

@@ -29,7 +29,7 @@ pub const ENV_READ_TOKEN: &str = "VIBE_TALK_READ_TOKEN";
 pub const ENV_WRITE_TOKEN: &str = "VIBE_TALK_WRITE_TOKEN";
 /// Environment variable carrying the dedicated live-event ingestion token.
 pub const ENV_INGEST_TOKEN: &str = "VIBE_TALK_INGEST_TOKEN";
-/// Environment variable selecting read-aloud: `elevenlabs` (default) or `browser`.
+/// Environment variable selecting read-aloud: `elevenlabs` (default), `browser`, or `conversation`.
 pub const ENV_READ_ALOUD_BACKEND: &str = "VIBE_TALK_READ_ALOUD_BACKEND";
 /// Environment variable carrying the ElevenLabs API key.
 pub const ENV_ELEVENLABS_API_KEY: &str = "VIBE_TALK_ELEVENLABS_API_KEY";
@@ -175,15 +175,20 @@ pub enum ReadAloudBackend {
     ElevenLabs,
     /// Browser Web Speech using a voice advertised as local by the browser.
     Browser,
+    /// Ask the configured conversational WebSocket agent to speak the message.
+    Conversation,
 }
 
 /// Backend selection for tapping messages to read them aloud.
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadAloudConfig {
     /// Speech backend; defaults to ElevenLabs when omitted.
     #[serde(default)]
     pub backend: ReadAloudBackend,
+    /// Optional server-side route to the same conversational agent. Useful when the browser uses
+    /// a public `wss://` ingress while the application can reach the bridge on loopback.
+    pub websocket_url: Option<String>,
 }
 
 /// Whether a message body is rewritten before it is spoken.
@@ -927,15 +932,17 @@ impl Config {
                     None => file.read_aloud.backend,
                     Some("browser") => ReadAloudBackend::Browser,
                     Some("elevenlabs") => ReadAloudBackend::ElevenLabs,
+                    Some("conversation") => ReadAloudBackend::Conversation,
                     Some(other) => {
                         return Err(ConfigError::Invalid {
                             field: "read_aloud.backend".to_owned(),
                             detail: format!(
-                                "unknown backend {other:?}; choose browser or elevenlabs"
+                                "unknown backend {other:?}; choose browser, elevenlabs, or conversation"
                             ),
                         })
                     }
                 },
+                websocket_url: file.read_aloud.websocket_url,
             },
             speakable,
             elevenlabs: ElevenLabsConfig {

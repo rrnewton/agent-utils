@@ -452,6 +452,10 @@ async fn main() -> anyhow::Result<()> {
     let bind = config.bind;
     let speech: Arc<dyn SpeechProvider> = match config.read_aloud.backend {
         ReadAloudBackend::Browser => Arc::new(vibe_talk::speech::BrowserSpeech),
+        ReadAloudBackend::Conversation => Arc::new(vibe_talk::speech::ConversationSpeech::new(
+            &config.conversation,
+            config.read_aloud.websocket_url.as_deref(),
+        )),
         ReadAloudBackend::ElevenLabs => {
             Arc::new(vibe_talk::elevenlabs::speech::ElevenLabsSpeech::new(
                 elevenlabs_client.clone(),

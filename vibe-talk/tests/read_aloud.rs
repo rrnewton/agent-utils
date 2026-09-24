@@ -12,6 +12,57 @@ use vibe_talk::config::{Config, ReadAloudBackend, ENV_READ_ALOUD_BACKEND};
 use vibe_talk::http::router;
 use vibe_talk::model::ChannelId;
 use vibe_talk::speech::{Description, Playback, Speech, SpeechError, SpeechProvider};
+
+#[tokio::test]
+async fn conversational_read_aloud_drives_the_provider_neutral_socket_and_returns_wav() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("upgrades");
+        socket
+            .send(Message::Text(r#"{"type":"session_started"}"#.into()))
+            .await
+            .expect("starts");
+        let prompt = socket.next().await.expect("prompt frame").expect("prompt");
+        let Message::Text(prompt) = prompt else {
+            panic!("prompt was not text")
+        };
+        assert!(prompt.contains("Read the channel message"));
+        assert!(prompt.contains("hello from the channel"));
+        socket
+            .send(Message::Binary(vec![1, 2, 3, 4].into()))
+            .await
+            .expect("audio");
+        socket
+            .send(Message::Text(r#"{"type":"turn_complete","turn":1}"#.into()))
+            .await
+            .expect("finishes");
+    });
+    let config = vibe_talk::config::ConversationConfig {
+        backend: vibe_talk::config::ConversationBackend::WebSocket,
+        websocket_url: Some("ws://127.0.0.1:1/browser-route".to_owned()),
+        label: "Test agent".to_owned(),
+    };
+    let server_route = format!("ws://{address}");
+    let provider = vibe_talk::speech::ConversationSpeech::new(&config, Some(&server_route));
+    assert_eq!(provider.describe().label, "Test agent");
+    let spoken = provider
+        .speak("hello from the channel", None)
+        .await
+        .expect("speaks");
+    assert_eq!(spoken.content_type, "audio/wav");
+    assert_eq!(&spoken.audio[..4], b"RIFF");
+    assert_eq!(&spoken.audio[44..], &[1, 2, 3, 4]);
+    server.await.expect("server exits");
+}
 use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN};
 
 async fn call(
@@ -132,7 +183,7 @@ impl SpeechProvider for IndependentSpeech {
     fn describe(&self) -> Description {
         Description {
             backend: "independent",
-            label: "Independent voice",
+            label: "Independent voice".to_owned(),
             playback: Playback::Audio,
             local_only: false,
         }

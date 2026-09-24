@@ -133,16 +133,24 @@ function redact(text) {
 // on. The reported bug was that a 502 naming a missing API-key permission appeared only in the dev
 // console, so the only visible symptom was a page that did nothing. The panel lives outside the
 // three screens so it is visible on whichever one is up.
+let errorTimer = null;
+
 function showError(text) {
-  const box = el("error");
-  box.textContent = redact(text);
+  const box = el("error-wrap");
+  el("error").textContent = redact(text);
+  el("error").hidden = false;
   box.hidden = false;
   setState("error");
+  if (errorTimer !== null) clearTimeout(errorTimer);
+  errorTimer = setTimeout(clearError, 12000);
 }
 
 function clearError() {
-  const box = el("error");
-  box.textContent = "";
+  const box = el("error-wrap");
+  if (errorTimer !== null) clearTimeout(errorTimer);
+  errorTimer = null;
+  el("error").textContent = "";
+  el("error").hidden = true;
   box.hidden = true;
 }
 
@@ -2240,7 +2248,18 @@ async function api(path, options) {
     headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(options.body);
   }
-  const response = await fetch(path, init);
+  let response;
+  try {
+    response = await fetch(path, init);
+  } catch (cause) {
+    const action = init.method === "GET" ? "loading data" : "saving your change";
+    const error = new Error(
+      `Could not reach vibe-talk while ${action}. Your current screen is still available; retry when the connection recovers.`
+    );
+    error.cause = cause;
+    error.network = true;
+    throw error;
+  }
   const text = await response.text();
   let payload = null;
   try {
@@ -2915,6 +2934,7 @@ function placementChanged() {
  * and because the fit check below is only as good as this table is complete.
  */
 const PACK_VIEWS = {
+  "audio-source": ["discord"],
   "discord-channel": ["discord"],
   "text-entry": ["voice"],
   // ONE LINE FOR ALL THE CANNED PROMPTS, which is the point of the tray: they used to be derived
@@ -2960,7 +2980,9 @@ function renderControlBar() {
   // default: see the loop below.
   for (const member of el("bar-pack").children) {
     const views = PACK_VIEWS[member.id] || [];
-    member.hidden = !main || !views.includes(currentView) || (typing && member.id !== "text-entry");
+    const unavailable = member.id === "audio-source" && agentReadAloud === null;
+    member.hidden = unavailable || !main || !views.includes(currentView) ||
+      (typing && member.id !== "text-entry");
   }
   el("text-entry").setAttribute("aria-pressed", typing ? "true" : "false");
   el("compose-text").hidden = !typing;
@@ -4357,6 +4379,31 @@ function applyTimelinePage(payload, older = false) {
       ? (selectedThread && selectedThread.title) || "this thread" : channelName(payload.channel));
   renderChannelSeam(label);
   return channelView === "threads" ? timelineThreads : shown;
+}
+
+/** Re-project the already fetched timeline after a local preference or archive change. */
+function renderCachedTimeline() {
+  if (!threadingSupported || channelView === "threads") return;
+  const shown = timelineMessages.filter((message) => !todoMode ||
+    (!archivedIds.has(String(message.id)) && (!markOwnRead ||
+      bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) !== "me")));
+  const redraw = () => {
+    el("discord-log").replaceChildren(...glom(shown).map(discordNode));
+    renderChannelRows();
+    backlogSize = shown.length;
+    renderTodoControls();
+    renderChannelSeam(channelSummary(
+      shown.length,
+      loadedIsWhole(),
+      channelView === "thread"
+        ? (selectedThread && selectedThread.title) || "this thread"
+        : channelName(knownChannel(el("discord-channel").value))
+    ));
+  };
+  preservingScroll(redraw);
+  renderScrollTools();
+  requestVisibleSummaries();
+  guardQuietly(prepareSpeech)();
 }
 
 async function loadTimeline(options) {
@@ -5758,9 +5805,58 @@ let readingMode = false;
 // voice is explicitly selected; it never falls back to a remote speech service.
 let readAloudPlayback = "audio";
 let readAloudLabel = "Voice provider";
+const READ_AUDIO_SOURCE_KEY = "vibe-talk.voice.read-audio-source";
+let agentReadAloud = null;
+let readAudioSource = "device";
 let browserVoicesListening = false;
 let waitingForBrowserVoice = false;
 let browserVoiceProblem = "";
+
+function storedReadAudioSource() {
+  try {
+    const held = localStorage.getItem(READ_AUDIO_SOURCE_KEY);
+    return held === "agent" || held === "device" ? held : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** Select where message audio is produced. The toggle itself never waits for either provider. */
+function setReadAudioSource(source, announce = true) {
+  readAudioSource = source === "agent" && agentReadAloud ? "agent" : "device";
+  stopReading();
+  forgetPreparedSpeech();
+  if (readAudioSource === "agent") {
+    readAloudPlayback = String(agentReadAloud.playback || "audio");
+    readAloudLabel = String(agentReadAloud["label"] || "Agent voice");
+  } else {
+    readAloudPlayback = "browser";
+    readAloudLabel = "Device voice";
+    prepareBrowserSpeech();
+  }
+  try {
+    localStorage.setItem(READ_AUDIO_SOURCE_KEY, readAudioSource);
+  } catch (_error) {
+    // The selection still applies to this page when storage is unavailable.
+  }
+  const agent = readAudioSource === "agent";
+  el("audio-source").setAttribute("aria-checked", agent ? "true" : "false");
+  el("audio-source").setAttribute(
+    "aria-label", agent ? `Read messages with ${readAloudLabel}` : "Read messages with device audio"
+  );
+  el("audio-source").title = agent
+    ? `${readAloudLabel}. Tap to use device audio.`
+    : `Device audio. Tap to use ${agentReadAloud ? agentReadAloud["label"] : "the configured agent"}.`;
+  el("audio-device-icon").hidden = agent;
+  el("audio-agent-icon").hidden = !agent;
+  if (readingMode) {
+    setReadState("ready");
+    guardQuietly(prepareSpeech)();
+  }
+  renderControlBar();
+  applyReadSpeed(readSpeed);
+  if (announce) setStatus(`Messages will use ${readAloudLabel}.`);
+}
 
 function browserSpeechEngine() {
   const engine = window.speechSynthesis;
@@ -7702,28 +7798,71 @@ async function toggleArchived(ids) {
  * after a round trip to Discord.
  */
 async function refreshAfterInboxChange() {
+  if (threadingSupported) {
+    renderCachedTimeline();
+    return;
+  }
   if (todoMode) {
-    // `ownAct`: rows LEAVING because the reader said so is not something arriving, and the re-read
-    // must not answer their own tap with an offer to jump to a bottom nothing turned up at.
-    await loadTodo({ keepPosition: true, ownAct: true });
+    const kept = [...el("discord-log").children].filter((row) => {
+      const ids = idsOf(row);
+      return ids.length === 0 || !ids.every((id) => archivedIds.has(id));
+    });
+    el("discord-log").replaceChildren(...kept);
+    backlogSize = el("discord-log").children.length;
+    todoView = { ...todoView, left: backlogSize };
+    renderChannelSeam(todoSummary());
+    renderTodoControls();
   } else {
     renderChannelRows();
   }
 }
 
+// Keep writes ordered while every visible result happens immediately. This prevents a quick run
+// of Done taps from occupying every provider-adapter worker even against an older server.
+let inboxWriteTail = Promise.resolve();
+
+function queueInboxWrite(task) {
+  const run = inboxWriteTail.then(task, task);
+  inboxWriteTail = run.catch(() => {});
+  return run;
+}
+
 /** Mark messages as dealt with, remember the exact set, and settle the list. */
 async function dismissMessages(body) {
   const channel = el("discord-channel").value;
-  const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/dismiss`, {
-    method: "POST",
-    body,
-  });
-  lastDismissal = { channel, messages: (payload.messages || []).map(String) };
-  for (const id of lastDismissal.messages) {
+  const visible = [...el("discord-log").children].flatMap(idsOf);
+  const boundary = body.through === undefined ? -1 : visible.indexOf(String(body.through));
+  const requested = body.messages
+    ? body.messages.map(String)
+    : boundary >= 0
+      ? visible.slice(0, boundary + 1)
+      : [];
+  if (requested.length === 0) return;
+  const previous = new Set(archivedIds);
+  const previousDismissal = lastDismissal;
+  lastDismissal = { channel, messages: requested };
+  for (const id of requested) {
     archivedIds.add(id);
   }
   await refreshAfterInboxChange();
-  const count = lastDismissal.messages.length;
+  renderTodoControls();
+  setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
+  let payload;
+  try {
+    payload = await queueInboxWrite(() => api(
+      `/api/v1/channels/${encodeURIComponent(channel)}/dismiss`,
+      { method: "POST", body }
+    ));
+  } catch (error) {
+    archivedIds = previous;
+    lastDismissal = previousDismissal;
+    await refreshAfterInboxChange();
+    renderTodoControls();
+    throw error;
+  }
+  const stored = (payload.messages || requested).map(String);
+  lastDismissal = { channel, messages: stored };
+  const count = stored.length;
   setStatus(
     `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in the source chat service.`
   );
@@ -7758,11 +7897,9 @@ async function markReadUpstream(messageId) {
  */
 async function restoreMessages(ids) {
   const channel = el("discord-channel").value;
-  const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/restore`, {
-    method: "POST",
-    body: { messages: ids.map(String) },
-  });
-  const restored = (payload.messages || []).map(String);
+  const restored = ids.map(String);
+  const previous = new Set(archivedIds);
+  const previousDismissal = lastDismissal;
   for (const id of restored) {
     archivedIds.delete(id);
   }
@@ -7771,6 +7908,23 @@ async function restoreMessages(ids) {
     lastDismissal = left.length === 0 ? null : { ...lastDismissal, messages: left };
   }
   await refreshAfterInboxChange();
+  renderTodoControls();
+  setStatus(`Restoring ${restored.length} message${restored.length === 1 ? "" : "s"}…`);
+  try {
+    await queueInboxWrite(() => api(`/api/v1/channels/${encodeURIComponent(channel)}/restore`, {
+      method: "POST",
+      body: { messages: restored },
+    }));
+    if (todoMode && !threadingSupported) {
+      await loadTodo({ keepPosition: true, ownAct: true });
+    }
+  } catch (error) {
+    archivedIds = previous;
+    lastDismissal = previousDismissal;
+    await refreshAfterInboxChange();
+    renderTodoControls();
+    throw error;
+  }
   const count = restored.length;
   setStatus(`${count} message${count === 1 ? "" : "s"} back in the list.`);
   renderTodoControls();
@@ -7782,16 +7936,9 @@ async function undoDismissal() {
     return;
   }
   const undoing = lastDismissal;
-  // Cleared BEFORE the request, so a second tap on a slow connection cannot restore twice — and
-  // so a failure below cannot leave the chip offering an undo that has already happened.
   lastDismissal = null;
   renderTodoControls();
-  await api(`/api/v1/channels/${encodeURIComponent(undoing.channel)}/restore`, {
-    method: "POST",
-    body: { messages: undoing.messages },
-  });
-  await loadTodo({ keepPosition: true, ownAct: true });
-  setStatus(`${undoing.messages.length} back in the list.`);
+  await restoreMessages(undoing.messages);
 }
 
 /** Declare bankruptcy on everything currently in the list. Two taps, and it says the count. */
@@ -7837,7 +7984,11 @@ function setTodoMode(on) {
     backlogSize = 0;
   }
   renderTodoControls();
-  guardQuietly(() => (on ? loadTodo() : loadDiscord()))();
+  if (threadingSupported) {
+    renderCachedTimeline();
+  } else {
+    guardQuietly(() => (on ? loadTodo() : loadDiscord()))();
+  }
 }
 
 // --- replying to a channel message -------------------------------------------------------------
@@ -9276,9 +9427,16 @@ function renderAgentLink() {
 
 function applyClientConfig(config) {
   const speech = config.read_aloud;
-  readAloudPlayback = speech ? String(speech.playback || "unsupported") : "audio";
-  readAloudLabel = speech && speech.label ? String(speech.label) : "Voice provider";
-  if (readAloudPlayback === "browser") prepareBrowserSpeech();
+  const effectiveSpeech = speech || {
+    backend: "legacy",
+    label: "Voice provider",
+    playback: "audio",
+    local_only: false,
+  };
+  // Device speech is always a local browser choice. A configured server-audio provider adds the
+  // other side of the bar toggle; its label comes from the provider trait and is never guessed.
+  agentReadAloud = String(effectiveSpeech.playback) === "audio" ? effectiveSpeech : null;
+  setReadAudioSource(storedReadAudioSource() || (agentReadAloud ? "agent" : "device"), false);
   applyReadSpeed(readSpeed);
   threadingSupported = config.threading_supported === true;
   // The selected backend owns its display name. An older server leaves it unspecified, so the
@@ -9570,8 +9728,12 @@ el("read-speed").addEventListener("click", () => {
 el("mark-own-read").addEventListener("change", () => {
   applyMarkOwnRead(el("mark-own-read").checked);
   // Both: the channel view re-greys, and the queue is a different list than it was a moment ago.
-  renderChannelRows();
-  if (todoMode) {
+  if (threadingSupported) {
+    renderCachedTimeline();
+  } else {
+    renderChannelRows();
+  }
+  if (todoMode && !threadingSupported) {
     guardQuietly(() => loadTodo({ keepPosition: true, ownAct: true }))();
   }
 });
@@ -9686,6 +9848,10 @@ el("compose-text").addEventListener("keydown", (event) => {
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);
 el("open-settings").addEventListener("click", () => showScreen("settings"));
+el("dismiss-error").addEventListener("click", clearError);
+el("audio-source").addEventListener("click", () =>
+  setReadAudioSource(readAudioSource === "device" ? "agent" : "device")
+);
 el("close-settings").addEventListener("click", () => showScreen(screenBeforeSettings));
 
 // `#85 voice-desktop-review`. The paragraphs that used to stand between the reader and every switch
