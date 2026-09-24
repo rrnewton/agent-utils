@@ -306,21 +306,21 @@ async fn main() -> anyhow::Result<()> {
         timezone = config.timezone.name(),
         "message times will be spoken in this zone"
     );
-    // Say the ElevenLabs wiring out loud, in both directions. An agent with "Enable
-    // Authentication" turned on cannot be reached without a signed URL, and the way that failure
-    // presents — a conversation that will not start, from a phone, in a car — is about as far as
-    // possible from the setting that causes it.
-    match vibe_talk::elevenlabs::credentials(&config.elevenlabs) {
-        Ok((agent_id, _key)) => tracing::info!(
-            agent_id,
-            "ElevenLabs configured; GET /api/v1/signed-url will mint signed conversation URLs, \
-             and /voice is the page that uses them"
-        ),
-        Err(error) => tracing::warn!(
-            %error,
-            "ElevenLabs is NOT fully configured; /api/v1/signed-url will refuse with this exact \
-             message rather than handing out an unsigned URL"
-        ),
+    // ElevenLabs credentials are relevant to live voice or read-aloud only when one of those
+    // selected providers uses them. The summary backend reports its own configuration below.
+    if config.conversation.backend == vibe_talk::config::ConversationBackend::ElevenLabs
+        || config.read_aloud.backend == ReadAloudBackend::ElevenLabs
+    {
+        match vibe_talk::elevenlabs::credentials(&config.elevenlabs) {
+            Ok((agent_id, _key)) => tracing::info!(
+                agent_id,
+                "ElevenLabs is configured for a selected voice capability"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "a selected ElevenLabs voice capability is not configured"
+            ),
+        }
     }
     // Say the MCP endpoint out loud at startup: an agent platform has to be told a URL, and the
     // most common deployment mistake is pointing it at the wrong path and getting a bare 404.
