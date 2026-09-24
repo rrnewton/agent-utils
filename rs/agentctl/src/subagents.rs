@@ -4,8 +4,13 @@
 //! launch intent, queue routing, snapshots, and conservative tab teardown.
 
 use std::collections::BTreeMap;
-use std::fs::{self, DirBuilder, File};
-use std::os::unix::fs::DirBuilderExt;
+use std::ffi::CString;
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{
+    DirBuilderExt, FileExt as UnixFileExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,16 +18,414 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
     muse_idle_composer, muse_prompt_in_composer, muse_prompt_transcript_count,
     muse_startup_metadata, muse_trust_prompt, AgentPaneInfo, CustomProcessIdentity, HerdrClient,
-    Pane,
+    Pane, PaneShellProof,
 };
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
+const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+
+fn rename_directory_noreplace_at(
+    source_parent: &File,
+    source_name: &str,
+    destination_parent: &File,
+    destination_name: &str,
+) -> Result<()> {
+    let source_bytes = CString::new(source_name.as_bytes())
+        .map_err(|_| fail("agent archive source path contains NUL"))?;
+    let destination_bytes = CString::new(destination_name.as_bytes())
+        .map_err(|_| fail("agent archive destination path contains NUL"))?;
+    let result = unsafe {
+        libc::renameat2(
+            source_parent.as_raw_fd(),
+            source_bytes.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_bytes.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EEXIST) => Err(fail(format!(
+            "refusing to replace existing agent archive {destination_name}",
+        ))),
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => Err(fail(
+            "cannot archive agent: filesystem lacks atomic no-replace rename support",
+        )),
+        _ => Err(fail(format!(
+            "cannot archive agent {source_name} as {destination_name}: {error}",
+        ))),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InstalledArtifact {
+    device: u64,
+    inode: u64,
+    size: u64,
+    digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactInstallState {
+    NotInstalled,
+    Installed(InstalledArtifact),
+    Uncertain,
+}
+
+#[derive(Debug)]
+struct ArtifactWriteError {
+    error: Box<AgentError>,
+    state: ArtifactInstallState,
+}
+
+impl std::fmt::Display for ArtifactWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl From<AgentError> for ArtifactWriteError {
+    fn from(error: AgentError) -> Self {
+        Self {
+            error: Box::new(error),
+            state: ArtifactInstallState::NotInstalled,
+        }
+    }
+}
+
+type ArtifactWriteResult = std::result::Result<InstalledArtifact, ArtifactWriteError>;
+
+fn atomic_replace_bytes(
+    pinned: &PinnedAgentDirectory,
+    name: &str,
+    content: &[u8],
+) -> ArtifactWriteResult {
+    atomic_replace_bytes_with(
+        pinned,
+        name,
+        content,
+        (
+            |_pinned, _temporary| Ok(()),
+            |_pinned, _name, _temporary| Ok(()),
+        ),
+    )
+}
+
+fn atomic_replace_bytes_with<AfterWrite, AfterRename>(
+    pinned: &PinnedAgentDirectory,
+    name: &str,
+    content: &[u8],
+    hooks: (AfterWrite, AfterRename),
+) -> ArtifactWriteResult
+where
+    AfterWrite: FnOnce(&PinnedAgentDirectory, &str) -> Result<()>,
+    AfterRename: FnOnce(&PinnedAgentDirectory, &str, &str) -> Result<()>,
+{
+    let (after_write, after_rename) = hooks;
+    if !matches!(name, "agent.json" | "output.json") {
+        return Err(fail("unsupported pinned registry artifact name").into());
+    }
+    let limit = if name == "agent.json" {
+        MAX_AGENT_RECORD_BYTES
+    } else {
+        MAX_SNAPSHOT_BYTES
+    };
+    if content.len() > limit {
+        return Err(fail(format!("refusing {name} larger than {limit} bytes")).into());
+    }
+    let name_c = CString::new(name).map_err(|_| fail("registry artifact name contains NUL"))?;
+    let mut selected = None;
+    for attempt in 0_u32..128 {
+        let candidate = format!(
+            ".{name}-recovery-{}-{}-{attempt}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| fail(error.to_string()))?
+                .as_nanos()
+        );
+        let candidate_c = CString::new(candidate.as_bytes())
+            .map_err(|_| fail("registry staging name contains NUL"))?;
+        let descriptor = unsafe {
+            libc::openat(
+                pinned.file.as_raw_fd(),
+                candidate_c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if descriptor >= 0 {
+            selected = Some((candidate_c, unsafe { File::from_raw_fd(descriptor) }));
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(fail(format!("cannot stage output snapshot: {error}")).into());
+        }
+    }
+    let (temporary, mut file) = selected.ok_or_else(|| {
+        ArtifactWriteError::from(fail("cannot reserve private output snapshot staging file"))
+    })?;
+    let temporary_name = temporary
+        .to_str()
+        .expect("constructed registry staging name is UTF-8");
+    let uid = unsafe { libc::getuid() };
+    let mut created_identity = None;
+    let mut rename_attempted = false;
+    let mut renamed = false;
+    let mut installed_verified = false;
+    let write_result = (|| -> Result<()> {
+        let created = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot inspect registry staging file: {error}")))?;
+        if !created.is_file()
+            || created.uid() != uid
+            || created.permissions().mode() & 0o077 != 0
+            || created.nlink() != 1
+        {
+            return Err(fail("unsafe registry artifact staging file"));
+        }
+        let identity = (created.dev(), created.ino());
+        created_identity = Some(identity);
+        file.write_all(content)
+            .map_err(|error| fail(format!("cannot write registry staging file: {error}")))?;
+        file.sync_all()
+            .map_err(|error| fail(format!("cannot sync registry staging file: {error}")))?;
+        after_write(pinned, temporary_name)?;
+        let held = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot reinspect registry staging file: {error}")))?;
+        let mut held_content = vec![0_u8; content.len() + 1];
+        let held_length = file
+            .read_at(&mut held_content, 0)
+            .map_err(|error| fail(format!("cannot reread registry staging file: {error}")))?;
+        let staged = ManagedAgents::<HerdrClient>::open_optional_pinned_file(
+            pinned,
+            temporary_name,
+            libc::O_RDONLY,
+        )?
+        .ok_or_else(|| fail("registry artifact staging name disappeared before installation"))?;
+        let staged_metadata = staged.metadata().map_err(|error| {
+            fail(format!(
+                "cannot inspect registry artifact staging name: {error}"
+            ))
+        })?;
+        if !held.is_file()
+            || !staged_metadata.is_file()
+            || held.uid() != uid
+            || staged_metadata.uid() != uid
+            || held.permissions().mode() & 0o077 != 0
+            || staged_metadata.permissions().mode() & 0o077 != 0
+            || held.nlink() != 1
+            || staged_metadata.nlink() != 1
+            || held.len() != content.len() as u64
+            || staged_metadata.len() != content.len() as u64
+            || held_length != content.len()
+            || &held_content[..held_length] != content
+            || (held.dev(), held.ino()) != identity
+            || (staged_metadata.dev(), staged_metadata.ino()) != identity
+        {
+            return Err(fail(format!(
+                "registry artifact staging generation changed before installing {name}"
+            )));
+        }
+        rename_attempted = true;
+        let rename_result = unsafe {
+            libc::renameat(
+                pinned.file.as_raw_fd(),
+                temporary.as_ptr(),
+                pinned.file.as_raw_fd(),
+                name_c.as_ptr(),
+            )
+        };
+        if rename_result != 0 {
+            return Err(fail(format!(
+                "cannot install pinned registry artifact: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // The staging name no longer belongs to this operation. Never remove
+        // a new entry that appears there after the rename.
+        renamed = true;
+        after_rename(pinned, name, temporary_name)?;
+        let installed =
+            ManagedAgents::<HerdrClient>::open_pinned_file(pinned, name, libc::O_RDONLY)?;
+        let installed_metadata = installed.metadata().map_err(|error| {
+            fail(format!(
+                "cannot inspect installed registry artifact: {error}"
+            ))
+        })?;
+        let held = file.metadata().map_err(|error| {
+            fail(format!(
+                "cannot reinspect installed registry artifact: {error}"
+            ))
+        })?;
+        let mut held_content = vec![0_u8; content.len() + 1];
+        let held_length = file.read_at(&mut held_content, 0).map_err(|error| {
+            fail(format!(
+                "cannot reread installed registry artifact: {error}"
+            ))
+        })?;
+        if !installed_metadata.is_file()
+            || installed_metadata.uid() != uid
+            || installed_metadata.permissions().mode() & 0o077 != 0
+            || installed_metadata.nlink() != 1
+            || installed_metadata.len() != content.len() as u64
+            || held_length != content.len()
+            || &held_content[..held_length] != content
+            || (installed_metadata.dev(), installed_metadata.ino()) != identity
+            || (held.dev(), held.ino(), held.len())
+                != (identity.0, identity.1, content.len() as u64)
+        {
+            return Err(fail(format!(
+                "installed registry artifact {name} was not the staged generation"
+            )));
+        }
+        installed_verified = true;
+        pinned
+            .file
+            .sync_all()
+            .map_err(|error| fail(format!("cannot sync installed registry artifact: {error}")))?;
+        Ok(())
+    })();
+    let mut uncertain = renamed && !installed_verified;
+    if !renamed && rename_attempted {
+        let mut held_content = vec![0_u8; content.len() + 1];
+        let held_content_exact = file
+            .read_at(&mut held_content, 0)
+            .is_ok_and(|length| length == content.len() && &held_content[..length] == content);
+        let held_exact = file.metadata().is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.uid() == uid
+                && metadata.permissions().mode() & 0o077 == 0
+                && metadata.nlink() == 1
+                && metadata.len() == content.len() as u64
+                && held_content_exact
+                && Some((metadata.dev(), metadata.ino())) == created_identity
+        });
+        let staged_exact = ManagedAgents::<HerdrClient>::open_optional_pinned_file(
+            pinned,
+            temporary_name,
+            libc::O_RDONLY,
+        )
+        .ok()
+        .flatten()
+        .and_then(|staged| staged.metadata().ok())
+        .is_some_and(|metadata| {
+            metadata.is_file()
+                && metadata.uid() == uid
+                && metadata.permissions().mode() & 0o077 == 0
+                && metadata.nlink() == 1
+                && Some((metadata.dev(), metadata.ino())) == created_identity
+        });
+        let installed_exact =
+            ManagedAgents::<HerdrClient>::open_optional_pinned_file(pinned, name, libc::O_RDONLY)
+                .ok()
+                .flatten()
+                .and_then(|installed| installed.metadata().ok())
+                .is_some_and(|metadata| {
+                    metadata.is_file()
+                        && metadata.uid() == uid
+                        && metadata.permissions().mode() & 0o077 == 0
+                        && metadata.nlink() == 1
+                        && metadata.len() == content.len() as u64
+                        && Some((metadata.dev(), metadata.ino())) == created_identity
+                });
+        if held_exact && installed_exact && !staged_exact {
+            renamed = true;
+            installed_verified = true;
+        } else if !(held_exact && staged_exact) {
+            uncertain = true;
+        }
+    }
+    let cleanup = if renamed || uncertain {
+        Ok(())
+    } else {
+        match ManagedAgents::<HerdrClient>::open_optional_pinned_file(
+        pinned,
+        temporary_name,
+        libc::O_RDONLY,
+    ) {
+        Ok(None) => Ok(()),
+        Ok(Some(staged)) => match staged.metadata() {
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.uid() == uid
+                    && metadata.permissions().mode() & 0o077 == 0
+                    && metadata.nlink() == 1
+                    && Some((metadata.dev(), metadata.ino())) == created_identity =>
+            {
+                let result = unsafe {
+                    libc::unlinkat(pinned.file.as_raw_fd(), temporary.as_ptr(), 0)
+                };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(fail(format!(
+                        "cannot remove owned registry staging file: {}",
+                        std::io::Error::last_os_error()
+                    )))
+                }
+            }
+            Ok(_) => Err(fail(
+                "registry staging name no longer denotes the owned file; replacement was preserved",
+            )),
+            Err(error) => Err(fail(format!(
+                "cannot inspect registry staging file during cleanup: {error}"
+            ))),
+        },
+        Err(error) => Err(error),
+        }
+    };
+    // A same-uid process ignoring the cooperative registry lock can still race
+    // the final identity check above and unlinkat.
+    let error = match (write_result, cleanup) {
+        (Ok(()), Ok(())) => None,
+        (Err(error), Ok(())) => Some(error),
+        (Ok(()), Err(cleanup)) => Some(cleanup),
+        (Err(error), Err(cleanup)) => Some(fail(format!(
+            "{error}; registry artifact cleanup failed: {cleanup}"
+        ))),
+    };
+    let artifact = created_identity.map(|(device, inode)| InstalledArtifact {
+        device,
+        inode,
+        size: content.len() as u64,
+        digest: Sha256::digest(content).into(),
+    });
+    match (error, artifact) {
+        (None, Some(artifact)) if installed_verified => Ok(artifact),
+        (None, _) => Err(ArtifactWriteError {
+            error: Box::new(fail(format!(
+                "cannot prove installed registry artifact {name}"
+            ))),
+            state: ArtifactInstallState::Uncertain,
+        }),
+        (Some(error), Some(artifact)) if installed_verified => Err(ArtifactWriteError {
+            error: Box::new(error),
+            state: ArtifactInstallState::Installed(artifact),
+        }),
+        (Some(error), _) if renamed || uncertain => Err(ArtifactWriteError {
+            error: Box::new(error),
+            state: ArtifactInstallState::Uncertain,
+        }),
+        (Some(error), _) => Err(ArtifactWriteError {
+            error: Box::new(error),
+            state: ArtifactInstallState::NotInstalled,
+        }),
+    }
+}
 
 /// Result of a managed-agent operation, including durable delivery outcomes.
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -239,6 +642,15 @@ pub trait ManagedApi: AgentApi {
             "identity-bound idle shell verification is unavailable",
         ))
     }
+    /// Capture one exact supported idle-shell generation with no descendants.
+    fn pane_idle_shell_identity(
+        &self,
+        _pane: &str,
+    ) -> crate::error::Result<Option<PaneShellProof>> {
+        Err(crate::error::AdapterError::unavailable(
+            "idle shell identity proof is unavailable",
+        ))
+    }
     /// Cancellation-aware custom harness verification.
     fn verify_custom_harness_with_runtime(
         &self,
@@ -429,6 +841,9 @@ impl ManagedApi for HerdrClient {
     ) -> crate::error::Result<bool> {
         HerdrClient::pane_is_same_idle_shell(self, pane, expected)
     }
+    fn pane_idle_shell_identity(&self, pane: &str) -> crate::error::Result<Option<PaneShellProof>> {
+        HerdrClient::pane_idle_shell_identity(self, pane)
+    }
     fn verify_custom_harness_with_runtime(
         &self,
         pane: &str,
@@ -456,7 +871,7 @@ impl ManagedApi for HerdrClient {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct AgentRecord {
     #[serde(default = "herdr_adapter")]
     adapter: String,
@@ -505,6 +920,65 @@ struct AgentRecord {
     goal_message_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeadPaneProof {
+    info: AgentPaneInfo,
+    presentation: Pane,
+    shell: PaneShellProof,
+}
+
+#[derive(Clone, Debug)]
+struct LegacyRecordSnapshot {
+    record: AgentRecord,
+    content: Vec<u8>,
+    digest: String,
+    directory_device: u64,
+    directory_inode: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedRecordSnapshot {
+    record: AgentRecord,
+    content: Vec<u8>,
+    directory_device: u64,
+    directory_inode: u64,
+}
+
+impl ManagedRecordSnapshot {
+    fn same_generation(&self, other: &Self) -> bool {
+        self.record == other.record
+            && self.content == other.content
+            && self.directory_device == other.directory_device
+            && self.directory_inode == other.directory_inode
+    }
+}
+
+#[derive(Debug)]
+struct PinnedAgentDirectory {
+    name: String,
+    path: PathBuf,
+    file: File,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug)]
+struct PinnedParentDirectory {
+    path: PathBuf,
+    file: File,
+    device: u64,
+    inode: u64,
+}
+
+impl LegacyRecordSnapshot {
+    fn same_generation(&self, other: &Self) -> bool {
+        self.content == other.content
+            && self.digest == other.digest
+            && self.directory_device == other.directory_device
+            && self.directory_inode == other.directory_inode
+    }
+}
+
 fn herdr_adapter() -> String {
     "herdr".to_owned()
 }
@@ -513,6 +987,68 @@ fn interactive_mode() -> String {
 }
 
 impl AgentRecord {
+    fn validate_loaded(&self, path: &Path, agent_name: &str) -> Result<()> {
+        if self.name != agent_name
+            || self.schema != 1
+            || self.token.is_empty()
+            || self.token.len() > 80
+            || !self
+                .token
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || self.harness.is_empty()
+            || self.cwd.is_empty()
+            || self.lifecycle.is_empty()
+            || !self.created_at.is_finite()
+            || self
+                .goal_message_id
+                .as_deref()
+                .is_some_and(|value| !message_id(value))
+            || self
+                .goal_messages
+                .iter()
+                .any(|(key, value)| !message_id(key) || value.is_empty())
+            || self.goal_command.as_ref().is_some_and(|command| {
+                command.is_empty()
+                    || command
+                        .iter()
+                        .any(|value| value.is_empty() || value.contains('\0'))
+            })
+            || self.startup_warning.as_deref().is_some_and(|warning| {
+                warning.len() > 256 || !warning.is_ascii() || warning.contains(['\r', '\n', '\0'])
+            })
+            || self
+                .effective_reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| {
+                    !matches!(
+                        effort,
+                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                    )
+                })
+            || self
+                .custom_process_identity
+                .as_ref()
+                .is_some_and(|identity| {
+                    self.adapter != "herdr-pane"
+                        || self.harness != "muse"
+                        || self.pane_id.as_deref().is_none_or(str::is_empty)
+                        || !identity.valid()
+                })
+            || self
+                .foreign_shell_identity
+                .as_ref()
+                .is_some_and(|identity| {
+                    self.adapter != "herdr-foreign"
+                        || self.pane_id.as_deref().is_none_or(str::is_empty)
+                        || !identity.valid()
+                })
+        {
+            return Err(fail(format!("invalid agent record: {}", path.display())));
+        }
+        Ok(())
+    }
+
     fn supported(&self) -> Result<()> {
         if !matches!(
             self.adapter.as_str(),
@@ -1158,6 +1694,17 @@ pub struct AdoptOptions {
     pub session: Option<String>,
 }
 
+/// Explicit safety assertions for stop/recovery.
+#[derive(Clone, Debug, Default)]
+pub struct StopOptions {
+    /// Exact current registry generation token.
+    pub expected_token: Option<String>,
+    /// Enable the narrowly scoped identity-less adopted-row recovery path.
+    pub recover_legacy_adoption: bool,
+    /// SHA-256 of the exact current identity-less `agent.json` bytes.
+    pub expected_record_sha256: Option<String>,
+}
+
 /// Registry-backed coordinator interface to visible foreign-harness workers.
 pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     client: &'a A,
@@ -1207,6 +1754,280 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(file)
     }
 
+    fn pane_lock(&self, pane_id: &str) -> Result<File> {
+        let path = agent::target_lock_path(pane_id)?;
+        let file = agent::open_private_lock(&path, "host-wide target lock")?;
+        file.lock_exclusive()
+            .map_err(|error| fail(error.to_string()))?;
+        Ok(file)
+    }
+
+    fn private_directory_identity(metadata: &fs::Metadata, label: &str) -> Result<(u64, u64)> {
+        let uid = unsafe { libc::getuid() };
+        if !metadata.is_dir() || metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(fail(format!("{label} is not a private directory")));
+        }
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    fn pinned_agent_directory(&self, agent_name: &str) -> Result<PinnedAgentDirectory> {
+        self.pinned_agent_directory_with(agent_name, || {})
+    }
+
+    fn pinned_agent_directory_with(
+        &self,
+        agent_name: &str,
+        after_preopen_check: impl FnOnce(),
+    ) -> Result<PinnedAgentDirectory> {
+        let path = self.directory(agent_name)?;
+        agent::validate_private_directory(&path, "agent directory", false)?;
+        let before = fs::symlink_metadata(&path)
+            .map_err(|error| fail(format!("cannot inspect agent directory: {error}")))?;
+        let (device, inode) = Self::private_directory_identity(&before, "agent directory")?;
+        after_preopen_check();
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| fail(format!("cannot pin agent directory: {error}")))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot inspect pinned agent directory: {error}")))?;
+        let opened = Self::private_directory_identity(&metadata, "pinned agent directory")?;
+        if opened != (device, inode) {
+            return Err(fail("agent directory changed while being pinned"));
+        }
+        let pinned = PinnedAgentDirectory {
+            name: agent_name.to_owned(),
+            path,
+            file,
+            device,
+            inode,
+        };
+        Self::verify_pinned_agent_directory(&pinned)?;
+        Ok(pinned)
+    }
+
+    fn verify_pinned_agent_directory(pinned: &PinnedAgentDirectory) -> Result<()> {
+        let path = fs::symlink_metadata(&pinned.path)
+            .map_err(|error| fail(format!("agent registry directory changed: {error}")))?;
+        let opened = pinned
+            .file
+            .metadata()
+            .map_err(|error| fail(format!("cannot reinspect pinned agent directory: {error}")))?;
+        let path_identity = Self::private_directory_identity(&path, "agent directory")?;
+        let opened_identity = Self::private_directory_identity(&opened, "pinned agent directory")?;
+        if path_identity != (pinned.device, pinned.inode)
+            || opened_identity != (pinned.device, pinned.inode)
+        {
+            return Err(fail(format!(
+                "agent {:?} registry directory changed",
+                pinned.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn pinned_parent_directory(path: &Path, label: &str) -> Result<PinnedParentDirectory> {
+        Self::pinned_parent_directory_with(path, label, || {})
+    }
+
+    fn pinned_parent_directory_with(
+        path: &Path,
+        label: &str,
+        after_preopen_check: impl FnOnce(),
+    ) -> Result<PinnedParentDirectory> {
+        agent::validate_private_directory(path, label, false)?;
+        let before = fs::symlink_metadata(path)
+            .map_err(|error| fail(format!("cannot inspect {label}: {error}")))?;
+        let (device, inode) = Self::private_directory_identity(&before, label)?;
+        after_preopen_check();
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| fail(format!("cannot pin {label}: {error}")))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot inspect pinned {label}: {error}")))?;
+        let opened = Self::private_directory_identity(&metadata, &format!("pinned {label}"))?;
+        if opened != (device, inode) {
+            return Err(fail(format!("{label} changed while being pinned")));
+        }
+        let pinned = PinnedParentDirectory {
+            path: path.to_owned(),
+            file,
+            device,
+            inode,
+        };
+        Self::verify_pinned_parent_directory(&pinned, label)?;
+        Ok(pinned)
+    }
+
+    fn verify_pinned_parent_directory(pinned: &PinnedParentDirectory, label: &str) -> Result<()> {
+        let path = fs::symlink_metadata(&pinned.path)
+            .map_err(|error| fail(format!("{label} changed: {error}")))?;
+        let opened = pinned
+            .file
+            .metadata()
+            .map_err(|error| fail(format!("cannot reinspect pinned {label}: {error}")))?;
+        let path_identity = Self::private_directory_identity(&path, label)?;
+        let opened_identity =
+            Self::private_directory_identity(&opened, &format!("pinned {label}"))?;
+        if path_identity != (pinned.device, pinned.inode)
+            || opened_identity != (pinned.device, pinned.inode)
+        {
+            return Err(fail(format!("{label} changed")));
+        }
+        Ok(())
+    }
+
+    fn child_directory_identity(parent: &File, name: &str) -> Result<Option<(u64, u64)>> {
+        let name = CString::new(name).map_err(|_| fail("registry entry name contains NUL"))?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(fail(format!(
+                "cannot inspect registry directory entry: {error}"
+            )));
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot inspect registry directory entry: {error}")))?;
+        Ok(Some(Self::private_directory_identity(
+            &metadata,
+            "registry directory entry",
+        )?))
+    }
+
+    fn open_pinned_file(
+        pinned: &PinnedAgentDirectory,
+        name: &str,
+        flags: libc::c_int,
+    ) -> Result<File> {
+        let name = CString::new(name).map_err(|_| fail("agent record name contains NUL"))?;
+        let descriptor = unsafe {
+            libc::openat(
+                pinned.file.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor < 0 {
+            return Err(fail(format!(
+                "cannot open pinned agent file: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+
+    fn open_optional_pinned_file(
+        pinned: &PinnedAgentDirectory,
+        name: &str,
+        flags: libc::c_int,
+    ) -> Result<Option<File>> {
+        let name = CString::new(name).map_err(|_| fail("agent record name contains NUL"))?;
+        let descriptor = unsafe {
+            libc::openat(
+                pinned.file.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if descriptor >= 0 {
+            return Ok(Some(unsafe { File::from_raw_fd(descriptor) }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        Err(fail(format!("cannot open pinned agent file: {error}")))
+    }
+
+    fn record_bytes(&self, pinned: &PinnedAgentDirectory) -> Result<Vec<u8>> {
+        self.record_bytes_with(pinned, true)
+    }
+
+    fn record_bytes_with(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        require_active_name: bool,
+    ) -> Result<Vec<u8>> {
+        if require_active_name {
+            Self::verify_pinned_agent_directory(pinned)?;
+        }
+        let path = pinned.path.join("agent.json");
+        let mut file = Self::open_pinned_file(pinned, "agent.json", libc::O_RDONLY)?;
+        let before = file.metadata().map_err(|error| {
+            fail(format!(
+                "cannot inspect agent record {}: {error}",
+                path.display()
+            ))
+        })?;
+        let uid = unsafe { libc::getuid() };
+        if !before.is_file()
+            || before.uid() != uid
+            || before.permissions().mode() & 0o077 != 0
+            || before.nlink() != 1
+            || before.len() > MAX_AGENT_RECORD_BYTES as u64
+        {
+            return Err(fail(format!(
+                "unsafe agent record for recovery: {}",
+                path.display()
+            )));
+        }
+        let mut content = Vec::with_capacity(before.len() as usize);
+        Read::by_ref(&mut file)
+            .take((MAX_AGENT_RECORD_BYTES + 1) as u64)
+            .read_to_end(&mut content)
+            .map_err(|error| {
+                fail(format!(
+                    "cannot read agent record {}: {error}",
+                    path.display()
+                ))
+            })?;
+        let after = file.metadata().map_err(|error| {
+            fail(format!(
+                "cannot reinspect agent record {}: {error}",
+                path.display()
+            ))
+        })?;
+        if content.len() > MAX_AGENT_RECORD_BYTES
+            || before.len() != content.len() as u64
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.mode() != before.mode()
+            || after.uid() != before.uid()
+            || after.nlink() != before.nlink()
+            || after.len() != before.len()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+        {
+            return Err(fail(format!(
+                "agent record changed while reading: {}",
+                path.display()
+            )));
+        }
+        if require_active_name {
+            Self::verify_pinned_agent_directory(pinned)?;
+        }
+        Ok(content)
+    }
+
     fn load(&self, agent_name: &str) -> Result<AgentRecord> {
         let directory = self.directory(agent_name)?;
         agent::validate_private_directory(&self.registry, "agent registry", false)?;
@@ -1219,65 +2040,82 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let path = directory.join("agent.json");
         let record: AgentRecord = serde_json::from_value(agent::read_private_json(&path)?)
             .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
-        if record.name != agent_name
-            || record.schema != 1
-            || record.token.is_empty()
-            || record.token.len() > 80
-            || !record
-                .token
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            || record.harness.is_empty()
-            || record.cwd.is_empty()
-            || record.lifecycle.is_empty()
-            || !record.created_at.is_finite()
-            || record
-                .goal_message_id
-                .as_deref()
-                .is_some_and(|value| !message_id(value))
-            || record
-                .goal_messages
-                .iter()
-                .any(|(key, value)| !message_id(key) || value.is_empty())
-            || record.goal_command.as_ref().is_some_and(|command| {
-                command.is_empty()
-                    || command
-                        .iter()
-                        .any(|value| value.is_empty() || value.contains('\0'))
-            })
-            || record.startup_warning.as_deref().is_some_and(|warning| {
-                warning.len() > 256 || !warning.is_ascii() || warning.contains(['\r', '\n', '\0'])
-            })
-            || record
-                .effective_reasoning_effort
-                .as_deref()
-                .is_some_and(|effort| {
-                    !matches!(
-                        effort,
-                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-                    )
-                })
-            || record
-                .custom_process_identity
-                .as_ref()
-                .is_some_and(|identity| {
-                    record.adapter != "herdr-pane"
-                        || record.harness != "muse"
-                        || record.pane_id.as_deref().is_none_or(str::is_empty)
-                        || !identity.valid()
-                })
-            || record
-                .foreign_shell_identity
-                .as_ref()
-                .is_some_and(|identity| {
-                    record.adapter != "herdr-foreign"
-                        || record.pane_id.as_deref().is_none_or(str::is_empty)
-                        || !identity.valid()
-                })
-        {
-            return Err(fail(format!("invalid agent record: {}", path.display())));
-        }
+        record.validate_loaded(&path, agent_name)?;
         Ok(record)
+    }
+
+    fn legacy_record_snapshot(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        expected_token: &str,
+        expected_digest: &str,
+    ) -> Result<LegacyRecordSnapshot> {
+        if expected_digest.len() != 64
+            || !expected_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(fail(
+                "expected-record-sha256 must be exactly 64 lowercase hexadecimal characters",
+            ));
+        }
+        let path = pinned.path.join("agent.json");
+        let content = self.record_bytes(pinned)?;
+        let document: Value = serde_json::from_slice(&content).map_err(|error| {
+            fail(format!(
+                "cannot inspect legacy agent record {}: {error}",
+                path.display()
+            ))
+        })?;
+        let object = document
+            .as_object()
+            .ok_or_else(|| fail(format!("invalid legacy agent record: {}", path.display())))?;
+        if object.contains_key("foreign_shell_identity") {
+            return Err(fail(
+                "--recover-legacy-adoption requires foreign_shell_identity to be absent, not null or populated",
+            ));
+        }
+        let record: AgentRecord = serde_json::from_value(document)
+            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        record.validate_loaded(&path, &pinned.name)?;
+        let digest = format!("{:x}", Sha256::digest(&content));
+        if record.token != expected_token || digest != expected_digest {
+            return Err(fail(format!(
+                "agent {:?} record changed before adoption recovery",
+                pinned.name
+            )));
+        }
+        Ok(LegacyRecordSnapshot {
+            record,
+            content,
+            digest,
+            directory_device: pinned.device,
+            directory_inode: pinned.inode,
+        })
+    }
+
+    fn managed_record_snapshot(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        expected_token: &str,
+    ) -> Result<ManagedRecordSnapshot> {
+        let path = pinned.path.join("agent.json");
+        let content = self.record_bytes(pinned)?;
+        let record: AgentRecord = serde_json::from_slice(&content)
+            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        record.validate_loaded(&path, &pinned.name)?;
+        if record.token != expected_token {
+            return Err(fail(format!(
+                "agent {:?} was replaced before this operation",
+                pinned.name
+            )));
+        }
+        Ok(ManagedRecordSnapshot {
+            record,
+            content,
+            directory_device: pinned.device,
+            directory_inode: pinned.inode,
+        })
     }
 
     fn save(&self, record: &AgentRecord) -> Result<()> {
@@ -2596,20 +3434,1020 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(())
     }
 
+    fn dead_pane_snapshot(
+        &self,
+        record: &AgentRecord,
+        operation: &str,
+    ) -> Result<(Pane, AgentPaneInfo)> {
+        let pane_id = record.pane_id.as_deref().ok_or_else(|| {
+            fail(format!(
+                "refusing to {operation} {:?}: record lacks pane identity",
+                record.name
+            ))
+        })?;
+        let tab_id = record.tab_id.as_deref().ok_or_else(|| {
+            fail(format!(
+                "refusing to {operation} {:?}: record lacks tab identity",
+                record.name
+            ))
+        })?;
+        let workspace_id = record.workspace_id.as_deref().ok_or_else(|| {
+            fail(format!(
+                "refusing to {operation} {:?}: record lacks workspace identity",
+                record.name
+            ))
+        })?;
+        let panes = self.client.panes()?;
+        let mut presentations: Vec<Pane> = panes
+            .iter()
+            .filter(|pane| pane.pane_id == pane_id)
+            .cloned()
+            .collect();
+        if presentations.len() != 1 {
+            return Err(fail(format!(
+                "refusing to {operation} {:?}: expected one recorded pane, found {}",
+                record.name,
+                presentations.len()
+            )));
+        }
+        let presentation = presentations.pop().expect("one presentation was checked");
+        if presentation.tab_id != tab_id || presentation.workspace_id != workspace_id {
+            return Err(fail(format!(
+                "refusing to {operation} {:?}: recorded pane, tab, or workspace changed",
+                record.name
+            )));
+        }
+        let tab_panes: Vec<&Pane> = panes.iter().filter(|pane| pane.tab_id == tab_id).collect();
+        if tab_panes.len() != 1 || *tab_panes[0] != presentation {
+            return Err(fail(format!(
+                "refusing to {operation} {:?}: recorded tab is not the exact one-pane tab",
+                record.name
+            )));
+        }
+        let info = self.client.pane_info(pane_id)?;
+        let cwd_matches = info.cwd == record.cwd
+            || fs::canonicalize(&info.cwd)
+                .ok()
+                .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+        if info.pane_id != pane_id || info.workspace_id != workspace_id || !cwd_matches {
+            return Err(fail(format!(
+                "refusing to {operation} {:?}: recorded pane, workspace, or cwd changed",
+                record.name
+            )));
+        }
+        if let Some(agent) = info.agent.as_deref() {
+            return Err(fail(format!(
+                "refusing to {operation} {:?}: pane still reports agent {agent:?}",
+                record.name
+            )));
+        }
+        if info.session_agent.is_some() || info.session_value.is_some() {
+            return Err(fail(format!(
+                "refusing to {operation} {:?}: absent agent has native session identity",
+                record.name
+            )));
+        }
+        Ok((presentation, info))
+    }
+
+    fn dead_pane_proof(&self, record: &AgentRecord, operation: &str) -> Result<DeadPaneProof> {
+        let pane_id = record.pane_id.as_deref().ok_or_else(|| {
+            fail(format!(
+                "refusing to {operation} {:?}: record lacks pane identity",
+                record.name
+            ))
+        })?;
+        let (presentation, info) = self.dead_pane_snapshot(record, operation)?;
+        let shell = self
+            .client
+            .pane_idle_shell_identity(pane_id)
+            .map_err(|error| {
+                fail(format!(
+                    "refusing to {operation} {:?}: cannot prove supported idle shell generation: {error}",
+                    record.name
+                ))
+            })?
+            .ok_or_else(|| {
+                fail(format!(
+                    "refusing to {operation} {:?}: pane is not a supported idle shell generation without descendants",
+                    record.name
+                ))
+            })?;
+        let (final_presentation, final_info) = self.dead_pane_snapshot(record, operation)?;
+        if final_presentation != presentation || final_info != info {
+            return Err(fail(format!(
+                "refusing to {operation} {:?}: pane membership or agent state changed during shell proof",
+                record.name
+            )));
+        }
+        Ok(DeadPaneProof {
+            info: final_info,
+            presentation: final_presentation,
+            shell,
+        })
+    }
+
+    fn bounded_terminal_text(&self, pane_id: &str) -> Result<String> {
+        let mut text = self
+            .client
+            .read(pane_id, "recent-unwrapped", Some(5000))
+            .map_err(|error| {
+                fail(format!(
+                    "cannot preserve terminal output before stop: {error}"
+                ))
+            })?;
+        if text.is_empty() {
+            text = self
+                .client
+                .read(pane_id, "recent", Some(5000))
+                .map_err(|error| {
+                    fail(format!(
+                        "cannot preserve terminal output before stop: {error}"
+                    ))
+                })?;
+        }
+        Ok(text)
+    }
+
+    fn shell_proof_json(proof: &PaneShellProof) -> Value {
+        json!({
+            "version": proof.identity.version,
+            "boot_id": proof.identity.boot_id,
+            "pid": proof.identity.pid,
+            "starttime_ticks": proof.identity.starttime_ticks,
+            "executable_device": proof.identity.executable_device,
+            "executable_inode": proof.identity.executable_inode,
+            "executable_path": proof.executable_path,
+        })
+    }
+
+    fn archive_destination(&self, record: &AgentRecord) -> Result<(PathBuf, PathBuf)> {
+        let archive = self.registry.join("archive");
+        agent::create_private_directory(&archive, "agent archive", false, false)?;
+        let destination = archive.join(format!("{}-{}", record.name, record.token));
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                return Err(fail(format!(
+                    "refusing to overwrite existing agent archive {}",
+                    destination.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(fail(error.to_string())),
+        }
+        Ok((archive, destination))
+    }
+
+    fn publish_pinned_directory(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        destination: &Path,
+        expected_record: &[u8],
+    ) -> Result<()> {
+        let mut published = false;
+        self.publish_pinned_directory_with(
+            pinned,
+            destination,
+            expected_record,
+            &mut published,
+            (
+                rename_directory_noreplace_at,
+                || {},
+                || {},
+                |directory: &File, _label| directory.sync_all(),
+            ),
+        )
+    }
+
+    fn publish_pinned_directory_with<Rename, AfterRename, AfterRollback, Sync>(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        destination: &Path,
+        expected_record: &[u8],
+        published: &mut bool,
+        publication_hooks: (Rename, AfterRename, AfterRollback, Sync),
+    ) -> Result<()>
+    where
+        Rename: FnOnce(&File, &str, &File, &str) -> Result<()>,
+        AfterRename: FnOnce(),
+        AfterRollback: FnOnce(),
+        Sync: FnMut(&File, &str) -> io::Result<()>,
+    {
+        let (rename, after_rename, after_rollback, mut sync) = publication_hooks;
+        *published = false;
+        let archive_path = destination
+            .parent()
+            .ok_or_else(|| fail("agent archive destination has no parent"))?;
+        if archive_path != self.registry.join("archive") {
+            return Err(fail("invalid agent archive destination"));
+        }
+        let destination_name = destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| fail("invalid agent archive destination name"))?;
+        let registry_parent = Self::pinned_parent_directory(&self.registry, "agent registry")?;
+        let archive_parent = Self::pinned_parent_directory(archive_path, "agent archive")?;
+        Self::verify_pinned_agent_directory(pinned)?;
+        if Self::child_directory_identity(&registry_parent.file, &pinned.name)?
+            != Some((pinned.device, pinned.inode))
+        {
+            return Err(fail(format!(
+                "agent {:?} registry directory changed before publication",
+                pinned.name
+            )));
+        }
+        if let Err(rename_error) = rename(
+            &registry_parent.file,
+            &pinned.name,
+            &archive_parent.file,
+            destination_name,
+        ) {
+            let active = Self::child_directory_identity(&registry_parent.file, &pinned.name);
+            let archived = Self::child_directory_identity(&archive_parent.file, destination_name);
+            let opened = pinned
+                .file
+                .metadata()
+                .map_err(|error| fail(format!("cannot reinspect pinned agent directory: {error}")))
+                .and_then(|metadata| {
+                    Self::private_directory_identity(&metadata, "pinned agent directory")
+                });
+            match (active, archived, opened) {
+                (Ok(Some(active)), _archived, Ok(opened))
+                    if active == (pinned.device, pinned.inode)
+                        && opened == (pinned.device, pinned.inode) =>
+                {
+                    return Err(rename_error);
+                }
+                (Ok(None), Ok(Some(archived)), Ok(opened))
+                    if archived == (pinned.device, pinned.inode)
+                        && opened == (pinned.device, pinned.inode) =>
+                {
+                    *published = true;
+                    return match self.record_bytes_with(pinned, false) {
+                        Ok(record) if record == expected_record => Err(fail(format!(
+                            "archive rename reported failure ({rename_error}) after the proved generation was published"
+                        ))),
+                        Ok(_) => Err(fail(format!(
+                            "archive rename reported failure ({rename_error}); the generation was published but its record changed"
+                        ))),
+                        Err(proof) => Err(fail(format!(
+                            "archive rename reported failure ({rename_error}); the generation was published but its record could not be proved: {proof}"
+                        ))),
+                    };
+                }
+                (active, archived, opened) => {
+                    *published = true;
+                    return Err(fail(format!(
+                        "archive rename reported failure ({rename_error}) with an ambiguous namespace outcome: active={active:?}, archive={archived:?}, opened={opened:?}"
+                    )));
+                }
+            }
+        }
+        *published = true;
+        after_rename();
+        let result = (|| -> Result<()> {
+            Self::verify_pinned_parent_directory(&registry_parent, "agent registry")?;
+            Self::verify_pinned_parent_directory(&archive_parent, "agent archive")?;
+            if Self::child_directory_identity(&registry_parent.file, &pinned.name)?.is_some() {
+                return Err(fail(format!(
+                    "agent {:?} active name reappeared during publication",
+                    pinned.name
+                )));
+            }
+            let published = Self::child_directory_identity(&archive_parent.file, destination_name)?
+                .ok_or_else(|| fail("published agent directory disappeared"))?;
+            let opened = pinned.file.metadata().map_err(|error| {
+                fail(format!("cannot reinspect pinned agent directory: {error}"))
+            })?;
+            let opened_identity =
+                Self::private_directory_identity(&opened, "pinned agent directory")?;
+            if published != (pinned.device, pinned.inode)
+                || opened_identity != (pinned.device, pinned.inode)
+            {
+                return Err(fail(format!(
+                    "agent {:?} published directory was not the proved generation",
+                    pinned.name
+                )));
+            }
+            if self.record_bytes_with(pinned, false)? != expected_record {
+                return Err(fail(format!(
+                    "agent {:?} record changed during archival publication",
+                    pinned.name
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // All agentctl participants hold the name lock. Reprove both
+            // entries immediately before the inverse rename so a replacement
+            // at either name is never promoted to active state. renameat2
+            // cannot compare an inode atomically, so an actor that ignores the
+            // cooperative lock can still race this last check; RENAME_NOREPLACE
+            // at least refuses an occupied active name.
+            let active = match Self::child_directory_identity(
+                &registry_parent.file,
+                &pinned.name,
+            ) {
+                Ok(value) => value,
+                Err(proof) => {
+                    return Err(fail(format!(
+                        "archive identity check failed ({error}); cannot prove the active name absent before rollback: {proof}"
+                    )))
+                }
+            };
+            if active.is_some() {
+                return Err(fail(format!(
+                    "archive identity check failed ({error}); active name reappeared, so rollback was not attempted"
+                )));
+            }
+            let rollback_source = match Self::child_directory_identity(
+                &archive_parent.file,
+                destination_name,
+            ) {
+                Ok(value) => value,
+                Err(proof) => {
+                    return Err(fail(format!(
+                        "archive identity check failed ({error}); cannot reprove the published generation before rollback: {proof}"
+                    )))
+                }
+            };
+            if rollback_source != Some((pinned.device, pinned.inode)) {
+                return Err(fail(format!(
+                    "archive identity check failed ({error}); archive destination was replaced, so rollback was not attempted"
+                )));
+            }
+            if let Err(rollback) = rename_directory_noreplace_at(
+                &archive_parent.file,
+                destination_name,
+                &registry_parent.file,
+                &pinned.name,
+            ) {
+                return Err(fail(format!(
+                    "archive identity check failed ({error}) and rollback was incomplete: {rollback}"
+                )));
+            }
+            after_rollback();
+            let rollback_proof = (|| -> Result<()> {
+                Self::verify_pinned_parent_directory(&registry_parent, "agent registry")?;
+                Self::verify_pinned_parent_directory(&archive_parent, "agent archive")?;
+                Self::verify_pinned_agent_directory(pinned)?;
+                if Self::child_directory_identity(&registry_parent.file, &pinned.name)?
+                    != Some((pinned.device, pinned.inode))
+                {
+                    return Err(fail("restored active name is not the proved generation"));
+                }
+                if Self::child_directory_identity(&archive_parent.file, destination_name)?.is_some()
+                {
+                    return Err(fail("archive destination remained after rollback"));
+                }
+                if self.record_bytes(pinned)? != expected_record {
+                    return Err(fail("restored agent record is not the proved content"));
+                }
+                Ok(())
+            })();
+            if let Err(rollback_proof) = rollback_proof {
+                return Err(fail(format!(
+                    "archive identity check failed ({error}); inverse rename completed but rollback state could not be proved: {rollback_proof}"
+                )));
+            }
+            let mut failures = Vec::new();
+            for (directory, label) in [
+                (&archive_parent.file, "agent archive rollback"),
+                (&registry_parent.file, "agent registry rollback"),
+            ] {
+                if let Err(sync_error) = sync(directory, label) {
+                    failures.push(format!("{label}: {sync_error}"));
+                }
+            }
+            if !failures.is_empty() {
+                return Err(fail(format!(
+                    "archive identity check failed ({error}); rollback completed but directory durability is uncertain: {}",
+                    failures.join("; ")
+                )));
+            }
+            *published = false;
+            return Err(error);
+        }
+        let mut failures = Vec::new();
+        for (directory, label) in [
+            (&archive_parent.file, "published agent archive"),
+            (&registry_parent.file, "published agent registry"),
+        ] {
+            if let Err(sync_error) = sync(directory, label) {
+                failures.push(format!("{label}: {sync_error}"));
+            }
+        }
+        if !failures.is_empty() {
+            return Err(fail(format!(
+                "agent archive was published but directory durability is uncertain: {}",
+                failures.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    fn unlink_pinned_file(pinned: &PinnedAgentDirectory, name: &str) -> Result<()> {
+        let name = CString::new(name).map_err(|_| fail("registry artifact name contains NUL"))?;
+        let result = unsafe { libc::unlinkat(pinned.file.as_raw_fd(), name.as_ptr(), 0) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(fail(format!("cannot remove recovery snapshot: {error}")));
+            }
+        }
+        pinned
+            .file
+            .sync_all()
+            .map_err(|error| fail(format!("cannot sync restored agent directory: {error}")))
+    }
+
+    fn restore_output_snapshot(
+        pinned: &PinnedAgentDirectory,
+        previous: Option<&[u8]>,
+    ) -> Result<()> {
+        match previous {
+            Some(content) => atomic_replace_bytes(pinned, "output.json", content)
+                .map(|_| ())
+                .map_err(|error| *error.error),
+            None => Self::unlink_pinned_file(pinned, "output.json"),
+        }
+    }
+
+    fn verify_installed_output_snapshot(
+        pinned: &PinnedAgentDirectory,
+        installed: InstalledArtifact,
+    ) -> Result<()> {
+        let mut current = Self::open_pinned_file(pinned, "output.json", libc::O_RDONLY)?;
+        let before = current
+            .metadata()
+            .map_err(|error| fail(format!("cannot reprove installed output: {error}")))?;
+        let uid = unsafe { libc::getuid() };
+        let mut content = Vec::with_capacity(installed.size as usize);
+        Read::by_ref(&mut current)
+            .take(installed.size + 1)
+            .read_to_end(&mut content)
+            .map_err(|error| fail(format!("cannot reread installed output: {error}")))?;
+        let after = current
+            .metadata()
+            .map_err(|error| fail(format!("cannot reinspect installed output: {error}")))?;
+        if !before.is_file()
+            || before.uid() != uid
+            || before.permissions().mode() & 0o077 != 0
+            || before.nlink() != 1
+            || before.len() != installed.size
+            || content.len() as u64 != installed.size
+            || <[u8; 32]>::from(Sha256::digest(&content)) != installed.digest
+            || (before.dev(), before.ino()) != (installed.device, installed.inode)
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.mode() != before.mode()
+            || after.uid() != before.uid()
+            || after.nlink() != before.nlink()
+            || after.len() != before.len()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+        {
+            return Err(fail(
+                "installed output generation changed before use; replacement was preserved",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore_installed_output_snapshot(
+        pinned: &PinnedAgentDirectory,
+        previous: Option<&[u8]>,
+        installed: InstalledArtifact,
+    ) -> Result<()> {
+        Self::verify_installed_output_snapshot(pinned, installed)?;
+        // Registry participants hold the per-name lock; a same-uid process
+        // ignoring it can still race this final proof and replacement.
+        Self::restore_output_snapshot(pinned, previous)
+    }
+
+    fn optional_snapshot_bytes(pinned: &PinnedAgentDirectory) -> Result<Option<Vec<u8>>> {
+        let path = pinned.path.join("output.json");
+        let Some(mut file) =
+            Self::open_optional_pinned_file(pinned, "output.json", libc::O_RDONLY)?
+        else {
+            return Ok(None);
+        };
+        let before = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot inspect output snapshot: {error}")))?;
+        let uid = unsafe { libc::getuid() };
+        if !before.is_file()
+            || before.uid() != uid
+            || before.permissions().mode() & 0o077 != 0
+            || before.nlink() != 1
+            || before.len() > MAX_SNAPSHOT_BYTES as u64
+        {
+            return Err(fail(format!(
+                "unsafe existing output snapshot: {}",
+                path.display()
+            )));
+        }
+        let mut content = Vec::with_capacity(before.len() as usize);
+        Read::by_ref(&mut file)
+            .take((MAX_SNAPSHOT_BYTES + 1) as u64)
+            .read_to_end(&mut content)
+            .map_err(|error| fail(format!("cannot read output snapshot: {error}")))?;
+        let after = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot reinspect output snapshot: {error}")))?;
+        if content.len() > MAX_SNAPSHOT_BYTES
+            || before.len() != content.len() as u64
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.mode() != before.mode()
+            || after.uid() != before.uid()
+            || after.nlink() != before.nlink()
+            || after.len() != before.len()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+        {
+            return Err(fail(format!(
+                "existing output snapshot changed while reading: {}",
+                path.display()
+            )));
+        }
+        Ok(Some(content))
+    }
+
+    fn publish_archive(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        destination: &Path,
+        snapshot: &Value,
+        expected_record: &[u8],
+        before_publish: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.publish_archive_with(
+            pinned,
+            destination,
+            snapshot,
+            expected_record,
+            before_publish,
+            (
+                |_pinned, _temporary| Ok(()),
+                |_pinned, _name, _temporary| Ok(()),
+                rename_directory_noreplace_at,
+                || {},
+                || {},
+                |directory: &File, _label| directory.sync_all(),
+            ),
+        )
+    }
+
+    fn publish_archive_with<AfterWrite, AfterInstall, Rename, AfterRename, AfterRollback, Sync>(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        destination: &Path,
+        snapshot: &Value,
+        expected_record: &[u8],
+        before_publish: impl FnOnce() -> Result<()>,
+        publication_hooks: (
+            AfterWrite,
+            AfterInstall,
+            Rename,
+            AfterRename,
+            AfterRollback,
+            Sync,
+        ),
+    ) -> Result<()>
+    where
+        AfterWrite: FnOnce(&PinnedAgentDirectory, &str) -> Result<()>,
+        AfterInstall: FnOnce(&PinnedAgentDirectory, &str, &str) -> Result<()>,
+        Rename: FnOnce(&File, &str, &File, &str) -> Result<()>,
+        AfterRename: FnOnce(),
+        AfterRollback: FnOnce(),
+        Sync: FnMut(&File, &str) -> io::Result<()>,
+    {
+        let (after_write, after_install, rename, after_rename, after_rollback, sync) =
+            publication_hooks;
+        let previous = Self::optional_snapshot_bytes(pinned)?;
+        let encoded = serde_json::to_vec_pretty(snapshot)
+            .map_err(|error| fail(format!("cannot serialize output snapshot: {error}")))?;
+        let mut encoded = encoded;
+        encoded.push(b'\n');
+        let installed = match atomic_replace_bytes_with(
+            pinned,
+            "output.json",
+            &encoded,
+            (after_write, after_install),
+        ) {
+            Ok(installed) => installed,
+            Err(error) => match error.state {
+                ArtifactInstallState::NotInstalled => return Err(*error.error),
+                ArtifactInstallState::Uncertain => {
+                    return Err(fail(format!(
+                        "archive output installation is uncertain; replacement was preserved: {}",
+                        error.error
+                    )))
+                }
+                ArtifactInstallState::Installed(installed) => {
+                    if let Err(rollback) = Self::restore_installed_output_snapshot(
+                        pinned,
+                        previous.as_deref(),
+                        installed,
+                    ) {
+                        return Err(fail(format!(
+                            "archive preparation failed ({}) and exact output rollback was unsafe or incomplete: {rollback}",
+                            error.error
+                        )));
+                    }
+                    return Err(*error.error);
+                }
+            },
+        };
+        if let Err(error) = Self::verify_installed_output_snapshot(pinned, installed) {
+            return Err(fail(format!(
+                "archive output changed after preparation; replacement was preserved: {error}"
+            )));
+        }
+        if let Err(error) = before_publish() {
+            if let Err(rollback) =
+                Self::restore_installed_output_snapshot(pinned, previous.as_deref(), installed)
+            {
+                return Err(fail(format!(
+                    "archive preparation failed ({error}) and exact output rollback was unsafe or incomplete: {rollback}"
+                )));
+            }
+            return Err(error);
+        }
+        let mut published = false;
+        if let Err(error) = self.publish_pinned_directory_with(
+            pinned,
+            destination,
+            expected_record,
+            &mut published,
+            (rename, after_rename, after_rollback, sync),
+        ) {
+            if published {
+                return Err(error);
+            }
+            let rollback =
+                Self::restore_installed_output_snapshot(pinned, previous.as_deref(), installed);
+            if let Err(rollback) = rollback {
+                return Err(fail(format!(
+                    "archive publication failed ({error}) and output rollback was incomplete: {rollback}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn recover_legacy_adoption_locked(
+        &self,
+        record: &AgentRecord,
+        pinned: &PinnedAgentDirectory,
+        options: &StopOptions,
+    ) -> Result<Value> {
+        self.recover_legacy_adoption_locked_with(record, pinned, options, || {})
+    }
+
+    fn recover_legacy_adoption_locked_with(
+        &self,
+        record: &AgentRecord,
+        pinned: &PinnedAgentDirectory,
+        options: &StopOptions,
+        after_output_preparation: impl FnOnce(),
+    ) -> Result<Value> {
+        let expected_token = options.expected_token.as_deref().ok_or_else(|| {
+            fail("legacy adoption recovery requires --expected-token and --expected-record-sha256")
+        })?;
+        let expected_hash = options.expected_record_sha256.as_deref().ok_or_else(|| {
+            fail("legacy adoption recovery requires --expected-token and --expected-record-sha256")
+        })?;
+        let initial = self.legacy_record_snapshot(pinned, expected_token, expected_hash)?;
+        if &initial.record != record {
+            return Err(fail(format!(
+                "refusing to recover adoption {:?}: registry record changed",
+                record.name
+            )));
+        }
+        let record = &initial.record;
+        if record.adapter != "herdr-foreign"
+            || record.lifecycle != "running"
+            || record.mode != "interactive"
+            || record.backend != "herdr"
+            || record.foreign_shell_identity.is_some()
+        {
+            return Err(fail(
+                "--recover-legacy-adoption applies only to a running herdr-foreign record missing foreign_shell_identity",
+            ));
+        }
+        let before = self.dead_pane_proof(record, "recover legacy adoption")?;
+        let text = self.bounded_terminal_text(&before.info.pane_id)?;
+        let current_snapshot =
+            self.legacy_record_snapshot(pinned, expected_token, expected_hash)?;
+        if !current_snapshot.same_generation(&initial) {
+            return Err(fail(format!(
+                "refusing to recover legacy adoption {:?}: registry record changed",
+                record.name
+            )));
+        }
+        let current = &current_snapshot.record;
+        let after = self.dead_pane_proof(current, "recover legacy adoption")?;
+        if after != before {
+            return Err(fail(format!(
+                "refusing to recover legacy adoption {:?}: runtime identity changed during output capture",
+                record.name
+            )));
+        }
+        let (_archive, destination) = self.archive_destination(current)?;
+        let captured = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| fail(error.to_string()))?
+            .as_secs_f64();
+        self.publish_archive(
+            pinned,
+            &destination,
+            &json!({
+                "text": text,
+                "captured_at": captured,
+                "pane_id": current.pane_id,
+                "recovery_shell_identity": Self::shell_proof_json(&before.shell),
+            }),
+            &initial.content,
+            || {
+                after_output_preparation();
+                let final_snapshot =
+                    self.legacy_record_snapshot(pinned, expected_token, expected_hash)?;
+                if !final_snapshot.same_generation(&initial) {
+                    return Err(fail(format!(
+                        "refusing to recover legacy adoption {:?}: registry record changed",
+                        record.name
+                    )));
+                }
+                if self.dead_pane_proof(&final_snapshot.record, "recover legacy adoption")?
+                    != before
+                {
+                    return Err(fail(format!(
+                        "refusing to recover legacy adoption {:?}: runtime identity changed before archival",
+                        record.name
+                    )));
+                }
+                Ok(())
+            },
+        )?;
+        Ok(json!({
+            "name": record.name,
+            "archive": destination,
+            "pane_closed": false,
+            "tab_closed": false,
+            "runtime_preserved": true,
+            "recovered_legacy_adoption": true,
+            "record_sha256": expected_hash,
+            "recovery_shell_identity": Self::shell_proof_json(&before.shell),
+        }))
+    }
+
+    fn retire_managed_dead_locked(
+        &self,
+        record: &AgentRecord,
+        pinned: &PinnedAgentDirectory,
+        expected_token: Option<&str>,
+    ) -> Result<Value> {
+        self.retire_managed_dead_locked_with(
+            record,
+            pinned,
+            expected_token,
+            || {},
+            || {},
+            (
+                |_pinned, _temporary| Ok(()),
+                |_pinned, _name, _temporary| Ok(()),
+            ),
+        )
+    }
+
+    fn retire_managed_dead_locked_with<AfterWrite, AfterInstall>(
+        &self,
+        record: &AgentRecord,
+        pinned: &PinnedAgentDirectory,
+        expected_token: Option<&str>,
+        after_preparation: impl FnOnce(),
+        after_final_record_proof: impl FnOnce(),
+        artifact_hooks: (AfterWrite, AfterInstall),
+    ) -> Result<Value>
+    where
+        AfterWrite: FnOnce(&PinnedAgentDirectory, &str) -> Result<()>,
+        AfterInstall: FnOnce(&PinnedAgentDirectory, &str, &str) -> Result<()>,
+    {
+        let expected_token = expected_token.ok_or_else(|| {
+            fail(format!(
+                "retiring dead managed agent {:?} requires --expected-token",
+                record.name
+            ))
+        })?;
+        let initial = self.managed_record_snapshot(pinned, expected_token)?;
+        if &initial.record != record {
+            return Err(fail(format!(
+                "refusing to retire dead managed agent {:?}: registry record changed",
+                record.name
+            )));
+        }
+        let record = &initial.record;
+        if record.adapter != "herdr"
+            || record.lifecycle != "running"
+            || record.mode != "interactive"
+            || record.backend != "herdr"
+        {
+            return Err(fail(
+                "managed-dead retirement requires a running herdr record in interactive/herdr mode",
+            ));
+        }
+        let before = self.dead_pane_proof(record, "retire dead managed agent")?;
+        let text = self.bounded_terminal_text(&before.info.pane_id)?;
+        let current_snapshot = self.managed_record_snapshot(pinned, expected_token)?;
+        if !current_snapshot.same_generation(&initial) {
+            return Err(fail(format!(
+                "refusing to retire dead managed agent {:?}: registry record changed",
+                record.name
+            )));
+        }
+        let current = &current_snapshot.record;
+        if self.dead_pane_proof(current, "retire dead managed agent")? != before {
+            return Err(fail(format!(
+                "refusing to retire dead managed agent {:?}: runtime identity changed during output capture",
+                record.name
+            )));
+        }
+        let (_archive, destination) = self.archive_destination(current)?;
+        let final_snapshot = self.managed_record_snapshot(pinned, expected_token)?;
+        if !final_snapshot.same_generation(&initial) {
+            return Err(fail(format!(
+                "refusing to retire dead managed agent {:?}: registry record changed",
+                record.name
+            )));
+        }
+        if self.dead_pane_proof(&final_snapshot.record, "retire dead managed agent")? != before {
+            return Err(fail(format!(
+                "refusing to retire dead managed agent {:?}: runtime identity changed before close",
+                record.name
+            )));
+        }
+        let mut final_record = final_snapshot.record;
+        final_record.lifecycle = "stopped".to_owned();
+        let mut stopped_bytes = serde_json::to_vec_pretty(&final_record)
+            .map_err(|error| fail(format!("cannot serialize agent record: {error}")))?;
+        stopped_bytes.push(b'\n');
+        if stopped_bytes.len() > MAX_AGENT_RECORD_BYTES {
+            return Err(fail(format!(
+                "refusing stopped agent record larger than {MAX_AGENT_RECORD_BYTES} bytes"
+            )));
+        }
+        let captured = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| fail(error.to_string()))?
+            .as_secs_f64();
+        let previous_output = Self::optional_snapshot_bytes(pinned)?;
+        let snapshot = json!({
+            "text": text,
+            "captured_at": captured,
+            "pane_id": current.pane_id,
+            "retirement_shell_identity": Self::shell_proof_json(&before.shell),
+        });
+        let mut snapshot_bytes = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|error| fail(format!("cannot serialize output snapshot: {error}")))?;
+        snapshot_bytes.push(b'\n');
+        let installed = match atomic_replace_bytes_with(
+            pinned,
+            "output.json",
+            &snapshot_bytes,
+            artifact_hooks,
+        ) {
+            Ok(installed) => installed,
+            Err(error) => match error.state {
+                ArtifactInstallState::NotInstalled => return Err(*error.error),
+                ArtifactInstallState::Uncertain => {
+                    return Err(fail(format!(
+                        "managed retirement output installation is uncertain; replacement was preserved: {}",
+                        error.error
+                    )))
+                }
+                ArtifactInstallState::Installed(installed) => {
+                    if let Err(rollback) = Self::restore_installed_output_snapshot(
+                        pinned,
+                        previous_output.as_deref(),
+                        installed,
+                    ) {
+                        return Err(fail(format!(
+                            "managed retirement preparation failed ({}) and exact output rollback was unsafe or incomplete: {rollback}",
+                            error.error
+                        )));
+                    }
+                    return Err(*error.error);
+                }
+            },
+        };
+        after_preparation();
+        let final_runtime_proof = (|| -> Result<()> {
+            Self::verify_installed_output_snapshot(pinned, installed)?;
+            if self.record_bytes(pinned)? != initial.content {
+                return Err(fail(format!(
+                    "refusing to retire dead managed agent {:?}: registry record changed immediately before close",
+                    record.name
+                )));
+            }
+            after_final_record_proof();
+            self.dead_pane_proof(&final_record, "retire dead managed agent")
+                .and_then(|proof| {
+                if proof == before {
+                    Ok(())
+                } else {
+                    Err(fail(format!(
+                        "refusing to retire dead managed agent {:?}: runtime identity changed immediately before close",
+                        record.name
+                    )))
+                }
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = final_runtime_proof {
+            let rollback = Self::restore_installed_output_snapshot(
+                pinned,
+                previous_output.as_deref(),
+                installed,
+            );
+            if let Err(rollback) = rollback {
+                return Err(fail(format!(
+                    "managed retirement final runtime proof failed ({error}) and rollback was incomplete: {rollback}"
+                )));
+            }
+            return Err(error);
+        }
+        let pane_id = final_record
+            .pane_id
+            .as_deref()
+            .expect("proved pane identity");
+        self.client.close_pane(pane_id)?;
+        atomic_replace_bytes(pinned, "agent.json", &stopped_bytes).map_err(|error| *error.error)?;
+        self.publish_pinned_directory(pinned, &destination, &stopped_bytes)?;
+        let tab_closed = self.client.panes().ok().map(|panes| {
+            panes
+                .iter()
+                .all(|pane| Some(&pane.tab_id) != final_record.tab_id.as_ref())
+        });
+        Ok(json!({
+            "name": record.name,
+            "archive": destination,
+            "pane_closed": true,
+            "tab_closed": tab_closed,
+            "managed_dead": true,
+        }))
+    }
+
     /// Close an owned pane, or only unregister a foreign runtime, then archive state.
     pub fn stop(&self, agent_name: &str) -> Result<Value> {
+        self.stop_with_options(agent_name, StopOptions::default())
+    }
+
+    /// Stop with explicit generation assertions or the loud adoption-recovery gate.
+    pub fn stop_with_options(&self, agent_name: &str, options: StopOptions) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
         record.supported()?;
+        if options
+            .expected_token
+            .as_deref()
+            .is_some_and(|expected| expected != record.token)
+        {
+            return Err(fail(format!(
+                "agent {agent_name:?} was replaced before this operation"
+            )));
+        }
+        let confirmed_record = self.load(agent_name)?;
+        if confirmed_record.token != record.token || json!(confirmed_record) != json!(record) {
+            return Err(fail(format!(
+                "agent {agent_name:?} record changed before stop"
+            )));
+        }
+        record = confirmed_record;
+        if options.recover_legacy_adoption {
+            let pane_id = record
+                .pane_id
+                .as_deref()
+                .ok_or_else(|| fail("legacy adopted record has no pane identity"))?;
+            let _pane_lock = self.pane_lock(pane_id)?;
+            let pinned = self.pinned_agent_directory(agent_name)?;
+            return self.recover_legacy_adoption_locked(&record, &pinned, &options);
+        }
+        if options.expected_record_sha256.is_some() {
+            return Err(fail(
+                "--expected-record-sha256 requires --recover-legacy-adoption",
+            ));
+        }
         if record.adapter == "herdr-foreign" {
             let (live, info, presentation) = self.inspect_foreign(agent_name, &record)?;
-            let mut text = self
-                .client
-                .read(&info.pane_id, "recent-unwrapped", Some(5000))?;
-            if text.is_empty() {
-                text = self.client.read(&info.pane_id, "recent", Some(5000))?;
-            }
-            self.snapshot(&record, &text)?;
+            let text = self.bounded_terminal_text(&info.pane_id)?;
             // Output capture is another control round trip. Refuse archival if
             // the exact foreign identity changed while it was in progress.
             let (final_live, final_info, final_presentation) = self
@@ -2636,11 +4474,34 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     "refusing to unregister adopted agent {agent_name:?}: runtime identity changed during output capture"
                 )));
             }
+            let (archive, destination) = self.archive_destination(&record)?;
+            self.snapshot(&record, &text)?;
+            let (persisted_live, persisted_info, persisted_presentation) = self
+                .inspect_foreign(agent_name, &record)
+                .map_err(|error| {
+                    fail(format!(
+                        "refusing to unregister adopted agent {agent_name:?}: runtime identity could not be reverified before archival: {error}"
+                    ))
+                })?;
+            let persisted_cwd_stable = persisted_info.cwd == info.cwd
+                || fs::canonicalize(&persisted_info.cwd)
+                    .ok()
+                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&info.cwd).ok());
+            if persisted_live != live
+                || persisted_info.pane_id != info.pane_id
+                || persisted_info.workspace_id != info.workspace_id
+                || !persisted_cwd_stable
+                || persisted_info.agent != info.agent
+                || persisted_info.session_agent != info.session_agent
+                || persisted_info.session_value != info.session_value
+                || persisted_presentation != presentation
+            {
+                return Err(fail(format!(
+                    "refusing to unregister adopted agent {agent_name:?}: runtime identity changed before archival"
+                )));
+            }
             record.lifecycle = "stopped".to_owned();
             self.save(&record)?;
-            let archive = self.registry.join("archive");
-            agent::create_private_directory(&archive, "agent archive", false, false)?;
-            let destination = archive.join(format!("{agent_name}-{}", record.token));
             fs::rename(self.directory(agent_name)?, &destination)
                 .map_err(|error| fail(error.to_string()))?;
             agent::sync_directory(&archive)?;
@@ -2654,6 +4515,29 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }));
         }
         let panes = self.client.panes()?;
+        if record.adapter == "herdr"
+            && matches!(record.lifecycle.as_str(), "running" | "stopping")
+            && record.pane_id.is_some()
+        {
+            let recorded: Vec<&Pane> = panes
+                .iter()
+                .filter(|pane| Some(&pane.pane_id) == record.pane_id.as_ref())
+                .collect();
+            if recorded.len() == 1 && self.client.pane_info(&recorded[0].pane_id)?.agent.is_none() {
+                if record.lifecycle != "running" {
+                    return Err(fail(
+                        "managed-dead retirement requires a running herdr record",
+                    ));
+                }
+                let _pane_lock = self.pane_lock(&recorded[0].pane_id)?;
+                let pinned = self.pinned_agent_directory(agent_name)?;
+                return self.retire_managed_dead_locked(
+                    &record,
+                    &pinned,
+                    options.expected_token.as_deref(),
+                );
+            }
+        }
         if panes.iter().any(|pane| {
             Some(&pane.pane_id) == record.pane_id.as_ref()
                 && Some(&pane.tab_id) != record.tab_id.as_ref()
@@ -2679,6 +4563,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 self.save(&record)?;
             }
         }
+        let (archive, destination) = self.archive_destination(&record)?;
         if !owned.is_empty() {
             if owned.len() != 1
                 || Some(&owned[0].pane_id) != record.pane_id.as_ref()
@@ -2707,9 +4592,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         record.lifecycle = "stopped".to_owned();
         self.save(&record)?;
-        let archive = self.registry.join("archive");
-        agent::create_private_directory(&archive, "agent archive", false, false)?;
-        let destination = archive.join(format!("{agent_name}-{}", record.token));
         fs::rename(self.directory(agent_name)?, &destination)
             .map_err(|error| fail(error.to_string()))?;
         agent::sync_directory(&archive)?;
@@ -2788,14 +4670,25 @@ mod tests {
                     change_session_after_save: AtomicBool::new(false),
                     change_owned_session_after_save: AtomicBool::new(false),
                     fail_close: AtomicBool::new(false),
+                    fail_after_close: AtomicBool::new(false),
                     custom_reported: AtomicBool::new(false),
                     custom_alive: AtomicBool::new(false),
                     custom_dies_after_report: AtomicBool::new(false),
                     custom_fails_after_identity: AtomicBool::new(false),
                     custom_at_idle_shell: AtomicBool::new(true),
                     foreign_shell_identity: Mutex::new(Fake::foreign_shell_identity()),
+                    foreign_shell_path: Mutex::new(PathBuf::from("/bin/bash")),
+                    replacement_shell_on_read: Mutex::new(None),
                     change_foreign_shell_after_save: AtomicBool::new(false),
                     change_foreign_shell_on_read: AtomicBool::new(false),
+                    change_record_token_on_read: AtomicBool::new(false),
+                    add_null_shell_identity_on_read: AtomicBool::new(false),
+                    replace_record_directory_on_read: AtomicBool::new(false),
+                    fail_read: AtomicBool::new(false),
+                    fail_shell_proof: AtomicBool::new(false),
+                    shell_proof_mutation: AtomicU64::new(0),
+                    oversized_read: AtomicBool::new(false),
+                    non_ascii_read: AtomicBool::new(false),
                     restart_foreign_on_read: AtomicBool::new(false),
                     leave_idle_shell_on_read: AtomicBool::new(false),
                     wrong_foreign_cwd: AtomicBool::new(false),
@@ -2837,6 +4730,35 @@ mod tests {
             self.manager()
                 .adopt("foreign", self.adopt_options())
                 .unwrap()
+        }
+
+        fn make_legacy_dead(&self) -> (String, String, Vec<u8>) {
+            let adopted = self.adopt();
+            let path = self.root.join("registry/foreign/agent.json");
+            let mut document = agent::read_private_json(&path).unwrap();
+            document
+                .as_object_mut()
+                .unwrap()
+                .remove("foreign_shell_identity");
+            agent::atomic_json(&path, &document).unwrap();
+            let raw = fs::read(&path).unwrap();
+            self.client.started.store(false, Ordering::Relaxed);
+            self.client.report_session.store(false, Ordering::Relaxed);
+            (
+                adopted["token"].as_str().unwrap().to_owned(),
+                format!("{:x}", Sha256::digest(&raw)),
+                raw,
+            )
+        }
+
+        fn make_managed_dead(&self) -> (String, String) {
+            let started = self.start(None);
+            self.client.started.store(false, Ordering::Relaxed);
+            self.client.report_session.store(false, Ordering::Relaxed);
+            (
+                started["pane_id"].as_str().unwrap().to_owned(),
+                started["token"].as_str().unwrap().to_owned(),
+            )
         }
     }
 
@@ -2880,14 +4802,25 @@ mod tests {
         change_session_after_save: AtomicBool,
         change_owned_session_after_save: AtomicBool,
         fail_close: AtomicBool,
+        fail_after_close: AtomicBool,
         custom_reported: AtomicBool,
         custom_alive: AtomicBool,
         custom_dies_after_report: AtomicBool,
         custom_fails_after_identity: AtomicBool,
         custom_at_idle_shell: AtomicBool,
         foreign_shell_identity: Mutex<CustomProcessIdentity>,
+        foreign_shell_path: Mutex<PathBuf>,
+        replacement_shell_on_read: Mutex<Option<PaneShellProof>>,
         change_foreign_shell_after_save: AtomicBool,
         change_foreign_shell_on_read: AtomicBool,
+        change_record_token_on_read: AtomicBool,
+        add_null_shell_identity_on_read: AtomicBool,
+        replace_record_directory_on_read: AtomicBool,
+        fail_read: AtomicBool,
+        fail_shell_proof: AtomicBool,
+        shell_proof_mutation: AtomicU64,
+        oversized_read: AtomicBool,
+        non_ascii_read: AtomicBool,
         restart_foreign_on_read: AtomicBool,
         leave_idle_shell_on_read: AtomicBool,
         wrong_foreign_cwd: AtomicBool,
@@ -3018,6 +4951,15 @@ mod tests {
             Ok(())
         }
         fn read(&self, _: &str, _: &str, _: Option<usize>) -> AdapterResult<String> {
+            if self.fail_read.load(Ordering::Relaxed) {
+                return Err(AdapterError::unavailable("capture failed"));
+            }
+            if self.oversized_read.load(Ordering::Relaxed) {
+                return Ok("\0".repeat(3 << 20));
+            }
+            if self.non_ascii_read.load(Ordering::Relaxed) {
+                return Ok("é".repeat(3 << 20));
+            }
             if self.add_sibling_on_read.swap(false, Ordering::Relaxed) {
                 self.panes.lock().unwrap().push(Self::pane("human"));
             }
@@ -3033,6 +4975,54 @@ mod tests {
                 .swap(false, Ordering::Relaxed)
             {
                 self.foreign_shell_identity.lock().unwrap().starttime_ticks += 1;
+            }
+            if let Some(replacement) = self.replacement_shell_on_read.lock().unwrap().take() {
+                *self.foreign_shell_identity.lock().unwrap() = replacement.identity;
+                *self.foreign_shell_path.lock().unwrap() = replacement.executable_path;
+            }
+            if self
+                .change_record_token_on_read
+                .swap(false, Ordering::Relaxed)
+            {
+                for name in ["foreign", "worker"] {
+                    let path = self.root.join(format!("registry/{name}/agent.json"));
+                    if path.is_file() {
+                        let mut document = agent::read_private_json(&path).unwrap();
+                        document["token"] = json!("replacement-generation");
+                        agent::atomic_json(&path, &document).unwrap();
+                    }
+                }
+            }
+            if self
+                .add_null_shell_identity_on_read
+                .swap(false, Ordering::Relaxed)
+            {
+                let path = self.root.join("registry/foreign/agent.json");
+                if path.is_file() {
+                    let mut document = agent::read_private_json(&path).unwrap();
+                    document["foreign_shell_identity"] = Value::Null;
+                    agent::atomic_json(&path, &document).unwrap();
+                }
+            }
+            if self
+                .replace_record_directory_on_read
+                .swap(false, Ordering::Relaxed)
+            {
+                for name in ["foreign", "worker"] {
+                    let active = self.root.join(format!("registry/{name}"));
+                    if active.is_dir() {
+                        let displaced = self.root.join(format!("registry/.{name}-displaced"));
+                        fs::rename(&active, &displaced).unwrap();
+                        fs::create_dir(&active).unwrap();
+                        fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();
+                        fs::copy(displaced.join("agent.json"), active.join("agent.json")).unwrap();
+                        fs::set_permissions(
+                            active.join("agent.json"),
+                            fs::Permissions::from_mode(0o600),
+                        )
+                        .unwrap();
+                    }
+                }
             }
             Ok("visible output".to_owned())
         }
@@ -3076,6 +5066,11 @@ mod tests {
             }
             self.closed.lock().unwrap().push(pane.to_owned());
             self.panes.lock().unwrap().retain(|p| p.pane_id != pane);
+            if self.fail_after_close.swap(false, Ordering::Relaxed) {
+                return Err(AdapterError::unavailable(
+                    "injected result loss after close",
+                ));
+            }
             Ok(())
         }
         fn focus_pane(&self, pane: &str) -> AdapterResult<()> {
@@ -3173,6 +5168,25 @@ mod tests {
             Ok(!self.custom_alive.load(Ordering::Relaxed)
                 && self.custom_at_idle_shell.load(Ordering::Relaxed)
                 && *expected == *self.foreign_shell_identity.lock().unwrap())
+        }
+        fn pane_idle_shell_identity(&self, _: &str) -> AdapterResult<Option<PaneShellProof>> {
+            if self.fail_shell_proof.load(Ordering::Relaxed) {
+                return Err(AdapterError::unavailable("injected procfs proof failure"));
+            }
+            let proof = (!self.custom_alive.load(Ordering::Relaxed)
+                && self.custom_at_idle_shell.load(Ordering::Relaxed))
+            .then(|| PaneShellProof {
+                identity: self.foreign_shell_identity.lock().unwrap().clone(),
+                executable_path: self.foreign_shell_path.lock().unwrap().clone(),
+            });
+            if self.root.join("registry/worker/output.json").exists() {
+                match self.shell_proof_mutation.swap(0, Ordering::Relaxed) {
+                    1 => self.panes.lock().unwrap().push(Self::pane("human")),
+                    2 => self.started.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+            Ok(proof)
         }
         fn agent_pane(&self, _: &str) -> AdapterResult<String> {
             Ok("owned".to_owned())
@@ -3739,6 +5753,1282 @@ mod tests {
             fixture.manager().load("foreign").unwrap().lifecycle,
             "running"
         );
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_preserves_record_queue_and_foreign_runtime() {
+        let fixture = Fixture::new();
+        let adopted = fixture.adopt();
+        fixture
+            .manager()
+            .send("foreign", "retained request", DrainOptions::default())
+            .unwrap();
+        let record_path = fixture.root.join("registry/foreign/agent.json");
+        let mut document = agent::read_private_json(&record_path).unwrap();
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("foreign_shell_identity");
+        agent::atomic_json(&record_path, &document).unwrap();
+        let raw = fs::read(&record_path).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&raw));
+        let queue_before = fs::read(
+            fixture
+                .root
+                .join("registry/foreign/queue/processed")
+                .read_dir()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let presentation = Fake::pane("owned");
+
+        let stopped = fixture
+            .manager()
+            .stop_with_options(
+                "foreign",
+                StopOptions {
+                    expected_token: Some(adopted["token"].as_str().unwrap().to_owned()),
+                    recover_legacy_adoption: true,
+                    expected_record_sha256: Some(digest.clone()),
+                },
+            )
+            .unwrap();
+
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        assert_eq!(stopped["recovered_legacy_adoption"], true);
+        assert_eq!(stopped["runtime_preserved"], true);
+        assert_eq!(stopped["record_sha256"], digest);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(*fixture.client.panes.lock().unwrap(), [presentation]);
+        assert_eq!(fs::read(archive.join("agent.json")).unwrap(), raw);
+        let archived_queue = fs::read(
+            archive
+                .join("queue/processed")
+                .read_dir()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        assert_eq!(archived_queue, queue_before);
+        assert!(archive.join("output.json").is_file());
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_requires_exact_options_and_absent_raw_identity_key() {
+        for case in [
+            "missing-token",
+            "missing-hash",
+            "wrong-token",
+            "wrong-hash",
+            "null",
+        ] {
+            let fixture = Fixture::new();
+            let (token, mut digest, _) = fixture.make_legacy_dead();
+            if case == "null" {
+                let path = fixture.root.join("registry/foreign/agent.json");
+                let mut document = agent::read_private_json(&path).unwrap();
+                document["foreign_shell_identity"] = Value::Null;
+                agent::atomic_json(&path, &document).unwrap();
+                digest = format!("{:x}", Sha256::digest(fs::read(path).unwrap()));
+            }
+            let options = StopOptions {
+                expected_token: (case != "missing-token").then(|| {
+                    if case == "wrong-token" {
+                        "wrong-generation".to_owned()
+                    } else {
+                        token.clone()
+                    }
+                }),
+                recover_legacy_adoption: true,
+                expected_record_sha256: (case != "missing-hash").then(|| {
+                    if case == "wrong-hash" {
+                        "0".repeat(64)
+                    } else {
+                        digest.clone()
+                    }
+                }),
+            };
+            assert!(fixture
+                .manager()
+                .stop_with_options("foreign", options)
+                .is_err());
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.root.join("registry/foreign").is_dir());
+        }
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_refuses_all_shell_generation_changes_during_capture() {
+        let original = Fake::foreign_shell_identity();
+        let mut replacements = Vec::new();
+        let mut value = original.clone();
+        value.pid += 1;
+        replacements.push(PaneShellProof {
+            identity: value,
+            executable_path: PathBuf::from("/bin/bash"),
+        });
+        let mut value = original.clone();
+        value.starttime_ticks += 1;
+        replacements.push(PaneShellProof {
+            identity: value,
+            executable_path: PathBuf::from("/bin/bash"),
+        });
+        let mut value = original.clone();
+        value.boot_id = "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned();
+        replacements.push(PaneShellProof {
+            identity: value,
+            executable_path: PathBuf::from("/bin/bash"),
+        });
+        let mut value = original.clone();
+        value.executable_device += 1;
+        replacements.push(PaneShellProof {
+            identity: value,
+            executable_path: PathBuf::from("/bin/bash"),
+        });
+        let mut value = original.clone();
+        value.executable_inode += 1;
+        replacements.push(PaneShellProof {
+            identity: value,
+            executable_path: PathBuf::from("/bin/bash"),
+        });
+        replacements.push(PaneShellProof {
+            identity: original,
+            executable_path: PathBuf::from("/bin/dash"),
+        });
+
+        for replacement in replacements {
+            let fixture = Fixture::new();
+            let (token, digest, _) = fixture.make_legacy_dead();
+            *fixture.client.replacement_shell_on_read.lock().unwrap() = Some(replacement);
+            let error = fixture
+                .manager()
+                .stop_with_options(
+                    "foreign",
+                    StopOptions {
+                        expected_token: Some(token),
+                        recover_legacy_adoption: true,
+                        expected_record_sha256: Some(digest),
+                    },
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("runtime identity changed"));
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.root.join("registry/foreign").is_dir());
+        }
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_refuses_live_busy_session_moved_or_ambiguous_panes() {
+        for case in ["live", "busy", "session", "moved", "sibling", "duplicate"] {
+            let fixture = Fixture::new();
+            let (token, digest, _) = fixture.make_legacy_dead();
+            match case {
+                "live" => fixture.client.started.store(true, Ordering::Relaxed),
+                "busy" => fixture
+                    .client
+                    .custom_at_idle_shell
+                    .store(false, Ordering::Relaxed),
+                "session" => fixture.client.report_session.store(true, Ordering::Relaxed),
+                "moved" => fixture.client.panes.lock().unwrap()[0].tab_id = "moved".to_owned(),
+                "sibling" => fixture
+                    .client
+                    .panes
+                    .lock()
+                    .unwrap()
+                    .push(Fake::pane("sibling")),
+                "duplicate" => {
+                    let mut duplicate = Fake::pane("owned");
+                    duplicate.tab_id = "duplicate".to_owned();
+                    fixture.client.panes.lock().unwrap().push(duplicate);
+                }
+                _ => unreachable!(),
+            }
+            assert!(fixture
+                .manager()
+                .stop_with_options(
+                    "foreign",
+                    StopOptions {
+                        expected_token: Some(token),
+                        recover_legacy_adoption: true,
+                        expected_record_sha256: Some(digest),
+                    },
+                )
+                .is_err());
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.root.join("registry/foreign").is_dir());
+        }
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_refuses_record_change_or_capture_failure() {
+        for case in ["record", "directory", "capture", "procfs"] {
+            let fixture = Fixture::new();
+            let (token, digest, _) = fixture.make_legacy_dead();
+            if case == "record" {
+                fixture
+                    .client
+                    .change_record_token_on_read
+                    .store(true, Ordering::Relaxed);
+            } else if case == "directory" {
+                fixture
+                    .client
+                    .replace_record_directory_on_read
+                    .store(true, Ordering::Relaxed);
+            } else if case == "capture" {
+                fixture.client.fail_read.store(true, Ordering::Relaxed);
+            } else {
+                fixture
+                    .client
+                    .fail_shell_proof
+                    .store(true, Ordering::Relaxed);
+            }
+            let error = fixture
+                .manager()
+                .stop_with_options(
+                    "foreign",
+                    StopOptions {
+                        expected_token: Some(token),
+                        recover_legacy_adoption: true,
+                        expected_record_sha256: Some(digest),
+                    },
+                )
+                .unwrap_err();
+            if matches!(case, "capture" | "procfs") {
+                assert_eq!(error.exit_code(), 75);
+            }
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.root.join("registry/foreign").is_dir());
+        }
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_binds_absent_key_and_parsed_record_to_same_bytes() {
+        let fixture = Fixture::new();
+        let (token, digest, _) = fixture.make_legacy_dead();
+        let output = fixture.root.join("registry/foreign/output.json");
+        let prior = b"{\"prior\":\"evidence\"}\n";
+        fs::write(&output, prior).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+        fixture
+            .client
+            .add_null_shell_identity_on_read
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture
+            .manager()
+            .stop_with_options(
+                "foreign",
+                StopOptions {
+                    expected_token: Some(token),
+                    recover_legacy_adoption: true,
+                    expected_record_sha256: Some(digest),
+                },
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires foreign_shell_identity to be absent"));
+        assert_eq!(fs::read(output).unwrap(), prior);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_rechecks_record_after_output_preparation() {
+        let fixture = Fixture::new();
+        let (token, digest, _) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+        let path = fixture.root.join("registry/foreign/agent.json");
+        let options = StopOptions {
+            expected_token: Some(token),
+            recover_legacy_adoption: true,
+            expected_record_sha256: Some(digest),
+        };
+
+        let error = manager
+            .recover_legacy_adoption_locked_with(&record, &pinned, &options, || {
+                let mut document = agent::read_private_json(&path).unwrap();
+                document["foreign_shell_identity"] = Value::Null;
+                agent::atomic_json(&path, &document).unwrap();
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires foreign_shell_identity to be absent"));
+        assert!(fixture.root.join("registry/foreign").is_dir());
+        assert!(!fixture.root.join("registry/foreign/output.json").exists());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_refuses_oversize_serialized_output() {
+        let fixture = Fixture::new();
+        let (token, digest, raw) = fixture.make_legacy_dead();
+        fixture.client.oversized_read.store(true, Ordering::Relaxed);
+
+        let error = fixture
+            .manager()
+            .stop_with_options(
+                "foreign",
+                StopOptions {
+                    expected_token: Some(token.clone()),
+                    recover_legacy_adoption: true,
+                    expected_record_sha256: Some(digest),
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("output.json larger"));
+        assert_eq!(
+            fs::read(fixture.root.join("registry/foreign/agent.json")).unwrap(),
+            raw
+        );
+        assert!(!fixture.root.join("registry/foreign/output.json").exists());
+        assert!(!fixture
+            .root
+            .join(format!("registry/archive/foreign-{token}"))
+            .exists());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_uses_utf8_snapshot_budget() {
+        let fixture = Fixture::new();
+        let (token, digest, _) = fixture.make_legacy_dead();
+        fixture.client.non_ascii_read.store(true, Ordering::Relaxed);
+        let result = fixture
+            .manager()
+            .stop_with_options(
+                "foreign",
+                StopOptions {
+                    expected_token: Some(token),
+                    recover_legacy_adoption: true,
+                    expected_record_sha256: Some(digest),
+                },
+            )
+            .unwrap();
+        let output = PathBuf::from(result["archive"].as_str().unwrap()).join("output.json");
+        let bytes = fs::read(&output).unwrap();
+
+        assert!(bytes.len() < MAX_SNAPSHOT_BYTES);
+        assert_eq!(
+            agent::read_private_json(&output).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            3 << 20
+        );
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn directory_pin_refuses_validate_to_open_replacement() {
+        for target_kind in ["agent", "parent"] {
+            for replacement in ["private", "public", "missing"] {
+                let fixture = Fixture::new();
+                fixture.make_legacy_dead();
+                let manager = fixture.manager();
+                let target = if target_kind == "agent" {
+                    fixture.root.join("registry/foreign")
+                } else {
+                    let path = fixture.root.join("registry/archive");
+                    fs::create_dir(&path).unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                    path
+                };
+                let displaced = target.with_file_name(format!(
+                    ".{}-original",
+                    target.file_name().unwrap().to_string_lossy()
+                ));
+                let swap = || {
+                    fs::rename(&target, &displaced).unwrap();
+                    if replacement != "missing" {
+                        fs::create_dir(&target).unwrap();
+                        let mode = if replacement == "private" {
+                            0o700
+                        } else {
+                            0o755
+                        };
+                        fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+                    }
+                };
+
+                let result = if target_kind == "agent" {
+                    manager
+                        .pinned_agent_directory_with("foreign", swap)
+                        .map(|_| ())
+                } else {
+                    ManagedAgents::<Fake>::pinned_parent_directory_with(
+                        &target,
+                        "agent archive",
+                        swap,
+                    )
+                    .map(|_| ())
+                };
+
+                assert!(result.is_err(), "{target_kind}/{replacement} was pinned");
+                assert!(displaced.is_dir());
+                assert_eq!(target.exists(), replacement != "missing");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_directory_recheck_refuses_postopen_permission_change() {
+        let fixture = Fixture::new();
+        fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let agent_path = fixture.root.join("registry/foreign");
+        let agent_pinned = manager.pinned_agent_directory("foreign").unwrap();
+        fs::set_permissions(&agent_path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ManagedAgents::<Fake>::verify_pinned_agent_directory(&agent_pinned).is_err());
+
+        let parent_path = fixture.root.join("registry/archive");
+        fs::set_permissions(&agent_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&parent_path).unwrap();
+        fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let parent_pinned =
+            ManagedAgents::<Fake>::pinned_parent_directory(&parent_path, "agent archive").unwrap();
+        fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ManagedAgents::<Fake>::verify_pinned_parent_directory(
+            &parent_pinned,
+            "agent archive",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn atomic_snapshot_refuses_replaced_staging_and_installed_generations() {
+        for phase in ["before-rename", "after-rename"] {
+            let fixture = Fixture::new();
+            fixture.make_legacy_dead();
+            let manager = fixture.manager();
+            let pinned = manager.pinned_agent_directory("foreign").unwrap();
+            let active = fixture.root.join("registry/foreign");
+            let held = active.join(format!(".held-{phase}"));
+            let content = b"{\"new\":true}\n";
+            let result = atomic_replace_bytes_with(
+                &pinned,
+                "output.json",
+                content,
+                (
+                    |_pinned, temporary| {
+                        if phase == "before-rename" {
+                            fs::rename(active.join(temporary), &held).unwrap();
+                            fs::write(active.join(temporary), vec![b'x'; content.len()]).unwrap();
+                            fs::set_permissions(
+                                active.join(temporary),
+                                fs::Permissions::from_mode(0o600),
+                            )
+                            .unwrap();
+                        }
+                        Ok(())
+                    },
+                    |_pinned, name, temporary| {
+                        if phase == "after-rename" {
+                            fs::rename(active.join(name), &held).unwrap();
+                            fs::write(active.join(name), b"replacement").unwrap();
+                            fs::set_permissions(
+                                active.join(name),
+                                fs::Permissions::from_mode(0o600),
+                            )
+                            .unwrap();
+                            fs::write(active.join(temporary), b"new-temp-owner").unwrap();
+                            fs::set_permissions(
+                                active.join(temporary),
+                                fs::Permissions::from_mode(0o600),
+                            )
+                            .unwrap();
+                        }
+                        Ok(())
+                    },
+                ),
+            );
+            let error = result.unwrap_err().to_string();
+
+            assert!(held.is_file());
+            assert_eq!(fs::read(&held).unwrap(), content);
+            if phase == "before-rename" {
+                assert!(error.contains("staging generation changed"));
+                assert!(error.contains("replacement was preserved"));
+                assert!(!active.join("output.json").exists());
+                let replacement = fs::read_dir(&active)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".output.json-recovery-")
+                    })
+                    .unwrap();
+                assert_eq!(fs::read(replacement).unwrap(), vec![b'x'; content.len()]);
+            } else {
+                assert!(error.contains("was not the staged generation"));
+                assert_eq!(
+                    fs::read(active.join("output.json")).unwrap(),
+                    b"replacement"
+                );
+                assert!(fs::read_dir(&active).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".output.json-recovery-")
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_recovery_never_restores_over_replaced_artifact_generations() {
+        for phase in ["before-rename", "after-rename"] {
+            let fixture = Fixture::new();
+            let (_token, _digest, raw) = fixture.make_legacy_dead();
+            let manager = fixture.manager();
+            let record = manager.load("foreign").unwrap();
+            let (_archive, destination) = manager.archive_destination(&record).unwrap();
+            let pinned = manager.pinned_agent_directory("foreign").unwrap();
+            let active = fixture.root.join("registry/foreign");
+            let prior = b"{\"prior\":true}\n";
+            fs::write(active.join("output.json"), prior).unwrap();
+            fs::set_permissions(
+                active.join("output.json"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let held = active.join(format!(".held-recovery-{phase}"));
+
+            let error = manager
+                .publish_archive_with(
+                    &pinned,
+                    &destination,
+                    &json!({"text":"new retained output"}),
+                    &raw,
+                    || Ok(()),
+                    (
+                        |_pinned, temporary| {
+                            if phase == "before-rename" {
+                                fs::rename(active.join(temporary), &held).unwrap();
+                                fs::write(active.join(temporary), b"replacement owner").unwrap();
+                                fs::set_permissions(
+                                    active.join(temporary),
+                                    fs::Permissions::from_mode(0o600),
+                                )
+                                .unwrap();
+                            }
+                            Ok(())
+                        },
+                        |_pinned, name, temporary| {
+                            if phase == "after-rename" {
+                                fs::rename(active.join(name), &held).unwrap();
+                                fs::write(active.join(name), b"replacement owner").unwrap();
+                                fs::set_permissions(
+                                    active.join(name),
+                                    fs::Permissions::from_mode(0o600),
+                                )
+                                .unwrap();
+                                fs::write(active.join(temporary), b"new temp owner").unwrap();
+                                fs::set_permissions(
+                                    active.join(temporary),
+                                    fs::Permissions::from_mode(0o600),
+                                )
+                                .unwrap();
+                            }
+                            Ok(())
+                        },
+                        rename_directory_noreplace_at,
+                        || {},
+                        || {},
+                        |directory: &File, _label| directory.sync_all(),
+                    ),
+                )
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("generation changed")
+                    || error.to_string().contains("replacement was preserved")
+            );
+            assert!(active.is_dir());
+            assert!(!destination.exists());
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            if phase == "before-rename" {
+                assert_eq!(fs::read(active.join("output.json")).unwrap(), prior);
+            } else {
+                assert_eq!(
+                    fs::read(active.join("output.json")).unwrap(),
+                    b"replacement owner"
+                );
+                assert!(held.is_file());
+            }
+        }
+    }
+
+    #[test]
+    fn archive_publication_is_noreplace_rolls_back_output_and_reports_fsync_uncertainty() {
+        let fixture = Fixture::new();
+        let (_token, _digest, _) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let output = fixture.root.join("registry/foreign/output.json");
+        let prior = b"{\n  \"prior\": \"exact evidence\"\n}\n";
+        fs::write(&output, prior).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+        let (_archive, destination) = manager.archive_destination(&record).unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+        let expected_record = manager.record_bytes(&pinned).unwrap();
+        std::os::unix::fs::symlink(fixture.root.join("missing"), &destination).unwrap();
+
+        let error = manager
+            .publish_archive(
+                &pinned,
+                &destination,
+                &json!({"text":"new"}),
+                &expected_record,
+                || Ok(()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("existing agent archive"));
+        assert_eq!(fs::read(&output).unwrap(), prior);
+        assert!(fixture.root.join("registry/foreign").is_dir());
+
+        fs::remove_file(&destination).unwrap();
+        let error = manager
+            .publish_archive_with(
+                &pinned,
+                &destination,
+                &json!({"text":"new retained output"}),
+                &expected_record,
+                || Ok(()),
+                (
+                    |_pinned, _temporary| Ok(()),
+                    |_pinned, _name, _temporary| Ok(()),
+                    rename_directory_noreplace_at,
+                    || {},
+                    || {},
+                    |_directory: &File, _label| {
+                        Err(io::Error::other("injected directory fsync failure"))
+                    },
+                ),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("published"));
+        assert!(!fixture.root.join("registry/foreign").exists());
+        assert!(destination.is_dir());
+        assert_eq!(
+            agent::read_private_json(&destination.join("output.json")).unwrap()["text"],
+            "new retained output"
+        );
+    }
+
+    #[test]
+    fn publication_reconciles_successful_rename_reported_as_error() {
+        for record_read_fails in [false, true] {
+            let fixture = Fixture::new();
+            let (_token, _digest, raw) = fixture.make_legacy_dead();
+            let manager = fixture.manager();
+            let record = manager.load("foreign").unwrap();
+            let (_archive, destination) = manager.archive_destination(&record).unwrap();
+            let active = fixture.root.join("registry/foreign");
+            fs::write(active.join("output.json"), b"{\"prior\":true}\n").unwrap();
+            fs::set_permissions(
+                active.join("output.json"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let pinned = manager.pinned_agent_directory("foreign").unwrap();
+
+            let error = manager
+                .publish_archive_with(
+                    &pinned,
+                    &destination,
+                    &json!({"text":"new retained output"}),
+                    &raw,
+                    || Ok(()),
+                    (
+                        |_pinned, _temporary| Ok(()),
+                        |_pinned, _name, _temporary| Ok(()),
+                        |source_parent, source_name, destination_parent, destination_name| {
+                            rename_directory_noreplace_at(
+                                source_parent,
+                                source_name,
+                                destination_parent,
+                                destination_name,
+                            )?;
+                            if record_read_fails {
+                                fs::remove_file(destination.join("agent.json")).unwrap();
+                                std::os::unix::fs::symlink(
+                                    fixture.root.join("missing-agent-record"),
+                                    destination.join("agent.json"),
+                                )
+                                .unwrap();
+                            }
+                            Err(fail("injected lost successful rename result"))
+                        },
+                        || {},
+                        || {},
+                        |directory: &File, _label| directory.sync_all(),
+                    ),
+                )
+                .unwrap_err();
+
+            assert!(error.to_string().contains("reported failure"));
+            if record_read_fails {
+                assert!(error.to_string().contains("record could not be proved"));
+            } else {
+                assert!(error.to_string().contains("was published"));
+            }
+            assert!(!active.exists());
+            assert_eq!(
+                agent::read_private_json(&destination.join("output.json")).unwrap()["text"],
+                "new retained output"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_reconciles_late_destination_collision_and_restores_output() {
+        let fixture = Fixture::new();
+        let (_token, _digest, raw) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let (_archive, destination) = manager.archive_destination(&record).unwrap();
+        let active = fixture.root.join("registry/foreign");
+        let prior = b"{\"prior\":true}\n";
+        fs::write(active.join("output.json"), prior).unwrap();
+        fs::set_permissions(
+            active.join("output.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+
+        let error = manager
+            .publish_archive(
+                &pinned,
+                &destination,
+                &json!({"text":"new retained output"}),
+                &raw,
+                || {
+                    fs::create_dir(&destination).unwrap();
+                    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+                    fs::write(destination.join("sentinel"), b"other owner").unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("existing agent archive"));
+        assert_eq!(fs::read(active.join("output.json")).unwrap(), prior);
+        assert_eq!(
+            fs::read(destination.join("sentinel")).unwrap(),
+            b"other owner"
+        );
+    }
+
+    #[test]
+    fn publication_fsync_failure_attempts_both_and_retains_archive() {
+        for failing_label in ["published agent archive", "published agent registry"] {
+            let fixture = Fixture::new();
+            let (_token, _digest, raw) = fixture.make_legacy_dead();
+            let manager = fixture.manager();
+            let record = manager.load("foreign").unwrap();
+            let (_archive, destination) = manager.archive_destination(&record).unwrap();
+            let pinned = manager.pinned_agent_directory("foreign").unwrap();
+            let mut calls = Vec::new();
+
+            let error = manager
+                .publish_archive_with(
+                    &pinned,
+                    &destination,
+                    &json!({"text":"new retained output"}),
+                    &raw,
+                    || Ok(()),
+                    (
+                        |_pinned, _temporary| Ok(()),
+                        |_pinned, _name, _temporary| Ok(()),
+                        rename_directory_noreplace_at,
+                        || {},
+                        || {},
+                        |_directory, label| {
+                            calls.push(label.to_owned());
+                            if label == failing_label {
+                                Err(io::Error::other("injected publication fsync failure"))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    ),
+                )
+                .unwrap_err();
+
+            assert!(error.to_string().contains("published"));
+            assert_eq!(
+                calls,
+                ["published agent archive", "published agent registry"]
+            );
+            assert!(!fixture.root.join("registry/foreign").exists());
+            assert_eq!(
+                agent::read_private_json(&destination.join("output.json")).unwrap()["text"],
+                "new retained output"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_publication_refuses_postproof_directory_swap() {
+        let fixture = Fixture::new();
+        let (_token, _digest, raw) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let (_archive, destination) = manager.archive_destination(&record).unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+        let active = fixture.root.join("registry/foreign");
+        let displaced = fixture.root.join("registry/.foreign-original");
+        let mut published = false;
+
+        fs::rename(&active, &displaced).unwrap();
+        fs::create_dir(&active).unwrap();
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(active.join("agent.json"), &raw).unwrap();
+        fs::set_permissions(active.join("agent.json"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = manager
+            .publish_pinned_directory_with(
+                &pinned,
+                &destination,
+                &raw,
+                &mut published,
+                (
+                    rename_directory_noreplace_at,
+                    || {},
+                    || {},
+                    |directory: &File, _label| directory.sync_all(),
+                ),
+            )
+            .unwrap_err();
+        assert!(!published);
+
+        assert!(error.to_string().contains("registry directory changed"));
+        assert!(active.join("agent.json").is_file());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pinned_publication_refuses_reappeared_source_and_reports_published_state() {
+        let fixture = Fixture::new();
+        let (_token, _digest, raw) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let (_archive, destination) = manager.archive_destination(&record).unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+        let active = fixture.root.join("registry/foreign");
+
+        let error = manager
+            .publish_archive_with(
+                &pinned,
+                &destination,
+                &json!({"text":"new retained output"}),
+                &raw,
+                || Ok(()),
+                (
+                    |_pinned, _temporary| Ok(()),
+                    |_pinned, _name, _temporary| Ok(()),
+                    rename_directory_noreplace_at,
+                    || {
+                        fs::create_dir(&active).unwrap();
+                        fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();
+                        fs::write(active.join("agent.json"), &raw).unwrap();
+                        fs::set_permissions(
+                            active.join("agent.json"),
+                            fs::Permissions::from_mode(0o600),
+                        )
+                        .unwrap();
+                    },
+                    || {},
+                    |directory: &File, _label| directory.sync_all(),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("rollback was not attempted"));
+        assert!(active.is_dir());
+        assert!(destination.is_dir());
+        assert_eq!(
+            agent::read_private_json(&destination.join("output.json")).unwrap()["text"],
+            "new retained output"
+        );
+    }
+
+    #[test]
+    fn pinned_publication_refuses_postrename_permission_change() {
+        let fixture = Fixture::new();
+        let (_token, _digest, raw) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let (_archive, destination) = manager.archive_destination(&record).unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+
+        let error = manager
+            .publish_archive_with(
+                &pinned,
+                &destination,
+                &json!({"text":"new retained output"}),
+                &raw,
+                || Ok(()),
+                (
+                    |_pinned, _temporary| Ok(()),
+                    |_pinned, _name, _temporary| Ok(()),
+                    rename_directory_noreplace_at,
+                    || {
+                        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+                            .unwrap();
+                    },
+                    || {},
+                    |directory: &File, _label| directory.sync_all(),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not a private directory"));
+        assert!(!fixture.root.join("registry/foreign").exists());
+        assert_eq!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            agent::read_private_json(&destination.join("output.json")).unwrap()["text"],
+            "new retained output"
+        );
+    }
+
+    #[test]
+    fn pinned_publication_never_promotes_replaced_archive_entry_during_rollback() {
+        let fixture = Fixture::new();
+        let (_token, _digest, raw) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let (_archive, destination) = manager.archive_destination(&record).unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+        let active = fixture.root.join("registry/foreign");
+        let displaced = fixture.root.join("registry/archive/.held-original");
+
+        let error = manager
+            .publish_archive_with(
+                &pinned,
+                &destination,
+                &json!({"text":"new retained output"}),
+                &raw,
+                || Ok(()),
+                (
+                    |_pinned, _temporary| Ok(()),
+                    |_pinned, _name, _temporary| Ok(()),
+                    rename_directory_noreplace_at,
+                    || {
+                        fs::rename(&destination, &displaced).unwrap();
+                        fs::create_dir(&destination).unwrap();
+                        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
+                            .unwrap();
+                        fs::write(destination.join("attacker-marker"), b"replacement").unwrap();
+                    },
+                    || {},
+                    |directory: &File, _label| directory.sync_all(),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("destination was replaced"));
+        assert!(!active.exists());
+        assert_eq!(
+            fs::read(destination.join("attacker-marker")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            agent::read_private_json(&displaced.join("output.json")).unwrap()["text"],
+            "new retained output"
+        );
+    }
+
+    #[test]
+    fn pinned_publication_reproves_generation_after_inverse_rollback() {
+        let fixture = Fixture::new();
+        let (_token, _digest, raw) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let (_archive, destination) = manager.archive_destination(&record).unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+        let active = fixture.root.join("registry/foreign");
+        let displaced = fixture.root.join("registry/.foreign-after-rollback");
+
+        let mut wrong_record = raw.clone();
+        wrong_record.extend_from_slice(b"mismatch");
+        let error = manager
+            .publish_archive_with(
+                &pinned,
+                &destination,
+                &json!({"text":"new retained output"}),
+                &wrong_record,
+                || Ok(()),
+                (
+                    |_pinned, _temporary| Ok(()),
+                    |_pinned, _name, _temporary| Ok(()),
+                    rename_directory_noreplace_at,
+                    || {},
+                    || fs::rename(&active, &displaced).unwrap(),
+                    |directory: &File, _label| directory.sync_all(),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("rollback state could not be proved"));
+        assert!(!active.exists());
+        assert!(!destination.exists());
+        assert_eq!(
+            agent::read_private_json(&displaced.join("output.json")).unwrap()["text"],
+            "new retained output"
+        );
+    }
+
+    #[test]
+    fn pinned_publication_refuses_replaced_archive_parent_and_rolls_back() {
+        let fixture = Fixture::new();
+        let (_token, _digest, raw) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let (archive, destination) = manager.archive_destination(&record).unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+        let active = fixture.root.join("registry/foreign");
+        let displaced_archive = fixture.root.join("registry/.archive-original");
+        let mut published = false;
+
+        let error = manager
+            .publish_pinned_directory_with(
+                &pinned,
+                &destination,
+                &raw,
+                &mut published,
+                (
+                    rename_directory_noreplace_at,
+                    || {
+                        fs::rename(&archive, &displaced_archive).unwrap();
+                        fs::create_dir(&archive).unwrap();
+                        fs::set_permissions(&archive, fs::Permissions::from_mode(0o700)).unwrap();
+                    },
+                    || {},
+                    |directory: &File, _label| directory.sync_all(),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(published);
+        assert!(error.to_string().contains("agent archive changed"));
+        assert!(active.is_dir());
+        assert!(!destination.exists());
+        assert!(!displaced_archive
+            .join(destination.file_name().unwrap())
+            .exists());
+    }
+
+    #[test]
+    fn pinned_publication_reports_each_rollback_fsync_failure() {
+        for failing_label in ["agent archive rollback", "agent registry rollback"] {
+            let fixture = Fixture::new();
+            let (_token, _digest, raw) = fixture.make_legacy_dead();
+            let manager = fixture.manager();
+            let record = manager.load("foreign").unwrap();
+            let (_archive, destination) = manager.archive_destination(&record).unwrap();
+            let pinned = manager.pinned_agent_directory("foreign").unwrap();
+            let active_record = fixture.root.join("registry/foreign/agent.json");
+            let published_record = destination.join("agent.json");
+            let mut calls = Vec::new();
+
+            let error = manager
+                .publish_archive_with(
+                    &pinned,
+                    &destination,
+                    &json!({"text":"new retained output"}),
+                    &raw,
+                    || Ok(()),
+                    (
+                        |_pinned, _temporary| Ok(()),
+                        |_pinned, _name, _temporary| Ok(()),
+                        rename_directory_noreplace_at,
+                        || {
+                            fs::write(&published_record, b"mismatch").unwrap();
+                            fs::set_permissions(
+                                &published_record,
+                                fs::Permissions::from_mode(0o600),
+                            )
+                            .unwrap();
+                        },
+                        || {
+                            fs::write(&active_record, &raw).unwrap();
+                            fs::set_permissions(&active_record, fs::Permissions::from_mode(0o600))
+                                .unwrap();
+                        },
+                        |_directory, label| {
+                            calls.push(label.to_owned());
+                            if label == failing_label {
+                                Err(io::Error::other("injected rollback fsync failure"))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    ),
+                )
+                .unwrap_err();
+
+            let message = error.to_string();
+            assert!(message.contains("rollback completed"));
+            assert!(message.contains("durability is uncertain"));
+            assert!(message.contains(failing_label));
+            assert!(fixture.root.join("registry/foreign").is_dir());
+            assert!(!destination.exists());
+            assert_eq!(calls, ["agent archive rollback", "agent registry rollback"]);
+            assert_eq!(
+                agent::read_private_json(&fixture.root.join("registry/foreign/output.json"))
+                    .unwrap()["text"],
+                "new retained output"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_publication_refuses_postproof_record_swap() {
+        let fixture = Fixture::new();
+        let (_token, _digest, raw) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let (_archive, destination) = manager.archive_destination(&record).unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+        let record_path = fixture.root.join("registry/foreign/agent.json");
+        let mut published = false;
+
+        let mut document = agent::read_private_json(&record_path).unwrap();
+        document["goal"] = json!("replacement record");
+        agent::atomic_json(&record_path, &document).unwrap();
+
+        let error = manager
+            .publish_pinned_directory_with(
+                &pinned,
+                &destination,
+                &raw,
+                &mut published,
+                (
+                    rename_directory_noreplace_at,
+                    || {},
+                    || {},
+                    |directory: &File, _label| directory.sync_all(),
+                ),
+            )
+            .unwrap_err();
+        assert!(published);
+
+        assert!(error
+            .to_string()
+            .contains("record changed during archival publication"));
+        assert!(fixture.root.join("registry/foreign").is_dir());
+        assert!(!destination.exists());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pinned_publication_consumes_original_generation_after_safe_aba() {
+        let fixture = Fixture::new();
+        let (_token, _digest, raw) = fixture.make_legacy_dead();
+        let manager = fixture.manager();
+        let record = manager.load("foreign").unwrap();
+        let (_archive, destination) = manager.archive_destination(&record).unwrap();
+        let pinned = manager.pinned_agent_directory("foreign").unwrap();
+        let active = fixture.root.join("registry/foreign");
+        let held = fixture.root.join("registry/.foreign-held");
+        let mut published = false;
+
+        fs::rename(&active, &held).unwrap();
+        fs::create_dir(&active).unwrap();
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(active.join("agent.json"), &raw).unwrap();
+        fs::remove_file(active.join("agent.json")).unwrap();
+        fs::remove_dir(&active).unwrap();
+        fs::rename(&held, &active).unwrap();
+        manager
+            .publish_pinned_directory_with(
+                &pinned,
+                &destination,
+                &raw,
+                &mut published,
+                (
+                    rename_directory_noreplace_at,
+                    || {},
+                    || {},
+                    |directory: &File, _label| directory.sync_all(),
+                ),
+            )
+            .unwrap();
+        assert!(published);
+
+        assert_eq!(
+            fs::symlink_metadata(&destination).unwrap().ino(),
+            pinned.inode
+        );
+        assert!(!active.exists());
+    }
+
+    #[test]
+    fn explicit_legacy_recovery_preflights_archive_and_snapshot_failures() {
+        for case in ["collision", "snapshot"] {
+            let fixture = Fixture::new();
+            let (token, digest, raw) = fixture.make_legacy_dead();
+            let active = fixture.root.join("registry/foreign");
+            if case == "collision" {
+                let destination = fixture
+                    .root
+                    .join(format!("registry/archive/foreign-{token}"));
+                fs::create_dir_all(&destination).unwrap();
+                fs::set_permissions(
+                    destination.parent().unwrap(),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .unwrap();
+                fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+            } else {
+                fs::set_permissions(&active, fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            let result = fixture.manager().stop_with_options(
+                "foreign",
+                StopOptions {
+                    expected_token: Some(token),
+                    recover_legacy_adoption: true,
+                    expected_record_sha256: Some(digest),
+                },
+            );
+            fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(result.is_err(), "{case} unexpectedly succeeded");
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert_eq!(fs::read(active.join("agent.json")).unwrap(), raw);
+        }
     }
 
     #[test]
@@ -4727,6 +8017,550 @@ mod tests {
         assert_eq!(result["tab_closed"], false);
         assert_eq!(*fixture.client.panes.lock().unwrap(), [Fake::pane("human")]);
         assert_eq!(*fixture.client.closed.lock().unwrap(), ["owned"]);
+    }
+
+    #[test]
+    fn managed_dead_stop_requires_token_then_closes_exact_pane_and_archives() {
+        let fixture = Fixture::new();
+        let (pane, token) = fixture.make_managed_dead();
+        let error = fixture.manager().stop("worker").unwrap_err();
+        assert!(error.to_string().contains("requires --expected-token"));
+
+        let stopped = fixture
+            .manager()
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(stopped["managed_dead"], true);
+        assert_eq!(stopped["pane_closed"], true);
+        assert_eq!(stopped["tab_closed"], true);
+        assert_eq!(*fixture.client.closed.lock().unwrap(), [pane]);
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        assert_eq!(
+            agent::read_private_json(&archive.join("agent.json")).unwrap()["lifecycle"],
+            "stopped"
+        );
+        assert!(archive.join("output.json").is_file());
+    }
+
+    #[test]
+    fn managed_dead_stop_refuses_expanded_stopped_record_before_close() {
+        let fixture = Fixture::new();
+        let (_pane, token) = fixture.make_managed_dead();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut document = agent::read_private_json(&path).unwrap();
+        document["future_padding"] = json!(vec!["x"; 150_000]);
+        let mut raw = serde_json::to_vec(&document).unwrap();
+        raw.push(b'\n');
+        let mut stopped = document.clone();
+        stopped["lifecycle"] = json!("stopped");
+        let mut stopped_bytes = serde_json::to_vec_pretty(&stopped).unwrap();
+        stopped_bytes.push(b'\n');
+        assert!(raw.len() < MAX_AGENT_RECORD_BYTES);
+        assert!(stopped_bytes.len() > MAX_AGENT_RECORD_BYTES);
+        fs::write(&path, &raw).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = fixture
+            .manager()
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token.clone()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("stopped agent record larger"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), raw);
+        assert!(!fixture.root.join("registry/worker/output.json").exists());
+        assert!(!fixture
+            .root
+            .join(format!("registry/archive/worker-{token}"))
+            .exists());
+    }
+
+    #[test]
+    fn managed_dead_preparation_never_restores_over_replaced_artifact_generations() {
+        for phase in ["before-rename", "after-rename"] {
+            let fixture = Fixture::new();
+            let (_pane, token) = fixture.make_managed_dead();
+            let manager = fixture.manager();
+            let record = manager.load("worker").unwrap();
+            let pinned = manager.pinned_agent_directory("worker").unwrap();
+            let active = fixture.root.join("registry/worker");
+            let prior = b"{\"prior\":true}\n";
+            fs::write(active.join("output.json"), prior).unwrap();
+            fs::set_permissions(
+                active.join("output.json"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let held = active.join(format!(".held-managed-{phase}"));
+
+            let error = manager
+                .retire_managed_dead_locked_with(
+                    &record,
+                    &pinned,
+                    Some(&token),
+                    || {},
+                    || {},
+                    (
+                        |_pinned, temporary| {
+                            if phase == "before-rename" {
+                                fs::rename(active.join(temporary), &held).unwrap();
+                                fs::write(active.join(temporary), b"replacement owner").unwrap();
+                                fs::set_permissions(
+                                    active.join(temporary),
+                                    fs::Permissions::from_mode(0o600),
+                                )
+                                .unwrap();
+                            }
+                            Ok(())
+                        },
+                        |_pinned, name, temporary| {
+                            if phase == "after-rename" {
+                                fs::rename(active.join(name), &held).unwrap();
+                                fs::write(active.join(name), b"replacement owner").unwrap();
+                                fs::set_permissions(
+                                    active.join(name),
+                                    fs::Permissions::from_mode(0o600),
+                                )
+                                .unwrap();
+                                fs::write(active.join(temporary), b"new temp owner").unwrap();
+                                fs::set_permissions(
+                                    active.join(temporary),
+                                    fs::Permissions::from_mode(0o600),
+                                )
+                                .unwrap();
+                            }
+                            Ok(())
+                        },
+                    ),
+                )
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("generation changed")
+                    || error.to_string().contains("replacement was preserved")
+            );
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(active.is_dir());
+            assert!(fs::read_dir(fixture.root.join("registry/archive"))
+                .unwrap()
+                .next()
+                .is_none());
+            if phase == "before-rename" {
+                assert_eq!(fs::read(active.join("output.json")).unwrap(), prior);
+            } else {
+                assert_eq!(
+                    fs::read(active.join("output.json")).unwrap(),
+                    b"replacement owner"
+                );
+                assert!(held.is_file());
+            }
+        }
+    }
+
+    #[test]
+    fn managed_dead_stop_refuses_stopping_record_without_prior_proof() {
+        let fixture = Fixture::new();
+        let (_pane, token) = fixture.make_managed_dead();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut document = agent::read_private_json(&path).unwrap();
+        document["lifecycle"] = json!("stopping");
+        agent::atomic_json(&path, &document).unwrap();
+
+        let error = fixture
+            .manager()
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a running herdr record"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn managed_dead_stop_refuses_crossed_mode_or_backend() {
+        for (field, value) in [("mode", "headless"), ("backend", "tmux")] {
+            let fixture = Fixture::new();
+            let (_pane, token) = fixture.make_managed_dead();
+            let path = fixture.root.join("registry/worker/agent.json");
+            let mut document = agent::read_private_json(&path).unwrap();
+            document[field] = json!(value);
+            agent::atomic_json(&path, &document).unwrap();
+
+            assert!(fixture
+                .manager()
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(token),
+                        ..StopOptions::default()
+                    },
+                )
+                .is_err());
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(path.is_file());
+        }
+    }
+
+    #[test]
+    fn managed_dead_stop_refuses_runtime_or_registry_changes_without_closing() {
+        for case in [
+            "replacement",
+            "session",
+            "moved",
+            "sibling",
+            "shell",
+            "record",
+            "directory",
+            "capture",
+        ] {
+            let fixture = Fixture::new();
+            let (_pane, token) = fixture.make_managed_dead();
+            match case {
+                "replacement" => fixture
+                    .client
+                    .restart_foreign_on_read
+                    .store(true, Ordering::Relaxed),
+                "session" => fixture.client.report_session.store(true, Ordering::Relaxed),
+                "moved" => fixture.client.panes.lock().unwrap()[0].tab_id = "moved".to_owned(),
+                "sibling" => fixture
+                    .client
+                    .panes
+                    .lock()
+                    .unwrap()
+                    .push(Fake::pane("human")),
+                "shell" => fixture
+                    .client
+                    .change_foreign_shell_on_read
+                    .store(true, Ordering::Relaxed),
+                "record" => fixture
+                    .client
+                    .change_record_token_on_read
+                    .store(true, Ordering::Relaxed),
+                "directory" => fixture
+                    .client
+                    .replace_record_directory_on_read
+                    .store(true, Ordering::Relaxed),
+                "capture" => fixture.client.fail_read.store(true, Ordering::Relaxed),
+                _ => unreachable!(),
+            }
+            assert!(fixture
+                .manager()
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(token),
+                        ..StopOptions::default()
+                    },
+                )
+                .is_err());
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.root.join("registry/worker").is_dir());
+        }
+    }
+
+    #[test]
+    fn managed_dead_stop_reproves_runtime_after_artifact_preparation() {
+        let fixture = Fixture::new();
+        let (_pane, token) = fixture.make_managed_dead();
+        let manager = fixture.manager();
+        let record = manager.load("worker").unwrap();
+        let pinned = manager.pinned_agent_directory("worker").unwrap();
+        let record_path = fixture.root.join("registry/worker/agent.json");
+        let original_record = fs::read(&record_path).unwrap();
+
+        let error = manager
+            .retire_managed_dead_locked_with(
+                &record,
+                &pinned,
+                Some(&token),
+                || {
+                    fixture
+                        .client
+                        .foreign_shell_identity
+                        .lock()
+                        .unwrap()
+                        .starttime_ticks += 1;
+                },
+                || {},
+                (
+                    |_pinned, _temporary| Ok(()),
+                    |_pinned, _name, _temporary| Ok(()),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("immediately before close"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(fs::read(record_path).unwrap(), original_record);
+        assert!(!fixture.root.join("registry/worker/output.json").exists());
+        assert!(fs::read_dir(fixture.root.join("registry/archive"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn managed_dead_stop_rechecks_registry_after_artifact_preparation() {
+        for case in ["record", "directory", "output"] {
+            let fixture = Fixture::new();
+            let (_pane, token) = fixture.make_managed_dead();
+            let manager = fixture.manager();
+            let record = manager.load("worker").unwrap();
+            let pinned = manager.pinned_agent_directory("worker").unwrap();
+            let active = fixture.root.join("registry/worker");
+            let record_path = active.join("agent.json");
+            let original_record = fs::read(&record_path).unwrap();
+
+            let error = manager
+                .retire_managed_dead_locked_with(
+                    &record,
+                    &pinned,
+                    Some(&token),
+                    || {
+                        if case == "record" {
+                            let mut document = agent::read_private_json(&record_path).unwrap();
+                            document["goal"] = json!("replacement record");
+                            agent::atomic_json(&record_path, &document).unwrap();
+                        } else if case == "directory" {
+                            let displaced = fixture.root.join("registry/.worker-original");
+                            fs::rename(&active, &displaced).unwrap();
+                            fs::create_dir(&active).unwrap();
+                            fs::set_permissions(&active, fs::Permissions::from_mode(0o700))
+                                .unwrap();
+                            fs::copy(displaced.join("agent.json"), active.join("agent.json"))
+                                .unwrap();
+                            fs::set_permissions(
+                                active.join("agent.json"),
+                                fs::Permissions::from_mode(0o600),
+                            )
+                            .unwrap();
+                        } else {
+                            let output = active.join("output.json");
+                            fs::rename(&output, active.join(".prepared-output")).unwrap();
+                            fs::write(&output, b"replacement output").unwrap();
+                            fs::set_permissions(&output, fs::Permissions::from_mode(0o600))
+                                .unwrap();
+                        }
+                    },
+                    || {},
+                    (
+                        |_pinned, _temporary| Ok(()),
+                        |_pinned, _name, _temporary| Ok(()),
+                    ),
+                )
+                .unwrap_err();
+
+            assert!(error.to_string().contains("changed"));
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fs::read_dir(fixture.root.join("registry/archive"))
+                .unwrap()
+                .next()
+                .is_none());
+            if case == "record" {
+                assert_eq!(
+                    agent::read_private_json(&record_path).unwrap()["goal"],
+                    "replacement record"
+                );
+                assert_ne!(fs::read(record_path).unwrap(), original_record);
+                assert!(!active.join("output.json").exists());
+            } else if case == "directory" {
+                let displaced = fixture.root.join("registry/.worker-original");
+                assert_eq!(
+                    fs::read(displaced.join("agent.json")).unwrap(),
+                    original_record
+                );
+                assert!(!displaced.join("output.json").exists());
+                assert!(active.is_dir());
+            } else {
+                assert_eq!(fs::read(&record_path).unwrap(), original_record);
+                assert_eq!(
+                    fs::read(active.join("output.json")).unwrap(),
+                    b"replacement output"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn managed_dead_stop_rechecks_pane_after_final_record_proof() {
+        for case in ["sibling", "agent"] {
+            let fixture = Fixture::new();
+            let (_pane, token) = fixture.make_managed_dead();
+            let manager = fixture.manager();
+            let record = manager.load("worker").unwrap();
+            let pinned = manager.pinned_agent_directory("worker").unwrap();
+            let active = fixture.root.join("registry/worker");
+
+            let error = manager
+                .retire_managed_dead_locked_with(
+                    &record,
+                    &pinned,
+                    Some(&token),
+                    || {},
+                    || {
+                        if case == "sibling" {
+                            fixture
+                                .client
+                                .panes
+                                .lock()
+                                .unwrap()
+                                .push(Fake::pane("human"));
+                        } else {
+                            fixture.client.started.store(true, Ordering::Relaxed);
+                        }
+                    },
+                    (
+                        |_pinned, _temporary| Ok(()),
+                        |_pinned, _name, _temporary| Ok(()),
+                    ),
+                )
+                .unwrap_err();
+
+            let expected = if case == "sibling" {
+                "recorded tab is not the exact one-pane tab"
+            } else {
+                "pane still reports agent"
+            };
+            assert!(error.to_string().contains(expected));
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(active.is_dir());
+            assert!(!active.join("output.json").exists());
+            assert!(fs::read_dir(fixture.root.join("registry/archive"))
+                .unwrap()
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn managed_dead_stop_rechecks_pane_after_final_shell_proof() {
+        for mutation in [1, 2] {
+            let fixture = Fixture::new();
+            let (_pane, token) = fixture.make_managed_dead();
+            fixture
+                .client
+                .shell_proof_mutation
+                .store(mutation, Ordering::Relaxed);
+
+            let error = fixture
+                .manager()
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(token),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap_err();
+
+            let expected = if mutation == 1 {
+                "recorded tab is not the exact one-pane tab"
+            } else {
+                "pane still reports agent"
+            };
+            assert!(error.to_string().contains(expected));
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.root.join("registry/worker").is_dir());
+            assert!(!fixture.root.join("registry/worker/output.json").exists());
+            assert!(fs::read_dir(fixture.root.join("registry/archive"))
+                .unwrap()
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn managed_dead_stop_retries_after_close_result_is_uncertain() {
+        let fixture = Fixture::new();
+        let (_pane, token) = fixture.make_managed_dead();
+        fixture
+            .client
+            .fail_after_close
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture
+            .manager()
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token.clone()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("result loss after close"));
+        assert_eq!(
+            agent::read_private_json(&fixture.root.join("registry/worker/agent.json")).unwrap()
+                ["lifecycle"],
+            "running"
+        );
+        assert!(fixture.client.panes.lock().unwrap().is_empty());
+
+        let stopped = fixture
+            .manager()
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        assert!(!fixture.root.join("registry/worker").exists());
+        assert_eq!(
+            agent::read_private_json(&archive.join("agent.json")).unwrap()["lifecycle"],
+            "stopped"
+        );
+    }
+
+    #[test]
+    fn managed_dead_stop_preflights_archive_collision_before_close() {
+        let fixture = Fixture::new();
+        let (_pane, token) = fixture.make_managed_dead();
+        let destination = fixture
+            .root
+            .join(format!("registry/archive/worker-{token}"));
+        fs::create_dir_all(&destination).unwrap();
+        fs::set_permissions(
+            destination.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(fixture
+            .manager()
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .is_err());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert!(fixture.root.join("registry/worker").is_dir());
     }
 
     #[test]

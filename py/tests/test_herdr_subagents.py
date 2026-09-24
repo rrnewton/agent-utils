@@ -9,7 +9,9 @@ from typing import cast
 
 import pytest
 
-from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane
+from agentctl.client import (
+    AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
+)
 from agentctl.errors import AgentDeliveryError, AgentPending, HerdrUnavailable
 from agentctl.subagents import ManagedAgents, environment_entries, harness_arguments
 import agentctl.legacy_cli as cli
@@ -131,6 +133,14 @@ class FakeManagedClient:
     ) -> bool:
         assert pane_id in self.infos
         return self.custom_at_idle_shell and expected == self.foreign_shell_identity
+
+    def pane_idle_shell_identity(self, pane_id: str) -> PaneShellProof | None:
+        assert pane_id in self.infos
+        if not self.custom_at_idle_shell:
+            return None
+        return PaneShellProof(
+            self.foreign_shell_identity, str(Path("/bin/bash").resolve())
+        )
 
     def agent_pane(self, name: str) -> str:
         matches = [entry[2] for entry in self.launched if entry[0] == name]

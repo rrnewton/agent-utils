@@ -6,6 +6,7 @@ CLI and does not start a server, select a broker, or execute shell jobs.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import pwd
@@ -27,6 +28,7 @@ __all__ = [
     "Pane",
     "ProcessInfo",
     "CustomProcessIdentity",
+    "PaneShellProof",
     "Runner",
     "CONTROL_TIMEOUT_SECONDS",
     "AgentPaneInfo",
@@ -37,6 +39,9 @@ Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 
 #: Maximum wait for one Herdr control command, in seconds.
 CONTROL_TIMEOUT_SECONDS = 30.0
+_CONTROL_STDOUT_BYTES = 8 << 20
+_CONTROL_STDERR_BYTES = 64 << 10
+_CONTROL_READ_BURST = 256 << 10
 
 # Linux exposes process IDs through the positive range of its signed ``pid_t``.  Keep this bound
 # explicit so Python's arbitrary-precision integers cannot accept protocol values that the Rust
@@ -44,6 +49,9 @@ CONTROL_TIMEOUT_SECONDS = 30.0
 _MAX_PROCESS_ID = 2_147_483_647
 _MAX_U64 = (1 << 64) - 1
 _SUPPORTED_PANE_SHELLS = frozenset(("bash", "zsh", "sh", "dash", "fish", "ksh"))
+_MAX_SHELL_TASKS = 4096
+_MAX_CHILDREN_BYTES = 64 << 10
+_MAX_PROC_ENTRIES = 1 << 20
 _MUSE_EFFORT = re.compile(r"[a-z0-9_-]{1,32}\Z")
 _BOOT_ID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
@@ -191,6 +199,14 @@ class CustomProcessIdentity:
 
 
 @dataclass(frozen=True)
+class PaneShellProof:
+    """Exact supported idle-shell process generation and kernel executable path."""
+
+    identity: CustomProcessIdentity
+    executable_path: str
+
+
+@dataclass(frozen=True)
 class AgentPaneInfo:
     """Identity and readiness fields for one interactive-agent pane."""
 
@@ -219,17 +235,64 @@ def _bounded_control_command(
     argv = list(command)
     process = subprocess.Popen(
         argv,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=None if environ is None else dict(environ),
         start_new_session=True,
     )
+    assert process.stdout is not None and process.stderr is not None
+    stdout_content = bytearray()
+    stderr_content = bytearray()
+    streams = {
+        process.stdout.fileno(): (
+            process.stdout, stdout_content, _CONTROL_STDOUT_BYTES, "stdout",
+        ),
+        process.stderr.fileno(): (
+            process.stderr, stderr_content, _CONTROL_STDERR_BYTES, "stderr",
+        ),
+    }
+    poller = select.poll()
+    for descriptor in streams:
+        os.set_blocking(descriptor, False)
+        poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+    deadline = time.monotonic() + timeout
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        while streams:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            events = poller.poll(max(1, min(10, int(remaining * 1000))))
+            for descriptor, _event in events:
+                stream = streams.get(descriptor)
+                if stream is None:
+                    continue
+                pipe, content, limit, label = stream
+                consumed = 0
+                while consumed < _CONTROL_READ_BURST:
+                    try:
+                        block = os.read(
+                            descriptor,
+                            min(64 << 10, limit + 1 - len(content)),
+                        )
+                    except BlockingIOError:
+                        break
+                    if not block:
+                        poller.unregister(descriptor)
+                        pipe.close()
+                        del streams[descriptor]
+                        break
+                    content.extend(block)
+                    consumed += len(block)
+                    if len(content) > limit:
+                        raise OSError(
+                            errno.EFBIG,
+                            f"Herdr control {label} exceeds {limit} bytes",
+                        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        returncode = process.wait(timeout=remaining)
+    except BaseException:
         # start_new_session=True makes the child's PID its process-group ID.  Kill the group even
         # when the immediate child happened to exit at the deadline: descendants may still own the
         # captured pipe ends and are precisely what this cleanup is intended to catch.
@@ -238,11 +301,17 @@ def _bounded_control_command(
         except ProcessLookupError:
             pass
         finally:
-            # Reap the immediate child and drain/close both pipes before exposing the timeout.
             process.kill()
-            process.communicate()
+            for pipe in (process.stdout, process.stderr):
+                pipe.close()
+            process.wait()
         raise
-    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    return subprocess.CompletedProcess(
+        argv,
+        returncode,
+        stdout_content.decode("utf-8", errors="replace"),
+        stderr_content.decode("utf-8", errors="replace"),
+    )
 
 
 def default_runner(command: Sequence[str]) -> "subprocess.CompletedProcess[str]":
@@ -681,7 +750,12 @@ class HerdrClient:
         except (OSError, UnicodeError, ValueError):
             return None
         finally:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                raise HerdrUnavailable(
+                    f"cannot close pidfd after process identity proof: {exc}"
+                ) from exc
         if (boot_before is None or boot_before != boot_after
                 or first is None or second is None or first != second
                 or executable_link_before != executable_link_after
@@ -719,6 +793,125 @@ class HerdrClient:
         if observed is None or not self._supported_shell_name(observed[2]):
             return None
         return observed
+
+    @staticmethod
+    def _process_has_no_descendants(pid: int) -> bool:
+        """Boundedly prove that no task in this shell currently has a child."""
+        task_root = f"/proc/{pid}/task"
+
+        def proc_parents() -> dict[int, int] | None:
+            try:
+                entries = tuple(os.listdir("/proc"))
+            except OSError:
+                return None
+            numeric = tuple(
+                entry for entry in entries
+                if entry.isascii() and entry.isdigit()
+            )
+            if len(numeric) > _MAX_PROC_ENTRIES:
+                return None
+            parents: dict[int, int] = {}
+            for entry in numeric:
+                try:
+                    process = int(entry)
+                    with open(f"/proc/{entry}/stat", encoding="utf-8") as stream:
+                        raw = stream.read(8193)
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                except (OSError, UnicodeError, ValueError):
+                    return None
+                close = raw.rfind(")")
+                if (not raw.startswith(f"{entry} (") or close < 0
+                        or len(raw) > 8192):
+                    return None
+                fields = raw[close + 2:].split()
+                if len(fields) < 2:
+                    return None
+                try:
+                    parent = int(fields[1])
+                except ValueError:
+                    return None
+                if process > 0 and parent >= 0:
+                    parents[process] = parent
+            return parents
+
+        def has_descendant(parents: dict[int, int]) -> bool:
+            children: dict[int, list[int]] = {}
+            for process, parent in parents.items():
+                children.setdefault(parent, []).append(process)
+            pending = list(children.get(pid, ()))
+            seen: set[int] = set()
+            while pending:
+                process = pending.pop()
+                if process in seen:
+                    continue
+                seen.add(process)
+                pending.extend(children.get(process, ()))
+            return bool(seen)
+
+        def task_ids() -> tuple[str, ...] | None:
+            try:
+                names = tuple(sorted(os.listdir(task_root)))
+            except OSError:
+                return None
+            if (not names or len(names) > _MAX_SHELL_TASKS
+                    or any(not name.isascii() or not name.isdigit() for name in names)):
+                return None
+            return names
+
+        before = task_ids()
+        if before is None:
+            return False
+        children_supported = True
+        try:
+            for task in before:
+                with open(
+                    os.path.join(task_root, task, "children"),
+                    encoding="ascii",
+                ) as stream:
+                    children = stream.read(_MAX_CHILDREN_BYTES + 1)
+                if len(children) > _MAX_CHILDREN_BYTES or children.split():
+                    return False
+        except FileNotFoundError:
+            children_supported = False
+        except (OSError, UnicodeError):
+            return False
+        if children_supported:
+            return task_ids() == before
+        first = proc_parents()
+        second = proc_parents()
+        return (first is not None and second is not None
+                and not has_descendant(first) and not has_descendant(second)
+                and task_ids() == before)
+
+    def _idle_shell_proof(self, info: ProcessInfo) -> PaneShellProof | None:
+        if (info.foreground_pgid != info.shell_pid or len(info.foreground) != 1
+                or info.foreground[0][0] != info.shell_pid):
+            return None
+        _pid, _name, _command, argv0, _reported = info.foreground[0]
+        observed = self._supported_shell_identity(info.shell_pid)
+        if observed is None or observed[1] != info.foreground_pgid:
+            return None
+        executable_path = os.path.realpath(observed[2])
+        if executable_path != os.path.realpath(argv0):
+            return None
+        if not self._process_has_no_descendants(info.shell_pid):
+            return None
+        confirmed = self._supported_shell_identity(info.shell_pid)
+        if confirmed != observed:
+            return None
+        return PaneShellProof(observed[0], executable_path)
+
+    def pane_idle_shell_identity(self, pane_id: str) -> PaneShellProof | None:
+        """Return one stable idle-shell proof, including absence of descendants."""
+        before = self.process_info(pane_id)
+        proof = self._idle_shell_proof(before)
+        if proof is None:
+            return None
+        after = self.process_info(pane_id)
+        if after != before or self._idle_shell_proof(after) != proof:
+            return None
+        return proof
 
     def _pane_process_identity(
         self, info: ProcessInfo, executable: str | None,
@@ -783,19 +976,7 @@ class HerdrClient:
 
     def pane_is_idle_shell(self, pane_id: str) -> bool:
         """Prove the pane has returned to Herdr's original shell process group."""
-        info = self.process_info(pane_id)
-        if (info.foreground_pgid != info.shell_pid or len(info.foreground) != 1
-                or info.foreground[0][0] != info.shell_pid):
-            return False
-        _pid, _name, _command, argv0, _reported = info.foreground[0]
-        observed = self._process_executable(info.shell_pid)
-        shell = self._supported_shell_identity(info.shell_pid)
-        return (
-            observed is not None
-            and observed == os.path.realpath(argv0)
-            and shell is not None
-            and shell[1] == info.shell_pid
-        )
+        return self.pane_idle_shell_identity(pane_id) is not None
 
     def pane_shell_identity(self, pane_id: str) -> CustomProcessIdentity:
         """Capture the kernel identity of the shell process Herdr owns for one pane."""
@@ -811,21 +992,8 @@ class HerdrClient:
         self, pane_id: str, expected: CustomProcessIdentity,
     ) -> bool:
         """Prove both idle-shell state and the exact shell generation captured earlier."""
-        info = self.process_info(pane_id)
-        if (info.foreground_pgid != info.shell_pid or len(info.foreground) != 1
-                or info.foreground[0][0] != info.shell_pid
-                or info.shell_pid != expected.pid):
-            return False
-        _pid, _name, _command, argv0, _reported = info.foreground[0]
-        observed_path = self._process_executable(info.shell_pid)
-        observed = self._supported_shell_identity(info.shell_pid)
-        return (
-            observed_path is not None
-            and observed_path == os.path.realpath(argv0)
-            and observed is not None
-            and observed[0] == expected
-            and observed[1] == info.foreground_pgid
-        )
+        proof = self.pane_idle_shell_identity(pane_id)
+        return proof is not None and proof.identity == expected
 
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),

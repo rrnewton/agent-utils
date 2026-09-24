@@ -11,7 +11,9 @@ use serde_json::json;
 
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
-use crate::subagents::{environment_entries, AdoptOptions, ManagedAgents, StartOptions};
+use crate::subagents::{
+    environment_entries, AdoptOptions, ManagedAgents, StartOptions, StopOptions,
+};
 
 const MAX_CHAT_PUBLISH_BYTES: usize = 30_000;
 
@@ -65,7 +67,7 @@ enum Commands {
     Adopt(Adopt),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(after_help = "Example: agentctl stop reviewer")]
-    Stop(Named),
+    Stop(Stop),
     /// List registered agents with live status or an explicit probe error
     #[command(after_help = "Example: agentctl list --registry .agentctl")]
     List,
@@ -118,6 +120,21 @@ enum Commands {
 struct Named {
     /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
     name: String,
+}
+
+#[derive(Args)]
+struct Stop {
+    #[command(flatten)]
+    agent: Named,
+    /// Require this exact current registry generation; mandatory for managed-dead recovery
+    #[arg(long, value_name = "TOKEN")]
+    expected_token: Option<String>,
+    /// Loud recovery for an identity-less dead adopted row; never mutates its pane
+    #[arg(long)]
+    recover_legacy_adoption: bool,
+    /// Exact lowercase SHA-256 of the identity-less agent.json bytes
+    #[arg(long, value_name = "SHA256")]
+    expected_record_sha256: Option<String>,
 }
 
 #[derive(Args)]
@@ -790,7 +807,29 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 session: value.session,
             },
         )?,
-        Commands::Stop(value) => manager.stop(&value.name)?,
+        Commands::Stop(value) => {
+            if value.recover_legacy_adoption
+                && (value.expected_token.is_none() || value.expected_record_sha256.is_none())
+            {
+                return Err(Failure::Usage(
+                    "--recover-legacy-adoption requires --expected-token and --expected-record-sha256"
+                        .to_owned(),
+                ));
+            }
+            if !value.recover_legacy_adoption && value.expected_record_sha256.is_some() {
+                return Err(Failure::Usage(
+                    "--expected-record-sha256 requires --recover-legacy-adoption".to_owned(),
+                ));
+            }
+            manager.stop_with_options(
+                &value.agent.name,
+                StopOptions {
+                    expected_token: value.expected_token,
+                    recover_legacy_adoption: value.recover_legacy_adoption,
+                    expected_record_sha256: value.expected_record_sha256,
+                },
+            )?
+        }
         Commands::List => json!(manager.list()?),
         Commands::Status(value) => manager.status(&value.name)?,
         Commands::Send(value) => {
@@ -1063,6 +1102,17 @@ mod tests {
         }
         assert!(help.contains("without taking ownership"));
         assert!(help.to_ascii_lowercase().contains("muse is refused"));
+        let error = Cli::try_parse_from(["agentctl", "stop", "--help"])
+            .err()
+            .unwrap();
+        let help = error.to_string();
+        for required in [
+            "--recover-legacy-adoption",
+            "--expected-token",
+            "--expected-record-sha256",
+        ] {
+            assert!(help.contains(required));
+        }
         assert!(Cli::try_parse_from([
             "agentctl",
             "chat",
@@ -1128,6 +1178,31 @@ mod tests {
                 })
             }))
         ));
+    }
+
+    #[test]
+    fn stop_parser_preserves_all_legacy_recovery_assertions() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "stop",
+            "legacy",
+            "--recover-legacy-adoption",
+            "--expected-token",
+            "generation-1",
+            "--expected-record-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ])
+        .unwrap();
+        let Some(Commands::Stop(stop)) = parsed.command else {
+            panic!("expected stop command");
+        };
+        assert_eq!(stop.agent.name, "legacy");
+        assert!(stop.recover_legacy_adoption);
+        assert_eq!(stop.expected_token.as_deref(), Some("generation-1"));
+        assert_eq!(
+            stop.expected_record_sha256.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
     }
 
     #[test]

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -9,9 +11,12 @@ from typing import cast
 
 import pytest
 
-from agentctl import cli
-from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient
-from agentctl.errors import AgentDeliveryError
+from agentctl import agent, cli
+import agentctl.subagents as subagents_module
+from agentctl.client import (
+    AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
+)
+from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 from agentctl.sessions import Sessions
 from agentctl.subagents import AgentRecord
 import agentctl.codex_goal as native_goal
@@ -349,6 +354,562 @@ def test_stop_refuses_live_legacy_foreign_record_without_shell_identity(
     assert fake.closed == []
     assert fake.infos[pane].agent == "codex"
     assert sessions.get("foreign").lifecycle == "running"
+
+
+def prepare_legacy_dead(
+    sessions: Sessions, fake: FakeManagedClient, pane: str,
+) -> tuple[str, str, bytes]:
+    """Turn one newly adopted fixture into the exact old on-disk shape."""
+    original = adopt(sessions, pane, Path(fake.infos[pane].cwd))
+    record_path = sessions.registry / "foreign" / "agent.json"
+    document = json.loads(record_path.read_text(encoding="utf-8"))
+    del document["foreign_shell_identity"]
+    record_path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
+    raw = record_path.read_bytes()
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    return str(original["token"]), hashlib.sha256(raw).hexdigest(), raw
+
+
+def test_explicit_legacy_recovery_archives_exact_record_queue_and_output_without_runtime_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    original = adopt(sessions, pane, tmp_path)
+    sessions.send_session("foreign", "retained request")
+    path = sessions.registry / "foreign" / "agent.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    del document["foreign_shell_identity"]
+    path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
+    raw = path.read_bytes()
+    queue_before = {
+        item.relative_to(sessions.registry / "foreign").as_posix(): item.read_bytes()
+        for item in (sessions.registry / "foreign" / "queue").rglob("*")
+        if item.is_file()
+    }
+    fake.infos[pane] = replace(
+        fake.infos[pane], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    presentation = fake.presentations[0]
+
+    stopped = sessions.stop(
+        "foreign", expected_token=str(original["token"]),
+        recover_legacy_adoption=True,
+        expected_record_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+    archive = Path(str(stopped["archive"]))
+    assert stopped["recovered_legacy_adoption"] is True
+    assert stopped["runtime_preserved"] is True
+    assert stopped["pane_closed"] is False and stopped["tab_closed"] is False
+    assert fake.closed == [] and fake.presentations == [presentation]
+    assert (archive / "agent.json").read_bytes() == raw
+    assert {
+        item.relative_to(archive).as_posix(): item.read_bytes()
+        for item in (archive / "queue").rglob("*") if item.is_file()
+    } == queue_before
+    assert json.loads((archive / "output.json").read_text())["text"] == (
+        "human and coordinator transcript\n"
+    )
+
+
+@pytest.mark.parametrize("case", ["missing-token", "missing-hash", "wrong-token", "wrong-hash", "explicit-null", "live"])
+def test_explicit_legacy_recovery_refuses_incomplete_or_mismatched_authority(
+    case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
+    path = sessions.registry / "foreign" / "agent.json"
+    if case == "explicit-null":
+        document = json.loads(raw)
+        document["foreign_shell_identity"] = None
+        path.write_text(json.dumps(document), encoding="utf-8")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if case == "live":
+        fake.infos[pane] = replace(fake.infos[pane], agent="codex")
+    kwargs: dict[str, object] = {
+        "expected_token": token,
+        "recover_legacy_adoption": True,
+        "expected_record_sha256": digest,
+    }
+    if case == "missing-token":
+        kwargs["expected_token"] = None
+    elif case == "missing-hash":
+        kwargs["expected_record_sha256"] = None
+    elif case == "wrong-token":
+        kwargs["expected_token"] = "wrong-generation"
+    elif case == "wrong-hash":
+        kwargs["expected_record_sha256"] = "0" * 64
+
+    with pytest.raises(AgentDeliveryError):
+        sessions.stop("foreign", **kwargs)  # type: ignore[arg-type]
+
+    assert fake.closed == []
+    assert path.exists()
+    assert not list((sessions.registry / "archive").glob("foreign-*")) if (
+        sessions.registry / "archive"
+    ).exists() else True
+
+
+@pytest.mark.parametrize("change", ["pid", "start", "boot", "device", "inode", "path", "busy", "session", "tab", "workspace", "sibling"])
+def test_explicit_legacy_recovery_refuses_identity_or_presentation_change(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, _raw = prepare_legacy_dead(sessions, fake, pane)
+    original_read = fake.read
+    if change in {"pid", "start", "boot", "device", "inode"}:
+        identity = fake.foreign_shell_identity
+        replacement = (
+            replace(identity, pid=identity.pid + 1) if change == "pid" else
+            replace(identity, starttime_ticks=identity.starttime_ticks + 1)
+            if change == "start" else
+            replace(identity, boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+            if change == "boot" else
+            replace(identity, executable_device=identity.executable_device + 1)
+            if change == "device" else
+            replace(identity, executable_inode=identity.executable_inode + 1)
+        )
+        def change_generation(
+            pane_id: str, *, source: str, lines: int,
+            replacement: CustomProcessIdentity = replacement,
+        ) -> str:
+            fake.foreign_shell_identity = replacement
+            return original_read(pane_id, source=source, lines=lines)
+
+        monkeypatch.setattr(fake, "read", change_generation)
+    elif change == "busy":
+        fake.custom_at_idle_shell = False
+    elif change == "session":
+        fake.infos[pane] = replace(
+            fake.infos[pane], session_agent="codex", session_value="replacement"
+        )
+    elif change == "tab":
+        fake.presentations[0] = replace(fake.presentations[0], tab_id="w1:moved")
+    elif change == "workspace":
+        fake.presentations[0] = replace(fake.presentations[0], workspace_id="w2")
+    elif change == "sibling":
+        fake.presentations.append(Pane("w1:sibling", "w1:t1", "w1"))
+    elif change == "path":
+        original = fake.pane_idle_shell_identity
+        calls = 0
+
+        def wrong_path(pane_id: str) -> PaneShellProof | None:
+            nonlocal calls
+            calls += 1
+            proof = original(pane_id)
+            assert proof is not None
+            return PaneShellProof(
+                proof.identity,
+                proof.executable_path if calls == 1 else "/bin/dash",
+            )
+
+        monkeypatch.setattr(fake, "pane_idle_shell_identity", wrong_path)
+
+    with pytest.raises(AgentDeliveryError):
+        sessions.stop(
+            "foreign", expected_token=token, recover_legacy_adoption=True,
+            expected_record_sha256=digest,
+        )
+
+    assert fake.closed == []
+    assert (sessions.registry / "foreign" / "agent.json").exists()
+
+
+def test_explicit_legacy_recovery_maps_shell_proof_transport_failure_to_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, _raw = prepare_legacy_dead(sessions, fake, pane)
+
+    def fail_shell_proof(_pane_id: str) -> PaneShellProof | None:
+        raise HerdrUnavailable("injected process-info failure")
+
+    monkeypatch.setattr(fake, "pane_idle_shell_identity", fail_shell_proof)
+    with pytest.raises(AgentDeliveryError) as raised:
+        sessions.stop(
+            "foreign", expected_token=token, recover_legacy_adoption=True,
+            expected_record_sha256=digest,
+        )
+
+    assert raised.value.exit_code == 75
+    assert "cannot prove supported idle shell generation" in str(raised.value)
+    assert fake.closed == []
+    assert (sessions.registry / "foreign" / "agent.json").exists()
+
+
+def test_explicit_legacy_recovery_refuses_record_directory_or_shell_change_during_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for mutation in ("record", "directory", "shell"):
+        root = tmp_path / mutation
+        root.mkdir()
+        sessions, fake, pane = setup_foreign(root, monkeypatch)
+        token, digest, _raw = prepare_legacy_dead(sessions, fake, pane)
+        original_read = fake.read
+
+        def changing_read(pane_id: str, *, source: str, lines: int) -> str:
+            if mutation == "record":
+                record_path = sessions.registry / "foreign" / "agent.json"
+                document = json.loads(record_path.read_text())
+                document["future_field"] = "replacement"
+                record_path.write_text(json.dumps(document), encoding="utf-8")
+            elif mutation == "directory":
+                active = sessions.registry / "foreign"
+                displaced = sessions.registry / ".foreign-displaced"
+                if not displaced.exists():
+                    active.rename(displaced)
+                    active.mkdir(mode=0o700)
+                    (active / "agent.json").write_bytes((displaced / "agent.json").read_bytes())
+                    (active / "agent.json").chmod(0o600)
+            else:
+                fake.foreign_shell_identity = replace(
+                    fake.foreign_shell_identity,
+                    starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1,
+                )
+            return original_read(pane_id, source=source, lines=lines)
+
+        monkeypatch.setattr(fake, "read", changing_read)
+        with pytest.raises(AgentDeliveryError):
+            sessions.stop(
+                "foreign", expected_token=token, recover_legacy_adoption=True,
+                expected_record_sha256=digest,
+            )
+        assert fake.closed == []
+        assert (sessions.registry / "foreign").is_dir()
+
+
+def test_explicit_legacy_recovery_binds_absent_key_and_parsed_record_to_same_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
+    record_path = sessions.registry / "foreign" / "agent.json"
+    output_path = sessions.registry / "foreign" / "output.json"
+    output_path.write_bytes(b'{"prior":"evidence"}\n')
+    output_path.chmod(0o600)
+    original_read = fake.read
+
+    def swap_absent_for_null(pane_id: str, *, source: str, lines: int) -> str:
+        document = json.loads(raw)
+        document["foreign_shell_identity"] = None
+        agent._atomic_json(str(record_path), document)
+        return original_read(pane_id, source=source, lines=lines)
+
+    monkeypatch.setattr(fake, "read", swap_absent_for_null)
+    with pytest.raises(AgentDeliveryError, match="requires foreign_shell_identity to be absent"):
+        sessions.stop(
+            "foreign", expected_token=token, recover_legacy_adoption=True,
+            expected_record_sha256=digest,
+        )
+    assert fake.closed == []
+    assert output_path.read_bytes() == b'{"prior":"evidence"}\n'
+    assert (sessions.registry / "foreign").is_dir()
+
+
+def test_explicit_legacy_recovery_rechecks_record_after_output_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
+    output_path = sessions.registry / "foreign" / "output.json"
+    prior = b'{"prior":"evidence"}\n'
+    output_path.write_bytes(prior)
+    output_path.chmod(0o600)
+    original_atomic = subagents_module.ManagedAgents._atomic_snapshot_bytes
+    changed = False
+
+    def replace_record_after_output(
+        pinned: subagents_module._PinnedAgentDirectory,
+        content: bytes,
+        *,
+        name: str = "output.json",
+    ) -> subagents_module._InstalledArtifact:
+        nonlocal changed
+        installed = original_atomic(pinned, content, name=name)
+        if name == "output.json" and not changed:
+            changed = True
+            document = json.loads(raw)
+            document["foreign_shell_identity"] = None
+            agent._atomic_json(str(sessions.registry / "foreign/agent.json"), document)
+        return installed
+
+    monkeypatch.setattr(
+        subagents_module.ManagedAgents,
+        "_atomic_snapshot_bytes",
+        staticmethod(replace_record_after_output),
+    )
+    with pytest.raises(AgentDeliveryError, match="foreign_shell_identity to be absent"):
+        sessions.stop(
+            "foreign", expected_token=token, recover_legacy_adoption=True,
+            expected_record_sha256=digest,
+        )
+
+    assert changed is True
+    assert fake.closed == []
+    assert output_path.read_bytes() == prior
+    assert (sessions.registry / "foreign").is_dir()
+    assert not list((sessions.registry / "archive").glob(f"foreign-{token}"))
+
+
+def test_explicit_legacy_recovery_refuses_oversize_serialized_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
+    def oversized_read(_pane_id: str, *, source: str, lines: int) -> str:
+        del source, lines
+        return "\x00" * (3 << 20)
+
+    monkeypatch.setattr(fake, "read", oversized_read)
+
+    with pytest.raises(AgentDeliveryError, match="output.json larger"):
+        sessions.stop(
+            "foreign", expected_token=token, recover_legacy_adoption=True,
+            expected_record_sha256=digest,
+        )
+
+    assert fake.closed == []
+    assert (sessions.registry / "foreign/agent.json").read_bytes() == raw
+    assert not (sessions.registry / "foreign/output.json").exists()
+    assert not list((sessions.registry / "archive").glob(f"foreign-{token}"))
+
+
+def test_explicit_legacy_recovery_uses_utf8_snapshot_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, _raw = prepare_legacy_dead(sessions, fake, pane)
+    text = "é" * (3 << 20)
+
+    def non_ascii_read(_pane_id: str, *, source: str, lines: int) -> str:
+        del source, lines
+        return text
+
+    monkeypatch.setattr(fake, "read", non_ascii_read)
+    result = sessions.stop(
+        "foreign", expected_token=token, recover_legacy_adoption=True,
+        expected_record_sha256=digest,
+    )
+    output = Path(str(result["archive"])) / "output.json"
+
+    assert output.stat().st_size < subagents_module._MAX_SNAPSHOT_BYTES
+    assert json.loads(output.read_text(encoding="utf-8"))["text"] == text
+    assert fake.closed == []
+
+
+def test_explicit_legacy_recovery_rename_race_rolls_back_output_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, _raw = prepare_legacy_dead(sessions, fake, pane)
+    output_path = sessions.registry / "foreign" / "output.json"
+    prior = b'{\n  "prior": "exact evidence"\n}\n'
+    output_path.write_bytes(prior)
+    output_path.chmod(0o600)
+    real_rename = subagents_module._rename_directory_noreplace_at
+
+    def collide(
+        source_parent: int, source_name: str,
+        destination_parent: int, destination_name: str,
+    ) -> None:
+        if destination_name.startswith("foreign-"):
+            destination = sessions.registry / "archive" / destination_name
+            destination.symlink_to(tmp_path / "missing-archive-target", target_is_directory=True)
+        real_rename(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(subagents_module, "_rename_directory_noreplace_at", collide)
+    with pytest.raises(AgentDeliveryError, match="existing agent archive"):
+        sessions.stop(
+            "foreign", expected_token=token, recover_legacy_adoption=True,
+            expected_record_sha256=digest,
+        )
+    assert output_path.read_bytes() == prior
+    assert fake.closed == []
+    assert (sessions.registry / "foreign").is_dir()
+    assert os.path.lexists(sessions.registry / "archive" / f"foreign-{token}")
+
+
+def test_explicit_legacy_recovery_fsync_failure_reports_published_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
+    real_fsync = subagents_module._fsync_pinned_directory
+
+    def fail_archive(descriptor: int, label: str) -> None:
+        if label == "published agent archive":
+            raise OSError("injected archive fsync failure")
+        real_fsync(descriptor, label)
+
+    monkeypatch.setattr(subagents_module, "_fsync_pinned_directory", fail_archive)
+    with pytest.raises(AgentDeliveryError, match="published.*durability is uncertain"):
+        sessions.stop(
+            "foreign", expected_token=token, recover_legacy_adoption=True,
+            expected_record_sha256=digest,
+        )
+    destination = sessions.registry / "archive" / f"foreign-{token}"
+    assert not (sessions.registry / "foreign").exists()
+    assert (destination / "agent.json").read_bytes() == raw
+    assert (destination / "output.json").is_file()
+    assert fake.closed == []
+
+
+def test_explicit_legacy_recovery_publication_refuses_postproof_directory_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, _raw = prepare_legacy_dead(sessions, fake, pane)
+    real_rename = subagents_module._rename_directory_noreplace_at
+    swapped = False
+
+    def swap_before_publish(
+        source_parent: int, source_name: str,
+        destination_parent: int, destination_name: str,
+    ) -> None:
+        nonlocal swapped
+        if not swapped and destination_name.startswith("foreign-"):
+            swapped = True
+            displaced = sessions.registry / ".foreign-original"
+            active = sessions.registry / source_name
+            active.rename(displaced)
+            active.mkdir(mode=0o700)
+            (active / "agent.json").write_bytes((displaced / "agent.json").read_bytes())
+            (active / "agent.json").chmod(0o600)
+        real_rename(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(subagents_module, "_rename_directory_noreplace_at", swap_before_publish)
+    with pytest.raises(AgentDeliveryError, match="published directory was not"):
+        sessions.stop(
+            "foreign", expected_token=token, recover_legacy_adoption=True,
+            expected_record_sha256=digest,
+        )
+    assert fake.closed == []
+    destination = sessions.registry / "archive" / f"foreign-{token}"
+    displaced = sessions.registry / ".foreign-original"
+    assert not (sessions.registry / "foreign").exists()
+    assert (destination / "agent.json").is_file()
+    assert (displaced / "agent.json").is_file()
+    assert (displaced / "output.json").is_file()
+
+
+def test_explicit_legacy_recovery_publication_refuses_postproof_record_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
+    real_rename = subagents_module._rename_directory_noreplace_at
+    changed = False
+
+    def replace_record_before_publish(
+        source_parent: int, source_name: str,
+        destination_parent: int, destination_name: str,
+    ) -> None:
+        nonlocal changed
+        if not changed and destination_name.startswith("foreign-"):
+            changed = True
+            document = json.loads(raw)
+            document["goal"] = "replacement record"
+            agent._atomic_json(
+                str(sessions.registry / source_name / "agent.json"), document,
+            )
+        real_rename(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(
+        subagents_module, "_rename_directory_noreplace_at", replace_record_before_publish,
+    )
+    with pytest.raises(AgentDeliveryError, match="record changed during archival"):
+        sessions.stop(
+            "foreign", expected_token=token, recover_legacy_adoption=True,
+            expected_record_sha256=digest,
+        )
+
+    assert changed is True
+    assert fake.closed == []
+    assert (sessions.registry / "foreign").is_dir()
+    assert (sessions.registry / "foreign" / "output.json").is_file()
+    assert not list((sessions.registry / "archive").glob(f"foreign-{token}"))
+
+
+def test_explicit_legacy_recovery_publication_archives_original_after_safe_aba(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
+    marker = sessions.registry / "foreign" / "queue" / "pending" / "marker"
+    marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker.write_text("original", encoding="utf-8")
+    marker.chmod(0o600)
+    real_rename = subagents_module._rename_directory_noreplace_at
+    swapped = False
+
+    def aba_before_publish(
+        source_parent: int, source_name: str,
+        destination_parent: int, destination_name: str,
+    ) -> None:
+        nonlocal swapped
+        if not swapped and destination_name.startswith("foreign-"):
+            swapped = True
+            held = sessions.registry / ".foreign-held"
+            active = sessions.registry / source_name
+            active.rename(held)
+            active.mkdir(mode=0o700)
+            (active / "agent.json").write_bytes(raw)
+            (active / "agent.json").chmod(0o600)
+            (active / "agent.json").unlink()
+            active.rmdir()
+            held.rename(active)
+        real_rename(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(subagents_module, "_rename_directory_noreplace_at", aba_before_publish)
+    result = sessions.stop(
+        "foreign", expected_token=token, recover_legacy_adoption=True,
+        expected_record_sha256=digest,
+    )
+    archive = Path(str(result["archive"]))
+    assert (archive / "queue" / "pending" / "marker").read_text() == "original"
+    assert (archive / "agent.json").read_bytes() == raw
+    assert fake.closed == []
+
+
+def test_explicit_legacy_recovery_preflights_archive_and_snapshot_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for failure in ("collision", "snapshot"):
+        root = tmp_path / failure
+        root.mkdir()
+        sessions, fake, pane = setup_foreign(root, monkeypatch)
+        token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
+        if failure == "collision":
+            (sessions.registry / "archive" / f"foreign-{token}").mkdir(parents=True)
+        else:
+            original_atomic = subagents_module.ManagedAgents._atomic_snapshot_bytes
+            failed = False
+
+            def fail_output(
+                pinned: subagents_module._PinnedAgentDirectory,
+                content: bytes, *, name: str = "output.json",
+            ) -> subagents_module._InstalledArtifact:
+                nonlocal failed
+                if name == "output.json" and not failed:
+                    failed = True
+                    raise AgentDeliveryError("injected snapshot failure")
+                return original_atomic(pinned, content, name=name)
+
+            monkeypatch.setattr(
+                subagents_module.ManagedAgents, "_atomic_snapshot_bytes",
+                staticmethod(fail_output),
+            )
+        with pytest.raises(AgentDeliveryError):
+            sessions.stop(
+                "foreign", expected_token=token, recover_legacy_adoption=True,
+                expected_record_sha256=digest,
+            )
+        assert fake.closed == []
+        assert (sessions.registry / "foreign" / "agent.json").read_bytes() == raw
 
 
 def test_stop_refuses_shell_generation_change_during_output_capture(
@@ -900,6 +1461,40 @@ def test_cli_adopt_requires_identity_and_stop_is_non_destructive(
     stopped = json.loads(capsys.readouterr().out)
     assert stopped["runtime_preserved"] is True
     assert fake.closed == []
+
+
+def test_cli_legacy_recovery_requires_and_forwards_exact_generation_assertions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    token, digest, raw = prepare_legacy_dead(sessions, fake, pane)
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+
+    assert cli.main([
+        "stop", "foreign", "--registry", str(sessions.registry),
+        "--recover-legacy-adoption", "--expected-token", token,
+        "--expected-record-sha256", digest,
+    ]) == 0
+
+    stopped = json.loads(capsys.readouterr().out)
+    assert stopped["recovered_legacy_adoption"] is True
+    assert Path(stopped["archive"]).joinpath("agent.json").read_bytes() == raw
+    assert fake.closed == []
+
+
+def test_stop_help_documents_loud_legacy_recovery_gate(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as result:
+        cli.parser().parse_args(["stop", "--help"])
+    assert result.value.code == 0
+    output = capsys.readouterr().out
+    for option in (
+        "--recover-legacy-adoption", "--expected-token",
+        "--expected-record-sha256",
+    ):
+        assert option in output
 
 
 def test_adopt_help_names_every_required_identity_assertion(

@@ -133,6 +133,10 @@ elif args[:2] == ["pane", "get"]:
         "agent_session": None if human or state.get("empty_shell") or state.get("sessionless") or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": "session-1"},
     }})
 elif args[:2] == ["pane", "process-info"]:
+    if state.get("fail_process_info"):
+        print("injected process-info failure", file=sys.stderr)
+        save()
+        raise SystemExit(1)
     shell_pid = state["fixture_shell_pid"]
     shell_executable = state["fixture_shell_executable"]
     if state.get("empty_shell"):
@@ -263,6 +267,10 @@ elif args[:2] == ["agent", "wait"]:
         raise SystemExit(1)
     print(json.dumps({"result": {"agent": {"pane_id": args[2], "agent_status": "working"}}}, sort_keys=True))
 elif args[:2] == ["pane", "read"]:
+    if state.get("fail_read"):
+        print("injected pane read failure", file=sys.stderr)
+        save()
+        raise SystemExit(1)
     if state.get("extra_pane_on_read"):
         state["extra_pane"] = True
     if state.get("restart_agent_on_read"):

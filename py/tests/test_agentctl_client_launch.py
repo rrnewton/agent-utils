@@ -1,15 +1,20 @@
 """Exact Herdr allocation commands used by first-class agentctl launches."""
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
 import shlex
+import signal
 import subprocess
+import sys
+import time
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
+import agentctl.client as client_module
 from agentctl.client import (
     CustomProcessIdentity,
     HerdrClient,
@@ -33,6 +38,32 @@ class Runner:
         return subprocess.CompletedProcess(
             command, 0, json.dumps({"result": self.response}), ""
         )
+
+
+@pytest.mark.parametrize(
+    ("descriptor", "limit", "label"),
+    [
+        (1, client_module._CONTROL_STDOUT_BYTES, "stdout"),
+        (2, client_module._CONTROL_STDERR_BYTES, "stderr"),
+    ],
+)
+def test_control_capture_refuses_output_above_each_byte_bound(
+    descriptor: int, limit: int, label: str,
+) -> None:
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import os\n"
+            f"remaining = {limit} + 1\n"
+            "chunk = b'x' * 65536\n"
+            "while remaining:\n"
+            f"    written = os.write({descriptor}, chunk[:min(remaining, len(chunk))])\n"
+            "    remaining -= written\n"
+        ),
+    ]
+    with pytest.raises(OSError, match=f"control {label} exceeds {limit} bytes"):
+        client_module._bounded_control_command(command, timeout=10)
 
 
 _ENVIRONMENT = (
@@ -307,6 +338,84 @@ def test_real_non_shell_process_cannot_be_adopted_as_a_pane_shell() -> None:
     finally:
         process.terminate()
         process.wait(timeout=5)
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_process_identity_maps_pidfd_close_failure_to_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = os.path.realpath("/usr/bin/sleep")
+    process = subprocess.Popen([executable, "30"], start_new_session=True)
+    real_close = os.close
+    injected = False
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal injected
+        real_close(descriptor)
+        if not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected pidfd close failure")
+
+    try:
+        monkeypatch.setattr("agentctl.client.os.close", close_then_fail)
+        with pytest.raises(HerdrUnavailable, match="cannot close pidfd"):
+            HerdrClient._process_identity(process.pid)
+        assert injected is True
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_real_supported_shell_with_background_descendant_is_not_idle() -> None:
+    executable = os.path.realpath("/bin/bash")
+    shell = subprocess.Popen(
+        [executable, "--noprofile", "--norc"], stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        text=True, start_new_session=True,
+    )
+    try:
+        assert shell.stdin is not None
+        shell.stdin.write("/usr/bin/sleep 30 & wait\n")
+        shell.stdin.flush()
+        def child_exists() -> bool:
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    raw = (entry / "stat").read_text()
+                except (FileNotFoundError, PermissionError):
+                    continue
+                close = raw.rfind(")")
+                if close >= 0 and raw[close + 1:].split()[1] == str(shell.pid):
+                    return True
+            return False
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not child_exists():
+            time.sleep(0.01)
+        assert child_exists(), "background child did not start"
+        process_info: dict[str, object] = {
+            "pane_id": "p1",
+            "shell_pid": shell.pid,
+            "foreground_process_group_id": shell.pid,
+            "foreground_processes": [{
+                "pid": shell.pid, "name": "bash", "cmdline": executable,
+                "argv": [executable], "executable": executable,
+            }],
+        }
+        client = HerdrClient(
+            herdr_bin="fixture-herdr", run=Runner({"process_info": process_info})
+        )
+        identity = client.pane_shell_identity("p1")
+        assert not client.pane_is_idle_shell("p1")
+        assert not client.pane_is_same_idle_shell("p1", identity)
+    finally:
+        try:
+            os.killpg(shell.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        shell.wait(timeout=5)
 
 
 def test_recorded_custom_process_identity_survives_atomic_executable_replacement(
