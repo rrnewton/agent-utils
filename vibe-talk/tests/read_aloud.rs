@@ -15,7 +15,7 @@ use vibe_talk::speech::{Description, Playback, Speech, SpeechError, SpeechProvid
 
 #[tokio::test]
 async fn conversational_read_aloud_drives_the_provider_neutral_socket_and_returns_wav() {
-    use futures_util::{SinkExt as _, StreamExt as _};
+    use futures_util::{SinkExt as _, StreamExt as _, TryStreamExt as _};
     use tokio_tungstenite::tungstenite::Message;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -55,12 +55,17 @@ async fn conversational_read_aloud_drives_the_provider_neutral_socket_and_return
     let provider = vibe_talk::speech::ConversationSpeech::new(&config, Some(&server_route));
     assert_eq!(provider.describe().label, "Test agent");
     let spoken = provider
-        .speak("hello from the channel", None)
+        .speak_stream("hello from the channel", None)
         .await
         .expect("speaks");
     assert_eq!(spoken.content_type, "audio/wav");
-    assert_eq!(&spoken.audio[..4], b"RIFF");
-    assert_eq!(&spoken.audio[44..], &[1, 2, 3, 4]);
+    let chunks = spoken
+        .chunks
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("streams");
+    assert_eq!(&chunks[0][..4], b"RIFF");
+    assert_eq!(&chunks[1][..], &[1, 2, 3, 4]);
     server.await.expect("server exits");
 }
 use vibe_talk::testing::{self, READ_CHANNEL, READ_TOKEN};
