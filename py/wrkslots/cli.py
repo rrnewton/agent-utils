@@ -16,8 +16,10 @@ import fnmatch
 import functools
 import hashlib
 import json
+import math
 import os
 import re
+import resource
 import selectors
 import shlex
 import shutil
@@ -321,6 +323,7 @@ CONFIG_NAME = ".wrkslots.yml"
 # be materialised: no `max_active_slots` key means allocation is uncapped.
 OPTIONAL_CONFIG_KEYS = frozenset(
     {
+        "liveness_batch_command",
         "max_active_slots",
         "layout",
         "cache_globs",
@@ -376,6 +379,14 @@ _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 22.0
 _READ_ONLY_COMMAND_REAP_SECONDS = 1.0
 _RECLAIM_LIVE_USE_RECHECK_SECONDS = 0.25
+_LIVENESS_BATCH_REQUEST_SCHEMA = "wrkslots-liveness-batch-request/v1"
+_LIVENESS_BATCH_RESPONSE_SCHEMA = "wrkslots-liveness-batch-response/v1"
+_LIVENESS_BATCH_BYTES_LIMIT = 4 * 1024 * 1024
+_AUDIT_METRICS_SCHEMA = "wrkslots-audit-metrics/v1"
+_AUDIT_CACHE_CENSUS_SCHEMA = "wrkslots-audit-cache-census/v1"
+_AUDIT_CACHE_STATE_BYTES_LIMIT = 64 * 1024 * 1024
+_AUDIT_CACHE_WORK_LIMIT = 100_000
+_AUDIT_CACHE_WALL_SECONDS = 5.0
 
 
 class Refusal(RuntimeError):
@@ -415,6 +426,7 @@ class Config:
     default_landed_ref: str
     heartbeat_ttl_seconds: int
     liveness_command: Path
+    liveness_batch_command: Path | None = None
     max_active_slots: int | None = None
     layout: str = "nested"
     cache_globs: tuple[str, ...] = ()
@@ -2481,6 +2493,7 @@ def _config_payload(
     default_landed_ref: str,
     heartbeat_ttl_seconds: int,
     liveness_command: str,
+    liveness_batch_command: str | None = None,
     max_active_slots: int | None = None,
     layout: str = "nested",
     cache_globs: Sequence[str] = (),
@@ -2499,6 +2512,8 @@ def _config_payload(
         "heartbeat_ttl_seconds": heartbeat_ttl_seconds,
         "liveness_command": liveness_command,
     }
+    if liveness_batch_command is not None:
+        payload["liveness_batch_command"] = liveness_batch_command
     # Absent means "no cap", so an unset cap must not appear in the payload at
     # all; writing an explicit null would make init non-idempotent against every
     # configuration written before the field existed.
@@ -2714,6 +2729,28 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         raise StateError(
             f"configured liveness command is missing, not runnable, or unsafe: {liveness_command}"
         )
+    liveness_batch_command: Path | None = None
+    if "liveness_batch_command" in raw:
+        _batch_relative, liveness_batch_command = _relative_inside(
+            root,
+            _as_str(
+                raw["liveness_batch_command"],
+                "configuration.liveness_batch_command",
+            ),
+            "batch liveness command",
+        )
+        if (
+            not liveness_batch_command.is_file()
+            or liveness_batch_command.is_symlink()
+            or (
+                liveness_batch_command.suffix != ".py"
+                and not os.access(liveness_batch_command, os.X_OK)
+            )
+        ):
+            raise StateError(
+                "configured batch liveness command is missing, not runnable, or "
+                f"unsafe: {liveness_batch_command}"
+            )
     cap = raw.get("max_active_slots")
     cache_globs = (
         ()
@@ -2779,6 +2816,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             minimum=1,
         ),
         liveness_command=liveness_command,
+        liveness_batch_command=liveness_batch_command,
         max_active_slots=(
             None
             if cap is None
@@ -9594,8 +9632,10 @@ def _assert_create_processes(
     _assert_create_owner_authorized(owner, coordinator)
 
 
-def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[str, str]:
-    env = {
+def _liveness_environment(config: Config, record: ActiveRecord) -> dict[str, str]:
+    """Return the exact one-subject environment shared by both protocols."""
+
+    return {
         "LC_ALL": "C",
         "PATH": "/usr/bin:/bin",
         "WRKSLOTS_PROJECT_ROOT": str(config.root),
@@ -9612,6 +9652,176 @@ def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[st
         "WRKSLOTS_OWNER_BOOT_ID": "" if record.owner is None else record.owner.boot_id,
         "WRKSLOTS_OWNER_CGROUP": "" if record.owner is None else record.owner.cgroup_path,
     }
+
+
+def _liveness_subject(config: Config, record: ActiveRecord) -> dict[str, object]:
+    binding: dict[str, object] = {
+        "agent": record.agent,
+        "environment": _liveness_environment(config, record),
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            binding, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+    return {"subject_id": digest, **binding}
+
+
+def _liveness_batch_request(
+    config: Config, records: Sequence[ActiveRecord]
+) -> dict[str, object]:
+    subjects = [_liveness_subject(config, record) for record in records]
+    request_body: dict[str, object] = {
+        "schema": _LIVENESS_BATCH_REQUEST_SCHEMA,
+        "subjects": subjects,
+    }
+    request_sha256 = hashlib.sha256(
+        json.dumps(
+            request_body, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+    return {**request_body, "request_sha256": request_sha256}
+
+
+def _parse_liveness_batch_response(
+    response_text: str,
+    request: Mapping[str, object],
+) -> dict[str, tuple[str, str]]:
+    if len(response_text.encode("utf-8")) > _LIVENESS_BATCH_BYTES_LIMIT:
+        raise Refusal("batch liveness response exceeded its byte limit")
+    try:
+        decoded = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise Refusal(f"batch liveness response is not JSON: {exc}") from exc
+    response = _as_mapping(decoded, "batch liveness response")
+    _exact_keys(
+        response,
+        {"schema", "request_sha256", "results"},
+        set(),
+        "batch liveness response",
+    )
+    if response["schema"] != _LIVENESS_BATCH_RESPONSE_SCHEMA:
+        raise Refusal("batch liveness response has an unsupported schema")
+    if response["request_sha256"] != request.get("request_sha256"):
+        raise Refusal("batch liveness response is bound to another request")
+    requested: dict[str, str] = {}
+    for index, value in enumerate(_as_list(request.get("subjects"), "batch subjects")):
+        subject = _as_mapping(value, f"batch subjects[{index}]")
+        subject_id = _as_str(subject.get("subject_id"), f"batch subjects[{index}].subject_id")
+        agent = _as_str(subject.get("agent"), f"batch subjects[{index}].agent")
+        if subject_id in requested:
+            raise StateError("batch liveness request contains duplicate subject identities")
+        requested[subject_id] = agent
+    parsed: dict[str, tuple[str, str]] = {}
+    for index, value in enumerate(_as_list(response["results"], "batch liveness results")):
+        result = _as_mapping(value, f"batch liveness results[{index}]")
+        _exact_keys(
+            result,
+            {"subject_id", "agent", "state", "detail"},
+            set(),
+            f"batch liveness results[{index}]",
+        )
+        subject_id = _as_str(
+            result["subject_id"], f"batch liveness results[{index}].subject_id"
+        )
+        if subject_id in parsed:
+            raise Refusal(f"batch liveness response duplicates subject {subject_id}")
+        expected_agent = requested.get(subject_id)
+        if expected_agent is None:
+            raise Refusal(f"batch liveness response contains unknown subject {subject_id}")
+        agent = _as_str(result["agent"], f"batch liveness results[{index}].agent")
+        if agent != expected_agent:
+            raise Refusal(
+                f"batch liveness response misbinds subject {subject_id} to agent {agent!r}"
+            )
+        state = _as_str(result["state"], f"batch liveness results[{index}].state")
+        if state not in {"dead", "alive", "unverifiable"}:
+            raise Refusal(
+                f"batch liveness response has invalid state {state!r} for {agent}"
+            )
+        detail = _as_str(result["detail"], f"batch liveness results[{index}].detail")
+        if not detail or len(detail) > 4096 or detail != " ".join(detail.split()):
+            raise Refusal(
+                f"batch liveness response detail is absent or not one bounded line for {agent}"
+            )
+        parsed[subject_id] = state, detail
+    missing = sorted(set(requested) - set(parsed))
+    if missing:
+        raise Refusal(
+            f"batch liveness response omitted {len(missing)} requested subject(s): {missing[0]}"
+        )
+    return parsed
+
+
+def _registered_liveness_states(
+    config: Config, records: Sequence[ActiveRecord]
+) -> dict[tuple[str, str, int], tuple[str, str]]:
+    """Read liveness once when a typed batch authority is configured.
+
+    A broken batch is one broken observation, not permission to fall back to a
+    different protocol whose answers might disagree. Every requested subject
+    therefore becomes unverifiable together.
+    """
+
+    if not records:
+        return {}
+    if config.liveness_batch_command is None:
+        return {
+            (record.machine, record.slot, record.generation):
+            _registered_liveness_state(config, record)
+            for record in records
+        }
+    request = _liveness_batch_request(config, records)
+    command = (
+        [sys.executable, str(config.liveness_batch_command)]
+        if config.liveness_batch_command.suffix == ".py"
+        else [str(config.liveness_batch_command)]
+    )
+    common_env = {
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "WRKSLOTS_PROJECT_ROOT": str(config.root),
+        "WRKSLOTS_MACHINE": config.machine,
+        "WRKSLOTS_LIVENESS_BATCH_SCHEMA": _LIVENESS_BATCH_REQUEST_SCHEMA,
+    }
+    try:
+        returncode, stdout_bytes, stderr_bytes = _run_bounded_read_only_command(
+            command,
+            timeout_seconds=_ABSENT_PROCESS_CENSUS_SECONDS,
+            stdout_limit=_LIVENESS_BATCH_BYTES_LIMIT,
+            stderr_limit=64 * 1024,
+            env_overrides=common_env,
+            input_data=json.dumps(
+                request, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8"),
+        )
+        stdout = stdout_bytes.decode("utf-8")
+        stderr = stderr_bytes.decode("utf-8")
+        if returncode != 0:
+            first = (stderr or stdout).strip().splitlines()
+            detail = first[0] if first else "no detail"
+            raise Refusal(
+                f"batch liveness command exited {returncode}: {detail}"
+            )
+        parsed = _parse_liveness_batch_response(stdout, request)
+    except (OSError, UnicodeError, subprocess.TimeoutExpired, Refusal, StateError) as exc:
+        detail = f"registered batch liveness authority is unverifiable: {exc}"
+        return {
+            (record.machine, record.slot, record.generation):
+            ("unverifiable", detail)
+            for record in records
+        }
+    result: dict[tuple[str, str, int], tuple[str, str]] = {}
+    subjects = _as_list(request["subjects"], "batch subjects")
+    for record, value in zip(records, subjects, strict=True):
+        subject = _as_mapping(value, "batch subject")
+        subject_id = _as_str(subject["subject_id"], "batch subject.subject_id")
+        result[(record.machine, record.slot, record.generation)] = parsed[subject_id]
+    return result
+
+
+def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[str, str]:
+    env = _liveness_environment(config, record)
     try:
         command = (
             [sys.executable, str(config.liveness_command), record.agent]
@@ -12188,6 +12398,23 @@ def _cmd_init(args: argparse.Namespace) -> int:
         raise Refusal(
             f"liveness command must be a runnable real file: {liveness_command}"
         )
+    liveness_batch_relative: str | None = None
+    if args.liveness_batch_command is not None:
+        liveness_batch_relative, liveness_batch_command = _relative_inside(
+            root, args.liveness_batch_command, "batch liveness command"
+        )
+        if (
+            not liveness_batch_command.is_file()
+            or liveness_batch_command.is_symlink()
+            or (
+                liveness_batch_command.suffix != ".py"
+                and not os.access(liveness_batch_command, os.X_OK)
+            )
+        ):
+            raise Refusal(
+                "batch liveness command must be a runnable real file: "
+                f"{liveness_batch_command}"
+            )
     worktrees_relative, worktrees = _relative_inside(
         root, args.worktrees_dir, "worktrees directory"
     )
@@ -12242,6 +12469,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         landed_ref,
         args.heartbeat_ttl_seconds,
         liveness_relative,
+        liveness_batch_relative,
         args.max_active_slots,
         layout,
         cache_globs,
@@ -15229,6 +15457,477 @@ def _allocated_cache_bytes(config: Config, cache: CacheDirectory) -> int:
         os.close(parent_fd)
 
 
+def _audit_cpu_seconds() -> float:
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
+
+
+@dataclasses.dataclass
+class _AuditMetrics:
+    """Typed phase measurements whose work counts are stable under host load."""
+
+    phases: list[dict[str, object]] = dataclasses.field(default_factory=list)
+
+    def start(self) -> tuple[float, float]:
+        return time.monotonic(), _audit_cpu_seconds()
+
+    def finish(
+        self,
+        name: str,
+        started: tuple[float, float],
+        work: Mapping[str, int],
+    ) -> None:
+        if any(value < 0 for value in work.values()):
+            raise StateError(f"audit phase {name} has a negative work counter")
+        wall_started, cpu_started = started
+        self.phases.append(
+            {
+                "name": name,
+                "wall_seconds": max(0.0, time.monotonic() - wall_started),
+                "cpu_seconds": max(0.0, _audit_cpu_seconds() - cpu_started),
+                "work": dict(sorted(work.items())),
+            }
+        )
+
+    def to_obj(self) -> dict[str, object]:
+        names = [str(item["name"]) for item in self.phases]
+        if len(names) != len(set(names)):
+            raise StateError("audit phase metrics contain duplicate names")
+        return {"schema": _AUDIT_METRICS_SCHEMA, "phases": list(self.phases)}
+
+
+@dataclasses.dataclass(frozen=True)
+class _AuditCacheMeasurement:
+    bytes: int | None
+    status: str
+    error: str | None = None
+
+
+def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
+    if explicit is not None:
+        candidate = Path(explicit)
+        if not candidate.is_absolute():
+            raise Refusal("--cache-census-state must be an absolute path")
+        return candidate
+    cache_home = Path(
+        os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+    ).expanduser()
+    project = hashlib.sha256(str(config.root).encode("utf-8")).hexdigest()
+    return cache_home / "wrkslots" / "audit-cache" / f"{project}.json"
+
+
+def _write_audit_cache_state(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+        raise
+
+
+def _audit_registry_revision(states: Sequence[ActiveState]) -> str:
+    identity = [
+        {"machine": state.machine, "revision": state.revision}
+        for state in sorted(states, key=lambda value: value.machine)
+    ]
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _audit_cache_root_identity(
+    config: Config, cache: CacheDirectory
+) -> tuple[int, int, int, int, int] | None:
+    opened = _open_cache_directory(config, cache)
+    if opened is None:
+        return None
+    parent_fd, cache_fd, _name = opened
+    try:
+        metadata = os.fstat(cache_fd)
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            _fd_mount_id(cache_fd, str(cache.path)),
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+    finally:
+        os.close(cache_fd)
+        os.close(parent_fd)
+
+
+def _audit_cache_root_key(
+    cache: CacheDirectory, identity: Sequence[int]
+) -> str:
+    value = {
+        "path": str(cache.path),
+        "checkout_root": str(cache.checkout_root),
+        "identity": list(identity),
+    }
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _new_audit_cache_root(
+    cache: CacheDirectory, identity: Sequence[int]
+) -> dict[str, object]:
+    return {
+        "path": str(cache.path),
+        "identity": list(identity),
+        "bytes": 0,
+        "pending": ["."],
+        "current": None,
+        "visited": [],
+        "verify_index": 0,
+        "status": "partial",
+        "entries_visited": 0,
+        "directories_visited": 0,
+        "directories_verified": 0,
+    }
+
+
+def _open_audit_cache_relative(
+    cache: CacheDirectory, relative: str
+) -> tuple[int, os.stat_result, int]:
+    if relative != ".":
+        lexical = Path(relative)
+        if (
+            lexical.is_absolute()
+            or not lexical.parts
+            or ".." in lexical.parts
+            or lexical.as_posix() != relative
+        ):
+            raise StateError(
+                f"cache census relative path is not canonical: {relative!r}"
+            )
+    candidate = cache.path if relative == "." else cache.path / relative
+    _ensure_no_symlink_components(cache.path, candidate, "cache census path")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(candidate, flags)
+    metadata = os.fstat(fd)
+    mount_id = _fd_mount_id(fd, str(candidate))
+    if metadata.st_dev != cache.checkout_device or mount_id != cache.checkout_mount_id:
+        os.close(fd)
+        raise Refusal(f"cache census crossed a filesystem boundary: {candidate}")
+    return fd, metadata, mount_id
+
+
+def _resume_audit_cache_root(
+    cache: CacheDirectory,
+    root: dict[str, object],
+    *,
+    work_remaining: int,
+    deadline: float,
+) -> tuple[int, bool]:
+    """Advance one exact root without turning an incomplete count into zero."""
+
+    consumed = 0
+    while work_remaining > consumed and time.monotonic() < deadline:
+        current_raw = root.get("current")
+        if current_raw is None:
+            pending = _as_list(root.get("pending"), "cache census pending")
+            if not pending:
+                visited = _as_list(root.get("visited"), "cache census visited")
+                verify_index = _as_int(
+                    root.get("verify_index"), "cache census verify_index"
+                )
+                if verify_index < 0 or verify_index > len(visited):
+                    raise StateError("cache census verify_index is out of range")
+                if verify_index == len(visited):
+                    root["status"] = "complete"
+                    return consumed, True
+                visited_entry = dict(
+                    _as_mapping(
+                        visited[verify_index], "cache census visited directory"
+                    )
+                )
+                relative = _as_str(
+                    visited_entry.get("path"), "cache census visited path"
+                )
+                expected_identity = tuple(
+                    _as_int(value, "cache census visited identity")
+                    for value in _as_list(
+                        visited_entry.get("identity"),
+                        "cache census visited identity",
+                    )
+                )
+                previous_blocks = _as_int(
+                    visited_entry.get("blocks"), "cache census visited blocks"
+                )
+                fd, metadata, _mount_id = _open_audit_cache_relative(
+                    cache, relative
+                )
+                os.close(fd)
+                actual_identity = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+                if actual_identity != expected_identity:
+                    raise Refusal(
+                        "cache census directory changed before final verification: "
+                        f"{cache.path / relative}"
+                    )
+                root["bytes"] = (
+                    _as_int(root.get("bytes"), "cache census bytes")
+                    + (metadata.st_blocks - previous_blocks) * 512
+                )
+                visited_entry["blocks"] = metadata.st_blocks
+                visited[verify_index] = visited_entry
+                root["visited"] = visited
+                root["verify_index"] = verify_index + 1
+                root["directories_verified"] = _as_int(
+                    root.get("directories_verified"),
+                    "cache census directories verified",
+                ) + 1
+                consumed += 1
+                if verify_index + 1 == len(visited):
+                    root["status"] = "complete"
+                    return consumed, True
+                continue
+            relative = _as_str(pending.pop(), "cache census pending path")
+            root["pending"] = pending
+            fd, metadata, _mount_id = _open_audit_cache_relative(cache, relative)
+            os.close(fd)
+            root["bytes"] = _as_int(root.get("bytes"), "cache census bytes") + metadata.st_blocks * 512
+            root["directories_visited"] = _as_int(
+                root.get("directories_visited"), "cache census directories"
+            ) + 1
+            visited = _as_list(root.get("visited"), "cache census visited")
+            visited.append(
+                {
+                    "path": relative,
+                    "identity": [
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mtime_ns,
+                        metadata.st_ctime_ns,
+                    ],
+                    "blocks": metadata.st_blocks,
+                }
+            )
+            root["visited"] = visited
+            root["current"] = {
+                "path": relative,
+                "after": None,
+                "identity": [
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                ],
+            }
+            current_raw = root["current"]
+        current = dict(_as_mapping(current_raw, "cache census current"))
+        relative = _as_str(current.get("path"), "cache census current.path")
+        after_value = current.get("after")
+        after = None if after_value is None else _as_str(after_value, "cache census current.after")
+        expected_identity = tuple(
+            _as_int(value, "cache census current identity")
+            for value in _as_list(current.get("identity"), "cache census current.identity")
+        )
+        fd, metadata, _mount_id = _open_audit_cache_relative(cache, relative)
+        try:
+            actual_identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+            if actual_identity != expected_identity:
+                raise Refusal(
+                    f"cache census directory changed while resuming: {cache.path / relative}"
+                )
+            found_after = after is None
+            exhausted = False
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    if not found_after:
+                        if entry.name == after:
+                            found_after = True
+                        continue
+                    if consumed >= work_remaining or time.monotonic() >= deadline:
+                        exhausted = True
+                        break
+                    try:
+                        child = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISLNK(child.st_mode):
+                        raise Refusal(
+                            f"cache census encountered a symlink: {cache.path / relative / entry.name}"
+                        )
+                    root["entries_visited"] = _as_int(
+                        root.get("entries_visited"), "cache census entries"
+                    ) + 1
+                    consumed += 1
+                    child_relative = (
+                        entry.name if relative == "." else f"{relative}/{entry.name}"
+                    )
+                    if stat.S_ISDIR(child.st_mode):
+                        pending = _as_list(root.get("pending"), "cache census pending")
+                        pending.append(child_relative)
+                        root["pending"] = pending
+                    else:
+                        root["bytes"] = _as_int(
+                            root.get("bytes"), "cache census bytes"
+                        ) + child.st_blocks * 512
+                    current["after"] = entry.name
+            if after is not None and not found_after:
+                raise Refusal(
+                    f"cache census resume marker disappeared: {cache.path / relative / after}"
+                )
+            if exhausted:
+                root["current"] = dict(current)
+                return consumed, False
+            root["current"] = None
+        finally:
+            os.close(fd)
+    return consumed, False
+
+
+def _audit_cache_census(
+    config: Config,
+    states: Sequence[ActiveState],
+    planned: Mapping[str, Sequence[CacheDirectory]],
+    errors: Mapping[str, str],
+    *,
+    state_path: Path,
+    work_limit: int,
+    wall_seconds: float,
+) -> tuple[dict[str, _AuditCacheMeasurement], dict[str, int]]:
+    registry_revision = _audit_registry_revision(states)
+    stored: dict[str, object] = {
+        "schema": _AUDIT_CACHE_CENSUS_SCHEMA,
+        "registry_revision": registry_revision,
+        "roots": {},
+    }
+    try:
+        raw = json.loads(
+            _read_bounded_regular_file(
+                state_path,
+                "audit cache census",
+                _AUDIT_CACHE_STATE_BYTES_LIMIT,
+            ).decode("utf-8")
+        )
+    except (Refusal, UnicodeError, json.JSONDecodeError):
+        raw = None
+    if isinstance(raw, Mapping) and (
+        raw.get("schema") == _AUDIT_CACHE_CENSUS_SCHEMA
+        and raw.get("registry_revision") == registry_revision
+        and isinstance(raw.get("roots"), dict)
+    ):
+        stored = dict(raw)
+    previous_roots = dict(
+        _as_mapping(stored.get("roots"), "audit cache census roots")
+    )
+    # Retain only roots in the current plan. Identity changes and removed
+    # registry rows must not make this regenerable state grow without bound.
+    roots: dict[str, object] = {}
+    deadline = time.monotonic() + wall_seconds
+    remaining = work_limit
+    root_results: dict[str, _AuditCacheMeasurement] = {}
+    root_keys: dict[str, list[str]] = {}
+    directories = entries = verified = 0
+    for subject, caches in sorted(planned.items()):
+        subject_keys: list[str] = []
+        for cache in sorted(caches, key=lambda value: str(value.path)):
+            identity = _audit_cache_root_identity(config, cache)
+            if identity is None:
+                continue
+            key = _audit_cache_root_key(cache, identity)
+            subject_keys.append(key)
+            root_raw = previous_roots.get(key)
+            root = (
+                dict(root_raw)
+                if isinstance(root_raw, Mapping)
+                and root_raw.get("path") == str(cache.path)
+                and root_raw.get("identity") == list(identity)
+                else _new_audit_cache_root(cache, identity)
+            )
+            before_dirs = _as_int(root.get("directories_visited"), "cache census directories")
+            before_entries = _as_int(root.get("entries_visited"), "cache census entries")
+            before_verified = _as_int(
+                root.get("directories_verified"),
+                "cache census directories verified",
+            )
+            try:
+                if root.get("status") != "complete" and remaining > 0 and time.monotonic() < deadline:
+                    consumed, _complete = _resume_audit_cache_root(
+                        cache,
+                        root,
+                        work_remaining=remaining,
+                        deadline=deadline,
+                    )
+                    remaining -= consumed
+                roots[key] = root
+                directories += _as_int(root.get("directories_visited"), "cache census directories") - before_dirs
+                entries += _as_int(root.get("entries_visited"), "cache census entries") - before_entries
+                verified += _as_int(
+                    root.get("directories_verified"),
+                    "cache census directories verified",
+                ) - before_verified
+                if root.get("status") == "complete":
+                    root_results[key] = _AuditCacheMeasurement(
+                        _as_int(root.get("bytes"), "cache census bytes"), "complete"
+                    )
+                else:
+                    root_results[key] = _AuditCacheMeasurement(None, "partial")
+            except (OSError, Refusal, StateError) as exc:
+                roots.pop(key, None)
+                root_results[key] = _AuditCacheMeasurement(None, "error", str(exc))
+        root_keys[subject] = subject_keys
+    stored = {
+        "schema": _AUDIT_CACHE_CENSUS_SCHEMA,
+        "registry_revision": registry_revision,
+        "roots": roots,
+    }
+    try:
+        _write_audit_cache_state(state_path, stored)
+    except OSError as exc:
+        state_error = f"cannot persist audit cache census: {exc}"
+        errors = {**errors, **{subject: state_error for subject in planned}}
+    results: dict[str, _AuditCacheMeasurement] = {}
+    for subject in planned:
+        error = errors.get(subject)
+        if error is not None:
+            results[subject] = _AuditCacheMeasurement(None, "error", error)
+            continue
+        measurements = [root_results[key] for key in root_keys[subject]]
+        root_error = next((item.error for item in measurements if item.error), None)
+        if root_error is not None:
+            results[subject] = _AuditCacheMeasurement(None, "error", root_error)
+        elif any(item.status != "complete" for item in measurements):
+            results[subject] = _AuditCacheMeasurement(None, "partial")
+        else:
+            results[subject] = _AuditCacheMeasurement(
+                sum(item.bytes or 0 for item in measurements), "complete"
+            )
+    return results, {
+        "cache_roots": sum(len(caches) for caches in planned.values()),
+        "directories_visited": directories,
+        "directories_verified": verified,
+        "entries_visited": entries,
+        "subjects": len(planned),
+        "work_consumed": work_limit - remaining,
+        "work_limit": work_limit,
+        "work_remaining": remaining,
+    }
+
+
 def _clear_open_directory(
     directory_fd: int,
     path: Path,
@@ -15566,27 +16265,41 @@ def _audit_record(
     vcs: _GitVcs | None = None,
     process_census: _ProcessPathCensus | None = None,
     process_census_error: str | None = None,
+    registered_liveness: tuple[str, str] | None = None,
+    cache_measurement: _AuditCacheMeasurement | None = None,
 ) -> tuple[dict[str, object], bool]:
     selected_vcs = vcs or _GitVcs()
     owner_state, owner_detail = _process_state(record.owner)
-    liveness_state, liveness_detail = _registered_liveness_state(config, record)
+    liveness_state, liveness_detail = (
+        registered_liveness
+        if registered_liveness is not None
+        else _registered_liveness_state(config, record)
+    )
     heartbeat_age, heartbeat_expired = _heartbeat_diagnosis(record)
     agent_running = not (
         liveness_state == "dead"
         and owner_state == "dead"
     )
     hold = _load_hold(config, record.slot, record.machine, events=events)
-    cache_bytes = 0
-    cache_error: str | None = None
-    try:
-        cache_bytes = sum(
-            _allocated_cache_bytes(config, cache)
-            for cache in _cache_directories(
-                config, record.checkouts, vcs=selected_vcs
+    if cache_measurement is None:
+        cache_bytes: int | None = 0
+        cache_error: str | None = None
+        cache_status = "complete"
+        try:
+            cache_bytes = sum(
+                _allocated_cache_bytes(config, cache)
+                for cache in _cache_directories(
+                    config, record.checkouts, vcs=selected_vcs
+                )
             )
-        )
-    except Refusal as exc:
-        cache_error = str(exc)
+        except Refusal as exc:
+            cache_bytes = None
+            cache_error = str(exc)
+            cache_status = "error"
+    else:
+        cache_bytes = cache_measurement.bytes
+        cache_error = cache_measurement.error
+        cache_status = cache_measurement.status
     if hold is not None:
         return (
             {
@@ -15604,6 +16317,7 @@ def _audit_record(
                 "heartbeat_expired": heartbeat_expired,
                 "cache_bytes": cache_bytes,
                 "cache_error": cache_error,
+                "cache_status": cache_status,
             },
             agent_running,
         )
@@ -15678,6 +16392,13 @@ def _audit_record(
                 agent_running = True
     if cache_error is not None:
         reasons.append(f"cache inspection failed: {cache_error}")
+    elif cache_status == "partial":
+        # A bounded census may not yet have reached a nested path that the
+        # complete historical traversal would have refused.  Its null byte
+        # count is therefore informationally honest but is not deletion
+        # evidence.  Keep the row out of DELETABLE until the same resumable
+        # census reaches and verifies every entry.
+        reasons.append("cache inspection incomplete: bounded census is partial")
     return (
         {
             "slot": record.slot,
@@ -15698,6 +16419,7 @@ def _audit_record(
             "heartbeat_expired": heartbeat_expired,
             "cache_bytes": cache_bytes,
             "cache_error": cache_error,
+            "cache_status": cache_status,
         },
         agent_running,
     )
@@ -15737,8 +16459,14 @@ def _audit_validate_batch_seal_evidence(
 
 
 def _cmd_audit(args: argparse.Namespace) -> int:
+    if args.cache_work_limit < 1:
+        raise Refusal("--cache-work-limit must be positive")
+    if not (math.isfinite(args.cache_wall_seconds) and args.cache_wall_seconds > 0):
+        raise Refusal("--cache-wall-seconds must be finite and positive")
     config = _load_config(args.project_root, args.machine)
+    metrics = _AuditMetrics()
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
+        registry_started = metrics.start()
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, _archives = _validate_global_state(config)
         records = [record for state in states for record in state.slots]
@@ -15751,6 +16479,34 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             for machine, slot, generation, path in seal_targets
         }
         represented_seals: set[tuple[str, str, int]] = set()
+        journal_slots = {slot.slot: slot for slot in _all_journal_cache_slots(config)}
+        metrics.finish(
+            "registry",
+            registry_started,
+            {
+                "active_rows": len(records),
+                "event_records": sum(len(events) for events in event_logs.values()),
+                "machine_shards": len(states),
+                "recovery_journals": len(journal_slots),
+                "validation_seals": len(seal_targets),
+            },
+        )
+        liveness_started = metrics.start()
+        registered_liveness = _registered_liveness_states(config, records)
+        metrics.finish(
+            "liveness",
+            liveness_started,
+            {
+                "batch_invocations": int(
+                    bool(records) and config.liveness_batch_command is not None
+                ),
+                "legacy_invocations": (
+                    0 if config.liveness_batch_command is not None else len(records)
+                ),
+                "subjects": len(records),
+            },
+        )
+        census_started = metrics.start()
         process_census: _ProcessPathCensus | None = None
         process_census_error: str | None = None
         if records:
@@ -15760,10 +16516,81 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 )
             except Refusal as exc:
                 process_census_error = f"process/path census failed: {exc}"
-        journal_slots = {slot.slot: slot for slot in _all_journal_cache_slots(config)}
+        metrics.finish(
+            "process-census",
+            census_started,
+            {
+                "census_attempted": int(bool(records)),
+                "slot_paths": len(records),
+            },
+        )
+        on_disk: set[tuple[str, str]] = set()
+        for slot_type, root in _slot_roots(config).items():
+            if not root.exists():
+                continue
+            try:
+                on_disk.update(
+                    (slot_type, entry.name)
+                    for entry in root.iterdir()
+                    if entry.is_dir()
+                    and not entry.is_symlink()
+                    and not entry.name.startswith("EVENTS.")
+                    and not (
+                        slot_type == "agent"
+                        and entry == _validate_slots_directory(config)
+                    )
+                )
+            except OSError as exc:
+                raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
+        registered = {(record.slot_type, record.slot) for record in records}
         rows: list[dict[str, object]] = []
         running_agent_count = 0
         audit_vcs = _AuditGitVcs()
+        cache_planned: dict[str, tuple[CacheDirectory, ...]] = {}
+        cache_errors: dict[str, str] = {}
+        record_cache_subjects: dict[tuple[str, str, int], str] = {}
+        unregistered_cache_subjects: dict[tuple[str, str], str] = {}
+        for record in records:
+            subject = f"record:{record.machine}:{record.slot}:{record.generation}"
+            record_cache_subjects[(record.machine, record.slot, record.generation)] = subject
+            try:
+                cache_planned[subject] = _cache_directories(
+                    config, record.checkouts, vcs=audit_vcs
+                )
+            except Refusal as exc:
+                cache_planned[subject] = ()
+                cache_errors[subject] = str(exc)
+        for slot_type, slot in sorted(on_disk - registered):
+            subject = f"unregistered:{slot_type}:{slot}"
+            unregistered_cache_subjects[(slot_type, slot)] = subject
+            if slot_type != "agent":
+                cache_planned[subject] = ()
+                continue
+            try:
+                journal_slot = journal_slots.get(slot)
+                unregistered = (
+                    journal_slot
+                    if journal_slot is not None
+                    else CacheSlot(slot, config.machine, (), "unregistered")
+                )
+                cache_planned[subject] = _cache_slot_directories(
+                    config, unregistered, vcs=audit_vcs
+                )
+            except Refusal as exc:
+                cache_planned[subject] = ()
+                cache_errors[subject] = str(exc)
+        cache_started = metrics.start()
+        cache_measurements, cache_work = _audit_cache_census(
+            config,
+            states,
+            cache_planned,
+            cache_errors,
+            state_path=_audit_cache_state_path(config, args.cache_census_state),
+            work_limit=args.cache_work_limit,
+            wall_seconds=args.cache_wall_seconds,
+        )
+        metrics.finish("cache-census", cache_started, cache_work)
+        records_started = metrics.start()
         for record in records:
             row, running = _audit_record(
                 config,
@@ -15772,6 +16599,14 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 vcs=audit_vcs,
                 process_census=process_census,
                 process_census_error=process_census_error,
+                registered_liveness=registered_liveness[
+                    (record.machine, record.slot, record.generation)
+                ],
+                cache_measurement=cache_measurements[
+                    record_cache_subjects[
+                        (record.machine, record.slot, record.generation)
+                    ]
+                ],
             )
             journal_slot = journal_slots.get(record.slot)
             if journal_slot is not None:
@@ -15807,42 +16642,18 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 )
             rows.append(row)
             running_agent_count += int(running)
-        on_disk: set[tuple[str, str]] = set()
-        for slot_type, root in _slot_roots(config).items():
-            if not root.exists():
-                continue
-            try:
-                on_disk.update(
-                    (slot_type, entry.name)
-                    for entry in root.iterdir()
-                    if entry.is_dir()
-                    and not entry.is_symlink()
-                    and not entry.name.startswith("EVENTS.")
-                    and not (slot_type == "agent" and entry == _validate_slots_directory(config))
-                )
-            except OSError as exc:
-                raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
-        registered = {(record.slot_type, record.slot) for record in records}
+        metrics.finish(
+            "registered-rows",
+            records_started,
+            {"rows": len(records)},
+        )
+        storage_started = metrics.start()
         for slot_type, slot in sorted(on_disk - registered):
             journal_slot = journal_slots.get(slot)
             sealed = seal_by_slot.get((config.machine, slot))
-            cache_bytes = 0
-            cache_error: str | None = None
-            if slot_type == "agent":
-                try:
-                    unregistered = (
-                        journal_slot
-                        if journal_slot is not None
-                        else CacheSlot(slot, config.machine, (), "unregistered")
-                    )
-                    cache_bytes = sum(
-                        _allocated_cache_bytes(config, cache)
-                        for cache in _cache_slot_directories(
-                            config, unregistered, vcs=audit_vcs
-                        )
-                    )
-                except Refusal as exc:
-                    cache_error = str(exc)
+            cache_measurement = cache_measurements[
+                unregistered_cache_subjects[(slot_type, slot)]
+            ]
             rows.append(
                 {
                     "slot": slot,
@@ -15886,8 +16697,9 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                         )
                     ),
                     "liveness_state": "unverifiable",
-                    "cache_bytes": cache_bytes,
-                    "cache_error": cache_error,
+                    "cache_bytes": cache_measurement.bytes,
+                    "cache_error": cache_measurement.error,
+                    "cache_status": cache_measurement.status,
                 }
             )
             if sealed is not None:
@@ -15915,6 +16727,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     "liveness_state": "unverifiable",
                     "cache_bytes": 0,
                     "cache_error": None,
+                    "cache_status": "complete",
                 }
             )
         for machine, slot, generation, sealed_path in seal_targets:
@@ -15937,6 +16750,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     "liveness_state": "unverifiable",
                     "cache_bytes": 0,
                     "cache_error": None,
+                    "cache_status": "complete",
                 }
             )
         for seal_error_machine, journal_name, error in seal_errors:
@@ -15956,10 +16770,20 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     "liveness_state": "unverifiable",
                     "cache_bytes": 0,
                     "cache_error": None,
+                    "cache_status": "complete",
                 }
             )
         worktree_count = len(on_disk)
         disk = _disk_status(config)
+        metrics.finish(
+            "storage",
+            storage_started,
+            {
+                "on_disk_rows": len(on_disk),
+                "output_rows": len(rows),
+                "unregistered_rows": len(on_disk - registered),
+            },
+        )
     sorted_rows = sorted(rows, key=lambda row: str(row["slot"]))
     attention = [
         row
@@ -16047,6 +16871,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         "remote_refs_refreshed": False,
         "disk": disk,
         "slots": sorted_rows,
+        "metrics": metrics.to_obj(),
     }
     if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -29604,6 +30429,15 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     init.add_argument(
+        "--liveness-batch-command",
+        metavar="PATH",
+        help=(
+            "optional executable path relative to the project root implementing the "
+            "typed wrkslots batch-liveness protocol used by audit; removal continues "
+            "to call --liveness-command for one exact subject"
+        ),
+    )
+    init.add_argument(
         "--max-active-slots",
         type=int,
         default=None,
@@ -29678,10 +30512,40 @@ usage or audit gate unknown, 3 fail-closed refusal.
 
     audit = subparsers.add_parser(
         "audit",
-        description="read-only leak audit with per-slot deletion verdicts",
+        description=(
+            "lifecycle-read-only leak audit with per-slot deletion verdicts; may update "
+            "only regenerable cache-accounting census state"
+        ),
         help="show leak counts and DELETABLE/BLOCKED/HELD verdicts",
     )
     audit.add_argument("--format", choices=("human", "json"), default="human")
+    audit.add_argument(
+        "--cache-census-state",
+        metavar="PATH",
+        help=(
+            "absolute resumable cache-accounting state path (default: a project-keyed "
+            "file below XDG_CACHE_HOME or ~/.cache); never stores lifecycle authority"
+        ),
+    )
+    audit.add_argument(
+        "--cache-work-limit",
+        type=int,
+        default=_AUDIT_CACHE_WORK_LIMIT,
+        metavar="ENTRIES",
+        help=(
+            f"maximum cache entries visited per invocation (default: {_AUDIT_CACHE_WORK_LIMIT})"
+        ),
+    )
+    audit.add_argument(
+        "--cache-wall-seconds",
+        type=float,
+        default=_AUDIT_CACHE_WALL_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "cache-accounting wall budget before publishing null/partial "
+            f"(default: {_AUDIT_CACHE_WALL_SECONDS:g})"
+        ),
+    )
     audit.add_argument(
         "--gate",
         action="store_true",

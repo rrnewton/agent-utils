@@ -709,6 +709,7 @@ def initialize(
     repo_cache_globs: tuple[tuple[str, str], ...] = (),
     post_provision_hooks: tuple[str, ...] = (),
     disk_thresholds_gib: tuple[int, int, int] | None = None,
+    liveness_batch: bool = False,
 ) -> None:
     liveness = project / "liveness.py"
     if not liveness.exists():
@@ -723,6 +724,27 @@ def initialize(
             encoding="utf-8",
         )
         liveness.chmod(0o755)
+    batch_liveness = project / "liveness-batch.py"
+    if liveness_batch and not batch_liveness.exists():
+        batch_liveness.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, sys\n"
+            "root = pathlib.Path(os.environ['WRKSLOTS_PROJECT_ROOT'])\n"
+            "state = (root / 'liveness-result').read_text().strip()\n"
+            "request = json.load(sys.stdin)\n"
+            "print(json.dumps({\n"
+            "  'schema': 'wrkslots-liveness-batch-response/v1',\n"
+            "  'request_sha256': request['request_sha256'],\n"
+            "  'results': [\n"
+            "    {'subject_id': item['subject_id'], 'agent': item['agent'],\n"
+            "     'state': state if state in {'dead', 'alive', 'unverifiable'} else 'unverifiable',\n"
+            "     'detail': state if state in {'dead', 'alive', 'unverifiable'} else 'unexpected fixture state'}\n"
+            "    for item in request['subjects']\n"
+            "  ],\n"
+            "}, sort_keys=True))\n",
+            encoding="utf-8",
+        )
+        batch_liveness.chmod(0o755)
     (project / "liveness-result").write_text("alive\n", encoding="utf-8")
     argv = [
         sys.executable,
@@ -736,6 +758,8 @@ def initialize(
         "--liveness-command",
         "liveness.py",
     ]
+    if liveness_batch:
+        argv.extend(("--liveness-batch-command", "liveness-batch.py"))
     if layout is not None:
         argv.extend(("--layout", layout))
     for cache_glob in cache_globs:
@@ -776,6 +800,7 @@ def make_project(
     repo_cache_globs: tuple[tuple[str, str], ...] = (),
     post_provision_hooks: tuple[str, ...] = (),
     disk_thresholds_gib: tuple[int, int, int] | None = None,
+    liveness_batch: bool = False,
 ) -> tuple[Path, Path, Path]:
     remote = tmp_path / "remote.git"
     project = tmp_path / "project"
@@ -813,6 +838,7 @@ def make_project(
         repo_cache_globs=repo_cache_globs,
         post_provision_hooks=post_provision_hooks,
         disk_thresholds_gib=disk_thresholds_gib,
+        liveness_batch=liveness_batch,
     )
     return project, repository, remote
 
@@ -21333,6 +21359,17 @@ def test_init_recovers_complete_configuration_temp_without_durable_target(
     assert config["liveness_command"] == "liveness.py"
 
 
+def test_init_records_optional_batch_liveness_command(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+
+    initialize(project, liveness_batch=True)
+
+    config = json.loads((project / ".wrkslots.yml").read_text(encoding="utf-8"))
+    assert config["liveness_command"] == "liveness.py"
+    assert config["liveness_batch_command"] == "liveness-batch.py"
+
+
 def test_create_recovery_refuses_journal_filename_for_another_machine(
     tmp_path: Path,
 ) -> None:
@@ -23949,6 +23986,23 @@ def test_audit_reports_deletable_blocked_held_and_the_leak_invariant(
     assert rows["slot02"]["verdict"] == "BLOCKED"
     assert rows["slot02"]["reasons"]
     assert rows["slot03"]["verdict"] == "HELD"
+    metrics = payload["metrics"]
+    assert metrics["schema"] == wrkslots._AUDIT_METRICS_SCHEMA
+    assert [phase["name"] for phase in metrics["phases"]] == [
+        "registry",
+        "liveness",
+        "process-census",
+        "cache-census",
+        "registered-rows",
+        "storage",
+    ]
+    for phase in metrics["phases"]:
+        assert type(phase["wall_seconds"]) is float
+        assert type(phase["cpu_seconds"]) is float
+        assert phase["wall_seconds"] >= 0
+        assert phase["cpu_seconds"] >= 0
+        assert phase["work"]
+        assert all(type(value) is int and value >= 0 for value in phase["work"].values())
     assert (control_directory(project) / "ACTIVE.testhost.json").read_bytes() == state_before
 
     gate_code = wrkslots.main(["--project-root", str(project), "audit", "--gate"])
@@ -24004,6 +24058,119 @@ def test_audit_reports_deletable_blocked_held_and_the_leak_invariant(
         "liveness" in reason.lower() or "unexpected rc" in reason.lower()
         for reason in failed_rows["slot01"]["reasons"]
     )
+
+
+def test_audit_partial_cache_census_cannot_upgrade_deletion_eligibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    made = create(project, slot="bounded", agent="codex-bounded", branch="codex/bounded")
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, "bounded")
+    commit_task(repository, tree, "codex/bounded")
+    finished = finish(project, slot="bounded", agent="codex-bounded")
+    assert finished.returncode == 0, finished.stderr
+    cache = tree / "target"
+    cache.mkdir()
+    for index in range(4):
+        (cache / f"artifact-{index}").write_bytes(bytes([index]) * 4096)
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    expire_heartbeat(project)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+    state_path = tmp_path / "bounded-cache-census.json"
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "audit",
+                "--format",
+                "json",
+                "--cache-census-state",
+                str(state_path),
+                "--cache-work-limit",
+                "1",
+            ]
+        )
+        == 0
+    )
+    partial = json.loads(capsys.readouterr().out)["slots"][0]
+    assert partial["cache_bytes"] is None
+    assert partial["cache_status"] == "partial"
+    assert partial["verdict"] == "BLOCKED"
+    assert partial["reasons"] == [
+        "cache inspection incomplete: bounded census is partial"
+    ]
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "audit",
+                "--format",
+                "json",
+                "--cache-census-state",
+                str(state_path),
+                "--cache-work-limit",
+                "100",
+            ]
+        )
+        == 0
+    )
+    complete = json.loads(capsys.readouterr().out)["slots"][0]
+    assert complete["cache_status"] == "complete"
+    assert type(complete["cache_bytes"]) is int
+    assert complete["verdict"] == "DELETABLE"
+    assert complete["reasons"] == []
+
+
+def test_audit_invokes_configured_batch_liveness_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path, liveness_batch=True)
+    made = create(
+        project,
+        slot="batch-audit",
+        agent="codex-batch",
+        branch=None,
+        slot_type="validate",
+    )
+    assert made.returncode == 0, made.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    expire_heartbeat(project)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    assert (
+        wrkslots.main(
+            ["--project-root", str(project), "audit", "--format", "json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    phases = {phase["name"]: phase for phase in payload["metrics"]["phases"]}
+    assert phases["liveness"]["work"] == {
+        "batch_invocations": 1,
+        "legacy_invocations": 0,
+        "subjects": 1,
+    }
+    assert payload["slots"][0]["liveness_state"] == "dead"
+    assert payload["slots"][0]["verdict"] == "DELETABLE"
 
 
 def test_audit_blocks_agent_slot_when_submodule_remote_differs_from_source(

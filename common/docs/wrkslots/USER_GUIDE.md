@@ -97,10 +97,19 @@ operation then touches only registered slots and prints how many unregistered di
 retained. It never uses that flag as permission to inspect, select, or remove one of them. Run
 `wrkslots audit --format json` and import each live slot only after verifying its process evidence.
 
-`wrkslots audit --gate` is the read-only coordinator reminder. It exits 1 for reclaimable,
+`wrkslots audit --gate` is the lifecycle-read-only coordinator reminder. It exits 1 for reclaimable,
 interrupted, or unregistered slots; exits 2 when an expired slot cannot be classified because
 evidence is unavailable; and exits 0 only when neither condition exists. The output names the
 affected slots and the next command. It never converts an unknown result into permission to remove.
+Audit may update only its regenerable, project-keyed cache-accounting census below
+`XDG_CACHE_HOME` (or the absolute path supplied with `--cache-census-state`); it does not change a
+registry, worktree, hold, journal, handoff, or Git repository. `--cache-work-limit` and
+`--cache-wall-seconds` bound each invocation. Until the census has visited and reverified every
+directory, JSON reports `cache_bytes: null` and `cache_status: "partial"`, and that incomplete
+evidence keeps the row out of `DELETABLE`. The state is keyed by the active-registry revision and
+cache-root identity and carries no lifecycle authority. JSON also reports typed CPU seconds, wall
+seconds, and work counters for the registry, liveness, process-census, cache-census,
+registered-row, and storage phases.
 
 ## Time-to-live and process evidence
 
@@ -122,6 +131,17 @@ Only `0` satisfies that reclaim condition. The exact recorded process generation
 be dead, and the full process-use scan must find no cwd, executable, root, descriptor, mapping,
 cgroup, or mount use. If the liveness source is degraded or stale, return `2`; unknown ownership is
 not a free slot.
+
+Large registries should configure `init --liveness-batch-command PATH`. Audit then invokes that
+project-owned command once, with a `wrkslots-liveness-batch-request/v1` JSON object on standard
+input. Every request subject contains the agent and the complete environment that the
+single-subject command would receive; its SHA-256 `subject_id` binds those exact values. The command
+must return `wrkslots-liveness-batch-response/v1`, echo the request SHA-256, and provide exactly one
+result for every subject with the same subject ID and agent, a state of `dead`, `alive`, or
+`unverifiable`, and one bounded detail line. A missing, duplicate, unknown, malformed, or misbound
+result makes every subject in that batch unverifiable. There is no permissive fallback after a
+configured batch command fails. Configurations without the optional command retain the established
+per-agent protocol.
 
 A slot imported from an older state file with no recorded owner identity cannot satisfy the
 owner-death condition, even after its heartbeat expires. `recover-unbound-owner` can record what was

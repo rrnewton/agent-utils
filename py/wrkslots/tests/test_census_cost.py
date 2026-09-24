@@ -8,12 +8,63 @@ never wall time, so they mean the same thing on a loaded box as on an idle one.
 
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from wrkslots import cli
+
+
+def _config(tmp_path: Path, *, batch: bool = False) -> cli.Config:
+    root = tmp_path / "project"
+    worktrees = root / "worktrees"
+    root.mkdir(exist_ok=True)
+    worktrees.mkdir(exist_ok=True)
+    liveness = root / "liveness.py"
+    liveness.write_text("raise SystemExit(2)\n", encoding="utf-8")
+    batch_path = root / "liveness-batch.py"
+    if batch:
+        batch_path.write_text("raise SystemExit(2)\n", encoding="utf-8")
+    return cli.Config(
+        root=root,
+        config_path=root / ".wrkslots.yml",
+        worktrees=worktrees,
+        control=worktrees,
+        machine="testhost",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=3600,
+        liveness_command=liveness,
+        liveness_batch_command=batch_path if batch else None,
+    )
+
+
+def _records(count: int) -> tuple[cli.ActiveRecord, ...]:
+    coordinator = cli.ProcessIdentity(1, 1, "boot", "host", "/fixture")
+    return tuple(
+        cli.ActiveRecord(
+            slot=f"slot-{index:03d}",
+            agent=f"agent-{index:03d}",
+            task=f"task-{index:03d}",
+            purpose="batch equivalence fixture",
+            slot_type="agent",
+            machine="testhost",
+            generation=1,
+            created_at="2026-01-01T00:00:00+00:00",
+            heartbeat_at="2026-01-01T00:00:00+00:00",
+            heartbeat_ttl_seconds=3600,
+            owner=None,
+            coordinator_lease=coordinator,
+            coordinator_recovery_note=None,
+            handoff=None,
+            checkouts=(),
+        )
+        for index in range(count)
+    )
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -234,3 +285,283 @@ def test_mountinfo_parse_cache_never_stores_a_refusal(
         cli._parse_mountinfo_paths(malformed, "mount evidence for PID 22", cache)
 
     assert cache == {}
+
+
+@pytest.mark.parametrize("row_count", (64, 128, 256))
+def test_batch_liveness_matches_per_subject_results_with_one_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    row_count: int,
+) -> None:
+    config = _config(tmp_path, batch=True)
+    records = _records(row_count)
+    calls = 0
+
+    def run(
+        _command: list[str],
+        *,
+        input_data: bytes,
+        **_kwargs: object,
+    ) -> tuple[int, bytes, bytes]:
+        nonlocal calls
+        calls += 1
+        request = json.loads(input_data)
+        results = []
+        for index, subject in enumerate(request["subjects"]):
+            state = ("dead", "alive", "unverifiable")[index % 3]
+            results.append(
+                {
+                    "subject_id": subject["subject_id"],
+                    "agent": subject["agent"],
+                    "state": state,
+                    "detail": f"fixture {state}",
+                }
+            )
+        response = {
+            "schema": cli._LIVENESS_BATCH_RESPONSE_SCHEMA,
+            "request_sha256": request["request_sha256"],
+            "results": results,
+        }
+        return 0, json.dumps(response).encode("utf-8"), b""
+
+    monkeypatch.setattr(cli, "_run_bounded_read_only_command", run)
+
+    def run_legacy(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        index = int(command[-1].rsplit("-", 1)[1])
+        state = ("dead", "alive", "unverifiable")[index % 3]
+        return subprocess.CompletedProcess(
+            command,
+            {"dead": 0, "alive": 1, "unverifiable": 2}[state],
+            f"fixture {state}\n",
+            "",
+        )
+
+    monkeypatch.setattr(subprocess, "run", run_legacy)
+
+    observed = cli._registered_liveness_states(config, records)
+    legacy = cli._registered_liveness_states(
+        replace(config, liveness_batch_command=None), records
+    )
+
+    assert calls == 1
+    assert observed == legacy
+    assert len(observed) == row_count
+
+
+@pytest.mark.parametrize("mutation", ("missing", "duplicate", "misbound", "wrong-request"))
+def test_batch_liveness_goalpost_mutations_fail_closed(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config = _config(tmp_path, batch=True)
+    request = cli._liveness_batch_request(config, _records(2))
+    subjects = request["subjects"]
+    assert isinstance(subjects, list)
+    results = [
+        {
+            "subject_id": subject["subject_id"],
+            "agent": subject["agent"],
+            "state": "dead",
+            "detail": "fixture dead",
+        }
+        for subject in subjects
+    ]
+    response = {
+        "schema": cli._LIVENESS_BATCH_RESPONSE_SCHEMA,
+        "request_sha256": request["request_sha256"],
+        "results": results,
+    }
+    if mutation == "missing":
+        results.pop()
+    elif mutation == "duplicate":
+        results.append(dict(results[0]))
+    elif mutation == "misbound":
+        results[0]["agent"] = "another-agent"
+    else:
+        response["request_sha256"] = "0" * 64
+
+    with pytest.raises(cli.Refusal):
+        cli._parse_liveness_batch_response(json.dumps(response), request)
+
+
+def test_batch_liveness_malformed_response_makes_every_subject_unverifiable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, batch=True)
+    records = _records(4)
+    monkeypatch.setattr(
+        cli,
+        "_run_bounded_read_only_command",
+        lambda _command, **_kwargs: (0, b"not-json", b""),
+    )
+
+    observed = cli._registered_liveness_states(config, records)
+
+    assert set(state for state, _detail in observed.values()) == {"unverifiable"}
+    assert all("not JSON" in detail for _state, detail in observed.values())
+
+
+def test_cache_census_is_partial_then_resumes_exactly(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    for index in range(9):
+        (cache / f"file-{index}").write_bytes(bytes([index]) * (index + 1))
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    planned = {
+        "subject": (
+            cli.CacheDirectory(
+                path=cache,
+                checkout_root=checkout,
+                checkout_device=checkout_identity[0],
+                checkout_inode=checkout_identity[1],
+                checkout_mount_id=checkout_identity[2],
+            ),
+        )
+    }
+    states = (cli.ActiveState("testhost", 7, ()),)
+    state_path = tmp_path / "cache-state.json"
+    statuses: list[str] = []
+    work: list[int] = []
+
+    for _ in range(10):
+        measured, counters = cli._audit_cache_census(
+            config,
+            states,
+            planned,
+            {},
+            state_path=state_path,
+            work_limit=2,
+            wall_seconds=5,
+        )
+        statuses.append(measured["subject"].status)
+        work.append(counters["work_consumed"])
+        if measured["subject"].status == "complete":
+            break
+
+    expected = sum(path.stat().st_blocks * 512 for path in (cache, *cache.iterdir()))
+    assert statuses[0] == "partial"
+    assert statuses[-1] == "complete"
+    assert measured["subject"].bytes == expected
+    assert all(value <= 2 for value in work)
+    assert state_path.is_file()
+
+
+def test_cache_census_identity_change_never_reuses_completed_bytes(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    (cache / "old").write_bytes(b"old")
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+
+    def planned() -> dict[str, tuple[cli.CacheDirectory, ...]]:
+        return {
+            "subject": (
+                cli.CacheDirectory(
+                    path=cache,
+                    checkout_root=checkout,
+                    checkout_device=checkout_identity[0],
+                    checkout_inode=checkout_identity[1],
+                    checkout_mount_id=checkout_identity[2],
+                ),
+            )
+        }
+
+    states = (cli.ActiveState("testhost", 9, ()),)
+    state_path = tmp_path / "cache-state.json"
+    first, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned(),
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+    assert first["subject"].status == "complete"
+    old_bytes = first["subject"].bytes
+
+    shutil.rmtree(cache)
+    cache.mkdir()
+    for index in range(5):
+        (cache / f"new-{index}").write_bytes(b"new contents")
+    second, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned(),
+        {},
+        state_path=state_path,
+        work_limit=1,
+        wall_seconds=5,
+    )
+
+    assert second["subject"].status == "partial"
+    assert second["subject"].bytes is None
+    assert second["subject"].bytes != old_bytes
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(persisted["roots"]) == 1
+
+
+def test_cache_census_refuses_mutated_resume_path_outside_root(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    (cache / "inside").write_bytes(b"inside")
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    planned = {
+        "subject": (
+            cli.CacheDirectory(
+                path=cache,
+                checkout_root=checkout,
+                checkout_device=checkout_identity[0],
+                checkout_inode=checkout_identity[1],
+                checkout_mount_id=checkout_identity[2],
+            ),
+        )
+    }
+    states = (cli.ActiveState("testhost", 11, ()),)
+    state_path = tmp_path / "cache-state.json"
+    first, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=1,
+        wall_seconds=5,
+    )
+    assert first["subject"].status == "partial"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    root = next(iter(state["roots"].values()))
+    root["pending"] = [".."]
+    root["current"] = None
+    root["status"] = "partial"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    observed, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=10,
+        wall_seconds=5,
+    )
+
+    assert observed["subject"].status == "error"
+    assert observed["subject"].bytes is None
+    assert observed["subject"].error is not None
+    assert "not canonical" in observed["subject"].error

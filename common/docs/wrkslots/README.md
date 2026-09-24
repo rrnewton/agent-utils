@@ -153,7 +153,12 @@ contract.
 
 For a periodic coordinator reminder, `wrkslots audit --gate` returns 1 when a slot is ready for
 reclaim or an interrupted/unregistered slot needs attention, 2 when expired-slot evidence is
-unavailable, and 0 when no action is currently indicated. It never removes anything.
+unavailable, and 0 when no action is currently indicated. A configured batch liveness command is
+called once for the complete subject-bound registry set; malformed, missing, duplicate, or misbound
+results fail closed. Recursive cache bytes use a bounded resumable census: incomplete counts are
+reported as null/partial and cannot make a slot deletable. JSON includes per-phase CPU, wall, and
+work counters. Audit never removes anything or changes lifecycle state; it may update only its
+regenerable project-keyed cache-accounting state below `XDG_CACHE_HOME` or an explicit census path.
 
 ## Development and stress testing
 
