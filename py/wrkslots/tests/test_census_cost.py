@@ -695,8 +695,10 @@ def test_completed_cache_census_revalidates_nested_directories(
     assert "nested Git metadata" in changed["subject"].error
 
 
-def test_completed_cache_state_cannot_bypass_fresh_recursive_verification(
+@pytest.mark.parametrize("forged_status", ("complete", "partial"))
+def test_forged_cache_state_cannot_bypass_fresh_recursive_verification(
     tmp_path: Path,
+    forged_status: str,
 ) -> None:
     config = _config(tmp_path)
     checkout = config.root / "checkout"
@@ -716,16 +718,30 @@ def test_completed_cache_state_cannot_bypass_fresh_recursive_verification(
     assert identity is not None
     key = cli._audit_cache_root_key(directory, identity)
     forged = cli._new_audit_cache_root(directory, identity)
+    metadata = cache.stat()
     forged.update(
         {
-            "phase": "verify",
+            "phase": "finalize" if forged_status == "complete" else "verify",
             "bytes": 0,
             "verify_bytes": 0,
             "pending": [],
             "current": None,
-            "status": "complete",
+            "status": forged_status,
             "directories_visited": 1,
             "directories_verified": 1,
+            "verified_directories": [
+                {
+                    "path": ".",
+                    "identity": [
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mtime_ns,
+                        metadata.st_ctime_ns,
+                    ],
+                }
+            ],
+            "finalize_index": 1 if forged_status == "complete" else 0,
+            "directories_finalized": 1 if forged_status == "complete" else 0,
         }
     )
     state_path = tmp_path / "forged-complete.json"
@@ -754,6 +770,73 @@ def test_completed_cache_state_cannot_bypass_fresh_recursive_verification(
     assert measured["subject"].bytes is None
     assert measured["subject"].error is not None
     assert "nested Git metadata" in measured["subject"].error
+    key_path = state_path.with_name(f"{state_path.name}.key")
+    assert key_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_cache_census_finalization_rechecks_earlier_verification_chunks(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    for name in ("first", "second"):
+        directory = cache / name
+        directory.mkdir(parents=True)
+        (directory / "artifact").write_bytes(name.encode("ascii"))
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    cache_directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+    states = (cli.ActiveState("testhost", 18, ()),)
+    planned = {"subject": (cache_directory,)}
+    state_path = tmp_path / "cross-chunk-mutation.json"
+    changed: Path | None = None
+
+    for _ in range(40):
+        measured, _work = cli._audit_cache_census(
+            config,
+            states,
+            planned,
+            {},
+            state_path=state_path,
+            work_limit=1,
+            wall_seconds=5,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        root = next(iter(state["roots"].values()))
+        current = root.get("current")
+        current_path = current.get("path") if isinstance(current, dict) else None
+        completed_nested = [
+            item["path"]
+            for item in root["verified_directories"]
+            if item["path"] != "." and item["path"] != current_path
+        ]
+        if root["phase"] == "verify" and completed_nested:
+            changed = cache / completed_nested[0]
+            (changed / ".git").mkdir()
+            break
+    assert changed is not None
+    assert measured["subject"].status == "partial"
+
+    observed, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert observed["subject"].status == "error"
+    assert observed["subject"].bytes is None
+    assert observed["subject"].error is not None
+    assert "changed before final publication" in observed["subject"].error
 
 
 def test_completed_cache_state_rechecks_file_allocation(
@@ -822,8 +905,6 @@ def test_cache_census_counts_symlink_without_following_like_historical_scan(
         checkout_inode=checkout_identity[1],
         checkout_mount_id=checkout_identity[2],
     )
-    expected = cli._allocated_cache_bytes(config, directory)
-
     measured, _work = cli._audit_cache_census(
         config,
         (cli.ActiveState("testhost", 17, ()),),
@@ -834,5 +915,6 @@ def test_cache_census_counts_symlink_without_following_like_historical_scan(
         wall_seconds=5,
     )
 
+    expected = cli._allocated_cache_bytes(config, directory)
     assert measured["subject"].status == "complete"
     assert measured["subject"].bytes == expected

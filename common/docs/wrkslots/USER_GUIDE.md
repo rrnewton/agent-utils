@@ -102,13 +102,17 @@ interrupted, or unregistered slots; exits 2 when an expired slot cannot be class
 evidence is unavailable; and exits 0 only when neither condition exists. The output names the
 affected slots and the next command. It never converts an unknown result into permission to remove.
 Audit may update only its regenerable, project-keyed cache-accounting census below
-`XDG_CACHE_HOME` (or the absolute path supplied with `--cache-census-state`); it does not change a
+`XDG_CACHE_HOME` (or a canonical absolute path outside the managed project supplied with
+`--cache-census-state`); it does not change a
 registry, worktree, hold, journal, handoff, or Git repository. `--cache-work-limit` and
 `--cache-wall-seconds` bound each invocation. Until the census has visited and reverified every
 directory, JSON reports `cache_bytes: null` and `cache_status: "partial"`, and that incomplete
 evidence keeps the row out of `DELETABLE`. The state is keyed by the active-registry revision and
-cache-root identity and carries no lifecycle authority. JSON also reports typed CPU seconds, wall
-seconds, and work counters for the registry, liveness, process-census, cache-census,
+cache-root identity. Persisted progress is authenticated by a sibling 0600 key; missing or altered
+authentication restarts the bounded census instead of accepting claimed progress. Completion still
+requires a recursive verification pass and a final directory-identity sweep in the publishing
+invocation, so the progress file alone carries no lifecycle authority. JSON also reports typed CPU
+seconds, wall seconds, and work counters for the registry, liveness, process-census, cache-census,
 registered-row, and storage phases.
 
 ## Time-to-live and process evidence
