@@ -6052,7 +6052,20 @@ let preparedUntil = 0;
  * repeat: it is one request covering every visible row, against messages the server has usually
  * just fetched anyway. It spends NOTHING at the vendor — no audio is generated until a tap.
  */
+let prepareSpeechInFlight = null;
+
 async function prepareSpeech() {
+  if (prepareSpeechInFlight !== null) return prepareSpeechInFlight;
+  const running = prepareSpeechNow();
+  prepareSpeechInFlight = running;
+  try {
+    return await running;
+  } finally {
+    if (prepareSpeechInFlight === running) prepareSpeechInFlight = null;
+  }
+}
+
+async function prepareSpeechNow() {
   if (!readingMode || currentView !== "discord") {
     return;
   }
@@ -6282,8 +6295,16 @@ async function readAloud(ids) {
   // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
   // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
   // starts playing against a response the server is still writing.
-  const ready = parts.map((part) => preparedSpeech.get(part));
-  const streamed = ready.every((url) => typeof url === "string" && url.length > 0);
+  let ready = parts.map((part) => preparedSpeech.get(part));
+  let streamed = ready.every((url) => typeof url === "string" && url.length > 0);
+  // Turning Read on starts preparation in the background. A quick row tap joins that same work
+  // instead of falling back to a second provider lookup followed by fully buffered synthesis.
+  if (!streamed) {
+    await prepareSpeech();
+    if (ticket !== readingTicket) return;
+    ready = parts.map((part) => preparedSpeech.get(part));
+    streamed = ready.every((url) => typeof url === "string" && url.length > 0);
+  }
   let blobs;
   if (streamed) {
     blobs = null;
