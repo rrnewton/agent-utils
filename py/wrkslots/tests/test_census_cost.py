@@ -565,3 +565,131 @@ def test_cache_census_refuses_mutated_resume_path_outside_root(
     assert observed["subject"].bytes is None
     assert observed["subject"].error is not None
     assert "not canonical" in observed["subject"].error
+
+
+def test_cache_census_single_large_directory_makes_bounded_progress(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    cache.mkdir(parents=True)
+    for index in range(1024):
+        (cache / f"artifact-{index:04d}").write_bytes(b"x")
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    planned = {
+        "subject": (
+            cli.CacheDirectory(
+                path=cache,
+                checkout_root=checkout,
+                checkout_device=checkout_identity[0],
+                checkout_inode=checkout_identity[1],
+                checkout_mount_id=checkout_identity[2],
+            ),
+        )
+    }
+    states = (cli.ActiveState("testhost", 12, ()),)
+    state_path = tmp_path / "large-cache-state.json"
+    consumed: list[int] = []
+
+    for _ in range(20):
+        measured, counters = cli._audit_cache_census(
+            config,
+            states,
+            planned,
+            {},
+            state_path=state_path,
+            work_limit=64,
+            wall_seconds=5,
+        )
+        consumed.append(counters["work_consumed"])
+        if measured["subject"].status == "complete":
+            break
+
+    assert measured["subject"].status == "complete"
+    assert all(0 < work <= 64 for work in consumed)
+    assert len(consumed) <= 18
+
+
+def test_cache_census_preserves_nested_git_metadata_refusal(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    nested = cache / "nested"
+    nested.mkdir(parents=True)
+    (nested / ".git").mkdir()
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+
+    with pytest.raises(cli.Refusal, match="nested Git metadata"):
+        cli._allocated_cache_bytes(config, directory)
+    measured, _work = cli._audit_cache_census(
+        config,
+        (cli.ActiveState("testhost", 13, ()),),
+        {"subject": (directory,)},
+        {},
+        state_path=tmp_path / "nested-git-state.json",
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert measured["subject"].status == "error"
+    assert measured["subject"].bytes is None
+    assert measured["subject"].error is not None
+    assert "nested Git metadata" in measured["subject"].error
+
+
+def test_completed_cache_census_revalidates_nested_directories(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    checkout = config.root / "checkout"
+    cache = checkout / "target"
+    nested = cache / "nested"
+    nested.mkdir(parents=True)
+    (nested / "artifact").write_bytes(b"artifact")
+    checkout_identity = cli._open_directory_identity(checkout, "checkout")
+    directory = cli.CacheDirectory(
+        path=cache,
+        checkout_root=checkout,
+        checkout_device=checkout_identity[0],
+        checkout_inode=checkout_identity[1],
+        checkout_mount_id=checkout_identity[2],
+    )
+    states = (cli.ActiveState("testhost", 14, ()),)
+    planned = {"subject": (directory,)}
+    state_path = tmp_path / "nested-mutation-state.json"
+    complete, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+    assert complete["subject"].status == "complete"
+
+    (nested / ".git").mkdir()
+    changed, _work = cli._audit_cache_census(
+        config,
+        states,
+        planned,
+        {},
+        state_path=state_path,
+        work_limit=100,
+        wall_seconds=5,
+    )
+
+    assert changed["subject"].status == "error"
+    assert changed["subject"].bytes is None
+    assert changed["subject"].error is not None
+    assert "changed before final verification" in changed["subject"].error

@@ -383,7 +383,7 @@ _LIVENESS_BATCH_REQUEST_SCHEMA = "wrkslots-liveness-batch-request/v1"
 _LIVENESS_BATCH_RESPONSE_SCHEMA = "wrkslots-liveness-batch-response/v1"
 _LIVENESS_BATCH_BYTES_LIMIT = 4 * 1024 * 1024
 _AUDIT_METRICS_SCHEMA = "wrkslots-audit-metrics/v1"
-_AUDIT_CACHE_CENSUS_SCHEMA = "wrkslots-audit-cache-census/v1"
+_AUDIT_CACHE_CENSUS_SCHEMA = "wrkslots-audit-cache-census/v2"
 _AUDIT_CACHE_STATE_BYTES_LIMIT = 64 * 1024 * 1024
 _AUDIT_CACHE_WORK_LIMIT = 100_000
 _AUDIT_CACHE_WALL_SECONDS = 5.0
@@ -15504,6 +15504,80 @@ class _AuditCacheMeasurement:
     error: str | None = None
 
 
+class _LinuxDirent(ctypes.Structure):
+    """glibc/Linux dirent layout used to retain an opaque telldir cursor."""
+
+    _fields_ = (
+        ("d_ino", ctypes.c_ulong),
+        ("d_off", ctypes.c_long),
+        ("d_reclen", ctypes.c_ushort),
+        ("d_type", ctypes.c_ubyte),
+        ("d_name", ctypes.c_char * 256),
+    )
+
+
+@contextlib.contextmanager
+def _audit_directory_stream(
+    directory_fd: int,
+    cursor: int,
+    label: str,
+) -> Iterator[Callable[[], tuple[str, int] | None]]:
+    """Open a seekable directory stream at one unchanged-directory cookie."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        fdopendir = libc.fdopendir
+        readdir = libc.readdir
+        telldir = libc.telldir
+        seekdir = libc.seekdir
+        closedir = libc.closedir
+    except AttributeError as exc:
+        raise Refusal(f"cache census directory cursors are unavailable for {label}") from exc
+    fdopendir.argtypes = [ctypes.c_int]
+    fdopendir.restype = ctypes.c_void_p
+    readdir.argtypes = [ctypes.c_void_p]
+    readdir.restype = ctypes.POINTER(_LinuxDirent)
+    telldir.argtypes = [ctypes.c_void_p]
+    telldir.restype = ctypes.c_long
+    seekdir.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    seekdir.restype = None
+    closedir.argtypes = [ctypes.c_void_p]
+    closedir.restype = ctypes.c_int
+    duplicate = os.dup(directory_fd)
+    stream = fdopendir(duplicate)
+    if stream is None:
+        error = ctypes.get_errno()
+        os.close(duplicate)
+        raise Refusal(f"cannot open cache census cursor for {label}: {os.strerror(error)}")
+    if cursor:
+        seekdir(stream, cursor)
+
+    def next_entry() -> tuple[str, int] | None:
+        ctypes.set_errno(0)
+        entry = readdir(stream)
+        if not entry:
+            error = ctypes.get_errno()
+            if error:
+                raise Refusal(
+                    f"cannot read cache census directory {label}: {os.strerror(error)}"
+                )
+            return None
+        name = os.fsdecode(bytes(entry.contents.d_name).split(b"\0", 1)[0])
+        next_cursor = int(telldir(stream))
+        if next_cursor < 0:
+            raise Refusal(f"cache census returned an invalid cursor for {label}")
+        return name, next_cursor
+
+    try:
+        yield next_entry
+    finally:
+        if closedir(stream) != 0:
+            error = ctypes.get_errno()
+            raise Refusal(
+                f"cannot close cache census directory {label}: {os.strerror(error)}"
+            )
+
+
 def _audit_cache_state_path(config: Config, explicit: str | None) -> Path:
     if explicit is not None:
         candidate = Path(explicit)
@@ -15722,7 +15796,7 @@ def _resume_audit_cache_root(
             root["visited"] = visited
             root["current"] = {
                 "path": relative,
-                "after": None,
+                "cursor": 0,
                 "identity": [
                     metadata.st_dev,
                     metadata.st_ino,
@@ -15733,8 +15807,9 @@ def _resume_audit_cache_root(
             current_raw = root["current"]
         current = dict(_as_mapping(current_raw, "cache census current"))
         relative = _as_str(current.get("path"), "cache census current.path")
-        after_value = current.get("after")
-        after = None if after_value is None else _as_str(after_value, "cache census current.after")
+        cursor = _as_int(current.get("cursor"), "cache census current.cursor")
+        if cursor < 0:
+            raise StateError("cache census current.cursor must be non-negative")
         expected_identity = tuple(
             _as_int(value, "cache census current identity")
             for value in _as_list(current.get("identity"), "cache census current.identity")
@@ -15751,31 +15826,44 @@ def _resume_audit_cache_root(
                 raise Refusal(
                     f"cache census directory changed while resuming: {cache.path / relative}"
                 )
-            found_after = after is None
-            exhausted = False
-            with os.scandir(fd) as entries:
-                for entry in entries:
-                    if not found_after:
-                        if entry.name == after:
-                            found_after = True
-                        continue
-                    if consumed >= work_remaining or time.monotonic() >= deadline:
-                        exhausted = True
+            complete = False
+            with _audit_directory_stream(
+                fd, cursor, str(cache.path / relative)
+            ) as next_entry:
+                while consumed < work_remaining and time.monotonic() < deadline:
+                    item = next_entry()
+                    if item is None:
+                        complete = True
                         break
+                    name, cursor = item
+                    current["cursor"] = cursor
+                    consumed += 1
+                    if name in {".", ".."}:
+                        continue
+                    if name == ".git":
+                        raise Refusal(
+                            f"cache directory contains nested Git metadata: "
+                            f"{cache.path / relative / name}"
+                        )
                     try:
-                        child = entry.stat(follow_symlinks=False)
+                        child = os.stat(name, dir_fd=fd, follow_symlinks=False)
                     except FileNotFoundError:
                         continue
+                    except OSError as exc:
+                        raise Refusal(
+                            f"cannot inspect cache entry "
+                            f"{cache.path / relative / name}: {exc}"
+                        ) from exc
                     if stat.S_ISLNK(child.st_mode):
                         raise Refusal(
-                            f"cache census encountered a symlink: {cache.path / relative / entry.name}"
+                            f"cache census encountered a symlink: "
+                            f"{cache.path / relative / name}"
                         )
                     root["entries_visited"] = _as_int(
                         root.get("entries_visited"), "cache census entries"
                     ) + 1
-                    consumed += 1
                     child_relative = (
-                        entry.name if relative == "." else f"{relative}/{entry.name}"
+                        name if relative == "." else f"{relative}/{name}"
                     )
                     if stat.S_ISDIR(child.st_mode):
                         pending = _as_list(root.get("pending"), "cache census pending")
@@ -15785,12 +15873,7 @@ def _resume_audit_cache_root(
                         root["bytes"] = _as_int(
                             root.get("bytes"), "cache census bytes"
                         ) + child.st_blocks * 512
-                    current["after"] = entry.name
-            if after is not None and not found_after:
-                raise Refusal(
-                    f"cache census resume marker disappeared: {cache.path / relative / after}"
-                )
-            if exhausted:
+            if not complete:
                 root["current"] = dict(current)
                 return consumed, False
             root["current"] = None
@@ -15850,6 +15933,8 @@ def _audit_cache_census(
                 continue
             key = _audit_cache_root_key(cache, identity)
             subject_keys.append(key)
+            if key in root_results:
+                continue
             root_raw = previous_roots.get(key)
             root = (
                 dict(root_raw)
@@ -15858,6 +15943,13 @@ def _audit_cache_census(
                 and root_raw.get("identity") == list(identity)
                 else _new_audit_cache_root(cache, identity)
             )
+            if root.get("status") == "complete":
+                # A completed byte count remains useful only after every
+                # visited directory is revalidated on this invocation. This
+                # catches nested structural mutations even when the cache
+                # root's own timestamps did not change.
+                root["status"] = "partial"
+                root["verify_index"] = 0
             before_dirs = _as_int(root.get("directories_visited"), "cache census directories")
             before_entries = _as_int(root.get("entries_visited"), "cache census entries")
             before_verified = _as_int(
@@ -16800,13 +16892,14 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         for row in sorted_rows
         if row["verdict"] == "UNKNOWN"
         or (
-            row["verdict"] == "BLOCKED"
-            and row.get("heartbeat_expired") is True
-            and (
+                row["verdict"] == "BLOCKED"
+                and row.get("heartbeat_expired") is True
+                and (
                 row["owner_state"] not in ("live", "dead")
-                or row["liveness_state"] not in ("alive", "dead")
-                or row["cache_error"] is not None
-                or any(
+                    or row["liveness_state"] not in ("alive", "dead")
+                    or row["cache_error"] is not None
+                    or row.get("cache_status") == "partial"
+                    or any(
                     token in str(reason).lower()
                     for reason in _as_list(row["reasons"], "audit row.reasons")
                     for token in ("cannot", "failed", "unavailable", "unknown")

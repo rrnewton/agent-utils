@@ -24116,6 +24116,27 @@ def test_audit_partial_cache_census_cannot_upgrade_deletion_eligibility(
                 "--project-root",
                 str(project),
                 "audit",
+                "--gate",
+                "--format",
+                "json",
+                "--cache-census-state",
+                str(state_path),
+                "--cache-work-limit",
+                "1",
+            ]
+        )
+        == 2
+    )
+    gated_partial = json.loads(capsys.readouterr().out)
+    assert gated_partial["state"] == "unknown"
+    assert gated_partial["unknown_slots"] == ["bounded"]
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "audit",
                 "--format",
                 "json",
                 "--cache-census-state",
