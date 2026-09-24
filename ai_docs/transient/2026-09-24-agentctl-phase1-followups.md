@@ -8,7 +8,9 @@ deliberately detection-first: it does not restart a harness or replay input.
 
 - `status`, `list`, and `health` distinguish the durable lifecycle from an
   observed runtime state. A positively proved shell fallback is `dead`; a
-  detector or transport failure without shell proof is `unknown`.
+  detector or transport failure without shell proof is `unknown`. A stale
+  expected Muse label cannot suppress an exact-process absence plus stable
+  descendant-free idle-shell proof.
 - Each name is checked independently. The aggregate result cannot lose later
   sessions because an earlier record is malformed or stale.
 - Per-generation observations retain exact reasons, first/current detection
@@ -16,14 +18,20 @@ deliberately detection-first: it does not restart a harness or replay input.
 - `health --watch SECONDS --interval SECONDS` polls for a bounded duration and
   exits immediately on a non-healthy result. It does not start, stop, or send.
 - Custom Muse startup retries transient incomplete process snapshots within the
-  existing startup deadline.
+  existing startup deadline, including command and malformed-response failures,
+  and preserves the last probe diagnostic if the deadline expires.
 - Before launching Muse, the record durably captures the canonical executable
   path, executable device/inode, and complete argv. `recover-start` requires the
   saved generation plus an operator-observed PID, matches those facts twice,
-  and can resume after an interrupted report/reconciliation step.
+  requires a visibly idle composer before publishing `idle`, and can resume
+  after an interrupted report/reconciliation step.
 - New records identify an owner-selected profile, non-secret environment
   variable names, and whether the runtime is owned or foreign. Secret values
   are never written to the record.
+- Headless health stores the runner PID and Linux start time and accepts a dead
+  result only from a typed `runner_alive: false` receipt bound to that exact
+  saved generation. Transport, decoding, and runtime errors remain `unknown`
+  regardless of diagnostic wording.
 
 ## Launch-intent gaps
 

@@ -497,6 +497,12 @@ expected-harness disappearance is `unhealthy`, while an unavailable Herdr
 transport is `unknown`. Both non-healthy outcomes exit 1 and are emitted as
 JSON.
 
+For headless workers, a dead result requires an explicit `runner_alive: false`
+observation whose name, PID, and Linux process start time all match the saved
+runner generation. Transport, decoding, and runtime errors remain `unknown`
+regardless of their wording, as does a liveness receipt for another process
+generation.
+
 Each check atomically updates `.agentctl/NAME/health.json` with the session
 token, exact reason, `first_detected_at`, and `last_checked_at` Unix timestamps.
 The file also retains the most recent unhealthy and unknown reason/timestamp
@@ -580,11 +586,13 @@ agentctl recover-start NAME --expected-token TOKEN --expected-pid PID
 This command accepts only that narrow failed-launch shape. It requires the saved
 pane, tab, workspace, and canonical working directory; the supplied PID; the
 complete saved launch argv; and the saved pinned Muse executable image to
-match twice before persisting identity. It then re-verifies that identity before
-reporting the pane and changing lifecycle to `running`. A failure after identity
-persistence remains `launch_failed` but becomes safely stoppable through the
-normal exact-identity path. The command never launches a replacement process or
-replays the initial brief.
+match twice before persisting identity. It then requires a visibly idle Muse
+composer and re-verifies that identity before reporting the pane as `idle` and
+changing lifecycle to `running`. Liveness without an idle-composer observation
+leaves the record `launch_failed`; it does not manufacture readiness. A failure
+after identity persistence remains safely stoppable through the normal
+exact-identity path. The command never launches a replacement process or replays
+the initial brief.
 
 A narrowly scoped recovery command exists only for an identity-less
 `herdr-foreign` record whose raw JSON omits `foreign_shell_identity`. Run

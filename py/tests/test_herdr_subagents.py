@@ -35,6 +35,7 @@ class FakeManagedClient:
         self.custom_dies_after_report = False
         self.custom_fails_after_observation = False
         self.custom_running = False
+        self.custom_ready = True
         self.custom_at_idle_shell = True
         self.custom_identity = CustomProcessIdentity(
             version=1, boot_id="00000000-0000-0000-0000-000000000000",
@@ -194,7 +195,13 @@ class FakeManagedClient:
 
     def read(self, pane_id: str, *, source: str, lines: int) -> str:
         assert pane_id in self.infos and lines > 0
-        return "" if source == "recent-unwrapped" else "human and coordinator transcript\n"
+        if source == "recent-unwrapped":
+            return ""
+        if self.custom_running:
+            if self.custom_ready:
+                return "Muse Code\n────────────────\n❯\n────────────────\nAuto-review\n"
+            return "Muse Code\nWorking…\n"
+        return "human and coordinator transcript\n"
 
     def close_tab(self, tab_id: str) -> None:
         self.closed.append(tab_id)
@@ -335,6 +342,25 @@ def test_health_does_not_call_live_muse_process_probe_failure_dead(
     assert session["health"] == "unknown"
     assert session["runtime_state"] == "unknown"
     assert session["reason_code"] == "custom-harness-verification-unconfirmed"
+    assert calls == 2
+
+
+def test_health_calls_stale_muse_label_dead_only_from_stable_shell_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    assert fake.infos["w1:p1"].agent == "muse"
+    fake.custom_running = False
+    fake.custom_at_idle_shell = True
+
+    result = manager.health(["worker"], checked_at=123.0)
+    session = cast(list[dict[str, object]], result["sessions"])[0]
+    assert fake.infos["w1:p1"].agent == "muse"
+    assert session["health"] == "unhealthy"
+    assert session["runtime_state"] == "dead"
+    assert session["reason_code"] == "expected-harness-missing"
+    assert "stable idle shell" in str(session["reason"])
 
 
 @pytest.mark.parametrize("mutation", ["workspace", "tab", "cwd", "session"])
@@ -666,6 +692,44 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
     recovered_identity = cast(dict[str, object], recovered["custom_process_identity"])
     assert recovered_identity["pid"] == fake.custom_identity.pid
     assert manager.get("worker").error is None
+    assert fake.submitted == []
+
+
+def test_failed_muse_recovery_does_not_report_idle_without_idle_composer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path), harness="muse")
+    record = replace(
+        manager.get("worker"), lifecycle="launch_failed",
+        custom_process_identity=None, pane_reported_by_agentctl=False,
+        session_agent=None, session_value=None,
+        error="transient process-info response",
+    )
+    manager._save(record)
+    fake.infos["w1:p1"] = replace(
+        fake.infos["w1:p1"], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+    fake.custom_ready = False
+    reports: list[tuple[str, str, str]] = []
+
+    def record_report(pane_id: str, kind: str, state: str) -> None:
+        reports.append((pane_id, kind, state))
+
+    monkeypatch.setattr(fake, "report_pane_agent", record_report)
+    with pytest.raises(AgentDeliveryError, match="no verified idle composer"):
+        manager.recover_start(
+            "worker", expected_token=str(started["token"]),
+            expected_pid=fake.custom_identity.pid,
+        )
+
+    partial = manager.get("worker")
+    assert partial.lifecycle == "launch_failed"
+    assert partial.pane_reported_by_agentctl is False
+    assert partial.custom_process_identity == fake.custom_identity
+    assert "no verified idle composer" in str(partial.error)
+    assert reports == []
     assert fake.submitted == []
 
 

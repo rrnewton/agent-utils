@@ -953,6 +953,10 @@ struct AgentRecord {
     launch_environment_names: Vec<String>,
     #[serde(default)]
     runtime_ownership: Option<String>,
+    #[serde(default)]
+    runner_pid: Option<u64>,
+    #[serde(default)]
+    runner_started_at: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
     name: String,
@@ -1111,6 +1115,15 @@ impl AgentRecord {
                 .runtime_ownership
                 .as_deref()
                 .is_some_and(|ownership| !matches!(ownership, "owned" | "foreign"))
+            || self
+                .runner_pid
+                .is_some_and(|pid| pid == 0 || pid > i32::MAX as u64)
+            || self.runner_started_at.as_deref().is_some_and(|started_at| {
+                started_at.is_empty()
+                    || !started_at.bytes().all(|byte| byte.is_ascii_digit())
+                    || started_at.bytes().all(|byte| byte == b'0')
+            })
+            || self.runner_pid.is_some() != self.runner_started_at.is_some()
             || self
                 .launch_argv
                 .iter()
@@ -2379,6 +2392,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .filter_map(|entry| entry.split_once('=').map(|(name, _)| name.to_owned()))
                 .collect(),
             runtime_ownership: Some("owned".to_owned()),
+            runner_pid: None,
+            runner_started_at: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -2515,6 +2530,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         record.custom_process_identity = Some(identity.clone());
         self.save(&record)?;
         let final_check = (|| -> Result<()> {
+            self.client
+                .verify_custom_harness(&pane_id, &record.harness, Some(&identity))?;
+            let screen = self.client.read(&pane_id, "visible", Some(200))?;
+            if !muse_idle_composer(&screen) {
+                return Err(fail(
+                    "start recovery found the exact Muse process but no verified idle composer",
+                ));
+            }
             self.client
                 .verify_custom_harness(&pane_id, &record.harness, Some(&identity))?;
             self.client
@@ -2736,6 +2759,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             launch_argv: Vec::new(),
             launch_environment_names: Vec::new(),
             runtime_ownership: Some("foreign".to_owned()),
+            runner_pid: None,
+            runner_started_at: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -3243,25 +3268,55 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 reason,
             );
         }
-        if info.agent.as_deref() != Some(record.harness.as_str()) {
-            if info.agent.is_none() {
-                if record.adapter == "herdr-pane"
-                    && record.custom_process_identity.is_some()
-                    && self
-                        .client
-                        .verify_custom_harness(
-                            pane_id,
-                            &record.harness,
-                            record.custom_process_identity.as_ref(),
-                        )
-                        .is_ok()
-                {
+        if record.adapter == "herdr-pane" {
+            if record.custom_process_identity.is_some()
+                && self
+                    .client
+                    .verify_custom_harness(
+                        pane_id,
+                        &record.harness,
+                        record.custom_process_identity.as_ref(),
+                    )
+                    .is_ok()
+            {
+                return (
+                    "unknown".to_owned(),
+                    "custom-harness-verification-unconfirmed".to_owned(),
+                    reason,
+                );
+            }
+            let shell_fallback = match self.client.pane_idle_shell_identity(pane_id) {
+                Ok(proof) => proof,
+                Err(_) => {
                     return (
                         "unknown".to_owned(),
-                        "agent-report-missing".to_owned(),
+                        "runtime-probe-failed".to_owned(),
                         reason,
-                    );
+                    )
                 }
+            };
+            if shell_fallback.is_some() {
+                let reported = info
+                    .agent
+                    .as_deref()
+                    .map_or_else(|| "None".to_owned(), |agent| format!("'{agent}'"));
+                return (
+                    "unhealthy".to_owned(),
+                    "expected-harness-missing".to_owned(),
+                    format!(
+                        "pane '{pane_id}' has no live exact '{}' process and is at a stable idle shell (reported agent {reported}); status probe: {reason}",
+                        record.harness
+                    ),
+                );
+            }
+            return (
+                "unknown".to_owned(),
+                "custom-harness-verification-unconfirmed".to_owned(),
+                reason,
+            );
+        }
+        if info.agent.as_deref() != Some(record.harness.as_str()) {
+            if info.agent.is_none() {
                 let shell_fallback = if record.adapter == "herdr-foreign" {
                     match record.foreign_shell_identity.as_ref() {
                         Some(identity) => {
@@ -3294,16 +3349,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     "pane '{pane_id}' reports agent {reported}, expected '{}'; status probe: {reason}",
                     record.harness
                 ),
-            );
-        }
-        if record.adapter == "herdr-pane" {
-            // The saved process identity may still be live when one process-info
-            // response is incomplete or transport fails. Without positive shell
-            // or alternate-agent proof, this is uncertainty rather than death.
-            return (
-                "unknown".to_owned(),
-                "custom-harness-verification-unconfirmed".to_owned(),
-                reason,
             );
         }
         (
@@ -5285,6 +5330,8 @@ mod tests {
                     custom_fails_after_identity: AtomicBool::new(false),
                     fail_custom_report_once: AtomicBool::new(false),
                     fail_custom_verify_once: AtomicBool::new(false),
+                    custom_verify_calls: AtomicU64::new(0),
+                    custom_ready: AtomicBool::new(true),
                     custom_at_idle_shell: AtomicBool::new(true),
                     foreign_shell_identity: Mutex::new(Fake::foreign_shell_identity()),
                     foreign_shell_path: Mutex::new(PathBuf::from("/bin/bash")),
@@ -5421,6 +5468,8 @@ mod tests {
         custom_fails_after_identity: AtomicBool,
         fail_custom_report_once: AtomicBool,
         fail_custom_verify_once: AtomicBool,
+        custom_verify_calls: AtomicU64,
+        custom_ready: AtomicBool,
         custom_at_idle_shell: AtomicBool,
         foreign_shell_identity: Mutex<CustomProcessIdentity>,
         foreign_shell_path: Mutex<PathBuf>,
@@ -5638,7 +5687,18 @@ mod tests {
                     }
                 }
             }
-            Ok("visible output".to_owned())
+            if self.custom_alive.load(Ordering::Relaxed) {
+                if self.custom_ready.load(Ordering::Relaxed) {
+                    Ok(
+                        "Muse Code\n────────────────\n❯\n────────────────\nAuto-review\n"
+                            .to_owned(),
+                    )
+                } else {
+                    Ok("Muse Code\nWorking…\n".to_owned())
+                }
+            } else {
+                Ok("visible output".to_owned())
+            }
         }
     }
     impl ManagedApi for Fake {
@@ -5791,6 +5851,7 @@ mod tests {
             _: &str,
             identity: Option<&CustomProcessIdentity>,
         ) -> AdapterResult<()> {
+            self.custom_verify_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail_custom_verify_once.swap(false, Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("transient process-info response"));
             }
@@ -5963,6 +6024,10 @@ mod tests {
             .client
             .fail_custom_verify_once
             .store(true, Ordering::Relaxed);
+        fixture
+            .client
+            .custom_verify_calls
+            .store(0, Ordering::Relaxed);
         let health = fixture.manager().health(&["worker".to_owned()]);
         assert!(fixture.client.custom_alive.load(Ordering::Relaxed));
         assert!(fixture.client.custom_reported.load(Ordering::Relaxed));
@@ -5972,6 +6037,45 @@ mod tests {
             health["sessions"][0]["reason_code"],
             "custom-harness-verification-unconfirmed"
         );
+        assert_eq!(
+            fixture.client.custom_verify_calls.load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn health_calls_stale_muse_label_dead_only_from_stable_shell_proof() {
+        let fixture = Fixture::new();
+        fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(fixture.client.custom_reported.load(Ordering::Relaxed));
+        fixture.client.custom_alive.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .custom_at_idle_shell
+            .store(true, Ordering::Relaxed);
+        let health = fixture.manager().health(&["worker".to_owned()]);
+        assert!(fixture.client.custom_reported.load(Ordering::Relaxed));
+        assert_eq!(health["sessions"][0]["health"], "unhealthy");
+        assert_eq!(health["sessions"][0]["runtime_state"], "dead");
+        assert_eq!(
+            health["sessions"][0]["reason_code"],
+            "expected-harness-missing"
+        );
+        assert!(health["sessions"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("stable idle shell"));
     }
 
     #[test]
@@ -6091,6 +6195,57 @@ mod tests {
         assert_eq!(recovered["lifecycle"], "running");
         assert!(recovered["probe_error"].is_null());
         assert_eq!(recovered["custom_process_identity"]["pid"], 4242);
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_muse_recovery_does_not_report_idle_without_idle_composer() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut record = agent::read_private_json(&path).unwrap();
+        record["lifecycle"] = json!("launch_failed");
+        record["custom_process_identity"] = Value::Null;
+        record["pane_reported_by_agentctl"] = json!(false);
+        record["session_agent"] = Value::Null;
+        record["session_value"] = Value::Null;
+        record["error"] = json!("transient process-info response");
+        agent::atomic_json(&path, &record).unwrap();
+        fixture
+            .client
+            .custom_reported
+            .store(false, Ordering::Relaxed);
+        fixture.client.started.store(false, Ordering::Relaxed);
+        fixture.client.custom_ready.store(false, Ordering::Relaxed);
+
+        let error = manager
+            .recover_start(
+                "worker",
+                started["token"].as_str().unwrap(),
+                Fake::custom_identity().pid,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("no verified idle composer"));
+        let partial = agent::read_private_json(&path).unwrap();
+        assert_eq!(partial["lifecycle"], "launch_failed");
+        assert_eq!(partial["pane_reported_by_agentctl"], false);
+        assert_eq!(partial["custom_process_identity"]["pid"], 4242);
+        assert!(partial["error"]
+            .as_str()
+            .unwrap()
+            .contains("no verified idle composer"));
+        assert!(!fixture.client.custom_reported.load(Ordering::Relaxed));
         assert!(fixture.client.runs.lock().unwrap().is_empty());
     }
 

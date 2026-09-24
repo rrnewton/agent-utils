@@ -133,6 +133,19 @@ elif args[:2] == ["pane", "get"]:
         "agent_session": None if human or state.get("empty_shell") or state.get("sessionless") or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": "session-1"},
     }})
 elif args[:2] == ["pane", "process-info"]:
+    state["process_info_calls"] = int(state.get("process_info_calls", 0)) + 1
+    transient_failures = int(state.get("process_info_failures_remaining", 0))
+    if transient_failures > 0:
+        state["process_info_failures_remaining"] = transient_failures - 1
+        print("injected transient process-info failure", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    malformed_responses = int(state.get("malformed_process_info_remaining", 0))
+    if malformed_responses > 0:
+        state["malformed_process_info_remaining"] = malformed_responses - 1
+        save()
+        envelope({"process_info": None})
+        raise SystemExit(0)
     if state.get("fail_process_info"):
         print("injected process-info failure", file=sys.stderr)
         save()

@@ -327,8 +327,8 @@ def _profiles(harness: Harness, report: Report) -> None:
                          "--meta-tag=repeatable"],
         "codex-safe-config": ["--no-alt-screen", "--config=features.web_search=true"],
     }
-    for profile in ("astra-ultra", "sol", "watermelon", "muse-literal", "codex-safe-config"):
-        case = harness.case(f"primary-profile-{profile}")
+
+    def configure(case: PairCase) -> None:
         for root in (case.python_root, case.rust_root):
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
@@ -337,6 +337,14 @@ def _profiles(harness: Harness, report: Report) -> None:
             config = directory / "profiles.json"
             config.write_text(json.dumps(document), encoding="utf-8")
             config.chmod(0o600)
+
+    def process_info_retried(root: Path) -> bool:
+        calls = _state(root).get("process_info_calls")
+        return isinstance(calls, int) and not isinstance(calls, bool) and calls >= 2
+
+    for profile in ("astra-ultra", "sol", "watermelon", "muse-literal", "codex-safe-config"):
+        case = harness.case(f"primary-profile-{profile}")
+        configure(case)
         listed = _pair(harness, report, case, f"primary/profile/{profile}/list",
                        ("profiles", "--cwd", "<ROOT>"))
         for edition, outcome in zip(("python", "rust"), listed, strict=True):
@@ -561,6 +569,55 @@ def _profiles(harness: Harness, report: Report) -> None:
         _pair(harness, report, case, f"primary/profile/{profile}/stop", (
             "stop", "worker", *_COMMON,
         ))
+
+    for label, injected in (
+        ("command-failure", {"process_info_failures_remaining": 1}),
+        ("malformed-envelope", {"malformed_process_info_remaining": 1}),
+    ):
+        case = harness.case(f"primary-profile-watermelon-transient-{label}", injected)
+        configure(case)
+        started = _pair(
+            harness, report, case,
+            f"primary/profile/watermelon/transient-{label}",
+            (
+                "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+                "--profile", "watermelon", "--startup-timeout", "1", *_COMMON,
+            ),
+        )
+        report.require(
+            f"primary/profile/watermelon/transient-{label}-retried",
+            all(process_info_retried(root)
+                for root in (case.python_root, case.rust_root)),
+            f"transient process-info failure was not retried: {started!r}",
+        )
+        _pair(
+            harness, report, case,
+            f"primary/profile/watermelon/transient-{label}-stop",
+            ("stop", "worker", *_COMMON),
+        )
+
+    permanent = harness.case(
+        "primary-profile-watermelon-permanent-process-info-failure",
+        {"fail_process_info": True},
+    )
+    configure(permanent)
+    outcomes = harness.invoke(permanent, (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--profile", "watermelon", "--startup-timeout", "0.15", *_COMMON,
+    ))
+    report.require(
+        "primary/profile/watermelon/permanent-process-info-failure",
+        all(
+            outcome.returncode == 75
+            and "last process probe" in outcome.stderr
+            and "injected process-info failure" in outcome.stderr
+            for outcome in outcomes
+        )
+        and all(process_info_retried(root)
+                for root in (permanent.python_root, permanent.rust_root)),
+        f"permanent process-info failure was not retried to the deadline: {outcomes!r}",
+    )
+    _retire_fixture_processes(permanent)
 
 
 def _skill_install(harness: Harness, report: Report) -> None:

@@ -23,6 +23,18 @@ from agentctl.profiles import (
 )
 from agentctl.subagents import AgentRecord, ManagedAgents, _name
 
+_WORKER_RPC_SCHEMA = "agentctl-worker-rpc/v1"
+_RUNNER_LIVENESS_SCHEMA = "agentctl-runner-liveness/v1"
+
+
+class WorkerRpcError(AgentDeliveryError):
+    """Typed failure at the private worker process boundary."""
+
+    def __init__(self, kind: str, message: str, *, remote_code: str | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.remote_code = remote_code
+
 
 class Sessions(ManagedAgents):
     """Route all public operations through one generation-locked session record."""
@@ -44,14 +56,47 @@ class Sessions(ManagedAgents):
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 env=environment, timeout=900 if action == "migrate" else 90)
         except subprocess.TimeoutExpired as exc:
-            raise AgentDeliveryError(f"runtime {action} timed out; inspect session state before retrying") from exc
+            raise WorkerRpcError(
+                "timeout", f"runtime {action} timed out; inspect session state before retrying",
+            ) from exc
+        except OSError as exc:
+            raise WorkerRpcError("transport", f"runtime {action} transport failed: {exc}") from exc
         try:
-            result = as_mapping(json.loads(completed.stdout), "runtime response")
+            envelope = as_mapping(json.loads(completed.stdout), "runtime response")
         except (ValueError, TypeError) as exc:
-            raise AgentDeliveryError(f"runtime {action} returned no valid receipt: {completed.stderr.strip()}") from exc
+            raise WorkerRpcError(
+                "invalid-receipt",
+                f"runtime {action} returned no valid receipt: {completed.stderr.strip()}",
+            ) from exc
+        if (envelope.get("schema") != _WORKER_RPC_SCHEMA
+                or envelope.get("action") != action
+                or not isinstance(envelope.get("ok"), bool)):
+            raise WorkerRpcError(
+                "invalid-receipt", f"runtime {action} returned an invalid typed envelope",
+            )
         if completed.returncode:
-            raise AgentDeliveryError(str(result.get("error", "runtime operation failed")))
-        return result
+            try:
+                error = as_mapping(envelope.get("error"), "runtime error")
+                code = error.get("code")
+                message = error.get("message")
+                if (envelope.get("ok") is not False or not isinstance(code, str) or not code
+                        or not isinstance(message, str) or not message):
+                    raise TypeError("invalid typed runtime error")
+            except TypeError as exc:
+                raise WorkerRpcError(
+                    "invalid-receipt", f"runtime {action} returned an invalid error receipt",
+                ) from exc
+            raise WorkerRpcError("runtime-error", message, remote_code=code)
+        if envelope.get("ok") is not True:
+            raise WorkerRpcError(
+                "invalid-receipt", f"runtime {action} returned failure with exit status zero",
+            )
+        try:
+            return as_mapping(envelope.get("payload"), "runtime payload")
+        except TypeError as exc:
+            raise WorkerRpcError(
+                "invalid-receipt", f"runtime {action} returned no typed payload",
+            ) from exc
 
     @staticmethod
     def _capabilities(record: AgentRecord) -> list[str]:
@@ -169,8 +214,59 @@ class Sessions(ManagedAgents):
             record.session_value = session if isinstance(session, str) else None
             pane = runtime.get("presentation_pane")
             record.pane_id = pane if isinstance(pane, str) else None
+            runner_pid = runtime.get("runner_pid")
+            runner_started_at = runtime.get("runner_started_at")
+            if (runtime.get("name") == record.name
+                    and isinstance(runner_pid, int) and not isinstance(runner_pid, bool)
+                    and 1 <= runner_pid <= 2_147_483_647
+                    and isinstance(runner_started_at, str)
+                    and runner_started_at.isascii() and runner_started_at.isdigit()
+                    and any(character != "0" for character in runner_started_at)):
+                record.runner_pid = runner_pid
+                record.runner_started_at = runner_started_at
+            elif runner_pid is not None or runner_started_at is not None:
+                raise AgentDeliveryError("worker returned an invalid runner identity")
         if save:
             self._save(record)
+
+    @staticmethod
+    def _runner_liveness(
+        record: AgentRecord, response: dict[str, object],
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """Bind one typed liveness observation to the saved runner generation."""
+        if record.runner_pid is None or record.runner_started_at is None:
+            return None, "saved runner identity is unavailable"
+        try:
+            runtime_record = as_mapping(response.get("record"), "worker runtime record")
+            result = as_mapping(response.get("result"), "worker status result")
+            agents = result.get("agents")
+            if (not isinstance(agents, list) or len(agents) != 1
+                    or not isinstance(agents[0], dict)):
+                raise TypeError("worker status result must contain exactly one agent")
+            row = as_mapping(agents[0], "worker status row")
+            identities = (runtime_record, row)
+            for value in identities:
+                if value.get("name") != record.name:
+                    raise TypeError("worker status identity has a different name")
+                observed_pid = value.get("runner_pid")
+                observed_start = value.get("runner_started_at")
+                if (not isinstance(observed_pid, int) or isinstance(observed_pid, bool)
+                        or not isinstance(observed_start, str)
+                        or observed_pid != record.runner_pid
+                        or observed_start != record.runner_started_at):
+                    raise TypeError("worker status identity does not match the saved runner")
+            runner_alive = row.get("runner_alive")
+            if not isinstance(runner_alive, bool):
+                raise TypeError("worker status row has no boolean runner_alive evidence")
+        except TypeError as exc:
+            return None, str(exc)
+        return {
+            "schema": _RUNNER_LIVENESS_SCHEMA,
+            "name": record.name,
+            "runner_pid": record.runner_pid,
+            "runner_started_at": record.runner_started_at,
+            "runner_alive": runner_alive,
+        }, None
 
     def status(self, name: str) -> dict[str, object]:
         """Distinguish saved lifecycle, runtime liveness, and supported operations."""
@@ -192,9 +288,24 @@ class Sessions(ManagedAgents):
                     live_pane = runtime_record.get("presentation_pane")
                     if isinstance(live_pane, str):
                         result["pane_id"] = live_pane
+                liveness, liveness_error = self._runner_liveness(record, response)
+                result["runtime_liveness"] = liveness
+                result["runtime_liveness_error"] = liveness_error
                 result["probe_error"] = None
+                result["probe_error_kind"] = None
+                result["probe_error_code"] = None
+            except WorkerRpcError as exc:
+                result.update(
+                    probe_error=str(exc), agent_status="unknown",
+                    probe_error_kind=exc.kind, probe_error_code=exc.remote_code,
+                    runtime_liveness=None, runtime_liveness_error=None,
+                )
             except (HerdrRunError, OSError, ValueError) as exc:
-                result.update(probe_error=str(exc), agent_status="unknown")
+                result.update(
+                    probe_error=str(exc), agent_status="unknown",
+                    probe_error_kind="untyped", probe_error_code=None,
+                    runtime_liveness=None, runtime_liveness_error=None,
+                )
         result["capabilities"] = self._capabilities(record)
         return result
 
@@ -211,25 +322,28 @@ class Sessions(ManagedAgents):
             )
         probe_error = status.get("probe_error")
         if probe_error is not None:
-            reason = str(probe_error)
-            if any(marker in reason.lower() for marker in ("not alive", "dead", "stopped")):
-                return "unhealthy", "runner-not-live", reason
-            return "unknown", "runtime-probe-failed", reason
-        runtime = status.get("runtime")
-        if isinstance(runtime, dict):
-            agents = runtime.get("agents")
-            if isinstance(agents, list) and len(agents) == 1 and isinstance(agents[0], dict):
-                live = agents[0]
-                state = live.get("status")
-                if live.get("runner_alive") is False or state in ("dead", "stopped", "error"):
-                    return (
-                        "unhealthy",
-                        "runner-not-live",
-                        f"runner reports status {state!r} and runner_alive={live.get('runner_alive')!r}",
-                    )
-                if live.get("runner_alive") is True:
-                    return "healthy", "ok", "worker runner is live"
-        return "unknown", "runtime-liveness-unconfirmed", "worker status did not confirm runner liveness"
+            kind = status.get("probe_error_kind")
+            return "unknown", "runtime-probe-failed", f"{kind or 'untyped'}: {probe_error}"
+        evidence = status.get("runtime_liveness")
+        if (isinstance(evidence, dict)
+                and evidence.get("schema") == _RUNNER_LIVENESS_SCHEMA
+                and evidence.get("name") == record.name
+                and evidence.get("runner_pid") == record.runner_pid
+                and evidence.get("runner_started_at") == record.runner_started_at):
+            if evidence.get("runner_alive") is False:
+                return (
+                    "unhealthy",
+                    "runner-not-live",
+                    f"saved runner pid {record.runner_pid} start {record.runner_started_at} "
+                    "is explicitly not alive",
+                )
+            if evidence.get("runner_alive") is True:
+                return "healthy", "ok", "saved worker runner identity is live"
+        reason = status.get("runtime_liveness_error")
+        return (
+            "unknown", "runtime-liveness-unconfirmed",
+            str(reason or "worker status did not confirm runner liveness"),
+        )
 
     def send_session(self, name: str, text: str, *, message_id: str | None = None,
                      model: str | None = None, **options: object) -> dict[str, object]:

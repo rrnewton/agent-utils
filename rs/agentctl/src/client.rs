@@ -1506,8 +1506,19 @@ impl HerdrClient {
         )?;
         let deadline = Instant::now() + timeout;
         let mut observed = None;
+        let mut last_probe_error = None;
         while Instant::now() < deadline {
-            observed = self.custom_harness_observed(pane_id, &executable, &|| false)?;
+            match self.custom_harness_observed(pane_id, &executable, &|| false) {
+                Ok(value) => observed = value,
+                Err(error) => {
+                    // Herdr can briefly expose an incomplete process snapshot or
+                    // fail one control request while the process is coming up.
+                    // Startup already owns a deadline, so preserve the last error
+                    // and retry within that existing bound.
+                    last_probe_error = Some(error.to_string());
+                    observed = None;
+                }
+            }
             if observed.is_some() {
                 break;
             }
@@ -1516,8 +1527,13 @@ impl HerdrClient {
             );
         }
         let observed = observed.ok_or_else(|| {
+            let detail = last_probe_error
+                .as_deref()
+                .map_or_else(String::new, |error| {
+                    format!("; last process probe: {error}")
+                });
             AdapterError::unavailable(format!(
-                "custom harness {kind:?} was not the foreground process in pane {pane_id}"
+                "custom harness {kind:?} was not the foreground process in pane {pane_id}{detail}"
             ))
         })?;
         // Persist before trust/readiness/report checks. If any later step fails, stop still has

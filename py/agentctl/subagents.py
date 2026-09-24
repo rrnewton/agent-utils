@@ -50,6 +50,7 @@ _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _BRACKETED_PASTE_START = "\x1b[200~"
 _BRACKETED_PASTE_END = "\x1b[201~"
 _MAX_U64 = (1 << 64) - 1
+_MAX_PROCESS_ID = (1 << 31) - 1
 _MAX_AGENT_RECORD_BYTES = 1 << 20
 _MAX_SNAPSHOT_BYTES = 16 << 20
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -233,6 +234,8 @@ class AgentRecord:
     launch_argv: list[str] = field(default_factory=list)
     launch_environment_names: list[str] = field(default_factory=list)
     runtime_ownership: str | None = None
+    runner_pid: int | None = None
+    runner_started_at: str | None = None
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
     def to_document(self) -> dict[str, object]:
@@ -259,7 +262,7 @@ class AgentRecord:
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
-        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "launch_profile", "launch_executable", "runtime_ownership"):
+        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "launch_profile", "launch_executable", "runtime_ownership", "runner_started_at"):
             if document.get(key) is not None and not isinstance(document[key], str):
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
         created = document.get("created_at")
@@ -286,6 +289,19 @@ class AgentRecord:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
         if document.get("runtime_ownership") not in (None, "owned", "foreign"):
             raise AgentDeliveryError(f"invalid runtime ownership in {path}")
+        runner_pid = document.get("runner_pid")
+        runner_started_at = document.get("runner_started_at")
+        if (runner_pid is not None
+                and (not isinstance(runner_pid, int) or isinstance(runner_pid, bool)
+                     or not 1 <= runner_pid <= _MAX_PROCESS_ID)):
+            raise AgentDeliveryError(f"invalid runner pid in {path}")
+        if (runner_started_at is not None
+                and (not isinstance(runner_started_at, str)
+                     or not runner_started_at.isascii() or not runner_started_at.isdigit()
+                     or not any(character != "0" for character in runner_started_at))):
+            raise AgentDeliveryError(f"invalid runner start time in {path}")
+        if (runner_pid is None) != (runner_started_at is None):
+            raise AgentDeliveryError(f"incomplete runner identity in {path}")
         if ((document.get("launch_executable_device") is None)
                 != (document.get("launch_executable_inode") is None)):
             raise AgentDeliveryError(f"incomplete launch executable identity in {path}")
@@ -1253,6 +1269,16 @@ class ManagedAgents:
                 self.client.verify_custom_harness(
                     record.pane_id, record.harness, identity,
                 )
+                screen = self.client.read(
+                    record.pane_id, source="visible", lines=200,
+                )
+                if not muse_idle_composer(screen):
+                    raise HerdrUnavailable(
+                        "start recovery found the exact Muse process but no verified idle composer"
+                    )
+                self.client.verify_custom_harness(
+                    record.pane_id, record.harness, identity,
+                )
                 self.client.report_pane_agent(record.pane_id, record.harness, "idle")
                 record.pane_reported_by_agentctl = True
                 self._save(record)
@@ -1554,17 +1580,32 @@ class ManagedAgents:
                 or os.path.realpath(info.cwd) != os.path.realpath(record.cwd)
                 or not session_agent_matches or not session_value_matches):
             return "unhealthy", "runtime-identity-mismatch", reason
+        if record.adapter == "herdr-pane":
+            if record.custom_process_identity is not None:
+                try:
+                    self.client.verify_custom_harness(
+                        record.pane_id, record.harness,
+                        record.custom_process_identity,
+                    )
+                except HerdrRunError:
+                    pass
+                else:
+                    return "unknown", "custom-harness-verification-unconfirmed", reason
+            try:
+                custom_shell_proof = self.client.pane_idle_shell_identity(record.pane_id)
+            except HerdrRunError:
+                return "unknown", "runtime-probe-failed", reason
+            if custom_shell_proof is not None:
+                return (
+                    "unhealthy",
+                    "expected-harness-missing",
+                    f"pane {record.pane_id!r} has no live exact {record.harness!r} "
+                    f"process and is at a stable idle shell (reported agent "
+                    f"{info.agent!r}); status probe: {reason}",
+                )
+            return "unknown", "custom-harness-verification-unconfirmed", reason
         if info.agent != record.harness:
             if info.agent is None:
-                if record.adapter == "herdr-pane" and record.custom_process_identity is not None:
-                    try:
-                        self.client.verify_custom_harness(
-                            record.pane_id, record.harness, record.custom_process_identity,
-                        )
-                    except HerdrRunError:
-                        pass
-                    else:
-                        return "unknown", "agent-report-missing", reason
                 try:
                     if record.adapter == "herdr-foreign" and record.foreign_shell_identity is not None:
                         shell_fallback = self.client.pane_is_same_idle_shell(
@@ -1582,11 +1623,6 @@ class ManagedAgents:
                 f"pane {record.pane_id!r} reports agent {info.agent!r}, "
                 f"expected {record.harness!r}; status probe: {reason}",
             )
-        if record.adapter == "herdr-pane":
-            # The saved process identity may still be live when one process-info
-            # response is incomplete or transport fails. Without positive shell
-            # or alternate-agent proof, this is uncertainty rather than death.
-            return "unknown", "custom-harness-verification-unconfirmed", reason
         return "unknown", "runtime-probe-failed", reason
 
     def _persist_health(

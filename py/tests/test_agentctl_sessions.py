@@ -17,7 +17,7 @@ from agentctl import cli, mcp
 from agentctl.client import HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError
 from agentctl.profiles import validate_muse_headless_arguments
-from agentctl.sessions import Sessions
+from agentctl.sessions import Sessions, WorkerRpcError
 from agentctl.subagents import AgentRecord
 from .test_herdr_subagents import FakeManagedClient
 
@@ -30,10 +30,12 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, Fa
 
     def worker(record: AgentRecord, action: str, **options: object) -> dict[str, object]:
         calls.append(action)
-        return {"record": {"mode": "headless", "backend": record.backend,
+        return {"record": {"name": record.name, "mode": "headless", "backend": record.backend,
                 "session_id": "native-thread", "tmux_target": "workers:worker",
-                "presentation_pane": "w1:headless"},
-            "result": {"agents": [{"name": record.name, "status": "idle", "pending": 0, "runner_alive": True}]}}
+                "presentation_pane": "w1:headless", "runner_pid": 4242,
+                "runner_started_at": "9001"},
+            "result": {"agents": [{"name": record.name, "status": "idle", "pending": 0,
+                "runner_pid": 4242, "runner_started_at": "9001", "runner_alive": True}]}}
 
     monkeypatch.setattr(sessions, "_worker", worker)
     return sessions, fake, calls
@@ -397,6 +399,143 @@ def test_live_idle_runner_remains_ready_when_only_its_presentation_is_lost(tmp_p
 
     monkeypatch.setattr(sessions, "_worker", status)
     assert sessions.wait("worker", timeout=0)["token"] == original["token"]
+
+
+@pytest.mark.parametrize("message", [
+    "transport stopped responding before a liveness receipt",
+    "remote side says runner is not alive but supplied no identity",
+    "decoder saw dead bytes in an incomplete response",
+])
+def test_headless_health_never_infers_death_from_error_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, message: str,
+) -> None:
+    sessions, _, _ = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+
+    def failed_status(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        assert record.name == "worker" and action == "status"
+        raise AgentDeliveryError(message)
+
+    monkeypatch.setattr(sessions, "_worker", failed_status)
+    health = sessions.health(["worker"], checked_at=123.0)
+    row = cast(list[dict[str, object]], health["sessions"])[0]
+    assert row["health"] == "unknown"
+    assert row["runtime_state"] == "unknown"
+    assert row["reason_code"] == "runtime-probe-failed"
+
+
+@pytest.mark.parametrize("alive", [False, True])
+def test_headless_health_requires_identity_bound_typed_liveness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alive: bool,
+) -> None:
+    sessions, _, _ = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    saved = replace(
+        sessions.get("worker"), runner_pid=4242, runner_started_at="9001",
+    )
+    sessions._save(saved)
+
+    def status(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        assert record.token == saved.token and action == "status"
+        identity = {
+            "name": record.name, "runner_pid": 4242, "runner_started_at": "9001",
+        }
+        return {
+            "record": {**identity, "session_id": "native-thread"},
+            "result": {"agents": [{
+                **identity, "status": "dead", "pending": 0,
+                "runner_alive": alive,
+            }]},
+        }
+
+    monkeypatch.setattr(sessions, "_worker", status)
+    health = sessions.health(["worker"], checked_at=123.0)
+    row = cast(list[dict[str, object]], health["sessions"])[0]
+    assert row["health"] == ("healthy" if alive else "unhealthy")
+    assert row["runtime_state"] == ("live" if alive else "dead")
+    assert row["reason_code"] == ("ok" if alive else "runner-not-live")
+
+
+def test_headless_dead_receipt_for_another_runner_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _, _ = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    saved = replace(
+        sessions.get("worker"), runner_pid=4242, runner_started_at="9001",
+    )
+    sessions._save(saved)
+
+    def status(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        assert action == "status"
+        return {
+            "record": {
+                "name": record.name, "runner_pid": 4242,
+                "runner_started_at": "replacement", "session_id": "native-thread",
+            },
+            "result": {"agents": [{
+                "name": record.name, "runner_pid": 4242,
+                "runner_started_at": "replacement", "runner_alive": False,
+            }]},
+        }
+
+    monkeypatch.setattr(sessions, "_worker", status)
+    health = sessions.health(["worker"], checked_at=123.0)
+    row = cast(list[dict[str, object]], health["sessions"])[0]
+    assert row["health"] == "unknown"
+    assert row["runtime_state"] == "unknown"
+    assert row["reason_code"] == "runtime-liveness-unconfirmed"
+
+
+def test_headless_boolean_pid_cannot_match_saved_runner_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _, _ = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    saved = replace(
+        sessions.get("worker"), runner_pid=1, runner_started_at="9001",
+    )
+    sessions._save(saved)
+
+    def status(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
+        assert action == "status"
+        identity = {
+            "name": record.name, "runner_pid": True, "runner_started_at": "9001",
+        }
+        return {
+            "record": identity,
+            "result": {"agents": [{**identity, "runner_alive": False}]},
+        }
+
+    monkeypatch.setattr(sessions, "_worker", status)
+    health = sessions.health(["worker"], checked_at=123.0)
+    row = cast(list[dict[str, object]], health["sessions"])[0]
+    assert row["health"] == "unknown"
+    assert row["runtime_state"] == "unknown"
+    assert row["reason_code"] == "runtime-liveness-unconfirmed"
+
+
+def test_worker_rpc_preserves_typed_remote_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    record = AgentRecord(
+        "worker", "generation", "codex", str(tmp_path), 1.0,
+        adapter="turn-runner", mode="headless", runtime_home=str(tmp_path / "runtime"),
+    )
+    response = {
+        "schema": "agentctl-worker-rpc/v1", "action": "status", "ok": False,
+        "error": {"code": "unknown_agent", "message": "runner is not alive"},
+    }
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *args, **kwargs: CompletedProcess(args[0], 1, json.dumps(response), ""),
+    )
+    with pytest.raises(WorkerRpcError) as raised:
+        sessions._worker(record, "status")
+    assert raised.value.kind == "runtime-error"
+    assert raised.value.remote_code == "unknown_agent"
+    assert str(raised.value) == "runner is not alive"
 
 
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -1.0, 31_536_001.0])

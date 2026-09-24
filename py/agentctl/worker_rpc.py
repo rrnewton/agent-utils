@@ -16,6 +16,8 @@ if __package__ in (None, ""):
 from agentctl.foreign import lib
 from agentctl.jsonx import as_mapping, get_str
 
+_RPC_SCHEMA = "agentctl-worker-rpc/v1"
+
 
 def _optional_text(request: dict[str, object], key: str) -> str | None:
     value = request.get(key)
@@ -86,13 +88,30 @@ def dispatch(request: dict[str, object]) -> dict[str, object]:
 
 def _main() -> int:
     """Exchange exactly one JSON request and response over stdin/stdout."""
+    action: str | None = None
     try:
-        result = dispatch(as_mapping(json.load(sys.stdin), "runtime request"))
+        request = as_mapping(json.load(sys.stdin), "runtime request")
+        raw_action = request.get("action")
+        action = raw_action if isinstance(raw_action, str) else None
+        result = dispatch(request)
     except (lib.AgentOperationError, ValueError, TypeError, OSError) as exc:
-        json.dump({"error": str(exc), "code": getattr(exc, "code", "runtime_failure")}, sys.stdout)
+        json.dump({
+            "schema": _RPC_SCHEMA,
+            "action": action,
+            "ok": False,
+            "error": {
+                "code": getattr(exc, "code", "runtime_failure"),
+                "message": str(exc),
+            },
+        }, sys.stdout)
         sys.stdout.write("\n")
         return 1
-    json.dump(result, sys.stdout)
+    json.dump({
+        "schema": _RPC_SCHEMA,
+        "action": action,
+        "ok": True,
+        "payload": result,
+    }, sys.stdout)
     sys.stdout.write("\n")
     return 0
 
