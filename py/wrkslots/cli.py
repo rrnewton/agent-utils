@@ -184,6 +184,7 @@ _CREATE_JOURNAL_OPTIONAL = frozenset(
         "hook_failure",
         "failure_policy",
         "submodule_baselines",
+        "abort_removal",
     }
 )
 _IMPORT_JOURNAL_REQUIRED = frozenset(
@@ -2421,6 +2422,21 @@ class _FileHandle(ctypes.Structure):
 
 
 _PrivateCleanupIdentity = tuple[int, int, int] | tuple[int, int, int, str]
+
+
+@dataclasses.dataclass(frozen=True)
+class _AbortRemovalEntry:
+    """One inode and its contents authorized by the final create-abort proof."""
+
+    name: str
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    size: int
+    digest_or_target: str | None
+    children: tuple[_AbortRemovalEntry, ...]
 
 
 def _fd_file_handle(fd: int, label: str) -> tuple[int, str]:
@@ -6612,6 +6628,8 @@ def _validate_journal_shape(
             raise StateError(
                 "create journal has a submodule baseline for an unrecorded checkout"
             )
+        if "abort_removal" in raw:
+            _create_abort_removal_target(config, slot, slot_type, raw["abort_removal"])
     elif kind == "import-existing":
         _exact_keys(raw, _IMPORT_JOURNAL_REQUIRED, set(), "import journal")
         record = _record_from_obj(raw["record"], "import journal.record")
@@ -7109,13 +7127,23 @@ def _create_journal_items(
             )
     slot_path = _slot_directory(config, slot, slot_type)
     fenced_slot = _create_abort_fenced_slot(config, slot, slot_type)
-    slot_present = slot_path.exists() or slot_path.is_symlink()
-    fenced_present = fenced_slot.exists() or fenced_slot.is_symlink()
-    if slot_present and fenced_present:
+    removal = (
+        None
+        if "abort_removal" not in raw
+        else _create_abort_removal_target(
+            config, slot, slot_type, raw["abort_removal"]
+        )[0]
+    )
+    candidates = [
+        path
+        for path in (slot_path, fenced_slot, removal)
+        if path is not None and (path.exists() or path.is_symlink())
+    ]
+    if len(candidates) > 1:
         raise StateError(
-            f"create journal has both canonical and abort-fenced storage for slot {slot!r}"
+            f"create journal has multiple canonical or fenced paths for slot {slot!r}"
         )
-    active_slot = fenced_slot if fenced_present else slot_path
+    active_slot = candidates[0] if candidates else slot_path
     created_by_name = {item.name: item for item in created}
     observed: list[Checkout] = []
     dirty: list[str] = []
@@ -21779,7 +21807,6 @@ def _submodule_admin_metadata_sha256(
                 "packed-refs",
                 "index",
                 "config",
-                "config.worktree",
                 "FETCH_HEAD",
             }
             or first.startswith("sharedindex.")
@@ -22384,6 +22411,32 @@ def _create_abort_fenced_slot(config: Config, slot: str, slot_type: str) -> Path
     return canonical.with_name(f".{slot}.abort-create")
 
 
+def _create_abort_removal_target(
+    config: Config,
+    slot: str,
+    slot_type: str,
+    value: object,
+) -> tuple[Path, _PrivateCleanupIdentity]:
+    label = "create journal.abort_removal"
+    raw = _as_mapping(value, label)
+    _exact_keys(raw, {"path", "identity"}, set(), label)
+    relative, path = _relative_inside(
+        config.root, _as_str(raw["path"], f"{label}.path"), label
+    )
+    del relative
+    canonical = _slot_directory(config, slot, slot_type)
+    prefix = f".{slot}.abort-remove."
+    if (
+        path.parent != canonical.parent
+        or not path.name.startswith(prefix)
+        or re.fullmatch(rf"{re.escape(prefix)}[0-9a-f]{{32}}", path.name) is None
+    ):
+        raise StateError("create journal abort-removal path is not canonical")
+    return path, _private_cleanup_identity_from_obj(
+        raw["identity"], f"{label}.identity"
+    )
+
+
 def _create_abort_checkout_path(
     config: Config, active_slot: Path, checkout_name: str
 ) -> Path:
@@ -22405,9 +22458,381 @@ def _repair_create_abort_registrations(
         _repair_nested_repositories(destination, vcs)
 
 
+def _abort_removal_regular_digest(
+    directory_fd: int, name: str, path: Path, expected: os.stat_result
+) -> str:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise Refusal(f"cannot open create-abort removal file {path}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise Refusal(f"create-abort removal file identity changed: {path}")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+        stable = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_size")
+        if any(getattr(opened, field) != getattr(after, field) for field in stable):
+            raise Refusal(f"create-abort removal file changed while read: {path}")
+        if size != after.st_size:
+            raise Refusal(f"create-abort removal file size changed while read: {path}")
+        return digest.hexdigest()
+    except OSError as exc:
+        raise Refusal(f"cannot read create-abort removal file {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _capture_abort_removal_entry(
+    directory_fd: int,
+    name: str,
+    path: Path,
+    *,
+    mount_id: int,
+) -> _AbortRemovalEntry:
+    try:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(f"cannot inspect create-abort removal entry {path}: {exc}") from exc
+    digest_or_target: str | None = None
+    children: tuple[_AbortRemovalEntry, ...] = ()
+    if stat.S_ISDIR(metadata.st_mode):
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot open create-abort removal directory {path}: {exc}"
+            ) from exc
+        try:
+            opened = os.fstat(child_fd)
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise Refusal(
+                    f"create-abort removal directory identity changed: {path}"
+                )
+            if _fd_mount_id(child_fd, str(path)) != mount_id:
+                raise Refusal(f"create-abort removal tree crosses a mount point: {path}")
+            children = tuple(
+                _capture_abort_removal_entry(
+                    child_fd,
+                    child_name,
+                    path / child_name,
+                    mount_id=mount_id,
+                )
+                for child_name in _directory_names(child_fd, path)
+            )
+        finally:
+            os.close(child_fd)
+    elif stat.S_ISREG(metadata.st_mode):
+        digest_or_target = _abort_removal_regular_digest(
+            directory_fd, name, path, metadata
+        )
+    elif stat.S_ISLNK(metadata.st_mode):
+        try:
+            digest_or_target = os.readlink(name, dir_fd=directory_fd)
+            after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot read create-abort removal symlink {path}: {exc}"
+            ) from exc
+        if (after.st_dev, after.st_ino, after.st_mode) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+        ):
+            raise Refusal(f"create-abort removal symlink changed while read: {path}")
+    else:
+        raise Refusal(
+            f"create-abort removal tree contains a special file: {path}"
+        )
+    return _AbortRemovalEntry(
+        name=name,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+        size=metadata.st_size,
+        digest_or_target=digest_or_target,
+        children=children,
+    )
+
+
+def _capture_abort_removal_tree(path: Path) -> _AbortRemovalEntry:
+    try:
+        parent_fd = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot open create-abort removal parent {path.parent}: {exc}") from exc
+    try:
+        root_metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise Refusal(f"create-abort removal target is not a directory: {path}")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        root_fd = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(root_fd)
+            if (opened.st_dev, opened.st_ino) != (
+                root_metadata.st_dev,
+                root_metadata.st_ino,
+            ):
+                raise Refusal(f"create-abort removal target identity changed: {path}")
+            mount_id = _fd_mount_id(root_fd, str(path))
+            children = tuple(
+                _capture_abort_removal_entry(
+                    root_fd, name, path / name, mount_id=mount_id
+                )
+                for name in _directory_names(root_fd, path)
+            )
+        finally:
+            os.close(root_fd)
+    except OSError as exc:
+        raise Refusal(f"cannot capture create-abort removal tree {path}: {exc}") from exc
+    finally:
+        os.close(parent_fd)
+    return _AbortRemovalEntry(
+        name=path.name,
+        device=root_metadata.st_dev,
+        inode=root_metadata.st_ino,
+        mode=root_metadata.st_mode,
+        uid=root_metadata.st_uid,
+        gid=root_metadata.st_gid,
+        size=root_metadata.st_size,
+        digest_or_target=None,
+        children=children,
+    )
+
+
+def _assert_abort_removal_entry(
+    directory_fd: int,
+    name: str,
+    path: Path,
+    expected: _AbortRemovalEntry,
+) -> os.stat_result:
+    try:
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(f"create-abort removal entry disappeared or changed: {path}: {exc}") from exc
+    if (
+        (observed.st_dev, observed.st_ino, observed.st_mode, observed.st_uid, observed.st_gid)
+        != (
+            expected.device,
+            expected.inode,
+            expected.mode,
+            expected.uid,
+            expected.gid,
+        )
+        or (not stat.S_ISDIR(observed.st_mode) and observed.st_size != expected.size)
+    ):
+        raise Refusal(f"create-abort removal entry identity changed: {path}")
+    if stat.S_ISREG(observed.st_mode):
+        if (
+            _abort_removal_regular_digest(directory_fd, name, path, observed)
+            != expected.digest_or_target
+        ):
+            raise Refusal(f"create-abort removal file contents changed: {path}")
+    elif stat.S_ISLNK(observed.st_mode):
+        try:
+            target = os.readlink(name, dir_fd=directory_fd)
+        except OSError as exc:
+            raise Refusal(f"cannot read create-abort removal symlink {path}: {exc}") from exc
+        if target != expected.digest_or_target:
+            raise Refusal(f"create-abort removal symlink target changed: {path}")
+    elif not stat.S_ISDIR(observed.st_mode):
+        raise Refusal(f"create-abort removal entry became a special file: {path}")
+    return observed
+
+
+def _clear_abort_removal_directory(
+    directory_fd: int,
+    path: Path,
+    children: Sequence[_AbortRemovalEntry],
+    before_destructive: Callable[[], None],
+) -> None:
+    remaining = {child.name for child in children}
+    if set(_directory_names(directory_fd, path)) != remaining:
+        raise Refusal(f"create-abort removal tree changed after final proof: {path}")
+    for child in children:
+        _interrupt_for_test("before-create-abort-entry-quarantine")
+        if set(_directory_names(directory_fd, path)) != remaining:
+            raise Refusal(f"create-abort removal tree changed before quarantine: {path}")
+        tombstone = f".wrkslots-abort-remove-{uuid.uuid4().hex}"
+        if tombstone in remaining:
+            raise StateError("generated create-abort tombstone collides with source")
+        child_path = path / child.name
+        tombstone_path = path / tombstone
+        _assert_abort_removal_entry(directory_fd, child.name, child_path, child)
+        try:
+            os.rename(
+                child.name,
+                tombstone,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot quarantine create-abort removal entry {child_path}: {exc}"
+            ) from exc
+        try:
+            _assert_abort_removal_entry(
+                directory_fd, tombstone, tombstone_path, child
+            )
+            expected_names = (remaining - {child.name}) | {tombstone}
+            if set(_directory_names(directory_fd, path)) != expected_names:
+                raise Refusal(
+                    f"create-abort removal tree changed during quarantine: {path}"
+                )
+            if stat.S_ISDIR(child.mode):
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+                child_fd = os.open(tombstone, flags, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (child.device, child.inode):
+                        raise Refusal(
+                            f"quarantined create-abort directory identity changed: "
+                            f"{tombstone_path}"
+                        )
+                    _clear_abort_removal_directory(
+                        child_fd,
+                        tombstone_path,
+                        child.children,
+                        before_destructive,
+                    )
+                finally:
+                    os.close(child_fd)
+            _interrupt_for_test("before-create-abort-entry-remove")
+            if set(_directory_names(directory_fd, path)) != expected_names:
+                raise Refusal(
+                    f"create-abort removal tree changed before entry removal: {path}"
+                )
+            current = _assert_abort_removal_entry(
+                directory_fd, tombstone, tombstone_path, child
+            )
+            try:
+                before_destructive()
+                if stat.S_ISDIR(current.st_mode):
+                    os.rmdir(tombstone, dir_fd=directory_fd)
+                else:
+                    os.unlink(tombstone, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            except OSError as exc:
+                raise Refusal(
+                    f"cannot remove quarantined create-abort entry "
+                    f"{tombstone_path}: {exc}"
+                ) from exc
+        except BaseException:
+            try:
+                tombstone_present = os.stat(
+                    tombstone, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                tombstone_present = None
+            try:
+                os.stat(child.name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                original_absent = True
+            else:
+                original_absent = False
+            if tombstone_present is not None and original_absent:
+                try:
+                    os.rename(
+                        tombstone,
+                        child.name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                    os.fsync(directory_fd)
+                except OSError:
+                    pass
+            raise
+        remaining.remove(child.name)
+    if _directory_names(directory_fd, path):
+        raise Refusal(f"create-abort removal tree changed while cleared: {path}")
+
+
+def _remove_abort_removal_tree(
+    path: Path,
+    expected: _AbortRemovalEntry,
+    before_destructive: Callable[[], None],
+) -> None:
+    try:
+        parent_fd = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot open create-abort removal parent {path.parent}: {exc}") from exc
+    root_fd: int | None = None
+    try:
+        observed = _assert_abort_removal_entry(parent_fd, path.name, path, expected)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise Refusal(f"create-abort removal target is not a directory: {path}")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        root_fd = os.open(path.name, flags, dir_fd=parent_fd)
+        opened = os.fstat(root_fd)
+        if (opened.st_dev, opened.st_ino) != (expected.device, expected.inode):
+            raise Refusal(f"create-abort removal target identity changed: {path}")
+        _interrupt_for_test("before-create-abort-removal-tree-clear")
+        _clear_abort_removal_directory(
+            root_fd, path, expected.children, before_destructive
+        )
+        _interrupt_for_test("before-create-abort-removal-root-rmdir")
+        if _directory_names(root_fd, path):
+            raise Refusal(f"create-abort removal target changed before rmdir: {path}")
+        current = _assert_abort_removal_entry(parent_fd, path.name, path, expected)
+        if not stat.S_ISDIR(current.st_mode):
+            raise Refusal(f"create-abort removal target changed before rmdir: {path}")
+        try:
+            before_destructive()
+            os.rmdir(path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise Refusal(f"cannot remove create-abort directory {path}: {exc}") from exc
+    except OSError as exc:
+        raise Refusal(f"create-abort removal tree changed at {path}: {exc}") from exc
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
+
+
+def _create_abort_worktree_admin(
+    repository: Path, checkout: Path, vcs: _GitVcs
+) -> Path:
+    value = vcs._run(
+        checkout, ["rev-parse", "--path-format=absolute", "--git-dir"]
+    ).stdout.strip()
+    admin = Path(value).absolute()
+    common = vcs.common_directory(repository)
+    expected_parent = common / "worktrees"
+    if (
+        admin.parent != expected_parent
+        or admin.is_symlink()
+        or not admin.is_dir()
+        or not admin.name
+    ):
+        raise Refusal(
+            f"create-abort checkout has unsafe linked-worktree administration: {admin}"
+        )
+    return admin
+
+
 def _abort_create(
     config: Config,
     journal_path: Path,
+    journal: Mapping[str, object],
     slot: str,
     slot_type: str,
     plan: Sequence[PlannedCheckout],
@@ -22416,14 +22841,29 @@ def _abort_create(
 ) -> None:
     slot_path = _slot_directory(config, slot, slot_type)
     fenced_slot = _create_abort_fenced_slot(config, slot, slot_type)
-    canonical_present = slot_path.exists() or slot_path.is_symlink()
-    fenced_present = fenced_slot.exists() or fenced_slot.is_symlink()
-    if canonical_present and fenced_present:
-        raise Refusal(
-            f"cannot abort slot {slot}: both canonical and abort-fenced paths exist; "
-            "preserve both for inspection"
+    removal_record = (
+        None
+        if "abort_removal" not in journal
+        else _create_abort_removal_target(
+            config, slot, slot_type, journal["abort_removal"]
         )
-    active_slot = fenced_slot if fenced_present else slot_path
+    )
+    removal_slot = None if removal_record is None else removal_record[0]
+    present_paths = [
+        path
+        for path in (slot_path, fenced_slot, removal_slot)
+        if path is not None and (path.exists() or path.is_symlink())
+    ]
+    if len(present_paths) > 1:
+        raise Refusal(
+            f"cannot abort slot {slot}: multiple canonical or fenced paths exist; "
+            "preserve them for inspection"
+        )
+    active_slot = present_paths[0] if present_paths else slot_path
+    if removal_record is not None and removal_slot in present_paths:
+        expected_identity = removal_record[1]
+        if _private_cleanup_fence_identity(config, removal_slot) != expected_identity:
+            raise Refusal("create-abort removal fence identity changed")
     vcs = _GitVcs()
     recorded_by_name = {checkout.name: checkout for checkout in recorded_created}
     if config.layout == "nested" and active_slot.exists():
@@ -22556,72 +22996,173 @@ def _abort_create(
             _repair_create_abort_registrations(config, plan, active_slot, vcs)
             _interrupt_for_test("after-create-abort-path-fence")
 
-        final: list[tuple[PlannedCheckout, Path, Path]] = []
-        for item, repository, expected_head, present, checkout, _caches in preflight:
-            if not present:
-                continue
-            assert checkout is not None
-            destination = _create_abort_checkout_path(config, active_slot, item.name)
-            head = vcs.verify_existing_worktree(repository, destination)
-            branch = vcs.branch(destination)
-            if head != expected_head or branch != item.branch:
-                raise Refusal(
-                    f"cannot abort changed checkout {item.name}: expected branch "
-                    f"{item.branch} at {expected_head}, found {branch} at {head}"
+        def prove_removal_target(
+            target_slot: Path,
+        ) -> list[tuple[PlannedCheckout, Path, Path]]:
+            proved: list[tuple[PlannedCheckout, Path, Path]] = []
+            for item, repository, expected_head, present, checkout, _caches in preflight:
+                if not present:
+                    continue
+                assert checkout is not None
+                destination = _create_abort_checkout_path(
+                    config, target_slot, item.name
                 )
-            operation_paths = vcs.operation_paths(destination)
-            if operation_paths:
-                raise Refusal(
-                    f"cannot abort checkout {item.name} with an unfinished Git operation: "
-                    f"{operation_paths[0]}"
+                head = vcs.verify_existing_worktree(repository, destination)
+                branch = vcs.branch(destination)
+                if head != expected_head or branch != item.branch:
+                    raise Refusal(
+                        f"cannot abort changed checkout {item.name}: expected branch "
+                        f"{item.branch} at {expected_head}, found {branch} at {head}"
+                    )
+                operation_paths = vcs.operation_paths(destination)
+                if operation_paths:
+                    raise Refusal(
+                        f"cannot abort checkout {item.name} with an unfinished Git "
+                        f"operation: {operation_paths[0]}"
+                    )
+                vcs.assert_ordinary_history(destination)
+                vcs.assert_ordinary_index(destination)
+                active_checkout = dataclasses.replace(
+                    checkout, path=destination.relative_to(config.root).as_posix()
                 )
-            vcs.assert_ordinary_history(destination)
-            vcs.assert_ordinary_index(destination)
-            active_checkout = dataclasses.replace(
-                checkout, path=destination.relative_to(config.root).as_posix()
-            )
-            _assert_cache_policy_untracked(config, active_checkout, vcs)
-            status = vcs.status(destination, _cache_globs_for(config, checkout.name))
-            if status:
-                first = status.splitlines()[0]
-                raise Refusal(
-                    f"cannot abort changed checkout {item.name}: source state is dirty "
-                    f"({first}); preserve it for inspection"
+                _assert_cache_policy_untracked(config, active_checkout, vcs)
+                status = vcs.status(
+                    destination, _cache_globs_for(config, checkout.name)
                 )
-            _assert_abort_create_submodules_pristine(
-                destination,
-                item.name,
-                vcs,
-                submodule_baselines.get(item.name),
-            )
-            final.append((item, repository, destination))
+                if status:
+                    first = status.splitlines()[0]
+                    raise Refusal(
+                        f"cannot abort changed checkout {item.name}: source state is "
+                        f"dirty ({first}); preserve it for inspection"
+                    )
+                _assert_abort_create_submodules_pristine(
+                    destination,
+                    item.name,
+                    vcs,
+                    submodule_baselines.get(item.name),
+                )
+                proved.append((item, repository, destination))
+            if target_slot.exists():
+                _assert_slot_unused(target_slot)
+            return proved
 
-        if active_slot.exists():
-            _assert_slot_unused(active_slot)
+        final = prove_removal_target(active_slot)
+
         _interrupt_for_test("after-create-abort-final-proof")
+        if final and removal_slot is None:
+            removal_slot = slot_path.with_name(
+                f".{slot}.abort-remove.{uuid.uuid4().hex}"
+            )
+            identity = _private_cleanup_fence_identity(config, active_slot)
+            updated_journal = dict(journal)
+            updated_journal["abort_removal"] = {
+                "path": removal_slot.relative_to(config.root).as_posix(),
+                "identity": list(identity),
+            }
+            _write_journal(config, updated_journal, journal_path=journal_path)
+            journal = updated_journal
+            removal_record = (removal_slot, identity)
+        if final and active_slot != removal_slot:
+            assert removal_slot is not None
+            if removal_slot.exists() or removal_slot.is_symlink():
+                raise Refusal(
+                    f"create-abort removal target already exists: {removal_slot}"
+                )
+            os.rename(active_slot, removal_slot)
+            _fsync_directory(active_slot.parent)
+            active_slot = removal_slot
+            assert removal_record is not None
+            if (
+                _private_cleanup_fence_identity(config, active_slot)
+                != removal_record[1]
+            ):
+                raise Refusal("create-abort removal fence identity changed during move")
+            _repair_create_abort_registrations(config, plan, active_slot, vcs)
+        final = prove_removal_target(active_slot)
+        removal_targets = [
+            (
+                item,
+                repository,
+                destination,
+                _capture_abort_removal_tree(destination),
+                (admin := _create_abort_worktree_admin(repository, destination, vcs)),
+                _capture_abort_removal_tree(admin),
+            )
+            for item, repository, destination in final
+        ]
+        # Snapshot before the final semantic proof.  A path first appearing
+        # after that proof is therefore absent from the deletion authority and
+        # cannot become authorized merely because cleanup observes it.
+        rechecked = prove_removal_target(active_slot)
+        if [
+            (item, repository, destination)
+            for item,
+            repository,
+            destination,
+            _checkout_tree,
+            _admin,
+            _admin_tree in removal_targets
+        ] != rechecked:
+            raise StateError("create-abort removal target set changed during proof")
+        _interrupt_for_test("after-create-abort-final-removal-proof")
         if slot_path.exists() or slot_path.is_symlink():
             raise Refusal(
                 f"canonical slot path reappeared behind the create-abort fence: "
                 f"{slot_path}; preserve it for inspection"
             )
-        for _item, repository, destination in final:
+        for (
+            _item,
+            _repository,
+            destination,
+            checkout_tree,
+            admin,
+            admin_tree,
+        ) in removal_targets:
+            def note_destructive_boundary() -> None:
+                nonlocal removed_any
+                removed_any = True
+
             if slot_path.exists() or slot_path.is_symlink():
                 raise Refusal(
-                    f"canonical slot path reappeared before forced removal: {slot_path}; "
+                    f"canonical slot path reappeared before bound removal: {slot_path}; "
                     "preserve it for inspection"
                 )
-            # Git requires --force even for a clean linked worktree when any
-            # submodule is initialized. The canonical namespace is absent, and
-            # the fenced tree was re-proved clean and unused immediately above.
-            vcs.remove_worktree(repository, destination, force=True)
-            removed_any = True
-            if slot_path.exists() or slot_path.is_symlink():
+            # Never give `git worktree remove --force` a writable pathname: it
+            # recursively deletes whatever happens to occupy that name.  Empty
+            # the exact proved inodes through rename/recheck boundaries, then
+            # remove the exact linked-worktree administration the same way.
+            _remove_abort_removal_tree(
+                destination, checkout_tree, note_destructive_boundary
+            )
+            _remove_abort_removal_tree(admin, admin_tree, note_destructive_boundary)
+            if (
+                slot_path.exists()
+                or slot_path.is_symlink()
+                or (
+                    active_slot != fenced_slot
+                    and (fenced_slot.exists() or fenced_slot.is_symlink())
+                )
+            ):
                 raise Refusal(
-                    f"canonical slot path reappeared during forced removal: {slot_path}; "
+                    "an earlier create-abort path reappeared during forced removal; "
                     "the new path was preserved"
                 )
             _fsync_directory(active_slot.parent)
     except Refusal:
+        if (
+            fence_created
+            and not removed_any
+            and removal_slot is not None
+            and removal_slot.is_dir()
+            and not removal_slot.is_symlink()
+            and not fenced_slot.exists()
+            and not fenced_slot.is_symlink()
+            and not slot_path.exists()
+            and not slot_path.is_symlink()
+        ):
+            os.rename(removal_slot, fenced_slot)
+            _fsync_directory(fenced_slot.parent)
+            _repair_create_abort_registrations(config, plan, fenced_slot, vcs)
         if (
             fence_created
             and not removed_any
@@ -22643,14 +23184,16 @@ def _abort_create(
             f"canonical slot path reappeared after create-abort removal: {slot_path}; "
             "preserve it for inspection"
         )
-    if fenced_slot.exists():
+    for empty_root in (fenced_slot, removal_slot):
+        if empty_root is None or not empty_root.exists():
+            continue
         try:
-            fenced_slot.rmdir()
+            empty_root.rmdir()
         except OSError as exc:
             raise Refusal(
-                f"cannot remove aborted slot directory {fenced_slot}: {exc}"
+                f"cannot remove aborted slot directory {empty_root}: {exc}"
             ) from exc
-        _fsync_directory(fenced_slot.parent)
+        _fsync_directory(empty_root.parent)
     _clear_journal(
         config,
         _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
@@ -22923,6 +23466,7 @@ def _recover_create(
         _abort_create(
             config,
             path,
+            raw,
             slot,
             slot_type,
             plan,
