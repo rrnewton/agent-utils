@@ -205,7 +205,7 @@ def test_crashed_invocations_seal_waits_for_explicit_recovery(
     assert active_slots(project) == []
 
 
-@pytest.mark.parametrize("failure", ("before-replace", "after-replace"))
+@pytest.mark.parametrize("failure", ("before-replace", "after-replace", "read-back"))
 def test_failed_seal_rewrite_still_retires_the_invocations_seal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -215,7 +215,9 @@ def test_failed_seal_rewrite_still_retires_the_invocations_seal(
     project, target, seal = _prepare(tmp_path, monkeypatch)
     original = target.stat().st_mode & 0o777
     real = wrkslots._write_validate_batch_seal_journal
+    real_read = wrkslots._read_regular_file_identity
     writes: list[bytes | None] = []
+    armed: list[Path] = []
 
     def write(config: wrkslots.Config, payload: object) -> None:
         # The first write publishes the empty seal; the second adds the target
@@ -225,17 +227,30 @@ def test_failed_seal_rewrite_still_retires_the_invocations_seal(
             real(config, payload)
             writes.append(seal.read_bytes())
             return
-        if failure == "after-replace":
+        if failure != "before-replace":
             real(config, payload)
         writes.append(seal.read_bytes())
+        if failure == "read-back":
+            # The write succeeds; reading the published seal back fails once.
+            armed.append(seal)
+            return
         raise wrkslots.Refusal("simulated seal write failure")
 
+    def read(
+        path: Path, label: str, limit: int
+    ) -> tuple[bytes, wrkslots._RegularFileIdentity]:
+        if path in armed:
+            armed.remove(path)
+            raise wrkslots.Refusal("simulated seal write failure")
+        return real_read(path, label, limit)
+
     monkeypatch.setattr(wrkslots, "_write_validate_batch_seal_journal", write)
+    monkeypatch.setattr(wrkslots, "_read_regular_file_identity", read)
 
     assert remove_completed_validation(project) == 3
     assert "simulated seal write failure" in capsys.readouterr().err
 
-    assert len(writes) == 2
+    assert len(writes) == 2 and not armed
     assert (writes[1] == writes[0]) == (failure == "before-replace")
     assert not seal.exists()
     assert target.is_dir()

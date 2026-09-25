@@ -20334,14 +20334,16 @@ def _write_owned_validate_batch_seal_journal(
 
     The previous identity is kept until the new payload is on disk, so a
     replacement that fails still leaves this invocation owning the seal it
-    wrote before. A failure after the payload was published adopts that file
-    only if it holds exactly the payload written here.
+    wrote before. A failure after the payload was published, including one
+    reading it back, adopts that file only if it holds exactly the payload
+    written here.
     """
 
     path = _validate_batch_seal_journal_path(config)
     label = "validation-batch seal journal"
     try:
         _write_validate_batch_seal_journal(config, payload)
+        owned[:] = [_read_regular_file_identity(path, label, 1024 * 1024)[1]]
     except BaseException:
         try:
             contents, identity = _read_regular_file_identity(path, label, 1024 * 1024)
@@ -20351,7 +20353,6 @@ def _write_owned_validate_batch_seal_journal(
         if published:
             owned[:] = [identity]
         raise
-    owned[:] = [_read_regular_file_identity(path, label, 1024 * 1024)[1]]
 
 
 def _validate_batch_seal_is_owned(
