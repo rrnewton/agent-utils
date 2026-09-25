@@ -11,12 +11,14 @@ one reader through:
   are drawn before any answer -> one bounded newest-page read merges a new row without
   duplicating -> switching views makes no request -> a reload with the API unreachable keeps the
   rows and says so -> a reload whose refresh fails keeps them and says that -> signing out removes
-  them from the screen and the device. Before the reloads, the pill also comes and goes in place,
-  on the channel's own poll, under a reader at the top, in the middle and at the newest line.
+  them from the screen and the device. Before the reloads, a refresh also fails and recovers in
+  place, on the channel's own poll, under a reader at the top, in the middle and at the newest line.
 
 While the freshness pill is up — refreshing, offline, failed — it must cover neither the view tabs
 nor the list's header seam or first row, and #scroll-area must be the same box with it as without
-it (`#32 freshness-pill-overlap`).
+it (`#32 freshness-pill-overlap`). As the pill's room and the error panel above the list come and
+go, a scrolled reader's line stays where it is on the screen, and a reader at the newest line stays
+there (`#33 error-banner-scroll-shift`).
 
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
@@ -220,16 +222,19 @@ def check(condition: bool, message: str) -> None:
 
 
 # Park the reader (`where`: "top", "middle", "newest", or "" to stay put), then say where they are:
-# the top of the thread root's row within the list, how far the newest line is below the fold, and the
-# scroll offset.
+# the top of the thread root's row on the screen, how far the newest line is below the fold, the scroll
+# offset, the list's bottom edge, and whether the error panel is up with something in it.
 PLACE_JS = """async (where) => {
     const area = document.getElementById('scroll-area');
     const range = area.scrollHeight - area.clientHeight;
     if (where) area.scrollTop = {top: 0, middle: Math.round(range / 2), newest: area.scrollHeight}[where];
     await new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
     const row = document.querySelector('#discord-log > li[data-id="201"]');
-    return {row: row.getBoundingClientRect().top - area.getBoundingClientRect().top,
-            gap: area.scrollHeight - area.clientHeight - area.scrollTop, top: area.scrollTop};
+    const error = document.getElementById('error-wrap');
+    return {row: row.getBoundingClientRect().top, gap: area.scrollHeight - area.clientHeight - area.scrollTop,
+            top: area.scrollTop, bottom: area.getBoundingClientRect().bottom,
+            banner: !error.hidden && error.getClientRects().length > 0
+                && document.getElementById('error').textContent.trim() !== ''};
 }"""
 
 # Everything that can be covered, measured at the head of the list, with the view tabs and without
@@ -314,7 +319,7 @@ def main() -> int:
             print(f"{browser_version} {label} at {width}x{height}: snapshot drawn before the network,"
                   " one newest-page read, local view switches, offline and failed states, the pill"
                   " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
-                  " held in place as it comes and goes, no Cache Storage or"
+                  " held in place as it and the error panel come and go, no Cache Storage or"
                   " service worker, sign-out clears")
     return 0
 
@@ -399,7 +404,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
 
             def place(where: str) -> dict[str, float]:
                 found = page.evaluate(PLACE_JS, where)
-                return {"row": float(found["row"]), "gap": float(found["gap"]), "top": float(found["top"])}
+                return {key: float(found[key]) for key in ("row", "gap", "top", "bottom", "banner")}
 
             def geometry(state: str, name: str) -> str:
                 # At the head of the list, where the header is: a pill over row 40 of 90 is the
@@ -470,35 +475,49 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(len(api.reads()) == 1, f"switching views read history again: {api.reads()}")
             shot("4-switched-locally")
 
-            # 4b. The pill arriving and leaving IN PLACE, over a list long enough to scroll. Its room
-            # is made above a reader who has scrolled down, where browser scroll anchoring does not
-            # hold, so the page must: the row being read stays put, and a reader at the newest line
-            # stays there. At the very top the header moves down out from under the pill instead.
-            # Tall rows, so that three of them overflow. The failed read's error banner is kept off
-            # the screen: it is a row ABOVE the list, and moves the reader by its own height as it
-            # comes and goes, which is its behaviour and not the pill's.
-            page.add_style_tag(content="#discord-log > li[data-id] { min-height: 70vh; }"
-                                       " #error-wrap { display: none !important; }")
+            # 4b. A failed refresh IN PLACE, over a list long enough to scroll: the pill's room is made
+            # at the head of the list and the error panel takes a row above it, and both go again
+            # when the next read succeeds. Browser scroll anchoring holds for neither, so the page
+            # must: the row being read stays where it is on the screen, and a reader at the newest
+            # line stays there (`#32 freshness-pill-overlap`, `#33 error-banner-scroll-shift`). At the
+            # very top the header moves down out from under them instead. Tall rows, so that three
+            # of them overflow.
+            page.add_style_tag(content="#discord-log > li[data-id] { min-height: 70vh; }")
             for where in ("middle", "newest", "top"):
                 before = place(where)
                 parked = {"middle": 0 < before["top"] and before["gap"] > 100,
                           "newest": before["gap"] <= 2, "top": before["top"] == 0}[where]
                 check(parked, f"{label}: could not park the reader at the {where}: {before}")
-                for fail in (True, False):
-                    poll_channel(fail)
+                # The panel clears two ways: by timing out while the recovering read is in flight,
+                # which re-anchors the list itself and so hides a clear that holds nobody, and by
+                # the reader's own dismissal with nothing in flight. The last recovery clears only
+                # the pill.
+                for step in ("fail", "recover", "fail", "dismiss", "recover"):
+                    if step == "dismiss":
+                        page.click("#dismiss-error")
+                        page.wait_for_timeout(100)
+                    else:
+                        poll_channel(step == "fail")
                     after = place("")
-                    state = f"{label}, reader at the {where}: the pill {'appeared' if fail else 'cleared'}"
+                    state = f"{label}, reader at the {where}: {step}"
+                    # Held, not hidden: the panel is up as soon as the pill says so, and the list
+                    # gives up room only at its head.
+                    check(after["banner"] == float(step == "fail"), f"{state} but the error panel is {after}")
+                    check(abs(after["bottom"] - before["bottom"]) < 1, f"{state} and moved the list's foot: {after}")
                     if where == "middle":
                         moved = after["row"] - before["row"]
-                        # Under 2px: a refresh makes three position fixes (its loading line
-                        # arriving, the pill's room, the loading line going), each landing on a
-                        # whole pixel. The defect was the pill's whole height, ~32px.
+                        # Under 2px a step: a refresh makes several position fixes (its loading line
+                        # arriving, the pill's room, the panel, the loading line going), each landing
+                        # on a whole pixel. The defects were the pill's height, ~32px, and the
+                        # panel's, 74-89px.
                         check(abs(moved) < 2, f"{state} and moved the row being read by {moved:.1f}px: {after}")
                     elif where == "newest":
                         check(after["gap"] <= 2, f"{state} and left the newest line {after['gap']:.1f}px below")
-                    elif fail:
+                    else:
                         check(after["top"] == 0, f"{state} and scrolled the header away: {after}")
-                        geometry("in place at the top", "4b-top")
+                        if step == "fail":
+                            geometry("in place at the top", "4b-top")
+                    before = after
             shot("4b-in-place")
 
             # 5. The API unreachable: the rows stay, and the pill says they are old.

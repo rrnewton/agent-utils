@@ -137,9 +137,11 @@ let errorTimer = null;
 
 function showError(text) {
   const box = el("error-wrap");
-  el("error").textContent = redact(text);
-  el("error").hidden = false;
-  box.hidden = false;
+  holdingReader(() => {
+    el("error").textContent = redact(text);
+    el("error").hidden = false;
+    box.hidden = false;
+  });
   setState("error");
   if (errorTimer !== null) clearTimeout(errorTimer);
   errorTimer = setTimeout(clearError, 12000);
@@ -149,9 +151,15 @@ function clearError() {
   const box = el("error-wrap");
   if (errorTimer !== null) clearTimeout(errorTimer);
   errorTimer = null;
-  el("error").textContent = "";
-  el("error").hidden = true;
-  box.hidden = true;
+  // Most callers clear on the way into an action — Read, Talk, sign-in — whether or not anything is
+  // showing. With nothing to take away there is nothing to hold, and holding anyway would snap a
+  // reader within BOTTOM_SLACK_PX of the newest line down onto it.
+  if (box.hidden) return;
+  holdingReader(() => {
+    el("error").textContent = "";
+    el("error").hidden = true;
+    box.hidden = true;
+  });
 }
 
 const session = {
@@ -596,6 +604,21 @@ function preservingScroll(mutate) {
   const mark = captureScroll();
   mutate();
   restoreScroll(mark);
+}
+
+/**
+ * `preservingScroll` for a change that resizes the list's window or the room at its head — the
+ * error panel above #scroll-area, the freshness pill's room inside it. Browser scroll anchoring
+ * holds for neither, so the line being read, or the newest line, would move by the change's height:
+ * 74-89px for a failed refresh's panel (`#33 error-banner-scroll-shift`).
+ *
+ * Not for a reader at the very top, nor off the main screen. At the top the first row is the
+ * anchor, and holding it would scroll the header out of view: that reader is meant to see the
+ * header move down. Off the main screen there is no list on screen to hold.
+ */
+function holdingReader(mutate) {
+  if (currentScreen === "main" && el("scroll-area").scrollTop > 0) preservingScroll(mutate);
+  else mutate();
 }
 
 /**
@@ -4968,12 +4991,10 @@ function renderChannelFreshness() {
  * never covers the list's header. Keyed to there being something to say, not to the pill being
  * shown: giving way to a pull or to the other view must not shift the list.
  *
- * Through `preservingScroll`, because the room is added ABOVE a reader who has scrolled down, and
+ * Through `holdingReader`, because the room is added ABOVE a reader who has scrolled down, and
  * browser scroll anchoring is suppressed for exactly this change — padding on an ancestor of every
  * row. Without it a failed refresh pushed the line being read, or the newest line, down by the
- * pill's height. Not for a reader at the very top: there the first row is the anchor, and holding
- * it would scroll the header straight back under the pill. That reader is meant to see the header
- * move down out from under it.
+ * pill's height.
  */
 function reserveFreshnessRoom(reserve) {
   const pane = el("pane-discord");
@@ -4983,7 +5004,7 @@ function reserveFreshnessRoom(reserve) {
     else pane.removeAttribute("data-freshness");
   };
   // The pane is not on screen in the other view; the list that is must not be moved on its behalf.
-  if (currentView === "discord" && el("scroll-area").scrollTop > 0) preservingScroll(toggle);
+  if (currentView === "discord") holdingReader(toggle);
   else toggle();
 }
 

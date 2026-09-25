@@ -5617,6 +5617,40 @@ test("device speech reads the full raw combined row synchronously without a spee
   assert.equal(page.players.length, 0);
 });
 
+test("tapping Read with no error showing leaves a reader near the newest line where they are", async () => {
+  // `#33 error-banner-scroll-shift`. Reading clears the error panel on its way in whether or not
+  // one is up. Holding the reader for a panel that is not there snapped anyone within
+  // BOTTOM_SLACK_PX of the newest line down onto it, under the thumb that had just tapped a row.
+  const readNearTheBottom = async (script) => {
+    const page = newPage(new Map(), script);
+    page.readAloud = DEVICE_SPEECH;
+    page.enableDeviceSpeech();
+    await signIn(page);
+    const messages = Array.from({ length: 8 }, (_, i) => message({
+      id: `10000000000000001${String(i).padStart(2, "0")}`,
+      author: i % 2 ? "ci-bot" : "deploy-bot",
+      author_id: i % 2 ? "1000000000000000001" : "1000000000000000002",
+      content: longMessage(`m${i}`),
+    }));
+    const rows = await inReadingMode(page, messages);
+    const area = page.el("scroll-area");
+    assert.ok(area.scrollHeight > area.clientHeight * 2, "the fixture cannot scroll, so this proves nothing");
+    area.scrollTop = area.scrollHeight - area.clientHeight - Math.floor(BOTTOM_SLACK_PX / 2);
+    const before = area.scrollTop;
+    assert.ok(atBottomOf(area) && before < area.scrollHeight - area.clientHeight,
+      "the reader is not inside the slack short of the newest line, so this is not the case here");
+    assert.equal(page.el("error-wrap").hidden, true, "an error is showing, so this is not the case here");
+    await rows.at(-2).dispatch("click", {});
+    await page.settle();
+    assert.equal(page.deviceSpeech.utterances.length > 0, true, "the tap did not start reading");
+    return area.scrollTop - before;
+  };
+  const held = await readNearTheBottom(SCRIPT);
+  assert.equal(held, 0, `tapping Read moved the reader by ${held}px`);
+  const moved = await readNearTheBottom(brokenScript("  if (box.hidden) return;\n", ""));
+  assert.ok(moved > 0, "the negative control did not snap the reader, so the check above proves nothing");
+});
+
 test("device speech ignores remote voices and waits for a fresh tap when installed voices appear", async () => {
   const remote = { name: "Cloud voice", lang: "en-US", localService: false, default: true };
   const page = devicePage([remote]);
