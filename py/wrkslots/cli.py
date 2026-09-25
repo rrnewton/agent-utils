@@ -8173,6 +8173,31 @@ class _GitVcs:
             raise Refusal(f"Git reported an unsafe common directory: {common}")
         return common
 
+    def linked_worktree_git_directory(self, checkout: Path) -> tuple[Path, Path]:
+        """Return the exact common and per-worktree Git directories."""
+
+        common = self.common_directory(checkout)
+        result = self._run(
+            checkout,
+            ["rev-parse", "--path-format=absolute", "--git-dir"],
+        )
+        lines = result.stdout.splitlines()
+        if len(lines) != 1:
+            raise Refusal(
+                f"Git did not report one linked-worktree directory for {checkout}"
+            )
+        git_directory = Path(lines[0]).absolute()
+        if (
+            git_directory.parent != common / "worktrees"
+            or not git_directory.name
+            or git_directory.is_symlink()
+            or not git_directory.is_dir()
+        ):
+            raise Refusal(
+                f"Git reported an unsafe linked-worktree directory: {git_directory}"
+            )
+        return common, git_directory
+
     def worktree_identity(self, checkout: Path) -> tuple[Path, Path, str]:
         """Answer repository_root, common_directory and head in ONE Git process.
 
@@ -15688,17 +15713,30 @@ def _open_cache_directory(
     return parent_fd, cache_fd, name
 
 
-def _directory_names(directory_fd: int, path: Path) -> list[str]:
+def _directory_names(
+    directory_fd: int,
+    path: Path,
+    *,
+    entry_limit: int | None = None,
+    label: str = "cache directory",
+) -> list[str]:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
         scan_fd = os.open(".", flags, dir_fd=directory_fd)
     except OSError as exc:
-        raise Refusal(f"cannot open cache directory {path} for enumeration: {exc}") from exc
+        raise Refusal(f"cannot open {label} {path} for enumeration: {exc}") from exc
     try:
         with os.scandir(scan_fd) as entries:
-            return sorted(entry.name for entry in entries)
+            names: list[str] = []
+            for entry in entries:
+                if entry_limit is not None and len(names) >= entry_limit:
+                    raise Refusal(f"{label} exceeds its directory-entry bound")
+                names.append(entry.name)
+            return sorted(names)
+    except Refusal:
+        raise
     except OSError as exc:
-        raise Refusal(f"cannot enumerate cache directory {path}: {exc}") from exc
+        raise Refusal(f"cannot enumerate {label} {path}: {exc}") from exc
     finally:
         os.close(scan_fd)
 
@@ -22558,6 +22596,394 @@ def _recover_partial_updates(config: Config, discard: bool) -> bool:
     return True
 
 
+_EMPTY_SUBMODULE_ADMIN_DIRECTORY_LIMIT = 4096
+_EMPTY_SUBMODULE_ADMIN_DEPTH_LIMIT = 64
+
+
+@dataclasses.dataclass(frozen=True)
+class _EmptySubmoduleAdministration:
+    """Identity-bound proof that one worktree's module administration is empty."""
+
+    common_directory: Path
+    common_identity: tuple[int, int, int]
+    git_directory: Path
+    git_directory_identity: tuple[int, int, int]
+    directories: tuple[tuple[tuple[str, ...], tuple[int, int, int]], ...]
+
+
+def _submodule_admin_identity(
+    directory_fd: int, path: Path, mount_id: int
+) -> tuple[int, int, int]:
+    try:
+        metadata = os.fstat(directory_fd)
+    except OSError as exc:
+        raise Refusal(f"cannot inspect submodule administration {path}: {exc}") from exc
+    identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        _fd_mount_id(directory_fd, str(path)),
+    )
+    if identity[2] != mount_id:
+        raise Refusal(f"submodule administration crosses a mount point: {path}")
+    return identity
+
+
+def _submodule_admin_names(directory_fd: int, path: Path) -> tuple[str, ...]:
+    return tuple(
+        _directory_names(
+            directory_fd,
+            path,
+            entry_limit=_EMPTY_SUBMODULE_ADMIN_DIRECTORY_LIMIT,
+            label="submodule administration",
+        )
+    )
+
+
+def _open_submodule_administration(
+    vcs: _GitVcs,
+    checkout: Path,
+    *,
+    expected: _EmptySubmoduleAdministration | None = None,
+) -> tuple[
+    int,
+    int,
+    Path,
+    Path,
+    Path,
+    tuple[int, int, int],
+    tuple[int, int, int],
+] | None:
+    common, git_directory = vcs.linked_worktree_git_directory(checkout)
+    common_identity = _open_directory_identity(common, "Git common directory")
+    if expected is not None and (
+        common != expected.common_directory
+        or common_identity != expected.common_identity
+        or git_directory != expected.git_directory
+    ):
+        raise Refusal(
+            "linked-worktree Git administration changed before abort cleanup"
+        )
+    modules = git_directory / "modules"
+    git_fd, name, mount_id = _open_parent_directory(
+        common,
+        modules,
+        "submodule administration",
+        expected_root_identity=common_identity,
+    )
+    try:
+        git_identity = _submodule_admin_identity(git_fd, git_directory, mount_id)
+        if expected is not None and git_identity != expected.git_directory_identity:
+            raise Refusal(
+                "linked-worktree Git administration changed before abort cleanup"
+            )
+        try:
+            named = os.stat(name, dir_fd=git_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.close(git_fd)
+            return None
+        if not stat.S_ISDIR(named.st_mode):
+            kind = "symlink" if stat.S_ISLNK(named.st_mode) else "non-directory entry"
+            raise Refusal(f"submodule administration is a {kind}: {modules}")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        modules_fd = os.open(name, flags, dir_fd=git_fd)
+        try:
+            modules_identity = _submodule_admin_identity(
+                modules_fd, modules, mount_id
+            )
+            if modules_identity[:2] != (named.st_dev, named.st_ino):
+                raise Refusal(
+                    f"submodule administration changed during inspection: {modules}"
+                )
+            if (
+                expected is not None
+                and dict(expected.directories).get(()) != modules_identity
+            ):
+                raise Refusal(
+                    "submodule administration changed between abort preflight and removal"
+                )
+        except BaseException:
+            os.close(modules_fd)
+            raise
+        return (
+            git_fd,
+            modules_fd,
+            modules,
+            common,
+            git_directory,
+            common_identity,
+            git_identity,
+        )
+    except OSError as exc:
+        os.close(git_fd)
+        raise Refusal(f"cannot open submodule administration {modules}: {exc}") from exc
+    except BaseException:
+        os.close(git_fd)
+        raise
+
+
+def _snapshot_empty_submodule_admin_tree(
+    directory_fd: int,
+    path: Path,
+    relative: tuple[str, ...],
+    mount_id: int,
+    observed: list[tuple[tuple[str, ...], tuple[int, int, int]]],
+) -> None:
+    if len(relative) > _EMPTY_SUBMODULE_ADMIN_DEPTH_LIMIT:
+        raise Refusal("submodule administration exceeds its directory-depth bound")
+    if len(observed) >= _EMPTY_SUBMODULE_ADMIN_DIRECTORY_LIMIT:
+        raise Refusal("submodule administration exceeds its directory-count bound")
+    identity = _submodule_admin_identity(directory_fd, path, mount_id)
+    observed.append((relative, identity))
+    names = _submodule_admin_names(directory_fd, path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        for name in names:
+            child_path = path / name
+            child = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(child.st_mode):
+                kind = (
+                    "symlink" if stat.S_ISLNK(child.st_mode) else "non-directory entry"
+                )
+                raise Refusal(
+                    f"submodule administration contains a {kind}: {child_path}"
+                )
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                child_identity = _submodule_admin_identity(
+                    child_fd, child_path, mount_id
+                )
+                if child_identity[:2] != (child.st_dev, child.st_ino):
+                    raise Refusal(
+                        f"submodule administration changed during inspection: "
+                        f"{child_path}"
+                    )
+                _snapshot_empty_submodule_admin_tree(
+                    child_fd,
+                    child_path,
+                    (*relative, name),
+                    mount_id,
+                    observed,
+                )
+            finally:
+                os.close(child_fd)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != child_identity[:2]
+            ):
+                raise Refusal(
+                    f"submodule administration changed during inspection: {child_path}"
+                )
+    except Refusal:
+        raise
+    except OSError as exc:
+        raise Refusal(
+            f"submodule administration changed during inspection: {path}: {exc}"
+        ) from exc
+    if _submodule_admin_names(directory_fd, path) != names:
+        raise Refusal(
+            f"submodule administration changed during inspection: {path}"
+        )
+
+
+def _empty_submodule_administration(
+    vcs: _GitVcs, checkout: Path
+) -> _EmptySubmoduleAdministration | None:
+    initialized = vcs.initialized_submodules(checkout)
+    declared = _declared_initialized_submodules(checkout)
+    if initialized or declared:
+        first = (
+            initialized[0]
+            if initialized
+            else str(declared[0].relative_to(checkout))
+        )
+        raise Refusal(
+            f"cannot abort checkout with initialized submodule {first!r}; "
+            "preserve it for inspection"
+        )
+    opened = _open_submodule_administration(vcs, checkout)
+    if opened is None:
+        return None
+    (
+        git_fd,
+        modules_fd,
+        modules,
+        common,
+        git_directory,
+        common_identity,
+        git_identity,
+    ) = opened
+    try:
+        observed: list[tuple[tuple[str, ...], tuple[int, int, int]]] = []
+        _snapshot_empty_submodule_admin_tree(
+            modules_fd, modules, (), git_identity[2], observed
+        )
+        try:
+            current = os.stat("modules", dir_fd=git_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise Refusal(
+                f"submodule administration changed during inspection: {modules}: {exc}"
+            ) from exc
+        if (current.st_dev, current.st_ino) != dict(observed)[()][:2]:
+            raise Refusal(
+                f"submodule administration changed during inspection: {modules}"
+            )
+        return _EmptySubmoduleAdministration(
+            common_directory=common,
+            common_identity=common_identity,
+            git_directory=git_directory,
+            git_directory_identity=git_identity,
+            directories=tuple(observed),
+        )
+    finally:
+        os.close(modules_fd)
+        os.close(git_fd)
+
+
+def _rmdir_verified_empty_admin_directory(
+    parent_fd: int,
+    directory_fd: int,
+    name: str,
+    path: Path,
+    expected_identity: tuple[int, int, int],
+) -> None:
+    try:
+        if (
+            _submodule_admin_identity(
+                directory_fd, path, expected_identity[2]
+            )
+            != expected_identity
+            or _submodule_admin_names(directory_fd, path)
+        ):
+            raise Refusal(
+                f"submodule administration changed or is not empty before removal: "
+                f"{path}"
+            )
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or (named.st_dev, named.st_ino) != expected_identity[:2]
+        ):
+            raise Refusal(f"submodule administration changed before removal: {path}")
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        removed = os.fstat(directory_fd)
+        if removed.st_nlink != 0:
+            raise Refusal(f"submodule administration raced removal: {path}")
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise Refusal(f"submodule administration reappeared during removal: {path}")
+    except Refusal:
+        raise
+    except OSError as exc:
+        raise Refusal(
+            f"cannot remove verified-empty submodule administration {path}: {exc}"
+        ) from exc
+
+
+def _prune_empty_submodule_admin_tree(
+    directory_fd: int,
+    path: Path,
+    relative: tuple[str, ...],
+    identities: Mapping[tuple[str, ...], tuple[int, int, int]],
+) -> None:
+    expected = identities.get(relative)
+    if expected is None:
+        raise Refusal(f"submodule administration acquired an unexpected directory: {path}")
+    if _submodule_admin_identity(directory_fd, path, expected[2]) != expected:
+        raise Refusal(f"submodule administration changed before removal: {path}")
+    children = tuple(
+        sorted(
+            child[-1]
+            for child in identities
+            if len(child) == len(relative) + 1 and child[:-1] == relative
+        )
+    )
+    if _submodule_admin_names(directory_fd, path) != children:
+        raise Refusal(
+            f"submodule administration changed before removal: {path}"
+        )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        for name in children:
+            child_relative = (*relative, name)
+            child_path = path / name
+            child_expected = identities[child_relative]
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                _prune_empty_submodule_admin_tree(
+                    child_fd, child_path, child_relative, identities
+                )
+                _rmdir_verified_empty_admin_directory(
+                    directory_fd,
+                    child_fd,
+                    name,
+                    child_path,
+                    child_expected,
+                )
+            finally:
+                os.close(child_fd)
+    except Refusal:
+        raise
+    except OSError as exc:
+        raise Refusal(
+            f"submodule administration changed before removal: {path}: {exc}"
+        ) from exc
+
+
+def _prune_empty_submodule_administration(
+    vcs: _GitVcs,
+    checkout: Path,
+    expected: _EmptySubmoduleAdministration,
+) -> None:
+    current = _empty_submodule_administration(vcs, checkout)
+    if current != expected:
+        raise Refusal(
+            "submodule administration changed between abort preflight and removal"
+        )
+    modules = expected.git_directory / "modules"
+    _assert_slot_unused(modules)
+    if _empty_submodule_administration(vcs, checkout) != expected:
+        raise Refusal(
+            "submodule administration changed during its live-use census"
+        )
+    _assert_slot_unused(modules)
+    opened = _open_submodule_administration(vcs, checkout, expected=expected)
+    if opened is None:
+        raise Refusal(
+            "submodule administration disappeared between preflight and removal"
+        )
+    (
+        git_fd,
+        modules_fd,
+        opened_modules,
+        _common,
+        _git_directory,
+        _common_identity,
+        _git_identity,
+    ) = opened
+    if opened_modules != modules:
+        raise Refusal("submodule administration path changed before removal")
+    try:
+        identities = dict(expected.directories)
+        root_identity = identities.get(())
+        if root_identity is None or len(identities) != len(expected.directories):
+            raise StateError("submodule administration witness is malformed")
+        _prune_empty_submodule_admin_tree(modules_fd, modules, (), identities)
+        _rmdir_verified_empty_admin_directory(
+            git_fd,
+            modules_fd,
+            "modules",
+            modules,
+            root_identity,
+        )
+    finally:
+        os.close(modules_fd)
+        os.close(git_fd)
+
+
 def _abort_create(
     config: Config,
     journal_path: Path,
@@ -22592,6 +23018,7 @@ def _abort_create(
             bool,
             Checkout | None,
             tuple[CacheDirectory, ...],
+            _EmptySubmoduleAdministration | None,
         ]
     ] = []
     for item in plan:
@@ -22629,7 +23056,9 @@ def _abort_create(
                 head=expected_head,
             )
             _assert_cache_policy_untracked(config, checkout, vcs)
-            status = vcs.status(destination, _cache_globs_for(config, checkout.name))
+            status = vcs.status(
+                destination, _cache_globs_for(config, checkout.name)
+            )
             if status:
                 first = status.splitlines()[0]
                 raise Refusal(
@@ -22638,6 +23067,9 @@ def _abort_create(
                 )
             present = True
             caches = _cache_directories_for_checkout(config, checkout)
+            submodule_administration = _empty_submodule_administration(
+                vcs, destination
+            )
         elif destination.absolute() in vcs.listed_worktrees(repository):
             raise Refusal(
                 f"cannot abort missing checkout still registered by Git: {destination}"
@@ -22646,6 +23078,7 @@ def _abort_create(
             present = False
             checkout = None
             caches = ()
+            submodule_administration = None
         if vcs.branch_exists(repository, item.branch):
             branch_head = vcs.verify_ref(
                 repository, f"refs/heads/{item.branch}", "created branch"
@@ -22656,11 +23089,29 @@ def _abort_create(
                     f"{branch_head}; preserve it instead of aborting provisioning"
                 )
         preflight.append(
-            (item, repository, destination, expected_head, present, checkout, caches)
+            (
+                item,
+                repository,
+                destination,
+                expected_head,
+                present,
+                checkout,
+                caches,
+                submodule_administration,
+            )
         )
     if slot_path.exists():
         _assert_slot_unused(slot_path)
-    for item, repository, destination, expected_head, present, checkout, caches in preflight:
+    for (
+        item,
+        repository,
+        destination,
+        expected_head,
+        present,
+        checkout,
+        caches,
+        submodule_administration,
+    ) in preflight:
         if present:
             assert checkout is not None
             head = vcs.verify_existing_worktree(repository, destination)
@@ -22679,18 +23130,41 @@ def _abort_create(
             vcs.assert_ordinary_history(destination)
             vcs.assert_ordinary_index(destination)
             _assert_cache_policy_untracked(config, checkout, vcs)
-            status = vcs.status(destination, _cache_globs_for(config, checkout.name))
+            status = vcs.status(
+                destination, _cache_globs_for(config, checkout.name)
+            )
             if status:
                 first = status.splitlines()[0]
                 raise Refusal(
                     f"cannot abort changed checkout {item.name}: source state is dirty "
                     f"({first}); preserve it for inspection"
                 )
+            current_submodule_administration = _empty_submodule_administration(
+                vcs, destination
+            )
+            if current_submodule_administration != submodule_administration:
+                raise Refusal(
+                    "submodule administration changed between abort preflight and "
+                    "removal"
+                )
             for cache in caches:
                 _remove_cache_directory(config, cache)
+            if current_submodule_administration is not None:
+                _prune_empty_submodule_administration(
+                    vcs, destination, current_submodule_administration
+                )
             vcs.remove_worktree(repository, destination)
             _fsync_directory(slot_path.parent)
-    for item, repository, _destination, expected_head, _present, _checkout, _caches in preflight:
+    for (
+        item,
+        repository,
+        _destination,
+        expected_head,
+        _present,
+        _checkout,
+        _caches,
+        _submodule_administration,
+    ) in preflight:
         vcs.delete_branch_at(repository, item.branch, expected_head)
     if slot_path.exists():
         try:

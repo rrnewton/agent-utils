@@ -139,6 +139,23 @@ def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     return completed
 
 
+def git_dir(
+    directory: Path, *args: str, check: bool = True
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        ["git", f"--git-dir={directory}", *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        raise AssertionError(
+            f"git --git-dir={directory} {' '.join(args)} failed: "
+            f"{completed.stderr or completed.stdout}"
+        )
+    return completed
+
+
 def reject_all_pushes(remote: Path) -> None:
     hook = remote / "hooks" / "pre-receive"
     hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
@@ -24470,6 +24487,541 @@ def test_failed_post_provision_hook_can_be_explicitly_aborted(
         "refs/heads/codex/task",
         check=False,
     ).returncode == 1
+
+
+def prepare_failed_create_with_empty_submodule_administration(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path, Path]:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project,
+        post_provision_hooks=["exit 9"],
+    )
+
+    refused = create(project)
+
+    assert refused.returncode == 3
+    tree = checkout(project)
+    journal = create_journal_path(project)
+    assert tree.is_dir()
+    assert journal.is_file()
+    git_directory = Path(
+        git(
+            tree,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+        ).stdout.strip()
+    )
+    administration = git_directory / "modules"
+    (administration / "third-party").mkdir(parents=True)
+    submodules = git(tree, "submodule", "status", "--recursive").stdout.splitlines()
+    assert submodules
+    assert all(line.startswith("-") for line in submodules)
+    assert git(tree, "status", "--porcelain=v2", "--untracked-files=all").stdout == ""
+    refused_by_git = git(
+        repository,
+        "worktree",
+        "remove",
+        "--",
+        str(tree),
+        check=False,
+    )
+    assert refused_by_git.returncode != 0
+    assert "containing submodules cannot be moved or removed" in refused_by_git.stderr
+    assert tree.is_dir()
+    return project, repository, tree, journal, administration
+
+
+def test_abort_create_removes_clean_worktree_with_uninitialized_submodule(
+    tmp_path: Path,
+) -> None:
+    project, repository, tree, journal, administration = (
+        prepare_failed_create_with_empty_submodule_administration(tmp_path)
+    )
+    common = Path(
+        git(
+            repository,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ).stdout.strip()
+    )
+    config_before = (common / "config").read_bytes()
+    source_submodules_before = git(
+        repository, "submodule", "status", "--recursive"
+    ).stdout
+    assert sorted(
+        path.relative_to(administration)
+        for path in administration.rglob("*")
+    ) == [Path("third-party")]
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert not tree.exists()
+    assert not journal.exists()
+    assert active_slots(project) == []
+    assert (common / "config").read_bytes() == config_before
+    assert (
+        git(repository, "submodule", "status", "--recursive").stdout
+        == source_submodules_before
+    )
+    assert (
+        git(
+            repository,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/codex/task",
+            check=False,
+        ).returncode
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("dirty", "source state is dirty"),
+        ("moved", "cannot abort changed checkout"),
+        ("operation", "unfinished Git operation"),
+        ("identity", "does not belong to repository"),
+        ("initialized-clean", "initialized submodule"),
+        ("nested-dirty-hidden", "initialized submodule"),
+        ("deinitialized-unique-commit", "non-directory entry"),
+        ("deinitialized-unique-branch", "non-directory entry"),
+        ("deinitialized-stash", "non-directory entry"),
+        ("initialized-ignored-file", "initialized submodule"),
+        ("admin-file", "non-directory entry"),
+        ("admin-symlink", "contains a symlink"),
+        ("admin-directory-count", "directory-count bound"),
+        ("admin-directory-depth", "directory-depth bound"),
+    ),
+)
+def test_abort_create_empty_admin_prune_preserves_every_preflight_refusal(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    project, repository, tree, journal, administration = (
+        prepare_failed_create_with_empty_submodule_administration(tmp_path)
+    )
+    journal_before = journal.read_bytes()
+    displaced = tmp_path / "displaced-worktree"
+    displaced_admin = tmp_path / "displaced-admin"
+    evidence: Path | None = None
+    module_git_directory: Path | None = None
+    preserved_object: str | None = None
+    preserved_ref: str | None = None
+    if mutation == "dirty":
+        evidence = tree / "preserve.txt"
+        evidence.write_text("preserve me\n", encoding="utf-8")
+    elif mutation in {
+        "initialized-clean",
+        "nested-dirty-hidden",
+        "deinitialized-unique-commit",
+        "deinitialized-unique-branch",
+        "deinitialized-stash",
+        "initialized-ignored-file",
+    }:
+        git(
+            tree,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        )
+        component = tree / "component"
+        leaf = component / "leaf"
+        module_git_directory = Path(
+            git(
+                component,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+            ).stdout.strip()
+        )
+        git(component, "config", "user.name", "Wrkslots Test")
+        git(component, "config", "user.email", "wrkslots@example.invalid")
+        if mutation == "nested-dirty-hidden":
+            git(component, "config", "submodule.leaf.ignore", "all")
+            evidence = leaf / "leaf.txt"
+            evidence.write_text("nested work to preserve\n", encoding="utf-8")
+            assert (
+                git(
+                    tree,
+                    "status",
+                    "--porcelain=v2",
+                    "--untracked-files=all",
+                    "--ignore-submodules=none",
+                ).stdout
+                == ""
+            )
+        elif mutation == "deinitialized-unique-commit":
+            original = git(component, "rev-parse", "HEAD").stdout.strip()
+            git(component, "switch", "--detach")
+            evidence = component / "component.txt"
+            evidence.write_text("unique detached work\n", encoding="utf-8")
+            git(component, "commit", "-am", "unique detached work")
+            preserved_object = git(component, "rev-parse", "HEAD").stdout.strip()
+            git(component, "switch", "--detach", original)
+            git(tree, "submodule", "deinit", "--force", "--all")
+            evidence = module_git_directory / "objects"
+        elif mutation == "deinitialized-unique-branch":
+            preserved_ref = "refs/heads/preserve-local-work"
+            git(component, "branch", "preserve-local-work")
+            git(tree, "submodule", "deinit", "--force", "--all")
+            evidence = module_git_directory / "refs"
+        elif mutation == "deinitialized-stash":
+            changed = component / "component.txt"
+            changed.write_text("stash work to preserve\n", encoding="utf-8")
+            git(component, "stash", "push", "-m", "preserve-stash")
+            preserved_ref = "refs/stash"
+            preserved_object = git(
+                component, "rev-parse", preserved_ref
+            ).stdout.strip()
+            git(tree, "submodule", "deinit", "--force", "--all")
+            evidence = module_git_directory / "logs"
+        elif mutation == "initialized-ignored-file":
+            exclude = Path(
+                git(
+                    component,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "info/exclude",
+                ).stdout.strip()
+            )
+            exclude.write_text("preserve.log\n", encoding="utf-8")
+            evidence = component / "preserve.log"
+            evidence.write_text("ignored evidence\n", encoding="utf-8")
+            assert "preserve.log" in git(
+                component,
+                "status",
+                "--porcelain=v2",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ).stdout
+        else:
+            assert mutation == "initialized-clean"
+        assert (
+            git(tree, "status", "--porcelain=v2", "--untracked-files=all").stdout
+            == ""
+        )
+    elif mutation == "moved":
+        git(tree, "commit", "--allow-empty", "-m", "move aborted checkout")
+    elif mutation == "operation":
+        evidence = Path(
+            git(tree, "rev-parse", "--git-path", "MERGE_HEAD").stdout.strip()
+        )
+        evidence.write_text(
+            git(tree, "rev-parse", "HEAD").stdout,
+            encoding="utf-8",
+        )
+    elif mutation == "identity":
+        tree.rename(displaced)
+        subprocess.run(
+            ["git", "clone", str(repository), str(tree)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    elif mutation == "admin-file":
+        evidence = administration / "third-party" / "preserve.admin"
+        evidence.write_text("administrative evidence\n", encoding="utf-8")
+    elif mutation == "admin-symlink":
+        (administration / "third-party").rmdir()
+        displaced_admin.mkdir()
+        (administration / "third-party").symlink_to(
+            displaced_admin, target_is_directory=True
+        )
+        evidence = displaced_admin
+    elif mutation == "admin-directory-count":
+        for index in range(wrkslots._EMPTY_SUBMODULE_ADMIN_DIRECTORY_LIMIT - 1):
+            (administration / f"bounded-{index:04d}").mkdir()
+        evidence = administration / "bounded-0000"
+    else:
+        assert mutation == "admin-directory-depth"
+        evidence = administration / "third-party"
+        for index in range(wrkslots._EMPTY_SUBMODULE_ADMIN_DEPTH_LIMIT):
+            evidence /= f"nested-{index:02d}"
+            evidence.mkdir()
+
+    branch_before = git(
+        repository, "rev-parse", "refs/heads/codex/task"
+    ).stdout.strip()
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 3
+    assert message in aborted.stderr
+    assert tree.is_dir()
+    assert journal.read_bytes() == journal_before
+    assert active_slots(project) == []
+    assert str(tree) in git(repository, "worktree", "list", "--porcelain").stdout
+    assert (
+        git(repository, "rev-parse", "refs/heads/codex/task").stdout.strip()
+        == branch_before
+    )
+    if evidence is not None:
+        assert evidence.exists()
+    if mutation == "identity":
+        assert displaced.is_dir()
+    if module_git_directory is not None:
+        assert module_git_directory.is_dir()
+    if preserved_object is not None:
+        assert (
+            git_dir(
+                cast(Path, module_git_directory),
+                "cat-file",
+                "-e",
+                f"{preserved_object}^{{commit}}",
+                check=False,
+            ).returncode
+            == 0
+        )
+    if preserved_ref is not None:
+        assert (
+            git_dir(
+                cast(Path, module_git_directory),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                preserved_ref,
+                check=False,
+            ).returncode
+            == 0
+        )
+
+
+@pytest.mark.parametrize("race", ("new-content", "replacement"))
+def test_abort_create_empty_admin_prune_refuses_race_without_losing_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    project, repository, tree, journal, administration = (
+        prepare_failed_create_with_empty_submodule_administration(tmp_path)
+    )
+    journal_before = journal.read_bytes()
+    target = administration / "third-party"
+    displaced = tmp_path / "raced-original-admin"
+    original = wrkslots._rmdir_verified_empty_admin_directory
+    injected = False
+
+    def inject(
+        parent_fd: int,
+        directory_fd: int,
+        name: str,
+        path: Path,
+        expected_identity: tuple[int, int, int],
+    ) -> None:
+        nonlocal injected
+        if not injected and path == target:
+            injected = True
+            if race == "new-content":
+                (path / "raced.txt").write_text(
+                    "preserve raced content\n", encoding="utf-8"
+                )
+            else:
+                path.rename(displaced)
+                path.mkdir()
+        original(parent_fd, directory_fd, name, path, expected_identity)
+
+    monkeypatch.setattr(
+        wrkslots, "_rmdir_verified_empty_admin_directory", inject
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--abort-create",
+                "--coordinator-authorized",
+            ]
+        )
+
+    assert injected
+    assert returncode == 3
+    assert "submodule administration changed" in stderr.getvalue()
+    assert tree.is_dir()
+    assert journal.read_bytes() == journal_before
+    assert str(tree) in git(repository, "worktree", "list", "--porcelain").stdout
+    if race == "new-content":
+        assert (target / "raced.txt").read_text(encoding="utf-8") == (
+            "preserve raced content\n"
+        )
+    else:
+        assert target.is_dir()
+        assert displaced.is_dir()
+
+
+@pytest.mark.parametrize("kind", ("cwd", "fd"))
+def test_abort_create_empty_admin_prune_refuses_live_directory_holder(
+    tmp_path: Path, kind: str
+) -> None:
+    project, repository, tree, journal, administration = (
+        prepare_failed_create_with_empty_submodule_administration(tmp_path)
+    )
+    journal_before = journal.read_bytes()
+    target = administration / "third-party"
+    script = (
+        "import os, pathlib, sys, time; "
+        "path = pathlib.Path(sys.argv[1]); "
+        + (
+            "os.chdir(path); "
+            if kind == "cwd"
+            else "descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY); "
+        )
+        + "print('ready', flush=True); time.sleep(300)"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", script, str(target)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+        refused = command(
+            project,
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+        )
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+    assert refused.returncode == 3
+    assert f"live process {holder.pid} uses slot {administration}" in refused.stderr
+    assert tree.is_dir()
+    assert target.is_dir()
+    assert journal.read_bytes() == journal_before
+    assert str(tree) in git(repository, "worktree", "list", "--porcelain").stdout
+
+
+def test_abort_create_empty_admin_recheck_catches_late_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, tree, journal, administration = (
+        prepare_failed_create_with_empty_submodule_administration(tmp_path)
+    )
+    journal_before = journal.read_bytes()
+    target = administration / "third-party"
+    original = wrkslots._assert_slot_unused
+    holder: subprocess.Popen[str] | None = None
+
+    def check_then_enter(path: Path) -> None:
+        nonlocal holder
+        original(path)
+        if path == administration and holder is None:
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os, sys, time; os.chdir(sys.argv[1]); "
+                    "print('ready', flush=True); time.sleep(300)",
+                    str(target),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", check_then_enter)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            returncode = wrkslots.main(
+                [
+                    "--project-root",
+                    str(project),
+                    "recover",
+                    "--coordinator-pid",
+                    str(os.getpid()),
+                    "--abort-create",
+                    "--coordinator-authorized",
+                ]
+            )
+    finally:
+        if holder is not None:
+            holder.terminate()
+            holder.wait(timeout=5)
+
+    assert holder is not None
+    assert returncode == 3
+    assert f"live process {holder.pid} uses slot {administration}" in stderr.getvalue()
+    assert tree.is_dir()
+    assert target.is_dir()
+    assert journal.read_bytes() == journal_before
+    assert str(tree) in git(repository, "worktree", "list", "--porcelain").stdout
+
+
+def test_abort_create_ordinary_git_remove_preserves_last_moment_dirty_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, tree, journal, _administration = (
+        prepare_failed_create_with_empty_submodule_administration(tmp_path)
+    )
+    journal_before = journal.read_bytes()
+    evidence = tree / "late-evidence.txt"
+    original = wrkslots._GitVcs.remove_worktree
+
+    def dirty_then_remove(
+        vcs: wrkslots._GitVcs,
+        source: Path,
+        checkout_path: Path,
+        *,
+        force: bool = False,
+    ) -> None:
+        assert not force
+        evidence.write_text("late evidence\n", encoding="utf-8")
+        original(vcs, source, checkout_path, force=force)
+
+    monkeypatch.setattr(wrkslots._GitVcs, "remove_worktree", dirty_then_remove)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--abort-create",
+                "--coordinator-authorized",
+            ]
+        )
+
+    assert returncode == 3
+    assert "contains modified or untracked files" in stderr.getvalue()
+    assert evidence.read_text(encoding="utf-8") == "late evidence\n"
+    assert tree.is_dir()
+    assert journal.read_bytes() == journal_before
+    assert str(tree) in git(repository, "worktree", "list", "--porcelain").stdout
 
 
 def test_audit_associates_recovery_journals_from_other_machine_shards(
