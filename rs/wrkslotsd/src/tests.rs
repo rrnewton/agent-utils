@@ -5725,6 +5725,100 @@ fn completed_create_and_import_recoveries_close_their_marker_only_with_a_row() {
 }
 
 #[test]
+fn a_later_create_of_the_same_slot_closes_a_row_less_recovery_marker() {
+    // Python's create refuses an existing slot path, so a later create that
+    // publishes a row proves the aborted attempt left no slot directory, and
+    // the new row owns that path. Both journal paths are reused per slot.
+    for journal_path in ["CREATE.6.node-a.6.slot-a.journal", "ACTIVE.node-a.journal"] {
+        let scratch = Scratch::new();
+        let events = scratch.events();
+        let record = active_record("slot-a", 1);
+        let progress = json!({
+            "slot": "slot-a",
+            "operation": "create",
+            "journal_path": journal_path,
+            "journal": {"schema": 2, "kind": "create", "machine": "node-a", "slot": "slot-a"},
+        });
+        let completion =
+            json!({"slot": "slot-a", "operation": "create", "journal_path": journal_path});
+        let mut tip = import_log(&events, vec![], vec![]);
+        tip = append_event(
+            &events,
+            2,
+            &tip,
+            "operation-progress-recorded",
+            progress.clone(),
+        );
+        tip = append_event(
+            &events,
+            3,
+            &tip,
+            "recovery-started",
+            recovery_started_payload("slot-a", "create"),
+        );
+        tip = append_event(&events, 4, &tip, "operation-completed", completion.clone());
+        let pending = replay_stream(&events, None, |_| Ok(()))
+            .unwrap_or_else(|error| panic!("replay abort at {journal_path}: {error}"))
+            .pending_operations
+            .iter()
+            .map(|pending| (pending.kind, pending.journal_path.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending,
+            [(
+                PendingOperationKind::Recovery,
+                Some(journal_path.to_owned())
+            )],
+            "abort at {journal_path}"
+        );
+
+        tip = append_event(&events, 5, &tip, "operation-progress-recorded", progress);
+        tip = append_event(
+            &events,
+            6,
+            &tip,
+            "active-state-recorded",
+            json!({
+                "action": "slot-created",
+                "slot": "slot-a",
+                "previous_revision": 0,
+                "revision": 1,
+                "previous_record_sha256": null,
+                "record": record.clone(),
+                "evidence": {},
+            }),
+        );
+        append_event(&events, 7, &tip, "operation-completed", completion);
+        assert_eq!(
+            python_pending_journals(&events),
+            json!({}),
+            "{journal_path}"
+        );
+        let replayed = replay_stream(&events, None, |_| Ok(()))
+            .unwrap_or_else(|error| panic!("replay re-create at {journal_path}: {error}"));
+        assert!(
+            replayed.pending_operations.is_empty(),
+            "re-create at {journal_path} left {:?}",
+            replayed.pending_operations
+        );
+        let (config, evidence) =
+            write_policy_inputs(&scratch, &[record], "2026-09-22T09:40:01+00:00", |_| {});
+        let decisions =
+            evaluate_policy_at(&events, &config, &evidence, "2026-09-22T09:40:01+00:00")
+                .unwrap_or_else(|error| panic!("evaluate {journal_path}: {error}"));
+        assert_eq!(decisions.len(), 1, "{journal_path}");
+        assert!(
+            !decisions[0]
+                .reason_codes
+                .iter()
+                .any(|code| code == "RECOVERY_PENDING"),
+            "{journal_path}: {:?}",
+            decisions[0].reason_codes
+        );
+    }
+}
+
+#[test]
 fn create_recovery_marker_closes_only_on_its_bound_journal() {
     // Python refuses two pending journals for one slot operation, so the only
     // binding that can differ from a later completion is the legacy default:
