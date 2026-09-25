@@ -1773,6 +1773,32 @@ impl HerdrClient {
         self.verify_custom_harness_with_cancellation(pane_id, kind, identity, &|| false)
     }
 
+    /// Prove that one recorded Linux PID generation is no longer live.
+    ///
+    /// A reused PID is absence of the recorded generation.  An unreadable but
+    /// still-present procfs entry is uncertainty and therefore fails closed.
+    pub fn process_generation_absent(&self, expected: &CustomProcessIdentity) -> Result<bool> {
+        if !expected.valid() {
+            return Err(AdapterError::unavailable(
+                "recorded custom process identity is invalid",
+            ));
+        }
+        match live_custom_process(expected.pid) {
+            Ok(observed) => Ok(observed.identity != *expected),
+            Err(error) => {
+                let path = PathBuf::from(format!("/proc/{}", expected.pid));
+                match fs::symlink_metadata(&path) {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(true),
+                    Ok(_) => Err(error),
+                    Err(inspect) => Err(AdapterError::unavailable(format!(
+                        "cannot prove recorded process {} absent: {inspect}",
+                        expected.pid
+                    ))),
+                }
+            }
+        }
+    }
+
     /// Prove that no child command owns the terminal and the foreground process
     /// group contains only the pane's Herdr-reported shell process.
     pub fn pane_is_idle_shell(&self, pane_id: &str) -> Result<bool> {

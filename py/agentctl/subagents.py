@@ -258,6 +258,7 @@ class AgentRecord:
     _legacy_runner_started_at: str | None = field(default=None, repr=False)
     _legacy_goal_delivery: str | None = field(default=None, repr=False)
     _legacy_goal_messages: dict[str, str] = field(default_factory=dict, repr=False)
+    _legacy_goal_pointer: bool = field(default=False, repr=False)
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
     @property
@@ -308,6 +309,7 @@ class AgentRecord:
         document.pop("_legacy_runner_started_at")
         document.pop("_legacy_goal_delivery")
         document.pop("_legacy_goal_messages")
+        document.pop("_legacy_goal_pointer")
         document.pop("launch")
         launch = self.launch
         executable = launch.executable
@@ -501,6 +503,11 @@ class AgentRecord:
         """Validate an already identity-bound record value."""
         if not isinstance(value, dict):
             raise AgentDeliveryError(f"invalid agent record: {path}")
+        source_schema = value.get("schema")
+        legacy_goal_pointer = (
+            (source_schema == 1 and not isinstance(source_schema, bool))
+            or source_schema == _LEGACY_SESSION_STORAGE_SCHEMA
+        )
         document = cls._normalize_storage_value(cast(dict[str, object], value), path)
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
@@ -603,6 +610,7 @@ class AgentRecord:
         fields = {key: document[key] for key in session_fields if key in document}
         fields["_legacy_goal_delivery"] = document.get("goal_delivery")
         fields["_legacy_goal_messages"] = cast(dict[str, str], goals)
+        fields["_legacy_goal_pointer"] = legacy_goal_pointer
         if document.get("adapter", "herdr") not in ("herdr", "herdr-pane", "herdr-foreign", "turn-runner"):
             raise AgentDeliveryError(f"unsupported runtime adapter in {path}")
         if document.get("mode", "interactive") not in ("interactive", "headless"):
@@ -2052,8 +2060,20 @@ class ManagedAgents:
         )
 
     def _migrate_legacy_goal_messages(self, record: AgentRecord) -> None:
-        """Tag v1/v2 goal artifacts before dropping their duplicate objective map."""
-        if not record.goal_messages:
+        """Tag exact v1/v2 goal artifacts before retiring decode-only state."""
+        legacy_goals = dict(record.goal_messages)
+        if record._legacy_goal_pointer and record.goal_message_id is not None:
+            if record.goal is None:
+                raise AgentDeliveryError(
+                    "legacy goal pointer has no session objective"
+                )
+            mapped = legacy_goals.get(record.goal_message_id)
+            if mapped is not None and mapped != record.goal:
+                raise AgentDeliveryError(
+                    "legacy goal pointer disagrees with its duplicate objective map"
+                )
+            legacy_goals[record.goal_message_id] = record.goal
+        if not legacy_goals:
             return
         queue = self._queue(record.name)
         if not os.path.lexists(queue):
@@ -2071,7 +2091,7 @@ class ManagedAgents:
                 raise AgentDeliveryError(
                     "legacy goal migration is busy with queue delivery; retry"
                 ) from exc
-            for identifier, objective in sorted(record.goal_messages.items()):
+            for identifier, objective in sorted(legacy_goals.items()):
                 state = agent.message_state(queue, identifier)
                 if state is None:
                     raise AgentDeliveryError(
@@ -2099,6 +2119,8 @@ class ManagedAgents:
                     migrated = dict(document)
                     migrated["kind"] = "goal"
                     agent._atomic_json(str(path), migrated)
+            record._legacy_goal_messages.clear()
+            record._legacy_goal_pointer = False
         finally:
             os.close(lock)
 
@@ -3357,10 +3379,7 @@ class ManagedAgents:
                 max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
             )
             objective = record.goal
-            legacy_match = (
-                objective is not None
-                and record.goal_messages.get(identifier) == objective
-            )
+            legacy_match = record._legacy_goal_pointer
             if (not isinstance(document, dict)
                     or document.get("id") != identifier
                     or objective is None
@@ -3439,7 +3458,12 @@ class ManagedAgents:
                 raise AgentDeliveryError(
                     f"refusing to {operation} {record.name!r}: recorded pane, workspace, or cwd changed"
                 )
-            if info.agent is not None:
+            stale_custom_label = (
+                record.launch.adapter == "herdr-pane"
+                and record.custom_process_identity is not None
+                and info.agent == record.launch.harness
+            )
+            if info.agent is not None and not stale_custom_label:
                 raise AgentDeliveryError(
                     f"refusing to {operation} {record.name!r}: pane still reports agent {info.agent!r}"
                 )
@@ -3450,6 +3474,24 @@ class ManagedAgents:
             return presentation, info
 
         presentation, info = snapshot()
+        if record.launch.adapter == "herdr-pane":
+            identity = record.custom_process_identity
+            if identity is None:
+                raise AgentDeliveryError(
+                    f"refusing to {operation} {record.name!r}: record lacks custom process identity"
+                )
+            try:
+                absent = self.client.process_generation_absent(identity)
+            except HerdrRunError as exc:
+                raise AgentDeliveryError(
+                    f"refusing to {operation} {record.name!r}: cannot prove recorded "
+                    f"custom process generation absent: {exc}"
+                ) from exc
+            if not absent:
+                raise AgentDeliveryError(
+                    f"refusing to {operation} {record.name!r}: recorded custom process "
+                    "generation is still live"
+                )
         try:
             shell = self.client.pane_idle_shell_identity(pane_id)
         except HerdrRunError as exc:
@@ -4377,10 +4419,11 @@ class ManagedAgents:
                 f"refusing to retire dead managed agent {record.name!r}: registry record changed"
             )
         record = initial.record
-        if (record.launch.adapter != "herdr" or record.lifecycle != "running"
+        if (record.launch.adapter not in ("herdr", "herdr-pane")
+                or record.lifecycle != "running"
                 or record.launch.mode != "interactive" or record.launch.backend != "herdr"):
             raise AgentDeliveryError(
-                "managed-dead retirement requires a running herdr record in "
+                "managed-dead retirement requires a running owned Herdr record in "
                 "interactive/herdr mode"
             )
         before = self._dead_pane_proof(record, operation="retire dead managed agent")
@@ -4416,6 +4459,7 @@ class ManagedAgents:
                 "runtime identity changed before close"
             )
         final.lifecycle = "stopped"
+        self._migrate_legacy_goal_messages(final)
         stopped_bytes = agent._json_text(final.to_storage_document()).encode("utf-8")
         if len(stopped_bytes) > _MAX_AGENT_RECORD_BYTES:
             raise AgentDeliveryError(
@@ -4645,15 +4689,22 @@ class ManagedAgents:
                         "pane_closed": False, "tab_closed": False,
                         "runtime_preserved": True}
             panes = self.client.panes()
-            if (record.launch.adapter == "herdr" and record.lifecycle in ("running", "stopping")
+            if (record.launch.adapter in ("herdr", "herdr-pane")
+                    and record.lifecycle in ("running", "stopping")
                     and record.pane_id is not None):
                 recorded = [pane for pane in panes if pane.pane_id == record.pane_id]
                 if len(recorded) == 1:
                     observed = self.client.pane_info(record.pane_id)
-                    if observed.agent is None:
+                    dead = record.launch.adapter == "herdr" and observed.agent is None
+                    if (record.launch.adapter == "herdr-pane"
+                            and record.custom_process_identity is not None):
+                        dead = self.client.process_generation_absent(
+                            record.custom_process_identity
+                        )
+                    if dead:
                         if record.lifecycle != "running":
                             raise AgentDeliveryError(
-                                "managed-dead retirement requires a running herdr record"
+                                "managed-dead retirement requires a running owned Herdr record"
                             )
                         return self._retire_managed_dead(
                             record, expected_token=expected_token,

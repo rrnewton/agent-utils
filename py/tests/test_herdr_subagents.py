@@ -211,6 +211,13 @@ class FakeManagedClient:
                     and expected_identity != self.custom_identity)):
             raise HerdrUnavailable("custom harness is not the foreground process")
 
+    def process_generation_absent(
+        self, expected: CustomProcessIdentity,
+    ) -> bool:
+        if expected != self.custom_identity:
+            return True
+        return not self.custom_running
+
     def pane_is_idle_shell(self, pane_id: str) -> bool:
         assert pane_id in self.infos
         return self.custom_at_idle_shell
@@ -1902,6 +1909,98 @@ def test_agent_record_v3_migrates_legacy_goal_artifact_before_dropping_map(
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert artifact["kind"] == "goal"
     assert "goal_messages" not in migrated
+
+
+@pytest.mark.parametrize("legacy_schema", ("flat-v1", "session-v2"))
+def test_legacy_goal_pointer_without_duplicate_map_is_exactly_recovered(
+    legacy_schema: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    objective = "recover the retained timerfd worktree"
+    prompt = (
+        f"Your ongoing goal: {objective}\n"
+        "Work toward this goal and report completion or blockers."
+    )
+    queue = manager.registry / "worker" / "queue"
+    identifier = agent.enqueue(queue, prompt, message_id="legacy-goal")
+    artifact_path = queue / "inbox" / f"{identifier}.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("kind")
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    path = manager.registry / "worker" / "agent.json"
+    if legacy_schema == "session-v2":
+        stored = _downgrade_current_record_to_v2(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+    else:
+        stored = manager.get("worker").to_document()
+    stored["goal"] = objective
+    stored["goal_delivery"] = "possibly_submitted"
+    stored["goal_message_id"] = identifier
+    stored["goal_messages"] = {}
+    path.write_text(json.dumps(stored), encoding="utf-8")
+
+    assert manager.status("worker")["goal_delivery"] == "pending"
+    manager.pause("worker")
+
+    migrated = json.loads(path.read_text(encoding="utf-8"))
+    assert migrated["schema"] == "agentctl-session/v3"
+    assert json.loads(artifact_path.read_text(encoding="utf-8"))["kind"] == "goal"
+
+
+@pytest.mark.parametrize("mutation", ("id", "text"))
+def test_legacy_goal_pointer_without_map_refuses_mismatched_artifact(
+    mutation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    objective = "recover the retained timerfd worktree"
+    prompt = (
+        f"Your ongoing goal: {objective}\n"
+        "Work toward this goal and report completion or blockers."
+    )
+    queue = manager.registry / "worker" / "queue"
+    identifier = agent.enqueue(queue, prompt, message_id="legacy-goal")
+    artifact_path = queue / "inbox" / f"{identifier}.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("kind")
+    artifact[mutation] = "wrong"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    path = manager.registry / "worker" / "agent.json"
+    stored = _downgrade_current_record_to_v2(
+        json.loads(path.read_text(encoding="utf-8"))
+    )
+    stored["goal"] = objective
+    stored["goal_delivery"] = "possibly_submitted"
+    stored["goal_message_id"] = identifier
+    stored["goal_messages"] = {}
+    path.write_text(json.dumps(stored), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError):
+        manager.status("worker")
+    with pytest.raises(AgentDeliveryError):
+        manager.pause("worker")
+
+
+def test_current_goal_pointer_never_accepts_an_untagged_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    queue = manager.registry / "worker" / "queue"
+    identifier = agent.enqueue(queue, "/goal exact", message_id="current-goal")
+    artifact_path = queue / "inbox" / f"{identifier}.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("kind")
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    record = manager.get("worker")
+    record.goal = "exact"
+    record.goal_message_id = identifier
+    manager._save(record)
+
+    with pytest.raises(AgentDeliveryError, match="disagrees with its session record"):
+        manager.status("worker")
 
 
 def test_send_migrates_legacy_goal_authority_before_queue_delivery(

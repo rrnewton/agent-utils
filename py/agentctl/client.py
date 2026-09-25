@@ -1290,6 +1290,29 @@ class HerdrClient:
                 f"custom harness {kind!r} is not the foreground process in pane {pane_id}"
             )
 
+    def process_generation_absent(
+        self, expected: CustomProcessIdentity,
+    ) -> bool:
+        """Prove that one recorded Linux PID generation is no longer live.
+
+        A changed boot/start/image identity proves that the recorded generation
+        ended.  An unreadable but still-present PID is uncertainty, not death.
+        """
+        observed = self._process_identity(expected.pid)
+        if observed is not None:
+            return observed[0] != expected
+        try:
+            os.kill(expected.pid, 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError) as exc:
+            raise HerdrUnavailable(
+                f"cannot prove recorded process {expected.pid} absent: {exc}"
+            ) from exc
+        raise HerdrUnavailable(
+            f"cannot prove recorded process {expected.pid} identity"
+        )
+
     def pane_is_idle_shell(
         self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> bool:

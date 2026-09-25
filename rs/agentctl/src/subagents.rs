@@ -662,6 +662,15 @@ pub trait ManagedApi: AgentApi {
             "custom pane harness verification is unavailable",
         ))
     }
+    /// Prove that one recorded custom-process generation is absent.
+    fn process_generation_absent(
+        &self,
+        _expected: &CustomProcessIdentity,
+    ) -> crate::error::Result<bool> {
+        Err(crate::error::AdapterError::unavailable(
+            "custom process generation proof is unavailable",
+        ))
+    }
     /// Prove the pane has returned to its original shell process group.
     fn pane_is_idle_shell(&self, _pane: &str) -> crate::error::Result<bool> {
         Err(crate::error::AdapterError::unavailable(
@@ -960,6 +969,12 @@ impl ManagedApi for HerdrClient {
     ) -> crate::error::Result<()> {
         HerdrClient::verify_custom_harness(self, pane, harness, identity)
     }
+    fn process_generation_absent(
+        &self,
+        expected: &CustomProcessIdentity,
+    ) -> crate::error::Result<bool> {
+        HerdrClient::process_generation_absent(self, expected)
+    }
     fn pane_is_idle_shell(&self, pane: &str) -> crate::error::Result<bool> {
         HerdrClient::pane_is_idle_shell(self, pane)
     }
@@ -1166,6 +1181,7 @@ struct AgentRecord {
     legacy_runner_started_at: Option<String>,
     legacy_goal_delivery: Option<String>,
     legacy_goal_messages: BTreeMap<String, String>,
+    legacy_goal_pointer: bool,
     extra: BTreeMap<String, Value>,
 }
 
@@ -1489,7 +1505,7 @@ impl AgentRecord {
             .as_object()
             .cloned()
             .ok_or_else(|| fail(format!("invalid agent record: {}", path.display())))?;
-        match document.get("schema") {
+        let legacy_goal_pointer = match document.get("schema") {
             Some(Value::String(schema))
                 if schema == SESSION_STORAGE_SCHEMA || schema == LEGACY_SESSION_STORAGE_SCHEMA =>
             {
@@ -1790,6 +1806,7 @@ impl AgentRecord {
                     document.insert("goal_session_id".to_owned(), value);
                     document.insert("session_source".to_owned(), source);
                 }
+                !current
             }
             Some(Value::Number(schema)) if schema.as_u64() == Some(1) => {
                 if !document.contains_key("arguments") {
@@ -1840,6 +1857,7 @@ impl AgentRecord {
                 document.insert("session_value".to_owned(), value.clone());
                 document.insert("goal_session_id".to_owned(), value);
                 document.insert("session_source".to_owned(), source);
+                true
             }
             _ => {
                 return Err(fail(format!(
@@ -1847,7 +1865,7 @@ impl AgentRecord {
                     path.display()
                 )))
             }
-        }
+        };
         let raw_arguments = document.remove("arguments").unwrap_or_else(|| json!([]));
         let arguments = raw_arguments.as_array().ok_or_else(|| {
             fail(format!(
@@ -1939,6 +1957,7 @@ impl AgentRecord {
             legacy_runner_started_at: None,
             legacy_goal_delivery: legacy.goal_delivery,
             legacy_goal_messages: legacy.goal_messages,
+            legacy_goal_pointer,
             extra: legacy.extra,
         };
         if let Some(identity) = record.runner_identity.as_ref() {
@@ -3693,7 +3712,25 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn migrate_legacy_goal_messages(&self, record: &AgentRecord) -> Result<()> {
-        if record.legacy_goal_messages.is_empty() {
+        let mut legacy_goals = record.legacy_goal_messages.clone();
+        if record.legacy_goal_pointer {
+            if let Some(identifier) = &record.goal_message_id {
+                let objective = record
+                    .goal
+                    .as_ref()
+                    .ok_or_else(|| fail("legacy goal pointer has no session objective"))?;
+                if legacy_goals
+                    .get(identifier)
+                    .is_some_and(|mapped| mapped != objective)
+                {
+                    return Err(fail(
+                        "legacy goal pointer disagrees with its duplicate objective map",
+                    ));
+                }
+                legacy_goals.insert(identifier.clone(), objective.clone());
+            }
+        }
+        if legacy_goals.is_empty() {
             return Ok(());
         }
         let queue = self.queue(&record.name)?;
@@ -3707,7 +3744,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "legacy goal migration is busy with queue delivery; retry: {error}"
             ))
         })?;
-        for (identifier, objective) in &record.legacy_goal_messages {
+        for (identifier, objective) in &legacy_goals {
             let Some(state) = agent::message_state(&queue, identifier)? else {
                 return Err(fail(format!(
                     "legacy goal artifact {identifier:?} is missing; refusing to discard its confirmation authority"
@@ -3896,6 +3933,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             legacy_runner_started_at: None,
             legacy_goal_delivery: None,
             legacy_goal_messages: BTreeMap::new(),
+            legacy_goal_pointer: false,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -4286,6 +4324,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             legacy_runner_started_at: None,
             legacy_goal_delivery: None,
             legacy_goal_messages: BTreeMap::new(),
+            legacy_goal_pointer: false,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -5976,10 +6015,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     "goal message {identifier:?} has no session objective"
                 ))
             })?;
-            let legacy_match = record
-                .legacy_goal_messages
-                .get(identifier)
-                .is_some_and(|legacy| legacy == objective);
+            let legacy_match = record.legacy_goal_pointer;
             let expected_text = goal_prompt(&record.launch.harness, objective);
             let kind_matches = document.get("kind").and_then(Value::as_str) == Some("goal")
                 || (document.get("kind").is_none() && legacy_match);
@@ -6208,7 +6244,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 record.name
             )));
         }
-        if let Some(agent) = info.agent.as_deref() {
+        let stale_custom_label = record.launch.adapter == "herdr-pane"
+            && record.custom_process_identity.is_some()
+            && info.agent.as_deref() == Some(&record.launch.harness);
+        if info.agent.is_some() && !stale_custom_label {
+            let agent = info.agent.as_deref().expect("checked present agent");
             return Err(fail(format!(
                 "refusing to {operation} {:?}: pane still reports agent {agent:?}",
                 record.name
@@ -6231,6 +6271,25 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             ))
         })?;
         let (presentation, info) = self.dead_pane_snapshot(record, operation)?;
+        if record.launch.adapter == "herdr-pane" {
+            let identity = record.custom_process_identity.as_ref().ok_or_else(|| {
+                fail(format!(
+                    "refusing to {operation} {:?}: record lacks custom process identity",
+                    record.name
+                ))
+            })?;
+            if !self.client.process_generation_absent(identity).map_err(|error| {
+                fail(format!(
+                    "refusing to {operation} {:?}: cannot prove recorded custom process generation absent: {error}",
+                    record.name
+                ))
+            })? {
+                return Err(fail(format!(
+                    "refusing to {operation} {:?}: recorded custom process generation is still live",
+                    record.name
+                )));
+            }
+        }
         let shell = self
             .client
             .pane_idle_shell_identity(pane_id)
@@ -6968,13 +7027,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         let record = &initial.record;
-        if record.launch.adapter != "herdr"
+        if !matches!(record.launch.adapter.as_str(), "herdr" | "herdr-pane")
             || record.lifecycle != "running"
             || record.launch.mode != "interactive"
             || record.launch.backend != "herdr"
         {
             return Err(fail(
-                "managed-dead retirement requires a running herdr record in interactive/herdr mode",
+                "managed-dead retirement requires a running owned Herdr record in interactive/herdr mode",
             ));
         }
         let before = self.dead_pane_proof(record, "retire dead managed agent")?;
@@ -7009,6 +7068,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let mut final_record = final_snapshot.record;
         final_record.lifecycle = "stopped".to_owned();
+        self.migrate_legacy_goal_messages(&final_record)?;
         let mut stopped_bytes = serde_json::to_vec_pretty(&final_record.storage_value()?)
             .map_err(|error| fail(format!("cannot serialize agent record: {error}")))?;
         stopped_bytes.push(b'\n');
@@ -7230,7 +7290,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }));
         }
         let panes = self.client.panes()?;
-        if record.launch.adapter == "herdr"
+        if matches!(record.launch.adapter.as_str(), "herdr" | "herdr-pane")
             && matches!(record.lifecycle.as_str(), "running" | "stopping")
             && record.pane_id.is_some()
         {
@@ -7238,19 +7298,31 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .iter()
                 .filter(|pane| Some(&pane.pane_id) == record.pane_id.as_ref())
                 .collect();
-            if recorded.len() == 1 && self.client.pane_info(&recorded[0].pane_id)?.agent.is_none() {
-                if record.lifecycle != "running" {
-                    return Err(fail(
-                        "managed-dead retirement requires a running herdr record",
-                    ));
+            if recorded.len() == 1 {
+                let info = self.client.pane_info(&recorded[0].pane_id)?;
+                let dead = if record.launch.adapter == "herdr" {
+                    info.agent.is_none()
+                } else if let Some(identity) = record.custom_process_identity.as_ref() {
+                    self.client.process_generation_absent(identity)?
+                } else {
+                    false
+                };
+                if !dead {
+                    // Continue through the ordinary live-session teardown path.
+                } else {
+                    if record.lifecycle != "running" {
+                        return Err(fail(
+                            "managed-dead retirement requires a running owned Herdr record",
+                        ));
+                    }
+                    let _pane_lock = self.pane_lock(&recorded[0].pane_id)?;
+                    let pinned = self.pinned_agent_directory(agent_name)?;
+                    return self.retire_managed_dead_locked(
+                        &record,
+                        &pinned,
+                        options.expected_token.as_deref(),
+                    );
                 }
-                let _pane_lock = self.pane_lock(&recorded[0].pane_id)?;
-                let pinned = self.pinned_agent_directory(agent_name)?;
-                return self.retire_managed_dead_locked(
-                    &record,
-                    &pinned,
-                    options.expected_token.as_deref(),
-                );
             }
         }
         if panes.iter().any(|pane| {
@@ -8054,6 +8126,15 @@ mod tests {
                     "custom harness is not the foreground process",
                 ))
             }
+        }
+        fn process_generation_absent(
+            &self,
+            expected: &CustomProcessIdentity,
+        ) -> AdapterResult<bool> {
+            if expected != &Self::custom_identity() {
+                return Ok(true);
+            }
+            Ok(!self.custom_alive.load(Ordering::Relaxed))
         }
         fn pane_is_idle_shell(&self, _: &str) -> AdapterResult<bool> {
             Ok(!self.custom_alive.load(Ordering::Relaxed)
@@ -9664,6 +9745,112 @@ mod tests {
         let artifact = agent::read_private_json(&artifact_path).unwrap();
         assert_eq!(artifact["kind"], "goal");
         assert!(migrated.get("goal_messages").is_none());
+    }
+
+    #[test]
+    fn legacy_goal_pointer_without_duplicate_map_is_exactly_recovered() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let objective = "recover the retained timerfd worktree";
+        let prompt = goal_prompt("muse", objective);
+        let queue = fixture.root.join("registry/worker/queue");
+        let identifier = agent::enqueue(&queue, &prompt, Some("legacy-goal")).unwrap();
+        let artifact_path = queue.join("inbox").join(format!("{identifier}.json"));
+        let mut artifact = agent::read_private_json(&artifact_path).unwrap();
+        artifact.as_object_mut().unwrap().remove("kind");
+        agent::atomic_json(&artifact_path, &artifact).unwrap();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut legacy = downgrade_current_record_to_v2(agent::read_private_json(&path).unwrap());
+        legacy["goal"] = json!(objective);
+        legacy["goal_delivery"] = json!("possibly_submitted");
+        legacy["goal_message_id"] = json!(identifier);
+        legacy["goal_messages"] = json!({});
+        agent::atomic_json(&path, &legacy).unwrap();
+
+        assert_eq!(
+            manager.status("worker").unwrap()["goal_delivery"],
+            "pending"
+        );
+        manager.pause("worker", true).unwrap();
+
+        assert_eq!(
+            agent::read_private_json(&path).unwrap()["schema"],
+            SESSION_STORAGE_SCHEMA
+        );
+        assert_eq!(
+            agent::read_private_json(&artifact_path).unwrap()["kind"],
+            "goal"
+        );
+    }
+
+    #[test]
+    fn legacy_goal_pointer_without_map_refuses_wrong_id_or_text() {
+        for mutation in ["id", "text"] {
+            let fixture = Fixture::new();
+            let manager = fixture.manager();
+            fixture.start(None);
+            let objective = "recover the retained timerfd worktree";
+            let queue = fixture.root.join("registry/worker/queue");
+            let identifier = agent::enqueue(
+                &queue,
+                &goal_prompt("codex", objective),
+                Some("legacy-goal"),
+            )
+            .unwrap();
+            let artifact_path = queue.join("inbox").join(format!("{identifier}.json"));
+            let mut artifact = agent::read_private_json(&artifact_path).unwrap();
+            artifact.as_object_mut().unwrap().remove("kind");
+            artifact[mutation] = json!("wrong");
+            agent::atomic_json(&artifact_path, &artifact).unwrap();
+            let path = fixture.root.join("registry/worker/agent.json");
+            let mut legacy =
+                downgrade_current_record_to_v2(agent::read_private_json(&path).unwrap());
+            legacy["goal"] = json!(objective);
+            legacy["goal_delivery"] = json!("possibly_submitted");
+            legacy["goal_message_id"] = json!(identifier);
+            legacy["goal_messages"] = json!({});
+            agent::atomic_json(&path, &legacy).unwrap();
+
+            assert!(manager.status("worker").is_err(), "mutation {mutation}");
+            assert!(
+                manager.pause("worker", true).is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_goal_pointer_never_accepts_an_untagged_artifact() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let queue = fixture.root.join("registry/worker/queue");
+        let identifier = agent::enqueue(&queue, "/goal exact", Some("current-goal")).unwrap();
+        let artifact_path = queue.join("inbox").join(format!("{identifier}.json"));
+        let mut artifact = agent::read_private_json(&artifact_path).unwrap();
+        artifact.as_object_mut().unwrap().remove("kind");
+        agent::atomic_json(&artifact_path, &artifact).unwrap();
+        let mut record = manager.load("worker").unwrap();
+        record.goal = Some("exact".to_owned());
+        record.goal_message_id = Some(identifier);
+        manager.save(&record).unwrap();
+
+        assert!(manager.status("worker").is_err());
     }
 
     #[test]
@@ -12439,10 +12626,14 @@ mod tests {
     }
 
     #[test]
-    fn running_muse_record_does_not_gain_idle_shell_cleanup_fallback() {
+    fn running_owned_dead_muse_requires_token_then_archives_stale_label_pane() {
         let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
         let manager = fixture.manager();
-        manager
+        let started = manager
             .start(
                 "worker",
                 &fixture.root,
@@ -12454,8 +12645,136 @@ mod tests {
             )
             .unwrap();
         fixture.client.custom_alive.store(false, Ordering::Relaxed);
+        let objective = "recover the retained timerfd worktree";
+        let queue = fixture.root.join("registry/worker/queue");
+        let identifier =
+            agent::enqueue(&queue, &goal_prompt("muse", objective), Some("legacy-goal")).unwrap();
+        let artifact_path = queue.join("inbox").join(format!("{identifier}.json"));
+        let mut artifact = agent::read_private_json(&artifact_path).unwrap();
+        artifact.as_object_mut().unwrap().remove("kind");
+        agent::atomic_json(&artifact_path, &artifact).unwrap();
+        let record_path = fixture.root.join("registry/worker/agent.json");
+        let mut legacy =
+            downgrade_current_record_to_v2(agent::read_private_json(&record_path).unwrap());
+        legacy["goal"] = json!(objective);
+        legacy["goal_delivery"] = json!("possibly_submitted");
+        legacy["goal_message_id"] = json!(identifier);
+        legacy["goal_messages"] = json!({});
+        agent::atomic_json(&record_path, &legacy).unwrap();
+
         let error = manager.stop("worker").unwrap_err();
-        assert!(error.to_string().contains("foreground process"));
+        assert!(error.to_string().contains("requires --expected-token"));
+        let stopped = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped["managed_dead"], true);
+        assert_eq!(stopped["pane_closed"], true);
+        assert_eq!(*fixture.client.closed.lock().unwrap(), ["owned"]);
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        assert_eq!(
+            agent::read_private_json(
+                &archive
+                    .join("queue/inbox")
+                    .join(format!("{identifier}.json")),
+            )
+            .unwrap()["kind"],
+            "goal"
+        );
+    }
+
+    #[test]
+    fn running_owned_dead_muse_refuses_unproved_or_changed_pane() {
+        for case in ["descendant", "moved", "label"] {
+            let fixture = Fixture::new();
+            fixture
+                .client
+                .report_session
+                .store(false, Ordering::Relaxed);
+            let manager = fixture.manager();
+            let started = manager
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        workspace_id: Some("workspace".to_owned()),
+                        harness: "muse".to_owned(),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap();
+            fixture.client.custom_alive.store(false, Ordering::Relaxed);
+            match case {
+                "descendant" => fixture
+                    .client
+                    .custom_at_idle_shell
+                    .store(false, Ordering::Relaxed),
+                "moved" => fixture.client.panes.lock().unwrap()[0].tab_id = "moved".to_owned(),
+                "label" => fixture
+                    .client
+                    .custom_reported
+                    .store(false, Ordering::Relaxed),
+                _ => unreachable!(),
+            }
+            assert!(
+                manager
+                    .stop_with_options(
+                        "worker",
+                        StopOptions {
+                            expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                            ..StopOptions::default()
+                        },
+                    )
+                    .is_err(),
+                "case {case}"
+            );
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn running_owned_dead_muse_refuses_shell_generation_change() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        fixture.client.custom_alive.store(false, Ordering::Relaxed);
+        fixture
+            .client
+            .change_foreign_shell_on_read
+            .store(true, Ordering::Relaxed);
+
+        let error = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("runtime identity changed"),
+            "{error}"
+        );
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 

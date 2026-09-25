@@ -333,6 +333,113 @@ def test_managed_dead_stop_requires_token_then_closes_exact_pane_and_archives(
     assert json.loads((archive / "output.json").read_text())["pane_id"] == pane
 
 
+def _make_owned_muse_dead(
+    manager: ManagedAgents, fake: FakeManagedClient, tmp_path: Path,
+) -> tuple[str, str]:
+    started = manager.start("worker", cwd=str(tmp_path), harness="muse")
+    pane = str(started["pane_id"])
+    fake.custom_running = False
+    # Herdr may retain the last harness label after the process has exited.
+    assert fake.infos[pane].agent == "muse"
+    return pane, str(started["token"])
+
+
+def test_owned_dead_muse_requires_token_and_archives_exact_stale_label_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    objective = "recover the retained timerfd worktree"
+    queue = manager.registry / "worker" / "queue"
+    identifier = agent.enqueue(
+        queue,
+        f"Your ongoing goal: {objective}\n"
+        "Work toward this goal and report completion or blockers.",
+        message_id="legacy-goal",
+    )
+    artifact_path = queue / "inbox" / f"{identifier}.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("kind")
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    record_path = manager.registry / "worker" / "agent.json"
+    stored = json.loads(record_path.read_text(encoding="utf-8"))
+    goal = cast(dict[str, object], stored.pop("goal"))
+    native = cast(dict[str, object] | None, stored.pop("native_session"))
+    stored.update({
+        "schema": "agentctl-session/v2",
+        "session_agent": None if native is None else native["agent"],
+        "session_value": None if native is None else native["value"],
+        "goal": objective,
+        "goal_delivery": "possibly_submitted",
+        "goal_session_id": None if native is None else native["value"],
+        "goal_command": goal["native_command"],
+        "goal_messages": {},
+        "goal_message_id": identifier,
+    })
+    record_path.write_text(json.dumps(stored), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError, match="requires --expected-token"):
+        manager.stop("worker")
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["managed_dead"] is True
+    assert result["pane_closed"] is True
+    assert fake.closed == ["w1:t1"]
+    archive = Path(str(result["archive"]))
+    assert json.loads((archive / "agent.json").read_text())["lifecycle"] == "stopped"
+    assert json.loads((archive / "output.json").read_text())["pane_id"] == pane
+    assert json.loads(
+        (archive / "queue" / "inbox" / f"{identifier}.json").read_text()
+    )["kind"] == "goal"
+
+
+@pytest.mark.parametrize("mutation", ("descendant", "moved", "label"))
+def test_owned_dead_muse_refuses_unproved_or_changed_pane(
+    mutation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    if mutation == "descendant":
+        fake.custom_at_idle_shell = False
+    elif mutation == "moved":
+        fake.presentations[0] = replace(fake.presentations[0], tab_id="moved")
+    else:
+        fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], agent="claude")
+
+    with pytest.raises((AgentDeliveryError, HerdrUnavailable)):
+        manager.stop("worker", expected_token=token)
+    assert fake.closed == []
+    assert (manager.registry / "worker").is_dir()
+
+
+def test_owned_dead_muse_refuses_shell_generation_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    original = fake.pane_idle_shell_identity
+    calls = 0
+
+    def changing(pane_id: str) -> PaneShellProof | None:
+        nonlocal calls
+        proof = original(pane_id)
+        calls += 1
+        if proof is not None and calls > 1:
+            return replace(
+                proof,
+                identity=replace(
+                    proof.identity,
+                    starttime_ticks=proof.identity.starttime_ticks + 1,
+                ),
+            )
+        return proof
+
+    monkeypatch.setattr(fake, "pane_idle_shell_identity", changing)
+    with pytest.raises(AgentDeliveryError, match="runtime identity changed"):
+        manager.stop("worker", expected_token=token)
+    assert fake.closed == []
+
+
 def test_managed_dead_stop_refuses_expanded_stopped_record_before_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
