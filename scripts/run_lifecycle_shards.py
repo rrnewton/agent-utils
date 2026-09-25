@@ -59,14 +59,18 @@ _KILL_SECONDS = 5.0
 # hangup, and Ctrl-\.  Only SIGINT earns the shards a grace.  From before the first shard starts
 # until every shard has stopped, these are only recorded, never raised: Python runs a handler between
 # any two bytecodes, so a raising one can leave the start loop holding a child it never recorded, or
-# leave the stop steps before every group has been signalled.
+# leave the stop steps before every group has been signalled.  They are held back while the handlers
+# change, but a mask holds a signal back only from the thread that set it: the runner, like the
+# command that runs it, is single-threaded, and a caller with other threads loses that guarantee.
 _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 # Nothing can catch a SIGKILL of the runner itself, as a supervisor that kills the caller's process
 # group sends, so each shard leader is also told to receive a signal when the runner dies.  A mapped
 # shard's `unshare` leader gets SIGKILL and passes it on to the namespace's PID 1 (`--kill-child`),
 # which collapses the namespace.  An ordinary shard gets SIGINT, so pytest runs the teardown that
 # stops what its tests started.  Not covered: an ordinary shard that ignores SIGINT, and processes it
-# left in its group that its teardown does not stop.  Those need the runner alive to escalate.
+# left in its group that its teardown does not stop.  Those need the runner alive to escalate.  And
+# a runner killed during the interrupt grace sends a second SIGINT, which pytest takes as a request
+# to abandon the teardown the first one started: without the runner nothing would bound it anyway.
 _MAPPED_PARENT_DEATH_SIGNAL = signal.SIGKILL
 _ORDINARY_PARENT_DEATH_SIGNAL = signal.SIGINT
 _PR_SET_PDEATHSIG = 1
@@ -268,7 +272,11 @@ def run_commands(
     cwd: Path | None = None,
     parent_death_signal: int = _ORDINARY_PARENT_DEATH_SIGNAL,
 ) -> int:
-    """Run every shard concurrently and report every result before failing."""
+    """Run every shard concurrently and report every result before failing.
+
+    Leaves the caller's signal handlers and mask as it found them.  For the handlers that holds
+    only for a single-threaded caller: see _STOP_SIGNALS.
+    """
 
     processes: list[subprocess.Popen[bytes]] = []
     logs: list[Path] = []
@@ -278,11 +286,14 @@ def run_commands(
     groups = _Groups()
     fault: BaseException | None = None
     interrupted = False
-    mask = signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
+    # Blocking changes the mask before CPython runs pending handlers, one of which may raise, so
+    # the caller's mask is read first (this changes nothing) and the block happens inside the try.
+    caller_mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
     try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
         previous = {signum: signal.signal(signum, signals.record) for signum in _STOP_SIGNALS}
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
     try:
         try:
             for index, command in enumerate(commands):
@@ -326,13 +337,16 @@ def run_commands(
     finally:
         # Every shard has ended or been sent SIGKILL, so a signal may now act as the caller
         # arranged: even one that interrupts a report blocked on a full pipe cannot orphan anything.
-        # Signals are held back while handlers change, so none acts on a half-changed set.
-        mask = signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
+        # Signals are held back while handlers change, so none acts on a half-changed set; and
+        # the caller's handlers come back even if another signal's handler raises as they are held.
         try:
-            for signum, handler in previous.items():
-                signal.signal(signum, handler)
+            signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
         finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            try:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
     if interrupted:
         try:
             for index, process in enumerate(processes):

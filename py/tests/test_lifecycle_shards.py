@@ -348,6 +348,38 @@ def test_interrupt_grace_is_bounded_and_other_failures_stop_shards_at_once(
     assert marker.read_text() == "terminated"
 
 
+def test_a_fault_stops_shards_at_once_even_after_a_recorded_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A fault means the runner cannot be trusted to wait out a grace, whatever else arrived."""
+
+    marker = tmp_path / "ended"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    real_sleep = time.sleep
+    recorded: list[int] = []
+
+    def sleep(seconds: float) -> None:
+        log = logs / "shard-0.log"
+        if not recorded and log.exists() and b"shard started" in log.read_bytes():
+            os.kill(os.getpid(), signal.SIGINT)  # Ctrl-C: recorded, not raised.
+            recorder = getattr(signal.getsignal(signal.SIGINT), "__self__", None)
+            assert isinstance(recorder, runner._Signals)
+            recorded.extend(recorder.received)
+            raise RuntimeError("runner fault")
+        real_sleep(seconds)
+
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="runner fault"):
+        runner.run_commands(_shard(marker, 60), logs)
+
+    assert recorded == [signal.SIGINT]
+    assert time.monotonic() - started < runner._INTERRUPT_GRACE_SECONDS / 3
+    assert marker.read_text() == "terminated"
+    assert "=== mapped lifecycle shard 1/1 INTERRUPTED rc=143 ===" in capsys.readouterr().out
+
+
 def test_a_failed_interrupt_report_does_not_replace_the_original_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -548,7 +580,7 @@ _IGNORES_SIGTERM = (
 
 
 @pytest.mark.parametrize(
-    "signum", (signal.SIGINT, signal.SIGTERM), ids=("keyboard", "stop-signal")
+    "signum", (signal.SIGINT, signal.SIGTERM), ids=("sigint", "sigterm")
 )
 def test_an_interrupt_inside_the_first_sigkill_sweep_still_kills_every_later_group(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], signum: int
@@ -777,8 +809,14 @@ def test_a_finished_shard_group_proven_empty_is_never_signalled_again(
     real_sleep = time.sleep
 
     def sleep(seconds: float) -> None:
-        # Fault the runner once the finished shard has been proven empty, which stops the rest.
-        if not faulted and started_shards.started and started_shards.started[0].pid in proven_empty:
+        # Fault the runner once the finished shard has been proven empty, which stops the rest;
+        # but not before the running shard has set the SIGTERM handler that writes its marker.
+        if (
+            not faulted
+            and started_shards.started
+            and started_shards.started[0].pid in proven_empty
+            and b"shard started" in (logs / "shard-1.log").read_bytes()
+        ):
             faulted.append(True)
             raise RuntimeError("runner fault")
         real_sleep(seconds)
@@ -831,7 +869,13 @@ def test_a_group_that_empties_after_its_leader_ended_is_proven_empty_before_its_
         real_killpg(pgid, signum)
 
     def sleep(seconds: float) -> None:
-        if reused or len(started_shards.started) < 2 or started_shards.started[0].poll() is None:
+        if (
+            reused
+            or len(started_shards.started) < 2
+            or started_shards.started[0].poll() is None
+            # The running shard's SIGTERM handler, which writes its marker, must be set first.
+            or b"shard started" not in (logs / "shard-1.log").read_bytes()
+        ):
             real_sleep(seconds)
             return
         if seen_empty:
@@ -859,6 +903,30 @@ def test_a_group_that_empties_after_its_leader_ended_is_proven_empty_before_its_
     assert reused, "the finished shard's group never emptied"
     assert sent_after_reuse == []
     assert marker.read_text() == "terminated"
+
+
+def test_a_group_is_looked_at_again_just_before_it_is_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finished shard's group can empty, and its number be reused, after the last look and
+    before a signal step.  The step looks again first, so a group that emptied in between is
+    only probed, never sent the signal."""
+
+    process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    process.wait()  # The leader is reaped and started nothing: its group is empty.
+    groups = runner._Groups()  # No look yet since the group emptied.
+    sent: list[int] = []
+    real_killpg = os.killpg
+
+    def killpg(pgid: int, signum: int) -> None:
+        sent.append(signum)
+        real_killpg(pgid, signum)
+
+    monkeypatch.setattr(runner.os, "killpg", killpg)
+    groups.signal([process], signal.SIGTERM)
+    groups.signal([process], signal.SIGKILL)
+
+    assert sent == [0]  # One probe proved it empty; neither signal was sent.
 
 
 def test_a_shard_whose_runner_died_before_it_asked_for_a_parent_death_signal_exits() -> None:
@@ -955,6 +1023,52 @@ def test_a_signal_while_handlers_change_leaves_the_caller_with_all_its_own_handl
         real_signal(signal.SIGTERM, previous_term)
 
 
+@pytest.mark.parametrize("while_", ("installing", "restoring"))
+def test_a_handler_raising_as_the_stop_signals_are_blocked_leaves_the_caller_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, while_: str
+) -> None:
+    """CPython changes the mask first and then runs pending handlers, so a caller's handler (the
+    default SIGINT one when installing; any other signal's when restoring) can raise out of the
+    very call that blocked the stop signals.  The caller must not be left with them blocked, or
+    with the runner's recorder installed in place of its own handlers."""
+
+    real_sigmask = signal.pthread_sigmask
+    stop_signals = set(runner._STOP_SIGNALS)
+    own = {signum: signal.getsignal(signum) for signum in stop_signals}
+    caller_mask = real_sigmask(signal.SIG_BLOCK, ())
+    assert not stop_signals & caller_mask
+    blocks: list[int] = []
+
+    def sigmask(how: int, mask: Iterable[int]) -> set[int | signal.Signals]:
+        result: set[int | signal.Signals] = set(real_sigmask(how, mask))
+        if how == signal.SIG_BLOCK and stop_signals <= set(mask):
+            blocks.append(how)
+            if len(blocks) == (1 if while_ == "installing" else 2):
+                raise _CallerStop
+        return result
+
+    monkeypatch.setattr(runner.signal, "pthread_sigmask", sigmask)
+    started = tmp_path / "started"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    command = (sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).touch()")
+    try:
+        with pytest.raises(_CallerStop):
+            runner.run_commands(((*command, str(started)),), logs)
+        monkeypatch.undo()
+        left_mask = real_sigmask(signal.SIG_BLOCK, ())
+        left_handlers = {signum: signal.getsignal(signum) for signum in stop_signals}
+    finally:  # Whatever the result, the rest of the suite gets this process back as it was.
+        for signum, handler in own.items():
+            signal.signal(signum, handler)
+        real_sigmask(signal.SIG_SETMASK, caller_mask)
+
+    assert len(blocks) == (1 if while_ == "installing" else 2)
+    assert started.exists() == (while_ == "restoring")
+    assert left_mask == caller_mask
+    assert left_handlers == own
+
+
 def test_a_stop_signal_after_the_last_shard_ended_is_still_honoured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -965,7 +1079,9 @@ def test_a_stop_signal_after_the_last_shard_ended_is_still_honoured(
     blocks: list[int] = []
 
     def pthread_sigmask(how: int, mask: Iterable[int]) -> set[int | signal.Signals]:
-        if how == signal.SIG_BLOCK:
+        mask = set(mask)
+        # Only the calls that block the stop signals count; reading the mask blocks nothing.
+        if how == signal.SIG_BLOCK and set(runner._STOP_SIGNALS) <= mask:
             blocks.append(how)
             if len(blocks) == 2:  # The restoring, not the installing.
                 os.kill(os.getpid(), signal.SIGHUP)
