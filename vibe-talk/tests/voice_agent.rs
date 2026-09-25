@@ -282,3 +282,160 @@ async fn anything_but_phase_numbers_is_refused_rather_than_logged() {
         assert_eq!(body["error"], "invalid_timing", "{why}");
     }
 }
+
+// --- voice-unresponsive-signal -------------------------------------------------------------------
+
+/// A report the page could send after two silent turns, as the failure that motivated it looked.
+fn silent_report() -> Value {
+    json!({
+        "protocol": "vibe-talk-v1",
+        "chat": false,
+        "cause": "silent_turns",
+        "since_open_ms": 21_400,
+        "turns": 3,
+        "silent_turns": 2,
+        "audio_ms": 1_000,
+        "peak": 0,
+    })
+}
+
+#[tokio::test]
+async fn a_health_report_is_accepted_from_the_write_token_only() {
+    let router = app();
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-health",
+        None,
+        Some(silent_report()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-health",
+        Some(READ_TOKEN),
+        Some(silent_report()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read token wrote to the log"
+    );
+    for cause in [
+        "silent_greeting",
+        "silent_turns",
+        "no_reply",
+        "error_frame",
+        "recovered",
+    ] {
+        let mut report = silent_report();
+        report["cause"] = cause.into();
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v1/voice-health",
+            Some(WRITE_TOKEN),
+            Some(report),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{cause}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn anything_but_the_closed_health_record_is_refused_rather_than_logged() {
+    let router = app();
+    let with = |key: &str, value: Value| {
+        let mut report = silent_report();
+        report[key] = value;
+        report
+    };
+    let without = |key: &str| {
+        let mut report = silent_report();
+        report.as_object_mut().expect("object").remove(key);
+        report
+    };
+    for (why, report) in [
+        (
+            "an error message is free text",
+            with("message", json!("the upstream failed")),
+        ),
+        (
+            "a transcript is not a verdict",
+            with("transcript", json!("summarize the channel")),
+        ),
+        (
+            "an unknown cause is refused, not echoed",
+            with("cause", json!("made_up")),
+        ),
+        (
+            "an unknown protocol is refused, not echoed",
+            with("protocol", json!("some-vendor")),
+        ),
+        (
+            "a count is a number, not text",
+            with("turns", json!("three")),
+        ),
+        ("a peak past the 16-bit range", with("peak", json!(32_769))),
+        (
+            "more silent turns than turns",
+            with("silent_turns", json!(4)),
+        ),
+        ("a missing field is not a zero", without("peak")),
+    ] {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v1/voice-health",
+            Some(WRITE_TOKEN),
+            Some(report),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+        assert_eq!(body["error"], "invalid_health", "{why}");
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_health_body_is_not_read() {
+    let router = app();
+    let padded = json!({ "padding": "x".repeat(vibe_talk::voice_health::MAX_BODY_BYTES) });
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-health",
+        Some(WRITE_TOKEN),
+        Some(padded),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn one_caller_cannot_flood_the_log_with_health_records() {
+    let router = app();
+    for n in 0..vibe_talk::voice_health::MAX_LINES_PER_WINDOW {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v1/voice-health",
+            Some(WRITE_TOKEN),
+            Some(silent_report()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "record {n}: {body}");
+    }
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-health",
+        Some(WRITE_TOKEN),
+        Some(silent_report()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"], "voice_health_throttled");
+}

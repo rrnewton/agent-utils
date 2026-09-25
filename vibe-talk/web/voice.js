@@ -95,15 +95,27 @@ function dismissStatus() {
     clearTimeout(statusTimer);
     statusTimer = null;
   }
+  // `voice-unresponsive-signal`: while the service is not answering, the line falls back to
+  // saying so rather than to nothing. Hiding it would leave the call looking fine again.
+  if (session.health && session.health.unresponsive) {
+    el("status").textContent = UNRESPONSIVE_STATUS;
+    return;
+  }
   el("status-line").hidden = true;
 }
 
 /**
- * One of: idle, working, live, ended, suspended, error. web/voice.css colours the dot from this.
+ * One of: idle, working, live, unresponsive, ended, suspended, error. web/voice.css colours the
+ * dot from this.
  *
  * `suspended` is `#54 resume-recovery`: the socket died while the page was in the background. It
  * is deliberately neither `ended` (which says the reader chose to hang up) nor `error` (which says
  * something is broken), because it is neither, and calling it either one is the defect.
+ *
+ * `unresponsive` is `voice-unresponsive-signal`: the socket is open and the call may recover, but
+ * the service has stopped producing anything audible or readable. It is not `live`, which is what
+ * the page used to say through a whole call of silence, and not `error`, which says the call is
+ * broken and clears itself after a few seconds.
  */
 const setState = (name) => {
   el("status-line").setAttribute("data-state", name);
@@ -216,6 +228,8 @@ const session = {
   anonTurn: 0,
   // `#11 voice-connect-latency`. Content-free startup marks; see `markStartup`.
   timing: null,
+  // `voice-unresponsive-signal`. What this call's turns have produced; see `beginHealth`.
+  health: null,
 };
 
 // Recording is FIRE-AND-FORGET and gives up after the first failure.
@@ -1924,6 +1938,7 @@ function advanceVibeTalkInput() {
   session.typedTurnInFlight = true;
   session.socket.send(JSON.stringify({ type: "prompt", text }));
   setStatus("Waiting for the assistant…");
+  armNoReply();
 }
 
 /** Is there a live conversation for a client event or typed text to reach? */
@@ -3387,6 +3402,7 @@ async function start(options) {
   }
   const chat = Boolean(options && options.chat);
   beginStartupTiming(chat);
+  beginHealth(chat);
   clearError();
   // A new call is a clean slate for all three of these. `hasSuspended` in particular: leaving it
   // set would keep the large control reading "Resume" during and after the call it started.
@@ -3454,6 +3470,9 @@ async function start(options) {
 
   socket.onopen = () => {
     markStartup("socket_open");
+    if (session.health) {
+      session.health.openedAt = Date.now();
+    }
     if (session.protocol === "vibe-talk-v1") {
       session.connected = true;
       conversationOpen = true;
@@ -3518,6 +3537,10 @@ async function start(options) {
 
   socket.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) {
+      if (session.protocol === "vibe-talk-v1" && !session.chat) {
+        // Before the speaker-off drop: silencing the agent must not look like a dead service.
+        noteAgentAudio(new Uint8Array(event.data));
+      }
       if (session.protocol === "vibe-talk-v1" && !session.chat && !session.speakerOff) {
         markStartup("greeting_audio_received");
         playPcmBytes(new Uint8Array(event.data));
@@ -3884,6 +3907,236 @@ function sendStartupTiming() {
   }).catch(() => {});
 }
 
+// --- is the voice service answering? ------------------------------------------------------------
+//
+// `voice-unresponsive-signal`. A live call once stayed green for its whole length while every turn
+// produced nothing anyone could hear or read: turns completed, each carried PCM, and every sample
+// of it was silence. So a turn is judged by what it produced, not by whether bytes arrived, and
+// only from frames `vibe-talk-v1` already carries. The page cannot see WHY a service stopped
+// answering and does not guess; the README lists what it cannot observe.
+
+// The quietest sample peak that counts as sound: 256 of 32767, about -42 dBFS. Digital silence is
+// 0 and dither a few units, while speech peaks in the thousands, so this sits far from both.
+const AUDIBLE_PEAK = 256;
+
+// Consecutive silent turns before the page says so. One is not enough: a service may close an
+// empty turn for background noise it took for speech, or finish a tool-call-only response with
+// little or no speech before the answer follows. The greeting is the exception — it is supposed
+// to speak — so a silent greeting is reported after one.
+const SILENT_TURNS_TO_REPORT = 2;
+
+// How long a turn the PAGE started (the greeting, or a typed prompt) may produce nothing at all:
+// the same bound read-aloud already gives this protocol. Spoken turns are detected by the service,
+// so the page never knows when one began and cannot time it.
+const NO_REPLY_MS = 15000;
+
+// How much inaudible audio makes an INTERRUPTED turn count as silent. A listener hearing nothing
+// says "hello?" over it, and a server may take that for barge-in; without this, talking over a
+// dead service would hide it. "Inaudible" is the whole turn: one sample at AUDIBLE_PEAK anywhere
+// makes it heard, so the quiet gaps between a healthy reply's words never add up to silence. Dead
+// turns have been seen as short as 0.9 s, and a reply's lead-in before its first word is a small
+// fraction of that, so half a second of nothing at all is not the start of an answer.
+const INTERRUPTED_SILENT_MS = 500;
+
+const UNRESPONSIVE_STATUS = "The voice service is not responding.";
+
+function beginHealth(chat) {
+  session.health = {
+    chat,
+    openedAt: null,
+    turns: 0,
+    // Consecutive completed turns that produced nothing audible or readable.
+    silentRun: 0,
+    // The turn in progress.
+    heard: false,
+    peak: 0,
+    audioMs: 0,
+    greetingPending: false,
+    // The turn in progress carried an `error` frame, which is its verdict.
+    errored: false,
+    // The last silent turn, which is what a report describes.
+    lastPeak: 0,
+    lastAudioMs: 0,
+    unresponsive: false,
+    // Whether this episode's unresponsive state was reported, so its recovery may be.
+    episodeReported: false,
+    reported: new Set(),
+    noReplyTimer: null,
+  };
+}
+
+/** One PCM frame: its duration, and whether any sample in it could be heard. */
+function noteAgentAudio(bytes) {
+  const health = session.health;
+  if (!health) {
+    return;
+  }
+  const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+  let peak = 0;
+  for (let i = 0; i < pcm.length; i += 1) {
+    const magnitude = Math.abs(pcm[i]);
+    if (magnitude > peak) {
+      peak = magnitude;
+    }
+  }
+  health.peak = Math.max(health.peak, peak);
+  health.audioMs += (pcm.length / session.outputRate) * 1000;
+  if (peak >= AUDIBLE_PEAK) {
+    heardReply();
+  }
+}
+
+function noteAgentText() {
+  if (session.health) {
+    heardReply();
+  }
+}
+
+/** Something audible or readable arrived: the service is answering. */
+function heardReply() {
+  const health = session.health;
+  health.heard = true;
+  clearNoReply();
+  if (!health.unresponsive) {
+    return;
+  }
+  health.unresponsive = false;
+  setState("live");
+  setStatus("The voice service is responding again.");
+  if (health.episodeReported) {
+    health.episodeReported = false;
+    postHealth("recovered");
+  }
+}
+
+/**
+ * An `error` frame is the verdict on the turn it arrives in, whether before or after that turn's
+ * audio. A server may still close the turn with an ordinary `turn_complete`; counting that as a
+ * silent turn, or letting the no-reply bound fire after it, would log a second cause for one
+ * failure and paint over the error the page is already showing. An `error` carries no turn number,
+ * so the verdict attaches to the NEXT `turn_complete`, whichever turn that closes.
+ */
+function noteAgentError() {
+  const health = session.health;
+  if (!health) {
+    return;
+  }
+  health.errored = true;
+  clearNoReply();
+}
+
+/** A `turn_complete`: was the turn it ends silent, and is that enough to say so? */
+function judgeTurn(message, closingSegment) {
+  const health = session.health;
+  if (!health) {
+    return;
+  }
+  const greeting = health.greetingPending;
+  const errored = health.errored;
+  health.greetingPending = false;
+  health.errored = false;
+  const silent = !health.heard;
+  const turnPeak = health.peak;
+  const turnAudioMs = health.audioMs;
+  health.heard = false;
+  health.peak = 0;
+  health.audioMs = 0;
+  // An interrupted turn was cut short by the listener — unless what it cut short was a second or
+  // more of audio nobody could hear. An empty answer to the page closing its own audio segment is
+  // the server acknowledging that boundary, not a reply. Neither is evidence either way. A turn
+  // that carried an `error` has had its verdict already.
+  const cutShort = message.interrupted === true && !(silent && turnAudioMs >= INTERRUPTED_SILENT_MS);
+  if (errored || cutShort || (closingSegment && silent)) {
+    return;
+  }
+  health.turns += 1;
+  if (!silent) {
+    health.silentRun = 0;
+    return;
+  }
+  health.silentRun += 1;
+  health.lastPeak = turnPeak;
+  health.lastAudioMs = turnAudioMs;
+  if (greeting) {
+    reportHealth("silent_greeting");
+  } else if (health.silentRun >= SILENT_TURNS_TO_REPORT) {
+    reportHealth("silent_turns");
+  }
+}
+
+function armNoReply() {
+  const health = session.health;
+  if (!health) {
+    return;
+  }
+  clearNoReply();
+  health.noReplyTimer = setTimeout(() => {
+    health.noReplyTimer = null;
+    if (session.health === health) {
+      reportHealth("no_reply");
+    }
+  }, NO_REPLY_MS);
+}
+
+function clearNoReply() {
+  const health = session.health;
+  if (health && health.noReplyTimer !== null) {
+    clearTimeout(health.noReplyTimer);
+    health.noReplyTimer = null;
+  }
+}
+
+/**
+ * Say the service is not answering, on the page and — once per cause per call — in the app log.
+ *
+ * An `error` frame already turned the page red through `showError`, so it only gains the log line.
+ */
+function reportHealth(cause) {
+  const health = session.health;
+  if (!health) {
+    return;
+  }
+  if (cause !== "error_frame") {
+    if (!health.unresponsive) {
+      health.unresponsive = true;
+      setState("unresponsive");
+    }
+    // Every time, not just the first: completing the turn may have written an ordinary status.
+    setStatus(UNRESPONSIVE_STATUS);
+  }
+  if (health.reported.has(cause)) {
+    return;
+  }
+  health.reported.add(cause);
+  if (cause !== "error_frame") {
+    health.episodeReported = true;
+  }
+  postHealth(cause);
+}
+
+/** Enum names and integers only; the server refuses anything else. */
+function postHealth(cause) {
+  const health = session.health;
+  if (session.protocol !== "vibe-talk-v1") {
+    return;
+  }
+  const sinceOpen = health.openedAt === null ? 0 : Date.now() - health.openedAt;
+  // Diagnostics, not the call: a failure here is not worth a word on the screen.
+  api("/api/v1/voice-health", {
+    method: "POST",
+    body: {
+      protocol: session.protocol,
+      chat: health.chat,
+      cause,
+      since_open_ms: Math.max(0, Math.round(sinceOpen)),
+      turns: health.turns,
+      silent_turns: health.silentRun,
+      audio_ms: Math.round(health.lastAudioMs),
+      peak: health.lastPeak,
+    },
+  }).catch(() => {});
+}
+
 function handleVibeTalk(message) {
   switch (message.type) {
     case "session_started": {
@@ -3896,6 +4149,10 @@ function handleVibeTalk(message) {
         break;
       }
       session.waitingForGreeting = message.greeting === true;
+      if (session.waitingForGreeting && session.health) {
+        session.health.greetingPending = true;
+        armNoReply();
+      }
       session.capturePaused = session.waitingForGreeting;
       session.audioSegmentActive = true;
       session.socket.send(JSON.stringify({ type: "audio_start" }));
@@ -3919,6 +4176,9 @@ function handleVibeTalk(message) {
       // A provider that predates the flag sends only finished text, so absent means final.
       const final = message.final !== false;
       const key = `${message.turn ?? ""}:${who}:${final}:${said}`;
+      if (who === "assistant" && said.trim()) {
+        noteAgentText();
+      }
       if (!said || key === session.lastTranscriptKey) {
         break;
       }
@@ -3931,38 +4191,52 @@ function handleVibeTalk(message) {
     }
     case "error":
       showError(message.message || message.detail || "the voice provider reported an error");
+      noteAgentError();
+      reportHealth("error_frame");
       break;
-    case "turn_complete":
-      settleSpoken();
-      sendStartupTiming();
-      if (session.waitingForGreeting) {
-        session.waitingForGreeting = false;
-        session.capturePaused = false;
-        setStatus("Connected — say something.");
-        advanceVibeTalkInput();
-        break;
-      }
-      if (session.waitingForAudioEnd) {
-        session.waitingForAudioEnd = false;
-        advanceVibeTalkInput();
-        break;
-      }
-      if (session.typedTurnInFlight) {
-        session.typedTurnInFlight = false;
-        if (session.pendingPrompts.length > 0) {
-          advanceVibeTalkInput();
-        } else if (session.chat) {
-          setStatus("Connected — type a message.");
-        } else {
-          session.audioSegmentActive = true;
-          session.capturePaused = false;
-          session.socket.send(JSON.stringify({ type: "audio_start" }));
-          setStatus("Connected — say something.");
-        }
-      }
+    case "turn_complete": {
+      // Read before `vibeTalkTurnComplete` clears it: closing the page's own audio segment is not
+      // a request for a reply, so an empty answer to it says nothing about the service.
+      const closingSegment = session.waitingForAudioEnd;
+      // Cleared FIRST: completing this turn may send the next typed prompt, which arms its own.
+      clearNoReply();
+      vibeTalkTurnComplete();
+      judgeTurn(message, closingSegment);
       break;
+    }
     default:
       break;
+  }
+}
+
+/** The protocol's `turn_complete`, as it was before any health judgement. */
+function vibeTalkTurnComplete() {
+  settleSpoken();
+  sendStartupTiming();
+  if (session.waitingForGreeting) {
+    session.waitingForGreeting = false;
+    session.capturePaused = false;
+    setStatus("Connected — say something.");
+    advanceVibeTalkInput();
+    return;
+  }
+  if (session.waitingForAudioEnd) {
+    session.waitingForAudioEnd = false;
+    advanceVibeTalkInput();
+    return;
+  }
+  if (session.typedTurnInFlight) {
+    session.typedTurnInFlight = false;
+    if (session.pendingPrompts.length > 0) {
+      advanceVibeTalkInput();
+    } else if (session.chat) {
+      setStatus("Connected — type a message.");
+    } else {
+      session.audioSegmentActive = true;
+      session.capturePaused = false;
+      session.socket.send(JSON.stringify({ type: "audio_start" }));
+      setStatus("Connected — say something.");
+    }
   }
 }
 
@@ -4056,6 +4330,8 @@ function teardown() {
   session.liveTurns = new Map();
   session.anonTurn = 0;
   session.timing = null;
+  clearNoReply();
+  session.health = null;
   session.muted = false;
   session.v1Ready = false;
   session.capturePaused = false;

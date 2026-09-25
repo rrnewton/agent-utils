@@ -92,6 +92,9 @@ pub struct AppState {
     /// sides ensures concurrent requests cannot observe the same channel as absent and then undo
     /// one another's upstream registration during compensation.
     pub channel_registration_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Caps the lines `POST /api/v1/voice-health` writes, across every caller. Per process rather
+    /// than per call because the server has no call id to count by, by design.
+    pub voice_health_budget: Arc<crate::voice_health::LogBudget>,
 }
 
 fn added_channel_info(row: &AddedChannel, active_provider: Option<&str>) -> ChannelInfo {

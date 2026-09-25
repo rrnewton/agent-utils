@@ -500,3 +500,138 @@ async fn a_tool_line_names_an_integer_channel_and_the_shape_of_an_unreadable_one
         assert!(tool_line.contains(&expected), "{arguments}: {tool_line}");
     }
 }
+
+#[tokio::test]
+async fn a_voice_health_record_is_one_line_of_names_and_numbers_and_a_refused_one_is_none() {
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let report = json!({
+        "protocol": "vibe-talk-v1",
+        "chat": false,
+        "cause": "silent_turns",
+        "since_open_ms": 21_400,
+        "turns": 3,
+        "silent_turns": 2,
+        "audio_ms": 1_000,
+        "peak": 0,
+    });
+    let mut smuggled = report.clone();
+    smuggled["message"] = json!("the upstream failed");
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            "/api/v1/voice-health",
+            Some(WRITE_TOKEN),
+            Some(smuggled)
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            "/api/v1/voice-health",
+            Some(WRITE_TOKEN),
+            Some(report.clone())
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let mut recovered = report;
+    recovered["cause"] = json!("recovered");
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            "/api/v1/voice-health",
+            Some(WRITE_TOKEN),
+            Some(recovered)
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let text = capture.text();
+    assert!(!text.is_empty(), "nothing was captured at all");
+    assert!(
+        !text.contains("upstream failed"),
+        "refused free text reached the log: {text}"
+    );
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("voice_unresponsive"))
+        .collect();
+    assert_eq!(lines.len(), 1, "expected one unresponsive line: {lines:?}");
+    assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    let fields = lines[0]
+        .split("voice_unresponsive ")
+        .nth(1)
+        .expect("fields follow the name");
+    assert_eq!(
+        fields,
+        "protocol=vibe-talk-v1 chat=false cause=silent_turns since_open_ms=21400 turns=3 \
+         silent_turns=2 audio_ms=1000 peak=0"
+    );
+    let recoveries: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("voice_recovered"))
+        .collect();
+    assert_eq!(recoveries.len(), 1, "{recoveries:?}");
+    assert!(recoveries[0].contains("INFO") && recoveries[0].contains("cause=recovered"));
+}
+
+/// A throttled route says so once per window, not once per refused record.
+#[tokio::test]
+async fn throttled_health_records_are_announced_once_per_window() {
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let report = json!({
+        "protocol": "vibe-talk-v1",
+        "chat": false,
+        "cause": "no_reply",
+        "since_open_ms": 15_000,
+        "turns": 0,
+        "silent_turns": 0,
+        "audio_ms": 0,
+        "peak": 0,
+    });
+    let cap = vibe_talk::voice_health::MAX_LINES_PER_WINDOW;
+    for n in 0..cap + 3 {
+        let expected = if n < cap {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        assert_eq!(
+            call(
+                &harness,
+                "POST",
+                "/api/v1/voice-health",
+                Some(WRITE_TOKEN),
+                Some(report.clone())
+            )
+            .await,
+            expected,
+            "record {n}"
+        );
+    }
+    let text = capture.text();
+    let throttled: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("voice_health_throttled max_lines="))
+        .collect();
+    assert_eq!(throttled.len(), 1, "{throttled:?}");
+    assert!(throttled[0].contains("WARN"), "{}", throttled[0]);
+    assert!(
+        throttled[0].contains("max_lines=30 window_s=60"),
+        "{}",
+        throttled[0]
+    );
+    let written = text
+        .lines()
+        .filter(|l| l.contains("voice_unresponsive"))
+        .count();
+    assert_eq!(written, 30);
+}

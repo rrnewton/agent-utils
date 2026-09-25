@@ -746,6 +746,52 @@ pub async fn voice_timing(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// `POST /api/v1/voice-health` — the page's verdict that the voice service stopped answering.
+///
+/// The body is closed (see [`crate::voice_health::HealthReport`]): two closed enums, a flag and
+/// integers, so an unknown field or value is a 400 and nothing free-form reaches the log. Logged
+/// and not stored, like the timing record. The page sends each cause at most once per call; the
+/// shared [`crate::voice_health::LogBudget`] is what bounds a page that does not.
+pub async fn voice_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let report: crate::voice_health::HealthReport =
+        serde_json::from_slice(&body).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_health",
+                "expected a voice health record with only the documented fields and values",
+            )
+        })?;
+    report
+        .validate()
+        .map_err(|detail| ApiError::new(StatusCode::BAD_REQUEST, "invalid_health", detail))?;
+    let spend = state.voice_health_budget.spend();
+    if spend == crate::voice_health::Spend::FirstRefusal {
+        tracing::warn!(
+            "voice_health_throttled max_lines={} window_s={}",
+            crate::voice_health::MAX_LINES_PER_WINDOW,
+            crate::voice_health::BUDGET_WINDOW.as_secs()
+        );
+    }
+    if !spend.allowed() {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "voice_health_throttled",
+            "too many voice health records this minute; this one was not logged",
+        ));
+    }
+    if report.is_recovery() {
+        tracing::info!("voice_recovered {}", report.log_fields());
+    } else {
+        tracing::warn!("voice_unresponsive {}", report.log_fields());
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// `POST /api/v1/channels/{channel_id}/messages/{message_id}/speak`
 ///
 /// Read a message aloud, and hand back the AUDIO rather than a URL to it.

@@ -1233,6 +1233,7 @@ its own adapter-only token; every other route uses the read/write tokens describ
 | GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider |
 | GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers" |
 | POST | `/api/v1/voice-timing` | **write** | one call's content-free startup phase offsets, logged as `voice_startup` |
+| POST | `/api/v1/voice-health` | **write** | a content-free "the voice service is not responding" record, logged as `voice_unresponsive` or `voice_recovered` — see "When the voice service stops answering" |
 | GET | `/api/v1/signed-url` | **write** | compatibility endpoint that mints an ElevenLabs signed URL |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first |
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
@@ -1699,7 +1700,9 @@ it knows no later frame belongs to the interrupted turn. An `error` frame promis
 `turn_complete`, so a client should treat it as the end of the session. A server that predates
 `interrupt` answers it with an `error` frame. A client should still bound its wait for a prompt's
 first output rather than trust every server to answer: read-aloud abandons a session that returns
-no audio within 15 seconds of a prompt and repeats the read once on a fresh one.
+no audio within 15 seconds of a prompt and repeats the read once on a fresh one. A turn that a
+server completes with neither audible audio nor assistant text is reported to the listener as the
+service not responding, so a server that cannot produce speech should send `error`, not silent PCM.
 
 A `transcript` frame is `{"type":"transcript","role":"user"|"assistant","text":"…","turn":N,
 "final":true|false}`. `final` is optional and defaults to `true`, so a provider that sends only
@@ -1746,6 +1749,58 @@ first. The server accepts only those field names plus `protocol` and `chat`, ref
 else with 400 `invalid_timing`, and logs one line such as
 `voice_startup protocol=vibe-talk-v1 chat=false session_acquired=40 … greeting_audible=4050
 slowest=provider_ready:2480`. Nothing said and no identifier is in it.
+
+**When the voice service stops answering.** A `vibe-talk-v1` call can stay open, complete every
+turn, and even deliver PCM, while the listener hears nothing and sees no words. The page does not
+wait for the listener to notice. It calls a turn **silent** when its `turn_complete` arrives, not
+`interrupted`, with no assistant transcript text (an empty transcript or none at all) and no
+audible PCM (no audio bytes, or only bytes below the threshold). Audible means some sample
+reaches a magnitude of 256 (about -42 dBFS). Digital silence is 0 and speech peaks in the
+thousands. Audibility is judged on arrival, before the speaker-off switch drops the audio, so
+silencing the agent does not look like a dead service. A typed call plays no audio and is judged
+by text alone. The page reports each of these, once per call:
+
+| Cause | When |
+|---|---|
+| `silent_greeting` | the greeting turn is silent: a greeting is supposed to speak, so one is enough |
+| `silent_turns` | two consecutive turns are silent. One is not enough: turn detection may close an empty turn for background noise, and a response that only calls a tool may say nothing before the answer follows |
+| `no_reply` | 15 seconds after the greeting was promised, or after a typed prompt, with no audible PCM, no assistant text and no `turn_complete`. A typed call does not wait for its greeting, so there the greeting is judged as an ordinary turn and is not timed |
+| `error_frame` | the server sent `error`; the page already shows it in red and now also logs it, without its text. It is the verdict on the turn it arrives in, before or after that turn's audio: the next `turn_complete` is not counted as silent, and the no-reply bound is disarmed, so one failure is logged once. An `error` carries no turn number, so an `error` sent between turns spares the next turn instead |
+
+The status line then turns to the `unresponsive` state with "The voice service is not responding."
+That notice does not dismiss itself while the condition holds, and nothing is torn down, because
+the service may come back. The next audible audio or assistant text restores `live` and says "The
+voice service is responding again." Two kinds of turn count neither way. One is an interrupted
+turn, unless what it cut short was half a second or more of audio with no sample at the threshold,
+since a listener hearing nothing may talk over it. The other is the server's immediate `turn_complete` acknowledging
+the page's own `audio_end` before a typed prompt, which is a boundary, not a reply.
+
+Each cause is posted at most once per call to `POST /api/v1/voice-health`, and `recovered` at most
+once per reported episode. The body is a closed record, for example
+`{"protocol":"vibe-talk-v1","chat":false,"cause":"silent_turns","since_open_ms":21400,"turns":3,
+"silent_turns":2,"audio_ms":1000,"peak":0}`. Every field is required. `audio_ms` and `peak` describe
+the last silent turn, so "no audio arrived" (`audio_ms=0`) and "silent audio arrived" (`audio_ms>0`,
+`peak` under 256) can be told apart without capturing a call. An unknown field, `cause` or
+`protocol` is refused with 400 `invalid_health`, not echoed. A body over 512 bytes gets 413. Past 30
+records a minute across all callers the route answers 429 `voice_health_throttled` and writes
+nothing for them except one `voice_health_throttled max_lines=30 window_s=60` line per minute, so
+one page cannot flood the log with records. (The access log still notes every request, as it does
+for every route.) It logs one line of names and numbers only, WARN for a report and INFO for a
+recovery:
+`voice_unresponsive protocol=vibe-talk-v1 chat=false cause=silent_turns since_open_ms=21400 turns=3
+silent_turns=2 audio_ms=1000 peak=0`.
+
+What this cannot tell you:
+
+- **Why.** Which component failed is outside the protocol.
+- **Audio that is loud enough but not speech.** Noise, or speech too quiet to hear, that clears the
+  threshold counts as audible.
+- **The listener's own output.** The page judges samples, not speakers. A muted device or an
+  unplugged headset looks healthy.
+- **Whether the listener's speech reached the service.** A spoken turn the service never detects
+  produces no frames at all, which looks the same as the listener staying quiet. Only the greeting
+  and typed prompts are timed.
+- **The hosted vendor's protocol.** It has error frames of its own. This covers `vibe-talk-v1` only.
 
 ## Signed conversation URLs
 

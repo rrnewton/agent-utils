@@ -32,6 +32,7 @@
 pub mod access_layer;
 pub mod api;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use axum::Router;
 
@@ -66,6 +67,13 @@ pub fn router(state: AppState) -> Router {
         // `#11 voice-connect-latency`. Content-free startup phases, one log line per call. WRITE
         // scope, the same credential that opened the session.
         .route("/api/v1/voice-timing", post(api::voice_timing))
+        // `voice-unresponsive-signal`. The page's content-free verdict that the voice service stopped
+        // answering, one bounded log line per cause per call. WRITE scope, like the timing record.
+        .route(
+            "/api/v1/voice-health",
+            post(api::voice_health)
+                .layer(DefaultBodyLimit::max(crate::voice_health::MAX_BODY_BYTES)),
+        )
         .route("/api/v1/channels/{channel_id}/messages", get(api::messages))
         .route(
             "/api/v1/channels/{channel_id}/messages/{message_id}",

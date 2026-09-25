@@ -1998,6 +1998,14 @@ body {
   background: var(--paused);
 }
 
+/* `voice-unresponsive-signal`. The call is open and may recover, but the service has stopped
+   producing anything audible or readable. Neither `live` (which is what a whole call of silence
+   used to show) nor `error` (which says the call is broken): paused-coloured, ringed in warning. */
+#status-line[data-state="unresponsive"] .status-dot {
+  background: var(--paused);
+  box-shadow: 0 0 0 2px var(--warn);
+}
+
 /* ----------------------------------------------------------------------- the control bar --- */
 /*
  * `#58 control-bar`. The strip carrying the gear, the Voice/Discord switch, and — from `#59` and

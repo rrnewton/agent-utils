@@ -1205,6 +1205,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     },
     /** Every startup timing record the page has POSTed, parsed. */
     timingPosts: [],
+    /** Every voice health record the page has POSTed, parsed. */
+    healthPosts: [],
     /** Every constraint object the page has handed getUserMedia, in order. */
     micRequests: [],
     /** Every microphone track it has been given, each counting its own `stop()` calls. */
@@ -1542,6 +1544,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       }
       if (String(path) === "/api/v1/voice-timing") {
         page.timingPosts.push(JSON.parse(options.body));
+        return json(204, null);
+      }
+      if (String(path) === "/api/v1/voice-health") {
+        page.healthPosts.push(JSON.parse(options.body));
         return json(204, null);
       }
       if (String(path).startsWith("/api/v1/client-config")) {
@@ -2012,6 +2018,12 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   vm.runInContext(script, context, { filename: "voice.js" });
   // A binary socket frame from the page's own realm, where `instanceof ArrayBuffer` is asked.
   page.binaryFrame = (bytes) => vm.runInContext(`new ArrayBuffer(${bytes})`, context);
+  // The same, with every sample at `amplitude`: 0 is digital silence, thousands is speech.
+  page.pcmFrame = (samples, amplitude) =>
+    vm.runInContext(
+      `(() => { const b = new ArrayBuffer(${samples * 2}); new Int16Array(b).fill(${amplitude}); return b; })()`,
+      context
+    );
   return page;
 }
 
@@ -2281,6 +2293,19 @@ const TUNING_BANDS = {
     "how long a finger rests before the row shows who sent it and when. Below about a quarter of " +
     "a second an ordinary tap becomes a hold and the message stops folding; past a second and a " +
     "half the reader has concluded the gesture does not exist and lifted their finger"],
+  AUDIBLE_PEAK: [64, 1024,
+    "the quietest sample peak that counts as sound (voice-unresponsive-signal). Below 64 dither and " +
+    "codec noise read as a service that is speaking; above 1024 a quiet voice reads as silence"],
+  SILENT_TURNS_TO_REPORT: [2, 3,
+    "one silent turn can be background noise or a tool-call-only response, so one is too few; past " +
+    "three the reader has sat through a minute of nothing on a page that still looks fine"],
+  NO_REPLY_MS: [10000, 30000,
+    "a turn the page started that produced nothing at all. A slow tool call can take several " +
+    "seconds before the first word; past half a minute the reader has already given up"],
+  INTERRUPTED_SILENT_MS: [250, 1500,
+    "inaudible audio that makes a cut-short turn count as silent. Much under a quarter second is " +
+    "ordinary lead-in before speech; dead turns as short as 0.9 s have been seen, so much over a " +
+    "second and a half lets talking over a dead service hide it"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -12115,6 +12140,363 @@ test("a call that ends before its greeting still reports how far it got, once", 
   assert.equal(page.timingPosts.length, 1);
   assert.ok("provider_ready" in page.timingPosts[0]);
   assert.ok(!("greeting_audible" in page.timingPosts[0]), "a greeting nobody heard was reported heard");
+});
+
+// --- the voice service is not answering (voice-unresponsive-signal) ------------------------------
+//
+// A live call stayed green for its whole length while every turn completed with PCM that was
+// silence and an empty assistant transcript. These drive exactly that shape, and the ordinary
+// shapes around it that must NOT be mistaken for it.
+
+const NO_REPLY_MS = 15000;
+const SILENT = 0;
+const SPEECH = 4000;
+
+/**
+ * One completed turn: optional PCM at an amplitude, then assistant text — `null` sends no
+ * transcript frame at all, which a failing server does as often as it sends an empty one.
+ */
+function agentTurn(page, socket, turn, { amplitude = null, samples = 24000, text = "", interrupted = false } = {}) {
+  if (amplitude !== null) {
+    socket.onmessage({ data: page.pcmFrame(samples, amplitude) }); // 24000 is one second
+  }
+  if (text !== null) {
+    speech(socket, "assistant", turn, text, true);
+  }
+  socket.onmessage({
+    data: JSON.stringify(
+      interrupted ? { type: "turn_complete", turn, interrupted: true } : { type: "turn_complete", turn }
+    ),
+  });
+}
+
+test("two turns of silent PCM and no text say the service is not responding, once, with no words", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  agentTurn(page, socket, 1, { amplitude: SILENT });
+  assert.equal(state(page), "live", "one silent turn is not yet a dead service");
+  assert.equal(page.healthPosts.length, 0);
+  agentTurn(page, socket, 2, { amplitude: SILENT });
+  await page.settle();
+
+  assert.equal(state(page), "unresponsive", "the page stayed green through silence");
+  assert.equal(page.el("status").textContent, "The voice service is not responding.");
+  assert.equal(page.el("status-line").hidden, false);
+  // Sticky: the ordinary six-second dismissal falls back to the warning, not to nothing.
+  page.expireTimers(6000);
+  assert.equal(page.el("status-line").hidden, false, "the warning dismissed itself");
+  assert.equal(page.el("status").textContent, "The voice service is not responding.");
+
+  assert.equal(page.healthPosts.length, 1, `posted ${page.healthPosts.length} times`);
+  const [record] = page.healthPosts;
+  assert.deepStrictEqual(Object.keys(record).sort(), [
+    "audio_ms", "cause", "chat", "peak", "protocol", "silent_turns", "since_open_ms", "turns",
+  ]);
+  assert.equal(record.protocol, "vibe-talk-v1");
+  assert.equal(record.chat, false);
+  assert.equal(record.cause, "silent_turns");
+  assert.equal(record.turns, 2);
+  assert.equal(record.silent_turns, 2);
+  assert.equal(record.audio_ms, 1000, "bytes arrived, and the record must say so");
+  assert.equal(record.peak, 0, "and that every sample of them was silence");
+
+  agentTurn(page, socket, 3, { amplitude: SILENT });
+  await page.settle();
+  assert.equal(page.healthPosts.length, 1, "the same cause was logged twice in one call");
+  assert.equal(page.el("status").textContent, "The voice service is not responding.");
+});
+
+test("turns with no PCM at all are silent too, and the record says none arrived", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  agentTurn(page, socket, 1);
+  agentTurn(page, socket, 2);
+  await page.settle();
+  assert.equal(state(page), "unresponsive");
+  assert.equal(page.healthPosts.length, 1);
+  assert.equal(page.healthPosts[0].audio_ms, 0);
+  assert.equal(page.healthPosts[0].peak, 0);
+});
+
+test("a silent greeting is reported after ONE turn, because a greeting is supposed to speak", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page, { greeting: true });
+  agentTurn(page, socket, 0, { amplitude: SILENT });
+  await page.settle();
+  assert.equal(state(page), "unresponsive");
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["silent_greeting"]);
+  assert.equal(page.healthPosts[0].turns, 1);
+});
+
+test("a greeting that is heard but not transcribed is healthy: speaker-only is normal", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page, { greeting: true });
+  agentTurn(page, socket, 0, { amplitude: SPEECH });
+  agentTurn(page, socket, 1, { amplitude: SPEECH });
+  await page.settle();
+  assert.equal(state(page), "live");
+  assert.deepStrictEqual(page.healthPosts, []);
+});
+
+test("audible, readable, interrupted and lone silent turns are none of them a dead service", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  agentTurn(page, socket, 1, { amplitude: SILENT });
+  agentTurn(page, socket, 2, { amplitude: SPEECH }); // resets the run
+  agentTurn(page, socket, 3, { amplitude: SILENT });
+  agentTurn(page, socket, 4, { amplitude: SILENT, text: "Here is the summary." }); // text alone
+  agentTurn(page, socket, 5, { amplitude: SILENT });
+  agentTurn(page, socket, 6, { interrupted: true }); // the listener cut it short
+  agentTurn(page, socket, 7, { amplitude: SPEECH });
+  // Just under the threshold is silence, just at it is sound.
+  agentTurn(page, socket, 8, { amplitude: 255 });
+  agentTurn(page, socket, 9, { amplitude: 256 });
+  await page.settle();
+  assert.equal(state(page), "live");
+  assert.deepStrictEqual(page.healthPosts, []);
+});
+
+test("silencing the agent's voice does not make it look like a dead service", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await page.el("speaker").click();
+  agentTurn(page, socket, 1, { amplitude: SPEECH });
+  agentTurn(page, socket, 2, { amplitude: SPEECH });
+  await page.settle();
+  assert.equal(state(page), "live", "speaker off was read as the service going quiet");
+  assert.deepStrictEqual(page.healthPosts, []);
+});
+
+test("a greeting that never comes is reported after the no-reply bound, and not before", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page, { greeting: true });
+  await page.settle();
+  assert.equal(page.healthPosts.length, 0, "reported before the bound had passed");
+  assert.equal(page.expireTimers(NO_REPLY_MS), 1, "no bound was set on the greeting");
+  await page.settle();
+  assert.equal(state(page), "unresponsive");
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["no_reply"]);
+  assert.equal(page.healthPosts[0].turns, 0);
+  // Audio that is heard ends the episode.
+  socket.onmessage({ data: page.pcmFrame(2400, SPEECH) });
+  await page.settle();
+  assert.equal(state(page), "live");
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["no_reply", "recovered"]);
+});
+
+test("any reply inside the bound disarms it", async () => {
+  for (const reply of [
+    (page, socket) => socket.onmessage({ data: page.pcmFrame(2400, SPEECH) }),
+    (_page, socket) => speech(socket, "assistant", 0, "Hello.", false),
+    (_page, socket) => turnDone(socket, 0),
+  ]) {
+    const page = newPage();
+    const socket = await startNeutralCall(page, { greeting: true });
+    reply(page, socket);
+    assert.equal(page.expireTimers(NO_REPLY_MS), 0, "the bound outlived a reply");
+  }
+});
+
+test("a typed prompt with no reply is reported; closing the spoken turn first is not a silent turn", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await compose(page, "anyone there");
+  await page.el("send-text").click();
+  assert.deepStrictEqual(JSON.parse(socket.sent.at(-1)), { type: "audio_end" });
+  turnDone(socket, 1); // the page's own segment, closed with nothing said: no evidence
+  assert.deepStrictEqual(JSON.parse(socket.sent.at(-1)), { type: "prompt", text: "anyone there" });
+  assert.equal(page.expireTimers(NO_REPLY_MS), 1, "the typed prompt was given no bound");
+  await page.settle();
+  assert.equal(state(page), "unresponsive");
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["no_reply"]);
+  assert.equal(page.healthPosts[0].turns, 0, "closing the segment was counted as a turn");
+  assert.doesNotMatch(JSON.stringify(page.healthPosts), /anyone there/, "the record carries speech");
+});
+
+test("no transcript frame at all is as silent as an empty one: the greeting and a prompt", async () => {
+  // A real failure's greeting — zeroed PCM, no transcript frame at all — then a typed prompt
+  // answered by a bare turn_complete: no audio bytes and no transcript frame either.
+  const page = newPage();
+  const socket = await startNeutralCall(page, { greeting: true });
+  agentTurn(page, socket, 0, { amplitude: SILENT, samples: 22080, text: null });
+  await page.settle();
+  assert.equal(state(page), "unresponsive");
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["silent_greeting"]);
+  assert.equal(page.healthPosts[0].audio_ms, 920, "44160 bytes is 920 ms at 24 kHz");
+  assert.equal(page.healthPosts[0].peak, 0);
+  await compose(page, "anyone there");
+  await page.el("send-text").click();
+  turnDone(socket, 1); // the server acknowledging the page's own audio_end: a boundary, neutral
+  agentTurn(page, socket, 2, { text: null });
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["silent_greeting", "silent_turns"]);
+  assert.equal(page.healthPosts[1].audio_ms, 0);
+  assert.equal(page.healthPosts[1].silent_turns, 2);
+});
+
+test("an error frame is its turn's verdict: the silent turn_complete after it is not a second cause", async () => {
+  for (const errorFirst of [true, false]) {
+    const page = newPage();
+    const socket = await startNeutralCall(page);
+    const error = () => socket.onmessage({ data: JSON.stringify({ type: "error", message: "failed" }) });
+    agentTurn(page, socket, 1, { amplitude: SILENT }); // one silent turn already on the count
+    if (errorFirst) error();
+    socket.onmessage({ data: page.pcmFrame(24000, SILENT) });
+    if (!errorFirst) error();
+    turnDone(socket, 2);
+    await page.settle();
+    const order = errorFirst ? "error before the audio" : "error after the audio";
+    assert.equal(state(page), "error", `${order}: the error was painted over`);
+    assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["error_frame"], order);
+  }
+});
+
+test("an error frame disarms the no-reply bound, so one failure is not logged twice", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page, { greeting: true });
+  socket.onmessage({ data: JSON.stringify({ type: "error", message: "failed" }) });
+  assert.equal(page.expireTimers(NO_REPLY_MS), 0, "the bound outlived the error");
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["error_frame"]);
+});
+
+test("talking over half a second of silence does not hide a dead service; talking over speech does", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  // Healthy speech is mostly quiet samples: gaps between words, soft sounds. Three seconds with
+  // only short bursts at speaking level, cut off, is a reply the listener talked over.
+  const healthyShaped = () => {
+    for (let i = 0; i < 6; i += 1) {
+      socket.onmessage({ data: page.pcmFrame(9000, 40) }); // 375 ms of near-silence
+      socket.onmessage({ data: page.pcmFrame(3000, SPEECH) }); // a 125 ms syllable
+    }
+  };
+  agentTurn(page, socket, 1, { amplitude: SILENT, samples: 9600, interrupted: true }); // 0.4 s
+  healthyShaped();
+  agentTurn(page, socket, 2, { interrupted: true });
+  healthyShaped();
+  agentTurn(page, socket, 3, { interrupted: true });
+  agentTurn(page, socket, 4, { amplitude: SILENT, samples: 9600, interrupted: true });
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts, [], "a short or audible turn that was cut off is not evidence");
+  agentTurn(page, socket, 5, { amplitude: SILENT, samples: 12000, interrupted: true }); // 0.5 s
+  agentTurn(page, socket, 6, { amplitude: SILENT, samples: 21600, interrupted: true }); // 0.9 s
+  await page.settle();
+  assert.equal(state(page), "unresponsive");
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["silent_turns"]);
+  assert.equal(page.healthPosts[0].audio_ms, 900);
+});
+
+test("an error attaches to the next turn_complete, even when it arrives between turns", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  agentTurn(page, socket, 1, { amplitude: SILENT });
+  socket.onmessage({ data: JSON.stringify({ type: "error", message: "failed" }) });
+  agentTurn(page, socket, 2, { amplitude: SILENT }); // takes the error's verdict: not counted
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["error_frame"]);
+  agentTurn(page, socket, 3, { amplitude: SILENT }); // judged again, and the run continues
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["error_frame", "silent_turns"]);
+});
+
+test("a greeting that never comes and then completes silently is logged as both, once each", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page, { greeting: true });
+  page.expireTimers(NO_REPLY_MS);
+  agentTurn(page, socket, 0, { amplitude: SILENT });
+  agentTurn(page, socket, 1, { amplitude: SILENT });
+  await page.settle();
+  assert.equal(state(page), "unresponsive");
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["no_reply", "silent_greeting", "silent_turns"]);
+});
+
+test("a typed call's greeting is judged as an ordinary turn and is not timed", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(async () =>
+    json(200, {
+      websocket_url: "wss://example.invalid/private-voice",
+      protocol: "vibe-talk-v1",
+      provider: "Internal voice preview",
+      input_sample_rate: 24000,
+      output_sample_rate: 24000,
+    })
+  );
+  await page.el("text-entry").click();
+  await page.settle();
+  const socket = page.sockets[0];
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: true }) });
+  assert.equal(page.expireTimers(NO_REPLY_MS), 0, "a typed greeting was timed");
+  agentTurn(page, socket, 0, { text: null });
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts, [], "one silent typed turn was reported as a silent greeting");
+});
+
+test("recovery restores live and is logged once per logged episode", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  agentTurn(page, socket, 1, { amplitude: SILENT });
+  agentTurn(page, socket, 2, { amplitude: SILENT });
+  agentTurn(page, socket, 3, { amplitude: SPEECH });
+  await page.settle();
+  assert.equal(state(page), "live");
+  assert.equal(page.el("status").textContent, "The voice service is responding again.");
+  page.expireTimers(6000);
+  assert.equal(page.el("status-line").hidden, true, "the recovery notice did not dismiss normally");
+  // A second episode of the same cause shows on the page but is not logged again, so neither is
+  // its recovery: a call that flaps cannot write a line per flap.
+  agentTurn(page, socket, 4, { amplitude: SILENT });
+  agentTurn(page, socket, 5, { amplitude: SILENT });
+  assert.equal(state(page), "unresponsive");
+  agentTurn(page, socket, 6, { amplitude: SPEECH });
+  await page.settle();
+  assert.equal(state(page), "live");
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["silent_turns", "recovered"]);
+});
+
+test("an error frame is logged by cause alone, without the text it carried", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  socket.onmessage({ data: JSON.stringify({ type: "error", message: "upstream exploded" }) });
+  socket.onmessage({ data: JSON.stringify({ type: "error", message: "upstream exploded" }) });
+  await page.settle();
+  assert.equal(state(page), "error", "an error frame is still an error");
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["error_frame"]);
+  assert.doesNotMatch(JSON.stringify(page.healthPosts), /exploded/);
+});
+
+test("a typed call judges by text alone, because it plays no audio", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(async () =>
+    json(200, {
+      websocket_url: "wss://example.invalid/private-voice",
+      protocol: "vibe-talk-v1",
+      provider: "Internal voice preview",
+      input_sample_rate: 24000,
+      output_sample_rate: 24000,
+    })
+  );
+  await page.el("text-entry").click();
+  await page.settle();
+  const socket = page.sockets[0];
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  agentTurn(page, socket, 1, { amplitude: SPEECH });
+  agentTurn(page, socket, 2, { amplitude: SPEECH });
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts.map((r) => [r.cause, r.chat]), [["silent_turns", true]]);
+});
+
+test("hanging up ends the judgement: no bound fires into the next call", async () => {
+  const page = newPage();
+  await startNeutralCall(page, { greeting: true });
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.expireTimers(NO_REPLY_MS), 0, "the greeting bound survived the call");
+  assert.deepStrictEqual(page.healthPosts, []);
 });
 
 test("TYPING A MESSAGE SENDS user_message, AND NOTHING ELSE", async () => {

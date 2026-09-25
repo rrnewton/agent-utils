@@ -63,3 +63,4 @@ pub mod testing;
 pub mod threads;
 pub mod untrusted;
 pub mod voice_agent;
+pub mod voice_health;

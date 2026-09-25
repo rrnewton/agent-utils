@@ -495,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
         spoken_names: Arc::new(vibe_talk::speakable::SharedNames::new()),
         added_channels: Arc::new(std::sync::RwLock::new(Vec::new())),
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
+        voice_health_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),
         live: Arc::clone(&live),
         summarizer,
