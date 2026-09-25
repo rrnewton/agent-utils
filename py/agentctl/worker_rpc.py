@@ -83,7 +83,10 @@ def dispatch(request: dict[str, object]) -> dict[str, object]:
         raise ValueError(f"unsupported runtime operation: {action}")
     value: object = asdict(result) if is_dataclass(result) and not isinstance(result, type) else result
     record = lib.read_registry().get(name)
-    return {"result": value, "record": asdict(record) if record is not None else None}
+    return {
+        "result": value,
+        "record": record.to_public_dict() if record is not None else None,
+    }
 
 
 def _main() -> int:

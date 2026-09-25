@@ -1016,6 +1016,34 @@ class HerdrClient:
             )
         return observed[0]
 
+    def verify_pane_shell_identity(
+        self, pane_id: str, expected: CustomProcessIdentity, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
+        """Require the exact shell generation recorded for an adopted pane.
+
+        The shell is normally in the background while an adopted harness owns
+        the foreground process group, so an idle-shell proof is intentionally
+        too strong here.  This check binds the current Herdr pane's shell PID
+        to the complete boot/start/image identity captured at adoption.  An
+        unreadable procfs observation is not absence and therefore fails
+        closed as an unavailable observation.
+        """
+        info = self.process_info(pane_id, timeout=timeout)
+        if info.shell_pid != expected.pid:
+            raise HerdrUnavailable(
+                f"recorded pane shell generation changed for pane {pane_id}"
+            )
+        observed = self._process_identity(info.shell_pid)
+        if observed is None:
+            raise HerdrUnavailable(
+                f"cannot verify recorded pane shell generation for pane {pane_id}"
+            )
+        if observed[0] != expected:
+            raise HerdrUnavailable(
+                f"recorded pane shell generation changed for pane {pane_id}"
+            )
+
     def pane_is_same_idle_shell(
         self, pane_id: str, expected: CustomProcessIdentity, *,
         timeout: float = CONTROL_TIMEOUT_SECONDS,

@@ -1651,7 +1651,22 @@ pub(crate) fn read_private_json(path: &Path) -> AgentResult<Value> {
     read_json_with_policy(path, true)
 }
 
+pub(crate) fn read_private_json_bounded(path: &Path, max_bytes: u64) -> AgentResult<Value> {
+    if max_bytes == 0 {
+        return Err(AgentError::delivery("JSON byte limit must be positive"));
+    }
+    read_json_with_policy_bounded(path, true, Some(max_bytes))
+}
+
 fn read_json_with_policy(path: &Path, require_private: bool) -> AgentResult<Value> {
+    read_json_with_policy_bounded(path, require_private, None)
+}
+
+fn read_json_with_policy_bounded(
+    path: &Path,
+    require_private: bool,
+    max_bytes: Option<u64>,
+) -> AgentResult<Value> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1669,9 +1684,31 @@ fn read_json_with_policy(path: &Path, require_private: bool) -> AgentResult<Valu
             path.display()
         )));
     }
+    if max_bytes.is_some_and(|limit| metadata.len() == 0 || metadata.len() > limit) {
+        return Err(AgentError::delivery(format!(
+            "JSON artifact {} exceeds its bounded size",
+            path.display()
+        )));
+    }
     let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|error| io_error("read JSON", path, error))?;
+    match max_bytes {
+        Some(limit) => {
+            Read::by_ref(&mut file)
+                .take(limit.saturating_add(1))
+                .read_to_string(&mut contents)
+                .map_err(|error| io_error("read JSON", path, error))?;
+            if contents.len() as u64 > limit {
+                return Err(AgentError::delivery(format!(
+                    "JSON artifact {} exceeds its bounded size",
+                    path.display()
+                )));
+            }
+        }
+        None => {
+            file.read_to_string(&mut contents)
+                .map_err(|error| io_error("read JSON", path, error))?;
+        }
+    }
     serde_json::from_str(&contents).map_err(|error| {
         AgentError::delivery(format!("cannot read JSON {}: {error}", path.display()))
     })

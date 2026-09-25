@@ -14,6 +14,7 @@ from pathlib import Path
 
 from agentctl import agent
 from agentctl.client import HerdrClient, _bounded_control_command
+from agentctl.client import CustomProcessIdentity
 from agentctl.errors import AgentDeliveryError, HerdrRunError
 from agentctl.jsonx import as_mapping
 from agentctl.profiles import (
@@ -25,6 +26,24 @@ from agentctl.subagents import AgentRecord, ManagedAgents, _name
 
 _WORKER_RPC_SCHEMA = "agentctl-worker-rpc/v1"
 _RUNNER_LIVENESS_SCHEMA = "agentctl-runner-liveness/v1"
+
+
+def _runner_identity(value: object) -> CustomProcessIdentity | None:
+    """Parse one complete worker process identity; absence is not legacy proof."""
+    if not isinstance(value, dict) or set(value) != {
+        "version", "boot_id", "pid", "starttime_ticks",
+        "executable_device", "executable_inode",
+    }:
+        return None
+    try:
+        identity = CustomProcessIdentity(**value)
+    except (TypeError, ValueError):
+        return None
+    if (identity.version != 1 or identity.pid <= 0
+            or identity.starttime_ticks <= 0
+            or identity.executable_device <= 0 or identity.executable_inode <= 0):
+        return None
+    return identity
 
 
 class WorkerRpcError(AgentDeliveryError):
@@ -228,6 +247,10 @@ class Sessions(ManagedAgents):
             record.pane_id = pane if isinstance(pane, str) else None
             runner_pid = runtime.get("runner_pid")
             runner_started_at = runtime.get("runner_started_at")
+            identity = _runner_identity(runtime.get("runner_identity"))
+            if identity is not None:
+                runner_pid = identity.pid
+                runner_started_at = str(identity.starttime_ticks)
             if (runtime.get("name") == record.name
                     and isinstance(runner_pid, int) and not isinstance(runner_pid, bool)
                     and 1 <= runner_pid <= 2_147_483_647
@@ -236,6 +259,7 @@ class Sessions(ManagedAgents):
                     and any(character != "0" for character in runner_started_at)):
                 record.runner_pid = runner_pid
                 record.runner_started_at = runner_started_at
+                record.runner_identity = identity
             elif runner_pid is not None or runner_started_at is not None:
                 raise AgentDeliveryError("worker returned an invalid runner identity")
         if save:
@@ -244,7 +268,7 @@ class Sessions(ManagedAgents):
     @staticmethod
     def _runner_observation(
         record: AgentRecord, response: dict[str, object],
-    ) -> tuple[tuple[int, str, bool | None] | None, str | None]:
+    ) -> tuple[tuple[CustomProcessIdentity, bool | None] | None, str | None]:
         """Parse one internally consistent worker identity and liveness observation."""
         try:
             runtime_record = as_mapping(response.get("record"), "worker runtime record")
@@ -254,19 +278,14 @@ class Sessions(ManagedAgents):
                     or not isinstance(agents[0], dict)):
                 raise TypeError("worker status result must contain exactly one agent")
             row = as_mapping(agents[0], "worker status row")
-            parsed: list[tuple[int, str]] = []
+            parsed: list[CustomProcessIdentity] = []
             for value in (runtime_record, row):
                 if value.get("name") != record.name:
                     raise TypeError("worker status identity has a different name")
-                observed_pid = value.get("runner_pid")
-                observed_start = value.get("runner_started_at")
-                if (not isinstance(observed_pid, int) or isinstance(observed_pid, bool)
-                        or not 1 <= observed_pid <= 2_147_483_647
-                        or not isinstance(observed_start, str)
-                        or not observed_start.isascii() or not observed_start.isdigit()
-                        or not any(character != "0" for character in observed_start)):
+                identity = _runner_identity(value.get("runner_identity"))
+                if identity is None:
                     raise TypeError("worker status identity is invalid")
-                parsed.append((observed_pid, observed_start))
+                parsed.append(identity)
             if parsed[0] != parsed[1]:
                 raise TypeError("worker status identities disagree")
             runner_alive = row.get("runner_alive")
@@ -274,7 +293,7 @@ class Sessions(ManagedAgents):
                 raise TypeError("worker status row has invalid runner_alive evidence")
         except TypeError as exc:
             return None, str(exc)
-        return (parsed[0][0], parsed[0][1], runner_alive), None
+        return (parsed[0], runner_alive), None
 
     @classmethod
     def _runner_liveness(
@@ -283,20 +302,22 @@ class Sessions(ManagedAgents):
         """Bind one typed liveness observation to the saved runner generation."""
         if record.runner_pid is None or record.runner_started_at is None:
             return None, "saved runner identity is unavailable"
+        if record.runner_identity is None:
+            return None, "saved runner identity is not boot/image bound"
         observation, error = cls._runner_observation(record, response)
         if observation is None:
             return None, error
-        runner_pid, runner_started_at, runner_alive = observation
-        if (runner_pid != record.runner_pid
-                or runner_started_at != record.runner_started_at):
+        runner_identity, runner_alive = observation
+        if runner_identity != record.runner_identity:
             return None, "worker status identity does not match the saved runner"
         if runner_alive is None:
             return None, "worker status could not determine exact runner liveness"
         return {
             "schema": _RUNNER_LIVENESS_SCHEMA,
             "name": record.name,
-            "runner_pid": runner_pid,
-            "runner_started_at": runner_started_at,
+            "runner_pid": runner_identity.pid,
+            "runner_started_at": str(runner_identity.starttime_ticks),
+            "runner_identity": asdict(runner_identity),
             "runner_alive": runner_alive,
         }, None
 
@@ -321,9 +342,10 @@ class Sessions(ManagedAgents):
                         and record.runtime_home == expected_runtime_home
                         and record.runner_pid is None
                         and record.runner_started_at is None
-                        and observation is not None and observation[2] is True):
-                    record.runner_pid = observation[0]
-                    record.runner_started_at = observation[1]
+                        and observation is not None and observation[1] is True):
+                    record.runner_identity = observation[0]
+                    record.runner_pid = observation[0].pid
+                    record.runner_started_at = str(observation[0].starttime_ticks)
                     self._save(record)
                     result["runner_pid"] = record.runner_pid
                     result["runner_started_at"] = record.runner_started_at
@@ -476,6 +498,8 @@ class Sessions(ManagedAgents):
             record = self._load(name)
             if record.adapter == "turn-runner":
                 self._worker(record, "pause" if paused else "resume")
+            else:
+                self._checked(record)
             record.paused = paused
             self._save(record)
             return {"name": name, "token": record.token, "paused": paused}

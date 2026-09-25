@@ -658,6 +658,34 @@ pub trait ManagedApi: AgentApi {
             "pane shell identity is unavailable",
         ))
     }
+    /// Require the complete shell process generation captured at adoption.
+    fn verify_pane_shell_identity(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+    ) -> crate::error::Result<()> {
+        if self.pane_shell_identity(pane)? == *expected {
+            Ok(())
+        } else {
+            Err(crate::error::AdapterError::unavailable(format!(
+                "recorded pane shell generation changed for pane {pane}"
+            )))
+        }
+    }
+    /// Cancellation-aware complete adopted-shell generation check.
+    fn verify_pane_shell_identity_with_runtime(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "Herdr control operation was cancelled",
+            ));
+        }
+        self.verify_pane_shell_identity(pane, expected)
+    }
     /// Prove both idle-shell state and the exact process generation captured earlier.
     fn pane_is_same_idle_shell(
         &self,
@@ -912,6 +940,23 @@ impl ManagedApi for HerdrClient {
     fn pane_shell_identity(&self, pane: &str) -> crate::error::Result<CustomProcessIdentity> {
         HerdrClient::pane_shell_identity(self, pane)
     }
+    fn verify_pane_shell_identity(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+    ) -> crate::error::Result<()> {
+        HerdrClient::verify_pane_shell_identity(self, pane, expected)
+    }
+    fn verify_pane_shell_identity_with_runtime(
+        &self,
+        pane: &str,
+        expected: &CustomProcessIdentity,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<()> {
+        HerdrClient::verify_pane_shell_identity_with_cancellation(self, pane, expected, &|| {
+            runtime.cancelled()
+        })
+    }
     fn pane_is_same_idle_shell(
         &self,
         pane: &str,
@@ -1002,6 +1047,8 @@ struct AgentRecord {
     runner_pid: Option<u64>,
     #[serde(default)]
     runner_started_at: Option<String>,
+    #[serde(default)]
+    runner_identity: Option<CustomProcessIdentity>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
     name: String,
@@ -1169,6 +1216,15 @@ impl AgentRecord {
                     || started_at.bytes().all(|byte| byte == b'0')
             })
             || self.runner_pid.is_some() != self.runner_started_at.is_some()
+            || self.runner_identity.as_ref().is_some_and(|identity| {
+                !identity.valid()
+                    || self.runner_pid != Some(identity.pid)
+                    || self
+                        .runner_started_at
+                        .as_deref()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        != Some(identity.starttime_ticks)
+            })
             || self
                 .launch_argv
                 .iter()
@@ -1287,6 +1343,15 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             )));
         }
         if Some(pane_id) == self.record.pane_id.as_deref() {
+            if self.record.adapter == "herdr-foreign" {
+                let identity = self.record.foreign_shell_identity.as_ref().ok_or_else(|| {
+                    crate::error::AdapterError::unavailable(format!(
+                        "adopted agent {:?} has no identity-bound pane shell",
+                        self.record.name
+                    ))
+                })?;
+                self.client.verify_pane_shell_identity(pane_id, identity)?;
+            }
             if self.record.goal_session_id.is_some()
                 && info.session_value.is_some()
                 && info.session_value != self.record.goal_session_id
@@ -1528,6 +1593,16 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             )));
         }
         if Some(pane_id) == self.record.pane_id.as_deref() {
+            if self.record.adapter == "herdr-foreign" {
+                let identity = self.record.foreign_shell_identity.as_ref().ok_or_else(|| {
+                    crate::error::AdapterError::unavailable(format!(
+                        "adopted agent {:?} has no identity-bound pane shell",
+                        self.record.name
+                    ))
+                })?;
+                self.client
+                    .verify_pane_shell_identity_with_runtime(pane_id, identity, runtime)?;
+            }
             if self.record.goal_session_id.is_some()
                 && info.session_value.is_some()
                 && info.session_value != self.record.goal_session_id
@@ -2270,8 +2345,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         agent::validate_private_directory(&directory, "agent directory", false)?;
         let path = directory.join("agent.json");
-        let record: AgentRecord = serde_json::from_value(agent::read_private_json(&path)?)
-            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        let record: AgentRecord = serde_json::from_value(agent::read_private_json_bounded(
+            &path,
+            MAX_AGENT_RECORD_BYTES as u64,
+        )?)
+        .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
         record.validate_loaded(&path, agent_name)?;
         Ok(record)
     }
@@ -2500,6 +2578,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             runtime_ownership: Some("owned".to_owned()),
             runner_pid: None,
             runner_started_at: None,
+            runner_identity: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -2867,6 +2946,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             runtime_ownership: Some("foreign".to_owned()),
             runner_pid: None,
             runner_started_at: None,
+            runner_identity: None,
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
@@ -3181,11 +3261,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "refusing to unregister adopted agent {agent_name:?}: legacy record has no identity-bound pane shell"
             ))
         })?;
-        if self.client.pane_shell_identity(&info.pane_id)? != *shell_identity {
-            return Err(fail(format!(
-                "refusing to unregister adopted agent {agent_name:?}: recorded pane shell generation changed"
-            )));
-        }
+        self.client
+            .verify_pane_shell_identity(&info.pane_id, shell_identity)
+            .map_err(|_| {
+                fail(format!(
+                    "refusing to unregister adopted agent {agent_name:?}: recorded pane shell generation changed"
+                ))
+            })?;
         if info.agent.is_none() {
             // A live agent is pinned by its harness and, when one was
             // reported, native session. A returned shell has no such process
@@ -3269,6 +3351,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             Value::Null
         };
         result["goal_delivery"] = json!(self.goal_delivery(record));
+        if record.adapter == "turn-runner" {
+            result["agent_status"] = json!("unknown");
+            result["probe_error"] = json!(
+                "turn-runner liveness requires the worker extension; this edition made no death claim"
+            );
+            result["probe_error_kind"] = json!("unsupported-runtime-observer");
+            return Ok(result);
+        }
         let client = WorkspaceClient {
             client: self.client,
             record,
@@ -3304,6 +3394,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         status: &Value,
         runtime: &dyn agent::AgentRuntime,
     ) -> (String, String, String) {
+        if record.adapter == "turn-runner" {
+            return (
+                "unknown".to_owned(),
+                "runtime-observer-unavailable".to_owned(),
+                "turn-runner liveness requires the worker extension; no death was inferred"
+                    .to_owned(),
+            );
+        }
         if record.lifecycle != "running" {
             return (
                 "unhealthy".to_owned(),
@@ -3565,6 +3663,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         checked_at: f64,
         runtime: &dyn agent::AgentRuntime,
     ) -> Result<(Value, Option<Value>)> {
+        if runtime.cancelled() {
+            return Ok((
+                Self::unrecorded_health(
+                    agent_name,
+                    checked_at,
+                    "probe-deadline-exceeded",
+                    "health probe deadline expired before the record was read",
+                    None,
+                ),
+                None,
+            ));
+        }
         let initial = self.load(agent_name)?;
         if runtime.cancelled() {
             return Ok((
@@ -3906,6 +4016,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
         record.supported()?;
+        self.checked(&record)?;
         record.paused = paused;
         self.save(&record)?;
         Ok(json!({"name": agent_name, "token": record.token, "paused": paused}))
@@ -6918,6 +7029,35 @@ mod tests {
         assert_eq!(binding["kind"], "session");
         assert_eq!(binding["agent"], "codex");
         assert_eq!(binding["value"], "thread");
+    }
+
+    #[test]
+    fn every_adopted_operation_revalidates_the_shell_generation() {
+        let fixture = Fixture::new();
+        fixture.adopt();
+        fixture
+            .client
+            .foreign_shell_identity
+            .lock()
+            .unwrap()
+            .starttime_ticks += 1;
+        let manager = fixture.manager();
+
+        let status = manager.status("foreign").unwrap();
+        assert_eq!(status["agent_status"], "unknown");
+        assert!(status["probe_error"]
+            .as_str()
+            .unwrap()
+            .contains("shell generation changed"));
+        assert!(manager
+            .send("foreign", "message", DrainOptions::default())
+            .is_err());
+        assert!(manager.read("foreign", 10).is_err());
+        assert!(manager.wait("foreign", Duration::ZERO).is_err());
+        assert!(manager.pause("foreign", true).is_err());
+        assert!(manager.attach("foreign").is_err());
+        assert!(manager.bind_session("foreign", "thread", None).is_err());
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -9972,6 +10112,17 @@ mod tests {
             .unwrap()
             .contains("worker extension"));
         assert_eq!(manager.list().unwrap().len(), 1);
+        let health = manager.health(&["worker".to_owned()]);
+        assert_eq!(health["healthy"], false);
+        assert_eq!(health["sessions"][0]["health"], "unknown");
+        assert_eq!(
+            health["sessions"][0]["reason_code"],
+            "runtime-observer-unavailable"
+        );
+        let durable =
+            agent::read_private_json(&fixture.root.join("registry/worker/health.json")).unwrap();
+        assert_eq!(durable["health"], "unknown");
+        assert!(durable.get("last_unhealthy_reason").is_none());
         assert!(manager.stop("worker").is_err());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }

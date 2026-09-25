@@ -9,6 +9,7 @@ import subprocess
 import json
 import os
 import time
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Iterator
 
@@ -794,14 +795,34 @@ def test_harness_cleanup_refuses_changed_ownership(
     fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch, changed: str,
 ) -> None:
     rec = _install_agy_agent(fake_runner_state, "ownership")
-    rec.runner_pid, rec.runner_started_at = 22, "runner-start"
+    runner = lib.CustomProcessIdentity(
+        version=1, boot_id="11111111-2222-3333-4444-555555555555",
+        pid=22, starttime_ticks=100, executable_device=3, executable_inode=4,
+    )
+    harness = replace(runner, pid=33, starttime_ticks=200, executable_inode=5)
+    rec.runner_pid, rec.runner_started_at = runner.pid, str(runner.starttime_ticks)
+    rec.runner_identity = runner
     ownership: dict[str, object] = {
-        "runner_pid": 22, "runner_started_at": "runner-start", "pid": 33, "started_at": "child-start",
+        "schema": "agentctl-active-harness/v2",
+        "runner": asdict(runner),
+        "harness": asdict(harness),
     }
-    if changed != "process_group":
-        ownership[changed] = 23 if changed == "runner_pid" else "different-start"
+    if changed == "runner_pid":
+        ownership["runner"] = asdict(replace(runner, pid=23))
+    elif changed == "runner_started_at":
+        ownership["runner"] = asdict(replace(runner, starttime_ticks=101))
+    elif changed == "started_at":
+        ownership["harness"] = asdict(replace(harness, starttime_ticks=201))
     (lib.agent_dir(rec.name) / "active-harness.json").write_text(json.dumps(ownership))
-    monkeypatch.setattr(lib, "pid_start_time", lambda _pid: "child-start")
+    monkeypatch.setattr(
+        lib,
+        "process_identity_liveness",
+        lambda identity, **_kwargs: (
+            lib.ProcessLiveness.LIVE
+            if identity in (runner, harness)
+            else lib.ProcessLiveness.DEAD
+        ),
+    )
     monkeypatch.setattr(os, "getpgid", lambda pid: pid + 1 if changed == "process_group" else pid)
     monkeypatch.setattr(os, "killpg", lambda *_args: pytest.fail("changed ownership was signaled"))
     if changed == "process_group":
@@ -925,7 +946,8 @@ def test_activated_runner_can_acknowledge_successive_migrations(fake_runner_stat
         assert identity is not None
         with lib.registry_lock() as agents:
             agents[rec.name].runner_pid = identity.pid
-            agents[rec.name].runner_started_at = identity.started_at
+            agents[rec.name].runner_started_at = str(identity.starttime_ticks)
+            agents[rec.name].runner_identity = identity
         lib.staged_runner_activate_path(rec.name, token).touch()
         _wait_for(lib.staged_runner_activated_path(rec.name, token), runner)
         lib.clear_migration_markers(rec.name, token)

@@ -90,6 +90,33 @@ def test_adopted_agent_supports_named_operations_and_preserves_native_identity(
     assert binding["value"] == "native-session"
 
 
+def test_every_adopted_operation_revalidates_the_shell_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    adopt(sessions, pane, tmp_path)
+    fake.foreign_shell_identity = replace(
+        fake.foreign_shell_identity,
+        starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1,
+    )
+
+    status = sessions.status("foreign")
+    assert status["agent_status"] == "unknown"
+    assert "shell generation changed" in str(status["probe_error"])
+    operations = (
+        lambda: sessions.send_session("foreign", "message"),
+        lambda: sessions.read_session("foreign"),
+        lambda: sessions.wait("foreign", timeout=0),
+        lambda: sessions.pause("foreign"),
+        lambda: sessions.attach("foreign"),
+        lambda: sessions.bind_session("foreign", "native-session"),
+    )
+    for operation in operations:
+        with pytest.raises((AgentDeliveryError, HerdrUnavailable)):
+            operation()
+    assert fake.submitted == []
+
+
 def test_stop_unregisters_foreign_agent_without_closing_or_mutating_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -153,6 +153,13 @@ class FakeManagedClient:
         assert pane_id in self.infos
         return self.foreign_shell_identity
 
+    def verify_pane_shell_identity(
+        self, pane_id: str, expected: CustomProcessIdentity,
+    ) -> None:
+        assert pane_id in self.infos
+        if expected != self.foreign_shell_identity:
+            raise HerdrUnavailable("recorded pane shell generation changed")
+
     def pane_is_same_idle_shell(
         self, pane_id: str, expected: CustomProcessIdentity,
     ) -> bool:

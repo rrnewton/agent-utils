@@ -12,8 +12,19 @@ from typing import Iterator
 import pytest
 
 from agentctl.foreign import agent_keeper, agent_runner, lib
-from agentctl.client import AgentPaneInfo
+from agentctl.client import AgentPaneInfo, CustomProcessIdentity
 from agentctl.errors import HerdrUnavailable
+
+
+def _runner_identity(pid: int, started_at: int) -> CustomProcessIdentity:
+    return CustomProcessIdentity(
+        version=1,
+        boot_id="11111111-2222-3333-4444-555555555555",
+        pid=pid,
+        starttime_ticks=started_at,
+        executable_device=3,
+        executable_inode=4,
+    )
 
 
 @pytest.fixture()
@@ -363,18 +374,23 @@ def _tui_record(name: str, cwd: Path) -> lib.AgentRecord:
 
 @pytest.mark.parametrize(
     "observation, expected",
-    [(("R", "9001"), True), (("Z", "9001"), False),
-     (("x", "9001"), False), (("?", "9001"), None),
-     (("R", "9002"), False), (FileNotFoundError(), False),
-     (PermissionError(), None), (ValueError("malformed stat"), None)],
+    [(("R", "9001"), lib.ProcessLiveness.LIVE),
+     (("Z", "9001"), lib.ProcessLiveness.DEAD),
+     (("x", "9001"), lib.ProcessLiveness.DEAD),
+     (("?", "9001"), lib.ProcessLiveness.UNKNOWN),
+     (("R", "9002"), lib.ProcessLiveness.DEAD),
+     (FileNotFoundError(), lib.ProcessLiveness.DEAD),
+     (PermissionError(), lib.ProcessLiveness.UNKNOWN),
+     (ValueError("malformed stat"), lib.ProcessLiveness.UNKNOWN)],
 )
 def test_runner_identity_liveness_is_exact_and_tristate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    observation: tuple[str, str] | BaseException, expected: bool | None,
+    observation: tuple[str, str] | BaseException, expected: lib.ProcessLiveness,
 ) -> None:
+    identity = _runner_identity(4242, 9001)
     record = dataclasses.replace(
         _tui_record("worker", tmp_path), mode=lib.HEADLESS_MODE,
-        runner_pid=4242, runner_started_at="9001",
+        runner_pid=4242, runner_started_at="9001", runner_identity=identity,
     )
 
     def read(_pid: int) -> tuple[str, str]:
@@ -383,7 +399,12 @@ def test_runner_identity_liveness_is_exact_and_tristate(
         return observation
 
     monkeypatch.setattr(lib, "_read_process_state_start", read)
-    assert lib.runner_identity_alive(record) is expected
+    monkeypatch.setattr(
+        lib.SharedHerdrClient,
+        "_process_identity",
+        staticmethod(lambda _pid: (identity, identity.pid)),
+    )
+    assert lib.runner_liveness(record) is expected
 
 
 class _FakeSharedAgentClient:
@@ -1027,7 +1048,7 @@ def test_migration_preserves_session_and_updates_presentation(
     monkeypatch.setattr(
         lib,
         "wait_for_staged_runner",
-        lambda name, token: lib.RunnerIdentity(pid=999_999, started_at="new-start"),
+        lambda name, token: _runner_identity(999_999, 9002),
     )
     monkeypatch.setattr(lib, "terminate_runner", lambda rec: True)
     monkeypatch.setattr(lib, "wait_for_staged_runner_activation", lambda name, token: True)
@@ -1109,7 +1130,7 @@ def test_activation_timeout_restores_source_registry_after_commit(
             tmux_target=f"subagents:{name}", cwd=str(cwd), model=None, session_id="session-kept",
             status="idle", runner_pid=old_pid, runner_started_at=old_start, next_seq=1,
             created_at=lib.now_iso(), last_turn_at=lib.now_iso())
-    destination = lib.RunnerIdentity(999_998, "destination-start")
+    destination = _runner_identity(999_998, 9003)
     killed: list[str] = []
     stopped: list[int] = []
     monkeypatch.setattr(lib, "backend_available", lambda _backend: True)
@@ -1129,7 +1150,7 @@ def test_activation_timeout_restores_source_registry_after_commit(
     def restart(_name: str, old: lib.AgentRecord) -> lib.RunnerIdentity:
         current = lib.read_registry()[name]
         assert current.backend == old.backend and current.tmux_target == old.tmux_target
-        return lib.RunnerIdentity(old_pid, old_start)
+        return _runner_identity(old_pid, int(old_start or "1"))
     monkeypatch.setattr(lib, "_restore_legacy_tmux_runner", restart)
     with pytest.raises(lib.AgentOperationError) as caught:
         lib.migrate_agent(name)
@@ -1176,7 +1197,7 @@ def test_legacy_tmux_source_without_pause_ack_stops_only_after_idle_check(
     monkeypatch.setattr(
         lib,
         "wait_for_staged_runner",
-        lambda name, token: lib.RunnerIdentity(pid=999_998, started_at="legacy-new"),
+        lambda name, token: _runner_identity(999_998, 9004),
     )
     def stop_runner(rec: lib.AgentRecord) -> bool:
         stopped.append(rec)
@@ -1233,7 +1254,7 @@ def test_legacy_tmux_destination_failure_restores_tmux_runner(
     stopped: list[lib.AgentRecord] = []
     killed: list[lib.AgentRecord] = []
     launches: list[str] = []
-    restored = lib.RunnerIdentity(pid=999_997, started_at="restored")
+    restored = _runner_identity(999_997, 9005)
     monkeypatch.setattr(lib, "backend_available", lambda backend: True)
     monkeypatch.setattr(lib, "wait_for_pause_ack", lambda name, old: False)
     monkeypatch.setattr(lib, "wait_for_staged_runner", lambda name, token: None)
@@ -1251,7 +1272,8 @@ def test_legacy_tmux_destination_failure_restores_tmux_runner(
     def publish_restored_runner(name: str, previous: lib.RunnerIdentity) -> lib.RunnerIdentity:
         with lib.registry_lock() as agents:
             agents[name].runner_pid = restored.pid
-            agents[name].runner_started_at = restored.started_at
+            agents[name].runner_started_at = str(restored.starttime_ticks)
+            agents[name].runner_identity = restored
             agents[name].status = "idle"
         return restored
 
@@ -1274,6 +1296,7 @@ def test_legacy_tmux_destination_failure_restores_tmux_runner(
 
 
 def _headless_conversion_source(name: str, cwd: Path) -> lib.AgentRecord:
+    identity = lib.capture_process_identity(os.getpid())
     return lib.AgentRecord(
         name=name,
         harness="codex",
@@ -1285,6 +1308,7 @@ def _headless_conversion_source(name: str, cwd: Path) -> lib.AgentRecord:
         status="idle",
         runner_pid=os.getpid(),
         runner_started_at=lib.pid_start_time(os.getpid()),
+        runner_identity=identity,
         next_seq=1,
         created_at=lib.now_iso(),
         last_turn_at=lib.now_iso(),
@@ -1376,7 +1400,7 @@ def test_headless_to_tui_failure_keeps_paused_source_and_removes_destination(
     assert lib.read_registry()[name].mode == lib.HEADLESS_MODE
     assert not lib.migration_pause_path(name).exists()
     assert not lib.migration_pause_ack_path(name).exists()
-    assert lib.runner_identity_alive(lib.read_registry()[name])
+    assert lib.runner_liveness(lib.read_registry()[name]) is lib.ProcessLiveness.LIVE
 
 
 def test_legacy_headless_to_tui_failure_restores_tmux_source(
@@ -1389,7 +1413,7 @@ def test_legacy_headless_to_tui_failure_restores_tmux_source(
     source = _headless_conversion_source(name, cwd)
     with lib.registry_lock() as agents:
         agents[name] = source
-    restored = lib.RunnerIdentity(999_993, "restored")
+    restored = _runner_identity(999_993, 9006)
     probe = lib.TuiProbe(True, True, "idle", 999_994)
     launches: list[str] = []
     monkeypatch.setattr(lib, "backend_available", lambda backend: True)
@@ -1420,7 +1444,8 @@ def test_legacy_headless_to_tui_failure_restores_tmux_source(
     def publish_restore(name: str, previous: lib.RunnerIdentity) -> lib.RunnerIdentity:
         with lib.registry_lock() as agents:
             agents[name].runner_pid = restored.pid
-            agents[name].runner_started_at = restored.started_at
+            agents[name].runner_started_at = str(restored.starttime_ticks)
+            agents[name].runner_identity = restored
         return restored
 
     monkeypatch.setattr(lib, "wait_for_restarted_runner", publish_restore)
@@ -1442,9 +1467,10 @@ def test_resume_source_intake_removes_pause_and_ack_markers(
     cwd.mkdir(parents=True)
     lib.ensure_agent_dirs(name)
     source = _headless_conversion_source(name, cwd)
-    lib.write_migration_pause(name, lib.RunnerIdentity(source.runner_pid or -1, source.runner_started_at))
+    assert source.runner_identity is not None
+    lib.write_migration_pause(name, source.runner_identity)
     lib.acknowledge_migration_pause(
-        name, lib.RunnerIdentity(source.runner_pid or -1, source.runner_started_at)
+        name, source.runner_identity
     )
 
     lib._resume_source_intake(name, source)

@@ -237,6 +237,7 @@ class AgentRecord:
     runtime_ownership: str | None = None
     runner_pid: int | None = None
     runner_started_at: str | None = None
+    runner_identity: CustomProcessIdentity | None = None
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
     def to_document(self) -> dict[str, object]:
@@ -251,7 +252,10 @@ class AgentRecord:
     @classmethod
     def load(cls, path: Path, name: str) -> AgentRecord:
         """Reject malformed or non-private state before using any recorded identity."""
-        value = agent._read_queue_json(str(path), "agent record", require_private=True)
+        value = agent._read_queue_json(
+            str(path), "agent record", require_private=True,
+            max_artifact_bytes=_MAX_AGENT_RECORD_BYTES,
+        )
         return cls._from_value(value, path, name)
 
     @classmethod
@@ -386,10 +390,20 @@ class AgentRecord:
             )
         custom_identity = process_identity("custom_process_identity")
         foreign_shell_identity = process_identity("foreign_shell_identity")
+        runner_identity = process_identity("runner_identity")
         if custom_identity is not None:
             fields["custom_process_identity"] = custom_identity
         if foreign_shell_identity is not None:
             fields["foreign_shell_identity"] = foreign_shell_identity
+        if runner_identity is not None:
+            fields["runner_identity"] = runner_identity
+            if (runner_pid is not None and runner_pid != runner_identity.pid) or (
+                runner_started_at is not None
+                and runner_started_at != str(runner_identity.starttime_ticks)
+            ):
+                raise AgentDeliveryError(f"contradictory runner identity in {path}")
+            fields["runner_pid"] = runner_identity.pid
+            fields["runner_started_at"] = str(runner_identity.starttime_ticks)
         if (custom_identity is not None
                 and (document.get("adapter", "herdr") != "herdr-pane"
                      or document.get("harness") != "muse"
@@ -566,6 +580,19 @@ class _WorkspaceClient:
         if info.workspace_id != self.record.workspace_id:
             raise HerdrUnavailable(f"agent {self.record.name!r} workspace identity changed")
         if pane_id == self.record.pane_id:
+            if self.record.adapter == "herdr-foreign":
+                identity = self.record.foreign_shell_identity
+                if identity is None:
+                    raise HerdrUnavailable(
+                        f"adopted agent {self.record.name!r} has no identity-bound pane shell"
+                    )
+                if self.deadline is not None and isinstance(self.client, HerdrClient):
+                    self.client.verify_pane_shell_identity(
+                        pane_id, identity,
+                        timeout=self._timeout("adopted pane shell identity probe"),
+                    )
+                else:
+                    self.client.verify_pane_shell_identity(pane_id, identity)
             if self.record.goal_session_id is not None and info.session_value is not None and info.session_value != self.record.goal_session_id:
                 raise HerdrUnavailable(f"agent {self.record.name!r} native session identity changed")
             if self.check_prompt and info.status in ("idle", "done") and info.agent == "claude":
@@ -1848,6 +1875,11 @@ class ManagedAgents:
         self, name: str, checked_at: float, deadline: float,
     ) -> tuple[dict[str, object], dict[str, object] | None]:
         """Check and record one name, propagating registry/probe setup errors."""
+        if time.monotonic() >= deadline:
+            return self._unrecorded_health(
+                name, checked_at, "probe-deadline-exceeded",
+                "health probe deadline expired before the record was read",
+            ), None
         initial = self._load(name)
         if time.monotonic() >= deadline:
             return self._unrecorded_health(
@@ -3338,11 +3370,15 @@ class ManagedAgents:
                             f"refusing to unregister adopted agent {name!r}: "
                             "legacy record has no identity-bound pane shell"
                         )
-                    if self.client.pane_shell_identity(info.pane_id) != shell_identity:
+                    try:
+                        self.client.verify_pane_shell_identity(
+                            info.pane_id, shell_identity
+                        )
+                    except HerdrRunError as exc:
                         raise AgentDeliveryError(
                             f"refusing to unregister adopted agent {name!r}: "
                             "recorded pane shell generation changed"
-                        )
+                        ) from exc
                     if info.agent is None:
                         # A live agent is pinned by its harness and, when one was
                         # reported, native session.  A returned shell has no such
@@ -3522,6 +3558,7 @@ class ManagedAgents:
         """Pause automated input without interrupting an active harness turn."""
         with self._lock(name):
             record = self._load(name)
+            self._checked(record)
             record.paused = paused
             self._save(record)
             return {"name": name, "token": record.token, "paused": paused}

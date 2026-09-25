@@ -1427,6 +1427,45 @@ impl HerdrClient {
         Ok(observed.identity)
     }
 
+    /// Require the complete shell process generation captured when a pane was adopted.
+    pub fn verify_pane_shell_identity(
+        &self,
+        pane_id: &str,
+        expected: &CustomProcessIdentity,
+    ) -> Result<()> {
+        self.verify_pane_shell_identity_with_cancellation(pane_id, expected, &|| false)
+    }
+
+    pub(crate) fn verify_pane_shell_identity_with_cancellation(
+        &self,
+        pane_id: &str,
+        expected: &CustomProcessIdentity,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        if !expected.valid() {
+            return Err(AdapterError::unavailable(
+                "recorded pane shell identity is invalid",
+            ));
+        }
+        let state = self.pane_process_state(pane_id, cancelled)?;
+        if state.shell_pid != expected.pid {
+            return Err(AdapterError::unavailable(format!(
+                "recorded pane shell generation changed for pane {pane_id}"
+            )));
+        }
+        let observed = supported_shell_process(state.shell_pid)?.ok_or_else(|| {
+            AdapterError::unavailable(format!(
+                "cannot verify recorded pane shell generation for pane {pane_id}"
+            ))
+        })?;
+        if observed.identity != *expected || observed.process_group_id != state.shell_pid {
+            return Err(AdapterError::unavailable(format!(
+                "recorded pane shell generation changed for pane {pane_id}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Require the recorded shell generation and Herdr's strict idle-shell presentation.
     pub fn pane_is_same_idle_shell(
         &self,

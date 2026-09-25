@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import enum
 import fcntl
 import json
 import os
@@ -40,6 +41,7 @@ from agentctl.agent import drain as shared_agent_drain  # noqa: E402
 from agentctl.agent import read as shared_agent_read  # noqa: E402
 from agentctl.agent import send as shared_agent_send  # noqa: E402
 from agentctl.agent import status as shared_agent_status  # noqa: E402
+from agentctl.client import CustomProcessIdentity  # noqa: E402
 from agentctl.client import HerdrClient as SharedHerdrClient  # noqa: E402
 from agentctl.errors import HerdrRunError as SharedHerdrError  # noqa: E402
 
@@ -431,12 +433,19 @@ class AgentRecord:
     # Literal non-secret Muse options. Profiles reject credential-shaped
     # arguments before these durable launch settings are recorded.
     harness_args: tuple[str, ...] = ()
+    # New rows use the complete boot-bound identity.  The two scalar fields
+    # above are accepted only while loading legacy rows and are not emitted
+    # when this field is present.
+    runner_identity: Optional[CustomProcessIdentity] = None
 
     @staticmethod
     def from_dict(d: dict[str, object]) -> "AgentRecord":
         """Load a worker record, restoring omitted presentation fields from preserved identity metadata."""
         fields = {f.name for f in dataclasses.fields(AgentRecord)}
-        missing = fields - set(d) - {"runner_started_at", "backend", "mode", "presentation_pane", "codex_bypass_permissions", "harness_args"}
+        missing = fields - set(d) - {
+            "runner_pid", "runner_started_at", "runner_identity", "backend", "mode",
+            "presentation_pane", "codex_bypass_permissions", "harness_args",
+        }
         if missing:
             die(f"registry row for {d.get('name')!r} missing keys: {sorted(missing)}")
         preserved = _load_presentation_identity(d)
@@ -462,6 +471,40 @@ class AgentRecord:
             not isinstance(item, str) or not item or "\0" in item for item in raw_harness_args
         ):
             die("registry row has invalid harness_args")
+        raw_identity = d.get("runner_identity")
+        runner_identity: Optional[CustomProcessIdentity] = None
+        if raw_identity is not None:
+            if not isinstance(raw_identity, dict):
+                die("registry row has invalid runner_identity")
+            try:
+                runner_identity = CustomProcessIdentity(**raw_identity)
+            except (TypeError, ValueError):
+                die("registry row has invalid runner_identity")
+            if (runner_identity.version != 1 or runner_identity.pid <= 0
+                    or runner_identity.starttime_ticks <= 0
+                    or runner_identity.executable_device <= 0
+                    or runner_identity.executable_inode <= 0):
+                die("registry row has invalid runner_identity")
+        legacy_pid = None if d.get("runner_pid") is None else int(str(d["runner_pid"]))
+        legacy_started = None if d.get("runner_started_at") is None else str(d["runner_started_at"])
+        if runner_identity is not None:
+            if legacy_pid is not None and legacy_pid != runner_identity.pid:
+                die("registry row has contradictory runner identity")
+            if legacy_started is not None and legacy_started != str(runner_identity.starttime_ticks):
+                die("registry row has contradictory runner identity")
+            legacy_pid = runner_identity.pid
+            legacy_started = str(runner_identity.starttime_ticks)
+        elif legacy_pid is not None and legacy_started is not None:
+            # Upgrade a live legacy PID/start row while the original process
+            # generation is still available.  Failure to capture the boot and
+            # executable identity deliberately leaves the row legacy: callers
+            # may prove that generation dead, but may not control it as live.
+            try:
+                observed = capture_process_identity(legacy_pid)
+            except AgentOperationError:
+                observed = None
+            if observed is not None and str(observed.starttime_ticks) == legacy_started:
+                runner_identity = observed
         return AgentRecord(
             name=str(d["name"]),
             harness=str(d["harness"]),
@@ -471,10 +514,8 @@ class AgentRecord:
             model=(None if d["model"] is None else str(d["model"])),
             session_id=(None if d["session_id"] is None else str(d["session_id"])),
             status=str(d["status"]),
-            runner_pid=(None if d["runner_pid"] is None else int(str(d["runner_pid"]))),
-            runner_started_at=(
-                None if d.get("runner_started_at") is None else str(d["runner_started_at"])
-            ),
+            runner_pid=legacy_pid,
+            runner_started_at=legacy_started,
             next_seq=int(str(d["next_seq"])),
             created_at=str(d["created_at"]),
             last_turn_at=(None if d["last_turn_at"] is None else str(d["last_turn_at"])),
@@ -482,10 +523,21 @@ class AgentRecord:
             presentation_pane=presentation_pane,
             codex_bypass_permissions=bypass,
             harness_args=tuple(raw_harness_args),
+            runner_identity=runner_identity,
         )
 
     def to_dict(self) -> dict[str, object]:
         """Serialize this record into a JSON-compatible dictionary."""
+        document = dataclasses.asdict(self)
+        if self.runner_identity is not None:
+            document.pop("runner_pid", None)
+            document.pop("runner_started_at", None)
+        else:
+            document.pop("runner_identity", None)
+        return document
+
+    def to_public_dict(self) -> dict[str, object]:
+        """Expose derived compatibility fields without storing duplicate authority."""
         return dataclasses.asdict(self)
 
 
@@ -502,6 +554,7 @@ class AgentStatus:
     status: str
     runner_pid: Optional[int]
     runner_started_at: Optional[str]
+    runner_identity: Optional[CustomProcessIdentity]
     next_seq: int
     created_at: str
     last_turn_at: Optional[str]
@@ -610,11 +663,18 @@ class MigrationResult:
     transcript: str
 
 
-@dataclasses.dataclass(frozen=True)
-class RunnerIdentity:
-    """A process ID paired with its kernel start time to distinguish PID reuse."""
-    pid: int
-    started_at: Optional[str]
+class ProcessLiveness(enum.Enum):
+    """Exhaustive result of observing one saved Linux process generation."""
+
+    LIVE = "live"
+    DEAD = "dead"
+    UNKNOWN = "unknown"
+
+
+# Migration and teardown use the same complete process identity as interactive
+# harnesses.  Keeping one type prevents the weaker historical PID/start tuple
+# from silently regaining mutation authority.
+RunnerIdentity = CustomProcessIdentity
 
 
 @dataclasses.dataclass(frozen=True)
@@ -897,11 +957,10 @@ def _harness_lock(name: str) -> Iterator[None]:
 
 def record_active_harness(name: str, runner: RunnerIdentity, harness: RunnerIdentity) -> None:
     """Record an owned harness process group for bounded stop and orphan cleanup."""
-    if harness.started_at is None or runner.started_at is None:
-        raise AgentOperationError("harness_identity_unknown", "cannot establish active harness process identity")
     _write_durable_json(agent_dir(name) / "active-harness.json", {
-        "runner_pid": runner.pid, "runner_started_at": runner.started_at,
-        "pid": harness.pid, "started_at": harness.started_at,
+        "schema": "agentctl-active-harness/v2",
+        "runner": dataclasses.asdict(runner),
+        "harness": dataclasses.asdict(harness),
     })
 
 
@@ -914,19 +973,48 @@ def terminate_active_harness(rec: AgentRecord) -> bool:
         return False
     except (OSError, ValueError) as exc:
         raise AgentOperationError("harness_identity_unknown", f"cannot read active harness identity: {exc}") from exc
-    if not isinstance(value, dict) or value.get("runner_pid") != rec.runner_pid:
-        return False
-    if rec.runner_started_at is not None and value.get("runner_started_at") != rec.runner_started_at:
-        return False
-    pid, started_at = value.get("pid"), value.get("started_at")
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(started_at, str):
+    if not isinstance(value, dict) or value.get("schema") != "agentctl-active-harness/v2":
         raise AgentOperationError("harness_identity_unknown", "malformed active harness identity")
-    if pid_start_time(pid) != started_at:
+    try:
+        runner = CustomProcessIdentity(**cast(dict[str, object], value["runner"]))
+        harness = CustomProcessIdentity(**cast(dict[str, object], value["harness"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AgentOperationError(
+            "harness_identity_unknown", "malformed active harness identity"
+        ) from exc
+    if rec.runner_identity is None or runner != rec.runner_identity:
+        return False
+    runner_state = runner_liveness(rec)
+    if runner_state is ProcessLiveness.UNKNOWN:
+        raise AgentOperationError(
+            "runner_liveness_unknown",
+            "cannot verify active harness owner before teardown",
+        )
+    # A dead runner is the normal orphan-cleanup case.  The registry and this
+    # sidecar bind the same complete runner generation, so its confirmed death
+    # does not invalidate the separately boot-bound harness identity.
+    harness_record = dataclasses.replace(
+        rec,
+        runner_pid=harness.pid,
+        runner_started_at=str(harness.starttime_ticks),
+        runner_identity=harness,
+    )
+    harness_state = runner_liveness(harness_record)
+    if harness_state is ProcessLiveness.UNKNOWN:
+        raise AgentOperationError(
+            "harness_identity_unknown", "cannot verify active harness before teardown"
+        )
+    if harness_state is ProcessLiveness.DEAD:
         return False
     try:
-        if os.getpgid(pid) != pid:
+        if os.getpgid(harness.pid) != harness.pid:
             raise AgentOperationError("harness_identity_changed", "active harness no longer owns its process group")
-        os.killpg(pid, signal.SIGKILL)
+        # Re-prove the full boot/start/image tuple immediately before signaling.
+        if runner_liveness(harness_record) is not ProcessLiveness.LIVE:
+            raise AgentOperationError(
+                "harness_identity_unknown", "active harness identity changed before teardown"
+            )
+        os.killpg(harness.pid, signal.SIGKILL)
     except ProcessLookupError:
         return False
     return True
@@ -940,11 +1028,6 @@ def transcript_path(name: str) -> Path:
 def last_message_path(name: str) -> Path:
     """Return the file containing the most recent captured headless answer."""
     return agent_dir(name) / "last-message.txt"
-
-
-def runner_pid_path(name: str) -> Path:
-    """Return the runner process-identity file path."""
-    return agent_dir(name) / "runner.pid"
 
 
 def runner_stderr_path(name: str) -> Path:
@@ -984,19 +1067,20 @@ def staged_runner_activated_path(name: str, token: str) -> Path:
 
 def write_migration_pause(name: str, old: RunnerIdentity) -> None:
     """Record the source identity whose intake must pause before migration."""
-    migration_pause_path(name).write_text(
-        json.dumps({"pid": old.pid, "started_at": old.started_at, "created_at": now_iso()}) + "\n"
-    )
+    _write_durable_json(migration_pause_path(name), {
+        "schema": "agentctl-migration-pause/v2",
+        "runner": dataclasses.asdict(old),
+        "created_at": now_iso(),
+    })
 
 
 def acknowledge_migration_pause(name: str, identity: RunnerIdentity) -> None:
     """Record that this runner has stopped consuming pending messages."""
-    tmp = migration_pause_ack_path(name).with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps({"pid": identity.pid, "started_at": identity.started_at, "acknowledged_at": now_iso()})
-        + "\n"
-    )
-    os.replace(tmp, migration_pause_ack_path(name))
+    _write_durable_json(migration_pause_ack_path(name), {
+        "schema": "agentctl-migration-pause-ack/v2",
+        "runner": dataclasses.asdict(identity),
+        "acknowledged_at": now_iso(),
+    })
 
 
 def pause_acknowledged(name: str, old: RunnerIdentity) -> bool:
@@ -1005,34 +1089,39 @@ def pause_acknowledged(name: str, old: RunnerIdentity) -> bool:
         raw = cast(dict[str, object], json.loads(migration_pause_ack_path(name).read_text()))
     except (OSError, json.JSONDecodeError):
         return False
-    return raw.get("pid") == old.pid and raw.get("started_at") == old.started_at
+    return (
+        raw.get("schema") == "agentctl-migration-pause-ack/v2"
+        and raw.get("runner") == dataclasses.asdict(old)
+    )
 
 
 def write_staged_runner(name: str, token: str, identity: RunnerIdentity) -> None:
     """Publish the identity of a replacement runner awaiting activation."""
-    path = staged_runner_path(name, token)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps({"pid": identity.pid, "started_at": identity.started_at, "recorded_at": now_iso()})
-        + "\n"
-    )
-    os.replace(tmp, path)
+    _write_durable_json(staged_runner_path(name, token), {
+        "schema": "agentctl-staged-runner/v2",
+        "token": token,
+        "runner": dataclasses.asdict(identity),
+        "recorded_at": now_iso(),
+    })
 
 
 def read_staged_runner(name: str, token: str) -> Optional[RunnerIdentity]:
     """Read a replacement-runner identity, returning None when no valid record exists."""
     try:
         raw = json.loads(staged_runner_path(name, token).read_text())
-        pid = int(raw["pid"])
-        started_at = raw.get("started_at")
+        if (not isinstance(raw, dict)
+                or raw.get("schema") != "agentctl-staged-runner/v2"
+                or raw.get("token") != token
+                or not isinstance(raw.get("runner"), dict)):
+            return None
+        identity = CustomProcessIdentity(**raw["runner"])
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
-    if not pid_alive(pid):
-        return None
-    current_start = pid_start_time(pid)
-    if started_at is not None and current_start is not None and started_at != current_start:
-        return None
-    return RunnerIdentity(pid=pid, started_at=None if started_at is None else str(started_at))
+    return (
+        identity
+        if process_identity_liveness(identity) is ProcessLiveness.LIVE
+        else None
+    )
 
 
 def clear_migration_markers(name: str, token: str) -> None:
@@ -1302,6 +1391,17 @@ def _read_process_state_start(pid: int) -> tuple[str, str]:
     return fields[0], started_at
 
 
+def capture_process_identity(pid: int) -> CustomProcessIdentity:
+    """Capture one coherent boot/start/image identity for a live process."""
+    observed = SharedHerdrClient._process_identity(pid)
+    if observed is None:
+        raise AgentOperationError(
+            "runner_identity_unknown",
+            f"cannot capture complete boot-bound identity for process {pid}",
+        )
+    return observed[0]
+
+
 def pid_start_time(pid: int) -> Optional[str]:
     """Return Linux /proc starttime ticks for PID identity checks."""
     try:
@@ -1311,33 +1411,109 @@ def pid_start_time(pid: int) -> Optional[str]:
     return started_at
 
 
-def runner_identity_alive(rec: AgentRecord) -> Optional[bool]:
-    """Observe exact runner liveness; ``None`` means the procfs proof is ambiguous."""
-    if rec.runner_pid is None or rec.runner_started_at is None:
-        return None
+def process_identity_liveness(
+    identity: CustomProcessIdentity | None, *,
+    legacy_pid: int | None = None, legacy_started_at: str | None = None,
+) -> ProcessLiveness:
+    """Observe one process generation; a PID/start-only identity never proves life."""
+    if identity is None:
+        # A legacy PID/start tuple is enough to prove absence or reuse, but not
+        # enough to authorize a live control operation on a later boot/image.
+        if legacy_pid is None or legacy_started_at is None:
+            return ProcessLiveness.UNKNOWN
+        try:
+            state, current_start = _read_process_state_start(legacy_pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return ProcessLiveness.DEAD
+        except (OSError, UnicodeError, ValueError):
+            return ProcessLiveness.UNKNOWN
+        if state in ("Z", "X", "x") or current_start != legacy_started_at:
+            return ProcessLiveness.DEAD
+        return ProcessLiveness.UNKNOWN
     try:
-        state, current_start = _read_process_state_start(rec.runner_pid)
+        state, current_start = _read_process_state_start(identity.pid)
     except (FileNotFoundError, ProcessLookupError):
-        return False
+        return ProcessLiveness.DEAD
     except (OSError, UnicodeError, ValueError):
-        return None
+        return ProcessLiveness.UNKNOWN
     if state in ("Z", "X", "x"):
-        return False
+        return ProcessLiveness.DEAD
     if state not in "RSDTtKWPI":
-        return None
-    return current_start == rec.runner_started_at
+        return ProcessLiveness.UNKNOWN
+    if current_start != str(identity.starttime_ticks):
+        return ProcessLiveness.DEAD
+    observed = SharedHerdrClient._process_identity(identity.pid)
+    if observed is None:
+        return ProcessLiveness.UNKNOWN
+    return (
+        ProcessLiveness.LIVE
+        if observed[0] == identity
+        else ProcessLiveness.DEAD
+    )
+
+
+def runner_liveness(rec: AgentRecord) -> ProcessLiveness:
+    """Observe the exact runner generation without collapsing uncertainty."""
+    return process_identity_liveness(
+        rec.runner_identity,
+        legacy_pid=rec.runner_pid,
+        legacy_started_at=rec.runner_started_at,
+    )
+
+
+def require_live_runner(rec: AgentRecord, operation: str) -> None:
+    """Require a positive exact liveness proof for a mutating operation."""
+    state = runner_liveness(rec)
+    if state is ProcessLiveness.LIVE:
+        return
+    if state is ProcessLiveness.UNKNOWN:
+        raise AgentOperationError(
+            "runner_liveness_unknown",
+            f"cannot prove exact runner identity while {operation}; no mutation was performed",
+        )
+    raise AgentOperationError(
+        "dead_runner",
+        f"runner is absent or its saved process generation was replaced while {operation}",
+    )
+
+
+def recorded_runner_identity(rec: AgentRecord, operation: str) -> RunnerIdentity:
+    """Return the complete saved identity or refuse an incomplete record."""
+    if rec.runner_identity is None:
+        raise AgentOperationError(
+            "runner_identity_incomplete",
+            f"{operation} requires a complete boot/start/image runner identity",
+        )
+    return rec.runner_identity
 
 
 def wait_for_pause_ack(name: str, old: RunnerIdentity) -> bool:
     """Wait within the migration deadline for the source runner to acknowledge paused intake."""
     deadline = time.monotonic() + MIGRATION_READY_TIMEOUT_S
     while time.monotonic() < deadline:
-        if not pid_alive(old.pid):
+        current = read_registry().get(name)
+        if current is None:
             return False
+        if current.runner_identity != old:
+            return False
+        state = runner_liveness(current)
+        if state is ProcessLiveness.DEAD:
+            return False
+        if state is ProcessLiveness.UNKNOWN:
+            raise AgentOperationError(
+                "runner_liveness_unknown",
+                "cannot verify source runner while waiting for migration pause",
+            )
         if pause_acknowledged(name, old):
             return True
         time.sleep(0.05)
-    return pause_acknowledged(name, old) and pid_alive(old.pid)
+    current = read_registry().get(name)
+    return (
+        pause_acknowledged(name, old)
+        and current is not None
+        and current.runner_identity == old
+        and runner_liveness(current) is ProcessLiveness.LIVE
+    )
 
 
 def wait_for_staged_runner(name: str, token: str) -> Optional[RunnerIdentity]:
@@ -1357,15 +1533,21 @@ def wait_for_restarted_runner(name: str, previous: RunnerIdentity) -> Optional[R
     while time.monotonic() < deadline:
         rec = read_registry().get(name)
         if rec is not None and rec.runner_pid is not None:
-            identity = RunnerIdentity(rec.runner_pid, rec.runner_started_at)
-            if identity != previous and runner_identity_alive(rec):
+            identity = rec.runner_identity
+            if (identity is not None and identity != previous
+                    and runner_liveness(rec) is ProcessLiveness.LIVE):
                 return identity
         time.sleep(0.05)
     rec = read_registry().get(name)
     if rec is None or rec.runner_pid is None:
         return None
-    identity = RunnerIdentity(rec.runner_pid, rec.runner_started_at)
-    return identity if identity != previous and runner_identity_alive(rec) else None
+    identity = rec.runner_identity
+    return (
+        identity
+        if identity is not None and identity != previous
+        and runner_liveness(rec) is ProcessLiveness.LIVE
+        else None
+    )
 
 
 def _pid_is_descendant(pid: int, ancestor: int) -> bool:
@@ -1932,21 +2114,36 @@ def break_runner_pane_to_window(rec: AgentRecord) -> Optional[str]:
 
 def terminate_runner_identity(identity: RunnerIdentity, grace: float = 2.0) -> bool:
     """Stop a matching process identity with a bounded graceful shutdown and kill fallback."""
-    if not pid_alive(identity.pid):
+    state = process_identity_liveness(identity)
+    if state is ProcessLiveness.DEAD:
         return False
-    current_start = pid_start_time(identity.pid)
-    if identity.started_at is not None and current_start != identity.started_at:
-        return False
+    if state is ProcessLiveness.UNKNOWN:
+        raise AgentOperationError(
+            "runner_liveness_unknown",
+            "cannot verify complete runner identity before teardown",
+        )
     try:
         os.kill(identity.pid, signal.SIGTERM)
     except ProcessLookupError:
         return False
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
-        if not pid_alive(identity.pid):
+        state = process_identity_liveness(identity)
+        if state is ProcessLiveness.DEAD:
             return True
+        if state is ProcessLiveness.UNKNOWN:
+            raise AgentOperationError(
+                "runner_liveness_unknown",
+                "runner identity became unobservable during teardown",
+            )
         time.sleep(0.1)
-    if pid_alive(identity.pid):
+    final_state = process_identity_liveness(identity)
+    if final_state is ProcessLiveness.UNKNOWN:
+        raise AgentOperationError(
+            "runner_liveness_unknown",
+            "runner identity became unobservable before forced teardown",
+        )
+    if final_state is ProcessLiveness.LIVE:
         try:
             os.kill(identity.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -1960,9 +2157,15 @@ def terminate_runner(rec: AgentRecord, grace: float = 2.0) -> bool:
     # stop observes the detached child before killing its runner.
     with _harness_lock(rec.name):
         harness_stopped = terminate_active_harness(rec)
-        if rec.runner_pid is None or not runner_identity_alive(rec):
+        state = runner_liveness(rec)
+        if state is ProcessLiveness.UNKNOWN:
+            raise AgentOperationError(
+                "runner_liveness_unknown",
+                "cannot verify runner identity before teardown",
+            )
+        if state is ProcessLiveness.DEAD or rec.runner_identity is None:
             return harness_stopped
-        return terminate_runner_identity(RunnerIdentity(rec.runner_pid, rec.runner_started_at), grace)
+        return terminate_runner_identity(rec.runner_identity, grace)
 
 
 # --------------------------------------------------------------------------- #
@@ -2060,15 +2263,17 @@ def gc() -> list[str]:
                         continue
                     if not exists:
                         process_liveness = (
-                            runner_identity_alive(rec) if rec.mode == HEADLESS_MODE else False
+                            runner_liveness(rec)
+                            if rec.mode == HEADLESS_MODE
+                            else ProcessLiveness.DEAD
                         )
-                        if process_liveness is None:
+                        if process_liveness is ProcessLiveness.UNKNOWN:
                             notes.append(
                                 f"{name} runner liveness is ambiguous while Herdr workspace "
                                 f"{workspace_id} is gone; preserving state"
                             )
                             continue
-                        if process_liveness:
+                        if process_liveness is ProcessLiveness.LIVE:
                             notes.append(
                                 f"{name} degraded: Herdr workspace {workspace_id} is gone but runner pid "
                                 f"{rec.runner_pid} remains alive; recover its presentation before sending work"
@@ -2108,14 +2313,14 @@ def gc() -> list[str]:
                 notes.append(f"reaped {name} (Herdr TUI pane is gone){tail}")
                 continue
             win = window_exists(rec)
-            runner_alive = runner_identity_alive(rec)
-            if runner_alive is None:
+            runner_state = runner_liveness(rec)
+            if runner_state is ProcessLiveness.UNKNOWN:
                 notes.append(
                     f"{name} runner pid {rec.runner_pid} liveness probe is ambiguous; "
                     "preserving state"
                 )
                 continue
-            if runner_alive:
+            if runner_state is ProcessLiveness.LIVE:
                 if not win:
                     notes.append(
                         f"{name} degraded: runner pid {rec.runner_pid} is alive but "
@@ -2178,6 +2383,7 @@ def _agent_status(rec: AgentRecord) -> AgentStatus:
             status=status,
             runner_pid=probe.pid,
             runner_started_at=None if probe.pid is None else pid_start_time(probe.pid),
+            runner_identity=None,
             next_seq=rec.next_seq,
             created_at=rec.created_at,
             last_turn_at=rec.last_turn_at,
@@ -2190,7 +2396,12 @@ def _agent_status(rec: AgentRecord) -> AgentStatus:
             mode=rec.mode,
             presentation_pane=rec.presentation_pane,
         )
-    runner_alive = runner_identity_alive(rec)
+    runner_state = runner_liveness(rec)
+    runner_alive = (
+        True if runner_state is ProcessLiveness.LIVE
+        else False if runner_state is ProcessLiveness.DEAD
+        else None
+    )
     win = window_exists(rec)
     return AgentStatus(
         name=rec.name,
@@ -2203,6 +2414,7 @@ def _agent_status(rec: AgentRecord) -> AgentStatus:
         status=rec.status,
         runner_pid=rec.runner_pid,
         runner_started_at=rec.runner_started_at,
+        runner_identity=rec.runner_identity,
         next_seq=rec.next_seq,
         created_at=rec.created_at,
         last_turn_at=rec.last_turn_at,
@@ -2397,7 +2609,8 @@ def _require_live_agent(name: str) -> AgentRecord:
                 f"TUI agent {valid_name!r} has no live Codex process in pane {rec.presentation_pane}",
             )
         return rec
-    if runner_identity_alive(rec):
+    state = runner_liveness(rec)
+    if state is ProcessLiveness.LIVE:
         return rec
     if rec.runner_pid is None and _within_startup_grace(rec) and window_exists(rec):
         return rec
@@ -2406,7 +2619,12 @@ def _require_live_agent(name: str) -> AgentRecord:
             "dead_runner",
             f"agent {valid_name!r} has no runner pid after startup grace",
         )
-    if not runner_identity_alive(rec):
+    if state is ProcessLiveness.UNKNOWN:
+        raise AgentOperationError(
+            "runner_liveness_unknown",
+            f"cannot prove exact runner identity for agent {valid_name!r}",
+        )
+    if state is ProcessLiveness.DEAD:
         raise AgentOperationError(
             "dead_runner",
             f"agent {valid_name!r} runner pid {rec.runner_pid} is not alive or was reused",
@@ -2919,13 +3137,23 @@ def bring_down_agent(
     rec = reg.get(valid_name)
     was_registered = rec is not None
     if rec is not None:
-        if rec.mode == HEADLESS_MODE:
+        if rec.mode == HEADLESS_MODE and (
+            rec.runner_identity is not None or rec.runner_pid is not None
+        ):
             stop_path(valid_name).write_text(now_iso() + "\n")
             deadline = time.monotonic() + grace
             while time.monotonic() < deadline:
                 cur = read_registry().get(valid_name)
-                if cur is None or not runner_identity_alive(cur):
+                if cur is None:
                     break
+                state = runner_liveness(cur)
+                if state is ProcessLiveness.DEAD:
+                    break
+                if state is ProcessLiveness.UNKNOWN:
+                    raise AgentOperationError(
+                        "runner_liveness_unknown",
+                        "cannot verify runner while waiting for graceful stop; state was preserved",
+                    )
                 time.sleep(0.2)
             cur = read_registry().get(valid_name)
             if cur is not None:
@@ -2986,7 +3214,7 @@ def _restore_legacy_tmux_runner(name: str, old: AgentRecord) -> RunnerIdentity:
         kill_window(old)
     target = launch_window("tmux", name, old.cwd, runner_wrapper(name))
     restored = wait_for_restarted_runner(
-        name, RunnerIdentity(old.runner_pid or -1, old.runner_started_at)
+        name, recorded_runner_identity(old, "restore legacy runner")
     )
     if restored is None:
         raise AgentOperationError(
@@ -3005,17 +3233,20 @@ def _restore_migration_record(
         current = agents.get(name)
         if current is None:
             raise AgentOperationError("migration_source_changed", "worker disappeared during migration rollback")
-        actual = (current.backend, current.tmux_target, current.runner_pid, current.runner_started_at)
-        source = (old.backend, old.tmux_target, old.runner_pid, old.runner_started_at)
+        actual = (
+            current.backend, current.tmux_target, current.runner_identity,
+        )
+        source = (old.backend, old.tmux_target, old.runner_identity)
         if actual == source:
             return False
-        expected = None if destination is None else (backend, target, destination.pid, destination.started_at)
+        expected = None if destination is None else (backend, target, destination)
         if actual != expected:
             raise AgentOperationError("migration_source_changed", "registry identity changed during migration rollback")
         current.backend = old.backend
         current.tmux_target = old.tmux_target
         current.runner_pid = old.runner_pid
         current.runner_started_at = old.runner_started_at
+        current.runner_identity = old.runner_identity
         # Preserve sequence allocation and other metadata written while activation waited.
         return True
 
@@ -3023,11 +3254,12 @@ def _restore_migration_record(
 def _migrate_legacy_tmux_source(name: str, old: AgentRecord, to_backend: str) -> MigrationResult:
     """Migrate a pre-pause-handshake tmux runner with restart-on-failure safety."""
     assert old.runner_pid is not None
-    old_identity = RunnerIdentity(old.runner_pid, old.runner_started_at)
+    old_identity = recorded_runner_identity(old, "migrate legacy runner")
     with registry_lock() as agents:
         current = agents.get(name)
-        if current is None or not runner_identity_alive(current):
+        if current is None:
             raise AgentOperationError("dead_runner", f"legacy source runner for {name!r} is no longer alive")
+        require_live_runner(current, "starting legacy runner migration")
         if current.status != "idle" or pending_count(name) > 0:
             raise AgentOperationError(
                 "agent_busy",
@@ -3037,7 +3269,7 @@ def _migrate_legacy_tmux_source(name: str, old: AgentRecord, to_backend: str) ->
             current.backend != old.backend
             or current.tmux_target != old.tmux_target
             or current.runner_pid != old_identity.pid
-            or current.runner_started_at != old_identity.started_at
+            or current.runner_started_at != str(old_identity.starttime_ticks)
         ):
             raise AgentOperationError(
                 "migration_source_changed",
@@ -3076,7 +3308,7 @@ def _migrate_legacy_tmux_source(name: str, old: AgentRecord, to_backend: str) ->
                 current.backend != old.backend
                 or current.tmux_target != old.tmux_target
                 or current.runner_pid != old_identity.pid
-                or current.runner_started_at != old_identity.started_at
+                or current.runner_started_at != str(old_identity.starttime_ticks)
             ):
                 raise AgentOperationError(
                     "migration_source_changed",
@@ -3085,7 +3317,8 @@ def _migrate_legacy_tmux_source(name: str, old: AgentRecord, to_backend: str) ->
             current.backend = to_backend
             current.tmux_target = new_target
             current.runner_pid = staged_identity.pid
-            current.runner_started_at = staged_identity.started_at
+            current.runner_started_at = str(staged_identity.starttime_ticks)
+            current.runner_identity = staged_identity
             staged_runner_activate_path(name, token).write_text(now_iso() + "\n")
             session_id = current.session_id
         if not wait_for_staged_runner_activation(name, token):
@@ -3217,12 +3450,14 @@ def _resume_source_intake(name: str, old: AgentRecord) -> None:
             f"source {old.backend} runner intake could not be resumed; pause marker(s) remain: "
             + ", ".join(remaining),
         )
-    if not runner_identity_alive(old):
+    try:
+        require_live_runner(old, "confirming migration rollback intake")
+    except AgentOperationError as exc:
         raise AgentOperationError(
             "migration_intake_resume_failed",
-            f"source {old.backend} runner pid {old.runner_pid} is not live after rollback; "
-            "cannot prove intake resumed",
-        )
+            f"source {old.backend} runner pid {old.runner_pid} is not provably live "
+            f"after rollback: {exc.message}",
+        ) from exc
 
 
 def _restore_headless_runner(name: str, old: AgentRecord) -> RunnerIdentity:
@@ -3231,7 +3466,7 @@ def _restore_headless_runner(name: str, old: AgentRecord) -> RunnerIdentity:
         kill_window(old)
     target = launch_window(old.backend, name, old.cwd, runner_wrapper(name))
     restored = wait_for_restarted_runner(
-        name, RunnerIdentity(old.runner_pid or -1, old.runner_started_at)
+        name, recorded_runner_identity(old, "restore headless runner")
     )
     if restored is None:
         raise AgentOperationError(
@@ -3301,11 +3536,12 @@ def _convert_headless_to_tui(name: str, old: AgentRecord) -> MigrationResult:
             "cannot convert a headless agent before it has recorded a Codex session id",
         )
     assert old.runner_pid is not None
-    old_identity = RunnerIdentity(old.runner_pid, old.runner_started_at)
+    old_identity = recorded_runner_identity(old, "convert headless runner")
     with registry_lock() as agents:
         current = agents.get(name)
-        if current is None or not runner_identity_alive(current):
+        if current is None:
             raise AgentOperationError("dead_runner", f"agent {name!r} runner stopped before conversion")
+        require_live_runner(current, "starting headless conversion")
         if current.status != "idle" or pending_count(name) > 0:
             raise AgentOperationError("agent_busy", f"agent {name!r} is busy or has queued work")
         write_migration_pause(name, old_identity)
@@ -3334,6 +3570,7 @@ def _convert_headless_to_tui(name: str, old: AgentRecord) -> MigrationResult:
             presentation_pane=pane_id,
             runner_pid=probe.pid,
             runner_started_at=None if probe.pid is None else pid_start_time(probe.pid),
+            runner_identity=None,
             status="idle",
         )
         _confirm_resumed_tui(destination)
@@ -3397,8 +3634,9 @@ def _convert_legacy_tmux_headless_to_tui(name: str, old: AgentRecord) -> Migrati
     assert old.runner_pid is not None
     with registry_lock() as agents:
         current = agents.get(name)
-        if current is None or not runner_identity_alive(current):
+        if current is None:
             raise AgentOperationError("dead_runner", f"legacy source runner for {name!r} is no longer alive")
+        require_live_runner(current, "starting legacy headless conversion")
         if current.status != "idle" or pending_count(name) > 0:
             raise AgentOperationError(
                 "agent_busy", f"legacy source {name!r} is no longer idle with an empty inbox"
@@ -3423,6 +3661,7 @@ def _convert_legacy_tmux_headless_to_tui(name: str, old: AgentRecord) -> Migrati
             presentation_pane=pane_id,
             runner_pid=probe.pid,
             runner_started_at=None if probe.pid is None else pid_start_time(probe.pid),
+            runner_identity=None,
             status="idle",
         )
         _confirm_resumed_tui(destination)
@@ -3510,14 +3749,15 @@ def migrate_agent(
 
     old_rec = dataclasses.replace(rec)
     assert old_rec.runner_pid is not None
-    old_identity = RunnerIdentity(old_rec.runner_pid, old_rec.runner_started_at)
+    old_identity = recorded_runner_identity(old_rec, "migrate runner")
     token = secrets.token_hex(16)
     with registry_lock() as agents:
         current = agents.get(valid_name)
-        if current is None or not runner_identity_alive(current):
+        if current is None:
             raise AgentOperationError(
                 "dead_runner", f"agent {valid_name!r} runner stopped before migration could begin"
             )
+        require_live_runner(current, "starting runner migration")
         if current.status != "idle" or pending_count(valid_name) > 0:
             raise AgentOperationError(
                 "agent_busy", f"agent {valid_name!r} became busy before migration could pause intake"
@@ -3553,16 +3793,22 @@ def migrate_agent(
             )
         with registry_lock() as agents:
             current = agents.get(valid_name)
-            if current is None or not runner_identity_alive(current):
+            if current is None:
                 raise AgentOperationError(
                     "migration_source_lost",
                     "source runner stopped before the destination could be committed",
                 )
+            try:
+                require_live_runner(current, "committing runner migration")
+            except AgentOperationError as live_error:
+                raise AgentOperationError(
+                    "migration_source_lost", live_error.message,
+                ) from live_error
             if (
                 current.backend != old_rec.backend
                 or current.tmux_target != old_rec.tmux_target
                 or current.runner_pid != old_identity.pid
-                or current.runner_started_at != old_identity.started_at
+                or current.runner_started_at != str(old_identity.starttime_ticks)
             ):
                 raise AgentOperationError(
                     "migration_source_changed",
@@ -3576,7 +3822,8 @@ def migrate_agent(
             current.backend = to_backend
             current.tmux_target = new_target
             current.runner_pid = staged_identity.pid
-            current.runner_started_at = staged_identity.started_at
+            current.runner_started_at = str(staged_identity.starttime_ticks)
+            current.runner_identity = staged_identity
             staged_runner_activate_path(valid_name, token).write_text(now_iso() + "\n")
             session_id = current.session_id
         if not wait_for_staged_runner_activation(valid_name, token):
@@ -3600,7 +3847,7 @@ def migrate_agent(
                 "migration_rollback_failed", f"destination failed ({exc}); source registry restoration failed: {restore_exc}; intake remains paused"
             ) from exc
         clear_migration_markers(valid_name, token)
-        source_state = "alive" if runner_identity_alive(old_rec) else "not alive"
+        source_state = runner_liveness(old_rec).value
         if rollback_errors:
             raise AgentOperationError(
                 "migration_rollback_failed",
@@ -3654,11 +3901,7 @@ def recreate_window(name: str) -> RecreateWindowResult:
             "tui_recreate_unsupported",
             "recreating an interactive TUI would lose its visible conversation; inspect or restore its Herdr tab manually",
         )
-    if not runner_identity_alive(rec):
-        raise AgentOperationError(
-            "dead_runner",
-            f"agent {valid_name!r} runner pid {rec.runner_pid} is not alive or was reused",
-        )
+    require_live_runner(rec, "recreating the runner presentation")
     if window_exists(rec):
         return RecreateWindowResult(
             name=valid_name,

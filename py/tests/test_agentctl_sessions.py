@@ -14,13 +14,31 @@ from typing import cast
 import pytest
 
 from agentctl import cli, mcp, worker_rpc
-from agentctl.client import HerdrClient, Pane
+from agentctl.client import CustomProcessIdentity, HerdrClient, Pane
 from agentctl.errors import AgentDeliveryError
 from agentctl.foreign import lib as worker_lib
 from agentctl.profiles import validate_muse_headless_arguments
 from agentctl.sessions import Sessions, WorkerRpcError
 from agentctl.subagents import AgentRecord
 from .test_herdr_subagents import FakeManagedClient
+
+
+RUNNER_IDENTITY = CustomProcessIdentity(
+    version=1,
+    boot_id="11111111-2222-3333-4444-555555555555",
+    pid=4242,
+    starttime_ticks=9001,
+    executable_device=3,
+    executable_inode=4,
+)
+RUNNER_IDENTITY_JSON = {
+    "version": RUNNER_IDENTITY.version,
+    "boot_id": RUNNER_IDENTITY.boot_id,
+    "pid": RUNNER_IDENTITY.pid,
+    "starttime_ticks": RUNNER_IDENTITY.starttime_ticks,
+    "executable_device": RUNNER_IDENTITY.executable_device,
+    "executable_inode": RUNNER_IDENTITY.executable_inode,
+}
 
 
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, FakeManagedClient, list[str]]:
@@ -35,6 +53,7 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, Fa
         # response can precede publication of the child PID/starttime.
         identity: dict[str, object] = {} if action == "start" else {
             "runner_pid": 4242, "runner_started_at": "9001",
+            "runner_identity": RUNNER_IDENTITY_JSON,
         }
         if action == "status":
             descriptor = os.open(sessions.registry / f".{record.name}.lock", os.O_RDONLY)
@@ -456,6 +475,7 @@ def test_headless_health_requires_identity_bound_typed_liveness(
     sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
     saved = replace(
         sessions.get("worker"), runner_pid=4242, runner_started_at="9001",
+        runner_identity=RUNNER_IDENTITY,
     )
     sessions._save(saved)
 
@@ -463,6 +483,7 @@ def test_headless_health_requires_identity_bound_typed_liveness(
         assert record.token == saved.token and action == "status"
         identity = {
             "name": record.name, "runner_pid": 4242, "runner_started_at": "9001",
+            "runner_identity": RUNNER_IDENTITY_JSON,
         }
         return {
             "record": {**identity, "session_id": "native-thread"},
@@ -499,7 +520,7 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
         name="worker", harness="codex", backend="tmux",
         tmux_target="workers:worker", cwd=str(tmp_path), model=None,
         session_id="native-thread", status="idle", runner_pid=4242,
-        runner_started_at="9001", next_seq=0,
+        runner_started_at="9001", runner_identity=RUNNER_IDENTITY, next_seq=0,
         created_at="2026-09-24T00:00:00+00:00", last_turn_at=None,
     )
     monkeypatch.setattr(worker_lib, "read_registry", lambda: {"worker": inner})
@@ -514,6 +535,12 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
         return process_observation
 
     monkeypatch.setattr(worker_lib, "_read_process_state_start", read_process)
+    if not isinstance(process_observation, BaseException) and process_observation[0] not in ("Z", "X", "x"):
+        monkeypatch.setattr(
+            worker_lib.SharedHerdrClient,
+            "_process_identity",
+            staticmethod(lambda _pid: (RUNNER_IDENTITY, RUNNER_IDENTITY.pid)),
+        )
 
     def dispatch(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
         assert record.name == "worker" and action == "status"
@@ -566,8 +593,10 @@ def test_headless_boolean_pid_cannot_match_saved_runner_one(
 ) -> None:
     sessions, _, _ = setup(tmp_path, monkeypatch)
     sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    saved_identity = replace(RUNNER_IDENTITY, pid=1)
     saved = replace(
         sessions.get("worker"), runner_pid=1, runner_started_at="9001",
+        runner_identity=saved_identity,
     )
     sessions._save(saved)
 

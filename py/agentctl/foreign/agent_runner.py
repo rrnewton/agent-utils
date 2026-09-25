@@ -131,8 +131,8 @@ def _spawn_harness(name: str, argv: list[str], cwd: str, *, stdin: bool = False)
                                 text=True, start_new_session=True)
         try:
             lib.record_active_harness(name,
-                lib.RunnerIdentity(os.getpid(), lib.pid_start_time(os.getpid())),
-                lib.RunnerIdentity(proc.pid, lib.pid_start_time(proc.pid)))
+                lib.capture_process_identity(os.getpid()),
+                lib.capture_process_identity(proc.pid))
         except BaseException:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -202,18 +202,17 @@ def _record_session_id(name: str, session_id: str) -> None:
 
 def _record_runner_pid(name: str, stage_token: Optional[str] = None) -> None:
     pid = os.getpid()
-    started_at = lib.pid_start_time(pid)
-    identity = lib.RunnerIdentity(pid=pid, started_at=started_at)
+    identity = lib.capture_process_identity(pid)
     if stage_token is not None:
         lib.write_staged_runner(name, stage_token, identity)
         return
-    lib.runner_pid_path(name).write_text(f"{pid}\n")
     with lib.registry_lock() as agents:
         rec = agents.get(name)
         if rec is None:
             lib.die(f"runner started for unknown agent {name!r} (no registry row)")
         rec.runner_pid = pid
-        rec.runner_started_at = started_at
+        rec.runner_started_at = str(identity.starttime_ticks)
+        rec.runner_identity = identity
         rec.status = "idle"
 
 
@@ -857,7 +856,7 @@ def main() -> int:
     if stage_token is None:
         old = lib.read_registry().get(name)
         if old is not None and old.runner_pid is not None:
-            if (lib.runner_identity_alive(old) is not False
+            if (lib.runner_liveness(old) is not lib.ProcessLiveness.DEAD
                     and old.runner_pid != os.getpid()):
                 lib.die(f"worker {name!r} already has a live or unverified runner")
             lib.terminate_active_harness(old)
@@ -884,7 +883,7 @@ def main() -> int:
             break
         if stage_token is None and lib.migration_pause_path(name).exists():
             lib.acknowledge_migration_pause(
-                name, lib.RunnerIdentity(pid=os.getpid(), started_at=lib.pid_start_time(os.getpid()))
+                name, lib.capture_process_identity(os.getpid())
             )
             time.sleep(0.05)
             continue
