@@ -26,6 +26,7 @@ from agentctl.client import (
     muse_prompt_is_exact_composer,
     muse_prompt_transcript_count,
     muse_startup_metadata,
+    muse_verified_process_idle_composer,
 )
 from agentctl.errors import HerdrUnavailable
 import pytest
@@ -319,6 +320,16 @@ def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     assert not muse_prompt_in_composer(collapsed, long_prompt)
     assert not muse_prompt_in_composer(deceptive, long_prompt)
     assert not muse_prompt_in_transcript(prefixed, long_prompt)
+
+
+def test_headerless_muse_composer_requires_verified_process_context() -> None:
+    screen = (
+        "old transcript after the version header scrolled away\n"
+        "────────────────\n❯\n────────────────\n"
+        "kiki · xhigh · /work/project · YOLO\n"
+    )
+    assert not muse_idle_composer(screen)
+    assert muse_verified_process_idle_composer(screen)
 
 
 def test_custom_muse_launch_never_accepts_a_trust_prompt() -> None:

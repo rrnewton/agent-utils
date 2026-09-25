@@ -749,6 +749,24 @@ def test_custom_process_identity_outweighs_a_missing_native_agent_label(
     assert status["probe_error"] is None
 
 
+def test_headerless_muse_idle_requires_matching_terminal_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    screen = (
+        "old transcript after the version header scrolled away\n"
+        "────────────────\n❯\n────────────────\n"
+        "kiki · xhigh · /work · YOLO\n"
+    )
+    monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen)
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
+    assert manager.status("worker")["agent_status"] == "idle"
+
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="working")
+    assert manager.status("worker")["agent_status"] == "working"
+
+
 def test_status_does_not_call_claude_idle_while_background_agent_is_working(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

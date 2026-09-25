@@ -32,6 +32,7 @@ from agentctl.client import (
     PaneShellProof,
     claude_active_screen,
     muse_idle_composer,
+    muse_verified_process_idle_composer,
     muse_prompt_in_composer,
     muse_prompt_in_transcript,
     muse_prompt_is_exact_composer,
@@ -872,6 +873,7 @@ class _WorkspaceClient:
                             session_value=info.session_value,
                         )
             if self.record.adapter == "herdr-pane":
+                reported_status = info.status
                 if self.deadline is not None and isinstance(self.client, HerdrClient):
                     self.client.verify_custom_harness(
                         pane_id, self.record.harness,
@@ -900,7 +902,17 @@ class _WorkspaceClient:
                     # the ownership proof and can safely bridge a delayed or
                     # lost report-agent update.
                     agent=self.record.harness,
-                    status="idle" if muse_idle_composer(screen) else "working",
+                    status=(
+                        "idle"
+                        if (
+                            muse_idle_composer(screen)
+                            or (
+                                reported_status in ("idle", "done")
+                                and muse_verified_process_idle_composer(screen)
+                            )
+                        )
+                        else "working"
+                    ),
                     session_agent=info.session_agent,
                     session_value=info.session_value,
                 )

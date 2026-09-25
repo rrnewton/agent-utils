@@ -649,7 +649,13 @@ pub(crate) fn muse_trust_prompt(screen: &str) -> bool {
 }
 
 pub(crate) fn muse_idle_composer(screen: &str) -> bool {
-    muse_composer_regions(screen).is_some_and(|(_, composer)| matches!(composer.trim(), "❯" | "›"))
+    muse_composer_regions(screen, true)
+        .is_some_and(|(_, composer)| matches!(composer.trim(), "❯" | "›"))
+}
+
+pub(crate) fn muse_verified_process_idle_composer(screen: &str) -> bool {
+    muse_composer_regions(screen, false)
+        .is_some_and(|(_, composer)| matches!(composer.trim(), "❯" | "›"))
 }
 
 fn muse_marked_prompt_count(screen: &str, text: &str) -> usize {
@@ -678,7 +684,7 @@ fn muse_marked_prompt_count(screen: &str, text: &str) -> usize {
         .sum()
 }
 
-fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
+fn muse_composer_regions(screen: &str, require_header: bool) -> Option<(String, String)> {
     let lines = screen.lines().collect::<Vec<_>>();
     let dividers = lines
         .iter()
@@ -701,7 +707,7 @@ fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
             (!line.trim().is_empty()).then(|| line.split('·').map(str::trim).collect::<Vec<_>>())
         })
         .unwrap_or_default();
-    let current_footer = lines[..top].iter().any(|line| {
+    let versioned_header = lines[..top].iter().any(|line| {
         line.trim()
             .strip_prefix("Muse Code ")
             .is_some_and(|version| {
@@ -711,7 +717,9 @@ fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
                         !piece.is_empty() && piece.bytes().all(|byte| byte.is_ascii_digit())
                     })
             })
-    }) && matches!(status_fields.len(), 3 | 4)
+    });
+    let current_footer = (!require_header || versioned_header)
+        && matches!(status_fields.len(), 3 | 4)
         && status_fields.iter().all(|field| !field.is_empty())
         && muse_effort(status_fields[1])
         && (status_fields.len() == 3 || matches!(status_fields[3], "YOLO" | "Auto-review"));
@@ -723,7 +731,7 @@ fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
 
 pub(crate) fn muse_prompt_in_composer(screen: &str, text: &str) -> bool {
     let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    muse_composer_regions(screen).is_some_and(|(_, composer)| {
+    muse_composer_regions(screen, true).is_some_and(|(_, composer)| {
         let rendered = composer.split_whitespace().collect::<Vec<_>>().join(" ");
         !wanted.is_empty()
             && ["❯", "›"].iter().any(|marker| {
@@ -735,19 +743,19 @@ pub(crate) fn muse_prompt_in_composer(screen: &str, text: &str) -> bool {
 
 pub(crate) fn muse_prompt_is_exact_composer(screen: &str, text: &str) -> bool {
     let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    muse_composer_regions(screen).is_some_and(|(_, composer)| {
+    muse_composer_regions(screen, true).is_some_and(|(_, composer)| {
         let rendered = composer.split_whitespace().collect::<Vec<_>>().join(" ");
         !wanted.is_empty() && [format!("❯ {wanted}"), format!("› {wanted}")].contains(&rendered)
     })
 }
 
 pub(crate) fn muse_prompt_in_transcript(screen: &str, text: &str) -> bool {
-    muse_composer_regions(screen)
+    muse_composer_regions(screen, true)
         .is_some_and(|(transcript, _)| muse_marked_prompt_count(&transcript, text) > 0)
 }
 
 pub(crate) fn muse_prompt_transcript_count(screen: &str, text: &str) -> usize {
-    let Some((transcript, _)) = muse_composer_regions(screen) else {
+    let Some((transcript, _)) = muse_composer_regions(screen, true) else {
         return 0;
     };
     muse_marked_prompt_count(&transcript, text)
@@ -2654,6 +2662,15 @@ mod tests {
         assert!(!muse_prompt_in_transcript(&prefixed, &long_prompt));
         let assistant_echo = format!("{header}◆ {long_prompt}\n{divider}❯\n{divider}{footer}");
         assert!(!muse_prompt_in_transcript(&assistant_echo, &long_prompt));
+    }
+
+    #[test]
+    fn headerless_muse_composer_requires_verified_process_context() {
+        let screen = "old transcript after the version header scrolled away\n\
+                      ────────────────\n❯\n────────────────\n\
+                      kiki · xhigh · /work/project · YOLO\n";
+        assert!(!muse_idle_composer(screen));
+        assert!(muse_verified_process_idle_composer(screen));
     }
 
     #[test]

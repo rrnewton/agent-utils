@@ -24,8 +24,8 @@ use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target
 use crate::client::{
     claude_active_screen, muse_idle_composer, muse_prompt_in_composer, muse_prompt_in_transcript,
     muse_prompt_is_exact_composer, muse_prompt_transcript_count, muse_startup_metadata,
-    muse_trust_prompt, AgentPaneInfo, CustomLaunchObservation, CustomProcessIdentity, HerdrClient,
-    Pane, PaneShellProof,
+    muse_trust_prompt, muse_verified_process_idle_composer, AgentPaneInfo, CustomLaunchObservation,
+    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 };
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
@@ -1841,6 +1841,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 }
             }
             if self.record.adapter == "herdr-pane" {
+                let reported_status = info.status.clone();
                 self.client.verify_custom_harness_with_runtime(
                     pane_id,
                     &self.record.harness,
@@ -1858,7 +1859,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 // The exact custom-process proof is authoritative even when
                 // Herdr's advisory agent label has not been published yet.
                 info.agent = Some(self.record.harness.clone());
-                info.status = if muse_idle_composer(&screen) {
+                info.status = if muse_idle_composer(&screen)
+                    || (matches!(reported_status.as_str(), "idle" | "done")
+                        && muse_verified_process_idle_composer(&screen))
+                {
                     "idle".to_owned()
                 } else {
                     "working".to_owned()
@@ -5988,6 +5992,7 @@ mod tests {
                     fail_custom_verify_once: AtomicBool::new(false),
                     custom_verify_calls: AtomicU64::new(0),
                     custom_ready: AtomicBool::new(true),
+                    custom_native_working: AtomicBool::new(false),
                     custom_screen: Mutex::new(None),
                     custom_at_idle_shell: AtomicBool::new(true),
                     claude_background: AtomicBool::new(false),
@@ -6128,6 +6133,7 @@ mod tests {
         fail_custom_verify_once: AtomicBool,
         custom_verify_calls: AtomicU64,
         custom_ready: AtomicBool,
+        custom_native_working: AtomicBool,
         custom_screen: Mutex<Option<String>>,
         custom_at_idle_shell: AtomicBool,
         claude_background: AtomicBool,
@@ -6247,7 +6253,12 @@ mod tests {
                     .started
                     .load(Ordering::Relaxed)
                     .then(|| kind.to_owned()),
-                status: "idle".to_owned(),
+                status: if self.custom_native_working.load(Ordering::Relaxed) {
+                    "working"
+                } else {
+                    "idle"
+                }
+                .to_owned(),
                 session_agent: report_session.then(|| kind.to_owned()),
                 session_value: report_session.then(|| {
                     if changed_after_save {
@@ -7023,6 +7034,38 @@ mod tests {
         assert_eq!(status["agent"], "muse", "{status}");
         assert_eq!(status["agent_status"], "idle");
         assert!(status["probe_error"].is_null());
+    }
+
+    #[test]
+    fn headerless_muse_idle_requires_matching_terminal_status() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        *fixture.client.custom_screen.lock().unwrap() = Some(
+            "old transcript after the version header scrolled away\n\
+             ────────────────\n❯\n────────────────\n\
+             kiki · xhigh · /work · YOLO\n"
+                .to_owned(),
+        );
+        assert_eq!(manager.status("worker").unwrap()["agent_status"], "idle");
+
+        fixture
+            .client
+            .custom_native_working
+            .store(true, Ordering::Relaxed);
+        assert_eq!(
+            manager.status("worker").unwrap()["agent_status"],
+            "working"
+        );
     }
 
     #[test]

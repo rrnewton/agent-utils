@@ -110,11 +110,25 @@ def muse_trust_prompt(screen: str) -> bool:
 
 def muse_idle_composer(screen: str) -> bool:
     """Recognize Muse's idle composer without mistaking a choice prompt for it."""
-    regions = _muse_composer_regions(screen)
+    regions = _muse_composer_regions(screen, require_header=True)
     return regions is not None and regions[1].strip() in ("❯", "›")
 
 
-def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
+def muse_verified_process_idle_composer(screen: str) -> bool:
+    """Recognize an idle editor after the caller proves this is the live Muse process.
+
+    A long-running session eventually scrolls its version header out of the visible
+    viewport.  This narrower fallback still requires Muse's ruled editor and valid
+    status footer; callers must additionally require an exact custom-process proof
+    and Herdr's terminal ``idle``/``done`` observation.
+    """
+    regions = _muse_composer_regions(screen, require_header=False)
+    return regions is not None and regions[1].strip() in ("❯", "›")
+
+
+def _muse_composer_regions(
+    screen: str, *, require_header: bool = True,
+) -> tuple[str, str] | None:
     """Split transcript/composer using Muse's ruled editor and status footer."""
     lines = screen.splitlines()
     dividers = [
@@ -127,9 +141,12 @@ def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
     footer = lines[bottom + 1:]
     current_status = next((line.strip() for line in footer if line.strip()), "")
     status_fields = [field.strip() for field in current_status.split("·")]
+    versioned_header = any(
+        re.fullmatch(r"Muse Code [0-9]+\.[0-9]+\.[0-9]+", line.strip())
+        for line in lines[:top]
+    )
     current_footer = (
-        any(re.fullmatch(r"Muse Code [0-9]+\.[0-9]+\.[0-9]+", line.strip())
-            for line in lines[:top])
+        (versioned_header or not require_header)
         and len(status_fields) in (3, 4)
         and all(status_fields)
         and _MUSE_EFFORT.fullmatch(status_fields[1]) is not None
