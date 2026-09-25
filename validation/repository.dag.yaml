@@ -19,9 +19,10 @@ steps:
     hint:
       est_duration_s: 1
       classification: light
-      # The observed successful peak is 150.55 MiB. A 160 MiB authored floor yields a 200 MiB
-      # runtime cap, retaining useful headroom even before the local profile store is populated.
-      rss_baseline_bytes: 167772160
+      # The inventory grew to 185 component tests and touched the former 200 MiB runtime ceiling,
+      # recording memory.events.max despite passing. A 256 MiB authored floor yields a 320 MiB cap
+      # so future measurements remain uncensored while the hygiene check stays tightly bounded.
+      rss_baseline_bytes: 268435456
 
   - group: hygiene
     job: pytest-sharder
