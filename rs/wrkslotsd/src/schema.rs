@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-use chrono::{Datelike, NaiveDate, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
 use serde_json::{Map, Value};
 
 use crate::canonical::canonical_sha256;
@@ -671,36 +671,94 @@ fn historical_task_and_purpose(
 }
 
 pub(crate) fn parse_timestamp(value: &str, label: &str) -> Result<(), ObserverError> {
-    if python_aware_iso_timestamp(value) {
-        Ok(())
-    } else {
-        Err(invalid(format!(
-            "invalid or timezone-naive timestamp in {label}"
-        )))
-    }
+    parse_timestamp_instant(value, label).map(|_| ())
+}
+
+/// Parse a timestamp accepted by [`parse_timestamp`] into the UTC instant that
+/// CPython's `datetime.fromisoformat` assigns to it, so ages are computed from
+/// exactly the strings that replay admits.
+pub(crate) fn parse_timestamp_instant(
+    value: &str,
+    label: &str,
+) -> Result<DateTime<Utc>, ObserverError> {
+    python_aware_iso_instant(value)
+        .ok_or_else(|| invalid(format!("invalid or timezone-naive timestamp in {label}")))
 }
 
 /// Validate the supported `datetime.fromisoformat` grammar explicitly instead
 /// of composing Chrono format strings. In particular, Chrono's permissive
 /// `%#z` accepts lowercase `z` and malformed short offsets that CPython rejects.
-fn python_aware_iso_timestamp(value: &str) -> bool {
-    let Some(date_length) = python_iso_date_length(value) else {
-        return false;
-    };
-    let Some(separator) = value
+/// Values are extracted only after the grammar accepts the string.
+fn python_aware_iso_instant(value: &str) -> Option<DateTime<Utc>> {
+    let date_length = python_iso_date_length(value)?;
+    let separator = value
         .get(date_length..)
-        .and_then(|tail| tail.chars().next())
-    else {
-        return false;
+        .and_then(|tail| tail.chars().next())?;
+    let time_and_zone = value.get(date_length + separator.len_utf8()..)?;
+    let zone_start = time_and_zone.find(['+', '-', 'Z'])?;
+    let (time, zone) = time_and_zone.split_at(zone_start);
+    if !(valid_iso_time(time) && valid_iso_offset(zone)) {
+        return None;
+    }
+    let date = python_iso_date(value.get(..date_length)?)?;
+    let (hour, minute, second, microsecond) = python_clock_value(time.as_bytes())?;
+    let offset_microseconds = if zone == "Z" {
+        0
+    } else if let Some(body) = zone.strip_prefix('-') {
+        -python_offset_microseconds(body)?
+    } else {
+        python_offset_microseconds(zone.strip_prefix('+')?)?
     };
-    let separator_end = date_length + separator.len_utf8();
-    let Some(time_and_zone) = value.get(separator_end..) else {
-        return false;
-    };
-    let Some(zone_start) = time_and_zone.find(['+', '-', 'Z']) else {
-        return false;
-    };
-    valid_iso_time(&time_and_zone[..zone_start]) && valid_iso_offset(&time_and_zone[zone_start..])
+    let local = date.and_hms_micro_opt(hour, minute, second, microsecond)?;
+    Some(
+        local
+            .checked_sub_signed(Duration::microseconds(offset_microseconds))?
+            .and_utc(),
+    )
+}
+
+fn python_offset_microseconds(body: &str) -> Option<i64> {
+    let (hours, minutes, seconds, microseconds) = python_clock_value(body.as_bytes())?;
+    Some(
+        (i64::from(hours) * 3_600 + i64::from(minutes) * 60 + i64::from(seconds)) * 1_000_000
+            + i64::from(microseconds),
+    )
+}
+
+/// Mirror the value assignment of CPython's `parse_hh_mm_ss_ff` for a clock the
+/// grammar has already accepted: a component followed by one final character
+/// ends the clock with no fraction, and a fraction keeps its first six digits.
+fn python_clock_value(value: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    let mut components = [0_u32; 3];
+    let mut position = 0;
+    let mut has_separator = true;
+    for (index, component) in components.iter_mut().enumerate() {
+        *component = ascii_decimal(value.get(position..position + 2)?)?;
+        position += 2;
+        let separator = value.get(position).copied();
+        position += 1;
+        if index == 0 {
+            has_separator = separator == Some(b':');
+        }
+        if position >= value.len() {
+            return Some((components[0], components[1], components[2], 0));
+        }
+        match separator {
+            Some(b':') if has_separator => {}
+            Some(b'.' | b',') => break,
+            _ if !has_separator => position -= 1,
+            _ => return None,
+        }
+    }
+    let digits = value.len().checked_sub(position)?.min(6);
+    let fraction = ascii_decimal(value.get(position..position + digits)?)?;
+    let scale = 10_u32.pow(u32::try_from(6 - digits).ok()?);
+    Some((
+        components[0],
+        components[1],
+        components[2],
+        fraction * scale,
+    ))
 }
 
 fn python_iso_date_length(value: &str) -> Option<usize> {
@@ -746,72 +804,56 @@ fn python_iso_date_length(value: &str) -> Option<usize> {
     if !value.is_char_boundary(length) {
         return None;
     }
-    valid_python_iso_date(value.get(..length)?).then_some(length)
+    python_iso_date(value.get(..length)?).map(|_| length)
 }
 
-fn valid_python_iso_date(value: &str) -> bool {
+fn python_iso_date(value: &str) -> Option<NaiveDate> {
     let bytes = value.as_bytes();
-    let Some(year) = bytes.get(..4).and_then(ascii_decimal) else {
-        return false;
-    };
+    let year = bytes.get(..4).and_then(ascii_decimal)?;
     if year == 0 {
-        return false;
+        return None;
     }
 
     if bytes.get(4) == Some(&b'-') && bytes.get(5) == Some(&b'W') {
-        let Some(week) = bytes.get(6..8).and_then(ascii_decimal) else {
-            return false;
-        };
+        let week = bytes.get(6..8).and_then(ascii_decimal)?;
         let weekday = if bytes.get(8) == Some(&b'-') {
-            let Some(weekday) = bytes.get(9..10).and_then(ascii_decimal) else {
-                return false;
-            };
-            weekday
+            bytes.get(9..10).and_then(ascii_decimal)?
         } else {
             1
         };
-        matches!(bytes.len(), 8 | 10) && valid_iso_week_date(year, week, weekday)
+        if !matches!(bytes.len(), 8 | 10) {
+            return None;
+        }
+        iso_week_date(year, week, weekday)
     } else if bytes.get(4) == Some(&b'W') {
-        let Some(week) = bytes.get(5..7).and_then(ascii_decimal) else {
-            return false;
-        };
+        let week = bytes.get(5..7).and_then(ascii_decimal)?;
         let (length, weekday) = if bytes.get(7).is_some_and(u8::is_ascii_digit) {
-            let Some(weekday) = bytes.get(7..8).and_then(ascii_decimal) else {
-                return false;
-            };
-            (8, weekday)
+            (8, bytes.get(7..8).and_then(ascii_decimal)?)
         } else {
             (7, 1)
         };
-        bytes.len() == length && valid_iso_week_date(year, week, weekday)
+        if bytes.len() != length {
+            return None;
+        }
+        iso_week_date(year, week, weekday)
     } else if bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-') {
-        let Some(month) = bytes.get(5..7).and_then(ascii_decimal) else {
-            return false;
-        };
-        let Some(day) = bytes.get(8..10).and_then(ascii_decimal) else {
-            return false;
-        };
-        bytes.len() == 10
-            && i32::try_from(year)
-                .ok()
-                .and_then(|year| NaiveDate::from_ymd_opt(year, month, day))
-                .is_some()
+        let month = bytes.get(5..7).and_then(ascii_decimal)?;
+        let day = bytes.get(8..10).and_then(ascii_decimal)?;
+        if bytes.len() != 10 {
+            return None;
+        }
+        NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month, day)
     } else {
-        let Some(month) = bytes.get(4..6).and_then(ascii_decimal) else {
-            return false;
-        };
-        let Some(day) = bytes.get(6..8).and_then(ascii_decimal) else {
-            return false;
-        };
-        bytes.len() == 8
-            && i32::try_from(year)
-                .ok()
-                .and_then(|year| NaiveDate::from_ymd_opt(year, month, day))
-                .is_some()
+        let month = bytes.get(4..6).and_then(ascii_decimal)?;
+        let day = bytes.get(6..8).and_then(ascii_decimal)?;
+        if bytes.len() != 8 {
+            return None;
+        }
+        NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month, day)
     }
 }
 
-fn valid_iso_week_date(year: u32, week: u32, weekday: u32) -> bool {
+fn iso_week_date(year: u32, week: u32, weekday: u32) -> Option<NaiveDate> {
     let weekday = match weekday {
         1 => Weekday::Mon,
         2 => Weekday::Tue,
@@ -820,12 +862,10 @@ fn valid_iso_week_date(year: u32, week: u32, weekday: u32) -> bool {
         5 => Weekday::Fri,
         6 => Weekday::Sat,
         7 => Weekday::Sun,
-        _ => return false,
+        _ => return None,
     };
-    i32::try_from(year)
-        .ok()
-        .and_then(|year| NaiveDate::from_isoywd_opt(year, week, weekday))
-        .is_some_and(|date| (1..=9_999).contains(&date.year()))
+    NaiveDate::from_isoywd_opt(i32::try_from(year).ok()?, week, weekday)
+        .filter(|date| (1..=9_999).contains(&date.year()))
 }
 
 fn valid_iso_time(value: &str) -> bool {
@@ -1054,7 +1094,7 @@ fn nullable_string(value: Option<&Value>, label: &str) -> Result<String, Observe
     }
 }
 
-fn exact_keys(
+pub(crate) fn exact_keys(
     value: &Map<String, Value>,
     required: &[&str],
     label: &str,
@@ -1062,7 +1102,7 @@ fn exact_keys(
     exact_keys_optional(value, required, &[], label)
 }
 
-fn exact_keys_optional(
+pub(crate) fn exact_keys_optional(
     value: &Map<String, Value>,
     required: &[&str],
     optional: &[&str],
