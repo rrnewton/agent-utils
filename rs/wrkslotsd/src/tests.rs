@@ -250,16 +250,7 @@ fn import_log(directory: &Path, active: Vec<Value>, archive: Vec<Value>) -> Stri
     )
 }
 
-fn python_replay(events: &Path) -> std::process::Output {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("repository root");
-    let project = events
-        .parent()
-        .and_then(Path::parent)
-        .expect("fixture project root");
-    let script = r#"
+const PYTHON_EVENT_ORACLE_PRELUDE: &str = r#"
 import json
 import sys
 from pathlib import Path
@@ -278,6 +269,30 @@ config = w.Config(
     liveness_command=Path('/bin/true'),
     layout='nested',
 )
+"#;
+
+fn python_event_oracle(events: &Path, body: &str) -> std::process::Output {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repository root");
+    let project = events
+        .parent()
+        .and_then(Path::parent)
+        .expect("fixture project root");
+    Command::new("python3")
+        .arg("-c")
+        .arg(format!("{PYTHON_EVENT_ORACLE_PRELUDE}{body}"))
+        .arg(repository.join("py"))
+        .arg(project)
+        .output()
+        .expect("run Python differential oracle")
+}
+
+fn python_replay(events: &Path) -> std::process::Output {
+    python_event_oracle(
+        events,
+        r#"
 active, archive = w._states_from_events(config, 'node-a', require_repository=False)
 events = w._load_events(config, 'node-a')
 print(json.dumps({
@@ -289,14 +304,28 @@ print(json.dumps({
     'archive_revision': archive.revision,
     'archive_records': w._archive_to_obj(archive)['records'],
 }, sort_keys=True, separators=(',', ':')))
-"#;
-    Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .arg(repository.join("py"))
-        .arg(project)
-        .output()
-        .expect("run Python differential oracle")
+"#,
+    )
+}
+
+/// Python's pending-journal view: journal path name to `(slot, kind)`.
+fn python_pending_journals(events: &Path) -> Value {
+    let output = python_event_oracle(
+        events,
+        r#"
+pending = w._pending_operations_from_events(config, 'node-a')
+print(json.dumps({
+    path.name: [journal.get('slot'), journal.get('kind')]
+    for path, journal in pending.items()
+}, sort_keys=True))
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "Python pending-journal oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse Python pending journals")
 }
 
 fn python_synthetic_audit_verdict(events: &Path) -> std::process::Output {
@@ -730,6 +759,51 @@ print(json.dumps({
             .expect("Python canonical digest")
             .to_owned(),
     )
+}
+
+fn python_timestamp_instants(values: &[String]) -> Vec<i64> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repository root");
+    let script = r#"
+import datetime as dt
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+from wrkslots import cli as w
+epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+print(json.dumps([
+    (w._parse_timestamp(value, 'Rust differential fixture') - epoch)
+    // dt.timedelta(microseconds=1)
+    for value in json.load(sys.stdin)
+], separators=(',', ':')))
+"#;
+    let encoded = serde_json::to_string(values).expect("encode timestamp instants");
+    let mut child = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(repository.join("py"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start Python timestamp instant oracle");
+    child
+        .stdin
+        .take()
+        .expect("Python timestamp instant oracle stdin")
+        .write_all(encoded.as_bytes())
+        .expect("write Python timestamp instants");
+    let output = child
+        .wait_with_output()
+        .expect("wait for Python timestamp instant oracle");
+    assert!(
+        output.status.success(),
+        "Python timestamp instant oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("decode Python timestamp instants")
 }
 
 fn python_timestamp_acceptance(values: &[String]) -> Vec<bool> {
@@ -1226,8 +1300,9 @@ fn event_timestamps_require_an_iso_timezone() {
         .contains("timezone-naive"));
 }
 
-#[test]
-fn timestamp_parser_matches_python_generated_matrix() {
+/// Return the generated timestamp matrix: every value Python accepts, then
+/// every value it rejects, with the number of accepted values.
+fn python_timestamp_matrix() -> (usize, Vec<String>) {
     let dates = [
         "2026-09-22",
         "20260922",
@@ -1364,7 +1439,15 @@ fn timestamp_parser_matches_python_generated_matrix() {
     assert!(accepted.is_disjoint(&rejected));
 
     let accepted_count = accepted.len();
-    let values = accepted.into_iter().chain(rejected).collect::<Vec<_>>();
+    (
+        accepted_count,
+        accepted.into_iter().chain(rejected).collect::<Vec<_>>(),
+    )
+}
+
+#[test]
+fn timestamp_parser_matches_python_generated_matrix() {
+    let (accepted_count, values) = python_timestamp_matrix();
     assert_eq!(accepted_count, 17_823);
     assert_eq!(values.len(), 17_868);
     let python = python_timestamp_acceptance(&values);
@@ -4722,5 +4805,612 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
                 subcommand.get_name()
             );
         }
+    }
+}
+
+const ROLLOUT_GATES: [&str; 2] = [
+    "TASK_SCOPE_RUNTIME_UNVERIFIED",
+    "TASKGRAPH_CLAIM_UNVERIFIED",
+];
+
+fn with_rollout_gates(reasons: &[&str]) -> Vec<String> {
+    ROLLOUT_GATES
+        .iter()
+        .chain(reasons)
+        .map(|reason| (*reason).to_owned())
+        .collect()
+}
+
+type DecisionMutation = fn(&mut crate::policy::PolicyDecision);
+type EvidenceMutation = fn(&mut Value);
+
+fn evaluate_single_policy(
+    record: Value,
+    census_started_at: &str,
+    observed_at: &str,
+    evaluated_at: &str,
+) -> Result<crate::policy::PolicyDecision, crate::ObserverError> {
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    import_log(&events, vec![record.clone()], vec![]);
+    let (config, evidence) = write_policy_inputs(&scratch, &[record], observed_at, |value| {
+        value["census_started_at"] = Value::String(census_started_at.to_owned());
+    });
+    evaluate_policy_at(&events, &config, &evidence, evaluated_at)
+        .map(|mut decisions| decisions.remove(0))
+}
+
+#[test]
+fn heartbeat_after_the_lifecycle_instant_keeps_liveness_blockers(
+) -> Result<(), crate::ObserverError> {
+    // The imported event tip is recorded at 09:35:01 and the fixture skew is
+    // 60 s, so a census may begin as early as 09:34:01.
+    let mut record = scoped_active_record("slot-a", 1);
+    record["heartbeat_at"] = Value::String("2026-09-22T09:35:01+00:00".to_owned());
+
+    let at_skew = evaluate_single_policy(
+        record.clone(),
+        "2026-09-22T09:34:01+00:00",
+        "2026-09-22T09:34:01+00:00",
+        "2026-09-22T09:34:01+00:00",
+    )?;
+    assert_eq!(at_skew.verdict, Verdict::Blocked);
+    assert_eq!(
+        at_skew.reason_codes,
+        with_rollout_gates(&["HEARTBEAT_TTL_ACTIVE", "MINIMUM_STALE_AGE_ACTIVE"])
+    );
+
+    let error = evaluate_single_policy(
+        record.clone(),
+        "2026-09-22T09:34:00.999999999+00:00",
+        "2026-09-22T09:34:00.999999999+00:00",
+        "2026-09-22T09:34:00.999999999+00:00",
+    )
+    .expect_err("a census beyond the event-tip skew is refused")
+    .to_string();
+    assert!(error.contains("event tip"), "{error}");
+
+    // Evaluation may precede the census by up to the skew as well; a heartbeat
+    // more than one skew after the lifecycle instant is reported, but it is
+    // still younger than every TTL.
+    let beyond_skew = evaluate_single_policy(
+        record,
+        "2026-09-22T09:34:01+00:00",
+        "2026-09-22T09:34:01+00:00",
+        "2026-09-22T09:34:00.999999999+00:00",
+    )?;
+    assert_eq!(beyond_skew.verdict, Verdict::Blocked);
+    assert_eq!(
+        beyond_skew.reason_codes,
+        with_rollout_gates(&[
+            "CLOCK_BEFORE_HEARTBEAT",
+            "HEARTBEAT_TTL_ACTIVE",
+            "MINIMUM_STALE_AGE_ACTIVE",
+        ])
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_slot_evidence_keeps_heartbeat_blockers() {
+    let scratch = Scratch::new();
+    let decision = policy_decision(
+        &scratch,
+        scoped_active_record("slot-a", 1),
+        "2026-09-22T09:40:00+00:00",
+        |value| value["slots"] = json!([]),
+    );
+    assert_eq!(decision.verdict, Verdict::Blocked);
+    assert_eq!(
+        decision.reason_codes,
+        with_rollout_gates(&["HEARTBEAT_TTL_ACTIVE", "EVIDENCE_MISSING"])
+    );
+}
+
+#[test]
+fn schema_valid_non_rfc3339_heartbeats_keep_their_ttl_blockers() -> Result<(), crate::ObserverError>
+{
+    for (heartbeat, boundary, after) in [
+        (
+            "20260922T093000Z",
+            "2026-09-22T09:40:00+00:00",
+            "2026-09-22T09:40:00.000000001+00:00",
+        ),
+        (
+            "2026-W39-2T0930Z",
+            "2026-09-22T09:40:00+00:00",
+            "2026-09-22T09:40:00.000000001+00:00",
+        ),
+        (
+            "2026-09-22T11:30:00,5+02:00",
+            "2026-09-22T09:40:00.5+00:00",
+            "2026-09-22T09:40:00.500000001+00:00",
+        ),
+    ] {
+        assert!(parse_timestamp(heartbeat, "fixture heartbeat").is_ok());
+        assert!(chrono::DateTime::parse_from_rfc3339(heartbeat).is_err());
+        let mut record = scoped_active_record("slot-a", 1);
+        record["heartbeat_at"] = Value::String(heartbeat.to_owned());
+        let at_ttl = evaluate_single_policy(record.clone(), boundary, boundary, boundary)?;
+        assert_eq!(at_ttl.verdict, Verdict::Blocked, "{heartbeat}");
+        assert_eq!(
+            at_ttl.reason_codes,
+            with_rollout_gates(&["HEARTBEAT_TTL_ACTIVE"]),
+            "{heartbeat}"
+        );
+        let expired = evaluate_single_policy(record, after, after, after)?;
+        assert_rollout_gated(&expired);
+        assert_eq!(expired.reason_codes, with_rollout_gates(&[]), "{heartbeat}");
+    }
+    Ok(())
+}
+
+#[test]
+fn heartbeat_fields_that_cannot_be_aged_never_drop_blockers() -> Result<(), crate::ObserverError> {
+    let scratch = Scratch::new();
+    let base = policy_decision(
+        &scratch,
+        scoped_active_record("slot-a", 1),
+        "2026-09-22T09:40:00+00:00",
+        |_| {},
+    );
+    let lifecycle_at = chrono::DateTime::parse_from_rfc3339("2026-09-22T09:40:00+00:00")
+        .expect("fixture lifecycle instant");
+    let config = ShadowConfig::load(&scratch.0.join("policy.json"))?.value;
+    let mut stale_floor = config.clone();
+    stale_floor.minimum_stale_seconds = 900;
+    let cases: [(&ShadowConfig, DecisionMutation, Verdict, &[&str]); 4] = [
+        (
+            &config,
+            |decision| decision.heartbeat_at = None,
+            Verdict::Unknown,
+            &["ACTIVE_HEARTBEAT_MISSING"],
+        ),
+        (
+            &config,
+            |decision| decision.heartbeat_at = Some("not a timestamp".to_owned()),
+            Verdict::Blocked,
+            &["HEARTBEAT_TIMESTAMP_UNSUPPORTED"],
+        ),
+        (
+            &config,
+            |decision| decision.heartbeat_ttl_seconds = None,
+            Verdict::Unknown,
+            &["ACTIVE_HEARTBEAT_TTL_MISSING"],
+        ),
+        (
+            &stale_floor,
+            |decision| decision.heartbeat_ttl_seconds = None,
+            Verdict::Blocked,
+            &["ACTIVE_HEARTBEAT_TTL_MISSING", "MINIMUM_STALE_AGE_ACTIVE"],
+        ),
+    ];
+    for (config, mutate, verdict, reasons) in cases {
+        let mut decision = base.clone();
+        decision.verdict = Verdict::Eligible;
+        decision.reason_codes.clear();
+        mutate(&mut decision);
+        policy::evaluate_time(&mut decision, config, lifecycle_at)?;
+        assert_eq!(decision.verdict, verdict, "{reasons:?}");
+        assert_eq!(decision.reason_codes, reasons, "{reasons:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn each_policy_reason_code_is_isolated_by_one_evidence_field() {
+    let baseline_scratch = Scratch::new();
+    let baseline = policy_decision(
+        &baseline_scratch,
+        scoped_active_record("slot-a", 1),
+        "2026-09-22T09:40:01+00:00",
+        |_| {},
+    );
+    assert_eq!(baseline.verdict, Verdict::Unknown);
+    assert_eq!(baseline.reason_codes, with_rollout_gates(&[]));
+
+    // The baseline scope is `dead` with an `absent` leader, so the leader
+    // cases below cannot be satisfied by the scope-liveness blocker.
+    let cases: [(&str, Verdict, EvidenceMutation); 9] = [
+        ("EVIDENCE_MISSING", Verdict::Unknown, |value| {
+            value["slots"] = json!([]);
+        }),
+        ("SCOPE_EVIDENCE_MISSING", Verdict::Unknown, |value| {
+            value["slots"][0]["scope"] = Value::Null;
+        }),
+        ("TASK_LEADER_LIVE", Verdict::Blocked, |value| {
+            value["slots"][0]["scope"]["leader_state"] = json!("same");
+        }),
+        ("TASK_LEADER_STATE_UNKNOWN", Verdict::Unknown, |value| {
+            value["slots"][0]["scope"]["leader_state"] = json!("unknown");
+        }),
+        ("JOURNAL_STATE_UNKNOWN", Verdict::Unknown, |value| {
+            value["slots"][0]["journal"] = json!("unknown");
+        }),
+        ("CHECKOUT_NOT_DIRECTORY", Verdict::Blocked, |value| {
+            value["slots"][0]["checkouts"][0]["directory"] = json!(false);
+        }),
+        ("CHECKOUT_PATH_DRIFT", Verdict::Unknown, |value| {
+            value["slots"][0]["checkouts"][0]["path"] = json!("worktrees/slots/slot-a/other");
+        }),
+        ("CHECKOUT_EVIDENCE_MISSING", Verdict::Unknown, |value| {
+            value["slots"][0]["checkouts"][0]["name"] = json!("other");
+        }),
+        ("CHECKOUT_EVIDENCE_SET_DRIFT", Verdict::Unknown, |value| {
+            let extra = json!({
+                "name": "extra",
+                "path": "worktrees/slots/slot-a/extra",
+                "device": 11,
+                "inode": 22,
+                "mount_id": 33,
+                "directory": true,
+                "symlink_free": true,
+                "mount_stable": true,
+            });
+            value["slots"][0]["checkouts"]
+                .as_array_mut()
+                .expect("fixture checkouts")
+                .push(extra);
+        }),
+    ];
+    for (reason, verdict, mutate) in cases {
+        let scratch = Scratch::new();
+        let decision = policy_decision(
+            &scratch,
+            scoped_active_record("slot-a", 1),
+            "2026-09-22T09:40:01+00:00",
+            mutate,
+        );
+        assert_eq!(decision.verdict, verdict, "{reason}");
+        assert_eq!(
+            decision.reason_codes,
+            with_rollout_gates(&[reason]),
+            "{reason}"
+        );
+    }
+}
+
+fn append_retirement_attempt(events: &Path, sequence: u64, tip: &str, generation: u64) -> String {
+    append_event(
+        events,
+        sequence,
+        tip,
+        "retirement-attempted",
+        json!({
+            "slot": "slot-a",
+            "generation": generation,
+            "sha256": "a".repeat(64),
+            "handoff_read_sequence": 1,
+            "reason": "bounded queue attempt",
+        }),
+    )
+}
+
+#[test]
+fn pending_generation_conflicts_are_reported_for_active_and_pending_only_slots(
+) -> Result<(), crate::ObserverError> {
+    // A generation-1 retirement marker survives an in-place ACTIVE replacement
+    // by generation 2; the baseline records the marker after the replacement.
+    for conflicting in [false, true] {
+        let scratch = Scratch::new();
+        let events = scratch.events();
+        let first = scoped_active_record("slot-a", 1);
+        let second = scoped_active_record("slot-a", 2);
+        let mut tip = import_log(&events, vec![first.clone()], vec![]);
+        let mut sequence = 2;
+        if conflicting {
+            tip = append_retirement_attempt(&events, sequence, &tip, 1);
+            sequence += 1;
+        }
+        tip = append_event(
+            &events,
+            sequence,
+            &tip,
+            "active-state-recorded",
+            json!({
+                "action": "slot-updated",
+                "slot": "slot-a",
+                "previous_revision": 0,
+                "revision": 1,
+                "previous_record_sha256": canonical_sha256(&first).expect("active digest"),
+                "record": second,
+                "evidence": {},
+            }),
+        );
+        if !conflicting {
+            append_retirement_attempt(&events, sequence + 1, &tip, 2);
+        }
+        let replayed = replay_stream(&events, None, |_| Ok(()))?;
+        let (config, evidence) = write_policy_inputs(
+            &scratch,
+            &[replayed.active_records["slot-a"].clone()],
+            "2026-09-22T09:40:01+00:00",
+            |_| {},
+        );
+        let decision =
+            evaluate_policy_at(&events, &config, &evidence, "2026-09-22T09:40:01+00:00")?.remove(0);
+        assert_eq!(decision.verdict, Verdict::Blocked);
+        // The pending marker also disagrees with the fixture's `absent` journal.
+        let expected: &[&str] = if conflicting {
+            &[
+                "PENDING_GENERATION_CONFLICT",
+                "RETIREMENT_PENDING",
+                "JOURNAL_EVENT_EVIDENCE_CONFLICT",
+            ]
+        } else {
+            &["RETIREMENT_PENDING", "JOURNAL_EVENT_EVIDENCE_CONFLICT"]
+        };
+        assert_eq!(decision.reason_codes, with_rollout_gates(expected));
+    }
+
+    // Without an ACTIVE row, markers that disagree about the generation leave
+    // the pending-only decision's generation null and report the conflict.
+    for conflicting in [false, true] {
+        let scratch = Scratch::new();
+        let events = scratch.events();
+        let record = scoped_active_record("slot-a", 1);
+        let mut tip = import_log(&events, vec![record.clone()], vec![]);
+        let mut sequence = 2;
+        if conflicting {
+            tip = append_retirement_attempt(&events, sequence, &tip, 1);
+            sequence += 1;
+        }
+        tip = append_event(
+            &events,
+            sequence,
+            &tip,
+            "active-state-recorded",
+            json!({
+                "action": "slot-removed",
+                "slot": "slot-a",
+                "previous_revision": 0,
+                "revision": 1,
+                "previous_record_sha256": canonical_sha256(&record).expect("active digest"),
+                "record": null,
+                "evidence": {},
+            }),
+        );
+        append_event(
+            &events,
+            sequence + 1,
+            &tip,
+            "operation-progress-recorded",
+            json!({
+                "slot": "slot-a",
+                "operation": "create",
+                "journal": {"schema": 2, "kind": "create", "machine": "node-a", "slot": "slot-a"},
+            }),
+        );
+        let (config, evidence) =
+            write_policy_inputs(&scratch, &[], "2026-09-22T09:40:01+00:00", |_| {});
+        let decision =
+            evaluate_policy_at(&events, &config, &evidence, "2026-09-22T09:40:01+00:00")?.remove(0);
+        let expected: &[&str] = if conflicting {
+            &[
+                "ACTIVE_RECORD_MISSING",
+                "PENDING_GENERATION_CONFLICT",
+                "OPERATION_JOURNAL_PENDING",
+                "RETIREMENT_PENDING",
+            ]
+        } else {
+            &["ACTIVE_RECORD_MISSING", "OPERATION_JOURNAL_PENDING"]
+        };
+        assert_eq!(decision.verdict, Verdict::Blocked);
+        assert_eq!(decision.generation, None);
+        assert_eq!(decision.reason_codes, expected);
+
+        let plain_index = scratch.0.join("pending-generation-plain.sqlite");
+        rebuild_index(&events, &plain_index)?;
+        let plain = read_decision(&plain_index, "slot-a")?;
+        assert_eq!(plain.verdict, Verdict::Blocked);
+        assert_eq!(plain.generation, None);
+        assert_eq!(
+            plain.reason_codes,
+            std::iter::once("POLICY_INPUTS_MISSING")
+                .chain(expected.iter().copied())
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+fn singleton_finish_progress(events: &Path, sequence: u64, tip: &str, slot: &str) -> String {
+    append_event(
+        events,
+        sequence,
+        tip,
+        "operation-progress-recorded",
+        json!({
+            "slot": slot,
+            "operation": "finish",
+            "journal_path": "ACTIVE.node-a.journal",
+            "journal": {"schema": 2, "kind": "finish", "machine": "node-a", "slot": slot},
+        }),
+    )
+}
+
+#[test]
+fn journal_marker_divergences_from_python_are_fail_closed() {
+    // Python overwrites a pending marker when the reused singleton journal
+    // path names another operation identity; Rust refuses the history.
+    let reused = Scratch::new();
+    let reused_events = reused.events();
+    let mut tip = import_log(
+        &reused_events,
+        vec![active_record("slot-a", 1), active_record("slot-b", 1)],
+        vec![],
+    );
+    tip = singleton_finish_progress(&reused_events, 2, &tip, "slot-a");
+    singleton_finish_progress(&reused_events, 3, &tip, "slot-b");
+    assert_eq!(
+        python_pending_journals(&reused_events),
+        json!({"ACTIVE.node-a.journal": ["slot-b", "finish"]})
+    );
+    let error = replay(&reused_events)
+        .expect_err("a reused pending journal path must fail closed")
+        .to_string();
+    assert!(error.contains("reuses a pending journal path"), "{error}");
+
+    // Python ignores a completion without a pending marker; Rust refuses it
+    // unless a matching recovery attempt or identical completion exists.
+    let naked = Scratch::new();
+    let naked_events = naked.events();
+    let first = import_log(&naked_events, vec![active_record("slot-a", 1)], vec![]);
+    append_event(
+        &naked_events,
+        2,
+        &first,
+        "operation-completed",
+        json!({
+            "slot": "slot-a",
+            "operation": "finish",
+            "journal_path": "ACTIVE.node-a.journal",
+        }),
+    );
+    assert_eq!(python_pending_journals(&naked_events), json!({}));
+    let error = replay(&naked_events)
+        .expect_err("an unmatched completion must fail closed")
+        .to_string();
+    assert!(error.contains("no pending progress or recovery"), "{error}");
+}
+
+#[test]
+fn recovery_of_a_completed_scoped_journal_leaves_no_phantom_marker() {
+    // `operation-completed` is appended before the journal file is unlinked.
+    // A crash between the two leaves a completed FINISH journal on disk that
+    // `recover` loads again; its recovery must not invent a singleton marker.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let record = scoped_active_record("slot-a", 1);
+    let finish_path = "FINISH.6.node-a.6.slot-a.journal";
+    let mut tip = import_log(&events, vec![record.clone()], vec![]);
+    tip = append_event(
+        &events,
+        2,
+        &tip,
+        "operation-progress-recorded",
+        json!({
+            "slot": "slot-a",
+            "operation": "finish",
+            "journal_path": finish_path,
+            "journal": {
+                "schema": 2,
+                "kind": "finish",
+                "machine": "node-a",
+                "slot": "slot-a",
+                "phase": "prepared",
+                "record": record.clone(),
+            },
+        }),
+    );
+    tip = append_event(
+        &events,
+        3,
+        &tip,
+        "archive-state-recorded",
+        json!({
+            "action": "slot-removed",
+            "slot": "slot-a",
+            "previous_revision": 0,
+            "revision": 1,
+            "record": archive_record("slot-a", 1),
+            "evidence": {},
+        }),
+    );
+    tip = append_event(
+        &events,
+        4,
+        &tip,
+        "active-state-recorded",
+        json!({
+            "action": "slot-removed",
+            "slot": "slot-a",
+            "previous_revision": 0,
+            "revision": 1,
+            "previous_record_sha256": canonical_sha256(&record).expect("active digest"),
+            "record": null,
+            "evidence": {},
+        }),
+    );
+    let completion = json!({
+        "slot": "slot-a",
+        "operation": "finish",
+        "journal_path": finish_path,
+    });
+    tip = append_event(&events, 5, &tip, "operation-completed", completion.clone());
+    tip = append_event(
+        &events,
+        6,
+        &tip,
+        "recovery-started",
+        json!({
+            "slot": "slot-a",
+            "operation": "finish",
+            "actor": identity(12),
+            "runner": identity(13),
+            "handoff_writer": null,
+            "coordinator_authorized": true,
+        }),
+    );
+    let recovering = replay_stream(&events, None, |_| Ok(())).expect("replay recovery");
+    assert!(
+        recovering.pending_operations.is_empty(),
+        "{:?}",
+        recovering.pending_operations
+    );
+    append_event(&events, 7, &tip, "operation-completed", completion);
+    let recovered = replay_stream(&events, None, |_| Ok(())).expect("replay recovered finish");
+    assert!(
+        recovered.pending_operations.is_empty(),
+        "{:?}",
+        recovered.pending_operations
+    );
+    assert_eq!(python_pending_journals(&events), json!({}));
+}
+
+#[test]
+fn plain_rebuild_after_a_policy_rebuild_requires_a_fresh_index() -> Result<(), crate::ObserverError>
+{
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let record = scoped_active_record("slot-a", 1);
+    import_log(&events, vec![record.clone()], vec![]);
+    let (config, evidence) =
+        write_policy_inputs(&scratch, &[record], "2026-09-22T09:40:01+00:00", |_| {});
+    let index = scratch.0.join("policy-then-plain.sqlite");
+    rebuild_policy_index(&events, &index, &config, &evidence)?;
+
+    let error = rebuild_index(&events, &index)
+        .expect_err("plain rebuild must not discard indexed policy evidence")
+        .to_string();
+    assert!(error.contains("high-water mark"), "{error}");
+    assert!(error.contains("delete the disposable index"), "{error}");
+    let retained = read_decision(&index, "slot-a")?;
+    assert!(retained.evidence_sha256.is_some());
+    assert_eq!(retained.reason_codes, with_rollout_gates(&[]));
+
+    fs::remove_file(&index).expect("remove disposable policy index");
+    rebuild_index(&events, &index)?;
+    let plain = read_decision(&index, "slot-a")?;
+    assert_eq!(plain.verdict, Verdict::Unknown);
+    assert_eq!(plain.evidence_sha256, None);
+    assert_eq!(plain.reason_codes, ["POLICY_INPUTS_MISSING"]);
+    Ok(())
+}
+
+#[test]
+fn timestamp_instants_match_python_for_every_accepted_matrix_value() {
+    let (accepted_count, mut values) = python_timestamp_matrix();
+    values.truncate(accepted_count);
+    let python = python_timestamp_instants(&values);
+    assert_eq!(python.len(), accepted_count);
+    for (value, python_microseconds) in values.iter().zip(python) {
+        let rust = crate::schema::parse_timestamp_instant(value, "fixture timestamp")
+            .unwrap_or_else(|error| panic!("{value:?}: {error}"));
+        assert_eq!(
+            rust.timestamp_micros(),
+            python_microseconds,
+            "Rust/Python instant mismatch for {value:?}"
+        );
     }
 }

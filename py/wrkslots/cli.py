@@ -4173,7 +4173,20 @@ def _systemd_invocation_directory() -> Path:
     return Path("/run/user") / str(os.getuid()) / "systemd" / "units"
 
 
+def _systemd_user_manager_cgroup() -> str:
+    uid = os.getuid()
+    return f"/user.slice/user-{uid}.slice/user@{uid}.service"
+
+
 def _verify_task_scope_invocation(scope: TaskScopeIdentity) -> None:
+    # The invocation link comes from this user's manager, so a same-named unit
+    # under another manager or the system manager must not borrow its identity.
+    manager = _systemd_user_manager_cgroup()
+    if not scope.cgroup_path.startswith(f"{manager}/"):
+        raise Refusal(
+            f"task scope cgroup {scope.cgroup_path} is not under the systemd user "
+            f"manager {manager} whose invocation link is verified"
+        )
     path = _systemd_invocation_directory() / f"invocation:{scope.unit}"
     flags = os.O_PATH | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -4208,6 +4221,27 @@ def _verify_task_scope_invocation(scope: TaskScopeIdentity) -> None:
         raise Refusal(
             f"task scope invocation does not match the stable systemd runtime link {path}"
         )
+
+
+_CREATE_SCOPE_REMEDY = (
+    "the create journal is preserved and no ACTIVE row was published; run "
+    "'wrkslots recover --coordinator-pid PID --slot SLOT --abort-create' to remove its "
+    "unchanged provisional worktrees, then create the slot again from a live task scope"
+)
+_IMPORT_SCOPE_REMEDY = (
+    "the import journal is preserved and no ACTIVE row was published; run "
+    "'wrkslots recover --coordinator-pid PID --abort-import' to discard it, then "
+    "import the slot again from a live task scope"
+)
+
+
+def _verify_task_scope_before_publication(
+    scope: TaskScopeIdentity, remedy: str
+) -> None:
+    try:
+        _verify_task_scope_invocation(scope)
+    except Refusal as exc:
+        raise Refusal(str(exc), remedy=remedy) from exc
 
 
 def _task_scope_arguments(args: argparse.Namespace) -> tuple[str, str] | None:
@@ -13423,7 +13457,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             journal_path=journal_path,
         )
         if task_scope is not None:
-            _verify_task_scope_invocation(task_scope)
+            _verify_task_scope_before_publication(task_scope, _CREATE_SCOPE_REMEDY)
         record = ActiveRecord(
             slot=args.slot,
             agent=args.agent,
@@ -14165,7 +14199,7 @@ def _publish_import(
     _interrupt_for_test("after-import-journal")
     _verify_import_record(config, record, _GitVcs())
     if record.task_scope is not None:
-        _verify_task_scope_invocation(record.task_scope)
+        _verify_task_scope_before_publication(record.task_scope, _IMPORT_SCOPE_REMEDY)
     _write_active_state(
         config,
         _append_record(state, record),
@@ -22482,7 +22516,7 @@ def _recover_create(
         task_scope=task_scope,
     )
     if record.task_scope is not None:
-        _verify_task_scope_invocation(record.task_scope)
+        _verify_task_scope_before_publication(record.task_scope, _CREATE_SCOPE_REMEDY)
     _write_active_state(
         config,
         _append_record(state, record),
@@ -22504,6 +22538,8 @@ def _recover_import_existing(
     raw: Mapping[str, object],
     state: ActiveState,
     recovery_actor: ProcessIdentity,
+    *,
+    abort_import: bool = False,
 ) -> None:
     _exact_keys(
         raw,
@@ -22526,16 +22562,29 @@ def _recover_import_existing(
             raise StateError(
                 f"import journal for slot {slot} does not match its durable ACTIVE row"
             )
+        if abort_import:
+            raise Refusal(
+                f"cannot abort import for slot {slot}: its ACTIVE row is already durable"
+            )
         _verify_import_record(config, existing, _GitVcs())
         _clear_journal(config, raw)
         print(f"recovered import: active state was durable; cleared journal for {slot}")
+        return
+    if abort_import:
+        # An import only publishes a row for checkouts that already exist, so
+        # discarding the unpublished journal leaves every file untouched.
+        _clear_journal(config, raw)
+        print(
+            f"aborted interrupted import slot={slot}; no ACTIVE row was published "
+            "and no files were changed"
+        )
         return
     _assert_agent_and_slot_free(
         config, slot, record.agent, record.slot_type, enforce_cap=False
     )
     _verify_import_record(config, record, _GitVcs())
     if record.task_scope is not None:
-        _verify_task_scope_invocation(record.task_scope)
+        _verify_task_scope_before_publication(record.task_scope, _IMPORT_SCOPE_REMEDY)
     _write_active_state(
         config,
         _append_record(state, record),
@@ -31516,6 +31565,7 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
                 recovery_note=None,
                 retry_running_hook=False,
                 abort_create=False,
+                abort_import=False,
             )
             if frozen:
                 item_args.legacy_validate_checkout = None
@@ -31889,6 +31939,11 @@ def _cmd_recover(
             )
         if requested_ownerless:
             _require_coordinator_authorized(args, "ownerless validation cleanup")
+            if args.abort_import:
+                raise Refusal(
+                    "--abort-import applies only to an interrupted import-existing "
+                    "journal and cannot be combined with validation cleanup flags"
+                )
             if sum(
                 value is not None
                 for value in (
@@ -31976,6 +32031,11 @@ def _cmd_recover(
             )
             path, raw = _load_journal(config, selected_path=selected_path)
         kind_hint = _as_str(raw.get("kind"), "journal.kind")
+        if args.abort_import and kind_hint != "import-existing":
+            raise Refusal(
+                f"--abort-import applies only to import-existing journals; the "
+                f"recorded journal is {kind_hint!r}"
+            )
         if kind_hint == "finish":
             recovery_states, recovery_archives = (
                 _validate_global_state_for_finish_recovery(config, raw)
@@ -32084,7 +32144,14 @@ def _cmd_recover(
                 raise Refusal(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
-            _recover_import_existing(config, path, raw, state, coordinator)
+            _recover_import_existing(
+                config,
+                path,
+                raw,
+                state,
+                coordinator,
+                abort_import=args.abort_import,
+            )
         elif kind == "finish":
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
@@ -33669,6 +33736,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--abort-create",
         action="store_true",
         help="after inspection, remove an incomplete create's unchanged worktrees and branches",
+    )
+    create_recovery.add_argument(
+        "--abort-import",
+        action="store_true",
+        help=(
+            "discard an interrupted import-existing journal whose ACTIVE row was never "
+            "published; no files are changed"
+        ),
     )
     recover.set_defaults(handler=_cmd_recover)
     return parser

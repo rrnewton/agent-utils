@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
 use rustix::fs::{renameat_with, RenameFlags, CWD};
 
 use crate::canonical::{canonical_json, canonical_sha256};
-use crate::config::ShadowConfig;
+use crate::config::{is_sha256, ShadowConfig};
 use crate::evidence::EvidenceBundle;
 use crate::plan::{self, PressurePlan};
 use crate::policy::{self, PolicyDecision, Verdict};
@@ -570,7 +570,8 @@ fn refuse_nonmonotonic_evidence(
     };
     let Some(replacement) = replacement else {
         return Err(ObserverError::invalid(
-            "refusing to discard the indexed policy evidence high-water mark",
+            "refusing to discard the indexed policy evidence high-water mark; \
+             delete the disposable index to rebuild without policy inputs",
         ));
     };
     let prior_time = chrono::DateTime::parse_from_rfc3339(&prior_observed_at)
@@ -1087,7 +1088,7 @@ fn existing_index(transaction: &Transaction<'_>) -> Result<Option<ReplaySummary>
             "derived index schema {schema} has incompatible tables"
         )));
     }
-    if summary.replay_count == 0 || !is_digest(&summary.tip_sha256) {
+    if summary.replay_count == 0 || !is_sha256(&summary.tip_sha256) {
         return Err(ObserverError::invalid("derived index metadata is invalid"));
     }
     let event_count = table_count(transaction, "event_log")?;
@@ -1169,10 +1170,10 @@ fn validate_current_index(
     }
     if config_sha256
         .as_deref()
-        .is_some_and(|digest| !is_digest(digest))
+        .is_some_and(|digest| !is_sha256(digest))
         || evidence_sha256
             .as_deref()
-            .is_some_and(|digest| !is_digest(digest))
+            .is_some_and(|digest| !is_sha256(digest))
     {
         return Err(ObserverError::invalid(
             "derived index policy digests are invalid",
@@ -1474,14 +1475,6 @@ fn parse_index_u64(value: &str, label: &str) -> Result<u64, ObserverError> {
         )));
     }
     Ok(parsed)
-}
-
-fn is_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .as_bytes()
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 fn verdict_name(verdict: Verdict) -> &'static str {
