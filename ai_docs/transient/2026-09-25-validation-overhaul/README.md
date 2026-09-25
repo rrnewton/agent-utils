@@ -9,32 +9,32 @@ parallelism choices, and the remaining work that was deliberately split into fol
 ## Outcome
 
 The portable current-toolchain contract now runs as one composed dagrun graph. At source commit
-`e6a545e93917bd245b2512b0eed99954798349b7`, full run
-`18d89844a629049200077887` completed all 91 executable gates successfully in 407.988 seconds
-(6 minutes 47.988 seconds). That is 192.012 seconds below the ten-minute target. The run recorded
-3,280.088 aggregate step-wall seconds, 2,995.912 aggregate CPU-seconds, and no step with a positive
+`a6946c5cb492fc2131ab72863d798152cd94105d`, full run
+`18d8a508b7da701c0029bb68` completed all 92 executable gates successfully in 428.770 seconds
+(7 minutes 8.770 seconds). That is 171.230 seconds below the ten-minute target. The run recorded
+3,467.864 aggregate step-wall seconds, 3,116.833 aggregate CPU-seconds, and no step with a positive
 `memory.events` maximum.
 
-The current Python census is independently complete and green: all 5,882 collected cases passed,
-none skipped, with 1,261.883 seconds of summed testcase time. Exact collection equality, disjoint
+The current Python census is independently complete and green: all 5,904 collected cases passed,
+none skipped, with 1,299.440 seconds of summed testcase time. Exact collection equality, disjoint
 phase membership, native pytest node identities, artifact hashes, and the source-stable snapshot are
 recorded in `test-timing-provenance.json`. Every row has an ownership, coverage-contract, and
 recommendation classification in `test-timing-ranking.tsv`.
 
 ## Evidence boundary
 
-The gate report is schema `agent-utils-validation-gate-ranking/v2`. Its provenance binds the 91
+The gate report is schema `agent-utils-validation-gate-ranking/v2`. Its provenance binds the 92
 profile rows to the canonical root DAG, the expanded DAG, the public gate listing, the profile run,
-and source commit `e6a545e93917bd245b2512b0eed99954798349b7`. The generator refuses missing or duplicate gates,
+and source commit `a6946c5cb492fc2131ab72863d798152cd94105d`. The generator refuses missing or duplicate gates,
 mixed run metadata, failures, timeouts, positive OOM evidence, graph drift, or source drift. The
 ranking's SHA-256 is recorded in the provenance.
 
 The test report is schema `agent-utils-validation-test-timing-provenance/v2`. The capture began and
 ended at the same source snapshot, with zero tracked source-diff bytes outside its generated
 artifacts, zero bound untracked files, and no generated JUnit input present before collection.
-Fresh live collection, not pytest's accumulating cache, defines completeness. All 5,882 JUnit cases
+Fresh live collection, not pytest's accumulating cache, defines completeness. All 5,904 JUnit cases
 carry exact `nodeid` and `family` properties; legacy classname reconstruction was not used. The
-5,882-row TSV has 13 columns and its SHA-256 is recorded in the provenance.
+5,904-row TSV has 13 columns and its SHA-256 is recorded in the provenance.
 
 JUnit `time` is elapsed testcase time, including fixture work. It is not CPU time. Dagrun profiles
 supply step wall time, user plus system CPU, peak memory, caps, throttling, pressure, and memory
@@ -104,25 +104,25 @@ steps using 32 CPUs, while resource caps and measured inner widths constrain act
 
 | Phase | Cases | Result | Sum of shard-suite time | Sum of testcase time | Testcase-time share |
 |---|---:|---|---:|---:|---:|
-| General | 4,744 | 4,744 pass, 0 skip | 519.156 s | 515.854 s | 40.880% |
-| Lifecycle, namespaced | 856 | 856 pass, 0 skip | 507.054 s | 505.310 s | 40.044% |
-| Lifecycle, host-visible | 282 | 282 pass, 0 skip | 241.456 s | 240.719 s | 19.076% |
-| Total | 5,882 | 5,882 pass, 0 skip | 1,267.666 s | 1,261.883 s | 100% |
+| General | 4,765 | 4,765 pass, 0 skip | 549.826 s | 546.248 s | 42.037% |
+| Lifecycle, namespaced | 857 | 857 pass, 0 skip | 502.963 s | 501.273 s | 38.576% |
+| Lifecycle, host-visible | 282 | 282 pass, 0 skip | 252.707 s | 251.919 s | 19.387% |
+| Total | 5,904 | 5,904 pass, 0 skip | 1,305.496 s | 1,299.440 s | 100% |
 
-Cost remains concentrated but less extremely than in the first census: 251 cases account for 50%
-of testcase time, 751 for 80%, 1,088 for 90%, 1,412 for 95%, and 2,591 for 99%.
+Cost remains concentrated but less extremely than in the first census: 252 cases account for 50%
+of testcase time, 754 for 80%, 1,101 for 90%, 1,432 for 95%, and 2,679 for 99%.
 
 | Component | Cases | Testcase seconds | Share |
 |---|---:|---:|---:|
-| wrkslots | 1,369 | 818.503 | 64.864% |
-| dagrun | 954 | 219.242 | 17.374% |
-| repository-infrastructure | 165 | 76.955 | 6.098% |
-| agentctl | 1,647 | 71.908 | 5.698% |
-| wrkviz | 944 | 68.259 | 5.409% |
-| herdr-run | 423 | 3.279 | 0.260% |
-| tick-hub | 133 | 2.242 | 0.178% |
-| planner | 142 | 0.930 | 0.074% |
-| experiment-runner | 105 | 0.565 | 0.045% |
+| wrkslots | 1,370 | 827.925 | 63.714% |
+| dagrun | 954 | 229.745 | 17.680% |
+| repository-infrastructure | 186 | 88.818 | 6.835% |
+| agentctl | 1,647 | 75.828 | 5.835% |
+| wrkviz | 944 | 69.826 | 5.374% |
+| herdr-run | 423 | 3.355 | 0.258% |
+| tick-hub | 133 | 2.274 | 0.175% |
+| planner | 142 | 1.038 | 0.080% |
+| experiment-runner | 105 | 0.631 | 0.049% |
 
 ### Highest current testcase costs
 
@@ -130,22 +130,22 @@ These are the first twelve rows of the complete TSV, without extrapolation:
 
 | Seconds | Phase | Component | Test | Coverage contract | Recommendation |
 |---:|---|---|---|---|---|
-| 29.950 | lifecycle-host | wrkslots | `test_remove_refuses_live_process_using_slot` | process-liveness | keep-host-sharded |
-| 20.575 | general | dagrun | `test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape` | dag-scheduler-enforcement | keep-profile-optimize |
-| 18.620 | general | wrkslots | `test_real_process_and_git_invariants` | wrkslots-accounting | keep-isolated |
-| 16.943 | general | wrkslots | `test_lsof_guard_refuses_a_real_live_user_with_attributed_evidence` | wrkslots-accounting | keep-profile-optimize |
-| 14.044 | general | dagrun | `test_default_small_cpu_cap_is_enforced_and_allows_compliant_work` | dag-scheduler-enforcement | keep-profile-optimize |
-| 11.146 | general | dagrun | `test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree` | dag-scheduler-enforcement | keep-profile-optimize |
-| 10.289 | general | repository-infrastructure | `test_sigterm_stops_rsync_and_seals_an_interrupted_receipt` | repository-infrastructure | keep-harness-isolated |
-| 8.631 | general | dagrun | `test_an_outer_budget_cut_names_the_budget_and_never_a_peer` | dag-scheduler-enforcement | keep-profile-optimize |
-| 7.858 | general | dagrun | `test_peer_cancellation_survives_a_later_deadline_in_the_same_run` | dag-scheduler-enforcement | keep-profile-optimize |
-| 7.322 | general | agentctl | `test_command_timeout_contains_group_when_supervisor_is_stopped[emergency]` | agent-lifecycle-chat-state | keep-profile-optimize |
-| 7.169 | general | agentctl | `test_command_timeout_contains_group_when_supervisor_is_stopped[census-error]` | agent-lifecycle-chat-state | keep-profile-optimize |
-| 6.639 | general | dagrun | `test_outer_run_budget_cuts_a_long_run_early_and_still_reports` | dag-scheduler-enforcement | keep-profile-optimize |
+| 39.670 | lifecycle-host | wrkslots | `test_remove_refuses_live_process_using_slot` | process-liveness | keep-host-sharded |
+| 20.634 | general | dagrun | `test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape` | dag-scheduler-enforcement | keep-profile-optimize |
+| 18.490 | general | wrkslots | `test_real_process_and_git_invariants` | wrkslots-accounting | keep-isolated |
+| 18.386 | general | wrkslots | `test_lsof_guard_refuses_a_real_live_user_with_attributed_evidence` | wrkslots-accounting | keep-profile-optimize |
+| 14.441 | general | dagrun | `test_default_small_cpu_cap_is_enforced_and_allows_compliant_work` | dag-scheduler-enforcement | keep-profile-optimize |
+| 11.064 | general | dagrun | `test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree` | dag-scheduler-enforcement | keep-profile-optimize |
+| 10.293 | general | repository-infrastructure | `test_sigterm_stops_rsync_and_seals_an_interrupted_receipt` | repository-infrastructure | keep-harness-isolated |
+| 8.691 | general | dagrun | `test_an_outer_budget_cut_names_the_budget_and_never_a_peer` | dag-scheduler-enforcement | keep-profile-optimize |
+| 7.958 | general | dagrun | `test_peer_cancellation_survives_a_later_deadline_in_the_same_run` | dag-scheduler-enforcement | keep-profile-optimize |
+| 7.385 | general | agentctl | `test_command_timeout_contains_group_when_supervisor_is_stopped[emergency]` | agent-lifecycle-chat-state | keep-profile-optimize |
+| 7.196 | general | agentctl | `test_command_timeout_contains_group_when_supervisor_is_stopped[census-error]` | agent-lifecycle-chat-state | keep-profile-optimize |
+| 6.703 | general | dagrun | `test_outer_run_budget_cuts_a_long_run_early_and_still_reports` | dag-scheduler-enforcement | keep-profile-optimize |
 
-All 5,882 rows, including parameter-family identity and cumulative share, are in
-`test-timing-ranking.tsv`. The recommendation totals are also complete: 4,695 `keep-targeted`, 856
-`keep-namespace-sharded`, 281 `keep-host-sharded`, 33 `keep-harness-isolated`, 11
+All 5,904 rows, including parameter-family identity and cumulative share, are in
+`test-timing-ranking.tsv`. The recommendation totals are also complete: 4,715 `keep-targeted`, 857
+`keep-namespace-sharded`, 281 `keep-host-sharded`, 33 `keep-harness-isolated`, 12
 `keep-profile-optimize`, three `reduce-bounded-iterations`, and one each of `keep-isolated`,
 `keep-focused-proc`, and `shorten-test-only-deadline`. These categories preserve expensive safety
 anchors while identifying setup, bounded-loop, wait, isolation, and selection opportunities. Raw
@@ -158,32 +158,32 @@ accounted for by their measured outer gates without pretending that gate duratio
 
 ## Current full-graph gate ranking
 
-`gate-timing-ranking.tsv` contains every one of the 91 executable gates. It ranks wall and aggregate
+`gate-timing-ranking.tsv` contains every one of the 92 executable gates. It ranks wall and aggregate
 CPU time and records peak memory, applied cap, memory events, coverage rationale, and a retain or
 optimization recommendation. The ten highest aggregate-wall gates are:
 
 | Rank | Gate | Wall | CPU | Peak MiB | Cap MiB |
 |---:|---|---:|---:|---:|---:|
-| 1 | `cross.dagrun.differential` | 404.467 s | 482.479 s | 227.55 | 2,560 |
-| 2 | `vibe-talk.shots.screenshots` | 285.587 s | 170.822 s | 719.04 | 3,072 |
-| 3 | `rust.dagrun.test` | 198.473 s | 122.088 s | 1,482.52 | 7,680 |
-| 4 | `cross.agentctl.differential` | 176.558 s | 153.791 s | 2,185.49 | 3,200 |
-| 5 | `examples.run.rust` | 139.003 s | 100.448 s | 558.28 | 16,384 |
-| 6 | `rust.agentctl.test` | 136.271 s | 101.616 s | 135.18 | 7,680 |
-| 7 | `examples.run.python` | 135.332 s | 94.849 s | 575.88 | 16,384 |
-| 8 | `python.dagrun.shard-0` | 128.432 s | 113.406 s | 478.03 | 2,048 |
-| 9 | `python-lifecycle.namespace.shard-1` | 115.016 s | 109.914 s | 526.66 | 1,280 |
-| 10 | `python.dagrun.shard-1` | 106.762 s | 81.284 s | 533.17 | 2,048 |
+| 1 | `cross.dagrun.differential` | 424.595 s | 497.889 s | 226.76 | 2,560 |
+| 2 | `vibe-talk.shots.screenshots` | 296.589 s | 180.086 s | 664.13 | 3,072 |
+| 3 | `rust.dagrun.test` | 202.109 s | 123.906 s | 1,486.36 | 7,680 |
+| 4 | `cross.agentctl.differential` | 183.700 s | 160.234 s | 2,166.30 | 3,200 |
+| 5 | `python-lifecycle.host.shard-2` | 154.765 s | 145.836 s | 360.46 | 1,280 |
+| 6 | `rust.agentctl.test` | 147.404 s | 110.445 s | 131.08 | 7,680 |
+| 7 | `examples.run.rust` | 140.855 s | 104.807 s | 557.78 | 16,384 |
+| 8 | `examples.run.python` | 139.808 s | 98.520 s | 574.81 | 16,384 |
+| 9 | `python.dagrun.shard-0` | 130.295 s | 114.585 s | 626.39 | 2,048 |
+| 10 | `python-lifecycle.namespace.shard-1` | 115.741 s | 105.813 s | 166.97 | 1,280 |
 
-Nine gates account for 50% of aggregate gate-wall time, 20 for 80%, 25 for 90%, and 33 for 95%.
-The dagrun differential occupied 404.467 of the 407.988 graph seconds (99.137% of the critical-path
-window) while averaging 1.193 measured CPU cores. The complete graph averaged 7.343 measured CPU
+Nine gates account for 50% of aggregate gate-wall time, 19 for 80%, 26 for 90%, and 34 for 95%.
+The dagrun differential occupied 424.595 of the 428.770 graph seconds (99.026% of the critical-path
+window) while averaging 1.173 measured CPU cores. The complete graph averaged 7.269 measured CPU
 cores against its 32-CPU ceiling. Outer-DAG concurrency is therefore no longer the principal limit;
 the dominant remaining wall-time opportunity is to split or internally parallelize that
 differential safely. The screenshot gate is expensive in aggregate time but overlaps the critical
 path and retains real-browser coverage unavailable from unit tests.
 
-All 91 gates reported zero `memory.events` maxima, so none of their recorded peaks is marked
+All 92 gates reported zero `memory.events` maxima, so none of their recorded peaks is marked
 censored by a memory ceiling. That is evidence for this run, not permission to remove caps.
 
 ### Aggregate-only live cgroup omissions
@@ -264,7 +264,7 @@ while larger widths gave no stable gain and consumed at least as much CPU.
 ## Selection evidence
 
 The following selection measurements are historical proofs from the implemented graph before the
-current 91-gate run; they are not presented as measurements at commit `e6a545e`:
+current 92-gate run; they are not presented as measurements at commit `a6946c5`:
 
 - A documentation-only change selected seven always-on hygiene nodes, took 1.0 seconds of graph
   time, and completed the selector/driver invocation in 1.5 seconds.
@@ -286,8 +286,8 @@ suite counts or performance.
 
 An earlier green graph run, `18d885f0608c7bd9002d2cf9`, contained 78 gates and took 371.650 graph
 seconds, 3,272.204 aggregate step-wall seconds, and 2,916.240 aggregate CPU-seconds. Its dagrun
-differential took 368.428 seconds. The graph subsequently grew to 91 gates and the current evidence
-is run `18d89844a629049200077887`; the 78-gate values are retained only to preserve audit history.
+differential took 368.428 seconds. The graph subsequently grew to 92 gates and the current evidence
+is run `18d8a508b7da701c0029bb68`; the 78-gate values are retained only to preserve audit history.
 
 ## Open follow-ups
 
@@ -296,6 +296,8 @@ is run `18d89844a629049200077887`; the 78-gate values are retained only to prese
 - #29 delegated-scope-smokes: preserve fresh top-level scope smokes in a containment-safe lane.
 - #30 pidfd-process-ownership: bind agent cleanup to durable kernel process identity.
 - #31 late-fork-census: close the same-UID post-snapshot inheritance race.
+- #35 contained-example-memory: make the fixed 16 GiB example envelope portable to future small,
+  cgroup-capable runners.
 
 #21 validation-overhaul through #26 validation-flakes are closed by the current green full run,
 complete rankings, selection contract, include implementation, and documented follow-up boundary.
