@@ -87,15 +87,16 @@ check-test-suite-selector:
 # partition outside unshare, in duration-balanced parallel shards: its two
 # slowest tests each spend over a minute in the host-wide scan, and serially the
 # partition takes about 15 minutes. If unprivileged namespaces are unavailable,
-# run the original single pytest command; availability changes cost, never
-# coverage.
+# or unshare lacks the --kill-child the runner needs, run the original single
+# pytest command; availability changes cost, never coverage.
 # Resolve the real interpreter before unshare: a Python launcher that forks
 # cannot itself serve as the namespace init that reaps adopted children.
 test:
 ifneq ($(TEST_SUITE),rust)
 	@cd py && \
 	if command -v unshare >/dev/null 2>&1 \
-		&& unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then \
+		&& unshare --user --map-root-user --pid --fork --kill-child=SIGKILL --mount-proc true \
+			>/dev/null 2>&1; then \
 		python3 -m pytest -q --ignore=wrkslots/tests/test_lifecycle.py && \
 		python3 ../scripts/run_lifecycle_shards.py --partition mapped \
 			--shards "$${LIFECYCLE_TEST_SHARDS:-4}" && \

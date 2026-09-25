@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import ctypes
 import importlib.util
+import json
 import os
 import select
+import shutil
 import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 import pytest
@@ -75,27 +78,28 @@ def test_mapped_shard_command_preserves_namespace_selection_and_host_tools() -> 
         durations=10,
     )
 
-    assert command[:6] == [
+    assert command[:7] == [
         "/usr/bin/unshare",
         "--user",
         "--map-root-user",
         "--pid",
         "--fork",
+        "--kill-child=SIGKILL",
         "--mount-proc",
     ]
     # The resolved interpreter is PID 1; pytest keeps the invoking
     # interpreter's path so a virtual environment's packages stay visible.
-    assert command[6:9] == [
+    assert command[7:10] == [
         str(init_python),
         str(ROOT / "scripts" / "pid_namespace_init.py"),
         "--",
     ]
-    assert command[12:15] == [str(python), "-m", "pytest"]
+    assert command[13:16] == [str(python), "-m", "pytest"]
     assert [
         "/usr/bin/env",
         f"--chdir={ROOT / 'py'}",
         f"PATH={tool_directory}:{os.environ['PATH']}",
-    ] == command[9:12]
+    ] == command[10:13]
     assert command[-2:] == [
         "--durations=10",
         "wrkslots/tests/test_lifecycle.py::test_one",
@@ -511,6 +515,7 @@ def test_repeated_interrupts_escalate_to_sigkill_and_leave_no_process_behind(
     (
         (signal.SIGHUP, "leaky", "killable", -signal.SIGTERM),
         (signal.SIGTERM, "stubborn", "stubborn", -signal.SIGKILL),
+        (signal.SIGQUIT, "leaky", "killable", -signal.SIGTERM),  # Ctrl-\ at a terminal
     ),
 )
 def test_a_stop_signal_to_the_runner_stops_every_shard_group_without_a_grace(
@@ -542,13 +547,15 @@ _IGNORES_SIGTERM = (
 )
 
 
-@pytest.mark.parametrize("interrupt", ("keyboard", "stop-signal"))
+@pytest.mark.parametrize(
+    "signum", (signal.SIGINT, signal.SIGTERM), ids=("keyboard", "stop-signal")
+)
 def test_an_interrupt_inside_the_first_sigkill_sweep_still_kills_every_later_group(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], interrupt: str
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], signum: int
 ) -> None:
-    """The SIGKILL sweep is one killpg per shard, and Python runs a signal handler between any two
-    bytecodes, so an interrupt can land after the first group's SIGKILL and before the next one's.
-    The kill step must sweep again, not return with a later group never signalled."""
+    """The SIGKILL sweep is one killpg per shard, and a signal can arrive between any two.  The
+    kill step must still signal every later group: a signal is only recorded, so the one sweep
+    runs to its end."""
 
     processes = [
         subprocess.Popen(
@@ -559,37 +566,574 @@ def test_an_interrupt_inside_the_first_sigkill_sweep_still_kills_every_later_gro
         )
         for _ in range(2)
     ]
+    signals = runner._Signals()
+    previous = signal.signal(signum, signals.record)
     try:
         for process in processes:
             assert process.stdout is not None and process.stdout.readline() == b"ready\n"
         real_killpg = os.killpg
         kills: list[int] = []
 
-        def killpg(pgid: int, signum: int) -> None:
-            real_killpg(pgid, signum)
-            if signum == signal.SIGKILL:
+        def killpg(pgid: int, sent: int) -> None:
+            real_killpg(pgid, sent)
+            if sent == signal.SIGKILL:
                 kills.append(pgid)
                 if len(kills) == 1:  # Delivered to the first group; the later one not yet.
-                    if interrupt == "keyboard":
-                        raise KeyboardInterrupt
-                    raise runner._StopSignal(signal.SIGTERM)
+                    os.kill(os.getpid(), signum)
 
         monkeypatch.setattr(runner.os, "killpg", killpg)
         monkeypatch.setattr(runner, "_TERMINATE_SECONDS", 0.3)
 
-        runner._stop_shards(processes, 0.0, False)
+        runner._stop_shards(processes, runner._Groups(), signals, 0.0, False)
 
         first, later = (process.pid for process in processes)
-        assert kills[:3] == [first, first, later]
+        assert signals.received == [signum]  # It really arrived inside the sweep.
+        assert kills == [first, later]
         assert [process.returncode for process in processes] == [-signal.SIGKILL] * 2
         assert "still present after SIGKILL" not in capsys.readouterr().out
     finally:
+        signal.signal(signum, previous)
         for process in processes:
             if process.poll() is None:
                 process.kill()
                 process.wait()
             if process.stdout is not None:
                 process.stdout.close()
+
+
+_IGNORES_INT_AND_TERM = (
+    "import signal, time\n"
+    "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "print('shard started', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+class _StartedShards:
+    """Replaces the runner's Popen to keep a handle on every shard it starts, recorded or not."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.started: list[subprocess.Popen[bytes]] = []
+        self.after_start: Callable[[int], None] = lambda _count: None
+        # Hold each start until the shard has logged this, so its signal dispositions are set.
+        self.wait_for: bytes | None = None
+        shards = self
+
+        class Popen(subprocess.Popen[bytes]):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)  # type: ignore[call-overload]
+                if shards.wait_for is not None:
+                    log = Path(getattr(kwargs["stdout"], "name"))
+                    deadline = time.monotonic() + 30
+                    while shards.wait_for not in log.read_bytes():
+                        assert self.poll() is None and time.monotonic() < deadline
+                        time.sleep(0.01)
+                shards.started.append(self)
+                shards.after_start(len(shards.started))
+
+        monkeypatch.setattr(runner.subprocess, "Popen", Popen)
+
+    def assert_every_group_gone(self) -> None:
+        for process in self.started:
+            assert process.returncode is not None, f"shard {process.pid} was never reaped"
+            with pytest.raises(ProcessLookupError):
+                os.killpg(process.pid, 0)
+
+    def close(self) -> None:
+        for process in self.started:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+@pytest.fixture
+def started_shards(monkeypatch: pytest.MonkeyPatch) -> Iterator[_StartedShards]:
+    shards = _StartedShards(monkeypatch)
+    yield shards
+    shards.close()
+
+
+def _runner_handles(signum: int) -> bool:
+    """Whether the runner's recording handler would receive ``signum`` now; while the runner
+    holds it blocked, it would reach whatever handler is restored next."""
+
+    return isinstance(
+        getattr(signal.getsignal(signum), "__self__", None), runner._Signals
+    ) and signum not in signal.pthread_sigmask(signal.SIG_BLOCK, ())
+
+
+@pytest.mark.parametrize("signum", (signal.SIGINT, signal.SIGTERM))
+@pytest.mark.parametrize("from_shard", (1, 2), ids=("inside-startup", "after-startup"))
+def test_a_stop_signal_at_every_line_of_the_start_and_stop_paths_cannot_escape_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    started_shards: _StartedShards,
+    signum: int,
+    from_shard: int,
+) -> None:
+    """A signal handler runs between any two bytecodes.  Deliver a real signal at every line the
+    runner executes once ``from_shard`` shards have started, until its handlers are restored: at
+    each one a raising handler would have left a started shard unrecorded or a group unsignalled.
+    The shards ignore SIGINT and SIGTERM, so only the SIGKILL step stops them."""
+
+    monkeypatch.setattr(runner, "_TERMINATE_SECONDS", 0.3)
+    started_shards.wait_for = b"shard started"
+    commands = ((sys.executable, "-c", _IGNORES_INT_AND_TERM),) * 2
+    me = os.getpid()
+    delivered: list[int] = []
+
+    def line(frame: object, event: str, _arg: object) -> object:
+        if (
+            event == "line"
+            and os.getpid() == me  # Not in a forked child before its exec.
+            and len(started_shards.started) >= from_shard
+            and _runner_handles(signum)
+        ):
+            delivered.append(signum)
+            os.kill(me, signum)
+        return line
+
+    def call(frame: object, _event: str, _arg: object) -> object:
+        code = getattr(frame, "f_code")
+        if getattr(frame, "f_globals") is vars(runner) and code.co_name != "record":
+            return line
+        return None
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    previous_trace = sys.gettrace()
+    expected = KeyboardInterrupt if signum == signal.SIGINT else SystemExit
+    with pytest.raises(expected) as raised:
+        sys.settrace(call)  # type: ignore[arg-type]
+        try:
+            runner.run_commands(commands, logs)
+        finally:
+            sys.settrace(previous_trace)
+
+    if signum == signal.SIGTERM:
+        assert isinstance(raised.value, SystemExit) and raised.value.code == 128 + signal.SIGTERM
+    assert len(delivered) > 10
+    assert len(started_shards.started) == from_shard
+    started_shards.assert_every_group_gone()
+    output = capsys.readouterr().out
+    assert output.count(f"INTERRUPTED rc={-signal.SIGKILL} ===") == from_shard
+    assert ("shards 2-2/2 NOT STARTED" in output) == (from_shard == 1)
+    assert "still present after SIGKILL" not in output
+
+
+def test_a_stop_signal_inside_popen_neither_loses_that_shard_nor_starts_another(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    started_shards: _StartedShards,
+) -> None:
+    """The review's reproduction: the signal is handled after the second shard is running and
+    before Popen has returned it to the runner."""
+
+    monkeypatch.setattr(runner, "_TERMINATE_SECONDS", 0.3)
+
+    def signal_the_runner(count: int) -> None:
+        if count == 2:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    started_shards.after_start = signal_the_runner
+    started_shards.wait_for = b"shard started"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    commands = ((sys.executable, "-c", _IGNORES_INT_AND_TERM),) * 3
+
+    with pytest.raises(SystemExit) as raised:
+        runner.run_commands(commands, logs)
+
+    assert raised.value.code == 128 + signal.SIGTERM
+    assert len(started_shards.started) == 2
+    started_shards.assert_every_group_gone()
+    output = capsys.readouterr().out
+    assert "=== mapped lifecycle shard 2/3 INTERRUPTED rc=-9 ===" in output
+    assert "=== mapped lifecycle shards 3-3/3 NOT STARTED ===" in output
+
+
+def test_a_finished_shard_group_proven_empty_is_never_signalled_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, started_shards: _StartedShards
+) -> None:
+    """Once a shard's group is empty its number may be reused, possibly by an unrelated group."""
+
+    real_killpg = os.killpg
+    calls: list[tuple[int, int]] = []
+    proven_empty: list[int] = []
+
+    def killpg(pgid: int, signum: int) -> None:
+        calls.append((pgid, signum))
+        try:
+            real_killpg(pgid, signum)
+        except ProcessLookupError:
+            if signum == 0:
+                proven_empty.append(pgid)
+            raise
+
+    faulted: list[bool] = []
+    real_sleep = time.sleep
+
+    def sleep(seconds: float) -> None:
+        # Fault the runner once the finished shard has been proven empty, which stops the rest.
+        if not faulted and started_shards.started and started_shards.started[0].pid in proven_empty:
+            faulted.append(True)
+            raise RuntimeError("runner fault")
+        real_sleep(seconds)
+
+    monkeypatch.setattr(runner.os, "killpg", killpg)
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    marker = tmp_path / "ended"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    commands = ((sys.executable, "-c", "pass"), *_shard(marker, 60))
+
+    with pytest.raises(RuntimeError, match="runner fault"):
+        runner.run_commands(commands, logs)
+
+    finished, running = (process.pid for process in started_shards.started)
+    after_proof = calls[calls.index((finished, 0)) + 1 :]
+    assert [call for call in after_proof if call[0] == finished] == []
+    assert (running, signal.SIGTERM) in after_proof
+    assert marker.read_text() == "terminated"
+
+
+_EXITS_LEAVING_A_CHILD = (
+    "import subprocess, sys\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.3)'])\n"
+    "print('left', child.pid, flush=True)\n"
+)
+
+
+def test_a_group_that_empties_after_its_leader_ended_is_proven_empty_before_its_number_is_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, started_shards: _StartedShards
+) -> None:
+    """A shard can end while a process it left keeps its group alive.  The poll loop must keep
+    looking at that group, so that it is known empty from the first look after its last member
+    goes, rather than from the first stop signal, by which time the number may lead another
+    group.  Here the number is reused, in effect, one poll after the group really emptied."""
+
+    real_killpg = os.killpg
+    real_sleep = time.sleep
+    reused: list[bool] = []
+    sent_after_reuse: list[tuple[int, int]] = []
+    seen_empty: list[bool] = []
+
+    def finished() -> int:
+        return started_shards.started[0].pid
+
+    def killpg(pgid: int, signum: int) -> None:
+        if reused and pgid == finished():
+            sent_after_reuse.append((pgid, signum))
+            return  # An unrelated group now answers to this number.
+        real_killpg(pgid, signum)
+
+    def sleep(seconds: float) -> None:
+        if reused or len(started_shards.started) < 2 or started_shards.started[0].poll() is None:
+            real_sleep(seconds)
+            return
+        if seen_empty:
+            # The runner has looked at every shard since the group was seen empty.  Reuse the
+            # number, then fault the runner so that it stops the running shard.
+            reused.append(True)
+            raise RuntimeError("runner fault")
+        try:
+            real_killpg(finished(), 0)
+        except ProcessLookupError:
+            seen_empty.append(True)
+        real_sleep(seconds)
+
+    monkeypatch.setattr(runner.os, "killpg", killpg)
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    marker = tmp_path / "ended"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    commands = ((sys.executable, "-c", _EXITS_LEAVING_A_CHILD), *_shard(marker, 60))
+
+    with pytest.raises(RuntimeError, match="runner fault"):
+        runner.run_commands(commands, logs)
+
+    assert (logs / "shard-0.log").read_bytes().startswith(b"left ")
+    assert reused, "the finished shard's group never emptied"
+    assert sent_after_reuse == []
+    assert marker.read_text() == "terminated"
+
+
+def test_a_shard_whose_runner_died_before_it_asked_for_a_parent_death_signal_exits() -> None:
+    """PR_SET_PDEATHSIG only fires for a parent that dies after it is set.  A shard whose runner
+    died first has already been adopted, so it must notice and exit instead of running unwatched.
+    """
+
+    read_end, write_end = os.pipe()
+    child = os.fork()
+    if child == 0:  # The runner that dies.
+        try:
+            os.close(read_end)
+            dying_runner = os.getpid()
+            if os.fork() == 0:  # Its shard, before exec.
+                try:
+                    deadline = time.monotonic() + 10
+                    while os.getppid() == dying_runner and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    runner._signal_on_parent_death(dying_runner, signal.SIGTERM)()
+                    os.write(write_end, b"ran on unwatched")
+                finally:
+                    os._exit(0)
+        finally:
+            os._exit(0)
+    os.close(write_end)
+    os.waitpid(child, 0)
+    with os.fdopen(read_end, "rb") as shard_output:
+        assert shard_output.read() == b""  # EOF once the orphaned shard exited.
+
+    # Control: with its runner alive the shard carries on, and the request is in force.
+    read_end, write_end = os.pipe()
+    parent = os.getpid()
+    child = os.fork()
+    if child == 0:
+        try:
+            os.close(read_end)
+            runner._signal_on_parent_death(parent, signal.SIGTERM)()
+            requested = ctypes.c_int()
+            runner._LIBC.prctl(2, ctypes.byref(requested), 0, 0, 0)  # PR_GET_PDEATHSIG
+            os.write(write_end, str(requested.value).encode())
+        finally:
+            os._exit(0)
+    os.close(write_end)
+    os.waitpid(child, 0)
+    with os.fdopen(read_end, "rb") as shard_output:
+        assert shard_output.read() == str(int(signal.SIGTERM)).encode()
+
+
+class _CallerStop(Exception):
+    pass
+
+
+@pytest.mark.parametrize("while_", ("installing", "restoring"))
+def test_a_signal_while_handlers_change_leaves_the_caller_with_all_its_own_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, while_: str
+) -> None:
+    """If a signal reached a half-changed set, the caller's raising handler could leave the
+    runner's recorder installed for good, silently swallowing that signal in the caller."""
+
+    def caller_stop(_signum: int, _frame: object) -> None:
+        raise _CallerStop
+
+    real_signal = signal.signal
+    stop_signals = runner._STOP_SIGNALS
+    previous_term = real_signal(signal.SIGTERM, caller_stop)
+    try:
+        own = {signum: signal.getsignal(signum) for signum in stop_signals}
+        sent: list[bool] = []
+
+        def changing(signum: int, handler: object) -> object:
+            result = real_signal(signum, handler)  # type: ignore[arg-type]
+            recorder = isinstance(getattr(handler, "__self__", None), runner._Signals)
+            if not sent and signum == signal.SIGINT and recorder == (while_ == "installing"):
+                sent.append(True)
+                # Installing: the next handler is still the caller's.  Restoring: the rest are
+                # still the recorder.
+                os.kill(os.getpid(), signal.SIGTERM if while_ == "installing" else signal.SIGINT)
+            return result
+
+        monkeypatch.setattr(runner.signal, "signal", changing)
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        with pytest.raises(SystemExit if while_ == "installing" else KeyboardInterrupt) as raised:
+            runner.run_commands(((sys.executable, "-c", "pass"),), logs)
+        monkeypatch.undo()
+
+        assert sent
+        if while_ == "installing":  # Held back until the recorder had it: nothing started.
+            assert isinstance(raised.value, SystemExit)
+            assert raised.value.code == 128 + signal.SIGTERM
+        assert {signum: signal.getsignal(signum) for signum in stop_signals} == own
+        assert not set(stop_signals) & signal.pthread_sigmask(signal.SIG_BLOCK, ())
+    finally:
+        real_signal(signal.SIGTERM, previous_term)
+
+
+def test_a_stop_signal_after_the_last_shard_ended_is_still_honoured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A signal that arrives after the poll loop's last look and before the handlers are
+    restored reaches only the record.  The run still ends as that signal asks."""
+
+    real_mask = signal.pthread_sigmask
+    blocks: list[int] = []
+
+    def pthread_sigmask(how: int, mask: Iterable[int]) -> set[int | signal.Signals]:
+        if how == signal.SIG_BLOCK:
+            blocks.append(how)
+            if len(blocks) == 2:  # The restoring, not the installing.
+                os.kill(os.getpid(), signal.SIGHUP)
+        return real_mask(how, mask)
+
+    monkeypatch.setattr(runner.signal, "pthread_sigmask", pthread_sigmask)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+
+    with pytest.raises(SystemExit) as raised:
+        runner.run_commands(((sys.executable, "-c", "print('done')"),), logs)
+
+    assert raised.value.code == 128 + signal.SIGHUP
+    output = capsys.readouterr().out
+    assert "=== mapped lifecycle shard 1/1 rc=0 wall=" in output
+    assert "done" in output
+
+
+def test_another_interrupt_during_the_report_ends_the_report_not_the_exit_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "ended"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    real_sleep = time.sleep
+
+    sent: list[bool] = []
+
+    def sleep(seconds: float) -> None:
+        if not sent and b"shard started" in (logs / "shard-0.log").read_bytes():
+            sent.append(True)
+            os.kill(os.getpid(), signal.SIGTERM)
+        real_sleep(seconds)
+
+    reports: list[str] = []
+
+    def interrupted_report(header: str, _log: Path) -> None:
+        reports.append(header)
+        raise KeyboardInterrupt  # Ctrl-C, now under the caller's own handler
+
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    monkeypatch.setattr(runner, "_report_shard", interrupted_report)
+    commands = (*_shard(marker, 60), *_shard(tmp_path / "second", 60))
+
+    try:
+        with pytest.raises(SystemExit) as raised:
+            runner.run_commands(commands, logs)
+    except KeyboardInterrupt:
+        pytest.fail("the Ctrl-C during the report replaced the exit status")
+
+    assert raised.value.code == 128 + signal.SIGTERM
+    assert reports == ["=== mapped lifecycle shard 1/2 INTERRUPTED rc=143 ==="]
+    assert marker.read_text() == "terminated"
+
+
+def test_a_runner_killed_outright_interrupts_its_ordinary_shard_but_not_what_the_shard_leaked(
+    real_runner: Callable[[str, str], _RealRunner],
+) -> None:
+    """Nothing survives the runner to escalate, so an ordinary shard gets one SIGINT from the
+    kernel and its own teardown must do the rest.  What the teardown leaves in the group stays:
+    the limitation stated at _ORDINARY_PARENT_DEATH_SIGNAL, pinned here so it changes knowingly."""
+
+    run = real_runner("leaky", "killable")
+
+    run.process.kill()
+    returncode, _ = run.finish()
+    deadline = time.monotonic() + 10
+    while not run.exited("shard"):
+        assert time.monotonic() < deadline, "the shard outlived its runner"
+        time.sleep(0.02)
+
+    assert returncode == -signal.SIGKILL
+    assert (run.state / "shard-interrupted").exists(), "the shard's teardown never ran"
+    time.sleep(0.5)
+    assert not run.exited("grandchild")
+
+
+def _namespaces_available() -> bool:
+    unshare = shutil.which("unshare")
+    if unshare is None:
+        return False
+    probe = subprocess.run(
+        [unshare, "--user", "--map-root-user", "--pid", "--fork", "--kill-child=SIGKILL",
+         "--mount-proc", "true"],
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+def _host_processes_naming(token: bytes) -> list[int]:
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            try:
+                if token in (entry / "cmdline").read_bytes():
+                    pids.append(int(entry.name))
+            except OSError:
+                pass  # Gone meanwhile.
+    return pids
+
+
+_RUNNER_OF_ONE_COMMAND = """
+import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location("run_lifecycle_shards", sys.argv[1])
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+command = json.loads(sys.argv[3])
+sys.exit(runner.run_commands((command,), pathlib.Path(sys.argv[2]), parent_death_signal=int(sys.argv[4])))
+"""
+
+
+@pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and PID namespaces")
+def test_a_runner_killed_outright_takes_its_mapped_shard_namespace_with_it(tmp_path: Path) -> None:
+    """The namespace holds everything a mapped shard started, whatever it ignores; its PID 1
+    dies with `unshare`, which dies with the runner."""
+
+    state = tmp_path / "state"
+    state.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    unshare = shutil.which("unshare")
+    assert unshare is not None
+    command = [
+        *runner.namespace_prefix(unshare, ROOT, Path(os.path.realpath(sys.executable))),
+        sys.executable, "-c", _SHARD_WITH_A_GRANDCHILD, str(state), "stubborn", "stubborn",
+        _GRANDCHILD,
+    ]
+    token = str(state).encode()
+    process = subprocess.Popen(
+        [
+            sys.executable, "-c", _RUNNER_OF_ONE_COMMAND, str(RUNNER_PATH), str(logs),
+            json.dumps(command), str(int(runner._MAPPED_PARENT_DEATH_SIGNAL)),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not (state / "shard.pid").exists():
+            assert process.poll() is None, "the runner ended before the shard started"
+            assert time.monotonic() < deadline, "the shard never started"
+            time.sleep(0.02)
+        # The runner, unshare, PID 1, the shard and its grandchild.
+        assert len(_host_processes_naming(token)) >= 5
+
+        process.kill()
+        process.wait()
+        deadline = time.monotonic() + 10
+        while survivors := _host_processes_naming(token):
+            assert time.monotonic() < deadline, f"processes outlived the runner: {survivors}"
+            time.sleep(0.05)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        for pid in _host_processes_naming(token):
+            try:
+                pidfd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                continue
+            try:
+                if token in Path(f"/proc/{pid}/cmdline").read_bytes():
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            finally:
+                os.close(pidfd)
 
 
 def test_main_runs_ordinary_partition_with_the_unresolved_interpreter(
@@ -607,14 +1151,18 @@ def test_main_runs_ordinary_partition_with_the_unresolved_interpreter(
         selections.append((python, selection))
         return nodeids
 
+    death_signals: list[int] = []
+
     def run(
         commands: tuple[list[str], ...],
         _logs: Path,
         *,
         label: str,
         cwd: Path | None = None,
+        parent_death_signal: int,
     ) -> int:
         ran.append((commands, label, cwd))
+        death_signals.append(parent_death_signal)
         return 0
 
     monkeypatch.setattr(runner.sys, "executable", str(link))
@@ -634,3 +1182,26 @@ def test_main_runs_ordinary_partition_with_the_unresolved_interpreter(
         [nodeids[1]],
     ]
     assert "unshare" not in " ".join(" ".join(command) for command in commands)
+    assert death_signals == [signal.SIGINT]
+
+
+def test_main_runs_mapped_partition_with_a_sigkill_parent_death_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ran: list[tuple[tuple[list[str], ...], int]] = []
+    nodeids = tuple(f"wrkslots/tests/test_lifecycle.py::test_{index}" for index in range(2))
+
+    def run(commands: tuple[list[str], ...], _logs: Path, *, parent_death_signal: int) -> int:
+        ran.append((commands, parent_death_signal))
+        return 0
+
+    monkeypatch.setattr(runner, "collect_nodeids", lambda *_: nodeids)
+    monkeypatch.setattr(runner, "run_commands", run)
+    monkeypatch.setattr(runner.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/unshare")
+
+    assert runner.main(["--shards", "2"]) == 0
+
+    [(commands, death_signal)] = ran
+    assert death_signal == signal.SIGKILL
+    assert [command[5] for command in commands] == ["--kill-child=SIGKILL"] * 2
