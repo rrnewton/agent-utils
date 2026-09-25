@@ -327,19 +327,20 @@ Use `--workspace-id` to choose an exact Herdr workspace or
 `default_workspace` from the project config applies before the
 `HERDR_WORKSPACE_ID`/`subagents` fallback.
 
-Move a running interactive session without restarting it only through the
-identity-bound relocation transaction:
+Move a running owned interactive session without restarting it only through
+the identity-bound relocation transaction:
 
 ```sh
 agentctl relocate reviewer --workspace-label project --new-tab
 ```
 
 Relocation supports a one-pane source tab. It records the exact session token,
-terminal identity, old route, and intended workspace before asking Herdr to
-move the pane; a retry reconciles an interrupted move by terminal identity.
-The Herdr command must support the atomic `--expect-terminal-id` precondition;
-with an older Herdr release, the command retains its recovery journal but does
-not move the live pane.
+terminal and foreground process generations, old route, and intended workspace
+before asking Herdr to move the pane; a retry reconciles an interrupted move by
+terminal identity. Adopted foreign sessions are refused because agentctl does
+not own their foreground runtime. The Herdr command must atomically enforce both
+generation preconditions; with an older Herdr release, agentctl refuses before
+creating a recovery journal or moving the live pane.
 The session's launch specification, goal, and queue stay in the same registry
 generation. Ambiguous labels, multi-pane source tabs, changed processes, and
 changed terminals are refused.
@@ -637,6 +638,22 @@ completed native goal.
 ```sh
 agentctl stop reviewer
 ```
+
+Interactive records written before terminal-generation binding remain visible
+but cannot read, send, focus, move, or stop a pane. Recover one only by naming
+its exact registry token:
+
+```sh
+agentctl recover-terminal reviewer --expected-token TOKEN
+```
+
+The command discovers rather than guesses the terminal generation. It requires
+the recorded pane/tab/workspace/cwd, native session, and (for owned sessions)
+the complete launch argv and foreground process generation to remain stable
+through repeated checks. It migrates the queue binding under delivery exclusion
+and is safe to retry after either the record or queue half was published. A
+foreign adopted session instead revalidates its separately recorded shell
+generation. No prompt is sent and no process is restarted.
 
 Stopping closes only a runtime created and owned by the session manager, then
 archives its state. For an adopted `herdr-foreign` record, stopping means safe

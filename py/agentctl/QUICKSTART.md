@@ -80,12 +80,20 @@ while keeping their terminals available for direct inspection.
    agentctl resume reviewer
    ```
 
-   To preserve a running agent while moving its one-pane tab to another Herdr
-   workspace, use `agentctl relocate reviewer --workspace-label project
-   --new-tab`. This requires Herdr's atomic `--expect-terminal-id` move
-   precondition; older Herdr releases refuse rather than risk moving a replaced
-   terminal. Interrupted moves are reconciled by stable terminal and process
-   identity; the queue and goal remain attached to the same session generation.
+   To preserve a running agentctl-owned agent while moving its one-pane tab to
+   another Herdr workspace, use `agentctl relocate reviewer --workspace-label project
+   --new-tab`. This requires Herdr's atomic terminal- and process-generation
+   preconditions; older Herdr releases refuse rather than risk moving a replaced
+   terminal or harness. Interrupted moves are reconciled by stable terminal and
+   process identity; the queue and goal remain attached to the same session
+   generation. Adopted foreign agents are not moved.
+
+   A legacy interactive row without those bindings is intentionally read-only.
+   After checking its live pane, upgrade only that exact registry generation:
+
+   ```sh
+   agentctl recover-terminal reviewer --expected-token TOKEN
+   ```
 
 5. Finish with `agentctl stop reviewer`. This stops a runtime created by
    `agentctl` and archives its session state. For an adopted agent it only

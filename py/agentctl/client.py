@@ -33,6 +33,7 @@ __all__ = [
     "Runner",
     "CONTROL_TIMEOUT_SECONDS",
     "AgentPaneInfo",
+    "RuntimeGuard",
 ]
 
 #: A ``subprocess.run``-shaped callable, injected so tests never spawn a real process.
@@ -378,6 +379,21 @@ def claude_prompt_transcript_count(screen: str, text: str) -> int:
     """Count exact submitted Claude user turns above the current composer."""
     regions = _claude_composer_regions(screen)
     transcript = regions[0] if regions is not None else screen
+    if regions is None:
+        # Claude can briefly redraw a nonempty composer without the staged-input
+        # hint. The final structurally valid ruled region is still an editor;
+        # treating its ``❯`` text as transcript would turn an unconfirmed Enter
+        # into false delivery evidence even when the footer is not retained.
+        lines = screen.splitlines()
+        dividers = [
+            index for index, line in enumerate(lines)
+            if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+        ]
+        if len(dividers) >= 2:
+            top, bottom = dividers[-2:]
+            editor = "\n".join(lines[top + 1:bottom])
+            if _muse_editor_segments(editor) is not None:
+                transcript = "\n".join(lines[:top])
     lines = transcript.splitlines()
     count = 0
     index = 0
@@ -437,8 +453,8 @@ class ProcessInfo:
     pane_id: str
     shell_pid: int
     foreground_pgid: int
-    #: ``(pid, name, cmdline, argv0, reported_executable)`` for each foreground process.
-    foreground: tuple[tuple[int, str, str, str, str | None], ...]
+    #: ``(pid, name, cmdline, argv, reported_executable)`` for each foreground process.
+    foreground: tuple[tuple[int, str, str, tuple[str, ...], str | None], ...]
 
 
 @dataclass(frozen=True)
@@ -451,6 +467,25 @@ class CustomProcessIdentity:
     starttime_ticks: int
     executable_device: int
     executable_inode: int
+
+
+@dataclass(frozen=True)
+class RuntimeGuard:
+    """Atomic terminal and foreground-process generation precondition."""
+
+    terminal_id: str
+    process_identity: CustomProcessIdentity | None
+
+    def arguments(self) -> tuple[str, ...]:
+        arguments = ["--expect-terminal-id", self.terminal_id]
+        identity = self.process_identity
+        if identity is not None:
+            arguments.extend((
+                "--expect-process-generation",
+                f"v1:{identity.boot_id}:{identity.pid}:{identity.starttime_ticks}:"
+                f"{identity.executable_device}:{identity.executable_inode}",
+            ))
+        return tuple(arguments)
 
 
 @dataclass(frozen=True)
@@ -472,6 +507,7 @@ class AgentPaneInfo:
     status: str
     session_agent: str | None
     session_value: str | None
+    terminal_id: str | None = None
 
 
 def _bounded_control_command(
@@ -599,9 +635,12 @@ def _bounded_control_command(
             pass
         finally:
             process.kill()
-            for pipe in (process.stdin, process.stdout, process.stderr):
-                if pipe is not None and not pipe.closed:
-                    pipe.close()
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
+            if process.stderr is not None and not process.stderr.closed:
+                process.stderr.close()
             process.wait()
         raise
     return subprocess.CompletedProcess(
@@ -668,6 +707,7 @@ class HerdrClient:
         self._run: Runner = selected_runner
         self._environ = dict(os.environ if environ is None else environ)
         self._sleep = sleep
+        self._terminal_identity_support_checked = False
 
     # ---- plumbing ---------------------------------------------------------------------------
 
@@ -759,6 +799,56 @@ class HerdrClient:
         ) as exc:  # pragma: no cover - _execute already narrows production failures
             raise HerdrUnavailable(f"cannot invoke Herdr: {exc}") from exc
 
+    def require_terminal_identity_support(self) -> None:
+        """Prove the installed CLI supports every atomic terminal guard we use.
+
+        This probe is intentionally read-only. In particular, never discover
+        support by trying ``pane run``: an older Herdr can consume an unknown
+        option as harness argv and mutate the pane before reporting failure.
+        """
+        if self._terminal_identity_support_checked:
+            return
+        terminal_only = (
+            ("tab", "rename"), ("pane", "run"),
+            ("pane", "get"), ("pane", "process-info"),
+            ("agent", "start"), ("agent", "get"),
+        )
+        runtime_guarded = (
+            ("tab", "close"), ("pane", "move"),
+            ("pane", "report-agent"), ("pane", "report-agent-session"),
+            ("pane", "read"), ("pane", "send-text"),
+            ("pane", "send-keys"), ("pane", "close"),
+            ("agent", "wait"), ("agent", "prompt"),
+            ("agent", "focus"),
+        )
+        missing: list[str] = []
+        terminal_token = re.compile(
+            r"(?<![A-Za-z0-9_-])--expect-terminal-id(?![A-Za-z0-9_-])"
+        )
+        process_token = re.compile(
+            r"(?<![A-Za-z0-9_-])--expect-process-generation(?![A-Za-z0-9_-])"
+        )
+        for group, command in (*terminal_only, *runtime_guarded):
+            completed = self._invoke(
+                [group, command, "--help"],
+                timeout=min(CONTROL_TIMEOUT_SECONDS, 5.0),
+            )
+            help_text = f"{completed.stdout}\n{completed.stderr}"
+            needed = (
+                (terminal_token,)
+                if (group, command) in terminal_only
+                else (terminal_token, process_token)
+            )
+            if (completed.returncode != 0
+                    or any(token.search(help_text) is None for token in needed)):
+                missing.append(f"{group} {command}")
+        if missing:
+            raise HerdrUnavailable(
+                "installed Herdr lacks required atomic terminal/process generation support for: "
+                + ", ".join(missing)
+            )
+        self._terminal_identity_support_checked = True
+
     @staticmethod
     def _remaining_timeout(deadline: float, purpose: str) -> float:
         """Return the positive time left in one caller-owned operation."""
@@ -829,8 +919,8 @@ class HerdrClient:
 
     def create_workspace(
         self, *, label: str, cwd: str, environment: Sequence[str] = (),
-    ) -> tuple[str, str, str]:
-        """Create a workspace. Returns ``(workspace_id, root_tab_id, root_pane_id)``.
+    ) -> tuple[str, str, str, str]:
+        """Return the workspace, tab, pane, and terminal generation created together.
 
         Herdr gives a new workspace one default tab (labelled ``"1"``); the caller renames it rather
         than creating a second tab, so a freshly created workspace has exactly one tab.
@@ -851,6 +941,7 @@ class HerdrClient:
                 get_str(workspace, "workspace_id", "workspace create"),
                 get_str(tab, "tab_id", "workspace create"),
                 get_str(pane, "pane_id", "workspace create"),
+                get_str(pane, "terminal_id", "workspace create"),
             )
         except TypeError as exc:
             raise HerdrUnavailable(
@@ -899,15 +990,21 @@ class HerdrClient:
                 f"tab create: invalid Herdr response: {exc}"
             ) from exc
 
-    def rename_tab(self, tab_id: str, label: str) -> None:
+    def rename_tab(
+        self, tab_id: str, label: str, *, expected_terminal_id: str,
+    ) -> None:
         """Relabel an existing tab."""
-        self._call(["tab", "rename", tab_id, label], f"tab rename {tab_id}")
+        self._call(
+            ["tab", "rename", tab_id, label,
+             "--expect-terminal-id", expected_terminal_id],
+            f"tab rename {tab_id}",
+        )
 
     def create_tab_with_pane(
         self, *, workspace_id: str, label: str, cwd: str,
         environment: Sequence[str] = (),
-    ) -> tuple[str, str]:
-        """Return the tab and original pane from the same allocation response."""
+    ) -> tuple[str, str, str]:
+        """Return tab, pane, and terminal generation from one allocation response."""
         arguments = ["tab", "create", "--workspace", workspace_id,
             "--label", label, "--cwd", cwd]
         for entry in environment:
@@ -920,12 +1017,16 @@ class HerdrClient:
             tab_id = get_str(tab, "tab_id", "created tab")
             if get_str(pane, "tab_id", "created pane") != tab_id or get_str(pane, "workspace_id", "created pane") != workspace_id:
                 raise HerdrUnavailable("created pane does not belong to the allocated tab/workspace")
-            return tab_id, get_str(pane, "pane_id", "created pane")
+            return (
+                tab_id,
+                get_str(pane, "pane_id", "created pane"),
+                get_str(pane, "terminal_id", "created pane"),
+            )
         except TypeError as exc:
             raise HerdrUnavailable(f"tab create: invalid allocation identity: {exc}") from exc
 
     def move_pane_to_new_tab(
-        self, pane_id: str, *, expected_terminal_id: str,
+        self, pane_id: str, *, guard: RuntimeGuard,
         workspace_id: str, label: str,
         timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> PaneMove:
@@ -933,7 +1034,7 @@ class HerdrClient:
         result = self._call(
             [
                 "pane", "move", pane_id,
-                "--expect-terminal-id", expected_terminal_id,
+                *guard.arguments(),
                 "--workspace", workspace_id,
                 "--new-tab", "--label", label, "--no-focus",
             ],
@@ -952,7 +1053,7 @@ class HerdrClient:
                 get_str(pane, "terminal_id", "pane move pane"),
             )
             if (parsed.workspace_id != workspace_id
-                    or parsed.terminal_id != expected_terminal_id
+                    or parsed.terminal_id != guard.terminal_id
                     or get_str(created, "workspace_id", "pane move created_tab") != workspace_id
                     or get_str(created, "tab_id", "pane move created_tab") != parsed.tab_id
                     or get_int(created, "pane_count", "pane move created_tab") != 1
@@ -967,13 +1068,16 @@ class HerdrClient:
         except TypeError as exc:
             raise HerdrUnavailable(f"pane move: invalid Herdr response: {exc}") from exc
 
-    def close_tab(self, tab_id: str) -> None:
+    def close_tab(self, tab_id: str, *, guard: RuntimeGuard) -> None:
         """Close one explicitly owned tab, without closing its shared workspace."""
-        self._call_ok(["tab", "close", tab_id], f"tab close {tab_id}")
+        self._call_ok(
+            ["tab", "close", tab_id, *guard.arguments()],
+            f"tab close {tab_id}",
+        )
 
     def start_agent(
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
-        *, timeout: float = 30.0,
+        *, expected_terminal_id: str, timeout: float = 30.0,
     ) -> None:
         """Start a visible harness in an existing shell pane (Herdr 0.8 or newer).
 
@@ -985,6 +1089,7 @@ class HerdrClient:
             raise ValueError("agent startup timeout must be between 0 and 300 seconds")
         completed = self._invoke(
             ["agent", "start", name, "--kind", kind, "--pane", pane_id,
+             "--expect-terminal-id", expected_terminal_id,
              "--timeout", str(max(1, int(timeout * 1000))), "--", *arguments],
             timeout=timeout + CONTROL_TIMEOUT_SECONDS,
         )
@@ -1025,6 +1130,7 @@ class HerdrClient:
 
     def report_pane_agent(
         self, pane_id: str, kind: str, state: str, *,
+        guard: RuntimeGuard,
         timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> None:
         """Label one exact custom-harness pane without registering an agent name."""
@@ -1032,6 +1138,7 @@ class HerdrClient:
             [
                 "pane", "report-agent", pane_id, "--source", "agentctl",
                 "--agent", kind, "--state", state,
+                *guard.arguments(),
                 "--message", "agentctl custom harness",
             ],
             f"report custom agent {pane_id}",
@@ -1231,12 +1338,12 @@ class HerdrClient:
         if (info.foreground_pgid != info.shell_pid or len(info.foreground) != 1
                 or info.foreground[0][0] != info.shell_pid):
             return None
-        _pid, _name, _command, argv0, _reported = info.foreground[0]
+        _pid, _name, _command, argv, _reported = info.foreground[0]
         observed = self._supported_shell_identity(info.shell_pid)
         if observed is None or observed[1] != info.foreground_pgid:
             return None
         executable_path = os.path.realpath(observed[2])
-        if executable_path != os.path.realpath(argv0):
+        if executable_path != os.path.realpath(argv[0]):
             return None
         if not self._process_has_no_descendants(info.shell_pid):
             return None
@@ -1246,18 +1353,21 @@ class HerdrClient:
         return PaneShellProof(observed[0], executable_path)
 
     def pane_idle_shell_identity(
-        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> PaneShellProof | None:
         """Return one stable idle-shell proof, including absence of descendants."""
         deadline = time.monotonic() + timeout
         before = self.process_info(
-            pane_id, timeout=self._remaining_timeout(deadline, "idle-shell proof")
+            pane_id, expected_terminal_id=expected_terminal_id,
+            timeout=self._remaining_timeout(deadline, "idle-shell proof")
         )
         proof = self._idle_shell_proof(before)
         if proof is None:
             return None
         after = self.process_info(
-            pane_id, timeout=self._remaining_timeout(deadline, "idle-shell proof")
+            pane_id, expected_terminal_id=expected_terminal_id,
+            timeout=self._remaining_timeout(deadline, "idle-shell proof")
         )
         if after != before or self._idle_shell_proof(after) != proof:
             return None
@@ -1267,13 +1377,26 @@ class HerdrClient:
         self, info: ProcessInfo, executable: str | None,
         expected: CustomProcessIdentity | None = None,
         launch_image: tuple[int, int] | None = None,
+        expected_argv: Sequence[str] | None = None,
     ) -> CustomProcessIdentity | None:
         matches: list[CustomProcessIdentity] = []
-        for pid, _process_name, _command, argv0, reported_executable in info.foreground:
+        for pid, _process_name, _command, argv, reported_executable in info.foreground:
             if expected is not None and pid != expected.pid:
                 continue
-            if expected is None and (executable is None or os.path.realpath(argv0) != executable):
+            if (expected is None and executable is not None
+                    and os.path.realpath(argv[0]) != executable):
                 continue
+            if expected_argv is not None:
+                if len(argv) != len(expected_argv):
+                    continue
+                if tuple(argv[1:]) != tuple(expected_argv[1:]):
+                    continue
+                expected_program = expected_argv[0]
+                if os.path.isabs(expected_program) or "/" in expected_program:
+                    if os.path.realpath(argv[0]) != os.path.realpath(expected_program):
+                        continue
+                elif os.path.basename(argv[0]) != expected_program:
+                    continue
             observed_path = self._process_executable(pid)
             observed = self._process_identity(pid)
             if (observed is None and observed_path is None
@@ -1297,29 +1420,93 @@ class HerdrClient:
             if process_group_id != info.foreground_pgid:
                 continue
             if expected is not None:
-                if identity == expected:
+                if identity == expected and (
+                    executable is None
+                    or observed_path == executable
+                    or (
+                        not self._production_runner
+                        and reported_executable is not None
+                        and os.path.realpath(reported_executable) == executable
+                    )
+                ):
                     matches.append(identity)
                 continue
             if launch_image is not None and (
                 identity.executable_device, identity.executable_inode
             ) != launch_image:
                 continue
-            if launch_image is not None or observed_path == executable or (
+            if launch_image is not None or expected_argv is not None or observed_path == executable or (
                 not self._production_runner and reported_executable is not None
                 and os.path.realpath(reported_executable) == executable
             ):
                 matches.append(identity)
         return matches[0] if len(matches) == 1 else None
 
+    def capture_runtime_process_identity(
+        self, pane_id: str, kind: str, launch_argv: Sequence[str], *,
+        expected_terminal_id: str,
+        expected_identity: CustomProcessIdentity | None = None,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> CustomProcessIdentity:
+        """Bind one owned harness to its full launch argv and kernel generation."""
+        if (not launch_argv
+                or any(not isinstance(item, str) or "\0" in item for item in launch_argv)):
+            raise HerdrUnavailable("owned harness launch argv is incomplete")
+        expected_program = launch_argv[0]
+        if (not os.path.isabs(expected_program) and "/" not in expected_program
+                and expected_program != kind):
+            raise HerdrUnavailable(
+                "owned harness launch argv does not name its recorded harness"
+            )
+        identity = self._pane_process_identity(
+            self.process_info(
+                pane_id,
+                expected_terminal_id=expected_terminal_id,
+                timeout=timeout,
+            ),
+            None,
+            expected=expected_identity,
+            expected_argv=launch_argv,
+        )
+        if identity is None:
+            raise HerdrUnavailable(
+                f"owned harness {kind!r} process generation or full argv changed "
+                f"in pane {pane_id}"
+            )
+        return identity
+
+    def verify_runtime_process_identity(
+        self, pane_id: str, kind: str, launch_argv: Sequence[str],
+        expected_identity: CustomProcessIdentity | None, *,
+        expected_terminal_id: str,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
+        """Require one recorded owned process generation and its canonical launch argv."""
+        if expected_identity is None:
+            raise HerdrUnavailable("owned harness has no recorded process identity")
+        observed = self.capture_runtime_process_identity(
+            pane_id, kind, launch_argv,
+            expected_terminal_id=expected_terminal_id,
+            expected_identity=expected_identity,
+            timeout=timeout,
+        )
+        if observed != expected_identity:
+            raise RuntimeIdentityMismatch(
+                f"owned harness process generation changed for pane {pane_id}"
+            )
+
     def verify_custom_harness(
         self, pane_id: str, kind: str,
         expected_identity: CustomProcessIdentity | None = None,
-        *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+        *, expected_terminal_id: str | None = None,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> None:
         """Require the recorded custom process or strict current-path identity."""
         executable = None if expected_identity is not None else self._harness_executable(kind)
         if self._pane_process_identity(
-            self.process_info(pane_id, timeout=timeout), executable, expected_identity
+            self.process_info(
+                pane_id, expected_terminal_id=expected_terminal_id, timeout=timeout,
+            ), executable, expected_identity
         ) is None:
             raise HerdrUnavailable(
                 f"custom harness {kind!r} is not the foreground process in pane {pane_id}"
@@ -1349,14 +1536,21 @@ class HerdrClient:
         )
 
     def pane_is_idle_shell(
-        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> bool:
         """Prove the pane has returned to Herdr's original shell process group."""
-        return self.pane_idle_shell_identity(pane_id, timeout=timeout) is not None
+        return self.pane_idle_shell_identity(
+            pane_id, expected_terminal_id=expected_terminal_id, timeout=timeout,
+        ) is not None
 
-    def pane_shell_identity(self, pane_id: str) -> CustomProcessIdentity:
+    def pane_shell_identity(
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+    ) -> CustomProcessIdentity:
         """Capture the kernel identity of the shell process Herdr owns for one pane."""
-        info = self.process_info(pane_id)
+        info = self.process_info(
+            pane_id, expected_terminal_id=expected_terminal_id,
+        )
         observed = self._supported_shell_identity(info.shell_pid)
         if observed is None or observed[1] != info.shell_pid:
             raise HerdrUnavailable(
@@ -1366,6 +1560,7 @@ class HerdrClient:
 
     def verify_pane_shell_identity(
         self, pane_id: str, expected: CustomProcessIdentity, *,
+        expected_terminal_id: str | None = None,
         timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> None:
         """Require the exact shell generation recorded for an adopted pane.
@@ -1377,7 +1572,9 @@ class HerdrClient:
         unreadable procfs observation is not absence and therefore fails
         closed as an unavailable observation.
         """
-        info = self.process_info(pane_id, timeout=timeout)
+        info = self.process_info(
+            pane_id, expected_terminal_id=expected_terminal_id, timeout=timeout,
+        )
         if info.shell_pid != expected.pid:
             raise RuntimeIdentityMismatch(
                 f"recorded pane shell generation changed for pane {pane_id}"
@@ -1394,15 +1591,18 @@ class HerdrClient:
 
     def pane_is_same_idle_shell(
         self, pane_id: str, expected: CustomProcessIdentity, *,
+        expected_terminal_id: str | None = None,
         timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> bool:
         """Prove both idle-shell state and the exact shell generation captured earlier."""
-        proof = self.pane_idle_shell_identity(pane_id, timeout=timeout)
+        proof = self.pane_idle_shell_identity(
+            pane_id, expected_terminal_id=expected_terminal_id, timeout=timeout,
+        )
         return proof is not None and proof.identity == expected
 
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
-        *, timeout: float = 30.0,
+        *, expected_terminal_id: str, timeout: float = 30.0,
         on_launch_intent: Callable[[str, int, int, tuple[str, ...]], None] | None = None,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
     ) -> CustomProcessIdentity:
@@ -1440,7 +1640,8 @@ class HerdrClient:
                     (executable, *arguments),
                 )
             self._call_ok(
-                ["pane", "run", pane_id, shlex.join([executable, *arguments])],
+                ["pane", "run", pane_id, shlex.join([executable, *arguments]),
+                 "--expect-terminal-id", expected_terminal_id],
                 f"pane run {kind!r}",
                 timeout=self._remaining_timeout(deadline, "custom harness startup"),
             )
@@ -1451,12 +1652,14 @@ class HerdrClient:
                     observed = self._pane_process_identity(
                         self.process_info(
                             pane_id,
+                            expected_terminal_id=expected_terminal_id,
                             timeout=self._remaining_timeout(
                                 deadline, "custom harness process probe"
                             ),
                         ),
                         executable,
                         launch_image=launch_image,
+                        expected_argv=(executable, *arguments),
                     )
                 except HerdrUnavailable as exc:
                     # Herdr can briefly expose a foreground entry before its argv
@@ -1476,14 +1679,17 @@ class HerdrClient:
                 on_observed(observed)
         finally:
             os.close(descriptor)
+        guard = RuntimeGuard(expected_terminal_id, observed)
         ready = False
         while time.monotonic() < deadline:
-            self.verify_custom_harness(
-                pane_id, kind, observed,
+            self.verify_runtime_process_identity(
+                pane_id, kind, (executable, *arguments), observed,
+                expected_terminal_id=expected_terminal_id,
                 timeout=self._remaining_timeout(deadline, "custom harness readiness"),
             )
             screen = self.read(
                 pane_id, source="visible", lines=200,
+                guard=guard,
                 timeout=self._remaining_timeout(deadline, "custom harness readiness"),
             )
             if muse_trust_prompt(screen) and "--trust-workspace" not in arguments:
@@ -1500,19 +1706,21 @@ class HerdrClient:
             raise HerdrUnavailable(
                 f"custom harness {kind!r} did not reach a verified idle composer in pane {pane_id}"
             )
-        self.verify_custom_harness(
-            pane_id, kind, observed,
+        self.verify_runtime_process_identity(
+            pane_id, kind, (executable, *arguments), observed,
+            expected_terminal_id=expected_terminal_id,
             timeout=self._remaining_timeout(deadline, "custom harness final verification"),
         )
         self.report_pane_agent(
             pane_id, kind, "idle",
+            guard=guard,
             timeout=self._remaining_timeout(deadline, "custom harness report"),
         )
         return observed
 
     def recover_pane_agent(
         self, pane_id: str, expected_argv: Sequence[str], expected_device: int,
-        expected_inode: int, expected_pid: int,
+        expected_inode: int, expected_pid: int, *, expected_terminal_id: str,
     ) -> CustomProcessIdentity:
         """Pin one unrecorded failed launch by exact pane, PID, image, and argv."""
         if not 1 <= expected_pid <= _MAX_PROCESS_ID:
@@ -1525,7 +1733,8 @@ class HerdrClient:
 
         def observe() -> CustomProcessIdentity:
             result = self._call(
-                ["pane", "process-info", "--pane", pane_id],
+                ["pane", "process-info", "--pane", pane_id,
+                 "--expect-terminal-id", expected_terminal_id],
                 f"pane process-info {pane_id}",
             )
             try:
@@ -1581,7 +1790,7 @@ class HerdrClient:
 
     def commit_recovered_pane_agent(
         self, pane_id: str, kind: str, identity: CustomProcessIdentity,
-        commit: Callable[[], None],
+        commit: Callable[[], None], *, expected_terminal_id: str,
     ) -> None:
         """Publish recovered state while one pidfd pins the verified process."""
         opener = getattr(os, "pidfd_open", None)
@@ -1600,13 +1809,19 @@ class HerdrClient:
                 raise HerdrUnavailable(
                     "recovered custom harness exited before state publication"
                 )
-            self.verify_custom_harness(pane_id, kind, identity)
+            self.verify_custom_harness(
+                pane_id, kind, identity,
+                expected_terminal_id=expected_terminal_id,
+            )
             commit()
             if poller.poll(0):
                 raise HerdrUnavailable(
                     "recovered custom harness exited during state publication"
                 )
-            self.verify_custom_harness(pane_id, kind, identity)
+            self.verify_custom_harness(
+                pane_id, kind, identity,
+                expected_terminal_id=expected_terminal_id,
+            )
             if poller.poll(0):
                 raise HerdrUnavailable(
                     "recovered custom harness exited after state publication"
@@ -1620,27 +1835,43 @@ class HerdrClient:
                 ) from exc
 
     def agent_pane(
-        self, name: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+        self, name: str, *, expected_terminal_id: str | None = None,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> str:
         """Resolve an exact live Herdr agent name, rejecting a stale pane occupant."""
         result = self._call(
-            ["agent", "get", name], f"agent get {name!r}", timeout=timeout
+            ["agent", "get", name, *(
+                ["--expect-terminal-id", expected_terminal_id]
+                if expected_terminal_id is not None else []
+            )], f"agent get {name!r}", timeout=timeout
         )
         try:
             info = as_mapping(result.get("agent"), "agent get")
             if get_str(info, "name", "agent get") != name:
                 raise HerdrUnavailable(f"agent get: returned a different agent name for {name!r}")
+            if (expected_terminal_id is not None
+                    and get_str(info, "terminal_id", "agent get")
+                    != expected_terminal_id):
+                raise HerdrUnavailable(
+                    f"agent get: terminal generation changed for {name!r}"
+                )
             return get_str(info, "pane_id", "agent get")
         except TypeError as exc:
             raise HerdrUnavailable(f"agent get: invalid Herdr response: {exc}") from exc
 
-    def report_agent_session(self, name: str, pane_id: str, kind: str, session_id: str) -> None:
+    def report_agent_session(
+        self, name: str, pane_id: str, kind: str, session_id: str, *,
+        guard: RuntimeGuard,
+    ) -> None:
         """Publish an explicitly supplied native session identity on its named pane."""
-        if self.agent_pane(name) != pane_id:
+        if self.agent_pane(
+            name, expected_terminal_id=guard.terminal_id,
+        ) != pane_id:
             raise HerdrUnavailable("cannot bind a session to a different named agent pane")
         self._call_ok(
             ["pane", "report-agent-session", pane_id, "--source", "herdr-agent",
-             "--agent", kind, "--agent-session-id", session_id],
+             "--agent", kind, "--agent-session-id", session_id,
+             *guard.arguments()],
             "report managed agent session",
         )
 
@@ -1673,20 +1904,26 @@ class HerdrClient:
             raise HerdrUnavailable(f"pane list: invalid Herdr response: {exc}") from exc
         return tuple(out)
 
-    def pane_exists(self, pane_id: str) -> bool:
+    def pane_exists(
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+    ) -> bool:
         """Is this pane id still live? Used to invalidate a cached id rather than trust it."""
         try:
-            self._call(["pane", "get", pane_id], f"pane get {pane_id}")
+            self.pane_info(pane_id, expected_terminal_id=expected_terminal_id)
         except HerdrUnavailable:
             return False
         return True
 
     def pane_info(
-        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> AgentPaneInfo:
         """Return validated identity/readiness data for an interactive pane."""
         result = self._call(
-            ["pane", "get", pane_id], f"pane get {pane_id}", timeout=timeout
+            ["pane", "get", pane_id, *(
+                ["--expect-terminal-id", expected_terminal_id]
+                if expected_terminal_id is not None else []
+            )], f"pane get {pane_id}", timeout=timeout
         )
         try:
             pane = as_mapping(result.get("pane"), "pane get")
@@ -1694,6 +1931,16 @@ class HerdrClient:
             if returned != pane_id:
                 raise HerdrUnavailable(
                     f"pane get: returned pane {returned!r}, expected {pane_id!r}"
+                )
+            terminal_id = (
+                get_str(pane, "terminal_id", "pane get")
+                if expected_terminal_id is not None
+                else opt_str(pane, "terminal_id")
+            )
+            if (expected_terminal_id is not None
+                    and terminal_id != expected_terminal_id):
+                raise HerdrUnavailable(
+                    f"pane get: terminal generation changed for pane {pane_id!r}"
                 )
             session_raw = pane.get("agent_session")
             session_agent: str | None = None
@@ -1710,6 +1957,7 @@ class HerdrClient:
                 status=opt_str(pane, "agent_status") or "unknown",
                 session_agent=session_agent,
                 session_value=session_value,
+                terminal_id=terminal_id,
             )
         except TypeError as exc:
             raise HerdrUnavailable(f"pane get: invalid Herdr response: {exc}") from exc
@@ -1732,11 +1980,17 @@ class HerdrClient:
         except TypeError as exc:
             raise HerdrUnavailable(f"workspace get: invalid Herdr response: {exc}") from exc
 
-    def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
+    def wait_agent_status(
+        self, pane_id: str, status: str, timeout_ms: int, *,
+        guard: RuntimeGuard | None = None,
+    ) -> None:
         """Wait for a native Herdr agent-state transition."""
         purpose = f"wait for pane {pane_id} status {status}"
         completed = self._invoke(
-            ["agent", "wait", pane_id, "--until", status, "--timeout", str(timeout_ms)],
+            ["agent", "wait", pane_id, "--until", status,
+             "--timeout", str(timeout_ms), *(
+                 list(guard.arguments()) if guard is not None else []
+             )],
             timeout=max(0.001, timeout_ms / 1000.0),
         )
         if completed.returncode != 0:
@@ -1748,11 +2002,19 @@ class HerdrClient:
             data = as_mapping(result.get("agent"), purpose)
             returned_pane = get_str(data, "pane_id", purpose)
             returned_status = get_str(data, "agent_status", purpose)
+            returned_terminal = (
+                get_str(data, "terminal_id", purpose)
+                if guard is not None
+                else opt_str(data, "terminal_id")
+            )
         except (json.JSONDecodeError, TypeError) as exc:
             raise HerdrUnavailable(f"{purpose}: invalid Herdr event response: {exc}") from exc
-        if returned_pane != pane_id or returned_status != status:
+        if (returned_pane != pane_id or returned_status != status
+                or (guard is not None
+                    and returned_terminal != guard.terminal_id)):
             raise HerdrUnavailable(
-                f"{purpose}: event reported pane={returned_pane!r} status={returned_status!r}"
+                f"{purpose}: event reported pane={returned_pane!r} "
+                f"terminal={returned_terminal!r} status={returned_status!r}"
             )
 
     def event_socket(self) -> str:
@@ -1772,30 +2034,37 @@ class HerdrClient:
             raise HerdrUnavailable(f"invalid Herdr server status: {exc}") from exc
 
     def process_info(
-        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> ProcessInfo:
         """The pane's live shell pid and foreground process group — the readiness signal."""
         result = self._call(
-            ["pane", "process-info", "--pane", pane_id],
+            ["pane", "process-info", "--pane", pane_id, *(
+                ["--expect-terminal-id", expected_terminal_id]
+                if expected_terminal_id is not None else []
+            )],
             f"pane process-info {pane_id}",
             timeout=timeout,
         )
         try:
             info = as_mapping(result.get("process_info"), "pane process-info")
-            foreground: list[tuple[int, str, str, str, str | None]] = []
+            foreground: list[
+                tuple[int, str, str, tuple[str, ...], str | None]
+            ] = []
             for entry in as_sequence(
                 info.get("foreground_processes"), "foreground_processes"
             ):
                 process = as_mapping(entry, "foreground process")
                 argv = as_sequence(process.get("argv"), "foreground process argv")
-                if not argv or not isinstance(argv[0], str) or not argv[0]:
+                if (not argv or not isinstance(argv[0], str) or not argv[0]
+                        or any(not isinstance(item, str) or "\0" in item for item in argv)):
                     raise TypeError("foreground process argv must have a nonempty argv[0]")
                 foreground.append(
                     (
                         _get_process_id(process, "pid", "foreground process"),
                         opt_str(process, "name") or "",
                         opt_str(process, "cmdline") or "",
-                        argv[0],
+                        tuple(item for item in argv if isinstance(item, str)),
                         opt_str(process, "executable"),
                     )
                 )
@@ -1811,6 +2080,16 @@ class HerdrClient:
                 raise HerdrUnavailable(
                     f"pane process-info: returned pane {parsed.pane_id!r}, expected {pane_id!r}"
                 )
+            returned_terminal = (
+                get_str(info, "terminal_id", "pane process-info")
+                if expected_terminal_id is not None
+                else opt_str(info, "terminal_id")
+            )
+            if (expected_terminal_id is not None
+                    and returned_terminal != expected_terminal_id):
+                raise HerdrUnavailable(
+                    f"pane process-info: terminal generation changed for pane {pane_id!r}"
+                )
             return parsed
         except TypeError as exc:
             raise HerdrUnavailable(
@@ -1823,6 +2102,7 @@ class HerdrClient:
         *,
         source: str = "recent-unwrapped",
         lines: int | None = None,
+        guard: RuntimeGuard | None = None,
         timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> str:
         """Read the pane's rendered text. ANSI is stripped (no ``--raw``), trailing spaces included.
@@ -1831,6 +2111,8 @@ class HerdrClient:
         stdout directly, which is why it does not go through :meth:`_call`.
         """
         args = ["pane", "read", pane_id, "--source", source]
+        if guard is not None:
+            args += list(guard.arguments())
         if lines is not None:
             args += ["--lines", str(lines)]
         completed = self._invoke(args, timeout=timeout)
@@ -1856,36 +2138,57 @@ class HerdrClient:
             raise HerdrUnavailable(f"{purpose}: {detail}")
 
 
-    def prompt_agent(self, pane_id: str, text: str) -> None:
+    def prompt_agent(
+        self, pane_id: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
         """Submit agent text using live bracketed-paste mode and encoded Enter.
 
         Agent composers can treat a raw text-and-Enter burst as one paste. The
         native prompt primitive preserves the submission key outside that paste.
         This call does not wait for a lifecycle transition.
         """
-        self._call_ok(["agent", "prompt", pane_id, text], f"agent prompt {pane_id}")
+        self._call_ok(
+            ["agent", "prompt", pane_id, text, *guard.arguments()],
+            f"agent prompt {pane_id}",
+        )
 
-    def send_text(self, pane_id: str, text: str) -> None:
+    def send_text(
+        self, pane_id: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
         """Insert literal text without synthesizing a submission keystroke."""
-        self._call_ok(["pane", "send-text", pane_id, text], f"pane send-text {pane_id}")
+        self._call_ok(
+            ["pane", "send-text", pane_id, text, *guard.arguments()],
+            f"pane send-text {pane_id}",
+        )
 
     def send_keys(
-        self, pane_id: str, keys: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+        self, pane_id: str, keys: str, *, guard: RuntimeGuard,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> None:
         """Send named key presses (for example ``ctrl+u``) to a pane."""
         self._call_ok(
-            ["pane", "send-keys", pane_id, keys],
+            ["pane", "send-keys", pane_id, keys, *guard.arguments()],
             f"pane send-keys {pane_id}", timeout=timeout,
         )
 
-    def close_pane(self, pane_id: str) -> None:
+    def close_pane(self, pane_id: str, *, guard: RuntimeGuard) -> None:
         """Close one exact pane, preserving any other panes added to its tab."""
-        self._call_ok(["pane", "close", pane_id], f"pane close {pane_id}")
+        self._call_ok(
+            ["pane", "close", pane_id, *guard.arguments()],
+            f"pane close {pane_id}",
+        )
 
     def focus_tab(self, tab_id: str) -> None:
         """Focus an exact tab, including headless presentations without a detected agent."""
         self._call_ok(["tab", "focus", tab_id], f"tab focus {tab_id}")
 
-    def focus_pane(self, pane_id: str) -> None:
+    def focus_pane(
+        self, pane_id: str, *, guard: RuntimeGuard | None = None,
+    ) -> None:
         """Focus an existing verified pane for direct human interaction."""
-        self._call_ok(["agent", "focus", pane_id], f"agent focus {pane_id}")
+        self._call_ok(
+            ["agent", "focus", pane_id, *(
+                list(guard.arguments()) if guard is not None else []
+            )],
+            f"agent focus {pane_id}",
+        )

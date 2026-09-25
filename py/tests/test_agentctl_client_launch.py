@@ -23,6 +23,7 @@ from agentctl.client import (
     CustomProcessIdentity,
     HerdrClient,
     ProcessInfo,
+    RuntimeGuard,
     muse_idle_composer,
     muse_prompt_in_composer,
     muse_prompt_in_transcript,
@@ -89,12 +90,12 @@ def test_workspace_creation_passes_literal_environment_before_launch() -> None:
     runner = Runner({
         "workspace": {"workspace_id": "w1"},
         "tab": {"tab_id": "t1"},
-        "root_pane": {"pane_id": "p1"},
+        "root_pane": {"pane_id": "p1", "terminal_id": "term-1"},
     })
     client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
     assert client.create_workspace(
         label="subagents", cwd="/work/project", environment=_ENVIRONMENT
-    ) == ("w1", "t1", "p1")
+    ) == ("w1", "t1", "p1", "term-1")
     assert runner.calls == [[
         "fixture-herdr", "workspace", "create", "--label", "subagents",
         "--cwd", "/work/project", "--env", _ENVIRONMENT[0],
@@ -105,13 +106,14 @@ def test_workspace_creation_passes_literal_environment_before_launch() -> None:
 def test_tab_creation_passes_literal_environment_before_launch() -> None:
     runner = Runner({
         "tab": {"tab_id": "t1"},
-        "root_pane": {"pane_id": "p1", "tab_id": "t1", "workspace_id": "w1"},
+        "root_pane": {"pane_id": "p1", "tab_id": "t1", "workspace_id": "w1",
+                      "terminal_id": "term-1"},
     })
     client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
     assert client.create_tab_with_pane(
         workspace_id="w1", label="worker", cwd="/work/project",
         environment=_ENVIRONMENT,
-    ) == ("t1", "p1")
+    ) == ("t1", "p1", "term-1")
     assert runner.calls == [[
         "fixture-herdr", "tab", "create", "--workspace", "w1",
         "--label", "worker", "--cwd", "/work/project",
@@ -125,6 +127,7 @@ def _custom_runner(
     calls: list[list[str]] = []
     executable = os.path.realpath("/bin/true")
     observed = observed_executable or executable
+    launched_argv: list[str] = [observed, "literal"]
 
     def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
         argv = list(command)
@@ -132,9 +135,10 @@ def _custom_runner(
         if argv[1:3] == ["pane", "process-info"]:
             output = {"result": {"process_info": {
                 "pane_id": "p1", "shell_pid": 10, "foreground_process_group_id": 11,
+                "terminal_id": "term-1",
                 "foreground_processes": [{
                     "pid": 2_147_483_647, "name": "true", "cmdline": f"{observed} literal",
-                    "argv": [observed, "literal"], "executable": observed,
+                    "argv": launched_argv, "executable": observed,
                 }],
             }}}
             return subprocess.CompletedProcess(argv, 0, json.dumps(output), "")
@@ -146,6 +150,8 @@ def _custom_runner(
                 "agent": "muse", "agent_status": "idle", "agent_session": None,
             }}}
             return subprocess.CompletedProcess(argv, 0, json.dumps(output), "")
+        if argv[1:3] == ["pane", "run"]:
+            launched_argv[:] = shlex.split(argv[4])
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     client = HerdrClient(herdr_bin="fixture-herdr", run=run)
@@ -162,18 +168,27 @@ def test_custom_muse_launch_uses_literal_shell_quoting_and_exact_pane_report() -
     )
     client, calls = _custom_runner(screen)
     arguments = ("--reasoning-effort", "ultra", 'literal $(unexpanded) "quotes"')
-    client.start_pane_agent("worker", "muse", "p1", arguments, timeout=1)
+    client.start_pane_agent(
+        "worker", "muse", "p1", arguments,
+        expected_terminal_id="term-1", timeout=1,
+    )
     assert muse_startup_metadata(screen) == (
         "reasoning effort ultra is not available (gate ultra_reasoning_effort is closed); using xhigh",
         "xhigh",
     )
     pane_run = next(call for call in calls if call[1:3] == ["pane", "run"])
     assert shlex.split(pane_run[4]) == [os.path.realpath("/bin/true"), *arguments]
+    assert pane_run[5:] == ["--expect-terminal-id", "term-1"]
     report = next(call for call in calls if call[1:3] == ["pane", "report-agent"])
-    assert report[3:] == [
+    assert report[3:12] == [
         "p1", "--source", "agentctl", "--agent", "muse", "--state", "idle",
-        "--message", "agentctl custom harness",
+        "--expect-terminal-id", "term-1",
     ]
+    assert report[12] == "--expect-process-generation"
+    assert report[13].startswith(
+        "v1:00000000-0000-0000-0000-000000000000:2147483647:"
+    )
+    assert report[14:] == ["--message", "agentctl custom harness"]
 
 
 def test_custom_muse_launch_accepts_current_model_footer_without_auto_review() -> None:
@@ -188,6 +203,7 @@ def test_custom_muse_launch_accepts_current_model_footer_without_auto_review() -
     identity = client.start_pane_agent(
         "worker", "muse", "p1",
         ("--model", "kiki_gb300_mxfp8_6p2_840_nwr", "--reasoning-effort", "xhigh", "--yolo"),
+        expected_terminal_id="term-1",
         timeout=1,
     )
     assert identity.pid == 2_147_483_647
@@ -276,6 +292,92 @@ def test_claude_staged_prompt_is_distinct_from_a_submitted_turn() -> None:
     assert claude_prompt_transcript_count(submitted, prompt) == 1
 
 
+@pytest.mark.parametrize(
+    "footer",
+    (
+        "",
+        "⏵⏵ auto mode on · esc to interrupt\n",
+    ),
+)
+def test_claude_hintless_ruled_composer_never_counts_as_submitted(
+    footer: str,
+) -> None:
+    divider = "─" * 40
+    prompt = "do not mistake this staged text for a submitted turn"
+    screen = f"{divider}\n❯ {prompt}\n{divider}\n{footer}"
+
+    assert not claude_staged_composer(screen)
+    assert not claude_prompt_is_exact_composer(screen, prompt)
+    assert claude_prompt_transcript_count(screen, prompt) == 0
+
+    prior = f"❯ {prompt}\n● Prior reply\n{screen}"
+    assert claude_prompt_transcript_count(prior, prompt) == 1
+
+
+def test_terminal_identity_capability_probe_is_read_only_exact_and_cached() -> None:
+    calls: list[list[str]] = []
+
+    def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        argv = list(command)
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "options: --expect-terminal-id --expect-process-generation\n",
+            "",
+        )
+
+    client = HerdrClient(herdr_bin="fixture-herdr", run=run)
+    client.require_terminal_identity_support()
+    client.require_terminal_identity_support()
+
+    assert calls
+    assert all(call[-1] == "--help" for call in calls)
+    assert not any(call[1:3] in (["workspace", "create"], ["tab", "create"])
+                   for call in calls)
+    assert len(calls) == len({tuple(call) for call in calls})
+
+
+def test_terminal_identity_capability_probe_refuses_missing_process_guard() -> None:
+    calls: list[list[str]] = []
+
+    def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        argv = list(command)
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, "option: --expect-terminal-id\n", "",
+        )
+
+    client = HerdrClient(herdr_bin="fixture-herdr", run=run)
+    with pytest.raises(HerdrUnavailable, match="atomic terminal/process generation"):
+        client.require_terminal_identity_support()
+    assert calls
+    assert all(call[-1] == "--help" for call in calls)
+
+
+def test_interactive_mutation_carries_terminal_and_process_generation() -> None:
+    runner = Runner({})
+    client = HerdrClient(herdr_bin="fixture-herdr", run=runner)
+    identity = CustomProcessIdentity(
+        version=1,
+        boot_id="11111111-2222-3333-4444-555555555555",
+        pid=41,
+        starttime_ticks=42,
+        executable_device=43,
+        executable_inode=44,
+    )
+    guard = RuntimeGuard("terminal-generation", identity)
+
+    client.send_text("pane-1", "literal text", guard=guard)
+
+    assert runner.calls == [[
+        "fixture-herdr", "pane", "send-text", "pane-1", "literal text",
+        "--expect-terminal-id", "terminal-generation",
+        "--expect-process-generation",
+        "v1:11111111-2222-3333-4444-555555555555:41:42:43:44",
+    ]]
+
+
 def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
     executable = os.path.realpath("/bin/true")
     process_probes = 0
@@ -288,6 +390,7 @@ def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
             process_argv: object = None if process_probes == 1 else [executable]
             output = {"result": {"process_info": {
                 "pane_id": "p1", "shell_pid": 10,
+                "terminal_id": "term-1",
                 "foreground_process_group_id": 11,
                 "foreground_processes": [{
                     "pid": 2_147_483_647, "name": "true", "cmdline": executable,
@@ -306,7 +409,10 @@ def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
 
     client = HerdrClient(herdr_bin="fixture-herdr", run=run)
     client._harness_executable = lambda _kind: executable  # type: ignore[assignment]
-    identity = client.start_pane_agent("worker", "muse", "p1", (), timeout=1)
+    identity = client.start_pane_agent(
+        "worker", "muse", "p1", (),
+        expected_terminal_id="term-1", timeout=1,
+    )
     assert identity.pid == 2_147_483_647
     assert process_probes >= 2
 
@@ -329,7 +435,10 @@ def test_custom_muse_process_probe_honors_remaining_startup_deadline(
     )
     started = time.monotonic()
     with pytest.raises(HerdrUnavailable, match="timed out|deadline"):
-        client.start_pane_agent("worker", "muse", "p1", (), timeout=0.1)
+        client.start_pane_agent(
+            "worker", "muse", "p1", (),
+            expected_terminal_id="term-1", timeout=0.1,
+        )
     assert time.monotonic() - started < 1.0
 
 
@@ -430,14 +539,20 @@ def test_exact_muse_composer_matches_only_requested_hyphen_soft_wraps() -> None:
 def test_custom_muse_launch_never_accepts_a_trust_prompt() -> None:
     client, calls = _custom_runner("Do you trust this workspace?\n❯ Yes\n  No\n")
     with pytest.raises(HerdrUnavailable, match="trust prompt.*no input"):
-        client.start_pane_agent("worker", "muse", "p1", (), timeout=1)
+        client.start_pane_agent(
+            "worker", "muse", "p1", (),
+            expected_terminal_id="term-1", timeout=1,
+        )
     assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
 
 
 def test_custom_muse_launch_rejects_bare_prompt_without_idle_footer() -> None:
     client, calls = _custom_runner("A choice dialog\n❯\n")
     with pytest.raises(HerdrUnavailable, match="verified idle composer"):
-        client.start_pane_agent("worker", "muse", "p1", (), timeout=0.01)
+        client.start_pane_agent(
+            "worker", "muse", "p1", (),
+            expected_terminal_id="term-1", timeout=0.01,
+        )
     assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
 
 
@@ -447,7 +562,10 @@ def test_custom_muse_launch_rejects_auto_review_without_versioned_header() -> No
         "watermelon-preview · xhigh · /work/project · Auto-review\n"
     )
     with pytest.raises(HerdrUnavailable, match="verified idle composer"):
-        client.start_pane_agent("worker", "muse", "p1", (), timeout=0.01)
+        client.start_pane_agent(
+            "worker", "muse", "p1", (),
+            expected_terminal_id="term-1", timeout=0.01,
+        )
     assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
 
 
@@ -484,7 +602,10 @@ def test_custom_muse_explicit_executable_is_absolute_and_validated(tmp_path: Pat
         environ={"AGENTCTL_MUSE_BIN": str(script)},
     )
     with pytest.raises(HerdrUnavailable, match="native ELF"):
-        scripted.start_pane_agent("worker", "muse", "p1", (), timeout=1)
+        scripted.start_pane_agent(
+            "worker", "muse", "p1", (),
+            expected_terminal_id="term-1", timeout=1,
+        )
 
 
 def test_custom_harness_rejects_same_name_at_a_different_executable_path() -> None:
@@ -519,6 +640,7 @@ def test_legacy_recovery_uses_basename_only_with_exact_image_and_arguments() -> 
         identity, process_group, _path = observed
         response = {"result": {"process_info": {
             "pane_id": "p1", "shell_pid": 1,
+            "terminal_id": "term-1",
             "foreground_process_group_id": process_group,
             "foreground_processes": [{
                 "pid": process.pid, "name": "sleep", "cmdline": f"{executable} 30",
@@ -531,11 +653,13 @@ def test_legacy_recovery_uses_basename_only_with_exact_image_and_arguments() -> 
         assert client.recover_pane_agent(
             "p1", ("sleep", "30"), identity.executable_device,
             identity.executable_inode, process.pid,
+            expected_terminal_id="term-1",
         ) == identity
         with pytest.raises(HerdrUnavailable, match="argv does not exactly match"):
             client.recover_pane_agent(
                 "p1", ("sleep", "31"), identity.executable_device,
                 identity.executable_inode, process.pid,
+                expected_terminal_id="term-1",
             )
     finally:
         process.terminate()
@@ -552,6 +676,7 @@ def test_recovered_publication_detects_exit_after_commit_through_pinned_pidfd() 
         identity, process_group, _path = observed
         response = {"result": {"process_info": {
             "pane_id": "p1", "shell_pid": 1,
+            "terminal_id": "term-1",
             "foreground_process_group_id": process_group,
             "foreground_processes": [{
                 "pid": process.pid, "name": "sleep", "cmdline": executable,
@@ -572,7 +697,10 @@ def test_recovered_publication_detects_exit_after_commit_through_pinned_pidfd() 
             process.wait(timeout=5)
 
         with pytest.raises(HerdrUnavailable, match="exited"):
-            client.commit_recovered_pane_agent("p1", "muse", identity, commit)
+            client.commit_recovered_pane_agent(
+                "p1", "muse", identity, commit,
+                expected_terminal_id="term-1",
+            )
         assert committed
     finally:
         if process.poll() is None:
@@ -804,7 +932,9 @@ def test_recorded_custom_process_identity_survives_atomic_executable_replacement
         metadata = executable.stat()
         first_info = ProcessInfo(
             pane_id="p1", shell_pid=1, foreground_pgid=first.pid,
-            foreground=((first.pid, "muse", str(executable), str(executable), None),),
+            foreground=((
+                first.pid, "muse", str(executable), (str(executable), "60"), None,
+            ),),
         )
         identity = client._pane_process_identity(
             first_info, str(executable),
@@ -846,7 +976,9 @@ def test_recorded_custom_process_identity_survives_atomic_executable_replacement
         second = subprocess.Popen([str(executable), "60"], start_new_session=True)
         second_info = ProcessInfo(
             pane_id="p1", shell_pid=1, foreground_pgid=second.pid,
-            foreground=((second.pid, "muse", str(executable), str(executable), None),),
+            foreground=((
+                second.pid, "muse", str(executable), (str(executable), "60"), None,
+            ),),
         )
         assert client._pane_process_identity(second_info, None, identity) is None
     finally:

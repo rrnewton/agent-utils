@@ -150,6 +150,15 @@ def parser() -> argparse.ArgumentParser:
     recover_start.add_argument("--expected-pid", required=True, type=_positive_pid, metavar="PID",
         help="exact live Muse PID whose executable and complete argv must match (required)")
 
+    recover_terminal = command(
+        "recover-terminal",
+        "Bind a legacy live session to its stable Herdr terminal generation.",
+        "agentctl recover-terminal reviewer --expected-token TOKEN",
+        named=True,
+    )
+    recover_terminal.add_argument("--expected-token", required=True, metavar="TOKEN",
+        help="exact registry generation printed by status (required)")
+
     relocate = command(
         "relocate",
         "Move a live one-pane Herdr tab without restarting its agent.",
@@ -407,6 +416,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "recover-start":
             result = sessions.recover_start(
                 name, expected_token=args.expected_token, expected_pid=args.expected_pid,
+            )
+        elif args.command == "recover-terminal":
+            result = sessions.recover_terminal(
+                name, expected_token=args.expected_token,
             )
         elif args.command == "relocate":
             result = sessions.relocate(

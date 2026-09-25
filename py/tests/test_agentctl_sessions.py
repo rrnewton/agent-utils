@@ -170,7 +170,7 @@ def test_steady_headless_status_does_not_rewrite_outer_session_record(
     assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
 
 
-def test_sessions_status_and_list_derive_harness_from_v4_launch_only_record(
+def test_sessions_status_and_list_derive_harness_from_v5_launch_only_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions, _fake, _calls = setup(tmp_path, monkeypatch)
@@ -179,7 +179,8 @@ def test_sessions_status_and_list_derive_harness_from_v4_launch_only_record(
     )
     path = sessions.registry / "worker/agent.json"
     stored = json.loads(path.read_text(encoding="utf-8"))
-    assert stored["schema"] == "agentctl-session/v4"
+    assert stored["schema"] == "agentctl-session/v5"
+    assert stored["terminal_id"] == "term-1"
     assert stored["launch"]["harness"] == "claude"
     assert "harness" not in stored
 

@@ -36,6 +36,7 @@ def setup_foreign(
         pane, "w1", str(tmp_path), "codex", "idle",
         "codex" if native_session else None,
         "native-session" if native_session else None,
+        fake.presentations[-1].terminal_id,
     )
     sessions = Sessions(cast(HerdrClient, fake), tmp_path / "registry")
 
@@ -239,11 +240,13 @@ def test_stop_refuses_dead_foreign_agent_that_leaves_idle_shell_during_capture(
     calls = 0
 
     def changing_idle_shell(
-        pane_id: str, expected: object,
+        pane_id: str, expected: object, *,
+        expected_terminal_id: str | None = None,
     ) -> bool:
         nonlocal calls
         assert pane_id == pane
         assert expected == fake.foreign_shell_identity
+        assert expected_terminal_id == "term-1"
         calls += 1
         return calls == 1
 

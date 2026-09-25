@@ -56,7 +56,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"herdr-agent {__version__}")
     parser.add_argument("--userguide", action="store_true", help="print the installed user guide and exit")
-    parser.add_argument("command", nargs="?", choices=("start", "stop", "list", "wait", "goal", "bind-session", "send", "drain", "status", "read", "userguide"))
+    parser.add_argument("command", nargs="?", choices=("start", "stop", "recover-terminal", "list", "wait", "goal", "bind-session", "send", "drain", "status", "read", "userguide"))
     parser.add_argument("text", nargs="?")
     parser.add_argument("--file", help="read a message from this artifact")
     parser.add_argument("--pane")
@@ -76,7 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--brief", help="initial task after successful launch")
     parser.add_argument("--startup-timeout", type=_ascii_float, default=30.0)
     parser.add_argument("--goal-command-json", help="native Codex goal RPC argv as a JSON string array")
-    parser.add_argument("--expected-token", help="exact current registry generation for stop")
+    parser.add_argument("--expected-token", help="exact current registry generation for stop or terminal recovery")
     parser.add_argument("--recover-legacy-adoption", action="store_true",
         help="recover an identity-less dead adopted row without mutating its pane")
     parser.add_argument("--expected-record-sha256",
@@ -97,7 +97,7 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
     }
     name = args.name
     command = args.command
-    if command != "stop" and (
+    if command not in ("stop", "recover-terminal") and (
         args.expected_token is not None or args.recover_legacy_adoption
         or args.expected_record_sha256 is not None
     ):
@@ -108,7 +108,7 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
         if not isinstance(decoded, list) or not decoded or any(not isinstance(item, str) or not item for item in decoded):
             raise ValueError("goal command must be a nonempty JSON string array")
         goal_command = [str(item) for item in decoded]
-    if command in ("start", "stop"):
+    if command in ("start", "stop", "recover-terminal"):
         if args.text and name:
             raise ValueError("pass the agent name once, as a positional or --name")
         name = name or args.text
@@ -149,6 +149,14 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
             name, expected_token=args.expected_token,
             recover_legacy_adoption=args.recover_legacy_adoption,
             expected_record_sha256=args.expected_record_sha256,
+        )
+    elif command == "recover-terminal":
+        if args.expected_token is None:
+            raise ValueError("recover-terminal requires --expected-token")
+        if args.recover_legacy_adoption or args.expected_record_sha256 is not None:
+            raise ValueError("legacy adoption stop recovery does not apply to recover-terminal")
+        result = manager.recover_terminal(
+            name, expected_token=args.expected_token,
         )
     elif command == "list":
         if args.text or args.name:
@@ -251,7 +259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     target = _target(args)
     queue = os.path.abspath(str(args.queue))
     try:
-        if args.name is not None or args.command in ("start", "stop", "list", "wait", "goal", "bind-session"):
+        if args.name is not None or args.command in ("start", "stop", "recover-terminal", "list", "wait", "goal", "bind-session"):
             return _managed(args, client)
         if args.command == "send":
             result = send(

@@ -17,6 +17,7 @@ import pytest
 
 from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneMove, PaneShellProof,
+    RuntimeGuard,
 )
 from agentctl.errors import (
     AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable,
@@ -59,6 +60,7 @@ class FakeManagedClient:
         self.wait_fails = False
         self.working_after_prompt = False
         self.custom_at_idle_shell = True
+        self.capability_checks = 0
         self.custom_identity = CustomProcessIdentity(
             version=1, boot_id="00000000-0000-0000-0000-000000000000",
             pid=200, starttime_ticks=200, executable_device=1, executable_inode=2,
@@ -67,6 +69,9 @@ class FakeManagedClient:
             version=1, boot_id="11111111-2222-3333-4444-555555555555",
             pid=100, starttime_ticks=100, executable_device=3, executable_inode=4,
         )
+
+    def require_terminal_identity_support(self) -> None:
+        self.capability_checks += 1
 
     def workspace_id_for_label(self, label: str) -> str | None:
         assert label == "subagents"
@@ -77,12 +82,14 @@ class FakeManagedClient:
 
     def create_workspace(
         self, *, label: str, cwd: str, environment: tuple[str, ...] = (),
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, str]:
         self.workspace = "w1"
         tab = self.create_tab(
             workspace_id="w1", label=label, cwd=cwd, environment=environment
         )
-        return "w1", tab, self.presentations[-1].pane_id
+        pane = self.presentations[-1]
+        assert pane.terminal_id is not None
+        return "w1", tab, pane.pane_id, pane.terminal_id
 
     def create_tab(
         self, *, workspace_id: str, label: str, cwd: str,
@@ -93,24 +100,35 @@ class FakeManagedClient:
         self.serial += 1
         tab, pane = f"w1:t{self.serial}", f"w1:p{self.serial}"
         self.presentations.append(Pane(pane, tab, workspace_id, f"term-{self.serial}"))
-        self.infos[pane] = AgentPaneInfo(pane, workspace_id, cwd, None, "unknown", None, None)
+        self.infos[pane] = AgentPaneInfo(
+            pane, workspace_id, cwd, None, "unknown", None, None,
+            f"term-{self.serial}",
+        )
         return tab
 
-    def rename_tab(self, tab_id: str, label: str) -> None:
-        del tab_id, label
+    def rename_tab(
+        self, tab_id: str, label: str, *, expected_terminal_id: str,
+    ) -> None:
+        assert any(
+            pane.tab_id == tab_id and pane.terminal_id == expected_terminal_id
+            for pane in self.presentations
+        )
+        del label
 
     def create_tab_with_pane(
         self, *, workspace_id: str, label: str, cwd: str,
         environment: tuple[str, ...] = (),
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str]:
         tab = self.create_tab(
             workspace_id=workspace_id, label=label, cwd=cwd,
             environment=environment,
         )
-        return tab, self.presentations[-1].pane_id
+        pane = self.presentations[-1]
+        assert pane.terminal_id is not None
+        return tab, pane.pane_id, pane.terminal_id
 
     def move_pane_to_new_tab(
-        self, pane_id: str, *, expected_terminal_id: str,
+        self, pane_id: str, *, guard: RuntimeGuard,
         workspace_id: str, label: str,
     ) -> PaneMove:
         del label
@@ -122,7 +140,7 @@ class FakeManagedClient:
                 for item in self.presentations
             ]
         old = next(item for item in self.presentations if item.pane_id == pane_id)
-        if old.terminal_id != expected_terminal_id:
+        if old.terminal_id != guard.terminal_id:
             raise HerdrUnavailable("conditional terminal identity changed")
         self.move_count += 1
         moved = Pane(
@@ -148,19 +166,68 @@ class FakeManagedClient:
             old.tab_id, old.workspace_id, moved,
         )
 
-    def start_agent(self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float) -> None:
+    def start_agent(
+        self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *,
+        expected_terminal_id: str, timeout: float,
+    ) -> None:
         assert timeout > 0
+        assert self._terminal(pane_id) == expected_terminal_id
         self.launched.append((name, kind, pane_id, arguments))
         if self.fail_start:
             raise HerdrUnavailable("trust prompt needs attention")
         self.infos[pane_id] = replace(self.infos[pane_id], agent=kind, status="idle", session_agent=kind, session_value=f"session-{self.serial}")
 
+    def capture_runtime_process_identity(
+        self, pane_id: str, kind: str, launch_argv: tuple[str, ...], *,
+        expected_terminal_id: str,
+        expected_identity: CustomProcessIdentity | None = None,
+        timeout: float = 30.0,
+    ) -> CustomProcessIdentity:
+        assert timeout > 0
+        assert self._terminal(pane_id) == expected_terminal_id
+        launches = [
+            entry for entry in reversed(self.launched) if entry[2] == pane_id
+        ]
+        expected = tuple(launch_argv)
+        if launches:
+            expected = (kind, *launches[0][3])
+            if kind == "muse":
+                expected = ("/opt/agentctl/muse", *launches[0][3])
+        assert (
+            tuple(launch_argv) == expected
+            or (
+                launch_argv[0] == kind
+                and tuple(launch_argv[1:]) == expected[1:]
+            )
+        )
+        if kind == "muse" and not self.custom_running:
+            raise HerdrUnavailable("owned harness is not the foreground process")
+        if expected_identity is not None and expected_identity != self.custom_identity:
+            raise RuntimeIdentityMismatch("owned harness process generation changed")
+        return self.custom_identity
+
+    def verify_runtime_process_identity(
+        self, pane_id: str, kind: str, launch_argv: tuple[str, ...],
+        expected_identity: CustomProcessIdentity | None, *,
+        expected_terminal_id: str, timeout: float = 30.0,
+    ) -> None:
+        observed = self.capture_runtime_process_identity(
+            pane_id, kind, launch_argv,
+            expected_terminal_id=expected_terminal_id,
+            expected_identity=expected_identity,
+            timeout=timeout,
+        )
+        if observed != expected_identity:
+            raise RuntimeIdentityMismatch("owned harness process generation changed")
+
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: tuple[str, ...], *, timeout: float,
+        expected_terminal_id: str,
         on_launch_intent: Callable[[str, int, int, tuple[str, ...]], None] | None = None,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
     ) -> CustomProcessIdentity:
         assert timeout > 0
+        assert self._terminal(pane_id) == expected_terminal_id
         self.launched.append((name, kind, pane_id, arguments))
         self.custom_running = True
         if on_launch_intent is not None:
@@ -181,9 +248,10 @@ class FakeManagedClient:
 
     def recover_pane_agent(
         self, pane_id: str, expected_argv: tuple[str, ...], expected_device: int,
-        expected_inode: int, expected_pid: int,
+        expected_inode: int, expected_pid: int, *, expected_terminal_id: str,
     ) -> CustomProcessIdentity:
         assert pane_id in self.infos
+        assert self._terminal(pane_id) == expected_terminal_id
         assert tuple(expected_argv) in {
             ("/opt/agentctl/muse", *self.launched[-1][3]),
             ("muse", *self.launched[-1][3]),
@@ -197,23 +265,36 @@ class FakeManagedClient:
 
     def commit_recovered_pane_agent(
         self, pane_id: str, kind: str, identity: CustomProcessIdentity,
-        commit: Callable[[], None],
+        commit: Callable[[], None], *, expected_terminal_id: str,
     ) -> None:
-        self.verify_custom_harness(pane_id, kind, identity)
+        self.verify_custom_harness(
+            pane_id, kind, identity,
+            expected_terminal_id=expected_terminal_id,
+        )
         commit()
         if self.custom_dies_during_recovery_commit:
             self.custom_dies_during_recovery_commit = False
             self.custom_running = False
-        self.verify_custom_harness(pane_id, kind, identity)
+        self.verify_custom_harness(
+            pane_id, kind, identity,
+            expected_terminal_id=expected_terminal_id,
+        )
 
-    def report_pane_agent(self, pane_id: str, kind: str, state: str) -> None:
+    def report_pane_agent(
+        self, pane_id: str, kind: str, state: str, *,
+        guard: RuntimeGuard,
+    ) -> None:
+        self._assert_guard(pane_id, guard)
         assert state == "idle"
         self.infos[pane_id] = replace(self.infos[pane_id], agent=kind, status=state)
 
     def verify_custom_harness(
         self, pane_id: str, kind: str,
         expected_identity: CustomProcessIdentity | None = None,
+        *, expected_terminal_id: str | None = None,
     ) -> None:
+        if expected_terminal_id is not None:
+            assert self._terminal(pane_id) == expected_terminal_id
         if (self.infos[pane_id].agent not in (None, kind) or not self.custom_running
                 or (expected_identity is not None
                     and expected_identity != self.custom_identity)):
@@ -226,46 +307,74 @@ class FakeManagedClient:
             return True
         return not self.custom_running
 
-    def pane_is_idle_shell(self, pane_id: str) -> bool:
+    def pane_is_idle_shell(
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+    ) -> bool:
         assert pane_id in self.infos
+        if expected_terminal_id is not None:
+            assert self._terminal(pane_id) == expected_terminal_id
         return self.custom_at_idle_shell
 
-    def pane_shell_identity(self, pane_id: str) -> CustomProcessIdentity:
+    def pane_shell_identity(
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+    ) -> CustomProcessIdentity:
         assert pane_id in self.infos
+        if expected_terminal_id is not None:
+            assert self._terminal(pane_id) == expected_terminal_id
         return self.foreign_shell_identity
 
     def verify_pane_shell_identity(
         self, pane_id: str, expected: CustomProcessIdentity,
+        *, expected_terminal_id: str | None = None,
     ) -> None:
         assert pane_id in self.infos
+        if expected_terminal_id is not None:
+            assert self._terminal(pane_id) == expected_terminal_id
         if expected != self.foreign_shell_identity:
             raise RuntimeIdentityMismatch("recorded pane shell generation changed")
 
     def pane_is_same_idle_shell(
         self, pane_id: str, expected: CustomProcessIdentity,
+        *, expected_terminal_id: str | None = None,
     ) -> bool:
         assert pane_id in self.infos
+        if expected_terminal_id is not None:
+            assert self._terminal(pane_id) == expected_terminal_id
         return self.custom_at_idle_shell and expected == self.foreign_shell_identity
 
-    def pane_idle_shell_identity(self, pane_id: str) -> PaneShellProof | None:
+    def pane_idle_shell_identity(
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+    ) -> PaneShellProof | None:
         assert pane_id in self.infos
+        if expected_terminal_id is not None:
+            assert self._terminal(pane_id) == expected_terminal_id
         if not self.custom_at_idle_shell:
             return None
         return PaneShellProof(
             self.foreign_shell_identity, str(Path("/bin/bash").resolve())
         )
 
-    def agent_pane(self, name: str) -> str:
+    def agent_pane(
+        self, name: str, *, expected_terminal_id: str | None = None,
+    ) -> str:
         matches = [entry[2] for entry in self.launched if entry[0] == name]
         if self.offline or not matches:
             raise HerdrUnavailable("server unavailable or named agent missing")
-        return matches[-1]
+        pane_id = matches[-1]
+        if expected_terminal_id is not None:
+            assert self._terminal(pane_id) == expected_terminal_id
+        return pane_id
 
-    def pane_info(self, pane_id: str) -> AgentPaneInfo:
+    def pane_info(
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+    ) -> AgentPaneInfo:
         self.pane_info_calls += 1
         if self.offline:
             raise HerdrUnavailable("server unavailable")
-        return self.infos[pane_id]
+        info = self.infos[pane_id]
+        if expected_terminal_id is not None:
+            assert info.terminal_id == expected_terminal_id
+        return info
 
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
         self.panes_calls += 1
@@ -276,23 +385,39 @@ class FakeManagedClient:
             if workspace_id is None or pane.workspace_id == workspace_id
         )
 
-    def prompt_agent(self, pane_id: str, text: str) -> None:
+    def prompt_agent(
+        self, pane_id: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
         assert pane_id in self.infos
+        self._assert_guard(pane_id, guard)
         self.submitted.append(text)
         if self.working_after_prompt:
             self.infos[pane_id] = replace(self.infos[pane_id], status="working")
 
-    def send_text(self, pane_id: str, text: str) -> None:
+    def send_text(
+        self, pane_id: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
         assert pane_id in self.infos
+        self._assert_guard(pane_id, guard)
         self.sent_texts.append(text)
 
-    def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
+    def wait_agent_status(
+        self, pane_id: str, status: str, timeout_ms: int, *,
+        guard: RuntimeGuard | None = None,
+    ) -> None:
         assert pane_id in self.infos and status == "working" and timeout_ms > 0
+        if guard is not None:
+            self._assert_guard(pane_id, guard)
         if self.wait_fails:
             raise HerdrUnavailable("simulated lost Herdr status event")
 
-    def read(self, pane_id: str, *, source: str, lines: int) -> str:
+    def read(
+        self, pane_id: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
         assert pane_id in self.infos and lines > 0
+        if guard is not None:
+            self._assert_guard(pane_id, guard)
         if source == "recent-unwrapped":
             return ""
         if self.custom_running:
@@ -305,24 +430,55 @@ class FakeManagedClient:
             return "Muse Code\nWorking…\n"
         return "human and coordinator transcript\n"
 
-    def close_tab(self, tab_id: str) -> None:
+    def close_tab(self, tab_id: str, *, guard: RuntimeGuard) -> None:
+        assert any(
+            pane.tab_id == tab_id and pane.terminal_id == guard.terminal_id
+            for pane in self.presentations
+        )
         self.closed.append(tab_id)
         self.presentations = [pane for pane in self.presentations if pane.tab_id != tab_id]
 
-    def close_pane(self, pane_id: str) -> None:
+    def close_pane(self, pane_id: str, *, guard: RuntimeGuard) -> None:
+        self._assert_guard(pane_id, guard)
         tab = next(pane.tab_id for pane in self.presentations if pane.pane_id == pane_id)
         self.closed.append(tab)
         self.presentations = [pane for pane in self.presentations if pane.pane_id != pane_id]
 
-    def focus_pane(self, pane_id: str) -> None:
+    def focus_pane(
+        self, pane_id: str, *, guard: RuntimeGuard | None = None,
+    ) -> None:
         assert pane_id in self.infos
+        if guard is not None:
+            self._assert_guard(pane_id, guard)
 
-    def report_agent_session(self, name: str, pane_id: str, kind: str, session_id: str) -> None:
-        assert self.agent_pane(name) == pane_id
+    def report_agent_session(
+        self, name: str, pane_id: str, kind: str, session_id: str, *,
+        guard: RuntimeGuard,
+    ) -> None:
+        assert self.agent_pane(
+            name, expected_terminal_id=guard.terminal_id,
+        ) == pane_id
         self.infos[pane_id] = replace(self.infos[pane_id], session_agent=kind, session_value=session_id)
 
-    def send_keys(self, pane_id: str, keys: str) -> None:
+    def send_keys(
+        self, pane_id: str, keys: str, *, guard: RuntimeGuard,
+    ) -> None:
         assert pane_id in self.infos and keys == "Enter"
+        self._assert_guard(pane_id, guard)
+
+    def _terminal(self, pane_id: str) -> str:
+        terminal_id = self.infos[pane_id].terminal_id
+        assert terminal_id is not None
+        return terminal_id
+
+    def _assert_guard(self, pane_id: str, guard: RuntimeGuard) -> None:
+        if self._terminal(pane_id) != guard.terminal_id:
+            raise RuntimeIdentityMismatch("terminal generation changed")
+        if (guard.process_identity is not None
+                and guard.process_identity not in (
+            self.custom_identity, self.foreign_shell_identity,
+        )):
+            raise RuntimeIdentityMismatch("runtime process generation changed")
 
 
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ManagedAgents, FakeManagedClient]:
@@ -362,6 +518,129 @@ def test_explicit_workspace_label_never_creates_a_typo_workspace(
         )
     assert fake.presentations == []
     assert fake.launched == []
+
+
+def test_start_capability_refusal_precedes_all_persistent_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+
+    def refuse() -> None:
+        raise HerdrUnavailable("atomic generation guards are unsupported")
+
+    monkeypatch.setattr(fake, "require_terminal_identity_support", refuse)
+    with pytest.raises(HerdrUnavailable, match="generation guards"):
+        manager.start("worker", cwd=str(tmp_path))
+
+    assert fake.presentations == []
+    assert fake.launched == []
+    assert not manager.registry.exists()
+
+
+def test_start_recovers_exact_private_empty_interrupted_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager._prepare()
+    interrupted = manager.registry / "worker"
+    interrupted.mkdir(mode=0o700)
+
+    started = manager.start("worker", cwd=str(tmp_path))
+
+    assert started["name"] == "worker"
+    assert (interrupted / "agent.json").is_file()
+    assert len(fake.presentations) == 1
+
+
+@pytest.mark.parametrize("unsafe", ("nonempty", "symlink", "foreign-mode"))
+def test_start_refuses_nonempty_or_unsafe_reserved_directory(
+    unsafe: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager._prepare()
+    reserved = manager.registry / "worker"
+    if unsafe == "symlink":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        reserved.symlink_to(outside, target_is_directory=True)
+    else:
+        reserved.mkdir(mode=0o700)
+        if unsafe == "nonempty":
+            (reserved / "retained").write_text("do not remove", encoding="utf-8")
+        else:
+            reserved.chmod(0o755)
+
+    with pytest.raises(AgentDeliveryError):
+        manager.start("worker", cwd=str(tmp_path))
+
+    assert os.path.lexists(reserved)
+    assert fake.presentations == []
+    if unsafe == "nonempty":
+        assert (reserved / "retained").read_text(encoding="utf-8") == "do not remove"
+
+
+def test_adopt_capability_refusal_precedes_registry_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+
+    def refuse() -> None:
+        raise HerdrUnavailable("atomic generation guards are unsupported")
+
+    monkeypatch.setattr(fake, "require_terminal_identity_support", refuse)
+    with pytest.raises(HerdrUnavailable, match="generation guards"):
+        manager.adopt(
+            "worker", pane_id="uninspected-pane", expected_workspace="subagents",
+            expected_cwd=str(tmp_path), harness="codex",
+        )
+
+    assert not manager.registry.exists()
+
+
+def test_relocate_capability_refusal_preserves_record_and_live_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    path = manager.registry / "worker" / "agent.json"
+    before = path.read_bytes()
+    presentation = fake.presentations[0]
+
+    def refuse() -> None:
+        raise HerdrUnavailable("atomic generation guards are unsupported")
+
+    monkeypatch.setattr(fake, "require_terminal_identity_support", refuse)
+    with pytest.raises(HerdrUnavailable, match="generation guards"):
+        manager.relocate("worker", workspace_id="w2", new_tab=True)
+
+    assert path.read_bytes() == before
+    assert fake.presentations == [presentation]
+    assert fake.move_count == 0
+
+
+def test_relocate_refuses_adopted_foreign_runtime_before_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    fake.workspace = "w1"
+    fake.create_tab(
+        workspace_id="w1", label="foreign", cwd=str(tmp_path),
+    )
+    pane = fake.presentations[-1]
+    fake.infos[pane.pane_id] = AgentPaneInfo(
+        pane.pane_id, "w1", str(tmp_path), "codex", "idle",
+        "codex", "foreign-session", pane.terminal_id,
+    )
+    manager.adopt(
+        "foreign", pane_id=pane.pane_id, expected_workspace="subagents",
+        expected_cwd=str(tmp_path), harness="codex",
+    )
+
+    with pytest.raises(AgentDeliveryError, match="owned foreground runtime"):
+        manager.relocate("foreign", workspace_id="w2", new_tab=True)
+
+    assert fake.move_count == 0
+    assert fake.presentations == [pane]
 
 
 def test_relocate_preserves_runtime_and_queue_and_commits_new_route(
@@ -606,9 +885,10 @@ def test_adopted_shell_health_uses_typed_identity_failure(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     fake.workspace = "w1"
-    fake.presentations.append(Pane("w1:p1", "w1:t1", "w1"))
+    fake.presentations.append(Pane("w1:p1", "w1:t1", "w1", "term-foreign"))
     fake.infos["w1:p1"] = AgentPaneInfo(
         "w1:p1", "w1", str(tmp_path), "codex", "idle", "codex", "thread",
+        "term-foreign",
     )
     adopted = manager.adopt(
         "foreign", pane_id="w1:p1", expected_workspace="subagents",
@@ -617,7 +897,7 @@ def test_adopted_shell_health_uses_typed_identity_failure(
     assert adopted["runtime_ownership"] == "foreign"
 
     def fail_identity(
-        _pane: str, _expected: CustomProcessIdentity,
+        _pane: str, _expected: CustomProcessIdentity, **_options: object,
     ) -> None:
         raise error
 
@@ -652,20 +932,26 @@ def test_health_does_not_call_live_muse_process_probe_failure_dead(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="muse")
-    original_verify = fake.verify_custom_harness
+    original_verify = fake.verify_runtime_process_identity
     calls = 0
 
     def fail_first_verification(
         pane_id: str, kind: str,
+        launch_argv: tuple[str, ...],
         expected_identity: CustomProcessIdentity | None = None,
+        **_options: object,
     ) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise HerdrUnavailable("transient process-info response")
-        original_verify(pane_id, kind, expected_identity)
+            original_verify(
+                pane_id, kind, launch_argv, expected_identity, **_options,
+            )
 
-    monkeypatch.setattr(fake, "verify_custom_harness", fail_first_verification)
+    monkeypatch.setattr(
+        fake, "verify_runtime_process_identity", fail_first_verification,
+    )
     result = manager.health(["worker"], checked_at=123.0)
     session = cast(list[dict[str, object]], result["sessions"])[0]
     assert fake.custom_running is True
@@ -931,7 +1217,9 @@ def test_failed_launch_cleanup_refuses_replacement_harness(tmp_path: Path, monke
     with pytest.raises(AgentDeliveryError):
         manager.start("failed", cwd=str(tmp_path))
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], agent="codex", status="idle")
-    monkeypatch.setattr(fake, "agent_pane", lambda _name: "w1:p-other")
+    monkeypatch.setattr(
+        fake, "agent_pane", lambda _name, **_options: "w1:p-other",
+    )
     with pytest.raises(HerdrUnavailable, match="no longer owns"):
         manager.stop("failed")
     assert fake.closed == []
@@ -962,7 +1250,7 @@ def test_muse_process_identity_is_saved_before_trust_failure_and_permits_stop(
     failed = manager.get("failed")
     assert failed.lifecycle == "launch_failed"
     assert failed.pane_reported_by_agentctl is False
-    assert failed.custom_process_identity == fake.custom_identity
+    assert failed.runtime_process_identity == fake.custom_identity
     assert manager.stop("failed")["pane_closed"] is True
 
 
@@ -978,7 +1266,7 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
     assert started["runtime_ownership"] == "owned"
     record = replace(
         manager.get("worker"), lifecycle="launch_failed",
-        custom_process_identity=None, pane_reported_by_agentctl=False,
+        runtime_process_identity=None, pane_reported_by_agentctl=False,
         error="transient process-info response",
     )
     manager._save(record)
@@ -1002,7 +1290,7 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
         )
     partially_recovered = manager.get("worker")
     assert partially_recovered.lifecycle == "launch_failed"
-    assert partially_recovered.custom_process_identity == fake.custom_identity
+    assert partially_recovered.runtime_process_identity == fake.custom_identity
     assert partially_recovered.pane_reported_by_agentctl is False
 
     fake.custom_running = True
@@ -1026,7 +1314,7 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
     )
     assert recovered["lifecycle"] == "running"
     assert recovered["probe_error"] is None
-    recovered_identity = cast(dict[str, object], recovered["custom_process_identity"])
+    recovered_identity = cast(dict[str, object], recovered["runtime_process_identity"])
     assert recovered_identity["pid"] == fake.custom_identity.pid
     assert manager.get("worker").error is None
     assert manager.get("worker").pane_reported_by_agentctl is False
@@ -1042,7 +1330,7 @@ def test_starting_muse_after_launch_before_identity_callback_is_recoverable(
     )
     record = replace(
         manager.get("worker"), lifecycle="starting",
-        custom_process_identity=None, pane_reported_by_agentctl=False,
+        runtime_process_identity=None, pane_reported_by_agentctl=False,
         session_agent=None, session_value=None,
         error=None,
     )
@@ -1058,12 +1346,12 @@ def test_starting_muse_after_launch_before_identity_callback_is_recoverable(
     )
 
     assert recovered["lifecycle"] == "running"
-    assert recovered["custom_process_identity"]["pid"] == fake.custom_identity.pid
+    assert recovered["runtime_process_identity"]["pid"] == fake.custom_identity.pid
     assert manager.get("worker").error is None
     assert fake.submitted == []
 
 
-def test_custom_process_identity_outweighs_a_missing_native_agent_label(
+def test_runtime_process_identity_outweighs_a_missing_native_agent_label(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
@@ -1074,7 +1362,7 @@ def test_custom_process_identity_outweighs_a_missing_native_agent_label(
 
     status = manager.status("worker")
 
-    assert started["custom_process_identity"] == status["custom_process_identity"]
+    assert started["runtime_process_identity"] == status["runtime_process_identity"]
     assert status["agent"] == "muse"
     assert status["agent_status"] == "idle"
     assert status["probe_error"] is None
@@ -1129,7 +1417,7 @@ def test_failed_muse_recovery_does_not_report_idle_without_idle_composer(
     started = manager.start("worker", cwd=str(tmp_path), harness="muse")
     record = replace(
         manager.get("worker"), lifecycle="launch_failed",
-        custom_process_identity=None, pane_reported_by_agentctl=False,
+        runtime_process_identity=None, pane_reported_by_agentctl=False,
         session_agent=None, session_value=None,
         error="transient process-info response",
     )
@@ -1154,7 +1442,7 @@ def test_failed_muse_recovery_does_not_report_idle_without_idle_composer(
     partial = manager.get("worker")
     assert partial.lifecycle == "launch_failed"
     assert partial.pane_reported_by_agentctl is False
-    assert partial.custom_process_identity == fake.custom_identity
+    assert partial.runtime_process_identity == fake.custom_identity
     assert "no verified idle composer" in str(partial.error)
     assert reports == []
     assert fake.submitted == []
@@ -1169,7 +1457,7 @@ def test_unreported_starting_muse_without_identity_is_not_assumed_to_own_idle_sh
     document = json.loads(path.read_text(encoding="utf-8"))
     document["lifecycle"] = "starting"
     document["pane_reported_by_agentctl"] = False
-    document["custom_process_identity"] = None
+    document["runtime_process_identity"] = None
     path.write_text(json.dumps(document), encoding="utf-8")
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], agent=None)
 
@@ -1225,7 +1513,11 @@ def test_live_muse_paused_goal_is_healthy_but_not_ready(
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
     divider = "─" * 40
 
-    def paused_screen(_pane: str, *, source: str, lines: int) -> str:
+    def paused_screen(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         del source, lines
         return (
             f"Muse Code 1.4.0\n{divider}\n❯\n{divider}\n"
@@ -1504,13 +1796,17 @@ def test_submission_waiting_for_lifecycle_holds_neither_queue_nor_target_lock(
     original_guard = manager._submission_guard
     first_probe = True
 
-    def blocking_info(pane_id: str) -> AgentPaneInfo:
+    def blocking_info(
+        pane_id: str, *, expected_terminal_id: str | None = None,
+    ) -> AgentPaneInfo:
         nonlocal first_probe
         if first_probe:
             first_probe = False
             readiness.set()
             assert release_readiness.wait(5)
-        return original_info(pane_id)
+        return original_info(
+            pane_id, expected_terminal_id=expected_terminal_id,
+        )
 
     @contextmanager
     def observed_guard(record: AgentRecord) -> Iterator[None]:
@@ -1712,7 +2008,7 @@ def test_session_replacement_and_extra_panes_refuse_delivery_or_teardown(
     with pytest.raises(AgentDeliveryError, match="native session identity changed"):
         manager.send("worker", "must not reach replacement")
     fake.infos["w1:p1"] = original
-    fake.presentations.append(Pane("w1:p2", "w1:t1", "w1"))
+    fake.presentations.append(Pane("w1:p2", "w1:t1", "w1", "term-human"))
     with pytest.raises(AgentDeliveryError, match="ownership changed"):
         manager.stop("worker")
     assert fake.submitted == fake.closed == []
@@ -1745,6 +2041,54 @@ def test_stop_preserves_queue_and_output_and_allows_name_reuse(tmp_path: Path, m
     fresh = manager.start("worker", cwd=str(tmp_path))
     assert fresh["token"] != original["token"]
     assert fresh["pane_id"] != original["pane_id"]
+
+
+def test_managed_dead_retirement_guards_read_and_close_with_live_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path))
+    pane_id = cast(str, started["pane_id"])
+    fake.infos[pane_id] = replace(
+        fake.infos[pane_id],
+        agent=None,
+        status="unknown",
+        session_agent=None,
+        session_value=None,
+    )
+    guards: list[RuntimeGuard] = []
+    original_read = fake.read
+    original_close = fake.close_pane
+
+    def guarded_read(
+        pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None
+        guards.append(guard)
+        return original_read(pane, source=source, lines=lines, guard=guard)
+
+    def guarded_close(pane: str, *, guard: RuntimeGuard) -> None:
+        guards.append(guard)
+        original_close(pane, guard=guard)
+
+    monkeypatch.setattr(fake, "read", guarded_read)
+    monkeypatch.setattr(fake, "close_pane", guarded_close)
+
+    stopped = manager.stop(
+        "worker", expected_token=cast(str, started["token"]),
+    )
+
+    assert stopped["managed_dead"] is True
+    assert guards
+    assert all(guard.terminal_id == "term-1" for guard in guards)
+    assert all(
+        guard.process_identity == fake.foreign_shell_identity for guard in guards
+    )
+    assert all(guard.process_identity != fake.custom_identity for guard in guards)
+    replacement = manager.start("worker", cwd=str(tmp_path))
+    assert replacement["token"] != started["token"]
+    assert replacement["pane_id"] != pane_id
 
 
 def test_confirmed_missing_pane_can_be_archived(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1788,6 +2132,30 @@ def test_goal_read_refuses_a_name_reused_during_native_lookup(
         manager.goal("worker")
 
 
+def test_goal_read_refuses_same_token_goal_change_during_native_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path))
+
+    def replace_goal(
+        _session: str, _command: object = None,
+    ) -> dict[str, object]:
+        current = manager.get("worker")
+        assert current.token == started["token"]
+        current.goal = "new same-token objective"
+        manager._save(current)
+        return {"status": "active", "objective": "stale objective"}
+
+    monkeypatch.setattr(native_goal, "get_goal", replace_goal)
+
+    with pytest.raises(AgentDeliveryError, match="goal identity changed"):
+        manager.goal("worker")
+
+    assert manager.get("worker").token == started["token"]
+    assert manager.get("worker").goal == "new same-token objective"
+
+
 @pytest.mark.parametrize("tamper", ("kind", "text"))
 def test_goal_delivery_requires_the_exact_tagged_queue_artifact(
     tamper: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1822,12 +2190,19 @@ def test_collapsed_muse_paste_withholds_enter_then_reconciles_exact_user_turn(
     divider = "────────────────\n"
     footer = "kiki · xhigh · /work · YOLO\n"
 
-    def send_text(_pane: str, text: str) -> None:
+    def send_text(
+        _pane: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
+        assert guard.terminal_id == "term-1"
         nonlocal pasted
         assert prompt in text
         pasted = True
 
-    def read(_pane: str, *, source: str, lines: int) -> str:
+    def read(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         assert lines > 0
         if transcript:
             return transcript
@@ -1838,7 +2213,10 @@ def test_collapsed_muse_paste_withholds_enter_then_reconciles_exact_user_turn(
 
     transcript = ""
     monkeypatch.setattr(fake, "send_text", send_text, raising=False)
-    monkeypatch.setattr(fake, "send_keys", lambda _pane, key: keys.append(key))
+    monkeypatch.setattr(
+        fake, "send_keys",
+        lambda _pane, key, **_options: keys.append(key),
+    )
     monkeypatch.setattr(fake, "read", read)
     with pytest.raises(AgentPossiblySubmitted) as raised:
         manager.send(
@@ -1900,17 +2278,27 @@ def test_long_lived_muse_uses_unwrapped_editor_evidence_before_enter(
     entered = False
     sources: list[str] = []
 
-    def send_text(_pane: str, text: str) -> None:
+    def send_text(
+        _pane: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
+        assert guard.terminal_id == "term-1"
         nonlocal pasted
         assert prompt in text
         pasted = True
 
-    def send_keys(_pane: str, key: str) -> None:
+    def send_keys(
+        _pane: str, key: str, *, guard: RuntimeGuard,
+    ) -> None:
+        assert guard.terminal_id == "term-1"
         nonlocal entered
         assert key == "Enter"
         entered = True
 
-    def read(_pane: str, *, source: str, lines: int) -> str:
+    def read(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         sources.append(source)
         assert lines > 0
         if source == "visible":
@@ -1962,7 +2350,11 @@ def test_muse_submits_matching_prebuffered_prompt_once_without_reinjection(
     paste_calls: list[str] = []
     keys: list[str] = []
 
-    def read(_pane: str, *, source: str, lines: int) -> str:
+    def read(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         assert source in ("visible", "recent-unwrapped") and lines > 0
         if entered:
             return (
@@ -1972,7 +2364,10 @@ def test_muse_submits_matching_prebuffered_prompt_once_without_reinjection(
             )
         return staged
 
-    def send_keys(_pane: str, key: str) -> None:
+    def send_keys(
+        _pane: str, key: str, *, guard: RuntimeGuard,
+    ) -> None:
+        assert guard.terminal_id == "term-1"
         nonlocal entered
         keys.append(key)
         assert key == "Enter" and not entered
@@ -1980,7 +2375,7 @@ def test_muse_submits_matching_prebuffered_prompt_once_without_reinjection(
 
     monkeypatch.setattr(fake, "read", read)
     monkeypatch.setattr(
-        fake, "send_text", lambda _pane, text: paste_calls.append(text),
+        fake, "send_text", lambda _pane, text, **_options: paste_calls.append(text),
         raising=False,
     )
     monkeypatch.setattr(fake, "send_keys", send_keys)
@@ -2010,7 +2405,11 @@ def test_muse_completed_turn_beyond_200_lines_uses_bounded_deep_history(
     keys: list[str] = []
     reads: list[tuple[str, int]] = []
 
-    def read(_pane: str, *, source: str, lines: int) -> str:
+    def read(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         assert source in ("visible", "recent-unwrapped") and lines > 0
         reads.append((source, lines))
         if not submitted:
@@ -2022,7 +2421,10 @@ def test_muse_completed_turn_beyond_200_lines_uses_bounded_deep_history(
         )
         return "\n".join(full.splitlines()[-lines:]) + "\n"
 
-    def send_keys(_pane: str, key: str) -> None:
+    def send_keys(
+        _pane: str, key: str, *, guard: RuntimeGuard,
+    ) -> None:
+        assert guard.terminal_id == "term-1"
         nonlocal submitted
         assert key == "Enter" and not submitted
         keys.append(key)
@@ -2057,7 +2459,11 @@ def test_claude_staged_prompt_uses_enter_once(
     keys: list[str] = []
     reads: list[tuple[str, int]] = []
 
-    def screen(_pane: str, *, source: str, lines: int) -> str:
+    def screen(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         assert source in ("visible", "recent-unwrapped") and lines > 0
         reads.append((source, lines))
         if state == "staged":
@@ -2076,16 +2482,20 @@ def test_claude_staged_prompt_uses_enter_once(
             )
         return f"{divider}\n❯\n{divider}\nauto mode on\n"
 
-    def stage(pane: str, text: str) -> None:
+    def stage(pane: str, text: str, *, guard: RuntimeGuard) -> None:
         nonlocal state
+        assert guard.terminal_id == "term-1"
         assert pane == "w1:p1"
         assert text == f"\x1b[200~{prompt}\x1b[201~"
         assert state == "idle"
         fake.sent_texts.append(text)
         state = "staged"
 
-    def submit(pane: str, keys_value: str) -> None:
+    def submit(
+        pane: str, keys_value: str, *, guard: RuntimeGuard,
+    ) -> None:
         nonlocal state
+        assert guard.terminal_id == "term-1"
         assert pane == "w1:p1" and keys_value == "Enter"
         assert state == "staged"
         keys.append(keys_value)
@@ -2123,7 +2533,11 @@ def test_claude_new_active_ui_confirms_submission_when_long_turn_left_history(
     keys: list[str] = []
     reads: list[tuple[str, int]] = []
 
-    def screen(_pane: str, *, source: str, lines: int) -> str:
+    def screen(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         assert source in ("visible", "recent-unwrapped") and lines > 0
         reads.append((source, lines))
         if state == "staged":
@@ -2142,14 +2556,20 @@ def test_claude_new_active_ui_confirms_submission_when_long_turn_left_history(
             )
         return f"{divider}\n❯\n{divider}\nauto mode on\n"
 
-    def stage(_pane: str, text: str) -> None:
+    def stage(
+        _pane: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
         nonlocal state
+        assert guard.terminal_id == "term-1"
         assert text == f"\x1b[200~{prompt}\x1b[201~" and state == "idle"
         fake.sent_texts.append(text)
         state = "staged"
 
-    def submit(_pane: str, keys_value: str) -> None:
+    def submit(
+        _pane: str, keys_value: str, *, guard: RuntimeGuard,
+    ) -> None:
         nonlocal state
+        assert guard.terminal_id == "term-1"
         assert keys_value == "Enter" and state == "staged"
         keys.append(keys_value)
         state = "submitted"
@@ -2185,7 +2605,11 @@ def test_claude_exact_executed_turn_confirms_delivery_while_herdr_stays_idle(
     divider = "─" * 40
     state = "idle"
 
-    def screen(_pane: str, *, source: str, lines: int) -> str:
+    def screen(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         assert source in ("visible", "recent-unwrapped") and lines > 0
         if state == "staged":
             return (
@@ -2203,14 +2627,18 @@ def test_claude_exact_executed_turn_confirms_delivery_while_herdr_stays_idle(
             )
         return f"{divider}\n❯\n{divider}\nauto mode on\n"
 
-    def stage(_pane: str, text: str) -> None:
+    def stage(
+        _pane: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
         nonlocal state
+        assert guard.terminal_id == "term-1"
         assert text == f"\x1b[200~{prompt}\x1b[201~" and state == "idle"
         fake.sent_texts.append(text)
         state = "staged"
 
-    def submit(_pane: str, key: str) -> None:
+    def submit(_pane: str, key: str, *, guard: RuntimeGuard) -> None:
         nonlocal state
+        assert guard.terminal_id == "term-1"
         assert key == "Enter" and state == "staged"
         state = "submitted"
 
@@ -2248,7 +2676,11 @@ def test_claude_delayed_exact_turn_reconciles_without_reinjection(
     state = "idle"
     post_submit_visible_reads = 0
 
-    def screen(_pane: str, *, source: str, lines: int) -> str:
+    def screen(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         nonlocal post_submit_visible_reads
         assert source in ("visible", "recent-unwrapped") and lines > 0
         reads.append((source, lines))
@@ -2270,14 +2702,18 @@ def test_claude_delayed_exact_turn_reconciles_without_reinjection(
             "auto mode on\n"
         )
 
-    def stage(_pane: str, text: str) -> None:
+    def stage(
+        _pane: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
         nonlocal state
+        assert guard.terminal_id == "term-1"
         assert text == f"\x1b[200~{prompt}\x1b[201~" and state == "idle"
         fake.sent_texts.append(text)
         state = "staged"
 
-    def submit(_pane: str, key: str) -> None:
+    def submit(_pane: str, key: str, *, guard: RuntimeGuard) -> None:
         nonlocal state
+        assert guard.terminal_id == "term-1"
         assert key == "Enter" and state == "staged"
         state = "submitted"
 
@@ -2314,7 +2750,11 @@ def test_claude_stale_staged_redraw_never_causes_a_second_enter(
     state = "idle"
     keys: list[str] = []
 
-    def screen(_pane: str, *, source: str, lines: int) -> str:
+    def screen(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         assert source in ("visible", "recent-unwrapped") and lines > 0
         if state == "idle":
             return f"{divider}\n❯\n{divider}\nauto mode on\n"
@@ -2324,13 +2764,17 @@ def test_claude_stale_staged_redraw_never_causes_a_second_enter(
             f"{divider}\nauto mode on\n"
         )
 
-    def stage(_pane: str, text: str) -> None:
+    def stage(
+        _pane: str, text: str, *, guard: RuntimeGuard,
+    ) -> None:
         nonlocal state
+        assert guard.terminal_id == "term-1"
         assert text == f"\x1b[200~{prompt}\x1b[201~" and state == "idle"
         fake.sent_texts.append(text)
         state = "staged"
 
-    def submit(_pane: str, key: str) -> None:
+    def submit(_pane: str, key: str, *, guard: RuntimeGuard) -> None:
+        assert guard.terminal_id == "term-1"
         assert key == "Enter"
         keys.append(key)
 
@@ -2397,7 +2841,11 @@ def test_muse_never_retries_enter_when_the_first_submit_has_no_receipt(
     footer = "kiki · xhigh · /work · YOLO\n"
     keys: list[str] = []
 
-    def read(_pane: str, *, source: str, lines: int) -> str:
+    def read(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        assert guard is not None and guard.terminal_id == "term-1"
         assert source in ("visible", "recent-unwrapped") and lines > 0
         # A delayed redraw is not proof that the first accepted Enter was
         # ignored. A second Enter could act on a later dialog or empty prompt.
@@ -2408,7 +2856,9 @@ def test_muse_never_retries_enter_when_the_first_submit_has_no_receipt(
         fake, "send_text", lambda *_args, **_kwargs: pytest.fail("must not repaste"),
         raising=False,
     )
-    monkeypatch.setattr(fake, "send_keys", lambda _pane, key: keys.append(key))
+    monkeypatch.setattr(
+        fake, "send_keys", lambda _pane, key, **_options: keys.append(key),
+    )
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
 
     with pytest.raises(AgentPossiblySubmitted, match="ambiguous outcome"):
@@ -2435,10 +2885,12 @@ def test_muse_refuses_different_prebuffered_prompt_without_terminal_input(
     keys: list[str] = []
     monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen)
     monkeypatch.setattr(
-        fake, "send_text", lambda _pane, text: pasted.append(text),
+        fake, "send_text", lambda _pane, text, **_options: pasted.append(text),
         raising=False,
     )
-    monkeypatch.setattr(fake, "send_keys", lambda _pane, key: keys.append(key))
+    monkeypatch.setattr(
+        fake, "send_keys", lambda _pane, key, **_options: keys.append(key),
+    )
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
 
     assert manager.status("worker")["agent_status"] == "staged"
@@ -2466,8 +2918,12 @@ def test_muse_rechecks_exact_process_after_prebuffered_prompt_before_enter(
     pasted: list[str] = []
     keys: list[str] = []
 
-    def read(_pane: str, *, source: str, lines: int) -> str:
+    def read(
+        _pane: str, *, source: str, lines: int,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
         nonlocal recent_reads
+        assert guard is not None and guard.terminal_id == "term-1"
         assert lines > 0
         if source == "recent-unwrapped":
             recent_reads += 1
@@ -2477,10 +2933,12 @@ def test_muse_rechecks_exact_process_after_prebuffered_prompt_before_enter(
 
     monkeypatch.setattr(fake, "read", read)
     monkeypatch.setattr(
-        fake, "send_text", lambda _pane, text: pasted.append(text),
+        fake, "send_text", lambda _pane, text, **_options: pasted.append(text),
         raising=False,
     )
-    monkeypatch.setattr(fake, "send_keys", lambda _pane, key: keys.append(key))
+    monkeypatch.setattr(
+        fake, "send_keys", lambda _pane, key, **_options: keys.append(key),
+    )
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
 
     with pytest.raises(AgentPossiblySubmitted, match="foreground process"):
@@ -2519,7 +2977,7 @@ def test_private_state_and_malformed_record_are_rejected(tmp_path: Path, monkeyp
         manager.get("worker")
 
 
-def test_agent_record_v4_has_one_tagged_launch_and_goal_authority(
+def test_agent_record_v5_has_one_tagged_launch_and_goal_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -2529,7 +2987,7 @@ def test_agent_record_v4_has_one_tagged_launch_and_goal_authority(
     )
     path = manager.registry / "worker" / "agent.json"
     stored = json.loads(path.read_text(encoding="utf-8"))
-    assert stored["schema"] == "agentctl-session/v4"
+    assert stored["schema"] == "agentctl-session/v5"
     assert stored["launch"]["schema"] == "agentctl-launch/v2"
     assert stored["launch"]["permission_mode"] is None
     assert stored["launch"]["argv"] == [
@@ -2555,7 +3013,7 @@ def test_agent_record_v4_has_one_tagged_launch_and_goal_authority(
     assert manager.get("worker").arguments == started["arguments"]
 
 
-def test_agent_record_v4_requires_exact_terminal_union(
+def test_agent_record_v5_requires_exact_terminal_union(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -2577,6 +3035,10 @@ def test_agent_record_v4_requires_exact_terminal_union(
 
     legacy = dict(stopped_without_terminal)
     legacy.pop("terminal")
+    legacy.pop("terminal_id")
+    legacy["custom_process_identity"] = legacy.pop(
+        "runtime_process_identity"
+    )
     legacy["schema"] = "agentctl-session/v3"
     path.write_text(json.dumps(legacy), encoding="utf-8")
     decoded = manager.get("worker")
@@ -2585,7 +3047,7 @@ def test_agent_record_v4_requires_exact_terminal_union(
     assert decoded._legacy_terminal_authority is True
 
 
-def test_agent_record_v4_reads_profiled_claude_launch_without_flat_harness_field(
+def test_agent_record_v5_reads_profiled_claude_launch_without_flat_harness_field(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -2655,6 +3117,10 @@ def _downgrade_current_record_to_v2(stored: dict[str, object]) -> dict[str, obje
     goal = cast(dict[str, object], stored.pop("goal"))
     native = cast(dict[str, object] | None, stored.pop("native_session"))
     stored.pop("terminal")
+    stored.pop("terminal_id")
+    stored["custom_process_identity"] = stored.pop(
+        "runtime_process_identity"
+    )
     stored["schema"] = "agentctl-session/v2"
     stored.update({
         "session_agent": None if native is None else native["agent"],
@@ -2667,6 +3133,265 @@ def _downgrade_current_record_to_v2(stored: dict[str, object]) -> dict[str, obje
         "goal_message_id": goal["message_id"],
     })
     return stored
+
+
+def _downgrade_current_record_to_v3(stored: dict[str, object]) -> dict[str, object]:
+    stored.pop("terminal")
+    stored.pop("terminal_id")
+    stored["custom_process_identity"] = stored.pop(
+        "runtime_process_identity"
+    )
+    stored["schema"] = "agentctl-session/v3"
+    return stored
+
+
+def _downgrade_current_record_to_v4(stored: dict[str, object]) -> dict[str, object]:
+    stored.pop("terminal_id")
+    stored["custom_process_identity"] = stored.pop(
+        "runtime_process_identity"
+    )
+    stored["schema"] = "agentctl-session/v4"
+    return stored
+
+
+def _legacy_unbound_target(record: AgentRecord) -> agent.Target:
+    observed_session = record.session_source == "observed"
+    return agent.Target(
+        pane_id=record.pane_id,
+        session_agent=record.session_agent if observed_session else None,
+        session_value=record.session_value if observed_session else None,
+        expected_agent=record.launch.harness,
+        expected_cwd=record.launch.cwd,
+    )
+
+
+def _write_private_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value), encoding="utf-8")
+    path.chmod(0o600)
+
+
+def test_v2_launch_only_running_row_decodes_without_runtime_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    stored = _downgrade_current_record_to_v2(
+        json.loads(path.read_text(encoding="utf-8"))
+    )
+    stored["custom_process_identity"] = None
+    assert "harness" not in stored
+    _write_private_json(path, stored)
+
+    decoded = manager.get("worker")
+
+    assert decoded.launch.harness == "codex"
+    assert decoded.runtime_process_identity is None
+    assert decoded._legacy_terminal_binding is True
+    with pytest.raises(
+        AgentDeliveryError, match=r"terminal(?:/runtime)?-generation binding",
+    ):
+        decoded.target()
+
+
+@pytest.mark.parametrize("schema", ("v2", "v3", "v4"))
+def test_legacy_launch_only_status_and_list_preserve_all_rows(
+    schema: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("legacy", cwd=str(tmp_path), harness="claude")
+    manager.start("healthy", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "legacy" / "agent.json"
+    current = json.loads(path.read_text(encoding="utf-8"))
+    stored = {
+        "v2": _downgrade_current_record_to_v2,
+        "v3": _downgrade_current_record_to_v3,
+        "v4": _downgrade_current_record_to_v4,
+    }[schema](current)
+    stored["custom_process_identity"] = None
+    assert "harness" not in stored
+    _write_private_json(path, stored)
+
+    status = manager.status("legacy")
+    listed = {row["name"]: row for row in manager.list()}
+    health_rows, aggregate_healthy = manager.list_with_health()
+    health = {row["name"]: row for row in health_rows}
+
+    assert status["harness"] == "claude"
+    assert "terminal/runtime-generation binding" in cast(str, status["probe_error"])
+    assert set(listed) == {"healthy", "legacy"}
+    assert listed["legacy"]["harness"] == "claude"
+    assert set(health) == {"healthy", "legacy"}
+    assert health["healthy"]["health"] == "healthy"
+    assert health["legacy"]["health"] == "unknown"
+    assert aggregate_healthy is False
+
+
+def test_list_health_quarantines_invalid_row_without_hiding_valid_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("healthy", cwd=str(tmp_path), harness="codex")
+    manager.start("broken", cwd=str(tmp_path), harness="codex")
+    broken = manager.registry / "broken" / "agent.json"
+    document = json.loads(broken.read_text(encoding="utf-8"))
+    document["token"] = "INVALID TOKEN"
+    _write_private_json(broken, document)
+
+    rows, healthy = manager.list_with_health()
+
+    by_name = {row["name"]: row for row in rows}
+    assert set(by_name) == {"broken", "healthy"}
+    assert by_name["healthy"]["health"] == "healthy"
+    assert by_name["broken"]["health"] == "unknown"
+    assert by_name["broken"]["health_reason_code"] == "registry-or-health-error"
+    assert healthy is False
+
+
+def test_recover_terminal_binds_legacy_record_runtime_and_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    record_path = manager.registry / "worker" / "agent.json"
+    stored = _downgrade_current_record_to_v2(
+        json.loads(record_path.read_text(encoding="utf-8"))
+    )
+    token = cast(str, stored["token"])
+    stored["custom_process_identity"] = None
+    _write_private_json(record_path, stored)
+    legacy = manager.get("worker")
+    queue = manager.registry / "worker" / "queue"
+    agent.enqueue(str(queue), "retained message", message_id="retained")
+    _write_private_json(
+        queue / "target.json",
+        agent._unversioned_binding(_legacy_unbound_target(legacy)),
+    )
+
+    result = manager.recover_terminal("worker", expected_token=token)
+
+    recovered = manager.get("worker")
+    assert result["terminal_id"] == "term-1"
+    assert recovered.terminal_id == "term-1"
+    assert recovered.runtime_process_identity == fake.custom_identity
+    assert recovered._legacy_terminal_binding is False
+    binding = json.loads((queue / "target.json").read_text(encoding="utf-8"))
+    assert binding == agent._binding(recovered.target())
+    assert binding["schema"] == "agentctl-target/v2"
+    assert binding["terminal_id"] == "term-1"
+    assert binding["runtime_process_identity"]["pid"] == fake.custom_identity.pid
+    assert binding["launch_argv_sha256"] == (
+        "8b339c8ec508dff3546b4695d34d63958292a753916721eb69f6b8db7cea00c3"
+    )
+
+
+def test_recover_terminal_reconciles_record_new_queue_old(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    record_path = manager.registry / "worker" / "agent.json"
+    stored = _downgrade_current_record_to_v2(
+        json.loads(record_path.read_text(encoding="utf-8"))
+    )
+    token = cast(str, stored["token"])
+    stored["custom_process_identity"] = None
+    _write_private_json(record_path, stored)
+    legacy = manager.get("worker")
+    queue = manager.registry / "worker" / "queue"
+    agent.enqueue(str(queue), "retained message", message_id="retained")
+    old_binding = agent._unversioned_binding(_legacy_unbound_target(legacy))
+    _write_private_json(queue / "target.json", old_binding)
+    relocate = agent._relocate_existing_binding
+
+    def fail_after_record(*_args: object, **_kwargs: object) -> None:
+        raise AgentDeliveryError("simulated crash after record publication")
+
+    monkeypatch.setattr(agent, "_relocate_existing_binding", fail_after_record)
+    with pytest.raises(AgentDeliveryError, match="simulated crash"):
+        manager.recover_terminal("worker", expected_token=token)
+    assert manager.get("worker").terminal_id == "term-1"
+    assert json.loads((queue / "target.json").read_text()) == old_binding
+
+    monkeypatch.setattr(agent, "_relocate_existing_binding", relocate)
+    result = manager.recover_terminal("worker", expected_token=token)
+
+    recovered = manager.get("worker")
+    assert result["reconciled"] is True
+    assert json.loads((queue / "target.json").read_text()) == agent._binding(
+        recovered.target()
+    )
+
+
+def test_recover_terminal_reconciles_queue_new_record_old(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    record_path = manager.registry / "worker" / "agent.json"
+    stored = _downgrade_current_record_to_v2(
+        json.loads(record_path.read_text(encoding="utf-8"))
+    )
+    token = cast(str, stored["token"])
+    stored["custom_process_identity"] = None
+    _write_private_json(record_path, stored)
+    legacy = manager.get("worker")
+    queue = manager.registry / "worker" / "queue"
+    agent.enqueue(str(queue), "retained message", message_id="retained")
+    future = replace(
+        legacy,
+        terminal_id="term-1",
+        runtime_process_identity=fake.custom_identity,
+        _legacy_terminal_binding=False,
+    )
+    _write_private_json(queue / "target.json", agent._binding(future.target()))
+
+    result = manager.recover_terminal("worker", expected_token=token)
+
+    recovered = manager.get("worker")
+    assert result["reconciled"] is True
+    assert recovered.terminal_id == "term-1"
+    assert json.loads((queue / "target.json").read_text()) == agent._binding(
+        recovered.target()
+    )
+
+
+def test_recover_terminal_refuses_replacement_during_proof_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    record_path = manager.registry / "worker" / "agent.json"
+    stored = _downgrade_current_record_to_v2(
+        json.loads(record_path.read_text(encoding="utf-8"))
+    )
+    token = cast(str, stored["token"])
+    stored["custom_process_identity"] = None
+    _write_private_json(record_path, stored)
+    before = record_path.read_bytes()
+    calls = 0
+
+    def replacing_panes(workspace_id: str | None = None) -> tuple[Pane, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            fake.presentations = [
+                replace(pane, terminal_id="replacement-terminal")
+                for pane in fake.presentations
+            ]
+            fake.infos["w1:p1"] = replace(
+                fake.infos["w1:p1"], terminal_id="replacement-terminal",
+            )
+        return tuple(
+            pane for pane in fake.presentations
+            if workspace_id is None or pane.workspace_id == workspace_id
+        )
+
+    monkeypatch.setattr(fake, "panes", replacing_panes)
+    with pytest.raises(HerdrUnavailable, match="terminal generation changed"):
+        manager.recover_terminal("worker", expected_token=token)
+
+    assert record_path.read_bytes() == before
 
 
 def test_agent_record_v3_migrates_legacy_launch_spec_at_write_boundary(
@@ -2688,7 +3413,7 @@ def test_agent_record_v3_migrates_legacy_launch_spec_at_write_boundary(
     assert migrated["launch"]["permission_mode"] is None
 
 
-def test_agent_record_v3_migrates_v2_goal_and_native_session_without_duplicates(
+def test_agent_record_v2_decodes_goal_but_remains_terminal_unbound_and_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -2705,21 +3430,9 @@ def test_agent_record_v3_migrates_v2_goal_and_native_session_without_duplicates(
     path.write_text(json.dumps(stored), encoding="utf-8")
 
     assert manager.get("worker").goal == "legacy objective"
-    manager.pause("worker")
-    migrated = json.loads(path.read_text(encoding="utf-8"))
-    assert migrated["schema"] == "agentctl-session/v4"
-    assert migrated["goal"] == {
-        "schema": "agentctl-goal/v1",
-        "objective": "legacy objective",
-        "message_id": None,
-        "native_command": ["codex", "app-server", "proxy"],
-    }
-    assert migrated["native_session"]["value"] == "session-1"
-    for duplicate in (
-        "session_agent", "session_value", "goal_delivery", "goal_session_id",
-        "goal_command", "goal_messages", "goal_message_id",
-    ):
-        assert duplicate not in migrated
+    with pytest.raises(AgentDeliveryError, match=r"terminal(?:/runtime)?-generation binding"):
+        manager.pause("worker")
+    assert json.loads(path.read_text(encoding="utf-8")) == stored
 
 
 def test_agent_record_v2_refuses_conflicting_native_session_authorities(
@@ -2756,7 +3469,7 @@ def test_agent_record_v3_refuses_native_session_for_another_harness(
     ("codex", "/goal legacy objective"),
     ("claude", "Your ongoing goal: legacy objective\nWork toward this goal and report completion or blockers."),
 ))
-def test_agent_record_v3_migrates_legacy_goal_artifact_before_dropping_map(
+def test_legacy_goal_artifact_remains_read_only_without_terminal_binding(
     harness: str, prompt: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -2778,17 +3491,14 @@ def test_agent_record_v3_migrates_legacy_goal_artifact_before_dropping_map(
     stored["goal_messages"] = {identifier: "legacy objective"}
     path.write_text(json.dumps(stored), encoding="utf-8")
 
-    manager.pause("worker")
-
-    migrated = json.loads(path.read_text(encoding="utf-8"))
-    assert migrated["schema"] == "agentctl-session/v4"
-    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-    assert artifact["kind"] == "goal"
-    assert "goal_messages" not in migrated
+    with pytest.raises(AgentDeliveryError, match=r"terminal(?:/runtime)?-generation binding"):
+        manager.pause("worker")
+    assert json.loads(path.read_text(encoding="utf-8")) == stored
+    assert json.loads(artifact_path.read_text(encoding="utf-8")) == legacy_artifact
 
 
 @pytest.mark.parametrize("legacy_schema", ("flat-v1", "session-v2"))
-def test_legacy_goal_pointer_without_duplicate_map_is_exactly_recovered(
+def test_legacy_goal_pointer_decodes_but_remains_read_only(
     legacy_schema: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -2818,11 +3528,10 @@ def test_legacy_goal_pointer_without_duplicate_map_is_exactly_recovered(
     path.write_text(json.dumps(stored), encoding="utf-8")
 
     assert manager.status("worker")["goal_delivery"] == "pending"
-    manager.pause("worker")
-
-    migrated = json.loads(path.read_text(encoding="utf-8"))
-    assert migrated["schema"] == "agentctl-session/v4"
-    assert json.loads(artifact_path.read_text(encoding="utf-8"))["kind"] == "goal"
+    with pytest.raises(AgentDeliveryError, match=r"terminal(?:/runtime)?-generation binding"):
+        manager.pause("worker")
+    assert json.loads(path.read_text(encoding="utf-8")) == stored
+    assert "kind" not in json.loads(artifact_path.read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize("mutation", ("id", "text", "map"))
@@ -2978,7 +3687,7 @@ def test_goal_delivery_is_derived_from_every_exact_queue_transition(
     assert manager.status("worker")["goal_delivery"] == delivery
 
 
-def test_send_migrates_legacy_goal_authority_before_queue_delivery(
+def test_send_refuses_legacy_terminal_unbound_record_before_queue_delivery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -3000,19 +3709,22 @@ def test_send_migrates_legacy_goal_authority_before_queue_delivery(
     stored["goal_messages"] = {identifier: "legacy objective"}
     record_path.write_text(json.dumps(stored), encoding="utf-8")
 
+    called = False
+
     def observe_send(*_args: object, **_kwargs: object) -> agent.QueueResult:
-        migrated = json.loads(record_path.read_text(encoding="utf-8"))
-        tagged = json.loads(artifact_path.read_text(encoding="utf-8"))
-        assert migrated["schema"] == "agentctl-session/v4"
-        assert "goal_messages" not in migrated
-        assert tagged["kind"] == "goal"
+        nonlocal called
+        called = True
         return agent.QueueResult("ordinary", (), (), ())
 
     monkeypatch.setattr(agent, "send", observe_send)
-    manager.send("worker", "ordinary message")
+    with pytest.raises(AgentDeliveryError, match=r"terminal(?:/runtime)?-generation binding"):
+        manager.send("worker", "ordinary message")
+    assert called is False
+    assert json.loads(record_path.read_text(encoding="utf-8")) == stored
+    assert "kind" not in json.loads(artifact_path.read_text(encoding="utf-8"))
 
 
-def test_agent_record_v3_refuses_to_discard_missing_legacy_goal_artifact(
+def test_legacy_terminal_refusal_preserves_missing_goal_artifact_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -3031,7 +3743,7 @@ def test_agent_record_v3_refuses_to_discard_missing_legacy_goal_artifact(
     encoded = json.dumps(stored).encode()
     path.write_bytes(encoded)
 
-    with pytest.raises(AgentDeliveryError, match="refusing to discard"):
+    with pytest.raises(AgentDeliveryError, match=r"terminal(?:/runtime)?-generation binding"):
         manager.pause("worker")
     assert path.read_bytes() == encoded
 
@@ -3060,7 +3772,7 @@ def test_agent_record_v3_extensions_cannot_shadow_launch_authority(
         manager.get("worker")
 
 
-def test_agent_record_v1_migrates_once_and_refuses_conflicting_argument_authorities(
+def test_agent_record_v1_decodes_arguments_but_remains_terminal_unbound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
@@ -3073,14 +3785,12 @@ def test_agent_record_v1_migrates_once_and_refuses_conflicting_argument_authorit
     assert manager.get("worker").launch.argv == (
         "codex", "--no-alt-screen", "--literal",
     )
-    manager.pause("worker")
-    migrated = json.loads(path.read_text(encoding="utf-8"))
-    assert migrated["schema"] == "agentctl-session/v4"
-    assert migrated["launch"]["argv"] == [
-        "codex", "--no-alt-screen", "--literal",
-    ]
+    with pytest.raises(AgentDeliveryError, match=r"terminal(?:/runtime)?-generation binding"):
+        manager.pause("worker")
+    assert json.loads(path.read_text(encoding="utf-8")) == legacy
 
-    conflicting = manager.get("worker").to_document()
+    conflicting = dict(legacy)
+    conflicting["launch_argv"] = ["codex", "--no-alt-screen", "--literal"]
     conflicting["arguments"] = ["--different"]
     path.write_text(json.dumps(conflicting), encoding="utf-8")
     with pytest.raises(AgentDeliveryError, match="contradictory launch arguments"):
@@ -3124,14 +3834,14 @@ def test_agent_record_v2_refuses_crossed_launch_dimensions(
         manager.get("worker")
 
 
-def test_malformed_custom_process_identities_are_rejected(
+def test_malformed_runtime_process_identities_are_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="muse")
     path = manager.registry / "worker" / "agent.json"
     original = json.loads(path.read_text(encoding="utf-8"))
-    identity = original["custom_process_identity"]
+    identity = original["runtime_process_identity"]
     assert isinstance(identity, dict)
 
     variants: list[dict[str, object]] = []
@@ -3146,21 +3856,21 @@ def test_malformed_custom_process_identities_are_rejected(
         ("boot_id", "NOT-A-BOOT-ID"),
     ):
         variant = json.loads(json.dumps(original))
-        variant["custom_process_identity"][field] = value
+        variant["runtime_process_identity"][field] = value
         variants.append(variant)
     missing = json.loads(json.dumps(original))
-    del missing["custom_process_identity"]["starttime_ticks"]
+    del missing["runtime_process_identity"]["starttime_ticks"]
     variants.append(missing)
     unknown = json.loads(json.dumps(original))
-    unknown["custom_process_identity"]["unexpected"] = 1
+    unknown["runtime_process_identity"]["unexpected"] = 1
     variants.append(unknown)
     for record_field, record_value in (
-        ("adapter", "herdr"),
-        ("harness", "codex"),
+        ("adapter", "turn-runner"),
+        ("mode", "headless"),
         ("pane_id", None),
     ):
         variant = json.loads(json.dumps(original))
-        if record_field in ("adapter", "harness"):
+        if record_field in ("adapter", "mode"):
             variant["launch"][record_field] = record_value
         else:
             variant[record_field] = record_value
@@ -3168,7 +3878,13 @@ def test_malformed_custom_process_identities_are_rejected(
 
     for document in variants:
         path.write_text(json.dumps(document), encoding="utf-8")
-        with pytest.raises(AgentDeliveryError, match="custom process identity|invalid agent record"):
+        with pytest.raises(
+            AgentDeliveryError,
+            match=(
+                "runtime process identity|invalid agent record|"
+                "incomplete terminal identity|inconsistent"
+            ),
+        ):
             manager.get("worker")
 
 
@@ -3204,6 +3920,15 @@ def test_cli_parses_exact_delivery_reconciliation_authority() -> None:
     assert parsed.expected_sha256 == "0123456789abcdef" * 4
 
 
+def test_cli_parses_token_bound_terminal_recovery() -> None:
+    parsed = unified_cli.parser().parse_args([
+        "recover-terminal", "worker", "--expected-token", "generation-token",
+    ])
+    assert parsed.command == "recover-terminal"
+    assert parsed.name == "worker"
+    assert parsed.expected_token == "generation-token"
+
+
 def test_trust_prompt_is_not_a_composer_even_when_herdr_reports_idle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     trust = "Quick safety check: Is this a project you created or one you trust?\n❯ No, exit\nYes, I trust this folder"
@@ -3217,12 +3942,50 @@ def test_trust_prompt_is_not_a_composer_even_when_herdr_reports_idle(tmp_path: P
 def test_replaced_named_agent_is_not_retargeted_in_same_pane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
-    monkeypatch.setattr(fake, "agent_pane", lambda _name: "w1:p-other")
+    monkeypatch.setattr(
+        fake, "agent_pane", lambda _name, **_options: "w1:p-other",
+    )
     with pytest.raises(AgentPending, match="no longer owns"):
         manager.send("worker", "do not send to replacement", ready_timeout=0)
     with pytest.raises(HerdrUnavailable, match="no longer owns"):
         manager.stop("worker")
     assert fake.submitted == fake.closed == []
+
+
+def test_terminal_replacement_during_confirmation_is_ambiguous_not_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+
+    def replace_before_wait(
+        pane_id: str, _status: str, _timeout: int, *, guard: RuntimeGuard,
+    ) -> None:
+        fake.presentations = [
+            replace(item, terminal_id="replacement-terminal")
+            if item.pane_id == pane_id else item
+            for item in fake.presentations
+        ]
+        fake.infos[pane_id] = replace(
+            fake.infos[pane_id], terminal_id="replacement-terminal",
+        )
+        fake._assert_guard(pane_id, guard)
+
+    def guarded_agent_pane(
+        _name: str, *, expected_terminal_id: str | None = None,
+    ) -> str:
+        if expected_terminal_id != fake._terminal("w1:p1"):
+            raise RuntimeIdentityMismatch("terminal generation changed")
+        return "w1:p1"
+
+    monkeypatch.setattr(fake, "wait_agent_status", replace_before_wait)
+    monkeypatch.setattr(fake, "agent_pane", guarded_agent_pane)
+
+    with pytest.raises(AgentPossiblySubmitted):
+        manager.send("worker", "one irreversible prompt")
+
+    assert fake.submitted == ["one irreversible prompt"]
+    assert fake.sent_texts == []
 
 
 def test_explicit_session_binding_preserves_existing_queue_authority(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3251,11 +4014,21 @@ def test_goal_confirms_only_its_exact_replacement_menu(tmp_path: Path, monkeypat
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path))
     keys: list[str] = []
-    def wait(_pane: str, _status: str, _timeout: int) -> None:
+    def wait(
+        _pane: str, _status: str, _timeout: int, *, guard: RuntimeGuard,
+    ) -> None:
+        assert guard.terminal_id == "term-1"
         if not keys:
             raise HerdrUnavailable("working transition not observed")
+
+    def submit_key(
+        _pane: str, key: str, *, guard: RuntimeGuard,
+    ) -> None:
+        assert guard.terminal_id == "term-1"
+        keys.append(key)
+
     monkeypatch.setattr(fake, "wait_agent_status", wait)
-    monkeypatch.setattr(fake, "send_keys", lambda _pane, key: keys.append(key))
+    monkeypatch.setattr(fake, "send_keys", submit_key)
     objective = "finish this task" if correct_objective else "a different task"
     screen = f"Replace goal?\nNew objective: {objective}\n› 1. Replace current goal  Set the new objective and start it now\n2. Cancel  Keep the current goal\nPress enter to confirm or esc to go back"
     monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen)
@@ -3281,14 +4054,24 @@ def test_queued_goals_keep_confirmation_authority_across_restart(tmp_path: Path,
     restarted = ManagedAgents(cast(HerdrClient, fake), manager.registry)
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="idle")
     confirmations: list[str] = []
-    def wait(_pane: str, _status: str, _timeout: int) -> None:
+    def wait(
+        _pane: str, _status: str, _timeout: int, *, guard: RuntimeGuard,
+    ) -> None:
+        assert guard.terminal_id == "term-1"
         if len(confirmations) < len(fake.submitted):
             raise HerdrUnavailable("working transition not observed")
     def screen(*_args: object, **_kwargs: object) -> str:
         objective = fake.submitted[-1][6:]
         return f"Replace goal?\nNew objective: {objective}\n› 1. Replace current goal  Set the new objective and start it now\n2. Cancel  Keep the current goal\nPress enter to confirm or esc to go back"
+
+    def confirm_key(
+        _pane: str, key: str, *, guard: RuntimeGuard,
+    ) -> None:
+        assert guard.terminal_id == "term-1"
+        confirmations.append(key)
+
     monkeypatch.setattr(fake, "wait_agent_status", wait)
-    monkeypatch.setattr(fake, "send_keys", lambda _pane, key: confirmations.append(key))
+    monkeypatch.setattr(fake, "send_keys", confirm_key)
     monkeypatch.setattr(fake, "read", screen)
     assert len(restarted.drain("worker").delivered) == 2
     assert fake.submitted == ["/goal first objective", "/goal second objective"]

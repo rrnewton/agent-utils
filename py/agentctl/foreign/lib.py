@@ -1220,9 +1220,9 @@ def registry_lock() -> Iterator[dict[str, AgentRecord]]:
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         agents, migration_needed = _load_unlocked()
-        before = {name: rec.to_dict() for name, rec in agents.items()}
+        before, _ = _registry_payload(agents)
         yield agents
-        after = {name: rec.to_dict() for name, rec in agents.items()}
+        after, _ = _registry_payload(agents)
         if migration_needed or after != before:
             _save_unlocked(agents)
     finally:

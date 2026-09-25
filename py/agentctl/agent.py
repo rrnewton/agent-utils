@@ -23,8 +23,11 @@ from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, cast
 
-from agentctl.client import AgentPaneInfo, HerdrClient
+from agentctl.client import (
+    AgentPaneInfo, CustomProcessIdentity, HerdrClient, RuntimeGuard,
+)
 from agentctl.errors import (
     AgentDeliveryError,
     AgentPending,
@@ -40,16 +43,40 @@ __all__ = [
 ]
 
 
+class _RegistryAdapter(Protocol):
+    """Interactive registry adapter whose own implementation supplies guards."""
+
+    def prompt_agent(self, pane_id: str, text: str) -> None: ...
+
+    def wait_agent_status(
+        self, pane_id: str, status: str, timeout_ms: int,
+    ) -> None: ...
+
+    def read(
+        self, pane_id: str, *, source: str, lines: int,
+    ) -> str: ...
+
+
 @dataclass(frozen=True)
 class Target:
     """Identity assertions for one already-running interactive Herdr agent."""
 
     pane_id: str | None = None
+    terminal_id: str | None = None
+    runtime_process_identity: CustomProcessIdentity | None = None
+    expected_argv: tuple[str, ...] | None = None
     session_agent: str | None = None
     session_value: str | None = None
     expected_agent: str | None = None
     expected_workspace: str | None = None
     expected_cwd: str | None = None
+
+    def runtime_guard(self) -> RuntimeGuard:
+        if self.terminal_id is None:
+            raise AgentDeliveryError(
+                "target has no terminal generation binding"
+            )
+        return RuntimeGuard(self.terminal_id, self.runtime_process_identity)
 
 
 def _rename_directory_noreplace_at(
@@ -143,6 +170,7 @@ _U64_MAX = (1 << 64) - 1
 QUEUE_ERROR_MAX_BYTES = 2000
 _MESSAGE_STATE_MAX_BYTES = 16 << 20
 _LONGEST_JSON_FLOAT = -1.7976931348623157e308
+_TARGET_BINDING_SCHEMA = "agentctl-target/v2"
 
 
 def _json_text(document: dict[str, object], *, allow_nan: bool = True) -> str:
@@ -261,6 +289,10 @@ def _real(path: str) -> str:
 
 def _validate(client: HerdrClient, info: AgentPaneInfo, target: Target) -> None:
     failures: list[str] = []
+    if target.terminal_id is not None and info.terminal_id != target.terminal_id:
+        failures.append(
+            f"terminal is {info.terminal_id!r}, expected {target.terminal_id!r}"
+        )
     if target.expected_agent is not None and info.agent != target.expected_agent:
         failures.append(f"agent is {info.agent!r}, expected {target.expected_agent!r}")
     if target.session_agent is not None and info.session_agent != target.session_agent:
@@ -283,10 +315,18 @@ def resolve_target(client: HerdrClient, target: Target) -> AgentPaneInfo:
         raise AgentDeliveryError("target needs --pane or a stable session value")
     asserted_pane_id = target.pane_id
     pane_id = asserted_pane_id
+    def pane_info(exact_pane_id: str) -> AgentPaneInfo:
+        if target.terminal_id is None:
+            return client.pane_info(exact_pane_id)
+        return client.pane_info(
+            exact_pane_id, expected_terminal_id=target.terminal_id,
+        )
     if target.session_value is not None:
         matches: list[str] = []
         for pane in client.panes():
-            info = client.pane_info(pane.pane_id)
+            if target.terminal_id is not None and pane.terminal_id != target.terminal_id:
+                continue
+            info = pane_info(pane.pane_id)
             if info.session_value == target.session_value and (
                 target.session_agent is None or info.session_agent == target.session_agent
             ):
@@ -302,8 +342,20 @@ def resolve_target(client: HerdrClient, target: Target) -> AgentPaneInfo:
             )
     if pane_id is None:
         raise AgentDeliveryError("target needs --pane or a stable session value")
-    info = client.pane_info(pane_id)
+    info = pane_info(pane_id)
     _validate(client, info, target)
+    if target.runtime_process_identity is not None:
+        if (target.terminal_id is None or target.expected_agent is None
+                or target.expected_argv is None):
+            raise AgentDeliveryError(
+                "runtime-process target requires terminal, harness, and launch argv"
+            )
+        if isinstance(client, HerdrClient):
+            client.verify_runtime_process_identity(
+                info.pane_id, target.expected_agent, target.expected_argv,
+                target.runtime_process_identity,
+                expected_terminal_id=target.terminal_id,
+            )
     return info
 
 
@@ -1265,12 +1317,53 @@ def _binding(target: Target) -> dict[str, object]:
         identity = {"kind": "pane", "pane_id": target.pane_id}
     identity.update(
         {
+            "schema": _TARGET_BINDING_SCHEMA,
+            "terminal_id": target.terminal_id,
+            "runtime_process_identity": (
+                None
+                if target.runtime_process_identity is None
+                else {
+                    "version": target.runtime_process_identity.version,
+                    "boot_id": target.runtime_process_identity.boot_id,
+                    "pid": target.runtime_process_identity.pid,
+                    "starttime_ticks": (
+                        target.runtime_process_identity.starttime_ticks
+                    ),
+                    "executable_device": (
+                        target.runtime_process_identity.executable_device
+                    ),
+                    "executable_inode": (
+                        target.runtime_process_identity.executable_inode
+                    ),
+                }
+            ),
+            "launch_argv_sha256": (
+                None
+                if target.expected_argv is None
+                else hashlib.sha256(
+                    json.dumps(
+                        list(target.expected_argv),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+            ),
             "expected_agent": target.expected_agent,
             "expected_workspace": target.expected_workspace,
             "expected_cwd": None if target.expected_cwd is None else _real(target.expected_cwd),
         }
     )
     return identity
+
+
+def _unversioned_binding(target: Target) -> dict[str, object]:
+    """Decode-edge shape written before target bindings carried generation data."""
+    binding = _binding(target)
+    for key in (
+        "schema", "terminal_id", "runtime_process_identity", "launch_argv_sha256",
+    ):
+        del binding[key]
+    return binding
 
 
 def _target_lock_path(pane_id: str) -> str:
@@ -1389,7 +1482,9 @@ def _relocate_existing_binding(root: str, old: Target, new: Target) -> None:
         new_expected = _binding(new)
         if actual == new_expected:
             return
-        if actual != old_expected:
+        legacy_old = _unversioned_binding(old)
+        legacy_new = _unversioned_binding(new)
+        if actual not in (old_expected, legacy_old, legacy_new):
             raise AgentDeliveryError(
                 f"queue {root} is bound to {actual!r}, refusing relocation from "
                 f"{old_expected!r} to {new_expected!r}"
@@ -1557,12 +1652,18 @@ def _submission_guard(client: HerdrClient) -> Iterator[None]:
 
 
 def _inject_one(
-    client: HerdrClient,
+    client: HerdrClient | _RegistryAdapter,
     info: AgentPaneInfo,
     text: str,
+    target: Target,
 ) -> None:
     try:
-        client.prompt_agent(info.pane_id, text)
+        if isinstance(client, HerdrClient):
+            client.prompt_agent(
+                info.pane_id, text, guard=target.runtime_guard(),
+            )
+        else:
+            client.prompt_agent(info.pane_id, text)
     except Exception as exc:
         # The terminal server may have accepted the atomic text+Enter before the client lost its
         # response. Once agent.prompt is entered, failure is ambiguous and must never be retried.
@@ -1572,13 +1673,22 @@ def _inject_one(
 
 
 def _confirm_delivery(
-    client: HerdrClient,
+    client: HerdrClient | _RegistryAdapter,
     info: AgentPaneInfo,
+    target: Target,
     *,
     working_timeout: float,
 ) -> None:
     try:
-        client.wait_agent_status(info.pane_id, "working", max(1, int(working_timeout * 1000)))
+        if isinstance(client, HerdrClient):
+            client.wait_agent_status(
+                info.pane_id, "working", max(1, int(working_timeout * 1000)),
+                guard=target.runtime_guard(),
+            )
+        else:
+            client.wait_agent_status(
+                info.pane_id, "working", max(1, int(working_timeout * 1000)),
+            )
     except HerdrUnavailable as exc:
         raise _PossiblySubmitted(
             f"pane {info.pane_id} did not confirm ready -> working submission; "
@@ -1856,14 +1966,16 @@ def _drain(
                 try:
                     try:
                         try:
-                            _inject_one(client, info, str(document["text"]))
+                            _inject_one(
+                                client, info, str(document["text"]), target,
+                            )
                         finally:
                             # Lifecycle identity is needed only through the
                             # irreversible prompt call. The target/FIFO locks
                             # continue to serialize its bounded confirmation.
                             submission.close()
                         _confirm_delivery(
-                            client, info, working_timeout=working_timeout,
+                            client, info, target, working_timeout=working_timeout,
                         )
                     except _PossiblySubmitted as exc:
                         attempts += 1
@@ -2311,9 +2423,20 @@ def status(client: HerdrClient, target: Target, root: str) -> dict[str, object]:
     }
 
 
-def read(client: HerdrClient, target: Target, *, lines: int = 500) -> str:
+def read(
+    client: HerdrClient | _RegistryAdapter, target: Target, *, lines: int = 500,
+) -> str:
     """Read recent terminal output from a validated interactive-agent target."""
 
-    info = resolve_target(client, target)
+    info = resolve_target(cast(HerdrClient, client), target)
+    if isinstance(client, HerdrClient):
+        text = client.read(
+            info.pane_id, source="recent-unwrapped", lines=lines,
+            guard=target.runtime_guard(),
+        )
+        return text if text else client.read(
+            info.pane_id, source="recent", lines=lines,
+            guard=target.runtime_guard(),
+        )
     text = client.read(info.pane_id, source="recent-unwrapped", lines=lines)
     return text if text else client.read(info.pane_id, source="recent", lines=lines)

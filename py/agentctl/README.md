@@ -46,9 +46,14 @@ The documentation is installed with the command and works offline:
   printing their environment or raw arguments. The same private config can
   select one default Herdr workspace for project starts.
 - `agentctl relocate NAME --workspace-label LABEL --new-tab` moves a verified
-  one-pane live session without restarting it and reconciles interrupted moves.
-  It requires a Herdr `pane move` that atomically enforces
-  `--expect-terminal-id`; older Herdr releases refuse before moving the pane.
+  one-pane owned session without restarting it and reconciles interrupted moves.
+  It requires Herdr to atomically enforce the saved terminal and foreground
+  process generations; older Herdr releases refuse before moving the pane.
+  Adopted foreign sessions are intentionally not movable.
+- `agentctl recover-terminal NAME --expected-token TOKEN` explicitly upgrades
+  a live legacy registry row after proving its unchanged pane route, terminal,
+  native session, and foreground runtime. Legacy rows stay read-only until this
+  succeeds.
 - `agentctl skill install` installs this interface's bundled skill for Codex,
   Claude, and Muse without overwriting divergent content. Muse uses its native
   managed skill installer; an identical managed copy is not reinstalled.

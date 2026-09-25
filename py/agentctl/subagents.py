@@ -31,6 +31,7 @@ from agentctl.client import (
     HerdrClient,
     Pane,
     PaneShellProof,
+    RuntimeGuard,
     claude_active_screen,
     claude_prompt_is_exact_composer,
     claude_prompt_transcript_count,
@@ -70,9 +71,10 @@ _MAX_QUEUE_ARTIFACT_BYTES = 16 << 20
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _HEALTH_SCHEMA = "agentctl-health/v1"
 _HEALTH_PROBE_SECONDS = 60.0
-_SESSION_STORAGE_SCHEMA = "agentctl-session/v4"
-_PREVIOUS_SESSION_STORAGE_SCHEMA = "agentctl-session/v3"
-_LEGACY_SESSION_STORAGE_SCHEMA = "agentctl-session/v2"
+_SESSION_STORAGE_SCHEMA = "agentctl-session/v5"
+_PREVIOUS_SESSION_STORAGE_SCHEMA = "agentctl-session/v4"
+_LEGACY_SESSION_STORAGE_SCHEMA = "agentctl-session/v3"
+_OLDEST_SESSION_STORAGE_SCHEMA = "agentctl-session/v2"
 _LAUNCH_SPEC_SCHEMA = "agentctl-launch/v2"
 _LEGACY_LAUNCH_SPEC_SCHEMA = "agentctl-launch/v1"
 _GOAL_STATE_SCHEMA = "agentctl-goal/v1"
@@ -94,7 +96,8 @@ _SESSION_COMPATIBILITY_FIELDS = frozenset({
     "launch_permission_mode", "runner_pid", "runner_started_at",
     "session_agent", "session_value", "session_source", "goal_delivery",
     "goal_session_id", "goal_command", "goal_messages", "goal_message_id",
-    "terminal",
+    "terminal", "terminal_id", "runtime_process_identity",
+    "custom_process_identity",
 })
 
 _TERMINAL_OUTCOMES = frozenset({
@@ -307,6 +310,7 @@ class AgentRecord:
     workspace_id: str | None = None
     tab_id: str | None = None
     pane_id: str | None = None
+    terminal_id: str | None = None
     session_agent: str | None = None
     session_value: str | None = None
     session_source: str | None = None
@@ -318,7 +322,7 @@ class AgentRecord:
     goal_message_id: str | None = None
     paused: bool = False
     pane_reported_by_agentctl: bool = False
-    custom_process_identity: CustomProcessIdentity | None = None
+    runtime_process_identity: CustomProcessIdentity | None = None
     foreign_shell_identity: CustomProcessIdentity | None = None
     runner_identity: CustomProcessIdentity | None = None
     terminal: TerminalState | None = None
@@ -328,6 +332,7 @@ class AgentRecord:
     _legacy_goal_messages: dict[str, str] = field(default_factory=dict, repr=False)
     _legacy_goal_pointer: bool = field(default=False, repr=False)
     _legacy_terminal_authority: bool = field(default=False, repr=False)
+    _legacy_terminal_binding: bool = field(default=False, repr=False)
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
     @property
@@ -370,6 +375,19 @@ class AgentRecord:
         self._legacy_runner_pid = None
         self._legacy_runner_started_at = None
 
+    def same_goal_inspection_identity(self, other: AgentRecord) -> bool:
+        """Whether a native goal result still describes the same durable state."""
+        return (
+            self.token == other.token
+            and self.launch == other.launch
+            and self.session_agent == other.session_agent
+            and self.session_value == other.session_value
+            and self.session_source == other.session_source
+            and self.goal == other.goal
+            and self.goal_message_id == other.goal_message_id
+            and self.goal_command == other.goal_command
+        )
+
     def to_document(self) -> dict[str, object]:
         """Return the stable public compatibility view."""
         document = asdict(self)
@@ -380,6 +398,7 @@ class AgentRecord:
         document.pop("_legacy_goal_messages")
         document.pop("_legacy_goal_pointer")
         document.pop("_legacy_terminal_authority")
+        document.pop("_legacy_terminal_binding")
         document.pop("launch")
         document.pop("terminal")
         if self.terminal is not None:
@@ -449,6 +468,20 @@ class AgentRecord:
             raise AgentDeliveryError(
                 "nonterminal agent record cannot contain terminal state"
             )
+        route = (self.workspace_id, self.tab_id, self.pane_id, self.terminal_id)
+        if self.launch.mode == "interactive":
+            if self._legacy_terminal_binding:
+                raise AgentDeliveryError(
+                    "legacy interactive session has no terminal-generation binding; "
+                    "explicit recovery is required before mutation"
+                )
+            if any(value is not None for value in route) and not all(
+                isinstance(value, str) and value and "\0" not in value
+                for value in route
+            ):
+                raise AgentDeliveryError(
+                    "interactive routing requires workspace, tab, pane, and terminal identity"
+                )
         native_session: dict[str, object] | None = None
         if self.session_value is not None:
             native_session = {
@@ -467,6 +500,7 @@ class AgentRecord:
             "workspace_id": self.workspace_id,
             "tab_id": self.tab_id,
             "pane_id": self.pane_id,
+            "terminal_id": self.terminal_id,
             "native_session": native_session,
             "startup_warning": self.startup_warning,
             "effective_reasoning_effort": self.effective_reasoning_effort,
@@ -479,9 +513,9 @@ class AgentRecord:
             },
             "paused": self.paused,
             "pane_reported_by_agentctl": self.pane_reported_by_agentctl,
-            "custom_process_identity": (
-                asdict(self.custom_process_identity)
-                if self.custom_process_identity is not None else None
+            "runtime_process_identity": (
+                asdict(self.runtime_process_identity)
+                if self.runtime_process_identity is not None else None
             ),
             "foreign_shell_identity": (
                 asdict(self.foreign_shell_identity)
@@ -542,7 +576,7 @@ class AgentRecord:
                 and launch.runtime_ownership == "owned"
                 and launch.runtime_home is not None
                 and Path(launch.runtime_home).is_absolute()
-                and self.custom_process_identity is None
+                and self.runtime_process_identity is None
                 and self.foreign_shell_identity is None
                 and launch.permission_mode in (None, "native", "bypass")
                 and (launch.permission_mode != "bypass" or launch.harness == "codex")
@@ -560,14 +594,23 @@ class AgentRecord:
             )
             if launch.adapter == "herdr":
                 valid = valid and launch.runtime_ownership == "owned"
-                valid = valid and self.custom_process_identity is None
                 valid = valid and self.foreign_shell_identity is None
+                valid = valid and (
+                    self.lifecycle != "running"
+                    or self.runtime_process_identity is not None
+                    or self._legacy_terminal_binding
+                )
             elif launch.adapter == "herdr-pane":
                 valid = valid and launch.runtime_ownership == "owned" and launch.harness == "muse"
                 valid = valid and self.foreign_shell_identity is None
+                valid = valid and (
+                    self.lifecycle != "running"
+                    or self.runtime_process_identity is not None
+                    or self._legacy_terminal_binding
+                )
             else:
                 valid = valid and launch.runtime_ownership == "foreign"
-                valid = valid and self.custom_process_identity is None
+                valid = valid and self.runtime_process_identity is None
         if not launch_shape or not valid:
             raise AgentDeliveryError(
                 "adapter, mode, backend, ownership, and runtime identity are inconsistent"
@@ -590,13 +633,13 @@ class AgentRecord:
         source_schema = value.get("schema")
         legacy_goal_pointer = (
             (source_schema == 1 and not isinstance(source_schema, bool))
-            or source_schema == _LEGACY_SESSION_STORAGE_SCHEMA
+            or source_schema == _OLDEST_SESSION_STORAGE_SCHEMA
         )
         document = cls._normalize_storage_value(cast(dict[str, object], value), path)
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
-        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "session_source", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "launch_profile", "launch_executable", "runtime_ownership", "runner_started_at", "launch_permission_mode"):
+        for key in ("workspace_id", "tab_id", "pane_id", "terminal_id", "session_agent", "session_value", "session_source", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "launch_profile", "launch_executable", "runtime_ownership", "runner_started_at", "launch_permission_mode"):
             if document.get(key) is not None and not isinstance(document[key], str):
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
         created = document.get("created_at")
@@ -615,6 +658,21 @@ class AgentRecord:
             or any(not isinstance(item, str) or _ENVIRONMENT_NAME.fullmatch(item) is None
                    for item in launch_environment_names)):
             raise AgentDeliveryError(f"invalid agent record: {path}")
+        route = tuple(
+            document.get(key)
+            for key in ("workspace_id", "tab_id", "pane_id", "terminal_id")
+        )
+        if (source_schema == _SESSION_STORAGE_SCHEMA
+                and document.get("mode", "interactive") == "interactive"
+                and any(
+            value is not None for value in route
+        ) and not all(
+            isinstance(value, str) and value and "\0" not in value
+            for value in route
+        )):
+            raise AgentDeliveryError(
+                f"current interactive route has incomplete terminal identity: {path}"
+            )
         for key in ("launch_executable_device", "launch_executable_inode"):
             value = document.get(key)
             if (value is not None
@@ -709,7 +767,9 @@ class AgentRecord:
             raise AgentDeliveryError(
                 f"nonterminal agent record contains terminal state: {path}"
             )
-        if source_schema == _SESSION_STORAGE_SCHEMA and (
+        if source_schema in {
+            _SESSION_STORAGE_SCHEMA, _PREVIOUS_SESSION_STORAGE_SCHEMA,
+        } and (
             (lifecycle == "stopped") != (terminal is not None)
         ):
             raise AgentDeliveryError(
@@ -718,11 +778,15 @@ class AgentRecord:
         fields["terminal"] = terminal
         fields["_legacy_terminal_authority"] = (
             source_schema in {
-                1, _PREVIOUS_SESSION_STORAGE_SCHEMA,
-                _LEGACY_SESSION_STORAGE_SCHEMA,
+                1, _LEGACY_SESSION_STORAGE_SCHEMA,
+                _OLDEST_SESSION_STORAGE_SCHEMA,
             }
             and lifecycle == "stopped"
             and terminal is None
+        )
+        fields["_legacy_terminal_binding"] = (
+            source_schema != _SESSION_STORAGE_SCHEMA
+            and str(document.get("mode", "interactive")) == "interactive"
         )
         if document.get("adapter", "herdr") not in ("herdr", "herdr-pane", "herdr-foreign", "turn-runner"):
             raise AgentDeliveryError(f"unsupported runtime adapter in {path}")
@@ -769,11 +833,11 @@ class AgentRecord:
                 executable_device=cast(int, identity["executable_device"]),
                 executable_inode=cast(int, identity["executable_inode"]),
             )
-        custom_identity = process_identity("custom_process_identity")
+        runtime_identity = process_identity("runtime_process_identity")
         foreign_shell_identity = process_identity("foreign_shell_identity")
         runner_identity = process_identity("runner_identity")
-        if custom_identity is not None:
-            fields["custom_process_identity"] = custom_identity
+        if runtime_identity is not None:
+            fields["runtime_process_identity"] = runtime_identity
         if foreign_shell_identity is not None:
             fields["foreign_shell_identity"] = foreign_shell_identity
         if runner_identity is not None:
@@ -786,13 +850,13 @@ class AgentRecord:
         elif runner_pid is not None:
             fields["_legacy_runner_pid"] = runner_pid
             fields["_legacy_runner_started_at"] = runner_started_at
-        if (custom_identity is not None
-                and (document.get("adapter", "herdr") != "herdr-pane"
-                     or document.get("harness") != "muse"
+        if (runtime_identity is not None
+                and (document.get("adapter", "herdr") not in ("herdr", "herdr-pane")
                      or not isinstance(document.get("pane_id"), str)
                      or not document["pane_id"])):
             raise AgentDeliveryError(
-                f"custom process identity requires a Muse herdr-pane in {path}"
+                "inconsistent runtime process identity: it requires an owned "
+                f"interactive pane in {path}"
             )
         if (foreign_shell_identity is not None
                 and (document.get("adapter", "herdr") != "herdr-foreign"
@@ -851,24 +915,35 @@ class AgentRecord:
             _SESSION_STORAGE_SCHEMA,
             _PREVIOUS_SESSION_STORAGE_SCHEMA,
             _LEGACY_SESSION_STORAGE_SCHEMA,
+            _OLDEST_SESSION_STORAGE_SCHEMA,
         ):
             common_fields = {
                 "schema", "name", "token", "created_at", "lifecycle", "launch",
                 "workspace_id", "tab_id", "pane_id",
                 "startup_warning", "effective_reasoning_effort", "error",
                 "paused", "pane_reported_by_agentctl",
-                "custom_process_identity", "foreign_shell_identity", "runner_identity",
+                "foreign_shell_identity", "runner_identity",
                 "extensions",
             }
             if storage_schema == _SESSION_STORAGE_SCHEMA:
-                top_fields = common_fields | {"native_session", "goal", "terminal"}
+                top_fields = common_fields | {
+                    "terminal_id", "native_session", "goal", "terminal",
+                    "runtime_process_identity",
+                }
             elif storage_schema == _PREVIOUS_SESSION_STORAGE_SCHEMA:
-                top_fields = common_fields | {"native_session", "goal"}
+                top_fields = common_fields | {
+                    "native_session", "goal", "terminal", "custom_process_identity",
+                }
+            elif storage_schema == _LEGACY_SESSION_STORAGE_SCHEMA:
+                top_fields = common_fields | {
+                    "native_session", "goal", "custom_process_identity",
+                }
             else:
                 top_fields = common_fields | {
                     "session_agent", "session_value",
                     "goal", "goal_delivery", "goal_session_id", "goal_command",
                     "goal_messages", "goal_message_id",
+                    "custom_process_identity",
                 }
             if set(document) != top_fields:
                 raise AgentDeliveryError(
@@ -920,8 +995,13 @@ class AgentRecord:
                 key: value for key, value in document.items()
                 if key not in {"schema", "launch", "extensions", "native_session"}
             }
+            if storage_schema != _SESSION_STORAGE_SCHEMA:
+                normalized["runtime_process_identity"] = normalized.pop(
+                    "custom_process_identity"
+                )
             if storage_schema in (
                 _SESSION_STORAGE_SCHEMA, _PREVIOUS_SESSION_STORAGE_SCHEMA,
+                _LEGACY_SESSION_STORAGE_SCHEMA,
             ):
                 goal_value = document.get("goal")
                 if (not isinstance(goal_value, dict)
@@ -963,8 +1043,10 @@ class AgentRecord:
                     raise AgentDeliveryError(
                         f"invalid agent record native session: {path}"
                     )
-                if storage_schema == _PREVIOUS_SESSION_STORAGE_SCHEMA:
+                if storage_schema == _LEGACY_SESSION_STORAGE_SCHEMA:
                     normalized["terminal"] = None
+                if storage_schema != _SESSION_STORAGE_SCHEMA:
+                    normalized["terminal_id"] = None
             else:
                 observed = normalized.get("session_value")
                 asserted = normalized.get("goal_session_id")
@@ -1014,6 +1096,10 @@ class AgentRecord:
                 f"legacy agent record contains a reserved current-schema field: {path}"
             )
         normalized = dict(document)
+        if "runtime_process_identity" not in normalized:
+            normalized["runtime_process_identity"] = normalized.pop(
+                "custom_process_identity", None
+            )
         args = normalized.get("arguments")
         argv = normalized.get("launch_argv", [])
         if not isinstance(args, list) or not isinstance(argv, list):
@@ -1052,9 +1138,22 @@ class AgentRecord:
         """Pin the exact pane and, when available at launch, its durable session."""
         if not self.pane_id:
             raise AgentDeliveryError(f"agent {self.name!r} has no confirmed pane; inspect its launch error")
+        if (self._legacy_terminal_binding or not self.terminal_id
+                or (self.launch.adapter != "herdr-foreign"
+                    and self.runtime_process_identity is None)):
+            raise AgentDeliveryError(
+                f"agent {self.name!r} has no terminal/runtime-generation binding; "
+                "explicit recovery is required before interactive access"
+            )
         observed_session = self.session_source == "observed"
         return agent.Target(
             pane_id=self.pane_id,
+            terminal_id=self.terminal_id,
+            runtime_process_identity=self.runtime_process_identity,
+            expected_argv=(
+                self.launch.argv
+                if self.runtime_process_identity is not None else None
+            ),
             session_agent=self.session_agent if observed_session else None,
             session_value=self.session_value if observed_session else None,
             expected_agent=self.launch.harness,
@@ -1287,6 +1386,22 @@ class _WorkspaceClient:
         self._submission_guard_factory = submission_guard
         self.adopted_evidence_observation: AdoptedRuntimeEvidence | None = None
 
+    def _terminal_id(self) -> str:
+        terminal_id = self.record.terminal_id
+        if not terminal_id:
+            raise HerdrUnavailable(
+                f"agent {self.record.name!r} has no terminal-generation binding"
+            )
+        return terminal_id
+
+    def _guard(self) -> RuntimeGuard:
+        identity = self.record.runtime_process_identity
+        if identity is None and self.record.launch.adapter != "herdr-foreign":
+            raise HerdrUnavailable(
+                f"agent {self.record.name!r} has no runtime-process binding"
+            )
+        return RuntimeGuard(self._terminal_id(), identity)
+
     @contextmanager
     def acquire_submission_guard(self) -> Iterator[None]:
         """Pin the owner generation before the FIFO and pane lock boundary."""
@@ -1349,7 +1464,8 @@ class _WorkspaceClient:
                 f"expected one recorded pane, found {len(matches)}",
             )
         presentation = matches[0]
-        if presentation.workspace_id != self.record.workspace_id:
+        if (presentation.workspace_id != self.record.workspace_id
+                or presentation.terminal_id != self._terminal_id()):
             return observed(
                 AdoptedRuntimeState.IDENTITY_MISMATCH, "runtime-identity-mismatch",
                 f"adopted pane {pane_id!r} workspace identity changed",
@@ -1358,10 +1474,13 @@ class _WorkspaceClient:
         try:
             info = (
                 self.client.pane_info(
-                    pane_id, timeout=self._timeout("adopted pane identity probe"),
+                    pane_id, expected_terminal_id=self._terminal_id(),
+                    timeout=self._timeout("adopted pane identity probe"),
                 )
                 if self.deadline is not None and isinstance(self.client, HerdrClient)
-                else self.client.pane_info(pane_id)
+                else self.client.pane_info(
+                    pane_id, expected_terminal_id=self._terminal_id(),
+                )
             )
         except HerdrRunError as exc:
             return observed(
@@ -1379,10 +1498,14 @@ class _WorkspaceClient:
             if self.deadline is not None and isinstance(self.client, HerdrClient):
                 self.client.verify_pane_shell_identity(
                     pane_id, shell_identity,
+                    expected_terminal_id=self._terminal_id(),
                     timeout=self._timeout("adopted shell identity probe"),
                 )
             else:
-                self.client.verify_pane_shell_identity(pane_id, shell_identity)
+                self.client.verify_pane_shell_identity(
+                    pane_id, shell_identity,
+                    expected_terminal_id=self._terminal_id(),
+                )
         except RuntimeIdentityMismatch as exc:
             return observed(
                 AdoptedRuntimeState.IDENTITY_MISMATCH,
@@ -1430,10 +1553,14 @@ class _WorkspaceClient:
             idle = (
                 self.client.pane_is_same_idle_shell(
                     pane_id, shell_identity,
+                    expected_terminal_id=self._terminal_id(),
                     timeout=self._timeout("adopted idle-shell proof"),
                 )
                 if self.deadline is not None and isinstance(self.client, HerdrClient)
-                else self.client.pane_is_same_idle_shell(pane_id, shell_identity)
+                else self.client.pane_is_same_idle_shell(
+                    pane_id, shell_identity,
+                    expected_terminal_id=self._terminal_id(),
+                )
             )
         except HerdrRunError as exc:
             return observed(
@@ -1459,22 +1586,30 @@ class _WorkspaceClient:
             info, presentation,
         )
 
-    def pane_info(self, pane_id: str) -> AgentPaneInfo:
+    def pane_info(
+        self, pane_id: str, *, expected_terminal_id: str | None = None,
+    ) -> AgentPaneInfo:
         # Sessions started by this manager have a second lifecycle identity in
         # Herdr's named-agent registry.  Adopted sessions deliberately do not:
         # assigning or replacing a native name would mutate a runtime this
         # registry does not own.  Their exact pane/session/workspace/cwd/harness
         # assertions remain the authority instead.
+        if (expected_terminal_id is not None
+                and expected_terminal_id != self._terminal_id()):
+            raise HerdrUnavailable("terminal-generation assertion changed")
         if self.record.launch.adapter == "herdr-foreign" and pane_id == self.record.pane_id:
             return self.adopted_evidence().require_live()
         owned_pane: str | None
         if self.record.launch.adapter == "herdr":
             owned_pane = (
                 self.client.agent_pane(
-                    self.record.name, timeout=self._timeout("agent identity probe")
+                    self.record.name, expected_terminal_id=self._terminal_id(),
+                    timeout=self._timeout("agent identity probe")
                 )
                 if self.deadline is not None and isinstance(self.client, HerdrClient)
-                else self.client.agent_pane(self.record.name)
+                else self.client.agent_pane(
+                    self.record.name, expected_terminal_id=self._terminal_id(),
+                )
             )
         else:
             owned_pane = self.record.pane_id
@@ -1482,13 +1617,34 @@ class _WorkspaceClient:
             raise HerdrUnavailable(f"agent {self.record.name!r} no longer owns its recorded pane")
         info = (
             self.client.pane_info(
-                pane_id, timeout=self._timeout("pane identity probe")
+                pane_id, expected_terminal_id=self._terminal_id(),
+                timeout=self._timeout("pane identity probe")
             )
             if self.deadline is not None and isinstance(self.client, HerdrClient)
-            else self.client.pane_info(pane_id)
+            else self.client.pane_info(
+                pane_id, expected_terminal_id=self._terminal_id(),
+            )
         )
-        if info.workspace_id != self.record.workspace_id:
+        if (info.workspace_id != self.record.workspace_id
+                or info.terminal_id != self._terminal_id()):
             raise HerdrUnavailable(f"agent {self.record.name!r} workspace identity changed")
+        if self.record.launch.adapter in ("herdr", "herdr-pane"):
+            identity = self.record.runtime_process_identity
+            if identity is None:
+                raise HerdrUnavailable(
+                    f"agent {self.record.name!r} has no owned runtime-process binding"
+                )
+            if self.deadline is not None and isinstance(self.client, HerdrClient):
+                self.client.verify_runtime_process_identity(
+                    pane_id, self.record.launch.harness, self.record.launch.argv,
+                    identity, expected_terminal_id=self._terminal_id(),
+                    timeout=self._timeout("owned runtime-process probe"),
+                )
+            else:
+                self.client.verify_runtime_process_identity(
+                    pane_id, self.record.launch.harness, self.record.launch.argv,
+                    identity, expected_terminal_id=self._terminal_id(),
+                )
         if pane_id == self.record.pane_id:
             if (self.record.session_source == "observed"
                     and self.record.session_value is not None
@@ -1500,10 +1656,14 @@ class _WorkspaceClient:
                     screen = (
                         self.client.read(
                             pane_id, source="visible", lines=200,
+                            guard=self._guard(),
                             timeout=self._timeout("pane readiness probe"),
                         )
                         if self.deadline is not None and isinstance(self.client, HerdrClient)
-                        else self.client.read(pane_id, source="visible", lines=200)
+                        else self.client.read(
+                            pane_id, source="visible", lines=200,
+                            guard=self._guard(),
+                        )
                     )
                 except HerdrRunError:
                     if self.check_prompt:
@@ -1522,6 +1682,7 @@ class _WorkspaceClient:
                             status="staged",
                             session_agent=info.session_agent,
                             session_value=info.session_value,
+                            terminal_id=info.terminal_id,
                         )
                     elif claude_active_screen(screen):
                         info = AgentPaneInfo(
@@ -1532,24 +1693,21 @@ class _WorkspaceClient:
                             status="working",
                             session_agent=info.session_agent,
                             session_value=info.session_value,
+                            terminal_id=info.terminal_id,
                         )
             if self.record.launch.adapter == "herdr-pane":
                 reported_status = info.status
                 if self.deadline is not None and isinstance(self.client, HerdrClient):
-                    self.client.verify_custom_harness(
-                        pane_id, self.record.launch.harness,
-                        self.record.custom_process_identity,
-                        timeout=self._timeout("custom harness probe"),
-                    )
                     screen = self.client.read(
                         pane_id, source="visible", lines=200,
+                        guard=self._guard(),
                         timeout=self._timeout("custom harness readiness probe"),
                     )
                 else:
-                    self.client.verify_custom_harness(
-                        pane_id, self.record.launch.harness, self.record.custom_process_identity,
+                    screen = self.client.read(
+                        pane_id, source="visible", lines=200,
+                        guard=self._guard(),
                     )
-                    screen = self.client.read(pane_id, source="visible", lines=200)
                 if muse_trust_prompt(screen):
                     raise HerdrUnavailable(
                         "Muse workspace trust prompt requires human attention; no input was submitted"
@@ -1582,6 +1740,7 @@ class _WorkspaceClient:
                     ),
                     session_agent=info.session_agent,
                     session_value=info.session_value,
+                    terminal_id=info.terminal_id,
                 )
         return info
 
@@ -1590,11 +1749,23 @@ class _WorkspaceClient:
         if self.record.launch.adapter == "herdr-foreign":
             evidence = self.adopted_evidence()
             return (() if evidence.presentation is None else (evidence.presentation,))
-        if self.deadline is not None and isinstance(self.client, HerdrClient):
-            return self.client.panes(
+        panes = (
+            self.client.panes(
                 self.record.workspace_id, timeout=self._timeout("pane list probe")
             )
-        return self.client.panes(self.record.workspace_id)
+            if self.deadline is not None and isinstance(self.client, HerdrClient)
+            else self.client.panes(self.record.workspace_id)
+        )
+        terminal_id = self._terminal_id()
+        if any(
+            pane.pane_id == self.record.pane_id
+            and pane.terminal_id != terminal_id
+            for pane in panes
+        ):
+            raise HerdrUnavailable(
+                f"agent {self.record.name!r} terminal generation changed"
+            )
+        return panes
 
     def workspace_label(self, workspace_id: str) -> str:
         if self.deadline is not None and isinstance(self.client, HerdrClient):
@@ -1622,7 +1793,9 @@ class _WorkspaceClient:
                     break
         if self.record.launch.adapter != "herdr-pane":
             if self.record.launch.harness != "claude":
-                self.client.prompt_agent(pane_id, command)
+                self.client.prompt_agent(
+                    pane_id, command, guard=self._guard(),
+                )
                 return
             if "\0" in command or "\x1b" in command:
                 raise HerdrUnavailable(
@@ -1642,10 +1815,18 @@ class _WorkspaceClient:
                 # whether that Enter was accepted, so it cannot safely be
                 # followed by another Enter. Use the explicit pane primitive:
                 # literal text first, exact composer proof, then one Enter.
-                self.client.send_text(
-                    pane_id,
-                    f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}",
-                )
+                if isinstance(cast(object, self.client), HerdrClient):
+                    self.client.send_text(
+                        pane_id,
+                        f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}",
+                        guard=self._guard(),
+                    )
+                else:
+                    self.client.send_text(
+                        pane_id,
+                        f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}",
+                        guard=self._guard(),
+                    )
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline:
                     staged = self.read(pane_id, source="visible", lines=200)
@@ -1667,7 +1848,14 @@ class _WorkspaceClient:
                 raise HerdrUnavailable(
                     "Claude editor changed before submission; Enter was not sent"
                 )
-            self.client.send_keys(pane_id, "Enter")
+            if isinstance(cast(object, self.client), HerdrClient):
+                self.client.send_keys(
+                    pane_id, "Enter", guard=self._guard(),
+                )
+            else:
+                self.client.send_keys(
+                    pane_id, "Enter", guard=self._guard(),
+                )
             self.custom_submission = _CustomPaneSubmission(
                 "claude", command, prior_count, prior_active,
             )
@@ -1681,7 +1869,7 @@ class _WorkspaceClient:
             raise HerdrUnavailable(
                 f"custom pane {pane_id} is not at a verified idle or staged Muse composer"
             )
-        before = self.client.read(pane_id, source="recent-unwrapped", lines=200)
+        before = self.read(pane_id, source="recent-unwrapped", lines=200)
         if not muse_verified_process_composer(before):
             raise HerdrUnavailable(
                 "current Muse editor could not be verified before delivery; no input was sent"
@@ -1692,16 +1880,33 @@ class _WorkspaceClient:
                 raise HerdrUnavailable(
                     "Muse editor contains different buffered input; no input or Enter was sent"
                 )
-            self.client.send_text(
-                pane_id, f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}"
-            )
+            if isinstance(cast(object, self.client), HerdrClient):
+                self.client.send_text(
+                    pane_id, f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}",
+                    guard=self._guard(),
+                )
+            else:
+                self.client.send_text(
+                    pane_id, f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}",
+                    guard=self._guard(),
+                )
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
-                self.client.verify_custom_harness(
-                    pane_id, self.record.launch.harness,
-                    self.record.custom_process_identity,
-                )
-                staged = self.client.read(
+                if isinstance(cast(object, self.client), HerdrClient):
+                    self.client.verify_runtime_process_identity(
+                        pane_id, self.record.launch.harness,
+                        self.record.launch.argv,
+                        self.record.runtime_process_identity,
+                        expected_terminal_id=self._terminal_id(),
+                    )
+                else:
+                    self.client.verify_runtime_process_identity(
+                        pane_id, self.record.launch.harness,
+                        self.record.launch.argv,
+                        self.record.runtime_process_identity,
+                        expected_terminal_id=self._terminal_id(),
+                    )
+                staged = self.read(
                     pane_id, source="recent-unwrapped", lines=200,
                 )
                 if (staged != before
@@ -1714,20 +1919,47 @@ class _WorkspaceClient:
                 raise HerdrUnavailable(
                     "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent"
                 )
-        self.client.verify_custom_harness(
-            pane_id, self.record.launch.harness, self.record.custom_process_identity
-        )
-        confirmed = self.client.read(
+        if isinstance(cast(object, self.client), HerdrClient):
+            self.client.verify_runtime_process_identity(
+                pane_id, self.record.launch.harness,
+                self.record.launch.argv,
+                self.record.runtime_process_identity,
+                expected_terminal_id=self._terminal_id(),
+            )
+        else:
+            self.client.verify_runtime_process_identity(
+                pane_id, self.record.launch.harness,
+                self.record.launch.argv,
+                self.record.runtime_process_identity,
+                expected_terminal_id=self._terminal_id(),
+            )
+        confirmed = self.read(
             pane_id, source="recent-unwrapped", lines=200,
         )
         if not muse_verified_process_prompt_is_exact_composer(confirmed, command):
             raise HerdrUnavailable(
                 "Muse editor changed before submission; Enter was not sent"
             )
-        self.client.verify_custom_harness(
-            pane_id, self.record.launch.harness, self.record.custom_process_identity
-        )
-        self.client.send_keys(pane_id, "Enter")
+        if isinstance(cast(object, self.client), HerdrClient):
+            self.client.verify_runtime_process_identity(
+                pane_id, self.record.launch.harness,
+                self.record.launch.argv,
+                self.record.runtime_process_identity,
+                expected_terminal_id=self._terminal_id(),
+            )
+            self.client.send_keys(
+                pane_id, "Enter", guard=self._guard(),
+            )
+        else:
+            self.client.verify_runtime_process_identity(
+                pane_id, self.record.launch.harness,
+                self.record.launch.argv,
+                self.record.runtime_process_identity,
+                expected_terminal_id=self._terminal_id(),
+            )
+            self.client.send_keys(
+                pane_id, "Enter", guard=self._guard(),
+            )
         self.custom_submission = _CustomPaneSubmission(
             "muse", command,
             muse_verified_process_prompt_transcript_count(confirmed, command),
@@ -1773,15 +2005,19 @@ class _WorkspaceClient:
                     return
                 if harness == "muse":
                     if isinstance(cast(object, self.client), HerdrClient):
-                        self.client.verify_custom_harness(
+                        self.client.verify_runtime_process_identity(
                             pane_id, self.record.launch.harness,
-                            self.record.custom_process_identity,
+                            self.record.launch.argv,
+                            self.record.runtime_process_identity,
+                            expected_terminal_id=self._terminal_id(),
                             timeout=self._timeout("custom submission identity probe"),
                         )
                     else:
-                        self.client.verify_custom_harness(
+                        self.client.verify_runtime_process_identity(
                             pane_id, self.record.launch.harness,
-                            self.record.custom_process_identity,
+                            self.record.launch.argv,
+                            self.record.runtime_process_identity,
+                            expected_terminal_id=self._terminal_id(),
                         )
                     screen = self.read(
                         pane_id, source="recent-unwrapped", lines=5000,
@@ -1823,7 +2059,16 @@ class _WorkspaceClient:
                 1000,
                 max(1, int(self._timeout("initial agent status wait") * 1000)),
             )
-            self.client.wait_agent_status(pane_id, status, initial_ms)
+            if isinstance(cast(object, self.client), HerdrClient):
+                self.client.wait_agent_status(
+                    pane_id, status, initial_ms,
+                    guard=self._guard(),
+                )
+            else:
+                self.client.wait_agent_status(
+                    pane_id, status, initial_ms,
+                    guard=self._guard(),
+                )
             return
         except HerdrUnavailable as exc:
             # Herdr's wait subscription may be installed after the transition
@@ -1839,17 +2084,28 @@ class _WorkspaceClient:
             if _goal_replacement_selected(screen, self.goal_objective):
                 if isinstance(cast(object, self.client), HerdrClient):
                     self.client.send_keys(
-                        pane_id, "Enter",
+                        pane_id, "Enter", guard=self._guard(),
                         timeout=self._timeout("goal replacement confirmation"),
                     )
                 else:
-                    self.client.send_keys(pane_id, "Enter")
+                    self.client.send_keys(
+                        pane_id, "Enter", guard=self._guard(),
+                    )
         remaining = int(self._timeout("final agent status wait") * 1000)
         if remaining <= 0:
             assert initial_error is not None
             raise initial_error
         try:
-            self.client.wait_agent_status(pane_id, status, remaining)
+            if isinstance(cast(object, self.client), HerdrClient):
+                self.client.wait_agent_status(
+                    pane_id, status, remaining,
+                    guard=self._guard(),
+                )
+            else:
+                self.client.wait_agent_status(
+                    pane_id, status, remaining,
+                    guard=self._guard(),
+                )
             return
         except HerdrUnavailable as final_error:
             if self.pane_info(pane_id).status == status:
@@ -1860,9 +2116,13 @@ class _WorkspaceClient:
         if self.deadline is not None and isinstance(self.client, HerdrClient):
             return self.client.read(
                 pane_id, source=source, lines=lines,
+                guard=self._guard(),
                 timeout=self._timeout("pane read probe"),
             )
-        return self.client.read(pane_id, source=source, lines=lines)
+        return self.client.read(
+            pane_id, source=source, lines=lines,
+            guard=self._guard(),
+        )
 
 
 class ManagedAgents:
@@ -1871,6 +2131,16 @@ class ManagedAgents:
     def __init__(self, client: HerdrClient, registry: str | Path = ".herdr-agents") -> None:
         self.client = client
         self.registry = Path(os.path.abspath(registry))
+
+    @staticmethod
+    def _runtime_guard(record: AgentRecord) -> RuntimeGuard:
+        if (record.terminal_id is None
+                or (record.runtime_process_identity is None
+                    and record.launch.adapter != "herdr-foreign")):
+            raise AgentDeliveryError(
+                f"agent {record.name!r} has no complete terminal/runtime binding"
+            )
+        return RuntimeGuard(record.terminal_id, record.runtime_process_identity)
 
     def _prepare(self) -> None:
         self.registry.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1888,6 +2158,23 @@ class ManagedAgents:
         finally:
             os.close(descriptor)
 
+    @contextmanager
+    def _queue_delivery_transaction(self, name: str) -> Iterator[None]:
+        """Exclude prompt selection while record and queue binding converge."""
+        queue = self._queue(name)
+        if not os.path.lexists(queue):
+            yield
+            return
+        agent._validate_existing_queue(queue)
+        descriptor = agent._open_private_lock(
+            str(Path(queue) / ".delivery.lock"), "queue delivery lock",
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+
     @staticmethod
     def _delivery_identity(record: AgentRecord) -> tuple[object, ...]:
         """Return the immutable generation and runtime route used for submission."""
@@ -1897,10 +2184,11 @@ class ManagedAgents:
             record.workspace_id,
             record.tab_id,
             record.pane_id,
+            record.terminal_id,
             record.session_agent,
             record.session_value,
             record.session_source,
-            record.custom_process_identity,
+            record.runtime_process_identity,
             record.foreign_shell_identity,
             record.runner_identity,
             # Pause/resume changes the right to inject input. A pause that
@@ -2592,6 +2880,23 @@ class ManagedAgents:
                 return other
         return None
 
+    def _presentation_owner(
+        self, pane_id: str, terminal_id: str, *, exclude: str,
+    ) -> AgentRecord | None:
+        """Find another record that may own this exact pane generation."""
+        if not self.registry.exists():
+            return None
+        agent._validate_private_directory(str(self.registry), "agent registry")
+        for path in self.registry.iterdir():
+            if (not _NAME.fullmatch(path.name) or path.name == "archive"
+                    or path.name == exclude):
+                continue
+            other = self._load(path.name)
+            if (other.pane_id == pane_id
+                    or other.terminal_id == terminal_id):
+                return other
+        return None
+
     def start(
         self, name: str, *, cwd: str, workspace_id: str | None = None,
         workspace_label: str | None = None,
@@ -2643,6 +2948,7 @@ class ManagedAgents:
         environment = environment_entries(environment)
         if brief is not None and not brief:
             raise AgentDeliveryError("brief must not be empty")
+        self.client.require_terminal_identity_support()
         with self._lock(name):
             with self._identity_transaction():
                 if resume is not None:
@@ -2653,7 +2959,27 @@ class ManagedAgents:
                         )
                 directory = self._directory(name)
                 if os.path.lexists(directory):
-                    raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
+                    agent._validate_private_directory(
+                        str(directory), "agent start directory",
+                    )
+                    try:
+                        empty = next(directory.iterdir(), None) is None
+                    except OSError as exc:
+                        raise AgentDeliveryError(
+                            f"cannot inspect agent start directory: {exc}"
+                        ) from exc
+                    if not empty:
+                        raise AgentDeliveryError(
+                            f"agent {name!r} already registered; stop it before "
+                            "reusing the name"
+                        )
+                    try:
+                        directory.rmdir()
+                        agent._fsync_dir(str(self.registry))
+                    except OSError as exc:
+                        raise AgentDeliveryError(
+                            f"cannot remove interrupted empty agent start: {exc}"
+                        ) from exc
                 directory.mkdir(mode=0o700)
                 agent._fsync_dir(str(self.registry))
                 record = AgentRecord(
@@ -2678,6 +3004,7 @@ class ManagedAgents:
                         record, workspace_id, workspace_label, environment,
                     )
                     assert record.pane_id is not None
+                    assert record.terminal_id is not None
                     if record.launch.adapter == "herdr-pane":
                         def persist_launch_intent(
                             executable: str, device: int, inode: int,
@@ -2691,11 +3018,12 @@ class ManagedAgents:
                             self._save(record)
 
                         def persist_identity(identity: CustomProcessIdentity) -> None:
-                            record.custom_process_identity = identity
+                            record.runtime_process_identity = identity
                             self._save(record)
 
                         self.client.start_pane_agent(
                             name, harness, record.pane_id, arguments,
+                            expected_terminal_id=record.terminal_id,
                             timeout=startup_timeout,
                             on_launch_intent=persist_launch_intent,
                             on_observed=persist_identity,
@@ -2703,12 +3031,26 @@ class ManagedAgents:
                         record.pane_reported_by_agentctl = True
                         self._save(record)
                         screen = self.client.read(
-                            record.pane_id, source="visible", lines=200
+                            record.pane_id, source="visible", lines=200,
+                            guard=self._runtime_guard(record),
                         )
                         (record.startup_warning,
                          record.effective_reasoning_effort) = muse_startup_metadata(screen)
                     else:
-                        self.client.start_agent(name, harness, record.pane_id, arguments, timeout=startup_timeout)
+                        self.client.start_agent(
+                            name, harness, record.pane_id, arguments,
+                            expected_terminal_id=record.terminal_id,
+                            timeout=startup_timeout,
+                        )
+                        record.runtime_process_identity = (
+                            self.client.capture_runtime_process_identity(
+                                record.pane_id, record.launch.harness,
+                                record.launch.argv,
+                                expected_terminal_id=record.terminal_id,
+                                timeout=startup_timeout,
+                            )
+                        )
+                        self._save(record)
                     info = self._checked(record, ready=True)
                     if info.workspace_id != record.workspace_id:
                         raise AgentDeliveryError("started agent moved to another workspace")
@@ -2723,7 +3065,10 @@ class ManagedAgents:
                         )
                         if owner is not None:
                             try:
-                                self.client.close_pane(record.pane_id)
+                                self.client.close_pane(
+                                    record.pane_id,
+                                    guard=self._runtime_guard(record),
+                                )
                             except HerdrRunError as close_error:
                                 record.session_agent = record.session_value = None
                                 record.session_source = None
@@ -2810,8 +3155,15 @@ class ManagedAgents:
             raise AgentDeliveryError(f"cwd is not a directory: {root}")
         if session is not None and (not session or "\0" in session):
             raise AgentDeliveryError("native session id must be nonempty and contain no NUL")
+        self.client.require_terminal_identity_support()
+        observed = self.client.pane_info(pane_id)
+        if not observed.terminal_id:
+            raise AgentDeliveryError(
+                f"refusing pane {pane_id}: Herdr did not report a terminal generation"
+            )
         target = agent.Target(
             pane_id=pane_id,
+            terminal_id=observed.terminal_id,
             session_agent=harness if session is not None else None,
             session_value=session,
             expected_agent=harness,
@@ -2840,6 +3192,7 @@ class ManagedAgents:
         self, name: str, *, expected_token: str, expected_pid: int,
     ) -> dict[str, object]:
         """Recover or reconcile one exactly identified live Muse process."""
+        self.client.require_terminal_identity_support()
         with self._lock(name):
             record = self._load_expected(name, expected_token)
             if (record.lifecycle not in {"starting", "launch_failed"}
@@ -2862,10 +3215,10 @@ class ManagedAgents:
                 record.launch.executable[2]
                 if record.launch.executable is not None else None
             )
-            if record.custom_process_identity is not None:
+            if record.runtime_process_identity is not None:
                 recorded_image = (
-                    record.custom_process_identity.executable_device,
-                    record.custom_process_identity.executable_inode,
+                    record.runtime_process_identity.executable_device,
+                    record.runtime_process_identity.executable_inode,
                 )
                 if (launch_device is not None and launch_inode is not None
                         and (launch_device, launch_inode) != recorded_image):
@@ -2885,11 +3238,22 @@ class ManagedAgents:
             ]
             if (len(presentations) != 1
                     or presentations[0].tab_id != record.tab_id
-                    or presentations[0].workspace_id != record.workspace_id):
+                    or presentations[0].workspace_id != record.workspace_id
+                    or presentations[0].terminal_id is None):
                 raise AgentDeliveryError(
                     "refusing start recovery: recorded pane, tab, or workspace ownership changed"
                 )
-            info = self.client.pane_info(pane_id)
+            if (record.terminal_id is not None
+                    and presentations[0].terminal_id != record.terminal_id):
+                raise AgentDeliveryError(
+                    "refusing start recovery: recorded terminal generation changed"
+                )
+            record.terminal_id = presentations[0].terminal_id
+            record._legacy_terminal_binding = False
+            assert record.terminal_id is not None
+            info = self.client.pane_info(
+                pane_id, expected_terminal_id=record.terminal_id,
+            )
             if (info.pane_id != pane_id
                     or info.workspace_id != record.workspace_id
                     or os.path.realpath(info.cwd) != os.path.realpath(record.launch.cwd)
@@ -2901,18 +3265,22 @@ class ManagedAgents:
                 pane_id, record.launch.argv,
                 launch_device, launch_inode,
                 expected_pid,
+                expected_terminal_id=record.terminal_id,
             )
-            if (record.custom_process_identity is not None
-                    and record.custom_process_identity != identity):
+            if (record.runtime_process_identity is not None
+                    and record.runtime_process_identity != identity):
                 raise AgentDeliveryError(
                     "refusing start recovery: persisted custom process identity changed"
                 )
-            record.custom_process_identity = identity
+            record.runtime_process_identity = identity
             self._save(record)
+            terminal_id = record.terminal_id
+            assert terminal_id is not None
             try:
                 def commit_running() -> None:
                     screen = self.client.read(
                         pane_id, source="visible", lines=200,
+                        guard=RuntimeGuard(terminal_id, identity),
                     )
                     if not muse_idle_composer(screen):
                         raise HerdrUnavailable(
@@ -2926,6 +3294,7 @@ class ManagedAgents:
 
                 self.client.commit_recovered_pane_agent(
                     pane_id, record.launch.harness, identity, commit_running,
+                    expected_terminal_id=record.terminal_id,
                 )
             except HerdrRunError as exc:
                 record.lifecycle = "launch_failed"
@@ -2933,6 +3302,208 @@ class ManagedAgents:
                 self._save(record)
                 raise AgentDeliveryError(record.error) from exc
             return self._status_record(record)
+
+    def recover_terminal(
+        self, name: str, *, expected_token: str,
+    ) -> dict[str, object]:
+        """Bind one legacy live row to a stable Herdr terminal generation.
+
+        The terminal id is discovered from Herdr rather than supplied by the
+        caller, then used as an atomic precondition for every subsequent probe.
+        No registry write occurs until route, harness process, and native
+        session observations remain stable across the complete proof.
+        """
+        self.client.require_terminal_identity_support()
+        with self._lock(name):
+            with self._identity_transaction():
+                record = self._load_expected(name, expected_token)
+                if (record.lifecycle != "running"
+                        or record.launch.mode != "interactive"
+                        or record.launch.backend != "herdr"
+                        or record.launch.adapter not in (
+                            "herdr", "herdr-pane", "herdr-foreign",
+                        )
+                        or record.workspace_id is None
+                        or record.tab_id is None
+                        or record.pane_id is None):
+                    raise AgentDeliveryError(
+                        "terminal recovery requires a running legacy interactive "
+                        "Herdr record with complete pane routing"
+                    )
+
+                def unbound_target() -> agent.Target:
+                    observed_session = record.session_source == "observed"
+                    return agent.Target(
+                        pane_id=record.pane_id,
+                        session_agent=(
+                            record.session_agent if observed_session else None
+                        ),
+                        session_value=(
+                            record.session_value if observed_session else None
+                        ),
+                        expected_agent=record.launch.harness,
+                        expected_cwd=record.launch.cwd,
+                    )
+
+                old_target = unbound_target()
+                if (not record._legacy_terminal_binding
+                        and record.terminal_id is not None
+                        and (record.launch.adapter == "herdr-foreign"
+                            or record.runtime_process_identity is not None)):
+                    owner = self._presentation_owner(
+                        record.pane_id, record.terminal_id, exclude=name,
+                    )
+                    if owner is not None:
+                        raise AgentDeliveryError(
+                            "terminal generation is already registered as "
+                            f"{owner.name!r}"
+                        )
+                    self._checked(record)
+                    with self._queue_delivery_transaction(name):
+                        agent._relocate_existing_binding(
+                            self._queue(name), old_target, record.target(),
+                        )
+                    return {
+                        "name": record.name,
+                        "token": record.token,
+                        "terminal_id": record.terminal_id,
+                        "runtime_process_identity": (
+                            None if record.runtime_process_identity is None
+                            else asdict(record.runtime_process_identity)
+                        ),
+                        "recovered": True,
+                        "reconciled": True,
+                    }
+                if not record._legacy_terminal_binding or record.terminal_id is not None:
+                    raise AgentDeliveryError(
+                        "terminal recovery requires an unbound legacy session record"
+                    )
+
+                def presentation() -> Pane:
+                    matches = [
+                        pane for pane in self.client.panes()
+                        if pane.pane_id == record.pane_id
+                    ]
+                    if len(matches) != 1:
+                        raise AgentDeliveryError(
+                            "cannot recover terminal: recorded pane is absent or ambiguous"
+                        )
+                    pane = matches[0]
+                    if (pane.workspace_id != record.workspace_id
+                            or pane.tab_id != record.tab_id
+                            or not pane.terminal_id or "\0" in pane.terminal_id):
+                        raise AgentDeliveryError(
+                            "cannot recover terminal: recorded route changed or has no generation"
+                        )
+                    return pane
+
+                first_presentation = presentation()
+                terminal_id = cast(str, first_presentation.terminal_id)
+                owner = self._presentation_owner(
+                    record.pane_id, terminal_id, exclude=name,
+                )
+                if owner is not None:
+                    raise AgentDeliveryError(
+                        f"terminal generation is already registered as {owner.name!r}"
+                    )
+                first_info = self.client.pane_info(
+                    record.pane_id, expected_terminal_id=terminal_id,
+                )
+                if (first_info.workspace_id != record.workspace_id
+                        or first_info.terminal_id != terminal_id
+                        or os.path.realpath(first_info.cwd)
+                        != os.path.realpath(record.launch.cwd)):
+                    raise AgentDeliveryError(
+                        "cannot recover terminal: live pane identity disagrees with the record"
+                    )
+                for observed, saved in (
+                    (first_info.session_agent, record.session_agent),
+                    (first_info.session_value, record.session_value),
+                ):
+                    if observed is not None and saved is not None and observed != saved:
+                        raise AgentDeliveryError(
+                            "cannot recover terminal: native session identity changed"
+                        )
+
+                record.terminal_id = terminal_id
+                record._legacy_terminal_binding = False
+                if record.launch.adapter in ("herdr", "herdr-pane"):
+                    identity = record.runtime_process_identity
+                    if identity is None:
+                        identity = self.client.capture_runtime_process_identity(
+                            record.pane_id, record.launch.harness,
+                            record.launch.argv,
+                            expected_terminal_id=terminal_id,
+                        )
+                        record.runtime_process_identity = identity
+                    else:
+                        self.client.verify_runtime_process_identity(
+                            record.pane_id, record.launch.harness,
+                            record.launch.argv, identity,
+                            expected_terminal_id=terminal_id,
+                        )
+                else:
+                    if record.foreign_shell_identity is None:
+                        raise AgentDeliveryError(
+                            "cannot recover legacy adoption without its recorded shell identity"
+                        )
+                    self.client.verify_pane_shell_identity(
+                        record.pane_id, record.foreign_shell_identity,
+                        expected_terminal_id=terminal_id,
+                    )
+
+                if (record.session_agent is not None
+                        and record.session_value is not None):
+                    owner = self._identity_owner(
+                        record.session_agent, record.session_value, exclude=name,
+                    )
+                    if owner is not None:
+                        raise AgentDeliveryError(
+                            "native session is already registered as "
+                            f"{owner.name!r}"
+                        )
+
+                first_checked = self._checked(record)
+                second_presentation = presentation()
+                second_checked = self._checked(record)
+                def stable_info(info: AgentPaneInfo) -> tuple[object, ...]:
+                    return (
+                        info.pane_id, info.workspace_id,
+                        os.path.realpath(info.cwd), info.agent,
+                        info.session_agent, info.session_value, info.terminal_id,
+                    )
+                if (second_presentation != first_presentation
+                        or stable_info(second_checked) != stable_info(first_checked)):
+                    raise AgentDeliveryError(
+                        "cannot recover terminal: route or runtime identity changed during proof"
+                    )
+                # Legacy goal tagging owns this same delivery lock. Finish that
+                # decode-edge migration first, then hold delivery exclusion
+                # across the record-first, idempotent queue-binding transition.
+                self._migrate_legacy_goal_messages(record)
+                with self._queue_delivery_transaction(name):
+                    self._save(record)
+                    agent._relocate_existing_binding(
+                        self._queue(name), old_target, record.target(),
+                    )
+                persisted = self._load_expected(name, expected_token)
+                if (persisted.terminal_id != terminal_id
+                        or persisted._legacy_terminal_binding):
+                    raise AgentDeliveryError(
+                        "terminal recovery did not persist its generation binding"
+                    )
+                self._checked(persisted)
+                return {
+                    "name": persisted.name,
+                    "token": persisted.token,
+                    "terminal_id": terminal_id,
+                    "runtime_process_identity": (
+                        None if persisted.runtime_process_identity is None
+                        else asdict(persisted.runtime_process_identity)
+                    ),
+                    "recovered": True,
+                    "reconciled": True,
+                }
 
     def _adopt_locked(
         self, name: str, directory: Path, root: str, harness: str,
@@ -2960,7 +3531,8 @@ class ManagedAgents:
             # A reported native session becomes the durable queue authority.
             # Prove now that it resolves uniquely back to this exact pane.
             agent.resolve_target(self.client, agent.Target(
-                pane_id=info.pane_id, session_agent=info.session_agent,
+                pane_id=info.pane_id, terminal_id=info.terminal_id,
+                session_agent=info.session_agent,
                 session_value=info.session_value, expected_agent=harness,
                 expected_cwd=root,
             ))
@@ -2972,11 +3544,18 @@ class ManagedAgents:
                 f"found {len(presentations)}"
             )
         presentation = presentations[0]
-        if presentation.workspace_id != info.workspace_id:
+        if (presentation.workspace_id != info.workspace_id
+                or presentation.terminal_id != info.terminal_id):
             raise AgentDeliveryError(
-                f"refusing pane {pane_id}: presentation workspace identity changed"
+                f"refusing pane {pane_id}: presentation or terminal identity changed"
             )
-        shell_identity = self.client.pane_shell_identity(info.pane_id)
+        if not info.terminal_id:
+            raise AgentDeliveryError(
+                f"refusing pane {pane_id}: terminal generation is unavailable"
+            )
+        shell_identity = self.client.pane_shell_identity(
+            info.pane_id, expected_terminal_id=info.terminal_id,
+        )
         if self.registry.exists():
             agent._validate_private_directory(str(self.registry), "agent registry")
             for path in self.registry.iterdir():
@@ -2992,11 +3571,13 @@ class ManagedAgents:
                         f"pane {pane_id!r} is already registered as {other.name!r}"
                     )
         confirmed = agent.resolve_target(self.client, agent.Target(
-            pane_id=info.pane_id, session_agent=info.session_agent,
+            pane_id=info.pane_id, terminal_id=info.terminal_id,
+            session_agent=info.session_agent,
             session_value=info.session_value, expected_agent=harness,
             expected_cwd=root,
         ))
         if (confirmed.workspace_id != info.workspace_id
+                or confirmed.terminal_id != info.terminal_id
                 or confirmed.session_agent != info.session_agent
                 or confirmed.session_value != info.session_value):
             raise AgentDeliveryError(
@@ -3006,11 +3587,14 @@ class ManagedAgents:
                                if pane.pane_id == confirmed.pane_id]
         if (len(final_presentations) != 1
                 or final_presentations[0].tab_id != presentation.tab_id
-                or final_presentations[0].workspace_id != presentation.workspace_id):
+                or final_presentations[0].workspace_id != presentation.workspace_id
+                or final_presentations[0].terminal_id != info.terminal_id):
             raise AgentDeliveryError(
                 f"refusing pane {pane_id}: live presentation changed before adoption"
             )
-        if self.client.pane_shell_identity(confirmed.pane_id) != shell_identity:
+        if self.client.pane_shell_identity(
+            confirmed.pane_id, expected_terminal_id=info.terminal_id,
+        ) != shell_identity:
             raise AgentDeliveryError(
                 f"refusing pane {pane_id}: pane shell process changed before adoption"
             )
@@ -3027,6 +3611,7 @@ class ManagedAgents:
             time.time(),
             lifecycle="running", workspace_id=info.workspace_id,
             tab_id=presentation.tab_id, pane_id=info.pane_id,
+            terminal_id=info.terminal_id,
             session_agent=info.session_agent,
             session_value=info.session_value,
             session_source="observed" if info.session_value is not None else None,
@@ -3050,7 +3635,10 @@ class ManagedAgents:
             if (len(live) != 1 or live[0].tab_id != record.tab_id
                     or live[0].workspace_id != record.workspace_id):
                 raise AgentDeliveryError("final live-presentation verification failed")
-            if self.client.pane_shell_identity(confirmed.pane_id) != shell_identity:
+            if self.client.pane_shell_identity(
+                confirmed.pane_id,
+                expected_terminal_id=record.terminal_id,
+            ) != shell_identity:
                 raise AgentDeliveryError("final pane shell process identity changed")
             return result
         except (HerdrRunError, OSError) as exc:
@@ -3117,15 +3705,19 @@ class ManagedAgents:
                     raise AgentDeliveryError(
                         f"workspace label {selected_label!r} does not exist"
                     )
-                selected, tab, pane = self.client.create_workspace(
+                selected, tab, pane, terminal = self.client.create_workspace(
                     label=selected_label, cwd=record.launch.cwd, environment=environment
                 )
-                record.workspace_id, record.tab_id, record.pane_id = selected, tab, pane
+                (record.workspace_id, record.tab_id, record.pane_id,
+                 record.terminal_id) = selected, tab, pane, terminal
                 self._save(record)
-                self.client.rename_tab(tab, record.name)
+                self.client.rename_tab(
+                    tab, record.name, expected_terminal_id=terminal,
+                )
             else:
                 record.workspace_id = selected
-                record.tab_id, record.pane_id = self.client.create_tab_with_pane(
+                (record.tab_id, record.pane_id,
+                 record.terminal_id) = self.client.create_tab_with_pane(
                     workspace_id=selected, label=record.name, cwd=record.launch.cwd,
                     environment=environment,
                 )
@@ -3146,13 +3738,18 @@ class ManagedAgents:
         """Prove a failed custom launch is still ours or has returned to its shell."""
         if (record.lifecycle in ("starting", "launch_failed")
                 and record.launch.adapter == "herdr-pane"
-                and record.custom_process_identity is not None):
-            info = self.client.pane_info(pane_id)
+                and record.runtime_process_identity is not None
+                and record.terminal_id is not None):
+            info = self.client.pane_info(
+                pane_id, expected_terminal_id=record.terminal_id,
+            )
             if (info.pane_id == pane_id and info.workspace_id == record.workspace_id
                     and os.path.realpath(info.cwd) == os.path.realpath(record.launch.cwd)):
                 try:
-                    self.client.verify_custom_harness(
-                        pane_id, record.launch.harness, record.custom_process_identity
+                    self.client.verify_runtime_process_identity(
+                        pane_id, record.launch.harness, record.launch.argv,
+                        record.runtime_process_identity,
+                        expected_terminal_id=record.terminal_id,
                     )
                     return
                 except HerdrUnavailable:
@@ -3161,18 +3758,48 @@ class ManagedAgents:
         # return to the original shell is sufficient only after agentctl itself
         # reported that pane; an unreported pre-readiness pane remains unowned.
         if (record.lifecycle == "launch_failed" and record.launch.adapter == "herdr-pane"
-                and record.pane_reported_by_agentctl):
-            info = self.client.pane_info(pane_id)
+                and record.pane_reported_by_agentctl
+                and record.terminal_id is not None):
+            info = self.client.pane_info(
+                pane_id, expected_terminal_id=record.terminal_id,
+            )
             if (info.pane_id == pane_id and info.workspace_id == record.workspace_id
                     and os.path.realpath(info.cwd) == os.path.realpath(record.launch.cwd)
                     and info.agent == record.launch.harness
-                    and self.client.pane_is_idle_shell(pane_id)):
+                    and self.client.pane_is_idle_shell(
+                        pane_id, expected_terminal_id=record.terminal_id,
+                    )):
                 return
         if (record.lifecycle == "starting" and record.launch.adapter == "herdr-pane"
-                and record.custom_process_identity is None):
+                and record.runtime_process_identity is None):
             raise HerdrUnavailable(
                 f"cannot prove starting custom harness ownership in pane {pane_id}"
             )
+        if (record.lifecycle == "launch_failed"
+                and record.runtime_process_identity is None
+                and record.terminal_id is not None):
+            info = self.client.pane_info(
+                pane_id, expected_terminal_id=record.terminal_id,
+            )
+            shell = self.client.pane_idle_shell_identity(
+                pane_id, expected_terminal_id=record.terminal_id,
+            )
+            if (info.agent is None and shell is not None
+                    and info.workspace_id == record.workspace_id
+                    and os.path.realpath(info.cwd)
+                    == os.path.realpath(record.launch.cwd)):
+                return
+            if record.launch.adapter == "herdr":
+                owned_pane = self.client.agent_pane(
+                    record.name, expected_terminal_id=record.terminal_id,
+                )
+                if owned_pane != pane_id:
+                    raise HerdrUnavailable(
+                        f"agent {record.name!r} no longer owns its recorded pane"
+                    )
+                raise HerdrUnavailable(
+                    f"agent {record.name!r} has no recorded runtime process generation"
+                )
         self._checked(record)
 
     def status(self, name: str) -> dict[str, object]:
@@ -3194,53 +3821,73 @@ class ManagedAgents:
         return self.client.panes()
 
     def _health_pane_info(
-        self, pane_id: str, deadline: float | None,
+        self, record: AgentRecord, deadline: float | None,
     ) -> AgentPaneInfo:
+        if record.pane_id is None or record.terminal_id is None:
+            raise HerdrUnavailable("record has no terminal-generation binding")
         if deadline is not None and isinstance(self.client, HerdrClient):
             return self.client.pane_info(
-                pane_id,
+                record.pane_id, expected_terminal_id=record.terminal_id,
                 timeout=self._remaining_timeout(deadline, "health pane identity"),
             )
-        return self.client.pane_info(pane_id)
+        return self.client.pane_info(
+            record.pane_id, expected_terminal_id=record.terminal_id,
+        )
 
-    def _health_verify_custom(
+    def _health_verify_runtime(
         self, record: AgentRecord, deadline: float | None,
     ) -> None:
         assert record.pane_id is not None
+        if record.terminal_id is None:
+            raise HerdrUnavailable("record has no terminal-generation binding")
         if deadline is not None and isinstance(self.client, HerdrClient):
-            self.client.verify_custom_harness(
-                record.pane_id, record.launch.harness, record.custom_process_identity,
+            self.client.verify_runtime_process_identity(
+                record.pane_id, record.launch.harness, record.launch.argv,
+                record.runtime_process_identity,
+                expected_terminal_id=record.terminal_id,
                 timeout=self._remaining_timeout(
                     deadline, "health custom harness verification"
                 ),
             )
             return
-        self.client.verify_custom_harness(
-            record.pane_id, record.launch.harness, record.custom_process_identity,
+        self.client.verify_runtime_process_identity(
+            record.pane_id, record.launch.harness, record.launch.argv,
+            record.runtime_process_identity,
+            expected_terminal_id=record.terminal_id,
         )
 
     def _health_idle_shell(
-        self, pane_id: str, deadline: float | None,
+        self, record: AgentRecord, deadline: float | None,
     ) -> PaneShellProof | None:
+        if record.pane_id is None or record.terminal_id is None:
+            raise HerdrUnavailable("record has no terminal-generation binding")
         if deadline is not None and isinstance(self.client, HerdrClient):
             return self.client.pane_idle_shell_identity(
-                pane_id,
+                record.pane_id, expected_terminal_id=record.terminal_id,
                 timeout=self._remaining_timeout(deadline, "health idle-shell proof"),
             )
-        return self.client.pane_idle_shell_identity(pane_id)
+        return self.client.pane_idle_shell_identity(
+            record.pane_id, expected_terminal_id=record.terminal_id,
+        )
 
     def _health_same_idle_shell(
-        self, pane_id: str, identity: CustomProcessIdentity,
+        self, record: AgentRecord, identity: CustomProcessIdentity,
         deadline: float | None,
     ) -> bool:
+        if record.pane_id is None or record.terminal_id is None:
+            raise HerdrUnavailable("record has no terminal-generation binding")
         if deadline is not None and isinstance(self.client, HerdrClient):
             return self.client.pane_is_same_idle_shell(
-                pane_id, identity,
+                record.pane_id, identity,
+                expected_terminal_id=record.terminal_id,
                 timeout=self._remaining_timeout(
                     deadline, "health idle-shell identity proof"
                 ),
             )
-        return self.client.pane_is_same_idle_shell(pane_id, identity)
+        return self.client.pane_is_same_idle_shell(
+            record.pane_id, identity,
+            expected_terminal_id=record.terminal_id,
+        )
 
     def _status_record(
         self, record: AgentRecord, *, deadline: float | None = None,
@@ -3320,7 +3967,7 @@ class ManagedAgents:
         if len(presentations) != 1:
             return "unhealthy", "pane-identity-ambiguous", reason
         try:
-            info = self._health_pane_info(record.pane_id, deadline)
+            info = self._health_pane_info(record, deadline)
         except HerdrRunError:
             return "unknown", "runtime-probe-failed", reason
         presentation = presentations[0]
@@ -3336,21 +3983,23 @@ class ManagedAgents:
         )
         if (presentation.workspace_id != record.workspace_id
                 or presentation.tab_id != record.tab_id
+                or presentation.terminal_id != record.terminal_id
                 or info.pane_id != record.pane_id
+                or info.terminal_id != record.terminal_id
                 or info.workspace_id != record.workspace_id
                 or os.path.realpath(info.cwd) != os.path.realpath(record.launch.cwd)
                 or not session_agent_matches or not session_value_matches):
             return "unhealthy", "runtime-identity-mismatch", reason
         if record.launch.adapter == "herdr-pane":
-            if record.custom_process_identity is not None:
+            if record.runtime_process_identity is not None:
                 try:
-                    self._health_verify_custom(record, deadline)
+                    self._health_verify_runtime(record, deadline)
                 except HerdrRunError:
                     pass
                 else:
                     return "unknown", "custom-harness-verification-unconfirmed", reason
             try:
-                custom_shell_proof = self._health_idle_shell(record.pane_id, deadline)
+                custom_shell_proof = self._health_idle_shell(record, deadline)
             except HerdrRunError:
                 return "unknown", "runtime-probe-failed", reason
             if custom_shell_proof is not None:
@@ -3366,7 +4015,7 @@ class ManagedAgents:
             if info.agent is None:
                 try:
                     shell_fallback = (
-                        self._health_idle_shell(record.pane_id, deadline) is not None
+                        self._health_idle_shell(record, deadline) is not None
                     )
                 except HerdrRunError:
                     return "unknown", "runtime-probe-failed", reason
@@ -3814,7 +4463,18 @@ class ManagedAgents:
                     )
                 reported: list[str] = []
                 for pane in self.client.panes():
-                    live = self.client.pane_info(pane.pane_id)
+                    if (pane.pane_id == record.pane_id
+                            and pane.terminal_id != record.terminal_id):
+                        raise AgentDeliveryError(
+                            "recorded terminal generation changed during session binding"
+                        )
+                    live = self.client.pane_info(
+                        pane.pane_id,
+                        expected_terminal_id=(
+                            record.terminal_id
+                            if pane.pane_id == record.pane_id else None
+                        ),
+                    )
                     if (live.session_agent == record.launch.harness
                             and live.session_value == session_id):
                         reported.append(pane.pane_id)
@@ -3889,9 +4549,11 @@ class ManagedAgents:
         pane_id = record.pane_id
         tab_id = record.tab_id
         workspace_id = record.workspace_id
-        if not pane_id or not tab_id or not workspace_id:
+        terminal_id = record.terminal_id
+        if not pane_id or not tab_id or not workspace_id or not terminal_id:
             raise AgentDeliveryError(
-                f"refusing to {operation} {record.name!r}: record lacks pane, tab, or workspace identity"
+                f"refusing to {operation} {record.name!r}: record lacks pane, tab, "
+                "workspace, or terminal identity"
             )
         def snapshot() -> tuple[Pane, AgentPaneInfo]:
             panes = self.client.panes()
@@ -3903,7 +4565,8 @@ class ManagedAgents:
                 )
             presentation = presentations[0]
             if (presentation.tab_id != tab_id
-                    or presentation.workspace_id != workspace_id):
+                    or presentation.workspace_id != workspace_id
+                    or presentation.terminal_id != terminal_id):
                 raise AgentDeliveryError(
                     f"refusing to {operation} {record.name!r}: recorded pane, tab, or workspace changed"
                 )
@@ -3912,15 +4575,18 @@ class ManagedAgents:
                 raise AgentDeliveryError(
                     f"refusing to {operation} {record.name!r}: recorded tab is not the exact one-pane tab"
                 )
-            info = self.client.pane_info(pane_id)
+            info = self.client.pane_info(
+                pane_id, expected_terminal_id=terminal_id,
+            )
             if (info.pane_id != pane_id or info.workspace_id != workspace_id
+                    or info.terminal_id != terminal_id
                     or os.path.realpath(info.cwd) != os.path.realpath(record.launch.cwd)):
                 raise AgentDeliveryError(
                     f"refusing to {operation} {record.name!r}: recorded pane, workspace, or cwd changed"
                 )
             stale_custom_label = (
                 record.launch.adapter == "herdr-pane"
-                and record.custom_process_identity is not None
+                and record.runtime_process_identity is not None
                 and info.agent == record.launch.harness
             )
             if info.agent is not None and not stale_custom_label:
@@ -3935,7 +4601,7 @@ class ManagedAgents:
 
         presentation, info = snapshot()
         if record.launch.adapter == "herdr-pane":
-            identity = record.custom_process_identity
+            identity = record.runtime_process_identity
             if identity is None:
                 raise AgentDeliveryError(
                     f"refusing to {operation} {record.name!r}: record lacks custom process identity"
@@ -3953,7 +4619,9 @@ class ManagedAgents:
                     "generation is still live"
                 )
         try:
-            shell = self.client.pane_idle_shell_identity(pane_id)
+            shell = self.client.pane_idle_shell_identity(
+                pane_id, expected_terminal_id=terminal_id,
+            )
         except HerdrRunError as exc:
             raise AgentDeliveryError(
                 f"refusing to {operation} {record.name!r}: cannot prove supported "
@@ -3974,13 +4642,26 @@ class ManagedAgents:
             info=final_info, presentation=final_presentation, shell=shell,
         )
 
-    def _bounded_terminal_text(self, pane_id: str, *, operation: str) -> str:
+    def _bounded_terminal_text(
+        self, record: AgentRecord, *, operation: str,
+        guard: RuntimeGuard | None = None,
+    ) -> str:
+        if record.pane_id is None or record.terminal_id is None:
+            raise AgentDeliveryError(
+                f"cannot preserve terminal output before {operation}: "
+                "record has no terminal-generation binding"
+            )
         try:
+            operation_guard = self._runtime_guard(record) if guard is None else guard
             output = self.client.read(
-                pane_id, source="recent-unwrapped", lines=5000
+                record.pane_id, source="recent-unwrapped", lines=5000,
+                guard=operation_guard,
             )
             if not output:
-                output = self.client.read(pane_id, source="recent", lines=5000)
+                output = self.client.read(
+                    record.pane_id, source="recent", lines=5000,
+                    guard=operation_guard,
+                )
             return output
         except HerdrRunError as exc:
             raise AgentDeliveryError(
@@ -4792,7 +5473,7 @@ class ManagedAgents:
             )
         before = self._dead_pane_proof(record, operation="recover legacy adoption")
         text = self._bounded_terminal_text(
-            before.info.pane_id, operation="legacy adoption recovery"
+            record, operation="legacy adoption recovery"
         )
         current_snapshot = self._legacy_record_snapshot(
             pinned,
@@ -5096,7 +5777,7 @@ class ManagedAgents:
                 or record.launch.mode != "interactive"
                 or record.launch.backend != "herdr"
                 or record.launch.runtime_ownership != "owned"
-                or record.custom_process_identity is None
+                or record.runtime_process_identity is None
                 or not record.workspace_id or not record.tab_id or not record.pane_id
                 or evidence):
             raise AgentDeliveryError("terminal receipt has inconsistent custom outcome")
@@ -5307,8 +5988,12 @@ class ManagedAgents:
                 "owned interactive routing"
             )
         before = self._dead_pane_proof(record, operation="retire dead managed agent")
+        assert record.terminal_id is not None
+        retirement_guard = RuntimeGuard(
+            record.terminal_id, before.shell.identity,
+        )
         text = self._bounded_terminal_text(
-            before.info.pane_id, operation="managed-dead retirement"
+            record, operation="managed-dead retirement", guard=retirement_guard,
         )
         current_snapshot = self._managed_record_snapshot(
             pinned, expected_token=expected_token,
@@ -5422,7 +6107,11 @@ class ManagedAgents:
             raise
         assert final.pane_id is not None
         if close_pane:
-            self.client.close_pane(final.pane_id)
+            assert final.terminal_id is not None
+            self.client.close_pane(
+                final.pane_id,
+                guard=RuntimeGuard(final.terminal_id, before.shell.identity),
+            )
             try:
                 tab_closed: bool | None = not any(
                     pane.tab_id == final.tab_id for pane in self.client.panes()
@@ -5468,9 +6157,10 @@ class ManagedAgents:
             )
             with self._lock(name):
                 current = self._load(name)
-                if current.token != record.token:
+                if not current.same_goal_inspection_identity(record):
                     raise AgentDeliveryError(
-                        "agent generation changed during goal inspection"
+                        "agent generation changed or goal identity changed during "
+                        "goal inspection"
                     )
             return result
         if not text.strip() or "\n" in text or "\r" in text:
@@ -5606,7 +6296,7 @@ class ManagedAgents:
                 assert evidence.info is not None
                 info = evidence.info
                 output = self._bounded_terminal_text(
-                    info.pane_id, operation="unregistering"
+                    record, operation="unregistering"
                 )
                 try:
                     final_evidence = inspect_foreign()
@@ -5662,12 +6352,20 @@ class ManagedAgents:
                     and record.pane_id is not None):
                 recorded = [pane for pane in panes if pane.pane_id == record.pane_id]
                 if len(recorded) == 1:
-                    observed = self.client.pane_info(record.pane_id)
+                    if (record.terminal_id is None
+                            or recorded[0].terminal_id != record.terminal_id):
+                        raise AgentDeliveryError(
+                            "refusing stop: recorded terminal generation changed or is unbound"
+                        )
+                    observed = self.client.pane_info(
+                        record.pane_id,
+                        expected_terminal_id=record.terminal_id,
+                    )
                     dead = record.launch.adapter == "herdr" and observed.agent is None
                     if (record.launch.adapter == "herdr-pane"
-                            and record.custom_process_identity is not None):
+                            and record.runtime_process_identity is not None):
                         dead = self.client.process_generation_absent(
-                            record.custom_process_identity
+                            record.runtime_process_identity
                         )
                     if dead:
                         if record.lifecycle != "running":
@@ -5684,25 +6382,60 @@ class ManagedAgents:
             if record.pane_id is None and record.lifecycle == "launch_failed" and len(owned) == 1:
                 # Recover an older partial allocation only when its unique root
                 # still identifies an unclaimed shell in the recorded directory.
-                info = self.client.pane_info(owned[0].pane_id)
+                if owned[0].terminal_id is None:
+                    raise AgentDeliveryError(
+                        "cannot recover partial allocation without a terminal generation"
+                    )
+                info = self.client.pane_info(
+                    owned[0].pane_id,
+                    expected_terminal_id=owned[0].terminal_id,
+                )
                 if (info.agent is None and info.workspace_id == record.workspace_id
                         and os.path.realpath(info.cwd) == os.path.realpath(record.launch.cwd)):
                     record.pane_id = owned[0].pane_id
+                    record.terminal_id = owned[0].terminal_id
+                    record._legacy_terminal_binding = False
                     self._save(record)
             if any(pane.pane_id == record.pane_id and pane.tab_id != record.tab_id for pane in panes):
                 raise AgentDeliveryError("refusing to archive an agent whose pane moved to another tab")
             if owned:
-                if len(owned) != 1 or owned[0].pane_id != record.pane_id or owned[0].workspace_id != record.workspace_id:
+                if (len(owned) != 1 or owned[0].pane_id != record.pane_id
+                        or owned[0].workspace_id != record.workspace_id
+                        or owned[0].terminal_id != record.terminal_id):
                     raise AgentDeliveryError("refusing to close a tab whose pane ownership changed")
             _archive, destination = self._archive_destination(record)
             if owned:
                 if (record.launch.adapter == "herdr-pane" or record.lifecycle == "running"
-                        or self.client.pane_info(owned[0].pane_id).agent is not None):
+                        or self.client.pane_info(
+                            owned[0].pane_id,
+                            expected_terminal_id=record.terminal_id,
+                        ).agent is not None):
                     self._checked_or_failed_pane_report(record, owned[0].pane_id)
+                if record.runtime_process_identity is not None:
+                    operation_guard = self._runtime_guard(record)
+                else:
+                    assert record.terminal_id is not None
+                    shell = self.client.pane_idle_shell_identity(
+                        owned[0].pane_id,
+                        expected_terminal_id=record.terminal_id,
+                    )
+                    if shell is None:
+                        raise AgentDeliveryError(
+                            "cannot guard failed-launch cleanup with an exact idle shell"
+                        )
+                    operation_guard = RuntimeGuard(
+                        record.terminal_id, shell.identity,
+                    )
                 try:
-                    output = self.client.read(owned[0].pane_id, source="recent-unwrapped", lines=5000)
+                    output = self.client.read(
+                        owned[0].pane_id, source="recent-unwrapped", lines=5000,
+                        guard=operation_guard,
+                    )
                     if not output:
-                        output = self.client.read(owned[0].pane_id, source="recent", lines=5000)
+                        output = self.client.read(
+                            owned[0].pane_id, source="recent", lines=5000,
+                            guard=operation_guard,
+                        )
                     agent._atomic_json(str(self._directory(name) / "output.json"),
                                        {"text": output, "captured_at": time.time(), "pane_id": record.pane_id})
                 except HerdrRunError as exc:
@@ -5710,20 +6443,28 @@ class ManagedAgents:
                 # Output capture can involve another control round trip. Recheck
                 # the owned native identity before acting on that pane again.
                 if (record.launch.adapter == "herdr-pane" or record.lifecycle == "running"
-                        or self.client.pane_info(owned[0].pane_id).agent is not None):
+                        or self.client.pane_info(
+                            owned[0].pane_id,
+                            expected_terminal_id=record.terminal_id,
+                        ).agent is not None):
                     self._checked_or_failed_pane_report(record, owned[0].pane_id)
                 record.lifecycle = "stopping"
                 self._save(record)
                 assert record.pane_id is not None
-                self.client.close_pane(record.pane_id)
+                assert record.terminal_id is not None
+                self.client.close_pane(
+                    record.pane_id, guard=operation_guard,
+                )
                 try:
                     tab_closed = not any(pane.tab_id == record.tab_id for pane in self.client.panes())
                 except HerdrRunError:
                     tab_closed = None
             outcome = "owned-pane-closed" if owned else "owned-runtime-absent"
-            evidence = {"tab_closed": tab_closed} if owned else {}
+            terminal_evidence: dict[str, object] = (
+                {"tab_closed": tab_closed} if owned else {}
+            )
             record.lifecycle = "stopped"
-            record.terminal = TerminalState.create(outcome, evidence)
+            record.terminal = TerminalState.create(outcome, terminal_evidence)
             record._legacy_terminal_authority = False
             self._save(record)
             with self._pinned_agent_directory(name) as pinned:
@@ -5827,6 +6568,7 @@ class ManagedAgents:
         selector = workspace_id if workspace_id is not None else workspace_label
         if selector is None or not selector or "\0" in selector:
             raise AgentDeliveryError("workspace selector must be nonempty and contain no NUL")
+        self.client.require_terminal_identity_support()
         with self._lock(name):
             record = self._load(name)
             self._reconcile_goal_transaction(record)
@@ -5835,6 +6577,12 @@ class ManagedAgents:
                     or record.tab_id is None or record.workspace_id is None):
                 raise AgentDeliveryError(
                     "relocate requires a running interactive Herdr session with complete routing"
+                )
+            if (record.launch.adapter not in ("herdr", "herdr-pane")
+                    or record.runtime_process_identity is None):
+                raise AgentDeliveryError(
+                    "relocate requires an owned foreground runtime generation; "
+                    "adopted sessions cannot be moved"
                 )
             target_workspace = workspace_id
             if target_workspace is not None:
@@ -5906,7 +6654,7 @@ class ManagedAgents:
                     )
                 pane = fresh[0]
                 moved = self.client.move_pane_to_new_tab(
-                    pane.pane_id, expected_terminal_id=journal.terminal_id,
+                    pane.pane_id, guard=self._runtime_guard(record),
                     workspace_id=target_workspace, label=record.name,
                 )
                 if (moved.previous_pane_id, moved.previous_tab_id,
@@ -5944,5 +6692,8 @@ class ManagedAgents:
         with self._lock(name):
             record = self._load_expected(name, expected_token)
             info = self._checked(record)
-            self.client.focus_pane(info.pane_id)
+            assert record.terminal_id is not None
+            self.client.focus_pane(
+                info.pane_id, guard=self._runtime_guard(record),
+            )
             return {"name": name, "pane_id": info.pane_id, "paused": record.paused}
