@@ -12,6 +12,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
+from types import FrameType
 
 import pytest
 
@@ -378,6 +379,71 @@ def test_a_fault_stops_shards_at_once_even_after_a_recorded_interrupt(
     assert time.monotonic() - started < runner._INTERRUPT_GRACE_SECONDS / 3
     assert marker.read_text() == "terminated"
     assert "=== mapped lifecycle shard 1/1 INTERRUPTED rc=143 ===" in capsys.readouterr().out
+
+
+# Takes its signals one at a time rather than in handlers, which Python may nest: a SIGTERM
+# handler that exits inside the SIGINT one would lose the SIGINT's note.
+_SHARD_THAT_LISTS_ITS_SIGNALS = """
+import signal, sys
+wanted = {signal.SIGINT, signal.SIGTERM}
+signal.pthread_sigmask(signal.SIG_BLOCK, wanted)
+print("shard started", flush=True)
+with open(sys.argv[1], "a") as out:
+    while True:
+        signum = signal.sigwait(wanted)
+        out.write(signal.Signals(signum).name + "\\n")
+        out.flush()
+        if signum == signal.SIGTERM:
+            sys.exit(143)
+"""
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    ((signal.SIGINT, signal.SIGTERM), (signal.SIGTERM, signal.SIGINT)),
+    ids=("sigint-then-sigterm", "sigterm-then-sigint"),
+)
+def test_the_first_of_two_stop_signals_decides_the_grace_and_the_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: signal.Signals, second: signal.Signals
+) -> None:
+    """Two stop signals recorded before the runner acts: the first decides.  A Ctrl-C followed
+    by a SIGTERM forwards the Ctrl-C (the SIGTERM then cuts its grace short), and the run exits as
+    for a Ctrl-C.  A SIGTERM followed by a Ctrl-C forwards nothing and exits as for the SIGTERM."""
+
+    received = tmp_path / "received"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    real_sleep = time.sleep
+    recorded: list[int] = []
+
+    def sleep(seconds: float) -> None:
+        log = logs / "shard-0.log"
+        if not recorded and log.exists() and b"shard started" in log.read_bytes():
+            os.kill(os.getpid(), first)
+            os.kill(os.getpid(), second)
+            recorder = getattr(signal.getsignal(signal.SIGINT), "__self__", None)
+            assert isinstance(recorder, runner._Signals)
+            recorded.extend(recorder.received)
+        real_sleep(seconds)
+
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    command = (sys.executable, "-c", _SHARD_THAT_LISTS_ITS_SIGNALS, str(received))
+    started = time.monotonic()
+    with pytest.raises((KeyboardInterrupt, SystemExit)) as raised:
+        runner.run_commands((command,), logs)
+
+    assert recorded == [first, second]
+    assert time.monotonic() - started < runner._INTERRUPT_GRACE_SECONDS / 3
+    if first == signal.SIGINT:
+        assert raised.type is KeyboardInterrupt
+        assert received.read_text().split() == ["SIGINT", "SIGTERM"]
+    else:
+        assert isinstance(raised.value, SystemExit)
+        assert raised.value.code == 128 + signal.SIGTERM
+        # The Ctrl-C is not forwarded; it only cuts the SIGTERM's wait short, so a SIGKILL follows
+        # at once and may land before the shard has noted the SIGTERM.
+        noted = received.read_text().split() if received.exists() else []
+        assert noted in ([], ["SIGTERM"])
 
 
 def test_a_failed_interrupt_report_does_not_replace_the_original_exception(
@@ -929,6 +995,56 @@ def test_a_group_is_looked_at_again_just_before_it_is_signalled(
     assert sent == [0]  # One probe proved it empty; neither signal was sent.
 
 
+def test_a_group_that_vanishes_as_it_is_signalled_is_never_signalled_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group can empty between the fresh look and the signal.  Its number may then be reused,
+    so the failed signal proves it empty, and the error must not end the stop steps early."""
+
+    process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    process.wait()
+    groups = runner._Groups()
+    sent: list[int] = []
+
+    def killpg(_pgid: int, signum: int) -> None:
+        sent.append(signum)
+        if signum != 0:  # The look finds a member, which leaves before the signal lands.
+            raise ProcessLookupError
+
+    monkeypatch.setattr(runner.os, "killpg", killpg)
+    groups.signal([process], signal.SIGTERM)
+    groups.signal([process], signal.SIGKILL)
+
+    assert sent == [0, signal.SIGTERM]
+    assert groups.ended([process])
+
+
+@pytest.mark.parametrize("denied", ("look", "signal"))
+def test_a_group_this_user_may_not_signal_is_never_taken_for_empty(
+    monkeypatch: pytest.MonkeyPatch, denied: str
+) -> None:
+    """EPERM means a member exists that this user may not signal, so the group is not empty: it
+    must not end the wait, nor be skipped by a later step, nor end the stop steps early."""
+
+    process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    process.wait()
+    groups = runner._Groups()
+    sent: list[int] = []
+
+    def killpg(_pgid: int, signum: int) -> None:
+        sent.append(signum)
+        if (signum == 0) == (denied == "look"):
+            raise PermissionError
+
+    monkeypatch.setattr(runner.os, "killpg", killpg)
+    assert not groups.ended([process])
+    groups.signal([process], signal.SIGTERM)
+    groups.signal([process], signal.SIGKILL)
+
+    assert sent == [0, 0, signal.SIGTERM, 0, signal.SIGKILL]
+    assert not groups.ended([process])
+
+
 def test_a_shard_whose_runner_died_before_it_asked_for_a_parent_death_signal_exits() -> None:
     """PR_SET_PDEATHSIG only fires for a parent that dies after it is set.  A shard whose runner
     died first has already been adopted, so it must notice and exit instead of running unwatched.
@@ -1067,6 +1183,136 @@ def test_a_handler_raising_as_the_stop_signals_are_blocked_leaves_the_caller_as_
     assert started.exists() == (while_ == "restoring")
     assert left_mask == caller_mask
     assert left_handlers == own
+
+
+@pytest.mark.parametrize("failing", range(len(runner._STOP_SIGNALS)))
+def test_a_handler_raising_while_the_recorders_are_installed_puts_back_those_already_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: int
+) -> None:
+    """A caller's handler for another signal may raise out of any of the calls that install the
+    recorders.  The ones already installed go back, all while the stop signals are held back, so
+    the caller is never left with a Ctrl-C that is only recorded, and no shard starts."""
+
+    real_signal = signal.signal
+    real_sigmask = signal.pthread_sigmask
+    stop_signals = runner._STOP_SIGNALS
+    own = {signum: signal.getsignal(signum) for signum in stop_signals}
+    caller_mask = real_sigmask(signal.SIG_BLOCK, ())
+    assert not set(stop_signals) & caller_mask
+    calls: list[int] = []
+    masks: list[set[int | signal.Signals]] = []
+
+    def set_handler(
+        signum: int, handler: Callable[[int, FrameType | None], object] | int | None
+    ) -> Callable[[int, FrameType | None], object] | int | None:
+        calls.append(signum)
+        masks.append(real_sigmask(signal.SIG_BLOCK, ()))
+        if len(calls) == failing + 1:
+            raise _CallerStop
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(runner.signal, "signal", set_handler)
+    started = tmp_path / "started"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    command = (sys.executable, "-c", "import pathlib, sys; pathlib.Path(sys.argv[1]).touch()")
+    try:
+        with pytest.raises(_CallerStop):
+            runner.run_commands(((*command, str(started)),), logs)
+        monkeypatch.undo()
+        left_mask = real_sigmask(signal.SIG_BLOCK, ())
+        left_handlers = {signum: signal.getsignal(signum) for signum in stop_signals}
+    finally:  # Whatever the result, the rest of the suite gets this process back as it was.
+        monkeypatch.undo()
+        for signum, handler in own.items():
+            real_signal(signum, handler)
+        real_sigmask(signal.SIG_SETMASK, caller_mask)
+
+    # The installs up to the failing one, then the ones that succeeded, put back in order.
+    assert calls == [*stop_signals[: failing + 1], *stop_signals[:failing]]
+    assert all(mask == caller_mask | set(stop_signals) for mask in masks)
+    assert left_handlers == own
+    assert left_mask == caller_mask
+    assert not started.exists()
+
+
+def test_a_handler_raising_while_the_handlers_are_put_back_still_unblocks_the_stop_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop signals are blocked while the caller's handlers go back, and a caller's handler for
+    another signal may raise between any two of those calls.  Whatever handlers that leaves, the
+    stop signals must not stay blocked: a caller that could no longer be interrupted is worse."""
+
+    real_signal = signal.signal
+    real_sigmask = signal.pthread_sigmask
+    stop_signals = runner._STOP_SIGNALS
+    own = {signum: signal.getsignal(signum) for signum in stop_signals}
+    caller_mask = real_sigmask(signal.SIG_BLOCK, ())
+    assert not set(stop_signals) & caller_mask
+    calls: list[int] = []
+    masks: list[set[int | signal.Signals]] = []
+
+    def set_handler(
+        signum: int, handler: Callable[[int, FrameType | None], object] | int | None
+    ) -> Callable[[int, FrameType | None], object] | int | None:
+        calls.append(signum)
+        if len(calls) == len(stop_signals) + 1:  # The first handler put back.
+            masks.append(real_sigmask(signal.SIG_BLOCK, ()))
+            raise _CallerStop
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(runner.signal, "signal", set_handler)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    try:
+        with pytest.raises(_CallerStop):
+            runner.run_commands(((sys.executable, "-c", "pass"),), logs)
+        monkeypatch.undo()
+        left_mask = real_sigmask(signal.SIG_BLOCK, ())
+    finally:  # Whatever the result, the rest of the suite gets this process back as it was.
+        monkeypatch.undo()
+        for signum, handler in own.items():
+            real_signal(signum, handler)
+        real_sigmask(signal.SIG_SETMASK, caller_mask)
+
+    assert len(calls) == len(stop_signals) + 1
+    assert masks == [caller_mask | set(stop_signals)]  # It did raise with them blocked.
+    assert left_mask == caller_mask
+
+
+def test_a_caller_that_already_blocks_signals_keeps_them_blocked_during_and_after_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner holds the stop signals back only while handlers change.  Whatever the caller
+    had already blocked, a stop signal among them included, stays blocked throughout."""
+
+    real_sigmask = signal.pthread_sigmask
+    stop_signals = runner._STOP_SIGNALS
+    own = {signum: signal.getsignal(signum) for signum in stop_signals}
+    original_mask = real_sigmask(signal.SIG_BLOCK, ())
+    caller_mask = original_mask | {signal.SIGUSR1, signal.SIGINT}
+    real_sleep = time.sleep
+    during: list[set[int | signal.Signals]] = []
+
+    def sleep(seconds: float) -> None:
+        during.append(real_sigmask(signal.SIG_BLOCK, ()))
+        real_sleep(seconds)
+
+    monkeypatch.setattr(runner.time, "sleep", sleep)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    real_sigmask(signal.SIG_SETMASK, caller_mask)
+    try:
+        rc = runner.run_commands(((sys.executable, "-c", "import time; time.sleep(0.5)"),), logs)
+        after = real_sigmask(signal.SIG_BLOCK, ())
+    finally:
+        real_sigmask(signal.SIG_SETMASK, original_mask)
+
+    assert rc == 0
+    assert during
+    assert all(mask == caller_mask for mask in during)
+    assert after == caller_mask
+    assert {signum: signal.getsignal(signum) for signum in stop_signals} == own
 
 
 def test_a_stop_signal_after_the_last_shard_ended_is_still_honoured(
