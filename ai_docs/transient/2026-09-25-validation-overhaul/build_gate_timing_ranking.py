@@ -120,8 +120,8 @@ RATIONALE_OVERRIDES = {
     "rust.dagrun.test": (
         "scheduler, containment, timeout, and process-tree integration behavior"
     ),
-    "examples.run.python": "shipped examples execute successfully with the Python engine",
-    "examples.run.rust": "shipped examples execute successfully with the Rust engine",
+    "examples.run.python": "shipped examples behave as documented with the Python engine",
+    "examples.run.rust": "shipped examples behave as documented with the Rust engine",
     "python.repository-infrastructure.test": (
         "fail-closed repository routing, packaging, and launcher infrastructure"
     ),

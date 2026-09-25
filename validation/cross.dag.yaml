@@ -34,6 +34,10 @@ steps:
     desc: dagrun Python and Rust commands agree
     cmd: python3 cross/differential.py --tool dagrun
     jobs_flag: ""
+    # The harness has one live boxed CPU-bandwidth case. Let the outer scheduler deliver the
+    # admitted width explicitly so that case scales to a smaller runner instead of claiming an
+    # eight-worker requirement that its command cannot honor.
+    jobs_env: AGENT_UTILS_VALIDATION_JOBS
     labels: [validation-cross, component-dagrun]
     delegated_children: true
     timeout: 1200
@@ -41,9 +45,9 @@ steps:
     hint:
       est_duration_s: 180
       classification: latency-bound
-      # The boxed aggregate-bandwidth contract launches two eight-worker guests. When this
-      # harness itself is an included delegated node, its parent-owned cgroup must provide the
-      # same eight-core boundary that a standalone top-level run would create.
+      # Eight remains the preferred/full-strength width. jobs_env makes four-core CI a real
+      # four-core version of the same aggregate-bandwidth contract rather than an oversubscribed
+      # or falsely described eight-core run.
       preferred_inner_jobs: 8
       rss_baseline_bytes: 2147483648
 
