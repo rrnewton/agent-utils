@@ -33,6 +33,8 @@ const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const HEALTH_SCHEMA: &str = "agentctl-health/v1";
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_STORAGE_SCHEMA: &str = "agentctl-session/v2";
+const LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v1";
 
 fn rename_directory_noreplace_at(
     source_parent: &File,
@@ -1065,7 +1067,6 @@ struct AgentRecord {
     session_value: Option<String>,
     model: Option<String>,
     resume: Option<String>,
-    arguments: Vec<String>,
     #[serde(default)]
     startup_warning: Option<String>,
     #[serde(default)]
@@ -1078,6 +1079,33 @@ struct AgentRecord {
     #[serde(default)]
     goal_messages: BTreeMap<String, String>,
     goal_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchExecutable {
+    path: String,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchSpec {
+    schema: String,
+    harness: String,
+    cwd: String,
+    adapter: String,
+    mode: String,
+    backend: String,
+    model: Option<String>,
+    resume: Option<String>,
+    profile: Option<String>,
+    argv: Vec<String>,
+    environment_names: Vec<String>,
+    runtime_home: Option<String>,
+    runtime_ownership: String,
+    executable: Option<LaunchExecutable>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1147,6 +1175,359 @@ fn interactive_mode() -> String {
 }
 
 impl AgentRecord {
+    fn launch_spec(&self) -> Result<LaunchSpec> {
+        let runtime_ownership = self.runtime_ownership.clone().unwrap_or_else(|| {
+            if self.adapter == "herdr-foreign" {
+                "foreign".to_owned()
+            } else {
+                "owned".to_owned()
+            }
+        });
+        let mut argv = self.launch_argv.clone();
+        if argv.is_empty() && self.adapter != "herdr-foreign" {
+            argv.push(self.harness.clone());
+        }
+        let executable = match (
+            self.launch_executable.as_ref(),
+            self.launch_executable_device,
+            self.launch_executable_inode,
+        ) {
+            (None, None, None) => None,
+            (Some(path), Some(device), Some(inode)) => Some(LaunchExecutable {
+                path: path.clone(),
+                device,
+                inode,
+            }),
+            _ => return Err(fail("incomplete launch executable identity")),
+        };
+        Ok(LaunchSpec {
+            schema: LAUNCH_SPEC_SCHEMA.to_owned(),
+            harness: self.harness.clone(),
+            cwd: self.cwd.clone(),
+            adapter: self.adapter.clone(),
+            mode: self.mode.clone(),
+            backend: self.backend.clone(),
+            model: self.model.clone(),
+            resume: self.resume.clone(),
+            profile: self.launch_profile.clone(),
+            argv,
+            environment_names: self.launch_environment_names.clone(),
+            runtime_home: self.runtime_home.clone(),
+            runtime_ownership,
+            executable,
+        })
+    }
+
+    fn arguments(&self) -> &[String] {
+        self.launch_argv.get(1..).unwrap_or(&[])
+    }
+
+    fn public_value(&self) -> Value {
+        let mut value = json!(self);
+        value["arguments"] = json!(self.arguments());
+        value
+    }
+
+    fn storage_value(&self) -> Result<Value> {
+        self.validate_loaded(Path::new("<in-memory>"), &self.name)?;
+        let launch = self.launch_spec()?;
+        if let Some(program) = launch.argv.first() {
+            let expected = launch
+                .executable
+                .as_ref()
+                .map_or(launch.harness.as_str(), |identity| identity.path.as_str());
+            if program != expected {
+                return Err(fail("launch argv disagrees with its executable authority"));
+            }
+        }
+        self.validate_runtime_shape(&launch)?;
+        Ok(json!({
+            "schema": SESSION_STORAGE_SCHEMA,
+            "name": self.name,
+            "token": self.token,
+            "created_at": self.created_at,
+            "lifecycle": self.lifecycle,
+            "launch": launch,
+            "workspace_id": self.workspace_id,
+            "tab_id": self.tab_id,
+            "pane_id": self.pane_id,
+            "session_agent": self.session_agent,
+            "session_value": self.session_value,
+            "startup_warning": self.startup_warning,
+            "effective_reasoning_effort": self.effective_reasoning_effort,
+            "error": self.error,
+            "goal": self.goal,
+            "goal_delivery": self.goal_delivery,
+            "goal_session_id": self.goal_session_id,
+            "goal_command": self.goal_command,
+            "goal_messages": self.goal_messages,
+            "goal_message_id": self.goal_message_id,
+            "paused": self.paused,
+            "pane_reported_by_agentctl": self.pane_reported_by_agentctl,
+            "custom_process_identity": self.custom_process_identity,
+            "foreign_shell_identity": self.foreign_shell_identity,
+            "runner_identity": self.runner_identity,
+            "extensions": self.extra,
+        }))
+    }
+
+    fn from_storage_value(value: Value, path: &Path, agent_name: &str) -> Result<Self> {
+        let mut document = value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| fail(format!("invalid agent record: {}", path.display())))?;
+        match document.get("schema") {
+            Some(Value::String(schema)) if schema == SESSION_STORAGE_SCHEMA => {
+                const TOP_FIELDS: [&str; 25] = [
+                    "schema",
+                    "name",
+                    "token",
+                    "created_at",
+                    "lifecycle",
+                    "launch",
+                    "workspace_id",
+                    "tab_id",
+                    "pane_id",
+                    "session_agent",
+                    "session_value",
+                    "startup_warning",
+                    "effective_reasoning_effort",
+                    "error",
+                    "goal",
+                    "goal_delivery",
+                    "goal_session_id",
+                    "goal_command",
+                    "goal_messages",
+                    "goal_message_id",
+                    "paused",
+                    "pane_reported_by_agentctl",
+                    "custom_process_identity",
+                    "foreign_shell_identity",
+                    "runner_identity",
+                ];
+                if document.len() != TOP_FIELDS.len() + 1
+                    || !TOP_FIELDS.iter().all(|field| document.contains_key(*field))
+                    || !document.contains_key("extensions")
+                {
+                    return Err(fail(format!(
+                        "invalid agent record v2 fields: {}",
+                        path.display()
+                    )));
+                }
+                let launch: LaunchSpec = serde_json::from_value(
+                    document.remove("launch").expect("checked launch field"),
+                )
+                .map_err(|error| {
+                    fail(format!(
+                        "invalid agent record launch specification {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                if launch.schema != LAUNCH_SPEC_SCHEMA {
+                    return Err(fail(format!(
+                        "invalid agent record launch schema: {}",
+                        path.display()
+                    )));
+                }
+                let launch_object =
+                    serde_json::to_value(&launch).expect("LaunchSpec serialization is infallible");
+                if launch_object.as_object().map_or(0, serde_json::Map::len) != 14 {
+                    return Err(fail(format!(
+                        "invalid agent record launch fields: {}",
+                        path.display()
+                    )));
+                }
+                let extensions = document
+                    .remove("extensions")
+                    .and_then(|value| value.as_object().cloned())
+                    .ok_or_else(|| {
+                        fail(format!(
+                            "invalid agent record extensions: {}",
+                            path.display()
+                        ))
+                    })?;
+                document.insert("schema".to_owned(), json!(1));
+                document.insert("harness".to_owned(), json!(launch.harness));
+                document.insert("cwd".to_owned(), json!(launch.cwd));
+                document.insert("adapter".to_owned(), json!(launch.adapter));
+                document.insert("mode".to_owned(), json!(launch.mode));
+                document.insert("backend".to_owned(), json!(launch.backend));
+                document.insert("model".to_owned(), json!(launch.model));
+                document.insert("resume".to_owned(), json!(launch.resume));
+                document.insert("launch_profile".to_owned(), json!(launch.profile));
+                document.insert("launch_argv".to_owned(), json!(launch.argv));
+                document.insert(
+                    "launch_environment_names".to_owned(),
+                    json!(launch.environment_names),
+                );
+                document.insert("runtime_home".to_owned(), json!(launch.runtime_home));
+                document.insert(
+                    "runtime_ownership".to_owned(),
+                    json!(launch.runtime_ownership),
+                );
+                let (path_value, device, inode) =
+                    launch
+                        .executable
+                        .map_or((Value::Null, Value::Null, Value::Null), |identity| {
+                            (
+                                json!(identity.path),
+                                json!(identity.device),
+                                json!(identity.inode),
+                            )
+                        });
+                document.insert("launch_executable".to_owned(), path_value);
+                document.insert("launch_executable_device".to_owned(), device);
+                document.insert("launch_executable_inode".to_owned(), inode);
+                for (key, value) in extensions {
+                    if document.contains_key(&key) || key == "arguments" {
+                        return Err(fail(format!(
+                            "invalid agent record extension {:?}: {}",
+                            key,
+                            path.display()
+                        )));
+                    }
+                    document.insert(key, value);
+                }
+            }
+            Some(Value::Number(schema)) if schema.as_u64() == Some(1) => {
+                if !document.contains_key("arguments") {
+                    return Err(fail(format!("invalid agent record: {}", path.display())));
+                }
+                if !document.contains_key("runtime_ownership")
+                    || document["runtime_ownership"].is_null()
+                {
+                    let ownership = if document
+                        .get("adapter")
+                        .and_then(Value::as_str)
+                        .unwrap_or("herdr")
+                        == "herdr-foreign"
+                    {
+                        "foreign"
+                    } else {
+                        "owned"
+                    };
+                    document.insert("runtime_ownership".to_owned(), json!(ownership));
+                }
+            }
+            _ => {
+                return Err(fail(format!(
+                    "invalid agent record schema: {}",
+                    path.display()
+                )))
+            }
+        }
+        let raw_arguments = document.remove("arguments").unwrap_or_else(|| json!([]));
+        let arguments = raw_arguments.as_array().ok_or_else(|| {
+            fail(format!(
+                "invalid agent record arguments: {}",
+                path.display()
+            ))
+        })?;
+        if arguments.iter().any(|value| {
+            value
+                .as_str()
+                .is_none_or(|argument| argument.contains('\0'))
+        }) {
+            return Err(fail(format!(
+                "invalid agent record arguments: {}",
+                path.display()
+            )));
+        }
+        let arguments = arguments
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let launch_argv = document
+            .get("launch_argv")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if launch_argv.is_empty() && !arguments.is_empty() {
+            let program = document
+                .get("launch_executable")
+                .and_then(Value::as_str)
+                .or_else(|| document.get("harness").and_then(Value::as_str))
+                .ok_or_else(|| fail(format!("invalid agent record: {}", path.display())))?;
+            document.insert(
+                "launch_argv".to_owned(),
+                json!(std::iter::once(program.to_owned())
+                    .chain(arguments.iter().cloned())
+                    .collect::<Vec<_>>()),
+            );
+        } else if !arguments.is_empty()
+            && (launch_argv.len() != arguments.len() + 1
+                || launch_argv[1..]
+                    .iter()
+                    .zip(&arguments)
+                    .any(|(stored, expected)| stored.as_str() != Some(expected.as_str())))
+        {
+            return Err(fail(format!(
+                "contradictory launch arguments in {}",
+                path.display()
+            )));
+        }
+        let mut record: AgentRecord = serde_json::from_value(Value::Object(document))
+            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        if let Some(identity) = record.runner_identity.as_ref() {
+            record.runner_pid = Some(identity.pid);
+            record.runner_started_at = Some(identity.starttime_ticks.to_string());
+        }
+        record.validate_loaded(path, agent_name)?;
+        record.validate_runtime_shape(&record.launch_spec()?)?;
+        Ok(record)
+    }
+
+    fn validate_runtime_shape(&self, launch: &LaunchSpec) -> Result<()> {
+        let valid_lifecycle = matches!(
+            self.lifecycle.as_str(),
+            "starting" | "running" | "stopping" | "stopped" | "launch_failed" | "adopt_failed"
+        );
+        let valid = if launch.adapter == "turn-runner" {
+            launch.mode == "headless"
+                && matches!(launch.backend.as_str(), "herdr" | "tmux")
+                && launch.runtime_ownership == "owned"
+                && launch
+                    .runtime_home
+                    .as_deref()
+                    .is_some_and(|home| Path::new(home).is_absolute())
+                && self.custom_process_identity.is_none()
+                && self.foreign_shell_identity.is_none()
+        } else {
+            let base = matches!(
+                launch.adapter.as_str(),
+                "herdr" | "herdr-pane" | "herdr-foreign"
+            ) && launch.mode == "interactive"
+                && launch.backend == "herdr"
+                && launch.runtime_home.is_none()
+                && self.runner_identity.is_none()
+                && self.runner_pid.is_none()
+                && self.runner_started_at.is_none();
+            base && match launch.adapter.as_str() {
+                "herdr" => {
+                    launch.runtime_ownership == "owned"
+                        && self.custom_process_identity.is_none()
+                        && self.foreign_shell_identity.is_none()
+                }
+                "herdr-pane" => {
+                    launch.runtime_ownership == "owned"
+                        && launch.harness == "muse"
+                        && self.foreign_shell_identity.is_none()
+                }
+                "herdr-foreign" => {
+                    launch.runtime_ownership == "foreign" && self.custom_process_identity.is_none()
+                }
+                _ => false,
+            }
+        };
+        if !valid_lifecycle || !valid {
+            return Err(fail(
+                "adapter, mode, backend, ownership, and runtime identity are inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_loaded(&self, path: &Path, agent_name: &str) -> Result<()> {
         if self.name != agent_name
             || self.schema != 1
@@ -1386,6 +1767,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
+                // Herdr's native label is advisory for custom harnesses. The
+                // exact executable/process identity above is the ownership
+                // proof and safely bridges a delayed report-agent update.
+                info.agent = Some(self.record.harness.clone());
                 info.status = if muse_idle_composer(&screen) {
                     "idle".to_owned()
                 } else {
@@ -1642,6 +2027,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         "Muse workspace trust prompt requires human attention; no input was submitted",
                     ));
                 }
+                // The exact custom-process proof is authoritative even when
+                // Herdr's advisory agent label has not been published yet.
+                info.agent = Some(self.record.harness.clone());
                 info.status = if muse_idle_composer(&screen) {
                     "idle".to_owned()
                 } else {
@@ -2345,13 +2733,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         agent::validate_private_directory(&directory, "agent directory", false)?;
         let path = directory.join("agent.json");
-        let record: AgentRecord = serde_json::from_value(agent::read_private_json_bounded(
+        AgentRecord::from_storage_value(
+            agent::read_private_json_bounded(&path, MAX_AGENT_RECORD_BYTES as u64)?,
             &path,
-            MAX_AGENT_RECORD_BYTES as u64,
-        )?)
-        .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
-        record.validate_loaded(&path, agent_name)?;
-        Ok(record)
+            agent_name,
+        )
     }
 
     fn legacy_record_snapshot(
@@ -2380,14 +2766,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let object = document
             .as_object()
             .ok_or_else(|| fail(format!("invalid legacy agent record: {}", path.display())))?;
-        if object.contains_key("foreign_shell_identity") {
+        if object.get("schema").and_then(Value::as_u64) != Some(1)
+            || object.contains_key("foreign_shell_identity")
+        {
             return Err(fail(
-                "--recover-legacy-adoption requires foreign_shell_identity to be absent, not null or populated",
+                "--recover-legacy-adoption requires foreign_shell_identity to be absent, not null or populated, in a v1 record",
             ));
         }
-        let record: AgentRecord = serde_json::from_value(document)
-            .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
-        record.validate_loaded(&path, &pinned.name)?;
+        let record = AgentRecord::from_storage_value(document, &path, &pinned.name)?;
         let digest = format!("{:x}", Sha256::digest(&content));
         if record.token != expected_token || digest != expected_digest {
             return Err(fail(format!(
@@ -2411,9 +2797,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<ManagedRecordSnapshot> {
         let path = pinned.path.join("agent.json");
         let content = self.record_bytes(pinned)?;
-        let record: AgentRecord = serde_json::from_slice(&content)
+        let document: Value = serde_json::from_slice(&content)
             .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
-        record.validate_loaded(&path, &pinned.name)?;
+        let record = AgentRecord::from_storage_value(document, &path, &pinned.name)?;
         if record.token != expected_token {
             return Err(fail(format!(
                 "agent {:?} was replaced before this operation",
@@ -2431,7 +2817,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     fn save(&self, record: &AgentRecord) -> Result<()> {
         agent::atomic_json(
             &self.directory(&record.name)?.join("agent.json"),
-            &json!(record),
+            &record.storage_value()?,
         )
     }
 
@@ -2441,7 +2827,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Read durable metadata even if Herdr is unreachable.
     pub fn get(&self, agent_name: &str) -> Result<Value> {
-        Ok(json!(self.load(agent_name)?))
+        Ok(self.load(agent_name)?.public_value())
     }
 
     fn identity_owner(
@@ -2594,7 +2980,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             session_value: None,
             model: options.model.clone(),
             resume: options.resume.clone(),
-            arguments,
             startup_warning: None,
             effective_reasoning_effort: None,
             error: None,
@@ -2962,7 +3347,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             session_value: info.session_value,
             model: None,
             resume: None,
-            arguments: Vec::new(),
             startup_warning: None,
             effective_reasoning_effort: None,
             error: None,
@@ -3029,7 +3413,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent::sync_directory(&self.registry)?;
         record.lifecycle = "adopt_failed".to_owned();
         record.error = Some(error.to_owned());
-        agent::atomic_json(&destination.join("agent.json"), &json!(record))?;
+        agent::atomic_json(&destination.join("agent.json"), &record.storage_value()?)?;
         Ok(destination)
     }
 
@@ -3039,7 +3423,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if record.adapter == "herdr-pane" {
             let agent_name = record.name.clone();
             let harness = record.harness.clone();
-            let arguments = record.arguments.clone();
+            let arguments = record.arguments().to_vec();
             self.client.start_pane_agent(
                 &agent_name,
                 &harness,
@@ -3080,7 +3464,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 &record.name,
                 &record.harness,
                 &pane_id,
-                &record.arguments,
+                record.arguments(),
                 options.startup_timeout,
             )?;
         }
@@ -3342,7 +3726,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         runtime: &dyn agent::AgentRuntime,
     ) -> Result<Value> {
         let agent_name = &record.name;
-        let mut result = json!(record);
+        let mut result = record.public_value();
         result["queue"] = json!(self.queue(agent_name)?);
         result["output"] = json!(self.directory(agent_name)?.join("output.json"));
         result["goal_source"] = if record.goal.is_some() {
@@ -3884,6 +4268,57 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// Independently check selected names, or every active registry entry when empty.
     pub fn health(&self, requested: &[String]) -> Value {
         self.health_snapshot(requested).0
+    }
+
+    fn render_status_with_health(observation: &Value, status: Option<&Value>) -> Value {
+        let mut status = status.cloned().unwrap_or_else(|| {
+            json!({
+                "name": observation["name"],
+                "token": observation["token"],
+                "lifecycle": observation["lifecycle"],
+                "agent_status": observation["agent_status"],
+                "probe_error": observation["probe_error"],
+            })
+        });
+        for (destination, source) in [
+            ("health", "health"),
+            ("runtime_state", "runtime_state"),
+            ("health_reason_code", "reason_code"),
+            ("health_reason", "reason"),
+            ("health_first_detected_at", "first_detected_at"),
+            ("health_last_checked_at", "last_checked_at"),
+            ("health_recorded", "recorded"),
+            ("health_record_path", "record_path"),
+        ] {
+            status[destination] = observation[source].clone();
+        }
+        status
+    }
+
+    /// Return the canonical status payload and exit verdict from one probe.
+    pub fn status_with_health(&self, agent_name: &str) -> Result<(Value, bool)> {
+        let (observation, status) = self.status_health_snapshot(agent_name)?;
+        let healthy = observation["health"] == "healthy";
+        Ok((
+            Self::render_status_with_health(&observation, status.as_ref()),
+            healthy,
+        ))
+    }
+
+    /// Return the canonical list payload and aggregate exit verdict.
+    pub fn list_with_health(&self) -> (Vec<Value>, bool) {
+        let (aggregate, statuses) = self.health_snapshot(&[]);
+        let observations = aggregate["sessions"]
+            .as_array()
+            .expect("health snapshot always contains a session array");
+        let rows = observations
+            .iter()
+            .zip(statuses.iter())
+            .map(|(observation, status)| {
+                Self::render_status_with_health(observation, status.as_ref())
+            })
+            .collect();
+        (rows, aggregate["healthy"] == true)
     }
 
     /// Check selected names within one caller-owned absolute deadline.
@@ -5284,7 +5719,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let mut final_record = final_snapshot.record;
         final_record.lifecycle = "stopped".to_owned();
-        let mut stopped_bytes = serde_json::to_vec_pretty(&final_record)
+        let mut stopped_bytes = serde_json::to_vec_pretty(&final_record.storage_value()?)
             .map_err(|error| fail(format!("cannot serialize agent record: {error}")))?;
         stopped_bytes.push(b'\n');
         if stopped_bytes.len() > MAX_AGENT_RECORD_BYTES {
@@ -5413,7 +5848,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         let confirmed_record = self.load(agent_name)?;
-        if confirmed_record.token != record.token || json!(confirmed_record) != json!(record) {
+        if confirmed_record.token != record.token
+            || confirmed_record.public_value() != record.public_value()
+        {
             return Err(fail(format!(
                 "agent {agent_name:?} record changed before stop"
             )));
@@ -5729,7 +6166,7 @@ mod tests {
         fn make_legacy_dead(&self) -> (String, String, Vec<u8>) {
             let adopted = self.adopt();
             let path = self.root.join("registry/foreign/agent.json");
-            let mut document = agent::read_private_json(&path).unwrap();
+            let mut document = self.manager().load("foreign").unwrap().public_value();
             document
                 .as_object_mut()
                 .unwrap()
@@ -6025,7 +6462,7 @@ mod tests {
             if self.custom_alive.load(Ordering::Relaxed) {
                 if self.custom_ready.load(Ordering::Relaxed) {
                     Ok(
-                        "Muse Code\n────────────────\n❯\n────────────────\nAuto-review\n"
+                        "Muse Code at Meta\n  Muse Code 1.4.0\n────────────────\n❯\n────────────────\nkiki · xhigh · /work · YOLO\n"
                             .to_owned(),
                     )
                 } else {
@@ -6625,6 +7062,40 @@ mod tests {
     }
 
     #[test]
+    fn custom_process_identity_outweighs_a_missing_native_agent_label() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let mut record = manager.load("worker").unwrap();
+        record.session_agent = None;
+        record.session_value = None;
+        manager.save(&record).unwrap();
+        fixture
+            .client
+            .custom_reported
+            .store(false, Ordering::Relaxed);
+
+        let status = manager.status("worker").unwrap();
+
+        assert_eq!(
+            started["custom_process_identity"],
+            status["custom_process_identity"]
+        );
+        assert_eq!(status["agent"], "muse", "{status}");
+        assert_eq!(status["agent_status"], "idle");
+        assert!(status["probe_error"].is_null());
+    }
+
+    #[test]
     fn environment_entries_preserve_literals_and_reject_invalid_input() {
         let entries = vec![
             "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai".to_owned(),
@@ -6831,6 +7302,117 @@ mod tests {
         )
         .unwrap();
         assert_eq!(record["workspace_id"], "elsewhere");
+    }
+
+    #[test]
+    fn agent_record_v2_has_one_tagged_launch_authority() {
+        let fixture = Fixture::new();
+        let started = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    model: Some("model-a".to_owned()),
+                    harness_args: vec!["--literal".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let stored = agent::read_private_json(&path).unwrap();
+        assert_eq!(stored["schema"], SESSION_STORAGE_SCHEMA);
+        assert_eq!(stored["launch"]["schema"], LAUNCH_SPEC_SCHEMA);
+        assert_eq!(
+            stored["launch"]["argv"],
+            json!([
+                "codex",
+                "--no-alt-screen",
+                "--model",
+                "model-a",
+                "--literal"
+            ])
+        );
+        for duplicate in [
+            "harness",
+            "cwd",
+            "adapter",
+            "mode",
+            "backend",
+            "model",
+            "resume",
+            "arguments",
+            "launch_argv",
+            "launch_executable",
+            "runtime_home",
+            "runtime_ownership",
+            "runner_pid",
+            "runner_started_at",
+        ] {
+            assert!(
+                stored.get(duplicate).is_none(),
+                "duplicate field {duplicate}"
+            );
+        }
+        assert_eq!(
+            fixture.manager().get("worker").unwrap()["arguments"],
+            started["arguments"]
+        );
+    }
+
+    #[test]
+    fn agent_record_v1_migrates_once_and_refuses_conflicting_argument_authorities() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut legacy = manager.load("worker").unwrap().public_value();
+        legacy["launch_argv"] = json!([]);
+        legacy["arguments"] = json!(["--no-alt-screen", "--literal"]);
+        agent::atomic_json(&path, &legacy).unwrap();
+        assert_eq!(
+            manager.load("worker").unwrap().launch_argv,
+            ["codex", "--no-alt-screen", "--literal"]
+        );
+        manager.pause("worker", true).unwrap();
+        let migrated = agent::read_private_json(&path).unwrap();
+        assert_eq!(migrated["schema"], SESSION_STORAGE_SCHEMA);
+        assert_eq!(
+            migrated["launch"]["argv"],
+            json!(["codex", "--no-alt-screen", "--literal"])
+        );
+
+        let mut conflicting = manager.load("worker").unwrap().public_value();
+        conflicting["arguments"] = json!(["--different"]);
+        agent::atomic_json(&path, &conflicting).unwrap();
+        assert!(manager
+            .load("worker")
+            .unwrap_err()
+            .to_string()
+            .contains("contradictory launch arguments"));
+    }
+
+    #[test]
+    fn agent_record_v2_refuses_crossed_launch_dimensions() {
+        for (field, value) in [
+            ("adapter", "turn-runner"),
+            ("mode", "headless"),
+            ("backend", "tmux"),
+            ("runtime_ownership", "foreign"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.start(None);
+            let path = fixture.root.join("registry/worker/agent.json");
+            let mut document = agent::read_private_json(&path).unwrap();
+            document["launch"][field] = json!(value);
+            agent::atomic_json(&path, &document).unwrap();
+            assert!(fixture
+                .manager()
+                .load("worker")
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent"));
+        }
     }
 
     #[test]
@@ -7079,7 +7661,7 @@ mod tests {
         assert_eq!(*fixture.client.panes.lock().unwrap(), [presentation]);
         let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
         let saved = agent::read_private_json(&archive.join("agent.json")).unwrap();
-        assert_eq!(saved["adapter"], "herdr-foreign");
+        assert_eq!(saved["launch"]["adapter"], "herdr-foreign");
         assert_eq!(saved["token"], adopted["token"]);
         assert!(archive.join("output.json").is_file());
         assert_eq!(
@@ -7113,10 +7695,14 @@ mod tests {
         assert_eq!(archives.len(), 1);
         let saved = agent::read_private_json(&archives[0].path().join("agent.json")).unwrap();
         assert_eq!(saved["lifecycle"], "adopt_failed");
-        assert!(saved["error"]
-            .as_str()
-            .unwrap()
-            .contains("shell process identity changed"));
+        assert!(
+            saved["error"]
+                .as_str()
+                .unwrap()
+                .contains("shell generation changed"),
+            "{}",
+            saved["error"]
+        );
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 
@@ -7228,7 +7814,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.adopt();
         let path = fixture.root.join("registry/foreign/agent.json");
-        let mut document = agent::read_private_json(&path).unwrap();
+        let mut document = fixture.manager().load("foreign").unwrap().public_value();
         document
             .as_object_mut()
             .unwrap()
@@ -7261,7 +7847,7 @@ mod tests {
             .send("foreign", "retained request", DrainOptions::default())
             .unwrap();
         let record_path = fixture.root.join("registry/foreign/agent.json");
-        let mut document = agent::read_private_json(&record_path).unwrap();
+        let mut document = fixture.manager().load("foreign").unwrap().public_value();
         document
             .as_object_mut()
             .unwrap()
@@ -8595,7 +9181,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.adopt();
         let path = fixture.root.join("registry/foreign/agent.json");
-        let mut document = agent::read_private_json(&path).unwrap();
+        let mut document = fixture.manager().load("foreign").unwrap().public_value();
         document
             .as_object_mut()
             .unwrap()
@@ -8931,10 +9517,10 @@ mod tests {
         fixture.start(None);
         let path = fixture.root.join("registry/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
-        document["adapter"] = json!("turn-runner");
-        document["mode"] = json!("headless");
-        document["backend"] = json!("tmux");
-        document["runtime_home"] = json!(fixture.root.join("runtime"));
+        document["launch"]["adapter"] = json!("turn-runner");
+        document["launch"]["mode"] = json!("headless");
+        document["launch"]["backend"] = json!("tmux");
+        document["launch"]["runtime_home"] = json!(fixture.root.join("runtime"));
         document["session_agent"] = Value::Null;
         document["session_value"] = json!("thread");
         document["pane_id"] = json!("headless-pane");
@@ -9012,10 +9598,10 @@ mod tests {
         fixture.start(None);
         let holder_path = fixture.root.join("registry/worker/agent.json");
         let mut holder = agent::read_private_json(&holder_path).unwrap();
-        holder["adapter"] = json!("turn-runner");
-        holder["mode"] = json!("headless");
-        holder["backend"] = json!("tmux");
-        holder["runtime_home"] = json!(fixture.root.join("runtime"));
+        holder["launch"]["adapter"] = json!("turn-runner");
+        holder["launch"]["mode"] = json!("headless");
+        holder["launch"]["backend"] = json!("tmux");
+        holder["launch"]["runtime_home"] = json!(fixture.root.join("runtime"));
         holder["pane_id"] = json!("headless-pane");
         agent::atomic_json(&holder_path, &holder).unwrap();
         fixture.client.panes.lock().unwrap().clear();
@@ -9409,7 +9995,7 @@ mod tests {
             .contains("invalid agent record"));
 
         let mut wrong_adapter = original.clone();
-        wrong_adapter["adapter"] = json!("herdr");
+        wrong_adapter["launch"]["adapter"] = json!("herdr");
         agent::atomic_json(&path, &wrong_adapter).unwrap();
         assert!(manager
             .load("foreign")
@@ -9417,7 +10003,8 @@ mod tests {
             .to_string()
             .contains("invalid agent record"));
 
-        let mut legacy = original;
+        agent::atomic_json(&path, &original).unwrap();
+        let mut legacy = manager.load("foreign").unwrap().public_value();
         legacy
             .as_object_mut()
             .unwrap()
@@ -9552,7 +10139,7 @@ mod tests {
         let (_pane, token) = fixture.make_managed_dead();
         let path = fixture.root.join("registry/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
-        document["future_padding"] = json!(vec!["x"; 150_000]);
+        document["extensions"]["future_padding"] = json!(vec!["x"; 150_000]);
         let mut raw = serde_json::to_vec(&document).unwrap();
         raw.push(b'\n');
         let mut stopped = document.clone();
@@ -10067,7 +10654,7 @@ mod tests {
         let manager = fixture.manager();
         let path = fixture.root.join("registry/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
-        document["future_metadata"] = json!({"nested":true});
+        document["extensions"]["future_metadata"] = json!({"nested":true});
         agent::atomic_json(&path, &document).unwrap();
         assert_eq!(manager.pause("worker", true).unwrap()["paused"], true);
         assert!(manager
@@ -10099,9 +10686,9 @@ mod tests {
         fixture.start(None);
         let path = fixture.root.join("registry/worker/agent.json");
         let mut document = agent::read_private_json(&path).unwrap();
-        document["adapter"] = json!("turn-runner");
-        document["mode"] = json!("headless");
-        document["runtime_home"] = json!("/tmp/worker-runtime");
+        document["launch"]["adapter"] = json!("turn-runner");
+        document["launch"]["mode"] = json!("headless");
+        document["launch"]["runtime_home"] = json!("/tmp/worker-runtime");
         agent::atomic_json(&path, &document).unwrap();
         let manager = fixture.manager();
         let status = manager.status("worker").unwrap();

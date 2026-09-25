@@ -23,7 +23,7 @@ from agentctl import __version__
 from agentctl.agent import Target, drain, read, send, status
 from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
-from agentctl.subagents import ManagedAgents
+from agentctl.sessions import Sessions
 
 _MAX_WAIT_SECONDS = 31_536_000.0
 _MAX_COUNT = 1_000_000
@@ -90,7 +90,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
-    manager = ManagedAgents(client, args.registry)
+    manager = Sessions(client, args.registry)
     options: dict[str, object] = {
         "ready_timeout": args.ready_timeout, "working_timeout": args.working_timeout,
         "max_attempts": args.max_attempts,
@@ -153,14 +153,14 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
     elif command == "list":
         if args.text or args.name:
             raise ValueError("list does not accept an agent name")
-        result = manager.list()
+        result, healthy = manager.list_with_health()
     elif command == "send":
         result = manager.send(name, _message(args), message_id=None, expected_token=None, **options).__dict__
     elif command == "drain":
         drained = manager.drain(name, **options)
         result = drained.__dict__
     elif command == "status":
-        result = manager.status(name)
+        result, healthy = manager.status_with_health(name)
     elif command == "read":
         sys.stdout.write(manager.read(name, lines=args.lines))
         return 0
@@ -179,6 +179,8 @@ def _managed(args: argparse.Namespace, client: HerdrClient) -> int:
     sys.stdout.write("\n")
     if command == "drain":
         return 75 if drained.blocked else (76 if drained.quarantined else 0)
+    if command in ("list", "status"):
+        return 0 if healthy else 1
     return 0
 
 

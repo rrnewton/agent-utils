@@ -15,7 +15,7 @@ from typing import cast
 
 import pytest
 
-from agentctl import agent, cli
+from agentctl import agent, cli, legacy_cli
 import agentctl.subagents as subagents_module
 from agentctl.client import AgentPaneInfo, HerdrClient, Pane, PaneShellProof
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
@@ -106,6 +106,58 @@ def test_list_output_and_exit_share_one_probe_snapshot(
     assert [(row["name"], row["runtime_state"]) for row in rendered] == [
         ("alive", "live"), ("dead", "dead"),
     ]
+
+
+def test_legacy_status_uses_the_canonical_health_payload_and_exit_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    observation = {
+        "name": "worker", "token": "generation", "lifecycle": "running",
+        "agent_status": "unknown", "probe_error": "shell fallback",
+        "health": "unhealthy", "runtime_state": "dead",
+        "reason_code": "expected-harness-missing", "reason": "shell fallback",
+        "first_detected_at": 1.0, "last_checked_at": 2.0,
+        "recorded": True, "record_path": str(tmp_path / "health.json"),
+    }
+    monkeypatch.setattr(
+        Sessions, "status_health_snapshot",
+        lambda self, name: (observation, {"name": name, "lifecycle": "running"}),
+    )
+
+    assert legacy_cli.main([
+        "status", "--name", "worker", "--registry", str(tmp_path / "registry"),
+    ]) == 1
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["health"] == "unhealthy"
+    assert rendered["runtime_state"] == "dead"
+    assert rendered["health_reason_code"] == "expected-harness-missing"
+
+
+def test_legacy_list_uses_the_canonical_aggregate_exit_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    observation = {
+        "name": "worker", "token": "generation", "lifecycle": "running",
+        "agent_status": "unknown", "probe_error": "probe timed out",
+        "health": "unknown", "runtime_state": "unknown",
+        "reason_code": "runtime-probe-failed", "reason": "probe timed out",
+        "first_detected_at": 1.0, "last_checked_at": 2.0,
+        "recorded": False, "record_path": None,
+    }
+    monkeypatch.setattr(
+        Sessions, "health_snapshot",
+        lambda self, names: (
+            {"healthy": False, "sessions": [observation]},
+            [{"name": "worker", "lifecycle": "running"}],
+        ),
+    )
+
+    assert legacy_cli.main([
+        "list", "--registry", str(tmp_path / "registry"),
+    ]) == 1
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered[0]["health"] == "unknown"
+    assert rendered[0]["runtime_state"] == "unknown"
 
 
 def test_health_watch_skips_contended_first_lock_and_probes_later_row(
@@ -289,7 +341,7 @@ def test_managed_dead_stop_refuses_expanded_stopped_record_before_close(
     active = manager.registry / "worker"
     record_path = active / "agent.json"
     document = json.loads(record_path.read_text())
-    document["future_padding"] = ["x"] * 150_000
+    document["extensions"]["future_padding"] = ["x"] * 150_000
     raw = (json.dumps(document, separators=(",", ":")) + "\n").encode()
     stopped = dict(document)
     stopped["lifecycle"] = "stopped"
@@ -1708,14 +1760,14 @@ def test_unknown_metadata_survives_ownership_and_session_updates_without_a_wrapp
     manager.start("worker", cwd=str(tmp_path))
     path = tmp_path / "registry/worker/agent.json"
     record = json.loads(path.read_text())
-    record["future_metadata"] = {"nested": [1, "preserve"]}
+    record["extensions"]["future_metadata"] = {"nested": [1, "preserve"]}
     agent._atomic_json(str(path), record)
     manager.pause("worker")
     manager.bind_session("worker", "session-1")
     saved = json.loads(path.read_text())
-    assert saved["future_metadata"] == record["future_metadata"]
+    assert saved["extensions"]["future_metadata"] == record["extensions"]["future_metadata"]
     assert "_unknown" not in saved
-    assert manager.status("worker")["future_metadata"] == record["future_metadata"]
+    assert manager.status("worker")["future_metadata"] == record["extensions"]["future_metadata"]
     invalid = manager.get("worker")
     invalid._unknown["paused"] = False
     with pytest.raises(AgentDeliveryError, match="conflicts"):

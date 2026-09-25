@@ -19,6 +19,7 @@ from agentctl.client import (
     CustomProcessIdentity,
     HerdrClient,
     ProcessInfo,
+    muse_idle_composer,
     muse_prompt_in_composer,
     muse_prompt_in_transcript,
     muse_prompt_transcript_count,
@@ -161,6 +162,33 @@ def test_custom_muse_launch_uses_literal_shell_quoting_and_exact_pane_report() -
         "p1", "--source", "agentctl", "--agent", "muse", "--state", "idle",
         "--message", "agentctl custom harness",
     ]
+
+
+def test_custom_muse_launch_accepts_current_model_footer_without_auto_review() -> None:
+    screen = (
+        "Muse Code at Meta (https://fb.workplace.com/groups/27315719428107177)\n"
+        "Using AI Gateway (Meta Model API upstream)\n\n"
+        "  Muse Code 1.4.0\n\n"
+        "────────────────\n❯\n────────────────\n"
+        "  kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n"
+    )
+    client, calls = _custom_runner(screen)
+    identity = client.start_pane_agent(
+        "worker", "muse", "p1",
+        ("--model", "kiki_gb300_mxfp8_6p2_840_nwr", "--reasoning-effort", "xhigh", "--yolo"),
+        timeout=1,
+    )
+    assert identity.pid == 2_147_483_647
+    assert any(call[1:3] == ["pane", "report-agent"] for call in calls)
+
+
+def test_current_muse_footer_does_not_turn_a_choice_into_an_idle_composer() -> None:
+    screen = (
+        "  Muse Code 1.4.0\n\n"
+        "────────────────\n❯ Yes, continue\n  No, exit\n────────────────\n"
+        "  kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n"
+    )
+    assert not muse_idle_composer(screen)
 
 
 def test_custom_muse_launch_retries_transient_null_process_argv() -> None:

@@ -929,7 +929,7 @@ def test_automation_pause_keeps_request_pending(fake_runner_state: Path, monkeyp
     rec = _install_agy_agent(fake_runner_state, "paused")
     seq = lib.enqueue_message(rec.name, "wait for resume", model=None)
     source = lib.inbox_dir(rec.name) / f"{seq:012d}.json"
-    (lib.agent_dir(rec.name) / "automation-paused").touch()
+    lib.automation_pause_path(rec).touch()
     monkeypatch.setattr(agent_runner, "_run_turn", lambda *_args: pytest.fail("paused intake executed"))
     agent_runner._consume(rec.name, rec, source)
     assert source.exists()
@@ -943,6 +943,9 @@ def test_owner_generation_binds_once_and_rejects_stale_runtime_operations(
     rec = _install_agy_agent(fake_runner_state, "owned")
     first = "a" * 32
     second = "b" * 32
+    legacy = rec.to_public_dict()
+    legacy.pop("owner_token")
+    lib.REGISTRY.write_text(json.dumps([legacy]), encoding="utf-8")
     assert lib.bind_owner_token(rec.name, first).owner_token == first
     with pytest.raises(lib.AgentOperationError, match="another session generation") as raised:
         lib.bind_owner_token(rec.name, second)
@@ -969,7 +972,8 @@ def test_pause_markers_are_scoped_to_the_owner_generation(
     fake_runner_state: Path,
 ) -> None:
     rec = _install_agy_agent(fake_runner_state, "pause-generation")
-    current_token = "c" * 32
+    current_token = rec.owner_token
+    assert current_token is not None
     stale_token = "d" * 32
     current = lib.bind_owner_token(rec.name, current_token)
     legacy = lib.agent_dir(rec.name) / "automation-paused"

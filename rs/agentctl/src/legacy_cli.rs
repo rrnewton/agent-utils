@@ -377,7 +377,9 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                     "list does not accept an agent name".to_owned(),
                 ));
             }
-            write_json(&manager.list()?)?;
+            let (rows, healthy) = manager.list_with_health();
+            write_json(&rows)?;
+            return Ok(if healthy { 0 } else { 1 });
         }
         "send" => write_json(&manager.send(name, &message(&args)?, delivery)?)?,
         "drain" => {
@@ -391,7 +393,11 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                 76
             });
         }
-        "status" => write_json(&manager.status(name)?)?,
+        "status" => {
+            let (status, healthy) = manager.status_with_health(name)?;
+            write_json(&status)?;
+            return Ok(if healthy { 0 } else { 1 });
+        }
         "read" => print!("{}", manager.read(name, args.lines)?),
         "wait" => write_json(&manager.wait(name, Duration::from_secs_f64(args.ready_timeout))?)?,
         "goal" => {

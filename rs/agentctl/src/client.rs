@@ -637,7 +637,11 @@ pub(crate) fn muse_trust_prompt(screen: &str) -> bool {
 }
 
 pub(crate) fn muse_idle_composer(screen: &str) -> bool {
-    screen.contains("Auto-review") && screen.lines().any(|line| matches!(line.trim(), "❯" | "›"))
+    muse_composer_regions(screen).is_some_and(|(_, composer)| {
+        composer
+            .lines()
+            .any(|line| matches!(line.trim(), "❯" | "›"))
+    })
 }
 
 fn muse_text_visible(screen: &str, text: &str) -> bool {
@@ -658,10 +662,7 @@ fn muse_text_visible(screen: &str, text: &str) -> bool {
 
 fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
     let lines = screen.lines().collect::<Vec<_>>();
-    let footer = lines
-        .iter()
-        .rposition(|line| line.contains("Auto-review"))?;
-    let dividers = lines[..footer]
+    let dividers = lines
         .iter()
         .enumerate()
         .filter_map(|(index, line)| {
@@ -675,6 +676,31 @@ fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
         .collect::<Vec<_>>();
     let bottom = *dividers.last()?;
     let top = *dividers.get(dividers.len().checked_sub(2)?)?;
+    let footer = &lines[bottom + 1..];
+    let old_footer = footer.iter().any(|line| line.contains("Auto-review"));
+    let status_fields = footer
+        .iter()
+        .find_map(|line| {
+            (!line.trim().is_empty()).then(|| line.split('·').map(str::trim).collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    let current_footer = lines[..top].iter().any(|line| {
+        line.trim()
+            .strip_prefix("Muse Code ")
+            .is_some_and(|version| {
+                let pieces = version.split('.').collect::<Vec<_>>();
+                pieces.len() == 3
+                    && pieces.iter().all(|piece| {
+                        !piece.is_empty() && piece.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+    }) && matches!(status_fields.len(), 3 | 4)
+        && status_fields.iter().all(|field| !field.is_empty())
+        && muse_effort(status_fields[1])
+        && (status_fields.len() == 3 || status_fields[3] == "YOLO");
+    if !old_footer && !current_footer {
+        return None;
+    }
     Some((lines[..top].join("\n"), lines[top + 1..bottom].join("\n")))
 }
 
@@ -2486,6 +2512,20 @@ mod tests {
             muse_prompt_transcript_count(&cleared_without_submit, prompt),
             1
         );
+    }
+
+    #[test]
+    fn current_muse_footer_identifies_only_an_empty_composer() {
+        let prefix = "Muse Code at Meta (https://fb.workplace.com/groups/27315719428107177)\n\
+                      Using AI Gateway (Meta Model API upstream)\n\n  Muse Code 1.4.0\n\n";
+        let divider = "────────────────\n";
+        let footer = "kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n";
+        assert!(muse_idle_composer(&format!(
+            "{prefix}{divider}❯\n{divider}{footer}"
+        )));
+        assert!(!muse_idle_composer(&format!(
+            "{prefix}{divider}❯ Yes, continue\n  No, exit\n{divider}{footer}"
+        )));
     }
 
     #[cfg(target_os = "linux")]

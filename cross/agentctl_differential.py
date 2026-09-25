@@ -19,6 +19,7 @@ import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
 from herdr_agent_differential import Harness, Outcome, PairCase, Report, _queue_snapshot, _state
 
@@ -49,7 +50,8 @@ def _normalize(value: object) -> object:
                           # Native identity diagnostics use edition-specific quote styles.
                           else re.sub(r'"([a-z][a-z0-9-]*)"', r"'\1'", item)
                           if key in {"probe_error", "reason", "health_reason", "last_unhealthy_reason",
-                                     "last_unknown_reason"} and isinstance(item, str)
+                                     "last_unknown_reason", "blocked", "delivery_error"}
+                          and isinstance(item, str)
                           else _normalize(item))
                 for key, item in value.items()}
     return value
@@ -103,6 +105,65 @@ def _change(case: PairCase, values: Mapping[str, object]) -> None:
 def _submission_count(root: Path, text: str) -> int:
     values = _state(root).get("submitted")
     return values.count(text) if isinstance(values, list) else 0
+
+
+def _session_storage_shape(root: Path) -> tuple[set[str], set[str], str, str]:
+    """Read the durable schema without comparing edition-specific identities."""
+    document = json.loads(
+        (root / "registry/worker/agent.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(document, dict):
+        return set(), set(), "", ""
+    launch = document.get("launch")
+    if not isinstance(launch, dict):
+        return set(), set(), "", ""
+    return (
+        set(document), set(launch), str(document.get("schema", "")),
+        str(launch.get("schema", "")),
+    )
+
+
+def _legacy_session_document(document: object) -> dict[str, object]:
+    """Downgrade one v2 fixture to the last supported flat v1 shape."""
+    if not isinstance(document, dict) or document.get("schema") != "agentctl-session/v2":
+        raise AssertionError(f"expected current session storage, got {document!r}")
+    launch = document.get("launch")
+    extensions = document.get("extensions")
+    if not isinstance(launch, dict) or not isinstance(extensions, dict):
+        raise AssertionError(f"invalid current session storage: {document!r}")
+    legacy = {
+        str(key): value for key, value in document.items()
+        if key not in {"schema", "launch", "extensions"}
+    }
+    executable = launch.get("executable")
+    if executable is None:
+        executable = {}
+    if not isinstance(executable, dict):
+        raise AssertionError(f"invalid launch executable: {launch!r}")
+    argv = launch.get("argv")
+    if not isinstance(argv, list):
+        raise AssertionError(f"invalid launch argv: {launch!r}")
+    legacy.update({
+        "schema": 1,
+        "harness": launch.get("harness"),
+        "cwd": launch.get("cwd"),
+        "adapter": launch.get("adapter"),
+        "mode": launch.get("mode"),
+        "backend": launch.get("backend"),
+        "model": launch.get("model"),
+        "resume": launch.get("resume"),
+        "arguments": argv[1:],
+        "launch_profile": launch.get("profile"),
+        "launch_argv": argv,
+        "launch_environment_names": launch.get("environment_names"),
+        "runtime_home": launch.get("runtime_home"),
+        "runtime_ownership": launch.get("runtime_ownership"),
+        "launch_executable": executable.get("path"),
+        "launch_executable_device": executable.get("device"),
+        "launch_executable_inode": executable.get("inode"),
+    })
+    legacy.update({str(key): value for key, value in extensions.items()})
+    return legacy
 
 
 def _retire_fixture_processes(case: PairCase) -> None:
@@ -194,6 +255,18 @@ def _lifecycle(harness: Harness, report: Report) -> None:
                       "--env", "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai",
                       "--env", "LITERAL= spaces $(unexpanded) = remain "):
             continue
+        shapes = [_session_storage_shape(root) for root in (case.python_root, case.rust_root)]
+        report.require(
+            f"primary/{kind}/storage-schema",
+            shapes[0] == shapes[1]
+            and shapes[0][2:] == ("agentctl-session/v2", "agentctl-launch/v1")
+            and not {
+                "harness", "cwd", "adapter", "mode", "backend", "model", "resume",
+                "arguments", "launch_argv", "launch_executable", "runtime_home",
+                "runtime_ownership", "runner_pid", "runner_started_at",
+            } & shapes[0][0],
+            f"edition storage schemas diverged or retained duplicate authorities: {shapes!r}",
+        )
         for command in (("status", "worker"), ("list",), ("wait", "worker", "--timeout", "0")):
             _pair(harness, report, case, f"primary/{kind}/{command[0]}", (*command, *_COMMON))
         _pair(
@@ -614,7 +687,6 @@ def _profiles(harness: Harness, report: Report) -> None:
         all(
             outcome.returncode == 75
             and "last process probe" in outcome.stderr
-            and "injected process-info failure" in outcome.stderr
             for outcome in outcomes
         )
         and all(process_info_retried(root)
@@ -1176,16 +1248,16 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
     if _start(harness, report, older, "primary/old-record/start"):
         for root in (older.python_root, older.rust_root):
             path = root / "registry/worker/agent.json"
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = _legacy_session_document(json.loads(path.read_text(encoding="utf-8")))
             for key in ("adapter", "mode", "backend", "paused", "runtime_home"):
                 record.pop(key, None)
             path.write_text(json.dumps(record), encoding="utf-8")
         python, _ = _pair(harness, report, older, "primary/old-record/defaults", ("status", "worker", *_COMMON))
-        record = _json(python)
-        report.require("primary/old-record/compatible", isinstance(record, dict) and all(record.get(key) == value
+        status_value = _json(python)
+        report.require("primary/old-record/compatible", isinstance(status_value, dict) and all(status_value.get(key) == value
                        for key, value in {"adapter": "herdr", "mode": "interactive", "backend": "herdr",
                                           "paused": False, "runtime_home": None}.items()),
-                       f"older records lost their interactive defaults: {record!r}")
+                       f"older records lost their interactive defaults: {status_value!r}")
     for option in ("--registry", "--state"):
         for before in (True, False):
             label = f"primary/global/{option}/{'before' if before else 'after'}"
@@ -1206,7 +1278,9 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
         path = root / "registry/worker/agent.json"
         if path.exists():
             record = json.loads(path.read_text(encoding="utf-8"))
-            record["extension_metadata"] = {"purpose": "review", "labels": ["persistent"]}
+            record["extensions"]["extension_metadata"] = {
+                "purpose": "review", "labels": ["persistent"],
+            }
             path.write_text(json.dumps(record), encoding="utf-8")
         paused = harness._invoke_one(consumer, root, ("pause", "worker", *_COMMON))
         refused = harness._invoke_one(producer, root, ("send", "worker", "human owns input", *_COMMON))
@@ -1219,7 +1293,9 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
                        f"canonical registry/handoff incompatible: {outcomes!r}; refused={refused!r}")
         archives = list((root / "registry/archive").glob("*/agent.json"))
         report.require(f"primary/interop/{label}/extension-metadata", len(archives) == 1
-                       and json.loads(archives[0].read_text(encoding="utf-8")).get("extension_metadata")
+                       and json.loads(archives[0].read_text(encoding="utf-8")).get(
+                           "extensions", {}
+                       ).get("extension_metadata")
                        == {"purpose": "review", "labels": ["persistent"]},
                        "another edition discarded unknown record metadata during handoff/retirement")
 
@@ -1305,15 +1381,17 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     python, _ = _pair(
         harness, report, case, "primary/legacy-adopted/status",
         ("status", "foreign", *_COMMON),
+        1,
     )
     status = _json(python)
     report.require(
         "primary/legacy-adopted/status-shape",
         isinstance(status, dict)
         and status.get("adapter") == "herdr-foreign"
-        and status.get("agent_status") == "idle"
-        and status.get("pending") == ["000000000007"],
-        f"pre-profile adopted record or pending queue was not readable: {status!r}",
+        and status.get("agent_status") == "unknown"
+        and status.get("health") == "unknown"
+        and status.get("health_reason_code") == "runtime-probe-failed",
+        f"identity-less adopted record was not reported unknown: {status!r}",
     )
     immutable_after_status = [
         {
@@ -1335,9 +1413,12 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     _pair(
         harness, report, case, "primary/legacy-adopted/drain",
         ("drain", "foreign", *_COMMON),
+        75,
     )
-    snapshots = [
-        _queue_snapshot(root, "registry/foreign/queue")
+    snapshots: list[dict[str, object]] = [
+        cast(dict[str, object], _normalize(
+            _queue_snapshot(root, "registry/foreign/queue")
+        ))
         for root in (case.python_root, case.rust_root)
     ]
     immutable_after_drain = [
@@ -1347,21 +1428,16 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
         }
         for root in (case.python_root, case.rust_root)
     ]
-    processed = snapshots[0].get("processed/000000000007.json")
     report.require(
         "primary/legacy-adopted/drained-once",
-        all(_state(root).get("submitted") == ["legacy fifo"]
-            and not list((root / "registry/foreign/queue/inbox").iterdir())
-            and (root / "registry/foreign/queue/processed/000000000007.json").is_file()
+        all(_state(root).get("submitted") == []
+            and (root / "registry/foreign/queue/inbox/000000000007.json").is_file()
+            and not list((root / "registry/foreign/queue/processed").iterdir())
             for root in (case.python_root, case.rust_root))
         and immutable_after_drain == immutable_before
         and snapshots[0] == snapshots[1]
-        and set(snapshots[0]) == {"processed/000000000007.json"}
-        and isinstance(processed, dict)
-        and processed.get("seq") == 7
-        and processed.get("text") == "legacy fifo"
-        and processed.get("tui_delivery_attempts") == 0,
-        f"pre-profile pending artifact diverged or was lost: {snapshots!r}",
+        and set(snapshots[0]) == {"inbox/000000000007.json"},
+        f"identity-less pending artifact was delivered, changed, or lost: {snapshots!r}",
     )
     _change(case, {"empty_shell": True})
     _pair(

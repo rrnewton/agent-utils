@@ -206,7 +206,11 @@ class FakeManagedClient:
             return ""
         if self.custom_running:
             if self.custom_ready:
-                return "Muse Code\n────────────────\n❯\n────────────────\nAuto-review\n"
+                return (
+                    "Muse Code at Meta\n  Muse Code 1.4.0\n"
+                    "────────────────\n❯\n────────────────\n"
+                    "kiki · xhigh · /work · YOLO\n"
+                )
             return "Muse Code\nWorking…\n"
         return "human and coordinator transcript\n"
 
@@ -702,6 +706,23 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
     assert fake.submitted == []
 
 
+def test_custom_process_identity_outweighs_a_missing_native_agent_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path), harness="muse")
+    fake.infos["w1:p1"] = replace(
+        fake.infos["w1:p1"], agent=None, status="unknown",
+    )
+
+    status = manager.status("worker")
+
+    assert started["custom_process_identity"] == status["custom_process_identity"]
+    assert status["agent"] == "muse"
+    assert status["agent_status"] == "idle"
+    assert status["probe_error"] is None
+
+
 def test_failed_muse_recovery_does_not_report_idle_without_idle_composer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -886,6 +907,79 @@ def test_private_state_and_malformed_record_are_rejected(tmp_path: Path, monkeyp
         manager.get("worker")
 
 
+def test_agent_record_v2_has_one_tagged_launch_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    started = manager.start(
+        "worker", cwd=str(tmp_path), harness="codex", model="model-a",
+        harness_args=("--literal",),
+    )
+    path = manager.registry / "worker" / "agent.json"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["schema"] == "agentctl-session/v2"
+    assert stored["launch"]["schema"] == "agentctl-launch/v1"
+    assert stored["launch"]["argv"] == [
+        "codex", "--no-alt-screen", "--model", "model-a", "--literal",
+    ]
+    for duplicate in (
+        "harness", "cwd", "adapter", "mode", "backend", "model", "resume",
+        "arguments", "launch_argv", "launch_executable", "runtime_home",
+        "runtime_ownership", "runner_pid", "runner_started_at",
+    ):
+        assert duplicate not in stored
+    assert manager.get("worker").arguments == started["arguments"]
+
+
+def test_agent_record_v1_migrates_once_and_refuses_conflicting_argument_authorities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    legacy = manager.get("worker").to_document()
+    legacy["launch_argv"] = []
+    legacy["arguments"] = ["--no-alt-screen", "--literal"]
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert manager.get("worker").launch_argv == [
+        "codex", "--no-alt-screen", "--literal",
+    ]
+    manager.pause("worker")
+    migrated = json.loads(path.read_text(encoding="utf-8"))
+    assert migrated["schema"] == "agentctl-session/v2"
+    assert migrated["launch"]["argv"] == [
+        "codex", "--no-alt-screen", "--literal",
+    ]
+
+    conflicting = manager.get("worker").to_document()
+    conflicting["arguments"] = ["--different"]
+    path.write_text(json.dumps(conflicting), encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="contradictory launch arguments"):
+        manager.get("worker")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("adapter", "turn-runner"),
+        ("mode", "headless"),
+        ("backend", "tmux"),
+        ("runtime_ownership", "foreign"),
+    ],
+)
+def test_agent_record_v2_refuses_crossed_launch_dimensions(
+    field: str, value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    path = manager.registry / "worker" / "agent.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["launch"][field] = value
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="inconsistent"):
+        manager.get("worker")
+
+
 def test_malformed_custom_process_identities_are_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -922,7 +1016,10 @@ def test_malformed_custom_process_identities_are_rejected(
         ("pane_id", None),
     ):
         variant = json.loads(json.dumps(original))
-        variant[record_field] = record_value
+        if record_field in ("adapter", "harness"):
+            variant["launch"][record_field] = record_value
+        else:
+            variant[record_field] = record_value
         variants.append(variant)
 
     for document in variants:

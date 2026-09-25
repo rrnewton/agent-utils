@@ -56,6 +56,8 @@ _MAX_SNAPSHOT_BYTES = 16 << 20
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _HEALTH_SCHEMA = "agentctl-health/v1"
 _HEALTH_PROBE_SECONDS = 60.0
+_SESSION_STORAGE_SCHEMA = "agentctl-session/v2"
+_LAUNCH_SPEC_SCHEMA = "agentctl-launch/v1"
 
 
 def _rename_directory_noreplace_at(
@@ -193,6 +195,53 @@ def environment_entries(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(entries)
 
 
+@dataclass(frozen=True)
+class LaunchSpec:
+    """Canonical durable launch intent; argv is the sole argument authority."""
+
+    harness: str
+    cwd: str
+    adapter: str
+    mode: str
+    backend: str
+    model: str | None
+    resume: str | None
+    profile: str | None
+    argv: tuple[str, ...]
+    environment_names: tuple[str, ...]
+    runtime_home: str | None
+    runtime_ownership: str
+    executable: tuple[str, int, int] | None
+
+    @property
+    def arguments(self) -> list[str]:
+        """Derive harness arguments from the one canonical argv vector."""
+        return list(self.argv[1:]) if self.argv else []
+
+    def to_document(self) -> dict[str, object]:
+        executable: dict[str, object] | None = None
+        if self.executable is not None:
+            path, device, inode = self.executable
+            executable = {"path": path, "device": device, "inode": inode}
+        document: dict[str, object] = {
+            "schema": _LAUNCH_SPEC_SCHEMA,
+            "harness": self.harness,
+            "cwd": self.cwd,
+            "adapter": self.adapter,
+            "mode": self.mode,
+            "backend": self.backend,
+            "model": self.model,
+            "resume": self.resume,
+            "profile": self.profile,
+            "argv": list(self.argv),
+            "environment_names": list(self.environment_names),
+            "runtime_home": self.runtime_home,
+            "runtime_ownership": self.runtime_ownership,
+            "executable": executable,
+        }
+        return document
+
+
 @dataclass
 class AgentRecord:
     """Versioned launch identity for managed interactive agents."""
@@ -210,7 +259,6 @@ class AgentRecord:
     session_value: str | None = None
     model: str | None = None
     resume: str | None = None
-    arguments: list[str] = field(default_factory=list)
     startup_warning: str | None = None
     effective_reasoning_effort: str | None = None
     error: str | None = None
@@ -240,14 +288,140 @@ class AgentRecord:
     runner_identity: CustomProcessIdentity | None = None
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
+    def launch_spec(self) -> LaunchSpec:
+        """Return normalized launch intent without a second argument vector."""
+        ownership = self.runtime_ownership or (
+            "foreign" if self.adapter == "herdr-foreign" else "owned"
+        )
+        argv = tuple(self.launch_argv)
+        if not argv and self.adapter != "herdr-foreign":
+            argv = (self.harness,)
+        executable: tuple[str, int, int] | None = None
+        if self.launch_executable is not None:
+            if self.launch_executable_device is None or self.launch_executable_inode is None:
+                raise AgentDeliveryError("incomplete launch executable identity")
+            executable = (
+                self.launch_executable,
+                self.launch_executable_device,
+                self.launch_executable_inode,
+            )
+        return LaunchSpec(
+            harness=self.harness, cwd=self.cwd, adapter=self.adapter,
+            mode=self.mode, backend=self.backend, model=self.model,
+            resume=self.resume, profile=self.launch_profile, argv=argv,
+            environment_names=tuple(self.launch_environment_names),
+            runtime_home=self.runtime_home, runtime_ownership=ownership,
+            executable=executable,
+        )
+
+    @property
+    def arguments(self) -> list[str]:
+        """Compatibility view derived from the canonical launch vector."""
+        return self.launch_spec().arguments
+
     def to_document(self) -> dict[str, object]:
-        """Preserve unrecognized fields alongside the known schema, never in a wrapper."""
+        """Return the stable public compatibility view."""
         document = asdict(self)
         document.pop("_unknown")
+        document["arguments"] = self.arguments
         if self._unknown.keys() & document.keys():
             raise AgentDeliveryError("unknown agent metadata conflicts with a known schema field")
         document.update(self._unknown)
         return document
+
+    def to_storage_document(self) -> dict[str, object]:
+        """Return the strict v2 durable schema with one canonical launch spec."""
+        # Reuse the public-view collision check before placing extensions into
+        # their dedicated namespace.
+        self.to_document()
+        launch = self.launch_spec()
+        if launch.argv:
+            expected_program = (
+                launch.executable[0] if launch.executable is not None else launch.harness
+            )
+            if launch.argv[0] != expected_program:
+                raise AgentDeliveryError("launch argv disagrees with its executable authority")
+        self._validate_runtime_shape(launch)
+        document: dict[str, object] = {
+            "schema": _SESSION_STORAGE_SCHEMA,
+            "name": self.name,
+            "token": self.token,
+            "created_at": self.created_at,
+            "lifecycle": self.lifecycle,
+            "launch": launch.to_document(),
+            "workspace_id": self.workspace_id,
+            "tab_id": self.tab_id,
+            "pane_id": self.pane_id,
+            "session_agent": self.session_agent,
+            "session_value": self.session_value,
+            "startup_warning": self.startup_warning,
+            "effective_reasoning_effort": self.effective_reasoning_effort,
+            "error": self.error,
+            "goal": self.goal,
+            "goal_delivery": self.goal_delivery,
+            "goal_session_id": self.goal_session_id,
+            "goal_command": self.goal_command,
+            "goal_messages": self.goal_messages,
+            "goal_message_id": self.goal_message_id,
+            "paused": self.paused,
+            "pane_reported_by_agentctl": self.pane_reported_by_agentctl,
+            "custom_process_identity": (
+                asdict(self.custom_process_identity)
+                if self.custom_process_identity is not None else None
+            ),
+            "foreign_shell_identity": (
+                asdict(self.foreign_shell_identity)
+                if self.foreign_shell_identity is not None else None
+            ),
+            "runner_identity": (
+                asdict(self.runner_identity) if self.runner_identity is not None else None
+            ),
+            "extensions": dict(self._unknown),
+        }
+        # Validate the serialized form itself so in-memory callers cannot
+        # publish a state that only a later reader would reject.
+        self._from_value(document, Path("<in-memory>"), self.name)
+        return document
+
+    def _validate_runtime_shape(self, launch: LaunchSpec) -> None:
+        if self.lifecycle not in {
+            "starting", "running", "stopping", "stopped", "launch_failed", "adopt_failed",
+        }:
+            raise AgentDeliveryError(f"invalid lifecycle {self.lifecycle!r}")
+        if launch.adapter == "turn-runner":
+            valid = (
+                launch.mode == "headless"
+                and launch.backend in ("herdr", "tmux")
+                and launch.runtime_ownership == "owned"
+                and launch.runtime_home is not None
+                and Path(launch.runtime_home).is_absolute()
+                and self.custom_process_identity is None
+                and self.foreign_shell_identity is None
+            )
+        else:
+            valid = (
+                launch.adapter in ("herdr", "herdr-pane", "herdr-foreign")
+                and launch.mode == "interactive"
+                and launch.backend == "herdr"
+                and launch.runtime_home is None
+                and self.runner_identity is None
+                and self.runner_pid is None
+                and self.runner_started_at is None
+            )
+            if launch.adapter == "herdr":
+                valid = valid and launch.runtime_ownership == "owned"
+                valid = valid and self.custom_process_identity is None
+                valid = valid and self.foreign_shell_identity is None
+            elif launch.adapter == "herdr-pane":
+                valid = valid and launch.runtime_ownership == "owned" and launch.harness == "muse"
+                valid = valid and self.foreign_shell_identity is None
+            else:
+                valid = valid and launch.runtime_ownership == "foreign"
+                valid = valid and self.custom_process_identity is None
+        if not valid:
+            raise AgentDeliveryError(
+                "adapter, mode, backend, ownership, and runtime identity are inconsistent"
+            )
 
     @classmethod
     def load(cls, path: Path, name: str) -> AgentRecord:
@@ -263,7 +437,7 @@ class AgentRecord:
         """Validate an already identity-bound record value."""
         if not isinstance(value, dict):
             raise AgentDeliveryError(f"invalid agent record: {path}")
-        document = cast(dict[str, object], value)
+        document = cls._normalize_storage_value(cast(dict[str, object], value), path)
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
@@ -423,8 +597,105 @@ class AgentRecord:
         if home is not None and (not isinstance(home, str) or not Path(home).is_absolute()):
             raise AgentDeliveryError(f"invalid runtime directory in {path}")
         record = cls(**fields)  # type: ignore[arg-type]
-        record._unknown = {key: value for key, value in document.items() if key not in known}
+        record._unknown = {
+            key: value for key, value in document.items()
+            if key not in known and key != "arguments"
+        }
+        record._validate_runtime_shape(record.launch_spec())
         return record
+
+    @classmethod
+    def _normalize_storage_value(
+        cls, document: dict[str, object], path: Path,
+    ) -> dict[str, object]:
+        """Translate v2 storage or one legacy v1 row into the in-memory view."""
+        if document.get("schema") == _SESSION_STORAGE_SCHEMA:
+            top_fields = {
+                "schema", "name", "token", "created_at", "lifecycle", "launch",
+                "workspace_id", "tab_id", "pane_id", "session_agent", "session_value",
+                "startup_warning", "effective_reasoning_effort", "error", "goal",
+                "goal_delivery", "goal_session_id", "goal_command", "goal_messages",
+                "goal_message_id", "paused", "pane_reported_by_agentctl",
+                "custom_process_identity", "foreign_shell_identity", "runner_identity",
+                "extensions",
+            }
+            if set(document) != top_fields:
+                raise AgentDeliveryError(f"invalid agent record v2 fields: {path}")
+            launch_value = document.get("launch")
+            if not isinstance(launch_value, dict):
+                raise AgentDeliveryError(f"invalid agent record launch specification: {path}")
+            launch = cast(dict[str, object], launch_value)
+            launch_fields = {
+                "schema", "harness", "cwd", "adapter", "mode", "backend", "model",
+                "resume", "profile", "argv", "environment_names", "runtime_home",
+                "runtime_ownership", "executable",
+            }
+            if set(launch) != launch_fields or launch.get("schema") != _LAUNCH_SPEC_SCHEMA:
+                raise AgentDeliveryError(f"invalid agent record launch fields: {path}")
+            extensions = document.get("extensions")
+            if not isinstance(extensions, dict) or any(
+                not isinstance(key, str) or key in top_fields or key in launch_fields
+                for key in extensions
+            ):
+                raise AgentDeliveryError(f"invalid agent record extensions: {path}")
+            executable_value = launch.get("executable")
+            if executable_value is None:
+                executable: dict[str, object] = {}
+            elif (isinstance(executable_value, dict)
+                    and set(executable_value) == {"path", "device", "inode"}):
+                executable = cast(dict[str, object], executable_value)
+            else:
+                raise AgentDeliveryError(f"invalid agent record launch executable identity: {path}")
+            argv = launch.get("argv")
+            if not isinstance(argv, list):
+                raise AgentDeliveryError(f"invalid agent record launch argv: {path}")
+            normalized = {
+                key: value for key, value in document.items()
+                if key not in {"schema", "launch", "extensions"}
+            }
+            normalized.update({
+                "schema": 1,
+                "harness": launch.get("harness"),
+                "cwd": launch.get("cwd"),
+                "adapter": launch.get("adapter"),
+                "mode": launch.get("mode"),
+                "backend": launch.get("backend"),
+                "model": launch.get("model"),
+                "resume": launch.get("resume"),
+                "launch_profile": launch.get("profile"),
+                "launch_argv": argv,
+                "arguments": list(argv[1:]),
+                "launch_environment_names": launch.get("environment_names"),
+                "runtime_home": launch.get("runtime_home"),
+                "runtime_ownership": launch.get("runtime_ownership"),
+                "launch_executable": executable.get("path"),
+                "launch_executable_device": executable.get("device"),
+                "launch_executable_inode": executable.get("inode"),
+            })
+            normalized.update(cast(dict[str, object], extensions))
+            return normalized
+
+        if document.get("schema") != 1 or isinstance(document.get("schema"), bool):
+            raise AgentDeliveryError(f"invalid agent record schema: {path}")
+        normalized = dict(document)
+        args = normalized.get("arguments")
+        argv = normalized.get("launch_argv", [])
+        if not isinstance(args, list) or not isinstance(argv, list):
+            return normalized
+        if argv:
+            if args and args != argv[1:]:
+                raise AgentDeliveryError(f"contradictory launch arguments in {path}")
+            normalized["arguments"] = list(argv[1:])
+        elif args:
+            program = normalized.get("launch_executable") or normalized.get("harness")
+            if isinstance(program, str) and program:
+                normalized["launch_argv"] = [program, *args]
+        if normalized.get("runtime_ownership") is None:
+            normalized["runtime_ownership"] = (
+                "foreign" if normalized.get("adapter", "herdr") == "herdr-foreign"
+                else "owned"
+            )
+        return normalized
 
     def target(self) -> agent.Target:
         """Pin the exact pane and, when available at launch, its durable session."""
@@ -631,7 +902,11 @@ class _WorkspaceClient:
                     pane_id=info.pane_id,
                     workspace_id=info.workspace_id,
                     cwd=info.cwd,
-                    agent=info.agent,
+                    # Herdr's native agent label is advisory for custom
+                    # harnesses. Exact executable/process identity above is
+                    # the ownership proof and can safely bridge a delayed or
+                    # lost report-agent update.
+                    agent=self.record.harness,
                     status="idle" if muse_idle_composer(screen) else "working",
                     session_agent=info.session_agent,
                     session_value=info.session_value,
@@ -1028,10 +1303,10 @@ class ManagedAgents:
             ) from exc
         if not isinstance(document, dict):
             raise AgentDeliveryError(f"invalid legacy agent record: {path}")
-        if "foreign_shell_identity" in document:
+        if document.get("schema") != 1 or "foreign_shell_identity" in document:
             raise AgentDeliveryError(
                 "--recover-legacy-adoption requires foreign_shell_identity to be absent, "
-                "not null or populated"
+                "not null or populated, in a v1 record"
             )
         record = AgentRecord._from_value(document, path, name)
         if record.token != expected_token or digest != expected_digest:
@@ -1081,7 +1356,10 @@ class ManagedAgents:
             os.close(descriptor)
 
     def _save(self, record: AgentRecord) -> None:
-        agent._atomic_json(str(self._directory(record.name) / "agent.json"), record.to_document())
+        agent._atomic_json(
+            str(self._directory(record.name) / "agent.json"),
+            record.to_storage_document(),
+        )
 
     def _queue(self, name: str) -> str:
         return str(self._directory(name) / "queue")
@@ -1164,7 +1442,7 @@ class ManagedAgents:
                 directory.mkdir(mode=0o700)
                 agent._fsync_dir(str(self.registry))
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(),
-                                     model=model, resume=resume, arguments=list(arguments),
+                                     model=model, resume=resume,
                                      adapter="herdr-pane" if harness == "muse" else "herdr",
                                      launch_profile=launch_profile,
                                      launch_argv=[harness, *arguments],
@@ -1541,7 +1819,7 @@ class ManagedAgents:
         agent._fsync_dir(str(self.registry))
         record.lifecycle = "adopt_failed"
         record.error = error
-        agent._atomic_json(str(destination / "agent.json"), record.to_document())
+        agent._atomic_json(str(destination / "agent.json"), record.to_storage_document())
         return destination
 
     def _create_presentation(
@@ -2025,6 +2303,51 @@ class ManagedAgents:
         return self.health_snapshot(
             names, checked_at=checked_at, deadline=deadline,
         )[0]
+
+    @staticmethod
+    def _status_with_health(
+        observation: dict[str, object], status: dict[str, object] | None,
+    ) -> dict[str, object]:
+        """Render status and health from one probe without a second lookup."""
+        if status is None:
+            status = {
+                "name": observation.get("name"),
+                "token": observation.get("token"),
+                "lifecycle": observation.get("lifecycle"),
+                "agent_status": observation.get("agent_status"),
+                "probe_error": observation.get("probe_error"),
+            }
+        else:
+            status = dict(status)
+        status.update({
+            "health": observation.get("health"),
+            "runtime_state": observation.get("runtime_state"),
+            "health_reason_code": observation.get("reason_code"),
+            "health_reason": observation.get("reason"),
+            "health_first_detected_at": observation.get("first_detected_at"),
+            "health_last_checked_at": observation.get("last_checked_at"),
+            "health_recorded": observation.get("recorded"),
+            "health_record_path": observation.get("record_path"),
+        })
+        return status
+
+    def status_with_health(self, name: str) -> tuple[dict[str, object], bool]:
+        """Return the canonical status payload and exit verdict from one probe."""
+        observation, status = self.status_health_snapshot(name)
+        return self._status_with_health(observation, status), observation.get("health") == "healthy"
+
+    def list_with_health(self) -> tuple[list[dict[str, object]], bool]:
+        """Return the canonical list payload and aggregate exit verdict."""
+        aggregate, statuses = self.health_snapshot(())
+        observations = aggregate.get("sessions")
+        if not isinstance(observations, list):
+            raise AgentDeliveryError("health snapshot has no session list")
+        rows = [
+            self._status_with_health(observation, status)
+            for observation, status in zip(observations, statuses, strict=True)
+            if isinstance(observation, dict)
+        ]
+        return rows, aggregate.get("healthy") is True
 
     def list(self) -> list[dict[str, object]]:
         """List every registered agent; unavailable Herdr is not evidence of death."""
@@ -3169,7 +3492,7 @@ class ManagedAgents:
                 "runtime identity changed before close"
             )
         final.lifecycle = "stopped"
-        stopped_bytes = agent._json_text(final.to_document()).encode("utf-8")
+        stopped_bytes = agent._json_text(final.to_storage_document()).encode("utf-8")
         if len(stopped_bytes) > _MAX_AGENT_RECORD_BYTES:
             raise AgentDeliveryError(
                 f"refusing stopped agent record larger than {_MAX_AGENT_RECORD_BYTES} bytes"

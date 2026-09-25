@@ -108,22 +108,31 @@ def test_legacy_registry_writer_cannot_enable_bypass_on_a_native_worker(
 ) -> None:
     rec = _tui_record("native-worker", fake_backend_state)
     rec.mode = lib.HEADLESS_MODE
+    rec.presentation_pane = None
     rec.codex_bypass_permissions = False
     with lib.registry_lock() as agents:
         agents[rec.name] = rec
+    permission_path = lib._permission_policy_path(rec.name)
+    permission_path.parent.mkdir(parents=True, exist_ok=True)
+    permission_path.write_text(json.dumps({
+        "name": rec.name, "created_at": rec.created_at,
+        "codex_bypass_permissions": False,
+    }))
     original_rows = json.loads(lib.REGISTRY.read_text())
     for row in original_rows:
+        row.pop("schema")
         row.pop("codex_bypass_permissions")
     # A still-running pre-upgrade process serializes only fields it knows.
     lib.REGISTRY.write_text(json.dumps(original_rows))
     monkeypatch.setenv("SUBAGENTS_CODEX_BYPASS_PERMISSIONS", "1")
     restored = lib.read_registry()[rec.name]
     assert restored.codex_bypass_permissions is False
+    assert not permission_path.exists()
+    assert json.loads(lib.REGISTRY.read_text())[0]["schema"] == lib.RUNTIME_RECORD_SCHEMA
     argv = agent_runner._build_codex_argv(restored, lib.Message(0, "next task", None, lib.now_iso()))
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
-    lib._permission_policy_path(rec.name).write_text("invalid sidecar")
-    with pytest.raises(lib.AgentOperationError, match="cannot read worker permissions"):
-        lib.read_registry()
+    permission_path.write_text("invalid sidecar")
+    assert lib.read_registry()[rec.name].codex_bypass_permissions is False
 
 
 def test_auto_detection_requires_herdr_environment_socket_and_live_server(
@@ -399,11 +408,7 @@ def test_runner_identity_liveness_is_exact_and_tristate(
         return observation
 
     monkeypatch.setattr(lib, "_read_process_state_start", read)
-    monkeypatch.setattr(
-        lib.SharedHerdrClient,
-        "_process_identity",
-        staticmethod(lambda _pid: (identity, identity.pid)),
-    )
+    monkeypatch.setattr(lib, "capture_process_identity", lambda _pid: identity)
     assert lib.runner_liveness(record) is expected
 
 
@@ -749,8 +754,10 @@ def test_workspace_death_is_loud_and_preserves_recovery_snapshot(
     rec.session_id = "session-to-recover"
     rec.runner_pid = 999_990
     rec.runner_started_at = "stale"
-    with lib.registry_lock() as agents:
-        agents[name] = rec
+    legacy = rec.to_public_dict()
+    legacy.pop("owner_token")
+    lib.REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    lib.REGISTRY.write_text(json.dumps([legacy]))
     monkeypatch.setattr(lib, "_herdr_workspace_exists", lambda workspace_id: False)
 
     notes = lib.gc()
@@ -952,6 +959,54 @@ def test_old_server_rewrite_preserves_herdr_identity_through_tab_target() -> Non
     assert record.backend == "herdr"
 
 
+def test_current_runtime_record_has_one_tagged_process_identity_authority(
+    fake_backend_state: Path,
+) -> None:
+    record = _tui_record("runtime-schema", fake_backend_state)
+    record.mode = lib.HEADLESS_MODE
+    record.backend = "tmux"
+    record.tmux_target = "subagents:runtime-schema"
+    record.presentation_pane = None
+    document = record.to_dict()
+
+    assert document["schema"] == lib.RUNTIME_RECORD_SCHEMA
+    assert "runner_pid" not in document
+    assert "runner_started_at" not in document
+    assert isinstance(document["runner_identity"], dict)
+    assert lib.AgentRecord.from_dict(document).runner_identity == record.runner_identity
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("next_seq", True),
+        ("status", "stopped"),
+        ("harness", 7),
+        ("presentation_pane", "wT:p9"),
+    ],
+)
+def test_current_runtime_record_rejects_wrong_types_and_crossed_dimensions(
+    fake_backend_state: Path, field: str, value: object,
+) -> None:
+    record = _tui_record("runtime-invalid", fake_backend_state)
+    record.mode = lib.HEADLESS_MODE
+    record.backend = "tmux"
+    record.tmux_target = "subagents:runtime-invalid"
+    record.presentation_pane = None
+    document = record.to_dict()
+    document[field] = value
+
+    with pytest.raises(SystemExit):
+        lib.AgentRecord.from_dict(document)
+
+
+def test_current_runtime_record_rejects_unknown_fields(fake_backend_state: Path) -> None:
+    document = _tui_record("runtime-extra", fake_backend_state).to_dict()
+    document["retired_writer_field"] = True
+    with pytest.raises(SystemExit):
+        lib.AgentRecord.from_dict(document)
+
+
 def test_old_server_rewrite_recovers_tui_mode_and_pane_from_durable_identity(
     fake_backend_state: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -964,7 +1019,12 @@ def test_old_server_rewrite_recovers_tui_mode_and_pane_from_durable_identity(
     with lib.registry_lock() as agents:
         agents[name] = original
 
-    stripped = original.to_dict()
+    lib.presentation_identity_path(name).write_text(json.dumps({
+        "name": original.name, "created_at": original.created_at,
+        "backend": original.backend, "tmux_target": original.tmux_target,
+        "mode": original.mode, "presentation_pane": original.presentation_pane,
+    }))
+    stripped = original.to_public_dict()
     for key in ("backend", "mode", "presentation_pane"):
         del stripped[key]
     lib.REGISTRY.write_text(json.dumps([stripped]) + "\n")
@@ -973,8 +1033,9 @@ def test_old_server_rewrite_recovers_tui_mode_and_pane_from_durable_identity(
     assert recovered.backend == "herdr"
     assert recovered.mode == lib.TUI_MODE
     assert recovered.presentation_pane == "wT:p2"
-    assert lib.presentation_identity_path(name).exists()
+    assert not lib.presentation_identity_path(name).exists()
     repaired = json.loads(lib.REGISTRY.read_text())[0]
+    assert repaired["schema"] == lib.RUNTIME_RECORD_SCHEMA
     assert repaired["backend"] == "herdr"
     assert repaired["mode"] == lib.TUI_MODE
     assert repaired["presentation_pane"] == "wT:p2"
@@ -1006,7 +1067,12 @@ def test_stale_presentation_identity_does_not_apply_to_reused_name(
     with lib.registry_lock() as agents:
         agents[name] = original
 
-    stale_row = original.to_dict()
+    lib.presentation_identity_path(name).write_text(json.dumps({
+        "name": original.name, "created_at": original.created_at,
+        "backend": original.backend, "tmux_target": original.tmux_target,
+        "mode": original.mode, "presentation_pane": original.presentation_pane,
+    }))
+    stale_row = original.to_public_dict()
     stale_row["created_at"] = "2026-07-13T00:00:00+00:00"
     for key in ("backend", "mode", "presentation_pane"):
         del stale_row[key]

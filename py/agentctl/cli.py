@@ -247,32 +247,6 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
     return [str(item) for item in value]
 
 
-def _status_with_health(
-    observation: dict[str, object], status: dict[str, object] | None,
-) -> dict[str, object]:
-    """Retain the status schema while adding a machine-actionable live verdict."""
-    name = str(observation["name"])
-    if status is None:
-        status = {
-            "name": name,
-            "token": observation.get("token"),
-            "lifecycle": observation.get("lifecycle"),
-            "agent_status": observation.get("agent_status"),
-            "probe_error": observation.get("probe_error"),
-        }
-    status.update({
-        "health": observation.get("health"),
-        "runtime_state": observation.get("runtime_state"),
-        "health_reason_code": observation.get("reason_code"),
-        "health_reason": observation.get("reason"),
-        "health_first_detected_at": observation.get("first_detected_at"),
-        "health_last_checked_at": observation.get("last_checked_at"),
-        "health_recorded": observation.get("recorded"),
-        "health_record_path": observation.get("record_path"),
-    })
-    return status
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the unified interface with explicit outcome exit statuses."""
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -392,21 +366,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 name, expected_token=args.expected_token, expected_pid=args.expected_pid,
             )
         elif args.command == "list":
-            aggregate, statuses = sessions.health_snapshot(())
-            observations = aggregate["sessions"]
-            assert isinstance(observations, list)
-            rows = [
-                _status_with_health(observation, status)
-                for observation, status in zip(observations, statuses, strict=True)
-                if isinstance(observation, dict)
-            ]
+            rows, healthy = sessions.list_with_health()
             print(json.dumps(rows, indent=2, sort_keys=True))
-            return 0 if aggregate["healthy"] else 1
+            return 0 if healthy else 1
         elif args.command == "status":
-            observation, status = sessions.status_health_snapshot(name)
-            result = _status_with_health(observation, status)
+            result, healthy = sessions.status_with_health(name)
             print(json.dumps(result, indent=2, sort_keys=True))
-            return 0 if observation["health"] == "healthy" else 1
+            return 0 if healthy else 1
         elif args.command == "health":
             deadline = time.monotonic() + args.watch
             polls = 0

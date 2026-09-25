@@ -696,35 +696,6 @@ fn write_json(value: &impl Serialize) -> io::Result<()> {
     output.write_all(b"\n")
 }
 
-fn status_with_health(
-    observation: &serde_json::Value,
-    status: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let name = observation["name"].as_str().unwrap_or_default();
-    let mut status = status.cloned().unwrap_or_else(|| {
-        json!({
-            "name": name,
-            "token": observation["token"],
-            "lifecycle": observation["lifecycle"],
-            "agent_status": observation["agent_status"],
-            "probe_error": observation["probe_error"],
-        })
-    });
-    for (destination, source) in [
-        ("health", "health"),
-        ("runtime_state", "runtime_state"),
-        ("health_reason_code", "reason_code"),
-        ("health_reason", "reason"),
-        ("health_first_detected_at", "first_detected_at"),
-        ("health_last_checked_at", "last_checked_at"),
-        ("health_recorded", "recorded"),
-        ("health_record_path", "record_path"),
-    ] {
-        status[destination] = observation[source].clone();
-    }
-    status
-}
-
 fn plugin_discovery_required(command: &Commands) -> bool {
     matches!(command, Commands::Capabilities)
 }
@@ -927,25 +898,15 @@ fn run(args: Cli) -> Result<i32, Failure> {
             )?
         }
         Commands::List => {
-            let (aggregate, statuses) = manager.health_snapshot(&[]);
-            let rows = aggregate["sessions"]
-                .as_array()
-                .expect("health sessions array")
-                .iter()
-                .zip(statuses.iter())
-                .map(|(observation, status)| status_with_health(observation, status.as_ref()))
-                .collect::<Vec<_>>();
-            let healthy = aggregate["healthy"] == true;
+            let (rows, healthy) = manager.list_with_health();
             let mut result = json!(rows);
             add_capabilities(&mut result);
             write_json(&result).map_err(Failure::Output)?;
             return Ok(if healthy { 0 } else { 1 });
         }
         Commands::Status(value) => {
-            let (observation, status) = manager.status_health_snapshot(&value.name)?;
-            let mut result = status_with_health(&observation, status.as_ref());
+            let (mut result, healthy) = manager.status_with_health(&value.name)?;
             add_capabilities(&mut result);
-            let healthy = observation["health"] == "healthy";
             write_json(&result).map_err(Failure::Output)?;
             return Ok(if healthy { 0 } else { 1 });
         }

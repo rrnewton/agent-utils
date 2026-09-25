@@ -2,8 +2,8 @@
 """Portable persistent-worker registry, queues, and presentation lifecycle.
 
 State lives below HERDR_SUBAGENTS_HOME, independently of the installed package.
-The runner PID and its start time identify a headless worker; presentation can
-be repaired without discarding its durable conversation. Registry updates are
+A boot-bound process identity identifies a headless worker; presentation can be
+repaired without discarding its durable conversation. Registry updates are
 serialized by flock. Consumer scheduling and quota rules enter only through
 an explicitly configured policy; they are not discovered from the filesystem.
 """
@@ -65,6 +65,7 @@ SUPPORTED_BACKENDS: tuple[str, ...] = ("tmux", "herdr")
 HEADLESS_MODE: str = "headless"
 TUI_MODE: str = "tui"
 SUPPORTED_MODES: tuple[str, ...] = (HEADLESS_MODE, TUI_MODE)
+RUNTIME_RECORD_SCHEMA: str = "agentctl-runtime/v2"
 CODEX_BIN: str = os.environ.get("CODEX_BIN", "codex")
 AGY_BIN: str = os.environ.get("AGY_BIN", "agy")
 MUSE_BIN: str = os.environ.get("MUSE_BIN", "muse")
@@ -122,6 +123,9 @@ STARTUP_GRACE_S: int = 20
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _HERDR_TAB_ID_RE = re.compile(r"^w[^:]+:t[0-9]+$")
+_BOOT_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+)
 
 
 class AgentOperationError(Exception):
@@ -209,6 +213,34 @@ def require_supported_mode(mode: str) -> str:
             f"unsupported agent mode {mode!r}; supported modes: {', '.join(SUPPORTED_MODES)}",
         )
     return mode
+
+
+def _process_identity_from_value(value: object, label: str) -> CustomProcessIdentity:
+    """Decode the one strict boot-bound process identity representation."""
+    fields = {f.name for f in dataclasses.fields(CustomProcessIdentity)}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise AgentOperationError("invalid_process_identity", f"{label} has invalid fields")
+    raw = cast(dict[str, object], value)
+    integer_fields = (
+        "version", "pid", "starttime_ticks", "executable_device", "executable_inode",
+    )
+    if (any(type(raw[field]) is not int for field in integer_fields)
+            or raw["version"] != 1
+            or not isinstance(raw["boot_id"], str)
+            or _BOOT_ID_RE.fullmatch(raw["boot_id"]) is None
+            or not 1 <= cast(int, raw["pid"]) <= 2_147_483_647
+            or not 1 <= cast(int, raw["starttime_ticks"])
+            or not 1 <= cast(int, raw["executable_device"])
+            or not 1 <= cast(int, raw["executable_inode"])):
+        raise AgentOperationError("invalid_process_identity", f"{label} has invalid values")
+    return CustomProcessIdentity(
+        version=1,
+        boot_id=raw["boot_id"],
+        pid=cast(int, raw["pid"]),
+        starttime_ticks=cast(int, raw["starttime_ticks"]),
+        executable_device=cast(int, raw["executable_device"]),
+        executable_inode=cast(int, raw["executable_inode"]),
+    )
 
 
 def _load_backend_config() -> dict[str, object]:
@@ -436,7 +468,9 @@ class AgentRecord:
     # Generation token issued by the canonical outer agentctl registry. Direct
     # users receive a locally generated token. Every private worker RPC is
     # bound to this value before it may observe or mutate runtime state.
-    owner_token: Optional[str] = None
+    owner_token: Optional[str] = dataclasses.field(
+        default_factory=lambda: secrets.token_hex(16)
+    )
     # New rows use the complete boot-bound identity.  The two scalar fields
     # above are accepted only while loading legacy rows and are not emitted
     # when this field is present.
@@ -444,8 +478,29 @@ class AgentRecord:
 
     @staticmethod
     def from_dict(d: dict[str, object]) -> "AgentRecord":
-        """Load a worker record, restoring omitted presentation fields from preserved identity metadata."""
+        """Load a strict current row or normalize one supported legacy row."""
         fields = {f.name for f in dataclasses.fields(AgentRecord)}
+        schema = d.get("schema")
+        current = schema == RUNTIME_RECORD_SCHEMA
+        if schema is not None and not current:
+            die("registry row has an unsupported schema")
+        if current:
+            expected = (fields - {"runner_pid", "runner_started_at"}) | {"schema"}
+            if set(d) != expected:
+                die(f"registry row for {d.get('name')!r} has invalid v2 fields")
+            required_strings = (
+                "name", "harness", "backend", "tmux_target", "cwd", "status",
+                "created_at", "mode", "owner_token",
+            )
+            if any(not isinstance(d[field], str) or not d[field] for field in required_strings):
+                die("registry row has an invalid v2 string field")
+            for field in ("model", "session_id", "last_turn_at", "presentation_pane"):
+                if d[field] is not None and (not isinstance(d[field], str) or not d[field]):
+                    die(f"registry row has invalid {field}")
+            if type(d["next_seq"]) is not int or d["next_seq"] < 0:
+                die("registry row has invalid next_seq")
+            if type(d["codex_bypass_permissions"]) is not bool:
+                die("registry row has invalid codex_bypass_permissions")
         missing = fields - set(d) - {
             "runner_pid", "runner_started_at", "runner_identity", "backend", "mode",
             "presentation_pane", "codex_bypass_permissions", "harness_args",
@@ -453,7 +508,7 @@ class AgentRecord:
         }
         if missing:
             die(f"registry row for {d.get('name')!r} missing keys: {sorted(missing)}")
-        preserved = _load_presentation_identity(d)
+        preserved = None if current else _load_presentation_identity(d)
         raw_backend = d.get("backend")
         raw_mode = d.get("mode")
         raw_pane = d.get("presentation_pane")
@@ -470,7 +525,12 @@ class AgentRecord:
             if raw_pane is not None
             else (preserved.presentation_pane if preserved is not None and mode == TUI_MODE else None)
         )
-        bypass = _load_codex_permission_policy(d)
+        bypass = (
+            d.get("codex_bypass_permissions")
+            if current else _load_codex_permission_policy(d)
+        )
+        if not isinstance(bypass, bool):
+            die("registry row has invalid codex_bypass_permissions")
         raw_harness_args = d.get("harness_args", [])
         if not isinstance(raw_harness_args, list) or any(
             not isinstance(item, str) or not item or "\0" in item for item in raw_harness_args
@@ -479,17 +539,12 @@ class AgentRecord:
         raw_identity = d.get("runner_identity")
         runner_identity: Optional[CustomProcessIdentity] = None
         if raw_identity is not None:
-            if not isinstance(raw_identity, dict):
-                die("registry row has invalid runner_identity")
             try:
-                runner_identity = CustomProcessIdentity(**raw_identity)
-            except (TypeError, ValueError):
-                die("registry row has invalid runner_identity")
-            if (runner_identity.version != 1 or runner_identity.pid <= 0
-                    or runner_identity.starttime_ticks <= 0
-                    or runner_identity.executable_device <= 0
-                    or runner_identity.executable_inode <= 0):
-                die("registry row has invalid runner_identity")
+                runner_identity = _process_identity_from_value(
+                    raw_identity, "registry runner identity",
+                )
+            except AgentOperationError as exc:
+                die(str(exc))
         legacy_pid = None if d.get("runner_pid") is None else int(str(d["runner_pid"]))
         legacy_started = None if d.get("runner_started_at") is None else str(d["runner_started_at"])
         if runner_identity is not None:
@@ -516,15 +571,42 @@ class AgentRecord:
             or re.fullmatch(r"[a-z0-9-]{1,80}", owner_token) is None
         ):
             die("registry row has invalid owner_token")
+        if current and owner_token is None:
+            die("registry row has no owner_token")
+        harness = str(d["harness"])
+        status = str(d["status"])
+        if current:
+            try:
+                require_valid_name(str(d["name"]))
+                require_supported_harness(harness)
+                require_supported_backend(backend)
+            except AgentOperationError as exc:
+                die(str(exc))
+            if status not in {
+                "starting", "idle", "busy", "error", "quota_exhausted",
+                "auth_error", "blocked", "unknown",
+            }:
+                die("registry row has invalid status")
+            if mode == TUI_MODE:
+                if backend != "herdr" or harness != "codex":
+                    die("TUI registry row has contradictory backend, harness, or presentation")
+                if not presentation_pane and status != "starting":
+                    die("non-starting TUI registry row has no presentation pane")
+                if runner_identity is not None:
+                    die("TUI registry row must not contain a headless runner identity")
+            elif presentation_pane is not None:
+                die("headless registry row must not contain a TUI presentation pane")
+            if bypass and harness != "codex":
+                die("non-Codex registry row cannot enable Codex permission bypass")
         return AgentRecord(
             name=str(d["name"]),
-            harness=str(d["harness"]),
+            harness=harness,
             backend=backend,
             tmux_target=str(d["tmux_target"]),
             cwd=str(d["cwd"]),
             model=(None if d["model"] is None else str(d["model"])),
             session_id=(None if d["session_id"] is None else str(d["session_id"])),
-            status=str(d["status"]),
+            status=status,
             runner_pid=legacy_pid,
             runner_started_at=legacy_started,
             next_seq=int(str(d["next_seq"])),
@@ -539,13 +621,36 @@ class AgentRecord:
         )
 
     def to_dict(self) -> dict[str, object]:
-        """Serialize this record into a JSON-compatible dictionary."""
-        document = dataclasses.asdict(self)
-        if self.runner_identity is not None:
-            document.pop("runner_pid", None)
-            document.pop("runner_started_at", None)
+        """Serialize the strict current runtime schema without scalar identity copies."""
+        if self.mode == TUI_MODE:
+            durable_identity = None
         else:
-            document.pop("runner_identity", None)
+            durable_identity = self.runner_identity
+        if durable_identity is None and self.runner_pid is not None and self.mode == HEADLESS_MODE:
+            try:
+                observed = capture_process_identity(self.runner_pid)
+            except AgentOperationError:
+                observed = None
+            if (observed is not None and self.runner_started_at is not None
+                    and str(observed.starttime_ticks) == self.runner_started_at):
+                durable_identity = observed
+                self.runner_identity = observed
+            elif runner_liveness(self) is ProcessLiveness.UNKNOWN:
+                raise AgentOperationError(
+                    "runner_identity_unknown",
+                    "refusing to persist a live or unverified runner without boot-bound identity",
+                )
+        document = dataclasses.asdict(self)
+        document.pop("runner_pid", None)
+        document.pop("runner_started_at", None)
+        document["harness_args"] = list(self.harness_args)
+        document["runner_identity"] = (
+            dataclasses.asdict(durable_identity) if durable_identity is not None else None
+        )
+        document["schema"] = RUNTIME_RECORD_SCHEMA
+        # Persist only documents accepted by the current reader. This keeps
+        # every writer behind the same schema and cross-field invariants.
+        AgentRecord.from_dict(document)
         return document
 
     def to_public_dict(self) -> dict[str, object]:
@@ -750,26 +855,6 @@ def _load_presentation_identity(row: dict[str, object]) -> Optional[Presentation
     return PresentationIdentity(backend=backend, mode=mode, presentation_pane=pane)
 
 
-def _save_presentation_identity(rec: AgentRecord) -> None:
-    """Atomically mirror a live TUI's presentation identity outside its row."""
-    path = presentation_identity_path(rec.name)
-    if rec.mode != TUI_MODE or rec.presentation_pane is None:
-        path.unlink(missing_ok=True)
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "name": rec.name,
-        "created_at": rec.created_at,
-        "backend": rec.backend,
-        "tmux_target": rec.tmux_target,
-        "mode": rec.mode,
-        "presentation_pane": rec.presentation_pane,
-    }
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n")
-    os.replace(tmp, path)
-
-
 def _permission_policy_path(name: str) -> Path:
     return STATE / name / "permissions.json"
 
@@ -796,16 +881,7 @@ def _load_codex_permission_policy(row: dict[str, object]) -> bool:
     return value
 
 
-def _save_codex_permission_policy(rec: AgentRecord) -> None:
-    path = _permission_policy_path(rec.name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"name": rec.name, "created_at": rec.created_at, "codex_bypass_permissions": rec.codex_bypass_permissions}
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload) + "\n")
-    os.replace(tmp, path)
-
-
-def _clear_presentation_identity(name: str) -> None:
+def _clear_legacy_sidecars(name: str) -> None:
     presentation_identity_path(name).unlink(missing_ok=True)
     _permission_policy_path(name).unlink(missing_ok=True)
 
@@ -825,7 +901,7 @@ def _load_unlocked() -> tuple[dict[str, AgentRecord], bool]:
     if not isinstance(raw, list):
         die(f"registry.json must be a JSON array, found {type(raw).__name__}")
     out: dict[str, AgentRecord] = {}
-    presentation_repair_needed = False
+    migration_needed = False
     for row in raw:
         if not isinstance(row, dict):
             die("registry.json rows must be JSON objects")
@@ -835,25 +911,30 @@ def _load_unlocked() -> tuple[dict[str, AgentRecord], bool]:
         # durable presentation identity rehydrates them above; record that the
         # registry itself needs repair so the next read makes the canonical row
         # whole again instead of leaving a live TUI stranded on disk.
-        if rec.mode == TUI_MODE and any(
-            row.get(field) != rec.to_dict()[field]
-            for field in ("backend", "mode", "presentation_pane")
+        if rec.owner_token is not None and (
+            row.get("schema") != RUNTIME_RECORD_SCHEMA
+            or (rec.mode == TUI_MODE and any(
+                row.get(field) != rec.to_dict()[field]
+                for field in ("backend", "mode", "presentation_pane")
+            ))
         ):
-            presentation_repair_needed = True
-    return out, presentation_repair_needed
+            migration_needed = True
+    return out, migration_needed
 
 
 def _save_unlocked(agents: dict[str, AgentRecord]) -> None:
-    # Write TUI identities before the registry. If the process crashes between
-    # the two writes, a headless row cannot match the newer Herdr tab and will
-    # not be misclassified; a TUI row is never published without its fallback.
     for rec in agents.values():
-        _save_presentation_identity(rec)
-        _save_codex_permission_policy(rec)
+        if rec.owner_token is None:
+            rec.owner_token = secrets.token_hex(16)
     payload = [agents[name].to_dict() for name in sorted(agents)]
     tmp = REGISTRY.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
     os.replace(tmp, REGISTRY)
+    # These were compatibility mirrors for writers predating the tagged row.
+    # Delete them only after the canonical registry replacement succeeds.
+    for rec in agents.values():
+        presentation_identity_path(rec.name).unlink(missing_ok=True)
+        _permission_policy_path(rec.name).unlink(missing_ok=True)
 
 
 @contextlib.contextmanager
@@ -876,26 +957,25 @@ def registry_lock() -> Iterator[dict[str, AgentRecord]]:
 
 
 def read_registry() -> dict[str, AgentRecord]:
-    """Read the registry and repair stripped live-TUI presentation fields."""
+    """Read the registry and migrate legacy rows under the registry lock."""
     BASE.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_SH)
-        agents, presentation_repair_needed = _load_unlocked()
+        agents, migration_needed = _load_unlocked()
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
-    if not presentation_repair_needed:
+    if not migration_needed:
         return agents
 
-    # Do not continuously rewrite ordinary status reads. Only take the
-    # exclusive lock when a sidecar proved that a legacy writer dropped a live
-    # TUI's mode or pane. Re-load while exclusive so a concurrent repair wins.
+    # Do not rewrite ordinary status reads. Take the exclusive lock once when
+    # a legacy row or sidecar needs migration to the tagged canonical record.
     fd = os.open(str(LOCKFILE), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        agents, presentation_repair_needed = _load_unlocked()
-        if presentation_repair_needed:
+        agents, migration_needed = _load_unlocked()
+        if migration_needed:
             _save_unlocked(agents)
         return agents
     finally:
@@ -1036,9 +1116,9 @@ def terminate_active_harness(rec: AgentRecord) -> bool:
     if not isinstance(value, dict) or value.get("schema") != "agentctl-active-harness/v2":
         raise AgentOperationError("harness_identity_unknown", "malformed active harness identity")
     try:
-        runner = CustomProcessIdentity(**cast(dict[str, object], value["runner"]))
-        harness = CustomProcessIdentity(**cast(dict[str, object], value["harness"]))
-    except (KeyError, TypeError, ValueError) as exc:
+        runner = _process_identity_from_value(value["runner"], "active harness runner")
+        harness = _process_identity_from_value(value["harness"], "active harness process")
+    except (KeyError, AgentOperationError) as exc:
         raise AgentOperationError(
             "harness_identity_unknown", "malformed active harness identity"
         ) from exc
@@ -1174,8 +1254,8 @@ def read_staged_runner(name: str, token: str) -> Optional[RunnerIdentity]:
                 or raw.get("token") != token
                 or not isinstance(raw.get("runner"), dict)):
             return None
-        identity = CustomProcessIdentity(**raw["runner"])
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        identity = _process_identity_from_value(raw["runner"], "staged runner")
+    except (OSError, json.JSONDecodeError, KeyError, AgentOperationError):
         return None
     return (
         identity
@@ -1502,12 +1582,13 @@ def process_identity_liveness(
         return ProcessLiveness.UNKNOWN
     if current_start != str(identity.starttime_ticks):
         return ProcessLiveness.DEAD
-    observed = SharedHerdrClient._process_identity(identity.pid)
-    if observed is None:
+    try:
+        observed = capture_process_identity(identity.pid)
+    except AgentOperationError:
         return ProcessLiveness.UNKNOWN
     return (
         ProcessLiveness.LIVE
-        if observed[0] == identity
+        if observed == identity
         else ProcessLiveness.DEAD
     )
 
@@ -2252,6 +2333,10 @@ def archive_state(name: str) -> Optional[Path]:
 def _write_workspace_loss_snapshot(rec: AgentRecord, workspace_id: str) -> Path:
     """Preserve identity/context before archiving a hard Herdr workspace loss."""
     ensure_agent_dirs(rec.name)
+    if rec.owner_token is None:
+        # Reaping is a state transition. Give an unowned legacy row one final
+        # generation before serializing its canonical recovery record.
+        rec.owner_token = secrets.token_hex(16)
     path = agent_dir(rec.name) / "WORKSPACE_LOST.json"
     payload: dict[str, object] = {
         "detected_at": now_iso(),
@@ -2690,12 +2775,10 @@ def _require_live_agent(name: str) -> AgentRecord:
             "runner_liveness_unknown",
             f"cannot prove exact runner identity for agent {valid_name!r}",
         )
-    if state is ProcessLiveness.DEAD:
-        raise AgentOperationError(
-            "dead_runner",
-            f"agent {valid_name!r} runner pid {rec.runner_pid} is not alive or was reused",
-        )
-    return rec
+    raise AgentOperationError(
+        "dead_runner",
+        f"agent {valid_name!r} runner pid {rec.runner_pid} is not alive or was reused",
+    )
 
 
 def _read_tui_recent_scrollback(pane_id: str) -> str:
@@ -3254,7 +3337,7 @@ def bring_down_agent(
     with registry_lock() as agents:
         agents.pop(valid_name, None)
     if not archive:
-        _clear_presentation_identity(valid_name)
+        _clear_legacy_sidecars(valid_name)
     if was_registered or killed_window or archived_to is not None or state_path is not None:
         event = "agent_down_forced" if force else "agent_down"
         write_event(event, valid_name, preview=preview)
@@ -3634,8 +3717,8 @@ def _convert_headless_to_tui(name: str, old: AgentRecord) -> MigrationResult:
             tmux_target=target,
             mode=TUI_MODE,
             presentation_pane=pane_id,
-            runner_pid=probe.pid,
-            runner_started_at=None if probe.pid is None else pid_start_time(probe.pid),
+            runner_pid=None,
+            runner_started_at=None,
             runner_identity=None,
             status="idle",
         )

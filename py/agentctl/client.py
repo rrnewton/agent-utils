@@ -96,9 +96,10 @@ def muse_trust_prompt(screen: str) -> bool:
 
 def muse_idle_composer(screen: str) -> bool:
     """Recognize Muse's idle composer without mistaking a choice prompt for it."""
-    if "Auto-review" not in screen:
-        return False
-    return any(line.strip() in ("❯", "›") for line in screen.splitlines())
+    regions = _muse_composer_regions(screen)
+    return regions is not None and any(
+        line.strip() in ("❯", "›") for line in regions[1].splitlines()
+    )
 
 
 def _muse_text_visible(screen: str, text: str) -> bool:
@@ -112,21 +113,29 @@ def _muse_text_visible(screen: str, text: str) -> bool:
 
 
 def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
-    """Split transcript/composer using Muse's two rules above its status footer."""
+    """Split transcript/composer using Muse's ruled editor and status footer."""
     lines = screen.splitlines()
-    footer = next(
-        (index for index in range(len(lines) - 1, -1, -1) if "Auto-review" in lines[index]),
-        None,
-    )
-    if footer is None:
-        return None
     dividers = [
-        index for index, line in enumerate(lines[:footer])
+        index for index, line in enumerate(lines)
         if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
     ]
     if len(dividers) < 2:
         return None
     top, bottom = dividers[-2:]
+    footer = lines[bottom + 1:]
+    old_footer = any("Auto-review" in line for line in footer)
+    current_status = next((line.strip() for line in footer if line.strip()), "")
+    status_fields = [field.strip() for field in current_status.split("·")]
+    current_footer = (
+        any(re.fullmatch(r"Muse Code [0-9]+\.[0-9]+\.[0-9]+", line.strip())
+            for line in lines[:top])
+        and len(status_fields) in (3, 4)
+        and all(status_fields)
+        and _MUSE_EFFORT.fullmatch(status_fields[1]) is not None
+        and (len(status_fields) == 3 or status_fields[3] == "YOLO")
+    )
+    if not old_footer and not current_footer:
+        return None
     return "\n".join(lines[:top]), "\n".join(lines[top + 1:bottom])
 
 

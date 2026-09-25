@@ -135,7 +135,7 @@ def test_stop_unregisters_foreign_agent_without_closing_or_mutating_runtime(
     assert sessions.list() == []
     archive = Path(str(stopped["archive"]))
     saved = json.loads((archive / "agent.json").read_text())
-    assert saved["adapter"] == "herdr-foreign"
+    assert saved["launch"]["adapter"] == "herdr-foreign"
     assert saved["token"] == original["token"]
     assert (archive / "output.json").is_file()
     assert list((archive / "queue/processed").iterdir())
@@ -196,7 +196,7 @@ def test_malformed_foreign_shell_identities_are_rejected(
     unknown["foreign_shell_identity"]["unexpected"] = 1
     variants.append(unknown)
     wrong_adapter = json.loads(json.dumps(original))
-    wrong_adapter["adapter"] = "herdr"
+    wrong_adapter["launch"]["adapter"] = "herdr"
     variants.append(wrong_adapter)
 
     for document in variants:
@@ -350,7 +350,7 @@ def test_stop_refuses_absent_legacy_foreign_record_without_shell_identity(
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     original = adopt(sessions, pane, tmp_path)
     path = sessions.registry / "foreign" / "agent.json"
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = sessions.get("foreign").to_document()
     del document["foreign_shell_identity"]
     path.write_text(json.dumps(document), encoding="utf-8")
     fake.infos[pane] = replace(
@@ -371,7 +371,7 @@ def test_stop_refuses_live_legacy_foreign_record_without_shell_identity(
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     original = adopt(sessions, pane, tmp_path)
     path = sessions.registry / "foreign" / "agent.json"
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = sessions.get("foreign").to_document()
     del document["foreign_shell_identity"]
     path.write_text(json.dumps(document), encoding="utf-8")
 
@@ -389,7 +389,7 @@ def prepare_legacy_dead(
     """Turn one newly adopted fixture into the exact old on-disk shape."""
     original = adopt(sessions, pane, Path(fake.infos[pane].cwd))
     record_path = sessions.registry / "foreign" / "agent.json"
-    document = json.loads(record_path.read_text(encoding="utf-8"))
+    document = sessions.get("foreign").to_document()
     del document["foreign_shell_identity"]
     record_path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
     raw = record_path.read_bytes()
@@ -407,7 +407,7 @@ def test_explicit_legacy_recovery_archives_exact_record_queue_and_output_without
     original = adopt(sessions, pane, tmp_path)
     sessions.send_session("foreign", "retained request")
     path = sessions.registry / "foreign" / "agent.json"
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = sessions.get("foreign").to_document()
     del document["foreign_shell_identity"]
     path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
     raw = path.read_bytes()
