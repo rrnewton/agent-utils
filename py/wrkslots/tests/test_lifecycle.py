@@ -35362,6 +35362,225 @@ def test_stale_row_with_no_named_slot_still_refuses(tmp_path: Path) -> None:
         wrkslots._assert_registry_storage_consistent(config, [state])
 
 
+def _project_with_unrelated_rows(
+    parent: Path, unrelated: int, *, target_row: bool
+) -> tuple[Path, Path]:
+    parent.mkdir()
+    project, repository, _remote = make_project(parent)
+    if target_row:
+        made = create(project, bind_owner=False)
+        assert made.returncode == 0, made.stderr
+    for index in range(unrelated):
+        made = create(
+            project,
+            slot=f"other{index:02d}",
+            agent=f"codex-other-{index}",
+            branch=f"codex/other-{index}",
+        )
+        assert made.returncode == 0, made.stderr
+    return project, repository
+
+
+def _record_git_cwds(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    cwds: list[Path] = []
+    original_run = wrkslots._GitVcs._run
+
+    def recorded_run(
+        repository: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        cwds.append(Path(repository).absolute())
+        return original_run(
+            repository,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+        )
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run", staticmethod(recorded_run))
+    return cwds
+
+
+def _unrelated_slot_roots(project: Path, unrelated: int) -> list[Path]:
+    return [
+        (slots_directory(project) / f"other{index:02d}").absolute()
+        for index in range(unrelated)
+    ]
+
+
+def test_scoped_registry_check_git_work_does_not_grow_with_unrelated_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows a command does not name cost no per-checkout Git process.
+
+    Callers run this check while holding the mutation locks. Measured
+    2026-09-25 on a 305-row registry, verifying every row ran 1,720 Git
+    processes and held the locks for 67.6 seconds; each row's worktree root,
+    common directory and HEAD were probed although only the named slot can
+    refuse the command.
+    """
+
+    counts: dict[int, int] = {}
+    cwds = _record_git_cwds(monkeypatch)
+    for unrelated in (1, 4):
+        project, _repository = _project_with_unrelated_rows(
+            tmp_path / f"unrelated-{unrelated}", unrelated, target_row=True
+        )
+        config = wrkslots._load_config(str(project), "testhost")
+        state = wrkslots._load_active(config)
+        cwds.clear()
+        findings = wrkslots._assert_registry_storage_consistent(
+            config, [state], target_slot="slot01"
+        )
+        assert findings == wrkslots.RegistryStorageFindings()
+        counts[unrelated] = len(cwds)
+        for root in _unrelated_slot_roots(project, unrelated):
+            assert not any(
+                cwd == root or root in cwd.parents for cwd in cwds
+            ), (root, cwds)
+        # The named slot still receives the full identity verification.
+        assert checkout(project).absolute() in cwds
+    assert counts[1] == counts[4], counts
+
+
+@pytest.mark.parametrize("operation", ("register", "adopt"))
+def test_register_and_adopt_git_work_under_locks_does_not_grow_with_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+) -> None:
+    """The mutation locks are not held for Git work on unrelated rows."""
+
+    counts: dict[int, int] = {}
+    cwds = _record_git_cwds(monkeypatch)
+    under_locks: list[Path] = []
+    held = False
+    original_locks = wrkslots._mutation_locks
+
+    @contextlib.contextmanager
+    def observed_locks(
+        config: wrkslots.Config,
+        wait_seconds: float,
+        *,
+        deadline: float | None = None,
+    ) -> Iterator[None]:
+        nonlocal held
+        with original_locks(config, wait_seconds, deadline=deadline):
+            start = len(cwds)
+            held = True
+            try:
+                yield
+            finally:
+                held = False
+                under_locks.extend(cwds[start:])
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", observed_locks)
+    for unrelated in (1, 4):
+        project, repository = _project_with_unrelated_rows(
+            tmp_path / f"unrelated-{unrelated}",
+            unrelated,
+            target_row=operation == "adopt",
+        )
+        if operation == "register":
+            tree = checkout(project)
+            tree.parent.mkdir()
+            git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+        cwds.clear()
+        under_locks.clear()
+        pid = str(os.getpid())
+        if operation == "register":
+            argv = ["register", "slot01", "--slot-type", "agent",
+                    "--coordinator-authorized", "--agent", "codex-1", "--task",
+                    "task-slot01", "--purpose", "lock hold", "--owner-pid", pid,
+                    "--coordinator-pid", pid, "--verified-live", "--repo",
+                    "product=repo"]
+        else:
+            argv = ["adopt", "slot01", "--agent", "codex-1", "--owner-pid", pid,
+                    "--expected-generation", "1"]
+        rc = wrkslots.main(["--project-root", str(project), *argv])
+        captured = capsys.readouterr()
+        assert rc == 0, captured.err
+        assert not held
+        assert under_locks
+        counts[unrelated] = len(under_locks)
+        for root in _unrelated_slot_roots(project, unrelated):
+            assert not any(
+                cwd == root or root in cwd.parents for cwd in under_locks
+            ), (root, under_locks)
+    assert counts[1] == counts[4], counts
+
+
+def test_scoped_registry_check_still_names_an_unregistered_unrelated_checkout(
+    tmp_path: Path,
+) -> None:
+    """The cheaper check for unrelated rows still reads Git's worktree list."""
+
+    project, repository, _remote = make_project(tmp_path)
+    first = create(project, slot="slot01", agent="codex-1", branch="codex/one")
+    assert first.returncode == 0, first.stderr
+    second = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+    assert second.returncode == 0, second.stderr
+    unregistered = checkout(project, "slot02")
+    administration = Path(
+        git(unregistered, "rev-parse", "--absolute-git-dir").stdout.strip()
+    )
+    shutil.rmtree(administration)
+    assert unregistered.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    findings = wrkslots._assert_registry_storage_consistent(
+        config, [state], target_slot="slot01"
+    )
+    assert findings.stale == ("agent:slot02",), findings.stale
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._assert_registry_storage_consistent(
+            config, [state], target_slot="slot02"
+        )
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._assert_registry_storage_consistent(config, [state])
+
+
+def test_named_slot_identity_defect_still_refuses_when_git_lists_it(
+    tmp_path: Path,
+) -> None:
+    """A listed checkout whose own Git identity is broken still refuses its command.
+
+    The worktree list alone cannot see this defect, so it is the case that shows
+    the named slot and unscoped callers keep the full per-checkout verification.
+    An unrelated row with this defect is no longer named in the warning;
+    ``wrkslots audit`` reports it.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    first = create(project, slot="slot01", agent="codex-1", branch="codex/one")
+    assert first.returncode == 0, first.stderr
+    second = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+    assert second.returncode == 0, second.stderr
+    broken = checkout(project, "slot02")
+    (broken / ".git").write_text("gitdir: /nonexistent/wrkslots-test\n", encoding="utf-8")
+    assert broken.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._assert_registry_storage_consistent(
+            config, [state], target_slot="slot02"
+        )
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._assert_registry_storage_consistent(config, [state])
+    findings = wrkslots._assert_registry_storage_consistent(
+        config, [state], target_slot="slot01"
+    )
+    assert findings.stale == (), findings.stale
+
+
 def _reference_glob_matches_path(pattern: str, path: str) -> bool:
     """The straightforward reading of the cache-glob contract, kept for comparison.
 
