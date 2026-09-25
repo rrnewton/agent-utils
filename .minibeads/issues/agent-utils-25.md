@@ -1,6 +1,6 @@
 ---
 title: 'test-cost-ranking: justify every regression test by cost'
-status: open
+status: closed
 priority: 0
 issue_type: task
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-21: parent-child
 created_at: 2026-09-25T04:10:41.205691928+00:00
-updated_at: 2026-09-25T11:39:54.964293653+00:00
+updated_at: 2026-09-25T15:31:36.491255619+00:00
+closed_at: 2026-09-25T15:31:36.491255619+00:00
 ---
 
 # Description
@@ -23,3 +24,7 @@ The report covers every executable gate and every `py/` pytest case with duratio
 # Follow-up
 
 [gpt-5.6-sol] Cross-runner per-case telemetry beyond the complete gate-level ranking is tracked by #27 cross-runner-test-timing.
+
+# Outcome
+
+[gpt-5.6-sol] Closed with two exact v2 inventories. The source-stable Python census contains 5,882/5,882 passing cases: 4,744 general, 856 mapped-user/PID-namespace lifecycle, and 282 host lifecycle, with 1,261.883 summed testcase seconds and no skips. Its 5,882-row TSV assigns every case ownership, a coverage contract, and a recommendation. The full-graph report contains all 91 green gates from run `18d89844a629049200077887`, including non-pytest runners, their measured wall/CPU/memory cost, rationale, and recommendation. Unified non-pytest per-case telemetry remains the non-blocking follow-up #27 cross-runner-test-timing.

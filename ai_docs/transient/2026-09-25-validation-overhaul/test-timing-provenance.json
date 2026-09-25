@@ -1,222 +1,62 @@
 {
-  "schema": "agent-utils-validation-timing-provenance/v1",
-  "generated_at_utc": "2026-09-25T04:46:52Z",
-  "privacy": {
-    "host_identifier": "redacted-shared-development-host",
-    "internal_paths_and_vendor_runtime_suffixes_omitted": true
-  },
-  "source_revision": {
-    "git_head": "d893100730bb3a7f115724431c6c619be8164dfe",
-    "baseline_launch_worktree_state": "not-machine-recorded; treat as unproven",
-    "report_generation_worktree_state": "dirty-active-overhaul",
-    "report_generation_porcelain_entry_count": 38
-  },
-  "environment": {
-    "python": "3.12.14",
-    "logical_cpus": 316,
-    "baseline_load_series": "not captured",
-    "note": "Single shared-host sample. Use as a scheduling seed, not a stable benchmark."
-  },
-  "baseline": {
-    "testcase_count": 5734,
-    "unique_nodeid_count": 5734,
-    "duplicate_nodeid_count": 0,
-    "nodeid_mapping_miss_count": 0,
+  "collection_contract": {
+    "ambient_cache_observation": {
+      "authoritative": false,
+      "cache_only_stale_or_out_of_scope": 17,
+      "entries": 2064,
+      "live_only_missing_from_cache": 3835,
+      "path": "py/.pytest_cache/v/cache/nodeids",
+      "readable": true,
+      "unique_nodeids": 2064
+    },
+    "cache_provider_disabled": true,
     "phase_sets_pairwise_disjoint": true,
-    "phase_union_matches_collected_suite": true,
-    "sum_testcase_seconds": 2752.713,
-    "sum_sequential_suite_seconds": 2758.086,
+    "phase_union_matches_capture_exactly": true,
     "phases": [
       {
-        "name": "general",
+        "cases": 4744,
+        "exact_capture_collection_equality": true,
         "isolation": "ordinary",
-        "cases": 4604,
-        "passed": 4589,
-        "failed": 15,
-        "errors": 0,
+        "live_collection_command": "/usr/local/fbcode/platform010/bin/python3.12 -m pytest --collect-only -q -p no:cacheprovider -c pyproject.toml --rootdir=. --ignore=wrkslots/tests/test_lifecycle.py",
+        "name": "general",
+        "nodeid_set_sha256": "e9ff6ce01bedb88b5d0d5271063466e022dd17db29c812ac262a9bae8ec4485c",
+        "passed": 4744,
         "skipped": 0,
-        "suite_seconds": 733.080,
-        "testcase_seconds": 728.721,
-        "command_contract": "pytest --ignore=wrkslots/tests/test_lifecycle.py"
+        "sum_shard_suite_seconds": 519.156,
+        "testcase_seconds": 515.854
       },
       {
-        "name": "lifecycle-namespace",
+        "cases": 856,
+        "exact_capture_collection_equality": true,
         "isolation": "mapped-user-and-pid-namespace",
-        "cases": 848,
-        "passed": 848,
-        "failed": 0,
-        "errors": 0,
+        "live_collection_command": "/usr/local/fbcode/platform010/bin/python3.12 -m pytest --collect-only -q -p no:cacheprovider -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m not ordinary_environment",
+        "name": "lifecycle-namespace",
+        "nodeid_set_sha256": "22eba8eefcb90d9508ac57b5c21f4b8593a29c57d7569edaeccd5da18c1bd2ff",
+        "passed": 856,
         "skipped": 0,
-        "suite_seconds": 1355.402,
-        "testcase_seconds": 1354.718,
-        "command_contract": "pytest wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment' under unshare"
+        "sum_shard_suite_seconds": 507.054,
+        "testcase_seconds": 505.31
       },
       {
-        "name": "lifecycle-host",
-        "isolation": "ordinary-host-process-namespace",
         "cases": 282,
+        "exact_capture_collection_equality": true,
+        "isolation": "ordinary-host-process-namespace",
+        "live_collection_command": "/usr/local/fbcode/platform010/bin/python3.12 -m pytest --collect-only -q -p no:cacheprovider -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m ordinary_environment",
+        "name": "lifecycle-host",
+        "nodeid_set_sha256": "b5553ace2cf73946a2db4510c0c06c286c3f889f8fecffdc40b25af9bc429edf",
         "passed": 282,
-        "failed": 0,
-        "errors": 0,
         "skipped": 0,
-        "suite_seconds": 669.604,
-        "testcase_seconds": 669.274,
-        "command_contract": "pytest wrkslots/tests/test_lifecycle.py -m ordinary_environment"
+        "sum_shard_suite_seconds": 241.456,
+        "testcase_seconds": 240.719
       }
     ],
-    "pareto_case_counts": {
-      "50_percent": 182,
-      "80_percent": 574,
-      "90_percent": 836,
-      "95_percent": 1088,
-      "99_percent": 1876
-    }
-  },
-  "effective_cross_run_projection": {
-    "warning": "Measured substitutions from separate reruns; not an end-to-end full-suite result.",
-    "testcase_count": 5734,
-    "sum_testcase_seconds": 2410.090,
-    "phases": {
-      "general": 550.515,
-      "lifecycle-namespace": 1354.718,
-      "lifecycle-host": 504.857
-    },
-    "pareto_case_counts": {
-      "50_percent": 236,
-      "80_percent": 624,
-      "90_percent": 888,
-      "95_percent": 1138,
-      "99_percent": 1978
-    }
-  },
-  "ranking_artifact": {
-    "path": "ai_docs/transient/2026-09-25-validation-overhaul/test-timing-ranking.tsv",
-    "bytes": 2336478,
-    "lines_including_header": 5735,
-    "data_rows": 5734,
-    "columns": 19,
-    "sha256": "816f5bc40ff49ff56fce57bb1cbf998bdf5efb1380450022b41dd86706c398f3",
-    "sort": "effective_seconds descending, then nodeid ascending",
-    "effective_cumulative_percent_last_row": 100.0
-  },
-  "generator_artifact": {
-    "path": "ai_docs/transient/2026-09-25-validation-overhaul/build_test_timing_ranking.py",
-    "bytes": 14151,
-    "lines": 395,
-    "sha256": "2cb0dbc051ea6845b09007307848011e0d49761c2596685da3a25ab5e0da9efb"
-  },
-  "corrections": [
-    {
-      "id": "engine-toolchain-path",
-      "affected_cases": 13,
-      "baseline_failure": "measurement PATH omitted cargo for twelve cases and rustc for one",
-      "rerun_result": "13 passed",
-      "rerun_suite_seconds": 22.608,
-      "rerun_testcase_seconds": 22.566,
-      "ranking_policy": "replace baseline status and elapsed time by exact-node rerun"
-    },
-    {
-      "id": "herdr-readiness-contention",
-      "affected_cases": 2,
-      "baseline_failure": "fixture readiness deadlines expired under host load",
-      "rerun_result": "initial 2/2 pass and ten subsequent invocations, 20/20 cases pass",
-      "rerun_samples_per_case": 11,
-      "ranking_policy": "replace baseline status and elapsed time by per-node rerun median"
-    },
-    {
-      "id": "archive-stale-agent-harness",
-      "affected_baseline_cases": 32,
-      "baseline_testcase_seconds": 199.585,
-      "rerun_result": "33/33 pass, including one newly added explicit discovery control",
-      "rerun_suite_seconds": 10.991,
-      "rerun_testcase_seconds_all_33": 10.844,
-      "rerun_testcase_seconds_matching_baseline_32": 10.838,
-      "ranking_policy": "replace the 32 matching baseline nodes; omit the new node from the fixed 5,734-row baseline ranking"
-    },
-    {
-      "id": "focused-proc-race-harness",
-      "affected_cases": 1,
-      "baseline_testcase_seconds": 168.790,
-      "rerun_testcase_seconds": [4.373, 4.239, 4.899],
-      "rerun_median_testcase_seconds": 4.373,
-      "rerun_result": "3/3 pass; 13 neighboring scanner/lsof cases also pass",
-      "ranking_policy": "replace baseline elapsed time by rerun median"
-    }
-  ],
-  "source_artifacts": [
-    {
-      "role": "baseline-general",
-      "path": "/tmp/agent-utils-validation-general.xml",
-      "bytes": 1107277,
-      "sha256": "340612e0c6903c1b8484934c99bec7a2d5b98981554a60076f653cc5800b32d2"
-    },
-    {
-      "role": "baseline-lifecycle-namespace",
-      "path": "/tmp/agent-utils-validation-lifecycle-ns.xml",
-      "bytes": 126605,
-      "sha256": "b163096c24037823609bb38069488f78537b3cfe202cd8bdcb151ac4d0a1fb57"
-    },
-    {
-      "role": "baseline-lifecycle-host",
-      "path": "/tmp/agent-utils-validation-lifecycle-host.xml",
-      "bytes": 46475,
-      "sha256": "3c59608a6178f7eae6c5ec025ed7bedd61086f634bc40933a9cb320516b4eec7"
-    },
-    {
-      "role": "correction-engine-toolchain-path",
-      "path": "/tmp/agent-utils-engine-resolver-rerun.xml",
-      "bytes": 2131,
-      "sha256": "c71d416542fe2989b6123a04ed90db7928e0d9a92b61ce5434c50e707a80d8a3"
-    },
-    {
-      "role": "correction-herdr-initial",
-      "path": "/tmp/agent-utils-herdr-readiness-rerun.xml",
-      "bytes": 561,
-      "sha256": "fb4f559ad0e92eb088cc49cd1c9b7444c15dcb2a28877c54aa480994a53935aa"
-    },
-    {
-      "role": "correction-herdr-ten-repeat-bundle",
-      "path_pattern": "/tmp/agent-utils-herdr-readiness-repeat-*.xml",
-      "files": 10,
-      "bytes_per_file": 561,
-      "sha256_of_sorted_file_bytes": "67a80c24fa9b0767bedac89c9d9e863360b235239e499062599bac748cbccf99"
-    },
-    {
-      "role": "correction-archive-harness",
-      "path": "/tmp/agent-utils-agent-log-live-agent-rerun.xml",
-      "bytes": 5278,
-      "sha256": "c550836c76863d7afd17f4d8c36fb7815108882170fba06ece34c589cac180ac"
-    },
-    {
-      "role": "correction-focused-proc-race-1",
-      "path": "/tmp/agent-utils-race-fix-repeat-1.xml",
-      "bytes": 408,
-      "sha256": "fa3f88a6d2aeed5314e30e13f201541cde4b75d0375b4ae4cb0c7d89ee8a3f65"
-    },
-    {
-      "role": "correction-focused-proc-race-2",
-      "path": "/tmp/agent-utils-race-fix-repeat-2.xml",
-      "bytes": 408,
-      "sha256": "ec7f41f2c8062e5c771b66988f62da7d807c0c5c3ba0800e2ddf0d205c70437f"
-    },
-    {
-      "role": "correction-focused-proc-race-3",
-      "path": "/tmp/agent-utils-race-fix-repeat-3.xml",
-      "bytes": 408,
-      "sha256": "aeadad821d1e4fd9395f26a0f44568f06d8357675fe75421a3123939829ef824"
-    }
-  ],
-  "nodeid_mapping": {
-    "legacy_algorithm": "Choose the longest classname prefix whose dot-to-slash translation plus .py exists below py/; append remaining classname segments and testcase name with ::.",
-    "validated_against": "py/.pytest_cache/v/cache/nodeids",
-    "matched": 5734,
-    "missed": 0,
-    "collisions": 0,
-    "future_contract": "Write exact nodeid and parameter-family identity into JUnit testcase properties."
+    "reason": "pytest's cache/nodeids is an accumulating historical union and contained stale entries; the generator performs a fresh live collection for every phase.",
+    "testcase_count": 5882,
+    "union_nodeid_set_sha256": "22d93f646f02c359b02a35feae59494032ff63e3502d6e3478c87d3466fda7e5",
+    "unique_nodeid_count": 5882
   },
   "coverage_contract_codes": {
     "agent-lifecycle-chat-state": "Agent lifecycle, chat transport, durable state, and command safety.",
-    "archive-integrity-bounded-io": "Archive integrity, bounded child/remote I/O, and receipt durability.",
     "crash-recovery": "Crash boundary, replay, recovery, and idempotence behavior.",
     "dag-scheduler-enforcement": "DAG parsing, scheduling, resource enforcement, attribution, and CLI behavior.",
     "experiment-scheduling": "Experiment planning, calibration, limits, and reporting.",
@@ -225,23 +65,275 @@
     "landing-plan-contract": "Landing graph, prioritization, collection, and CLI behavior.",
     "lifecycle-state-machine": "Wrkslots state transitions and durable lifecycle invariants.",
     "process-liveness": "Real process identity, namespace, descriptor, socket, cgroup, and lsof evidence.",
-    "repository-infrastructure": "Repository launchers, package/build wiring, selectors, and hermeticity.",
     "remote-execution-session": "Remote runner configuration, allowlisting, session state, and readiness.",
+    "repository-infrastructure": "Repository launchers, package/build wiring, selectors, and hermeticity.",
     "tick-scheduling-state": "Tick cadence, probe, persistence, and CLI behavior.",
     "timeline-data-contract": "Timeline ingestion, normalization, query, storage, rendering, and browser behavior.",
     "wrkslots-accounting": "Wrkslots census, budget, reservation, and cache-accounting behavior."
   },
+  "current_census": {
+    "pareto_case_counts": {
+      "50_percent": 251,
+      "80_percent": 751,
+      "90_percent": 1088,
+      "95_percent": 1412,
+      "99_percent": 2591
+    },
+    "passed": 5882,
+    "result": "green",
+    "skipped": 0,
+    "sum_testcase_seconds": 1261.883,
+    "testcase_count": 5882
+  },
+  "environment": {
+    "logical_cpus": 316,
+    "note": "One shared-host census; use as a scheduling seed, not a stable benchmark.",
+    "python": "3.12.14+meta"
+  },
+  "generated_at_utc": "2026-09-25T15:33:15.752407Z",
+  "generator_artifact": {
+    "bytes": 34228,
+    "path": "ai_docs/transient/2026-09-25-validation-overhaul/build_test_timing_ranking.py",
+    "sha256": "53f3829420e3a79e529e225f4ba2bd3546fa3366a2e2c73a9cf78fe9b591f1a7"
+  },
+  "identity_contract": {
+    "capture_collection_misses": 0,
+    "collection_capture_misses": 0,
+    "collisions": 0,
+    "legacy_classname_reconstruction_used": false,
+    "required_properties": [
+      "family",
+      "nodeid"
+    ],
+    "source": "pytest xunit2 testcase properties written by run_pytest_shard.py"
+  },
+  "privacy": {
+    "host_identifier": "redacted-shared-development-host",
+    "internal_paths_and_vendor_runtime_suffixes_omitted": true
+  },
+  "ranking_artifact": {
+    "bytes": 2336356,
+    "columns": 13,
+    "cumulative_percent_last_row": 100.0,
+    "data_rows": 5882,
+    "lines_including_header": 5883,
+    "path": "ai_docs/transient/2026-09-25-validation-overhaul/test-timing-ranking.tsv",
+    "sha256": "9c902a082506707dda10144afa70279dabb739453744e77d59345fa322c24071",
+    "sort": "seconds descending, then nodeid ascending"
+  },
   "recommendation_codes": {
-    "keep-focused-proc": "Keep the real race but enumerate only its owned fixture PID; implemented and measured.",
-    "keep-harness-isolated": "Keep behavior while suppressing unrelated ambient tmux-agent delay; implemented and measured.",
-    "fix-test-path-preflight": "Keep test; ensure the validation environment exposes required toolchain binaries before collection.",
-    "stabilize-readiness": "Keep process-tree behavior; replace brittle fixed readiness assumptions with event evidence or load-aware bounds.",
-    "shorten-test-only-deadline": "Keep timeout/kill/reap behavior with a short explicit test budget and assert the production constant separately.",
-    "reduce-bounded-iterations": "Keep fairness/boundary observations but stop once the declared evidence is satisfied, retaining a finite failure cap.",
-    "keep-isolated": "High-value real integration behavior; retain as an isolated DAG node and profile internal phases.",
-    "keep-namespace-sharded": "Retain destructive lifecycle coverage; shard by parameter family in independent user/PID namespaces.",
-    "keep-host-sharded": "Retain host-identity behavior; shard only after repeated contamination and cleanup checks.",
-    "keep-profile-optimize": "Retain the scenario, profile its setup/waits, and optimize without deleting the invariant.",
-    "keep-targeted": "Cost is modest; run only for the owning component and its reverse dependencies."
+    "keep-focused-proc": "Keep the real race while enumerating only its owned fixture PID.",
+    "keep-harness-isolated": "Keep behavior while suppressing unrelated ambient-agent delay.",
+    "keep-host-sharded": "Retain host-identity behavior with contamination-aware sharding.",
+    "keep-isolated": "Retain high-value real integration behavior as an isolated DAG node.",
+    "keep-namespace-sharded": "Retain destructive coverage in independent user/PID namespaces.",
+    "keep-profile-optimize": "Retain the scenario and optimize its setup or waits.",
+    "keep-targeted": "Cost is modest; select through component ownership.",
+    "reduce-bounded-iterations": "Keep fairness observations but stop when declared evidence is satisfied.",
+    "review-skip-contract": "Confirm the skip is an intentional platform contract, not absent coverage.",
+    "shorten-test-only-deadline": "Keep timeout/kill/reap behavior with a short explicit test budget."
+  },
+  "schema": "agent-utils-validation-test-timing-provenance/v2",
+  "source_artifacts": [
+    {
+      "bytes": 2726825,
+      "cases": 4744,
+      "isolation": "ordinary",
+      "passed": 4744,
+      "path": "/tmp/agent-utils-current-general.xml",
+      "phase": "general",
+      "sha256": "ed6c696e05f052b5955e222dd440a2fb78f6ecf540332c859770a4b4a6447752",
+      "skipped": 0,
+      "suite_seconds": 519.156,
+      "testcase_seconds": 515.854
+    },
+    {
+      "bytes": 56328,
+      "cases": 124,
+      "isolation": "mapped-user-and-pid-namespace",
+      "passed": 124,
+      "path": "/tmp/agent-utils-current-lifecycle-namespace-0.xml",
+      "phase": "lifecycle-namespace",
+      "sha256": "a886237e04e8ddfe2c43af0fd1895756a6fd8f5a5a6d8b05fe29f9816e85dd53",
+      "skipped": 0,
+      "suite_seconds": 88.138,
+      "testcase_seconds": 87.826
+    },
+    {
+      "bytes": 64637,
+      "cases": 141,
+      "isolation": "mapped-user-and-pid-namespace",
+      "passed": 141,
+      "path": "/tmp/agent-utils-current-lifecycle-namespace-1.xml",
+      "phase": "lifecycle-namespace",
+      "sha256": "283010e79b67dd74eda91334e732e139492836b3c617bea2e1ec4cbaa7df295b",
+      "skipped": 0,
+      "suite_seconds": 101.556,
+      "testcase_seconds": 101.266
+    },
+    {
+      "bytes": 59338,
+      "cases": 131,
+      "isolation": "mapped-user-and-pid-namespace",
+      "passed": 131,
+      "path": "/tmp/agent-utils-current-lifecycle-namespace-2.xml",
+      "phase": "lifecycle-namespace",
+      "sha256": "f3228d8836f6e22cffdbd87a8b7dbbc929ff203ccc5f78acb49802cb48356e0c",
+      "skipped": 0,
+      "suite_seconds": 69.777,
+      "testcase_seconds": 69.494
+    },
+    {
+      "bytes": 52200,
+      "cases": 114,
+      "isolation": "mapped-user-and-pid-namespace",
+      "passed": 114,
+      "path": "/tmp/agent-utils-current-lifecycle-namespace-3.xml",
+      "phase": "lifecycle-namespace",
+      "sha256": "7b2242d8ae51ef4676d040a39577d9d7c4cc0751c36f531ff0c874ed302bc016",
+      "skipped": 0,
+      "suite_seconds": 79.059,
+      "testcase_seconds": 78.769
+    },
+    {
+      "bytes": 81189,
+      "cases": 174,
+      "isolation": "mapped-user-and-pid-namespace",
+      "passed": 174,
+      "path": "/tmp/agent-utils-current-lifecycle-namespace-4.xml",
+      "phase": "lifecycle-namespace",
+      "sha256": "4aac07c5f8c917a75ace4cbf91a3831dc8f810f13e728c06881848f4d5311fb0",
+      "skipped": 0,
+      "suite_seconds": 82.321,
+      "testcase_seconds": 82.024
+    },
+    {
+      "bytes": 79809,
+      "cases": 172,
+      "isolation": "mapped-user-and-pid-namespace",
+      "passed": 172,
+      "path": "/tmp/agent-utils-current-lifecycle-namespace-5.xml",
+      "phase": "lifecycle-namespace",
+      "sha256": "d59f146b786bc1398c7cad3cdb4d7daf3b027506774ab0d5b315c1513fe08e9f",
+      "skipped": 0,
+      "suite_seconds": 86.203,
+      "testcase_seconds": 85.931
+    },
+    {
+      "bytes": 49408,
+      "cases": 100,
+      "isolation": "ordinary-host-process-namespace",
+      "passed": 100,
+      "path": "/tmp/agent-utils-current-lifecycle-host-0.xml",
+      "phase": "lifecycle-host",
+      "sha256": "98e3b868d1fd929fab4efbaacf4e17fc88d6ac26211d6a5984d8e10a271dc3a0",
+      "skipped": 0,
+      "suite_seconds": 83.322,
+      "testcase_seconds": 83.071
+    },
+    {
+      "bytes": 37765,
+      "cases": 76,
+      "isolation": "ordinary-host-process-namespace",
+      "passed": 76,
+      "path": "/tmp/agent-utils-current-lifecycle-host-1.xml",
+      "phase": "lifecycle-host",
+      "sha256": "efb1e1b03ea9f85da19848e04d88a3cb71f49c9cad5024f2d87b61c152385925",
+      "skipped": 0,
+      "suite_seconds": 72.838,
+      "testcase_seconds": 72.608
+    },
+    {
+      "bytes": 51505,
+      "cases": 106,
+      "isolation": "ordinary-host-process-namespace",
+      "passed": 106,
+      "path": "/tmp/agent-utils-current-lifecycle-host-2.xml",
+      "phase": "lifecycle-host",
+      "sha256": "ca5a202e2188fa74f98cf8b7bdef03c5099eefdc4ae939f3030f19f3036dcd12",
+      "skipped": 0,
+      "suite_seconds": 85.296,
+      "testcase_seconds": 85.04
+    }
+  ],
+  "source_snapshot": {
+    "after_path": "/tmp/agent-utils-current-capture-after.json",
+    "after_recorded_at_utc": "2026-09-25T15:33:09.900123Z",
+    "before_path": "/tmp/agent-utils-current-capture-before.json",
+    "before_recorded_at_utc": "2026-09-25T15:05:51.006922Z",
+    "bound_untracked_file_count": 0,
+    "generated_artifacts_excluded_from_snapshot": [
+      "ai_docs/transient/2026-09-25-validation-overhaul/test-timing-provenance.json",
+      "ai_docs/transient/2026-09-25-validation-overhaul/test-timing-ranking.tsv"
+    ],
+    "git_head": "e6a545e93917bd245b2512b0eed99954798349b7",
+    "junit_inputs_absent_before_capture": true,
+    "junit_inputs_after_capture": [
+      {
+        "bytes": 2726825,
+        "mtime_ns": 1790349791943299309,
+        "name": "agent-utils-current-general.xml",
+        "sha256": "ed6c696e05f052b5955e222dd440a2fb78f6ecf540332c859770a4b4a6447752"
+      },
+      {
+        "bytes": 56328,
+        "mtime_ns": 1790350192344834734,
+        "name": "agent-utils-current-lifecycle-namespace-0.xml",
+        "sha256": "a886237e04e8ddfe2c43af0fd1895756a6fd8f5a5a6d8b05fe29f9816e85dd53"
+      },
+      {
+        "bytes": 64637,
+        "mtime_ns": 1790350205790920398,
+        "name": "agent-utils-current-lifecycle-namespace-1.xml",
+        "sha256": "283010e79b67dd74eda91334e732e139492836b3c617bea2e1ec4cbaa7df295b"
+      },
+      {
+        "bytes": 59338,
+        "mtime_ns": 1790350173993717820,
+        "name": "agent-utils-current-lifecycle-namespace-2.xml",
+        "sha256": "f3228d8836f6e22cffdbd87a8b7dbbc929ff203ccc5f78acb49802cb48356e0c"
+      },
+      {
+        "bytes": 52200,
+        "mtime_ns": 1790350183304777140,
+        "name": "agent-utils-current-lifecycle-namespace-3.xml",
+        "sha256": "7b2242d8ae51ef4676d040a39577d9d7c4cc0751c36f531ff0c874ed302bc016"
+      },
+      {
+        "bytes": 81189,
+        "mtime_ns": 1790350186533797712,
+        "name": "agent-utils-current-lifecycle-namespace-4.xml",
+        "sha256": "4aac07c5f8c917a75ace4cbf91a3831dc8f810f13e728c06881848f4d5311fb0"
+      },
+      {
+        "bytes": 79809,
+        "mtime_ns": 1790350312751598965,
+        "name": "agent-utils-current-lifecycle-namespace-5.xml",
+        "sha256": "d59f146b786bc1398c7cad3cdb4d7daf3b027506774ab0d5b315c1513fe08e9f"
+      },
+      {
+        "bytes": 49408,
+        "mtime_ns": 1790350309844412747,
+        "name": "agent-utils-current-lifecycle-host-0.xml",
+        "sha256": "98e3b868d1fd929fab4efbaacf4e17fc88d6ac26211d6a5984d8e10a271dc3a0"
+      },
+      {
+        "bytes": 37765,
+        "mtime_ns": 1790350299363855302,
+        "name": "agent-utils-current-lifecycle-host-1.xml",
+        "sha256": "efb1e1b03ea9f85da19848e04d88a3cb71f49c9cad5024f2d87b61c152385925"
+      },
+      {
+        "bytes": 51505,
+        "mtime_ns": 1790350311813593024,
+        "name": "agent-utils-current-lifecycle-host-2.xml",
+        "sha256": "ca5a202e2188fa74f98cf8b7bdef03c5099eefdc4ae939f3030f19f3036dcd12"
+      }
+    ],
+    "note": "The digest binds HEAD, the full tracked binary diff, and every non-generated untracked file. The workspace_state field states whether that bound source snapshot was clean or dirty.",
+    "pre_post_match": true,
+    "tracked_diff_bytes": 0,
+    "workspace_snapshot_sha256": "461093601aa9deeb0a369fa26dab3b6d4fee7776c92759cdeea7421064496282",
+    "workspace_state": "dirty"
   }
 }

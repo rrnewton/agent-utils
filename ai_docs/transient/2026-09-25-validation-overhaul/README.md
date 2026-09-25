@@ -2,249 +2,237 @@
 
 Date: 2026-09-25 UTC
 
-This is working evidence for the validation-overhaul project, not settled user-facing
-documentation. It records the original timing census, the implemented validation architecture,
-the measured concurrency choices, and a completed under-ten-minute full-validation run on the
-corrected current tree.
+This is working evidence for #21 validation-overhaul, not settled user-facing documentation. It
+records the implemented validation architecture, the current complete timing census, the measured
+parallelism choices, and the remaining work that was deliberately split into follow-up issues.
+
+## Outcome
+
+The portable current-toolchain contract now runs as one composed dagrun graph. At source commit
+`e6a545e93917bd245b2512b0eed99954798349b7`, full run
+`18d89844a629049200077887` completed all 91 executable gates successfully in 407.988 seconds
+(6 minutes 47.988 seconds). That is 192.012 seconds below the ten-minute target. The run recorded
+3,280.088 aggregate step-wall seconds, 2,995.912 aggregate CPU-seconds, and no step with a positive
+`memory.events` maximum.
+
+The current Python census is independently complete and green: all 5,882 collected cases passed,
+none skipped, with 1,261.883 seconds of summed testcase time. Exact collection equality, disjoint
+phase membership, native pytest node identities, artifact hashes, and the source-stable snapshot are
+recorded in `test-timing-provenance.json`. Every row has an ownership, coverage-contract, and
+recommendation classification in `test-timing-ranking.tsv`.
 
 ## Evidence boundary
 
-The baseline was launched at Git commit
-`d893100730bb3a7f115724431c6c619be8164dfe`. The launch-time worktree status was not captured in a
-machine-readable artifact, so it must be treated as unproven rather than asserted clean. The three
-baseline JUnit files nevertheless contain exactly 5,734 distinct tests, matching the collected
-suite: 4,604 general tests, 848 lifecycle tests in a mapped user/PID namespace, and 282 lifecycle
-tests in the ordinary host environment. Their sets are disjoint and their union is complete.
+The gate report is schema `agent-utils-validation-gate-ranking/v2`. Its provenance binds the 91
+profile rows to the canonical root DAG, the expanded DAG, the public gate listing, the profile run,
+and source commit `e6a545e93917bd245b2512b0eed99954798349b7`. The generator refuses missing or duplicate gates,
+mixed run metadata, failures, timeouts, positive OOM evidence, graph drift, or source drift. The
+ranking's SHA-256 is recorded in the provenance.
 
-The checkout was dirty when this report was generated because the validation overhaul was already
-being implemented. Corrective reruns are therefore recorded separately from the baseline; they are
-not presented as one end-to-end clean run. Exact file hashes, correction rules, and completeness
-checks are in `test-timing-provenance.json`.
+The test report is schema `agent-utils-validation-test-timing-provenance/v2`. The capture began and
+ended at the same source snapshot, with zero tracked source-diff bytes outside its generated
+artifacts, zero bound untracked files, and no generated JUnit input present before collection.
+Fresh live collection, not pytest's accumulating cache, defines completeness. All 5,882 JUnit cases
+carry exact `nodeid` and `family` properties; legacy classname reconstruction was not used. The
+5,882-row TSV has 13 columns and its SHA-256 is recorded in the provenance.
 
-JUnit `time` is elapsed test-case time, including fixture work. It is not CPU time. Dagrun step
-profiles must supply user CPU, system CPU, memory, throttling, and wall time for the parallelism
-sweep. The one-sample baseline is a scheduling seed, not a stable performance claim.
+JUnit `time` is elapsed testcase time, including fixture work. It is not CPU time. Dagrun profiles
+supply step wall time, user plus system CPU, peak memory, caps, throttling, pressure, and memory
+events. This remains a one-host census and should be treated as a scheduling seed rather than a
+low-variance benchmark.
 
 ## Implemented architecture
 
 ### One graph, composed at load time
 
-`validation.dag.yaml` is now the single portable, current-toolchain repository contract. It
-includes ten focused fragments --
-repository checks, ordinary Python components, Python lifecycle tests, Rust tests, cross-language
-tests, examples, Python packages, Rust packages, timeline/browser tests, and vibe-talk -- and one
-outer dagrun invocation plans the resulting graph. Shared resource caps therefore apply across
-languages and tools, and independent work can overlap instead of waiting for a Python phase, a
-Rust phase, and separate package scripts to run serially. Selected validation and full validation
-both load this same graph; selection changes labels, not the definition of a check.
+`validation.dag.yaml` is the single portable current-toolchain contract. It includes ten focused
+fragments: repository checks, ordinary Python components, Python lifecycle tests, Rust tests,
+cross-language tests, examples, Python packages, Rust packages, timeline/browser tests, and
+vibe-talk. One outer dagrun invocation schedules the flattened graph, so independent languages and
+tools overlap under one resource model instead of running as serial phases. Selected validation and
+full validation load the same graph; selection filters labels rather than defining another contract.
 
-DAG inclusion is strict compile-time composition, not a runtime subgraph node. Each included
-fragment receives a namespace that prefixes its steps and internal references. Nested namespaces
-compose with dots. A parent's optional `after` references are resolved in the parent's namespace
-and injected into every entry node of the included flattened subgraph. In the other direction, a
-parent connects to work inside a fragment by naming an exact flattened step tag. There is no
-synthetic include node and no implicit whole-fragment completion barrier: the parent owns boundary
-wiring, while the child remains reusable.
+DAG inclusion is transparent compile-time composition, not a runtime subgraph node. Each fragment
+is flattened under its namespace, nested namespaces compose with dots, and all internal dependency
+references are rewritten to their effective names. An include's optional `after` dependencies are
+resolved in the parent's namespace and fanned into every entry node of the included subgraph. An
+outer step can connect to one exact internal node by depending on its fully namespaced tag.
 
-The loader fails before planning on malformed or unknown include fields, missing or escaping
-paths, namespace collisions, cycles, duplicate effective includes, policy conflicts, invalid
-`after` targets, or expansion-limit violations. Includes are refused entirely by path-free parsing
-and standard input because those inputs have no safe directory against which to resolve a path.
-The exact `include` key is reserved, so composition can never be silently ignored by an older or
-context-free loader.
+There is deliberately no implicit whole-subgraph completion edge. If a fragment must appear as one
+node to downstream work, it must declare an explicit terminal barrier step that depends on every
+intended exit; the outer graph then depends on that barrier's exact namespaced tag. This makes the
+boundary visible and reviewable, while allowing callers that need an internal connection point to
+name one without waiting for unrelated exits.
+
+The loader fails before planning on malformed or unknown include fields, absolute, missing, or
+escaping paths, namespace collisions, cycles, duplicate effective includes, policy conflicts,
+invalid `after` targets, or expansion-limit violations. The reserved `include` key is rejected by
+path-free parsing and standard input, where no safe base directory exists; it is never silently
+ignored. Python and Rust share parity fixtures for these rules.
 
 ### Fail-closed selection and ownership
 
-`scripts/validate.py` gathers committed, unstaged, and untracked paths. Rename detection is
-deliberately disabled so both the removed and added paths contribute to the selection. Broad path
-rules select validation groups, while `validation/components.json` maps tool source prefixes to
-component checks and records reverse dependencies. The checked-in manifest currently owns 191
-ordinary Python test files across nine components and classifies the lifecycle file separately.
-Its self-test fails on every unclassified, missing, or multiply owned Python test file.
+`scripts/validate.py` gathers committed, unstaged, and untracked paths. Rename detection is disabled
+so both the removed and added paths contribute. Broad path rules select groups, while
+`validation/components.json` owns 185 ordinary Python test files across nine components and seven
+separate-suite files, including the lifecycle partition. Its self-test rejects unclassified,
+missing, or multiply owned test files.
 
-An unknown path selects the complete portable contract, and a change spanning areas selects the union of
-their requirements. Repository-wide hygiene remains selected for every change. A component-only
-edit selects only that tool's labelled Python, Rust, cross-language, and packaging nodes plus its
-declared reverse dependencies; `--all` omits label filtering and executes the entire flattened
-graph. This makes selection a latency optimization rather than a second, weaker test contract.
+An unknown path selects the complete portable contract, and a multi-area change selects the union
+plus reverse dependencies. Repository hygiene is always selected. A component-only edit selects
+that component's Python, Rust, cross-language, and packaging nodes plus declared dependents;
+`--all` executes the complete flattened graph. Local validation and CI therefore consume the same
+plan rather than maintaining copied command lists.
 
 ### One owner for nested execution
 
-Most graph steps are ordinary child processes of the one outer scheduler. The few tests that
-intentionally start dagrun themselves must opt in with the typed `delegated_children: true`
-property. When cgroup boxing is available, the outer run retains ownership of the complete subtree,
-puts the command in a supervisor leaf, and delegates an empty step root to the inner scheduler.
-Cancellation therefore still reaches descendants that escape a process group. An explicitly
-unboxed outer run may pass a narrowly scoped fallback marker only to an opted-in step; ordinary
-children do not inherit it, malformed markers and forged cgroup paths fail, and the fallback warns
-that it is using process-group/procfs accounting rather than claiming cgroup containment.
+Most gates are ordinary children of the outer scheduler. Tests that intentionally launch dagrun
+again must opt in with `delegated_children: true`. Under cgroup v2 the outer run retains the entire
+subtree, places the command in a supervisor leaf, and delegates an empty child root to the inner
+scheduler. Cancellation therefore reaches descendants even if they leave their original process
+group. An explicitly unboxed outer run passes only a narrowly scoped fallback marker to opted-in
+steps and labels the degraded procfs/process-group accounting path.
 
-Python test shards preserve parameterized families, use independent pytest temp roots, and keep
-the destructive lifecycle suite in its own namespace/host-visible lanes. Cargo consumers share a
-repository-wide target-directory cap. The default validation driver gives the outer critical-path
-planner at most 24 simultaneous steps and 32 CPUs; per-resource caps and measured inner widths
-further constrain the work that can actually overlap.
+Python tests are split into deterministic, disjoint component shards with separate temp roots. The
+destructive lifecycle suite has six mapped-user/PID-namespace shards and three host-visible shards.
+Cargo consumers share a repository target-directory cap. The outer planner may dispatch at most 24
+steps using 32 CPUs, while resource caps and measured inner widths constrain actual overlap.
 
-## Baseline result
+## Current Python test ranking
 
-| Phase | Cases | Result | Suite wall | Sum of cases | Share of case time |
+### Complete census
+
+| Phase | Cases | Result | Sum of shard-suite time | Sum of testcase time | Testcase-time share |
 |---|---:|---|---:|---:|---:|
-| General | 4,604 | 4,589 pass, 15 fail | 733.080 s | 728.721 s | 26.5% |
-| Lifecycle, namespaced | 848 | pass | 1,355.402 s | 1,354.718 s | 49.2% |
-| Lifecycle, host-visible | 282 | pass | 669.604 s | 669.274 s | 24.3% |
-| Total | 5,734 | baseline not green | 2,758.086 s | 2,752.713 s | 100% |
+| General | 4,744 | 4,744 pass, 0 skip | 519.156 s | 515.854 s | 40.880% |
+| Lifecycle, namespaced | 856 | 856 pass, 0 skip | 507.054 s | 505.310 s | 40.044% |
+| Lifecycle, host-visible | 282 | 282 pass, 0 skip | 241.456 s | 240.719 s | 19.076% |
+| Total | 5,882 | 5,882 pass, 0 skip | 1,267.666 s | 1,261.883 s | 100% |
 
-The sequential Python phases alone occupied about 46 minutes. Cost is concentrated: 182 cases
-accounted for 50% of raw case time, 574 for 80%, 836 for 90%, and 1,088 for 95%.
+Cost remains concentrated but less extremely than in the first census: 251 cases account for 50%
+of testcase time, 751 for 80%, 1,088 for 90%, 1,412 for 95%, and 2,591 for 99%.
 
-## Corrections and findings
+| Component | Cases | Testcase seconds | Share |
+|---|---:|---:|---:|
+| wrkslots | 1,369 | 818.503 | 64.864% |
+| dagrun | 954 | 219.242 | 17.374% |
+| repository-infrastructure | 165 | 76.955 | 6.098% |
+| agentctl | 1,647 | 71.908 | 5.698% |
+| wrkviz | 944 | 68.259 | 5.409% |
+| herdr-run | 423 | 3.279 | 0.260% |
+| tick-hub | 133 | 2.242 | 0.178% |
+| planner | 142 | 0.930 | 0.074% |
+| experiment-runner | 105 | 0.565 | 0.045% |
 
-The complete TSV keeps the raw baseline value and a separate effective value for every test. The
-effective values substitute measured reruns only where the baseline was invalidated by a known
-environment or harness problem.
+### Highest current testcase costs
 
-1. Thirteen engine-resolver tests failed immediately because the measurement command's `PATH`
-   omitted `cargo` (twelve tests) or `rustc` (one test). With the toolchain on `PATH`, all thirteen
-   passed in 22.608 seconds of JUnit suite time. These are environment failures, not product
-   regressions, and the original near-zero failure durations understate a clean run.
-2. Two process-readiness tests failed at their readiness deadlines under load. They passed together
-   in 2.970 seconds, then passed in ten further invocations (20/20 cases). The ranking uses the
-   eleven-rerun median for each case. This is load-sensitive readiness flakiness, not a reproduced
-   functional regression.
-3. The agent-log archive module cost 199.585 seconds because ordinary fetch tests repeatedly probed
-   one ambient stale tmux SSH-agent socket through its real ten-second ceiling. Isolating ambient
-   tmux from those generic subprocess tests, while adding a direct live-tmux-agent test, produced
-   33/33 passing tests in 10.991 seconds; the 32 baseline cases contributed 10.838 seconds. This is
-   harness overhead, not useful regression coverage.
-4. One host-visible lifecycle race cost 168.790 seconds because each semantic checkpoint scanned
-   every unrelated process on the shared host. It now enumerates a tiny synthetic proc root whose
-   sole entry is a symlink to the late entrant's real `/proc/<pid>` directory. The entrant is still
-   created after the second scan, and the production scanner still consumes real kernel evidence.
-   Three post-change JUnit reruns passed at 4.239, 4.373, and 4.899 seconds. The median is 4.373
-   seconds, a 97% reduction. Thirteen neighboring real lsof/process-census cases also passed.
-5. Profile feedback learned quiet-run footprints for the two Python dagrun shards and reduced
-   their effective caps to 548.4 MiB and 578.7 MiB. Under full-suite concurrency each shard in
-   turn reached that exact cap and recorded `memory.events: oom=3`. The delegated-root view had
-   correctly excluded descendant-owned kills, but the terminal diagnostic looked only at
-   `oom_kill=0` and misleadingly called the resulting SIGKILL unexplained. These variable,
-   nested-process workloads now carry explicit 2 GiB hard caps. Both engines classify positive
-   `oom`, `oom_kill`, or `oom_group_kill` evidence as a memory-cap failure and persist the group
-   counter; 905/905 shard cases then passed together with profile feedback enabled.
-6. Two full-load-only harness races were made explicit. The cpuset interoperability check now
-   retries the complete two-engine attempt, with a fresh ledger, only for the exact transient
-   systemd user-bus `Connection refused` signature; a deterministically injected refusal retried
-   once and then passed all 58 checks, while 12 delegated stress copies passed. An agentctl
-   process-containment fixture now atomically publishes its two-PID marker and waits for a complete,
-   parseable record rather than treating file creation as payload readiness; its three cleanup
-   modes passed 120/120 concurrent stress cases.
-7. A post-run profile audit found three fresh-profile-store ceilings with insufficient evidence or
-   headroom. One lifecycle shard had later reached its explicit 768 MiB ceiling with 845 reclaim
-   events, so that hard cap was removed in favor of the authored 1 GiB baseline and its 1.25 runtime
-   margin. The component-manifest floor was raised from 128 to 160 MiB after a 150.55 MiB successful
-   peak, and the agentctl differential floor was raised from 2048 to 2560 MiB after a 2229.57 MiB
-   successful peak. These changes prevent a fresh profile store from receiving tighter caps than
-   the measured workload supports.
-8. Full-graph concurrency exposed two publication races that focused runs had not. The wrkslots
-   stress fixture could expose an empty or partial JSON control request while writing it in place;
-   it now publishes with a temporary file and atomic rename, and four simultaneous end-to-end
-   reruns passed. In both dagrun engines, an injected profile-write crash could release accounting
-   and remove a tag from `running` before its terminal result reached `done`, allowing a duplicate
-   launch that never retired. Terminal publication now retires accounting, records `done`, and
-   only then removes `running`; the exact Python race passed 20 repeated runs, alongside the full
-   Python scheduler and Rust dagrun suites.
-9. Two memory-feedback tests still encoded the superseded rule that ordinary observations could
-   lower an authored RSS hint. They now distinguish the safe default, which preserves the authored
-   lower bound, from explicit `--profile-memory-feedback`, which may use an adequately sampled
-   lower observation. The focused cross-runtime memory contract passed all 11 checks.
+These are the first twelve rows of the complete TSV, without extrapolation:
 
-After those measured substitutions, the 5,734 baseline cases represent 2,410.090 seconds of
-sequential case time. This is a cross-run planning estimate, not a replacement for a green full run.
+| Seconds | Phase | Component | Test | Coverage contract | Recommendation |
+|---:|---|---|---|---|---|
+| 29.950 | lifecycle-host | wrkslots | `test_remove_refuses_live_process_using_slot` | process-liveness | keep-host-sharded |
+| 20.575 | general | dagrun | `test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape` | dag-scheduler-enforcement | keep-profile-optimize |
+| 18.620 | general | wrkslots | `test_real_process_and_git_invariants` | wrkslots-accounting | keep-isolated |
+| 16.943 | general | wrkslots | `test_lsof_guard_refuses_a_real_live_user_with_attributed_evidence` | wrkslots-accounting | keep-profile-optimize |
+| 14.044 | general | dagrun | `test_default_small_cpu_cap_is_enforced_and_allows_compliant_work` | dag-scheduler-enforcement | keep-profile-optimize |
+| 11.146 | general | dagrun | `test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree` | dag-scheduler-enforcement | keep-profile-optimize |
+| 10.289 | general | repository-infrastructure | `test_sigterm_stops_rsync_and_seals_an_interrupted_receipt` | repository-infrastructure | keep-harness-isolated |
+| 8.631 | general | dagrun | `test_an_outer_budget_cut_names_the_budget_and_never_a_peer` | dag-scheduler-enforcement | keep-profile-optimize |
+| 7.858 | general | dagrun | `test_peer_cancellation_survives_a_later_deadline_in_the_same_run` | dag-scheduler-enforcement | keep-profile-optimize |
+| 7.322 | general | agentctl | `test_command_timeout_contains_group_when_supervisor_is_stopped[emergency]` | agent-lifecycle-chat-state | keep-profile-optimize |
+| 7.169 | general | agentctl | `test_command_timeout_contains_group_when_supervisor_is_stopped[census-error]` | agent-lifecycle-chat-state | keep-profile-optimize |
+| 6.639 | general | dagrun | `test_outer_run_budget_cuts_a_long_run_early_and_still_reports` | dag-scheduler-enforcement | keep-profile-optimize |
 
-## Highest corrected costs
+All 5,882 rows, including parameter-family identity and cumulative share, are in
+`test-timing-ranking.tsv`. The recommendation totals are also complete: 4,695 `keep-targeted`, 856
+`keep-namespace-sharded`, 281 `keep-host-sharded`, 33 `keep-harness-isolated`, 11
+`keep-profile-optimize`, three `reduce-bounded-iterations`, and one each of `keep-isolated`,
+`keep-focused-proc`, and `shorten-test-only-deadline`. These categories preserve expensive safety
+anchors while identifying setup, bounded-loop, wait, isolation, and selection opportunities. Raw
+duration alone is not grounds to remove destructive Git, process-liveness, cgroup, crash-recovery,
+or fail-closed coverage.
 
-| Seconds | Phase | Test | Assessment |
-|---:|---|---|---|
-| 39.884 | general | `wrkslots/tests/test_e2e_stress.py::test_real_process_and_git_invariants` | Keep: real process/Git end-to-end safety; isolate and profile its internal phases. |
-| 22.040 | host lifecycle | `test_remove_refuses_live_process_using_slot` | Keep as one real host/lsof positive anchor; do not multiply it across equivalent matrices. |
-| 20.811 | general | `tests/test_cli.py::test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape` | Keep: direct regression anchor for CPU enforcement and its escape boundary. |
-| 17.458 | namespace lifecycle | `test_clean_agent_remove_with_recursive_submodules_preserves_peers_and_config` | Keep: destructive recursive-submodule integration; shard. |
-| 17.410 | namespace lifecycle | `test_audit_reports_deletable_blocked_held_and_the_leak_invariant` | Keep: lifecycle classification and leak invariant; shard. |
-| 14.453 | general | `test_subject_cursor_is_fair_with_different_root_counts_and_oversized_peer` | Preserve fairness observations; stop once the stated observations are satisfied if the long-tail cycles add no distinct assertion. |
-| 13.909 | general | `tests/test_cli.py::test_default_small_cpu_cap_is_enforced_and_allows_compliant_work` | Keep: real default-cap enforcement anchor. |
-| 13.681 | general | `test_default_budget_large_root_has_finite_explicit_terminal_outcome` | Separate the production-constant assertion from a smaller behavioral boundary where possible. |
-| 10.090 | general | `test_default_budget_blocked_traversal_terminates_on_every_attempt_and_retries` | Keep kill/reap semantics but use a short explicit test deadline; a neighboring 0.2-second case already proves the same worker boundary. |
+Per-case timing for non-pytest runners remains #27 cross-runner-test-timing. Until that lands,
+Rust/libtest, JavaScript/browser, cross-language, package, example, and application cases are
+accounted for by their measured outer gates without pretending that gate duration is a case timing.
 
-The namespace lifecycle cost is broad rather than dominated by a single wait: 120 of 848 cases
-make up 50%, 311 make up 80%, and 471 make up 95%. Those tests exercise destructive Git,
-submodule, crash-recovery, fail-closed parsing, and process-liveness behavior. Their first treatment
-should be isolation-preserving parallelism and targeted selection, not deletion.
+## Current full-graph gate ranking
 
-The host suite contains large setup matrices. In particular, the families checking pristine
-recursive checkouts, fresh-census rechecks, and exact current shapes account for roughly 202
-seconds. They cover distinct fail-closed states, but each case rebuilds substantial repository
-state. Reduce their total CPU only after either sharing an immutable setup safely or refactoring
-classify/recover through a common seam; do not prune one endpoint while those paths remain separate.
+`gate-timing-ranking.tsv` contains every one of the 91 executable gates. It ranks wall and aggregate
+CPU time and records peak memory, applied cap, memory events, coverage rationale, and a retain or
+optimization recommendation. The ten highest aggregate-wall gates are:
 
-## Ranking artifact
+| Rank | Gate | Wall | CPU | Peak MiB | Cap MiB |
+|---:|---|---:|---:|---:|---:|
+| 1 | `cross.dagrun.differential` | 404.467 s | 482.479 s | 227.55 | 2,560 |
+| 2 | `vibe-talk.shots.screenshots` | 285.587 s | 170.822 s | 719.04 | 3,072 |
+| 3 | `rust.dagrun.test` | 198.473 s | 122.088 s | 1,482.52 | 7,680 |
+| 4 | `cross.agentctl.differential` | 176.558 s | 153.791 s | 2,185.49 | 3,200 |
+| 5 | `examples.run.rust` | 139.003 s | 100.448 s | 558.28 | 16,384 |
+| 6 | `rust.agentctl.test` | 136.271 s | 101.616 s | 135.18 | 7,680 |
+| 7 | `examples.run.python` | 135.332 s | 94.849 s | 575.88 | 16,384 |
+| 8 | `python.dagrun.shard-0` | 128.432 s | 113.406 s | 478.03 | 2,048 |
+| 9 | `python-lifecycle.namespace.shard-1` | 115.016 s | 109.914 s | 526.66 | 1,280 |
+| 10 | `python.dagrun.shard-1` | 106.762 s | 81.284 s | 533.17 | 2,048 |
 
-`test-timing-ranking.tsv` is sorted by corrected/effective seconds descending and contains every
-baseline node ID exactly once. The columns are:
+Nine gates account for 50% of aggregate gate-wall time, 20 for 80%, 25 for 90%, and 33 for 95%.
+The dagrun differential occupied 404.467 of the 407.988 graph seconds (99.137% of the critical-path
+window) while averaging 1.193 measured CPU cores. The complete graph averaged 7.343 measured CPU
+cores against its 32-CPU ceiling. Outer-DAG concurrency is therefore no longer the principal limit;
+the dominant remaining wall-time opportunity is to split or internally parallelize that
+differential safely. The screenshot gate is expensive in aggregate time but overlaps the critical
+path and retains real-browser coverage unavailable from unit tests.
 
-- `rank`, `phase`, `isolation`, and `component`;
-- exact `nodeid` and parameter-family identity;
-- baseline and effective status/time;
-- effective share and cumulative share of all 5,734 cases;
-- timing source, coverage-contract category, and recommendation category.
+All 91 gates reported zero `memory.events` maxima, so none of their recorded peaks is marked
+censored by a memory ceiling. That is evidence for this run, not permission to remove caps.
 
-For the legacy xunit2 files, exact node IDs were reconstructed by choosing the longest prefix of
-`classname` whose dot-to-slash translation names an existing Python test file, appending any
-remaining class components with `::`, and then appending `name`. All 5,734 reconstructed IDs matched
-the pytest collection cache with zero misses and zero collisions. Future runs should put `nodeid`
-and family directly into JUnit `properties`; reconstruction should remain only a compatibility path.
+### Aggregate-only live cgroup omissions
 
-Coverage and recommendation values are family-level audit categories, not line-coverage claims.
-Unknown tests must fail the report's classification check rather than silently receiving a cheap
-default. Branch coverage and mutation evidence may refine these categories later, but neither can
-replace review of destructive safety invariants.
+Green gate status does not mean every environment-specific live cgroup leg ran inside the
+aggregate graph. A nested test that creates a fresh top-level systemd user scope can migrate into a
+sibling unit and escape the outer gate's ownership, so those legs now skip loudly rather than
+weakening containment:
 
-The ranking is a power-to-weight review tool, not an instruction to delete the slowest tests. The
-highest-cost cases disproportionately cover destructive Git behavior, process liveness, cgroup
-enforcement, crash recovery, and fail-closed parsing. The implemented changes first removed
-ambient-host probes and repeated setup that added no assertion, then isolated and sharded the
-remaining safety coverage. A test should be removed or weakened only when a cheaper test proves the
-same invariant; raw duration alone is not evidence that coverage lacks value.
+- #28 delegated-cpuset covers live `pin-run` and `cpuset-alloc` apply/release, interop, and selftest
+  execution beneath an already delegated parent.
+- #29 delegated-scope-smokes covers forced-box, observed-live-PID, boxed-journal, Python symlink and
+  stdin re-exec, and Rust boxed-stdin live scope legs in a containment-safe lane.
 
-## Full-graph gate ranking
+Their non-live schema, refusal, policy, and direct-route assertions still execute in the aggregate
+contract, and the live legs remain runnable standalone on a capable host. The follow-ups are open
+because an aggregate safety skip must not be mistaken for exercised coverage.
 
-`gate-timing-ranking.tsv` complements the Python case ranking with every one of the 78 executable
-gates in the flattened validation graph. It ranks their measured wall and aggregate CPU time,
-records peak memory and applied cap, and gives each gate a coverage rationale and recommendation.
-This is the correct resource-planning unit for Cargo, cross-language, packaging, browser, example,
-and application suites, whose nested frameworks do not currently emit one common per-case timing
-schema. The existing 5,734-row TSV retains the finer Python-case view.
+## Reliability and efficiency findings
 
-The checked-in gate ranking describes green run `18d885f0608c7bd9002d2cf9`: 371.650
-seconds of graph wall time, 3,272.204 aggregate step-wall seconds, and 2,916.240 aggregate CPU
-seconds. `gate-timing-provenance.json` binds the report to the exact 78 profile rows and canonical
-gate listing, and hashes the public `dagrun json` expansion so commands and resource limits from
-every included fragment are covered too. `build_gate_timing_ranking.py` rejects missing, blank, or
-duplicate proof fields, inconsistent run metadata, any failed, timed-out, or OOM-observed row, and
-any mismatch with the graph loaded by the public `dagrun list` command. It publishes the TSV and
-provenance through fsynced temporary files, with the self-hashing provenance replaced last.
+The overhaul removed or isolated several costs that did not buy regression coverage: ambient stale
+tmux-agent probes, a host-wide process scan inside a synthetic lifecycle race, fixed readiness
+assumptions, unsafe shard temp-root sharing, duplicate nested validation phases, and serial
+language/tool execution. Resource profiles also exposed under-sized learned memory limits,
+publication races, and delegated-scope escape hazards; those now fail closed or have explicit
+containment boundaries.
 
-The ranking also makes the remaining wall-time opportunity explicit. The dagrun cross-language
-differential occupied 368.428 of the graph's 371.650 seconds (99.1% of the critical-path wall) while
-using 386.617 CPU-seconds, or about 1.05 effective cores. The whole graph averaged 7.85 measured CPU
-cores against its 32-CPU ceiling. Outer-DAG concurrency is therefore no longer the limiting factor:
-materially shortening the full run now requires safely splitting or parallelizing that differential
-gate. The under-ten-minute target is demonstrated, but maximal machine utilization is not.
+A full-graph run then exposed a procfs parser assumption that focused tests had missed: Linux
+process names are opaque bytes and can contain invalid UTF-8, newlines, spaces, and parentheses.
+Dagrun, agentctl, and wrkslots now parse `/proc/<pid>/stat` from bytes using the final validated
+`) <state> ` delimiter and validate process identities. Status-field readers split only on literal
+LF, so control bytes in `Name:` cannot forge `Uid`, `State`, `Cpus_allowed_list`, or `NSpid` lines.
+Only definite disappearance (`ENOENT` or `ESRCH`) is treated as gone; malformed or unreadable live
+identity evidence fails closed. Teardown reports incomplete global scans instead of declaring a
+clean sweep, and wrkslots distinguishes harmless unrelated process churn from ambiguous evidence
+for a retained candidate.
+
+The remaining generation-safe signaling work is #30 pidfd-process-ownership, and the remaining
+post-snapshot inheritance boundary in the same-UID census is #31 late-fork-census. Neither is hidden
+inside the closed flake issue.
 
 ## Measured concurrency choices
 
+The design-time sweeps below predate the current v2 census, but they remain the measured basis for
+the checked-in caps and are retained here as historical calibration rather than current reruns.
+
 ### Lifecycle outer width
 
-Each lifecycle trial ran all 1,130 expected cases exactly once and passed. The reported CPU value
-is total user plus system CPU across the run.
+Each trial ran the then-current 1,130-case lifecycle suite exactly once and passed.
 
 | Concurrent lifecycle nodes | Wall | CPU total |
 |---:|---:|---:|
@@ -252,16 +240,13 @@ is total user plus system CPU across the run.
 | 5 | 190.0 s | 743.0 CPU-s |
 | 6 | 218.3 s | 748.9 CPU-s |
 
-Width five is retained as the `lifecycle-io` cap. It was the fastest observed run and used less CPU
-than width six. The host-visible subset has an additional cap of three because those tests share
-the host process namespace; namespaced shards each receive their own user/PID namespace and temp
-root.
+Width five was the fastest observation and used less CPU than width six, so `lifecycle-io` remains
+capped at five. Host-visible work is additionally capped at three.
 
 ### Cargo inner width
 
-The Cargo sweep used a dedicated target directory and cleaned it before every trial, so every row
-is a cold full-workspace release build rather than an incremental successor. This is one measured
-trial per width, not a claim about low-variance medians.
+Each historical trial used a clean dedicated target directory and was a cold full-workspace release
+build.
 
 | Cargo jobs | Wall | CPU total |
 |---:|---:|---:|
@@ -273,34 +258,44 @@ trial per width, not a claim about low-variance medians.
 | 24 | 45.097 s | 263.881 CPU-s |
 | 32 | 41.591 s | 269.251 CPU-s |
 
-Eight jobs is the chosen elbow. It is the smallest width within 5% of the fastest observation
-(43.230 seconds versus 41.527 at width 16), while higher widths provide no stable wall-time gain
-and width 32 consumes more CPU. The workspace build and its incremental clippy successor therefore
-request eight inner jobs. Pytest remains parallelized as outer DAG shards rather than pretending a
-larger inner-width hint can parallelize one sequential pytest process.
+Eight jobs is the chosen elbow: it was the smallest width within 5% of the fastest observation,
+while larger widths gave no stable gain and consumed at least as much CPU.
 
-## End-to-end evidence
+## Selection evidence
 
-A documentation-only selected run executed its seven always-on hygiene nodes successfully. The
-flattened graph reported 1.0 seconds wall time, and the complete selector/driver invocation took
-1.5 seconds. This establishes that prose-only changes no longer pay for unrelated language,
-package, browser, or application suites.
+The following selection measurements are historical proofs from the implemented graph before the
+current 91-gate run; they are not presented as measurements at commit `e6a545e`:
 
-The bare `make validate` proof (`run_id=18d885f0608c7bd9002d2cf9`) executed all 78 nodes
-exactly once and passed with zero failures, aborts, skips, or unlaunched work in 371.7 seconds
-(6 minutes 11.7 seconds). Its per-step profile records 2,916.240 aggregate user+system CPU-seconds,
-wall offsets, peak memory, applied memory caps, throttling, pressure, and OOM counters. The longest
-node was the 798-check dagrun cross-language differential at 368.4 seconds; independent work
-overlapped it rather than forming serial language phases. No validator, pytest-shard, or dagrun
-process remained afterward, and the successful run created no persistent pytest temp root.
+- A documentation-only change selected seven always-on hygiene nodes, took 1.0 seconds of graph
+  time, and completed the selector/driver invocation in 1.5 seconds.
+- A synthetic `py/tick_hub/cli.py` change selected 17 nodes in run
+  `18d88315e12d6b26003e9226`, passed in 13.9 seconds of graph time and 14.76 seconds end to end, and
+  consumed 42.246 aggregate CPU-seconds.
 
-A representative synthetic change to `py/tick_hub/cli.py`, passed through the real selection
-function and the same graph loader (`run_id=18d88315e12d6b26003e9226`), selected 17 nodes and passed
-in 13.9 seconds of graph time / 14.76 seconds end to end, consuming 42.246 aggregate CPU-seconds.
-Together with the 1.5-second documentation-only proof, this demonstrates that routine changes no
-longer pay for unrelated tools while the full portable contract remains a single explicit command and stays
-below its 600-second target.
+These measurements establish the intended order-of-magnitude advantage over the full contract;
+selector self-tests and the canonical graph contract protect the behavior on the current tree.
 
-This proof includes the resource-model, cap, harness-race, and terminal-publication corrections
-described above. The generated gate ranking and provenance were rebuilt directly from its 78 green
-profile rows.
+## Historical baselines, explicitly superseded
+
+The first timing census at commit `d893100730bb3a7f115724431c6c619be8164dfe` contained 5,734
+distinct cases: 4,604 general, 848 namespace lifecycle, and 282 host lifecycle. It was not green:
+15 general cases failed because of measurement-environment and readiness problems. Its summed
+testcase time was 2,752.713 seconds; measured corrective substitutions produced a 2,410.090-second
+planning estimate. Those values describe the original problem and must not be read as current
+suite counts or performance.
+
+An earlier green graph run, `18d885f0608c7bd9002d2cf9`, contained 78 gates and took 371.650 graph
+seconds, 3,272.204 aggregate step-wall seconds, and 2,916.240 aggregate CPU-seconds. Its dagrun
+differential took 368.428 seconds. The graph subsequently grew to 91 gates and the current evidence
+is run `18d89844a629049200077887`; the 78-gate values are retained only to preserve audit history.
+
+## Open follow-ups
+
+- #27 cross-runner-test-timing: normalize per-case timing beyond pytest.
+- #28 delegated-cpuset: execute live hard-pinning legs under the owning delegated cgroup.
+- #29 delegated-scope-smokes: preserve fresh top-level scope smokes in a containment-safe lane.
+- #30 pidfd-process-ownership: bind agent cleanup to durable kernel process identity.
+- #31 late-fork-census: close the same-UID post-snapshot inheritance race.
+
+#21 validation-overhaul through #26 validation-flakes are closed by the current green full run,
+complete rankings, selection contract, include implementation, and documented follow-up boundary.
