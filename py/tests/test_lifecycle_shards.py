@@ -802,9 +802,16 @@ class _StartedShards:
                 if shards.wait_for is not None:
                     log = Path(getattr(kwargs["stdout"], "name"))
                     deadline = time.monotonic() + 30
-                    while shards.wait_for not in log.read_bytes():
-                        assert self.poll() is None and time.monotonic() < deadline
-                        time.sleep(0.01)
+                    try:
+                        while shards.wait_for not in log.read_bytes():
+                            assert self.poll() is None and time.monotonic() < deadline
+                            time.sleep(0.01)
+                    except BaseException:
+                        # Nothing else has a handle on this shard yet: the runner gets none when
+                        # Popen raises, and close() sees only the recorded ones.
+                        self.kill()
+                        self.wait()
+                        raise
                 shards.started.append(self)
                 shards.after_start(len(shards.started))
 
