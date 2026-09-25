@@ -20,6 +20,10 @@ it (`#32 freshness-pill-overlap`). As the pill's room and the error panel above 
 go, a scrolled reader's line stays where it is on the screen, and a reader at the newest line stays
 there (`#33 error-banner-scroll-shift`).
 
+Opening a thread whose title is longer than the screen, with a long unbroken token and inline code
+in its reply, leaves the page no wider than the viewport and no shown part of the main screen past
+its right edge; on a phone the title is ellipsised instead (`#36 thread-view-phone-overflow`).
+
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
 
@@ -47,6 +51,9 @@ TOKEN = "write-token-browser-cache-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True}
 CACHE_KEY = "vibe-talk.voice.message-cache"
 EPOCH = datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc)
+# `#36 thread-view-phone-overflow`: wider than a phone as words, and unbreakable at its tail.
+LONG_TOKEN = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0-0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+LONG_TITLE = f"Overnight coordinator for the release lane #link {LONG_TOKEN}"
 Json = dict[str, object]
 
 
@@ -85,10 +92,11 @@ class FakeApi:
         self.messages = [
             message(0, "main channel announcement"),
             message(1, "a thread root", root),
-            message(2, "an answer in the thread", {**root, "is_root": False}),
+            message(2, f"an answer in the thread: `{LONG_TOKEN}` and {LONG_TOKEN}",
+                    {**root, "is_root": False}),
         ]
         self.threads = [{
-            "id": root["id"], "root": self.messages[1], "title": "A discussion",
+            "id": root["id"], "root": self.messages[1], "title": LONG_TITLE,
             "reply_count": 1, "reply_count_exact": True,
             "updated_at": self.messages[2]["timestamp"],
         }]
@@ -295,6 +303,26 @@ GEOMETRY_JS = """() => {
     return {problems, area: measured, bare, tabs: shown(tabs)};
 }"""
 
+# `#36 thread-view-phone-overflow`. `problems` is empty when the page is no wider than the viewport
+# and no shown element of the main screen reaches past its right edge; `clipped` says the thread
+# title is ellipsised, which is what a title longer than the screen should do instead.
+WIDTH_JS = """() => {
+    const viewport = document.documentElement.clientWidth;
+    const problems = [];
+    const wide = document.documentElement.scrollWidth;
+    if (wide > viewport) problems.push(`the page is ${wide}px wide in a ${viewport}px viewport`);
+    for (const element of document.querySelectorAll('#screen-main, #screen-main *')) {
+        const box = element.getBoundingClientRect();
+        if (box.width === 0 || element.closest('[hidden]')) continue;
+        if (box.right > viewport + 1) {
+            const name = element.id ? `#${element.id}` : `${element.tagName.toLowerCase()}.${element.className}`;
+            problems.push(`${name} reaches ${Math.round(box.right)}px`);
+        }
+    }
+    const title = document.getElementById('thread-title');
+    return {problems: problems.slice(0, 8), clipped: title.scrollWidth > title.clientWidth};
+}"""
+
 # A phone, the common narrow Android width, and a desk: the desktop regime is `(min-width: 900px) and
 # (pointer: fine)`, so the last is a fine pointer without touch, not a wide phone. Below 360 the
 # pill's longest line is ellipsised, which the "cut short" check would report.
@@ -320,7 +348,7 @@ def main() -> int:
                   " one newest-page read, local view switches, offline and failed states, the pill"
                   " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
                   " held in place as it and the error panel come and go, no Cache Storage or"
-                  " service worker, sign-out clears")
+                  " service worker, a long thread title ellipsised within the viewport, sign-out clears")
     return 0
 
 
@@ -549,6 +577,17 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(cache_names == [], f"Cache Storage holds {cache_names}")
             workers = page.evaluate("() => navigator.serviceWorker.getRegistrations().then(r => r.length)")
             check(workers == 0, f"{workers} service workers are registered")
+
+            # 6b. A thread named longer than the screen: its title is ellipsised, not the page widened.
+            view("threads")
+            page.click("#thread-list > li button.thread-open")
+            page.wait_for_selector("#thread-heading:not([hidden])", timeout=5_000)
+            wait_rows(["201", "202"], "the long-titled thread did not open")
+            found = page.evaluate(WIDTH_JS)
+            shot("6b-long-thread-title")
+            check(not found["problems"], f"{label}, a long-titled thread: {found['problems']}")
+            check(bool(found["clipped"]) or not mobile, f"{label}: the long title was not ellipsised: {found}")
+            page.click("#thread-back")
 
             # 7. Signing out takes the rows off the screen and off the device.
             page.evaluate("() => document.getElementById('forget-token').click()")

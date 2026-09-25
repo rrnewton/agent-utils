@@ -512,6 +512,12 @@ body {
 #screen-main {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
+  /* `#36 thread-view-phone-overflow`. The implicit column is `auto`, which may not shrink below
+     its widest item's min-content width — and #thread-title is `nowrap`, so that is the whole
+     title. A thread named longer than the phone widened the column, and every message row, the
+     composer and the tabs with it, off the right edge instead of ellipsising the title. The
+     same trap as `min-height: 0` above, sideways. */
+  grid-template-columns: minmax(0, 1fr);
   min-height: 0;
   /* The anchor for #scroll-tools, which floats over the bottom corner of the list. It has to be
      THIS element rather than #scroll-area: a child of the scroll area would be faded by the mask
