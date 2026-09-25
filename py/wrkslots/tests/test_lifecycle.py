@@ -14901,6 +14901,80 @@ def test_validate_batch_all_ineligible_reports_zero_censuses(
     assert not wrkslots._validate_batch_seal_journal_path(config).exists()
 
 
+def test_validate_batch_census_deadline_starts_after_seal_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    monotonic_now = 100.0
+    observed_budgets: list[wrkslots._ReadOnlyCommandBudget] = []
+
+    def monotonic() -> float:
+        return monotonic_now
+
+    def advance_during_seal(point: str) -> None:
+        nonlocal monotonic_now
+        if point == "after-validate-batch-seal-target":
+            monotonic_now += 60.0
+
+    def shared(
+        _paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        assert budget is not None
+        assert include_owner_cgroups is False
+        observed_budgets.append(budget)
+        return wrkslots._ProcessPathCensus((), ())
+
+    def fresh(
+        _paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        observed_budgets.append(budget)
+        return wrkslots._ProcessPathCensus((), ())
+
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", advance_during_seal)
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", fresh
+    )
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove-validate-batch",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--slot",
+                "slot01=1",
+                "--format",
+                "json",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["removed"] == [{"generation": 1, "slot": "slot01"}]
+    assert len(observed_budgets) == 2
+    assert observed_budgets[0] is observed_budgets[1]
+    assert observed_budgets[0].deadline == pytest.approx(
+        160.0 + wrkslots._VALIDATE_REMOVE_BATCH_CENSUS_SECONDS
+    )
+    assert observed_budgets[0].stdout_remaining == (
+        wrkslots._PROCESS_CENSUS_OUTPUT_BYTES_LIMIT
+    )
+    assert observed_budgets[0].input_remaining == (
+        wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT
+    )
+
+
 @pytest.mark.parametrize("expiry_point", ("shared", "fresh"))
 def test_validate_batch_census_deadline_restores_seals_before_outer_bound(
     tmp_path: Path,

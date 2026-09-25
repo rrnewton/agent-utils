@@ -402,9 +402,10 @@ _AT_SYMLINK_FOLLOW = 0x400
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 256 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
 _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
-# Keep this provider command inside the intended 30-second integration envelope:
+# Keep post-seal census work inside the intended 30-second integration envelope:
 # one evidence deadline leaves eight seconds for rollback, Git removal, and
-# durable state restoration. The parent batch caller still needs end-to-end timing.
+# durable state restoration. Phase A selects and seals the evidence paths before
+# this clock starts; the parent batch caller still needs end-to-end timing.
 _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 22.0
 _READ_ONLY_COMMAND_REAP_SECONDS = 1.0
 _RECLAIM_LIVE_USE_RECHECK_SECONDS = 0.25
@@ -22069,12 +22070,6 @@ def _remove_validate_batch(
     removed: list[dict[str, object]] = []
     same_uid_census_count = 0
     live_use_recheck = _LiveUseRecheckBudget()
-    census_budget = _ReadOnlyCommandBudget.start(
-        timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
-        stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
-        stderr_limit=64 * 1024,
-        input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
-    )
     try:
         _seal_validate_batch_targets(
             config,
@@ -22090,6 +22085,16 @@ def _remove_validate_batch(
             completed_records,
             removal_proofs,
             single_validate_complete=single_validate_complete,
+        )
+        # Lock acquisition and the exact seal/preflight establish which paths
+        # the census must cover, but are not census work.  Starting this budget
+        # before Phase A made a slow registry preflight consume most or all of
+        # the bounded evidence window before the first observer ran.
+        census_budget = _ReadOnlyCommandBudget.start(
+            timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+            stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
+            stderr_limit=64 * 1024,
+            input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
         )
         private_paths = [
             private_target.path for private_target in private_targets.values()
