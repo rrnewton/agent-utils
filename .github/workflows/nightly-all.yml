@@ -86,6 +86,11 @@ jobs:
       - name: install the tooling the contract runs on
         run: python -m pip install --upgrade 'setuptools>=77' mypy 'playwright==1.61.0' pytest pyyaml types-PyYAML 'websockets>=12'
 
+      # vibe-talk's generated wire contract is checked for staleness and voice.js is type-checked
+      # against it, both with the generator's pinned, lockfile-installed tools (Ajv, TypeScript).
+      - name: install the vibe-talk contract tools
+        run: npm ci --prefix vibe-talk/contract --no-audit --no-fund
+
       # The timeline's browser checks drive a real Chromium, so the runner needs the browser and
       # the suite's dependencies before `validate-all` reaches them. Named as its own step so a
       # download failure reads as a download failure rather than as a test failure.

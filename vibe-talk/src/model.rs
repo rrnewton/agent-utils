@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 /// A Discord channel snowflake, as a string, exactly as Discord renders it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct ChannelId(pub String);
 
 impl ChannelId {
@@ -25,7 +27,9 @@ impl std::fmt::Display for ChannelId {
 }
 
 /// A Discord message snowflake, as a string.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct MessageId(pub String);
 
 impl MessageId {
@@ -84,7 +88,9 @@ const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
 ///
 /// Kept distinct from [`MessageId`] and [`ChannelId`] so the three cannot be passed for one
 /// another: they are all decimal snowflakes, and a wrong one is silently plausible.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct UserId(pub String);
 
 impl UserId {
@@ -111,7 +117,7 @@ impl std::fmt::Display for UserId {
 }
 
 /// One chat message as the rest of the server sees it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Message {
     /// Thread membership supplied by the backend; independent of a reply-to message reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,7 +256,7 @@ pub fn sort_oldest_first(messages: &mut [Message]) {
 }
 
 /// A channel this server is configured to read.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ChannelInfo {
     /// Snowflake of the channel.
     pub id: ChannelId,

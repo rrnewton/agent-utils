@@ -1,6 +1,7 @@
 # TypeScript and shared wire types for vibe-talk
 
-Status: analysis only. This document does not propose changing the shipped build yet.
+Status: analysis, approved. Steps 1-3 and the generated-output gate of step 5 are implemented; see
+`2026-09-25-vibe-talk-typescript-contract.md` for what shipped and what remains.
 
 Tracking: #140 typescript-shared-types
 

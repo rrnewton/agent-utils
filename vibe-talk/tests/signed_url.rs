@@ -325,6 +325,9 @@ async fn the_voice_page_is_public_code_and_carries_no_credential() {
     for (path, needle) in [
         ("/voice", "<title>vibe-talk — voice</title>"),
         ("/voice.js", "/api/v1/voice-session"),
+        // Loaded before voice.js, which decodes every server answer with it; without the route the
+        // page would fail on its first `VibeTalkContract` reference.
+        ("/contract.js", "globalThis.VibeTalkContract"),
         // The page LINKS this file. A missing route would not error anywhere — it would serve a
         // 404 into a <link> and render the app frame as a plain scrolling document, which is
         // exactly the regression the frame exists to remove, and it would look like a CSS bug.

@@ -110,6 +110,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 use crate::chat::{ChatClient, ChatError};
+use crate::contract::{LiveDeleteEvent, LiveMessageEvent, LiveResetEvent};
 use crate::model::{sort_oldest_first, ChannelId, Message, MessageId};
 use crate::state::AppState;
 
@@ -445,34 +446,34 @@ fn message_event(live: &LiveMessage, replayed: bool) -> axum::response::sse::Eve
     // render it but never announce it to a live voice conversation as something that just
     // happened.
     let replayed = replayed || live.historical;
-    let payload = match live.kind {
-        LiveKind::Create | LiveKind::Update => serde_json::json!({
-            "message": live.message,
-            "self_posted": live.self_posted,
-            "replayed": replayed,
-            "untrusted_content_notice": crate::untrusted::NOTICE,
+    let encoded = match live.kind {
+        LiveKind::Create | LiveKind::Update => event.json_data(LiveMessageEvent {
+            message: &live.message,
+            self_posted: live.self_posted,
+            replayed,
+            untrusted_content_notice: crate::untrusted::NOTICE,
         }),
-        LiveKind::Delete => serde_json::json!({
-            "channel_id": live.message.channel_id,
-            "message_id": live.message.id,
-            "replayed": replayed,
+        LiveKind::Delete => event.json_data(LiveDeleteEvent {
+            channel_id: live.message.channel_id.clone(),
+            message_id: live.message.id.clone(),
+            replayed,
         }),
     };
-    event
-        .json_data(payload)
-        // A `Message` is plain data and cannot fail to serialize. If that ever stops being true,
-        // ending the stream with a reset is the honest answer: the page re-reads and sees the
-        // message, rather than being handed a frame it cannot parse.
-        .unwrap_or_else(|_| reset_event(0))
+    // A `Message` is plain data and cannot fail to serialize. If that ever stops being true,
+    // ending the stream with a reset is the honest answer: the page re-reads and sees the
+    // message, rather than being handed a frame it cannot parse.
+    encoded.unwrap_or_else(|_| reset_event(0))
 }
 
 fn reset_event(missed: u64) -> axum::response::sse::Event {
+    let data = serde_json::to_string(&LiveResetEvent {
+        missed,
+        detail: "this subscriber fell behind; re-read the channel rather than resuming",
+    })
+    .unwrap_or_else(|_| format!("{{\"missed\":{missed}}}"));
     axum::response::sse::Event::default()
         .event(EVENT_RESET)
-        .data(format!(
-            "{{\"missed\":{missed},\"detail\":\"this subscriber fell behind; re-read the \
-             channel rather than resuming\"}}"
-        ))
+        .data(data)
 }
 
 fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

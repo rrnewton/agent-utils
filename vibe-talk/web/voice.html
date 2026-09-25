@@ -17,7 +17,8 @@
           display: browser; opting it into standalone separately would restore the long-standing
           iOS microphone re-prompt risk (WebKit 185448, 215884). The app-like feel below is built
           entirely from layout and gesture properties, which need no such declaration.
-        * Any third-party script, font, or stylesheet. Two local files, no CDN, no build step.
+        * Any third-party script, font, or stylesheet. Local files only, no CDN, and nothing built at deploy time: the one generated script
+          (contract.js) is checked in beside the code it validates.
     -->
     <link rel="stylesheet" href="/style.css" />
     <link rel="stylesheet" href="/voice.css" />
@@ -1715,6 +1716,8 @@
       </div>
     </footer>
 
+    <!-- The generated wire-contract validators first: voice.js checks what it receives with them. -->
+    <script src="/contract.js"></script>
     <script src="/voice.js"></script>
   </body>
 </html>

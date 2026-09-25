@@ -5,7 +5,6 @@
 
 use async_trait::async_trait;
 use futures_util::{SinkExt as _, StreamExt as _};
-use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,9 +15,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::config::ConversationConfig;
+use crate::contract::VibeTalkV1ClientFrame;
 
 /// How the web app plays messages with the selected provider.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Playback {
     /// The browser speaks text using the device's speech engine.
@@ -28,7 +28,7 @@ pub enum Playback {
 }
 
 /// Public capabilities of the selected read-aloud provider; never contains credentials.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
 pub struct Description {
     /// Stable provider identifier.
     pub backend: &'static str,
@@ -631,6 +631,12 @@ impl ConversationSpeech {
     }
 }
 
+/// One `vibe-talk-v1` control frame as the text a WebSocket message carries.
+fn frame_text(frame: &VibeTalkV1ClientFrame) -> String {
+    // A tagged enum of strings has no map keys or floats that could fail to encode.
+    serde_json::to_string(frame).unwrap_or_default()
+}
+
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -707,9 +713,9 @@ impl SessionTask {
         self.finish(ending).await;
     }
 
-    async fn send_json(&mut self, frame: serde_json::Value) -> Result<(), Ending> {
+    async fn send_frame(&mut self, frame: &VibeTalkV1ClientFrame) -> Result<(), Ending> {
         self.socket
-            .send(Message::Text(frame.to_string().into()))
+            .send(Message::Text(frame_text(frame).into()))
             .await
             .map_err(|error| Ending::Failed(format!("could not write to the session: {error}")))
     }
@@ -769,7 +775,7 @@ impl SessionTask {
     async fn interrupt(&mut self) -> Result<(), Ending> {
         self.yielding = true;
         self.deadline = tokio::time::Instant::now() + INTERRUPT_ACK_TIMEOUT;
-        self.send_json(json!({ "type": "interrupt" })).await
+        self.send_frame(&VibeTalkV1ClientFrame::Interrupt).await
     }
 
     /// The HTTP response went away (the reader stopped, or the browser dropped the request).
@@ -796,7 +802,7 @@ impl SessionTask {
                 events: read.events.clone(),
                 heard: false,
             });
-            self.send_json(json!({ "type": "prompt", "text": read.prompt }))
+            self.send_frame(&VibeTalkV1ClientFrame::Prompt { text: read.prompt })
                 .await?;
             let _ = read.events.send(TurnEvent::Prompted {
                 turn: self.turns,
@@ -963,7 +969,9 @@ impl SessionTask {
         let _ = tokio::time::timeout(Duration::from_secs(1), async {
             let _ = self
                 .socket
-                .send(Message::Text(json!({ "type": "quit" }).to_string().into()))
+                .send(Message::Text(
+                    frame_text(&VibeTalkV1ClientFrame::Quit).into(),
+                ))
                 .await;
             let _ = self.socket.close(None).await;
         })

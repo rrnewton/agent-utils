@@ -25,7 +25,9 @@ pub enum ThreadApi {
 }
 
 /// A view of one configured channel.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TimelineView {
     /// Messages posted directly to the channel, including thread roots.
@@ -77,7 +79,7 @@ impl Default for TimelineRequest {
 }
 
 /// Thread membership attached to a message without conflating it with a reply reference.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MessageThread {
     /// Opaque thread identifier, scoped to the configured channel.
     pub id: String,
@@ -92,7 +94,7 @@ pub struct MessageThread {
 }
 
 /// One thread in the thread list, independent of the underlying provider's channel model.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ThreadSummary {
     /// Opaque identifier used for reading or posting to this thread.
     pub id: String,
@@ -109,7 +111,7 @@ pub struct ThreadSummary {
 }
 
 /// One complete page from a channel view, never a silently truncated discovery result.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TimelinePage {
     /// Messages for main, flat, or thread views, ordered oldest first.
     pub messages: Vec<Message>,

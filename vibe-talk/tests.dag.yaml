@@ -80,6 +80,20 @@ steps:
       classification: light
       rss_baseline_bytes: 536870912
 
+  # The generated browser contract matches the schema, and voice.js type-checks against it. The
+  # schema's own freshness against the Rust types is a `cargo test` in `test.unit`.
+  - group: check
+    job: contract
+    desc: generated browser contract is current, and tsc --checkJs over voice.js
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && make contract-check typecheck
+    jobs_flag: ""
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 8
+      classification: light
+      rss_baseline_bytes: 536870912
+
   # The physical Android run is opt-in. Its evaluator is not: silence and wrong-language speech
   # are negative controls here, requiring no phone, browser, capture device or STT service.
   - group: check

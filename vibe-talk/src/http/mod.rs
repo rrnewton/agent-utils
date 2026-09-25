@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         .route("/app.js", get(api::app_js))
         .route("/voice", get(api::voice_html))
         .route("/voice.js", get(api::voice_js))
+        .route("/contract.js", get(api::contract_js))
         .route("/voice.css", get(api::voice_css))
         .route("/style.css", get(api::style_css))
         .route("/manifest.webmanifest", get(api::web_manifest))

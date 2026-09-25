@@ -96,7 +96,7 @@ mod bridge {
     pub async fn transcript(socket: &mut Socket, text: &str) {
         socket
             .send(Message::Text(
-                json!({"type": "transcript", "role": "agent", "text": text})
+                json!({"type": "transcript", "role": "assistant", "text": text})
                     .to_string()
                     .into(),
             ))

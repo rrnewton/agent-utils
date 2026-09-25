@@ -10,13 +10,13 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check test page pwa-installability offline-cache-browser read-aloud-browser android-speech-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability offline-cache-browser read-aloud-browser android-speech-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
 # UNBOXED, and deliberately the default: it needs Rust, Node, and the repository's Python typing
 # tools, but no cgroup delegation. `validate-boxed` is the bounded version where cgroups exist.
-validate: fmt check scripts-check test dag-check android-speech-self-test
+validate: fmt check scripts-check contract-check typecheck test dag-check android-speech-self-test
 
 # The complete portable suite, run through dagrun: per-step wall and CPU timeouts, memory caps,
 # and process-tree teardown inside nested cgroups. Container-runtime and alternate-toolchain
@@ -60,6 +60,30 @@ scripts-check:
 	cd .. && python3 -m mypy --config-file py/pyproject.toml --strict \
 		--disallow-any-explicit --disallow-any-decorated vibe-talk
 	cd .. && python3 scripts/check_no_any.py vibe-talk
+
+# THE WIRE CONTRACT. `src/contract.rs` names the JSON the server and the page exchange; the files
+# under contract/ and web/contract.* are generated from it and checked in, so a change to a wire
+# type arrives as a reviewable diff. `contract` regenerates all of them: the schema and samples
+# from the Rust types, then the browser's validators and declarations from the schema, then every
+# contract test against the result. The browser-validator test is skipped while rewriting: it
+# would judge the OLD validators against the NEW samples, and stop the recipe before regenerating.
+# `contract-check` fails, naming the stale file, when the browser files no longer match the
+# schema; `cargo test --test contract` does the same for the schema against the Rust types.
+#
+# Both, and `typecheck`, need the generator's pinned tools: `npm ci --prefix contract` once.
+# Serving the page never does -- web/contract.js is plain checked-in JavaScript.
+contract:
+	VIBE_TALK_UPDATE_CONTRACT=1 cargo test --locked --test contract -- --skip the_browser_validators
+	node contract/generate.mjs
+	cargo test --locked --test contract
+
+contract-check:
+	node contract/generate.mjs --check
+
+# TypeScript checks web/voice.js as JavaScript (checkJs, noEmit) against the generated
+# declarations. Nothing is compiled or bundled; see tsconfig.json.
+typecheck:
+	contract/node_modules/.bin/tsc -p tsconfig.json
 
 # `cargo test` runs BOTH served pages' suites through `node --test` as well as the Rust tests, so
 # this is not only the Rust half. Those suites FAIL rather than skip when node is missing, which is

@@ -1,0 +1,954 @@
+{
+  "$defs": {
+    "ApiErrorBody": {
+      "description": "A JSON error body.",
+      "properties": {
+        "detail": {
+          "description": "Human-readable detail. Never contains a secret.",
+          "type": "string"
+        },
+        "error": {
+          "description": "Stable machine-readable code.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "error",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "ChannelId": {
+      "description": "A Discord channel snowflake, as a string, exactly as Discord renders it.",
+      "type": "string"
+    },
+    "ChannelInfo": {
+      "description": "A channel this server is configured to read.",
+      "properties": {
+        "added": {
+          "default": false,
+          "description": "Whether this channel was added from inside the app rather than named in the configuration\nfile.\n\nThe page needs it for one decision: only an added channel can be REMOVED from the app. A\nconfigured one comes from a file this server reads and never writes, so taking it out here\nwould last until the next restart and then undo itself — the server refuses that, and this\nis what stops the app offering a button whose whole outcome is a refusal.",
+          "type": "boolean"
+        },
+        "alias": {
+          "default": null,
+          "description": "The operator's own local name for this channel, when he has set one. `#39 channel-alias`.\n\n**Local, and only ours.** It lives in this server's store, exactly as read state does; it\nis never sent to Discord, renames nothing there, and no one outside this deployment sees\nit. It is set by the OPERATOR through the web app — never by the voice agent, which would\notherwise be renaming the things it is also reporting on.\n\n`None` means \"no alias\", which is not the same as an empty one: an empty alias is refused\nat the door, and clearing an alias is a separate act that puts [`ChannelInfo::label`] back.\n\nIt is `None` on a channel that came straight from [`crate::config::Config`]; the store\noverlay in [`crate::ops`] is what fills it in, so anything reading configuration directly\n— the startup banner, the preflight probe — still names the label the operator wrote.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "Snowflake of the channel."
+        },
+        "label": {
+          "description": "Human label used in speech and in the web app (\"acme lead team\").\n\nThis one comes from the operator's CONFIGURATION file and cannot be changed at runtime.\nWhat a person actually hears is [`ChannelInfo::display_name`], because `#39 channel-alias`\nlets him rename a channel from inside the app without editing a file or redeploying.",
+          "type": "string"
+        },
+        "writable": {
+          "description": "Whether posting into this channel is permitted at all.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "writable",
+        "alias",
+        "added"
+      ],
+      "type": "object"
+    },
+    "ClientConfigResponse": {
+      "description": "What the web app needs to know at startup.",
+      "properties": {
+        "channel_discovery_supported": {
+          "description": "Whether the selected provider can list its channels for browsing. `#19 channel-browser`.",
+          "type": "boolean"
+        },
+        "channel_registration_supported": {
+          "description": "Whether the selected provider accepts channel links or references and manages registration.",
+          "type": "boolean"
+        },
+        "channels": {
+          "description": "Configured channels.",
+          "items": {
+            "$ref": "#/$defs/ChannelInfo"
+          },
+          "type": "array"
+        },
+        "chat_provider_name": {
+          "description": "Source chat service's human-readable name, supplied by the selected backend.",
+          "type": "string"
+        },
+        "conversational_voice": {
+          "$ref": "#/$defs/VoiceDescription",
+          "description": "Selected conversational voice provider, named by its implementation."
+        },
+        "elevenlabs_agent_id": {
+          "description": "ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public\nwidget. The API key never leaves the server.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "live_delivery": {
+          "$ref": "#/$defs/LiveDelivery",
+          "description": "How changes reach the SSE hub."
+        },
+        "live_poll_seconds": {
+          "description": "Seconds between live ingestion ticks, or `0` when live ingestion is OFF.\n\nThe page needs this to tell the truth about its own channel view. With ingestion off the\nSSE stream attaches and delivers nothing, which is indistinguishable from a quiet channel;\na page that showed a \"live\" indicator on that basis would be claiming a freshness it does\nnot have. Not a secret: it is a property of this deployment, and the caller already holds\na token.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "owner_author_id": {
+          "description": "The READER's own Discord account, when the operator has said what it is.\n\nDistinct from `self_author_id`, which is the BRIDGE's account and is read out of the bot\ntoken. This one cannot be derived from anything the server holds — a bot's account has no\nrelationship to the human reading the channel — so it is absent unless configured. The page\ndraws both as the owner's own words, because they are: one typed into Discord, one dictated\nthrough this bridge.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "read_aloud": {
+          "$ref": "#/$defs/Description",
+          "description": "Selected read-aloud backend and the playback interface the browser should use."
+        },
+        "replay_enabled": {
+          "description": "Whether the operator has allowed an earlier transcript to be replayed into a new call.\n\nThe page needs it BEFORE it has anything to replay: the Settings screen has to describe\nwhat resuming will do, and the control's own note has to say what the next call will be —\nboth of which are questions asked while there is no conversation to fetch.",
+          "type": "boolean"
+        },
+        "self_author_id": {
+          "description": "The Discord account this bridge posts as, when it can be known.\n\nNOT a secret: a bot's user id is visible on every message it has ever sent. It is here so\nthe channel view can tell the owner's own words -- posted on his behalf by this bridge --\nfrom everybody else's, on the FIRST render rather than only after he has replied from the\napp. `None` when the token is not in the shape ids can be read from; the page then falls\nback to learning it the old way.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "speech_prep_enabled": {
+          "description": "Whether this server rewrites message bodies for speech before anything says them.\n\nHere for the same reason as `replay_enabled`: Settings has to be able to describe what this\ndeployment does, and the page cannot infer this one from any message it holds. An empty\n`spoken_content` means \"the rewrite changed nothing\" just as often as it means \"the pass is\noff\" — deliberately, see [`crate::model::Message::spoken_content`] — so a page guessing from\nthe data would tell the operator the feature was off every time the channel was plain prose.\nThey are flipping this switch to compare two runs; guessing is exactly what they cannot do.",
+          "type": "boolean"
+        },
+        "threading_supported": {
+          "description": "Whether the backend supports channel, thread-list, and flattened timelines.",
+          "type": "boolean"
+        },
+        "token_scope": {
+          "$ref": "#/$defs/TokenScope",
+          "description": "The scope of the token that asked.\n\nThe caller's own scope, so it discloses nothing it did not already hold. The page needs it\nto avoid asking for what this token cannot have: stored conversations are write-only (see\nthe conversation routes), and a read-scope page that probed them anyway got a 403 and a\nconsole error on every load. `#38 read-token-conversation-probe`."
+        },
+        "upstream_read_mark_supported": {
+          "description": "Whether the selected provider exposes a write-through read cursor.",
+          "type": "boolean"
+        },
+        "version": {
+          "description": "Server version, so a stale cached page is visible.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "chat_provider_name",
+        "channels",
+        "elevenlabs_agent_id",
+        "conversational_voice",
+        "read_aloud",
+        "version",
+        "replay_enabled",
+        "self_author_id",
+        "owner_author_id",
+        "live_poll_seconds",
+        "live_delivery",
+        "channel_registration_supported",
+        "channel_discovery_supported",
+        "upstream_read_mark_supported",
+        "threading_supported",
+        "speech_prep_enabled",
+        "token_scope"
+      ],
+      "type": "object"
+    },
+    "Description": {
+      "description": "Public capabilities of the selected read-aloud provider; never contains credentials.",
+      "properties": {
+        "backend": {
+          "description": "Stable provider identifier.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Human-readable provider name.",
+          "type": "string"
+        },
+        "local_only": {
+          "description": "Whether browser speech must select a voice advertised as running locally.\nThis is the browser's `localService` flag; the device engine controls actual networking.",
+          "type": "boolean"
+        },
+        "playback": {
+          "$ref": "#/$defs/Playback",
+          "description": "Which playback interface the browser should use."
+        }
+      },
+      "required": [
+        "backend",
+        "label",
+        "playback",
+        "local_only"
+      ],
+      "type": "object"
+    },
+    "LiveDeleteEvent": {
+      "description": "The data of a live stream `message_delete` event: only the ids, never the removed text.",
+      "properties": {
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "Channel the message was removed from."
+        },
+        "message_id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message that was removed."
+        },
+        "replayed": {
+          "description": "Whether it was classified as history rather than news.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "channel_id",
+        "message_id",
+        "replayed"
+      ],
+      "type": "object"
+    },
+    "LiveDelivery": {
+      "description": "How channel changes reach the live stream.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Live ingestion is off; the stream attaches and delivers nothing.",
+          "type": "string"
+        },
+        {
+          "const": "poll",
+          "description": "The server polls the chat provider on an interval.",
+          "type": "string"
+        },
+        {
+          "const": "push",
+          "description": "A provider-neutral adapter pushes changes to the ingest route.",
+          "type": "string"
+        }
+      ]
+    },
+    "LiveMessageEvent": {
+      "description": "The data of a live stream `message` or `message_update` event.",
+      "properties": {
+        "message": {
+          "$ref": "#/$defs/Message",
+          "description": "The message as it now stands. UNTRUSTED: written by whoever is in the channel."
+        },
+        "replayed": {
+          "description": "Whether it was classified as history — a replay or a catch-up — rather than news. The page\nmay render such a message but must not announce it to a live conversation.",
+          "type": "boolean"
+        },
+        "self_posted": {
+          "description": "Whether THIS SERVER posted it; the page must not relay these into a live conversation.",
+          "type": "boolean"
+        },
+        "untrusted_content_notice": {
+          "description": "Standing reminder that the content is third-party text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message",
+        "replayed",
+        "self_posted",
+        "untrusted_content_notice"
+      ],
+      "type": "object"
+    },
+    "LiveResetEvent": {
+      "description": "The data of a live stream `reset` event: the subscriber fell behind the replay tail.",
+      "properties": {
+        "detail": {
+          "description": "What the subscriber should do instead of resuming.",
+          "type": "string"
+        },
+        "missed": {
+          "description": "Events this subscriber missed, or `0` when the count is unknown.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "missed",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "Message": {
+      "description": "One chat message as the rest of the server sees it.",
+      "properties": {
+        "author": {
+          "description": "Display name of the author, as reported by the chat provider.",
+          "type": "string"
+        },
+        "author_id": {
+          "$ref": "#/$defs/UserId",
+          "description": "Snowflake of the author.\n\nThis travels with every rendered message ON PURPOSE, and the alternative — a\n\"look up this display name\" tool — was rejected. Two reasons, in order of importance:\n\n1. **No lookup step, so nothing to guess.** The id arrives ATTACHED to the very message\n   being replied to, so a caller that wants to mention its author already holds the exact\n   snowflake. A lookup tool would put a fuzzy name match between the agent and a real\n   notification, and a hallucinated id pings a stranger.\n2. **It bounds who can be mentioned.** The only ids a caller ever sees are those of people\n   and bots that have actually spoken in an allowlisted channel. A general user-lookup tool\n   would let the agent ping anyone in the server, which is a strictly larger capability\n   than this project wants to hand a voice model.\n\nBots have ids too and they are included: addressing another coding agent by mention is a\nlegitimate thing to want."
+        },
+        "author_is_bot": {
+          "description": "Whether the chat provider flagged the author as a bot.",
+          "type": "boolean"
+        },
+        "channel_id": {
+          "$ref": "#/$defs/ChannelId",
+          "description": "Channel the message was read from, in the provider-neutral application namespace."
+        },
+        "content": {
+          "description": "Raw message body. UNTRUSTED: written by whoever is in the channel.",
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "Snowflake of this message."
+        },
+        "reply_to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The message this one is a reply to, when it is one.\n\nDiscord records a reply on the REPLYING message, as `message_reference.message_id`, and\nnowhere else — there is no \"replies\" field on the message being answered. So \"has this been\nreplied to?\" is not a fact a single message carries; it is derived by looking at what else\nis loaded. That derivation belongs to the reader, which is why this field is the raw pointer\nand not a `has_replies` boolean:\n\n1. **A boolean computed here would be a lie about scope.** The server answers a read with a\n   WINDOW of a channel, so it could only ever mean \"replied to within this window\", and a\n   field named `has_replies` would be believed to mean more than that.\n2. **The pointer is the durable fact.** It is true of the message forever, independently of\n   what else happens to be loaded beside it.\n\n`None` for an ordinary message, and also for a reply whose reference Discord did not\ninclude. Absent is not \"not a reply\"; it is \"no pointer was reported\", and nothing should\npresent the two differently."
+        },
+        "spoken_content": {
+          "description": "The same body rewritten for speech by [`crate::speakable`]: markdown off, instants said the\nway a listener places them, long ids and hashes named. READ THIS ONE ALOUD.\n\nTwo fields for the same reason there are two time fields — they answer different questions.\n`content` is what was written and is what the SCREEN must show, character for character;\nthis is what a voice should say, and saying it costs the reader none of the seconds that\nspelling a nineteen-digit snowflake costs. Neither is a substitute for the other, and a\nrenderer that picked one for both jobs would be wrong in one of them.\n\nUNTRUSTED, exactly as much as `content` is: rewriting a body for speech is not sanitizing it\nfor a prompt, and it still goes through [`crate::untrusted`] on the way to a model.\n\nEMPTY means \"the body to say is the raw body\". That covers two cases on purpose: nothing has\nprepared this message yet — the chat adapters hold no configuration, so [`crate::ops`] is the\nonly filler, the same convention as [`Message::spoken_time`] — and the prepared form came\nback identical, which is the common case for ordinary chat with no markdown and no ids in\nit. One value can mean both because [`Message::spoken_body`] answers them the same way, and\ncollapsing them is what keeps a window of a hundred messages from carrying a hundred\nnear-copies of itself down a phone's connection. When the field IS set, something was\ngenuinely rewritten.",
+          "type": "string"
+        },
+        "spoken_time": {
+          "default": "",
+          "description": "The same instant in the operator's configured zone, already formatted for speech: `09:51`.\nREAD THIS ONE ALOUD.\n\nTwo fields rather than one because they answer different questions, and because a single\nfield would force whoever renders it to choose — which is exactly the choice that produced\nthe bug. Handed an ISO string in UTC, the assistant said \"thirteen fifty-one Eastern Time\":\nit kept the digits and relabelled them. A value that is already correct when read verbatim\nrequires no conversion and admits no such mistake.\n\nNo seconds and no zone label: see [`crate::clock::spoken`], which explains what carrying\nthem cost a listener and what dropping them trades away.\n\nEMPTY means \"not yet stamped\". The Discord layer constructs it empty because it holds no\nconfiguration and therefore does not know the operator's zone; [`crate::ops`] is the only\nfiller. Use [`Message::spoken`] to read it, which falls back to the exact instant rather\nthan to a blank.",
+          "type": "string"
+        },
+        "thread": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageThread"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Thread membership supplied by the backend; independent of a reply-to message reference."
+        },
+        "timestamp": {
+          "description": "The exact instant, ISO-8601, as reported by the chat provider. Compute with this one.\n\nUnrounded on purpose: sub-second precision is ordering information, and anything that has\nto decide which of two messages came first needs it. This field is never spoken; see\n[`Message::spoken_time`] for the one that is.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "channel_id",
+        "author",
+        "author_id",
+        "author_is_bot",
+        "timestamp",
+        "spoken_time",
+        "reply_to",
+        "content"
+      ],
+      "type": "object"
+    },
+    "MessageId": {
+      "description": "A Discord message snowflake, as a string.",
+      "type": "string"
+    },
+    "MessageThread": {
+      "description": "Thread membership attached to a message without conflating it with a reply reference.",
+      "properties": {
+        "id": {
+          "description": "Opaque thread identifier, scoped to the configured channel.",
+          "type": "string"
+        },
+        "is_root": {
+          "description": "Whether this message is the original thread root.",
+          "type": "boolean"
+        },
+        "reply_count": {
+          "description": "Number of replies, when the provider can supply it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reply_count_exact": {
+          "description": "Whether the reply count is exact rather than a provider estimate.",
+          "type": "boolean"
+        },
+        "root_message_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The original channel message, if this provider exposes one."
+        }
+      },
+      "required": [
+        "id",
+        "root_message_id",
+        "is_root",
+        "reply_count",
+        "reply_count_exact"
+      ],
+      "type": "object"
+    },
+    "Playback": {
+      "description": "How the web app plays messages with the selected provider.",
+      "oneOf": [
+        {
+          "const": "browser",
+          "description": "The browser speaks text using the device's speech engine.",
+          "type": "string"
+        },
+        {
+          "const": "audio",
+          "description": "The server returns encoded audio.",
+          "type": "string"
+        }
+      ]
+    },
+    "ThreadSummary": {
+      "description": "One thread in the thread list, independent of the underlying provider's channel model.",
+      "properties": {
+        "id": {
+          "description": "Opaque identifier used for reading or posting to this thread.",
+          "type": "string"
+        },
+        "reply_count": {
+          "description": "Number of replies when known.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reply_count_exact": {
+          "description": "Whether the reported count is exact.",
+          "type": "boolean"
+        },
+        "root": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Message"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The original message, when available and readable."
+        },
+        "title": {
+          "description": "Provider-supplied title, or a neutral fallback.",
+          "type": "string"
+        },
+        "updated_at": {
+          "description": "Latest message activity, as an RFC 3339 timestamp.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "root",
+        "title",
+        "reply_count",
+        "reply_count_exact",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "TimelineResponse": {
+      "description": "A provider-neutral timeline plus this application's channel and read-state metadata.",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "Configured parent channel, including its local alias and write policy."
+        },
+        "dismissed": {
+          "description": "Messages on this page that the reader has archived locally.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "has_more": {
+          "description": "Whether another backward page exists.",
+          "type": "boolean"
+        },
+        "has_threads": {
+          "description": "Whether accessible threads exist in this channel.",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Page size actually requested.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "messages": {
+          "description": "Messages for main, flat, or thread views, ordered oldest first.",
+          "items": {
+            "$ref": "#/$defs/Message"
+          },
+          "type": "array"
+        },
+        "next_before": {
+          "description": "Opaque continuation, present exactly when another page exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notice": {
+          "description": "Relevant provider limitation or scope information, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "returned": {
+          "description": "Entries on this page, never a channel-wide total.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "thread": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The selected thread, for the thread view."
+        },
+        "threads": {
+          "description": "Summaries for the threads view, ordered by last activity oldest first.",
+          "items": {
+            "$ref": "#/$defs/ThreadSummary"
+          },
+          "type": "array"
+        },
+        "untrusted_content_notice": {
+          "description": "Channel content remains untrusted data in every view.",
+          "type": "string"
+        },
+        "view": {
+          "$ref": "#/$defs/TimelineView",
+          "description": "View represented by this page."
+        }
+      },
+      "required": [
+        "channel",
+        "view",
+        "limit",
+        "returned",
+        "messages",
+        "threads",
+        "thread",
+        "has_threads",
+        "has_more",
+        "next_before",
+        "notice",
+        "dismissed",
+        "untrusted_content_notice"
+      ],
+      "type": "object"
+    },
+    "TimelineView": {
+      "description": "A view of one configured channel.",
+      "oneOf": [
+        {
+          "const": "main",
+          "description": "Messages posted directly to the channel, including thread roots.",
+          "type": "string"
+        },
+        {
+          "const": "threads",
+          "description": "Thread summaries, ordered by their latest message activity.",
+          "type": "string"
+        },
+        {
+          "const": "flat",
+          "description": "Channel messages and all accessible thread messages in one chronological history.",
+          "type": "string"
+        },
+        {
+          "const": "thread",
+          "description": "The history of one explicitly selected thread.",
+          "type": "string"
+        }
+      ]
+    },
+    "TokenScope": {
+      "description": "The scope of the credential that made a request.",
+      "oneOf": [
+        {
+          "const": "read",
+          "description": "May read channel history and summaries.",
+          "type": "string"
+        },
+        {
+          "const": "write",
+          "description": "May also post, and may use the write-only conversation routes.",
+          "type": "string"
+        }
+      ]
+    },
+    "TranscriptRole": {
+      "description": "Who spoke a `vibe-talk-v1` transcript line.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "The person on the call.",
+          "type": "string"
+        },
+        {
+          "const": "assistant",
+          "description": "The voice agent.",
+          "type": "string"
+        }
+      ]
+    },
+    "UserId": {
+      "description": "A Discord user snowflake, as a string.\n\nKept distinct from [`MessageId`] and [`ChannelId`] so the three cannot be passed for one\nanother: they are all decimal snowflakes, and a wrong one is silently plausible.",
+      "type": "string"
+    },
+    "VibeTalkV1ClientFrame": {
+      "description": "A JSON control frame a `vibe-talk-v1` client sends. Microphone audio travels separately, as\nbinary PCM at the session's input rate.",
+      "oneOf": [
+        {
+          "description": "Microphone frames follow.",
+          "properties": {
+            "type": {
+              "const": "audio_start",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The open microphone segment is over; the server answers with `turn_complete`.",
+          "properties": {
+            "type": {
+              "const": "audio_end",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One typed turn.",
+          "properties": {
+            "text": {
+              "description": "What the person typed.",
+              "type": "string"
+            },
+            "type": {
+              "const": "prompt",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Stop the running turn. The server answers with exactly one interrupted `turn_complete`, or\nignores this when nothing is running.",
+          "properties": {
+            "type": {
+              "const": "interrupt",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "End the session.",
+          "properties": {
+            "type": {
+              "const": "quit",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VibeTalkV1ServerFrame": {
+      "description": "A JSON control frame a `vibe-talk-v1` server sends. Audio travels separately, as binary frames\nof 24 kHz, 16-bit little-endian mono PCM.\n\nA client ignores a `type` it does not know, so a new frame type is backward compatible; a\nchanged field of a known type is not.",
+      "oneOf": [
+        {
+          "description": "The session is ready. Always the first frame.",
+          "properties": {
+            "greeting": {
+              "description": "Whether the agent speaks first. When true, a voice client withholds microphone frames\nuntil the first `turn_complete`. Absent means false.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "session_id": {
+              "description": "Provider session identifier, for connection details only.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "session_started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Recognised or generated speech text.",
+          "properties": {
+            "final": {
+              "description": "False for a streaming hypothesis the provider may still correct. Absent means true, so\na provider that only sends finished text needs no change.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "role": {
+              "$ref": "#/$defs/TranscriptRole",
+              "description": "Who said it."
+            },
+            "text": {
+              "description": "The words, or the current hypothesis of them.",
+              "type": "string"
+            },
+            "turn": {
+              "description": "The turn this text belongs to. A frame without one cannot be matched and is treated as\nits own turn.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "transcript",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "role",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Every accepted prompt, and every closed audio segment, ends with exactly one of these.",
+          "properties": {
+            "interrupted": {
+              "description": "True when an `interrupt` cut the turn short.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "turn": {
+              "description": "The turn that ended.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "turn_complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The provider failed. No `turn_complete` follows, so a client treats this as the end of the\nsession.",
+          "properties": {
+            "detail": {
+              "description": "Additional detail, when the provider has any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "What went wrong, in words.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VoiceDescription": {
+      "description": "Stable provider details that can be shown before a session is opened.",
+      "properties": {
+        "instance_id": {
+          "description": "Provider instance identifier, when one exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Human-readable provider name.",
+          "type": "string"
+        },
+        "settings_url": {
+          "description": "Provider console for the configured agent, when one exists.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "VoiceSession": {
+      "description": "A browser-ready conversational voice session.",
+      "properties": {
+        "input_sample_rate": {
+          "description": "Microphone PCM sample rate expected by the provider.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_sample_rate": {
+          "description": "Speaker PCM sample rate emitted by the provider.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocol": {
+          "description": "Wire protocol spoken on the socket.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "Human-readable provider label for connection details.",
+          "type": "string"
+        },
+        "valid_for_seconds": {
+          "description": "Endpoint validity when the provider issues expiring URLs.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "websocket_url": {
+          "description": "WebSocket endpoint for this conversation.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "websocket_url",
+        "protocol",
+        "provider",
+        "input_sample_rate",
+        "output_sample_rate"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/rrnewton/agent-utils/vibe-talk/contract/vibe-talk.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/ApiErrorBody"
+    },
+    {
+      "$ref": "#/$defs/ClientConfigResponse"
+    },
+    {
+      "$ref": "#/$defs/VoiceSession"
+    },
+    {
+      "$ref": "#/$defs/TimelineResponse"
+    },
+    {
+      "$ref": "#/$defs/LiveMessageEvent"
+    },
+    {
+      "$ref": "#/$defs/LiveDeleteEvent"
+    },
+    {
+      "$ref": "#/$defs/LiveResetEvent"
+    },
+    {
+      "$ref": "#/$defs/VibeTalkV1ServerFrame"
+    },
+    {
+      "$ref": "#/$defs/VibeTalkV1ClientFrame"
+    },
+    {
+      "$ref": "#/$defs/Message"
+    },
+    {
+      "$ref": "#/$defs/ThreadSummary"
+    }
+  ],
+  "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",
+  "title": "vibe-talk wire contract"
+}

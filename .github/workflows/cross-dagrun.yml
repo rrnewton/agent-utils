@@ -29,6 +29,7 @@ jobs:
       browser: ${{ steps.select.outputs.browser }}
       python: ${{ steps.select.outputs.python }}
       rust: ${{ steps.select.outputs.rust }}
+      contract: ${{ steps.select.outputs.contract }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -55,12 +56,13 @@ jobs:
           echo "validate_args=$args" >> "$GITHUB_OUTPUT"
           python3 scripts/validate.py $args --list > /tmp/validation-plan.txt
           cat /tmp/validation-plan.txt
-          for group in browser python rust; do
+          for group in browser python rust contract; do
             selected=false
             case "$group" in
               browser) pattern='NEED +resource:browser' ;;
               python) pattern='RUN +(python|workspace)' ;;
               rust) pattern='RUN +(rust|workspace)' ;;
+              contract) pattern='STEP +vibe-talk\.check\.contract$' ;;
             esac
             if [[ "$args" == --all ]] || grep -Eq "$pattern" /tmp/validation-plan.txt; then
               selected=true
@@ -106,6 +108,11 @@ jobs:
         # PyYAML is a workspace runtime dep; Playwright and websockets are optional vibe-talk
         # runtime deps. All three must be installed for the repository-wide strict mypy gate.
         run: python -m pip install --upgrade 'setuptools>=77' mypy 'playwright==1.61.0' pytest pyyaml types-PyYAML 'websockets>=12'
+      # vibe-talk's generated wire contract is checked for staleness and voice.js is type-checked
+      # against it, both with the generator's pinned, lockfile-installed tools (Ajv, TypeScript).
+      - name: install the vibe-talk contract tools
+        if: needs.plan.outputs.contract == 'true'
+        run: npm ci --prefix vibe-talk/contract --no-audit --no-fund
       - name: install Chromium only when the selected graph needs it
         if: needs.plan.outputs.browser == 'true'
         working-directory: py/tests/js/browser

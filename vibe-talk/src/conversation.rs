@@ -12,7 +12,7 @@ use crate::config::{ConversationBackend, ConversationConfig, ElevenLabsConfig};
 use crate::elevenlabs::{SignedUrlError, SignedUrlProvider};
 
 /// Stable provider details that can be shown before a session is opened.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct VoiceDescription {
     /// Human-readable provider name.
     pub name: String,
@@ -25,7 +25,7 @@ pub struct VoiceDescription {
 }
 
 /// A browser-ready conversational voice session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct VoiceSession {
     /// WebSocket endpoint for this conversation.
     pub websocket_url: String,

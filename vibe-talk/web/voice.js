@@ -42,7 +42,57 @@ const MARKER_KEY = "vibe-talk.voice.place-marker";
 const COMBINE_KEY = "vibe-talk.voice.combine";
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
-const el = (id) => document.getElementById(id);
+// The element with this id. Form controls are typed by their tag in voice.html, so the checker
+// knows `.value` and `.checked` exist; tests/js/contract.test.mjs keeps these lists equal to the
+// page's real controls.
+/**
+ * @overload
+ * @param {"api-token" | "channel-alias" | "channel-directory-search" | "combine-messages"
+ *   | "compose-text" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
+ *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
+ *   | "new-channel-writable" | "read-speed-range" | "reading-width" | "resume-toggle"
+ *   | "search-field"} id
+ * @returns {HTMLInputElement}
+ */
+/**
+ * @overload
+ * @param {"channel-compose-text" | "prompt-blockers" | "prompt-summary" | "reply-text"} id
+ * @returns {HTMLTextAreaElement}
+ */
+/**
+ * @overload
+ * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-channel"} id
+ * @returns {HTMLSelectElement}
+ */
+/**
+ * @overload
+ * @param {"add-channel" | "audio-source" | "cancel-add-channel" | "cancel-rename" | "canned-blockers"
+ *   | "canned-summary" | "channel-directory-more" | "channel-directory-retry" | "channel-send"
+ *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
+ *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
+ *   | "close-settings" | "collapse-all" | "dismiss-banner" | "dismiss-error" | "dismiss-status"
+ *   | "expand-all" | "forget-conversations" | "forget-token" | "hang-up"
+ *   | "help-link-canned-prompts" | "help-link-channel-alias" | "help-link-combining"
+ *   | "help-link-connection" | "help-link-control-bar" | "help-link-identities"
+ *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
+ *   | "help-link-reading-width" | "help-link-resuming" | "help-link-speech-prep"
+ *   | "help-link-storage" | "jump-marker" | "jump-newest" | "load-older" | "load-older-turns"
+ *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
+ *   | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
+ *   | "rename-channel" | "reply-cancel" | "reply-send" | "save-alias" | "save-token"
+ *   | "search-toggle" | "send-text" | "speaker" | "summarise" | "talk" | "text-entry"
+ *   | "thread-back" | "todo-filter" | "undo-dismiss" | "view-switch"} id
+ * @returns {HTMLButtonElement}
+ */
+/**
+ * @overload
+ * @param {string} id
+ * @returns {HTMLElement}
+ */
+/** @param {string} id */
+function el(id) {
+  return document.getElementById(id);
+}
 
 // ONE status line. It used to be two — a word under the header and a sentence at the foot — which
 // is how the closed state managed to announce itself three times in three vocabularies. The
@@ -1940,13 +1990,13 @@ function advanceVibeTalkInput() {
     session.capturePaused = true;
     session.waitingForAudioEnd = true;
     session.audioSegmentActive = false;
-    session.socket.send(JSON.stringify({ type: "audio_end" }));
+    sendVibeTalkFrame({ type: "audio_end" });
     setStatus("Finishing the spoken turn…");
     return;
   }
   const text = session.pendingPrompts.shift();
   session.typedTurnInFlight = true;
-  session.socket.send(JSON.stringify({ type: "prompt", text }));
+  sendVibeTalkFrame({ type: "prompt", text });
   setStatus("Waiting for the assistant…");
   armNoReply();
 }
@@ -1964,6 +2014,19 @@ function noteReplyArriving() {
   if (session.chat && !session.typedTurnInFlight && session.pendingPrompts.length > 0) {
     armNoReply();
   }
+}
+
+/**
+ * One `vibe-talk-v1` control frame onto the conversation socket.
+ *
+ * Every JSON frame this page sends on that protocol comes through here, typed against the
+ * generated contract, so the checker refuses a frame type or field the protocol does not define.
+ * Readiness stays with the callers, which already know which state the session is in.
+ *
+ * @param {VibeTalk.VibeTalkV1ClientFrame} frame
+ */
+function sendVibeTalkFrame(frame) {
+  session.socket.send(JSON.stringify(frame));
 }
 
 /** Is there a live conversation for a client event or typed text to reach? */
@@ -2300,6 +2363,18 @@ function setPromptsOpen(open) {
 // --- the server ------------------------------------------------------------------------------
 
 /**
+ * What {@link api} throws: an ordinary Error, plus the facts a caller branches on.
+ *
+ * @typedef {Error & {
+ *   network?: boolean,
+ *   refused?: boolean,
+ *   status?: number,
+ *   code?: string,
+ *   detail?: string,
+ * }} ApiRequestError
+ */
+
+/**
  * One request to vibe-talk, with the token, and one error taxonomy out of it.
  *
  * The server answers with a real taxonomy — 503 `elevenlabs_not_configured` names the exact
@@ -2324,9 +2399,9 @@ async function api(path, options) {
     response = await fetch(path, init);
   } catch (cause) {
     const action = init.method === "GET" ? "loading data" : "saving your change";
-    const error = new Error(
+    const error = /** @type {ApiRequestError} */ (new Error(
       `Could not reach vibe-talk while ${action}. Your current screen is still available; retry when the connection recovers.`
-    );
+    ));
     error.cause = cause;
     error.network = true;
     throw error;
@@ -2339,9 +2414,13 @@ async function api(path, options) {
     throw new Error(`vibe-talk returned non-JSON (HTTP ${response.status})`);
   }
   if (!response.ok) {
-    const detail = payload && payload.detail ? payload.detail : "(no detail)";
-    const code = payload && payload.error ? payload.error : "error";
-    const error = new Error(`HTTP ${response.status} ${code}: ${detail}`);
+    // The server's error body is part of the wire contract. Anything else on a failed response —
+    // a proxy's page, a gateway's JSON — is not this server speaking, so it names no code of its
+    // own and the status line says so rather than inventing one.
+    const body = VibeTalkContract.is("ApiErrorBody", payload) ? payload : null;
+    const detail = body && body.detail ? body.detail : "(no detail)";
+    const code = body && body.error ? body.error : "error";
+    const error = /** @type {ApiRequestError} */ (new Error(`HTTP ${response.status} ${code}: ${detail}`));
     // Only these two mean "your token is wrong". Everything else means the server is unhappy for
     // a reason that signing in again will not fix, and bouncing the owner back to the sign-in
     // screen for those would be a lie about which thing is broken.
@@ -2362,10 +2441,38 @@ async function api(path, options) {
     // diagnosis. `error.message` is the right thing on a status line, where the code and the
     // status are what an operator acts on; it is the wrong thing in a standing sentence that a
     // reader is meant to understand.
-    error.detail = payload && payload.detail ? payload.detail : "";
+    error.detail = body && body.detail ? body.detail : "";
     throw error;
   }
   return payload;
+}
+
+/**
+ * {@link api}, with the answer checked against the wire contract before anything reads it.
+ *
+ * The page and the server ship in one binary, so a body that does not match is a defect — or
+ * something between them rewriting it — rather than version skew to tolerate. It fails the way the
+ * request itself would have: one error, whose sentence names the type and the field that is wrong,
+ * instead of a missing property surfacing as `undefined` somewhere far from the cause.
+ *
+ * @template {keyof VibeTalk.Contract} K
+ * @param {K} type the contract type the route answers with
+ * @param {string} path
+ * @param {{method?: string, body?: unknown, signal?: AbortSignal}} [options]
+ * @returns {Promise<VibeTalk.Contract[K]>}
+ */
+async function apiDecoded(type, path, options) {
+  const payload = await api(path, options);
+  try {
+    return VibeTalkContract.decode(type, payload);
+  } catch (cause) {
+    const error = /** @type {ApiRequestError} */ (new Error(
+      `vibe-talk returned a malformed answer — ${cause.message}. Reload the page; if this persists, ` +
+        `the page and the server disagree about the wire format.`
+    ));
+    error.cause = cause;
+    throw error;
+  }
 }
 
 // --- the durable transcript --------------------------------------------------------------------
@@ -2737,8 +2844,8 @@ async function openVoiceSession() {
   if (!token()) {
     throw new Error("no API token saved on this phone yet");
   }
-  const payload = await api("/api/v1/voice-session");
-  if (!payload || !payload.websocket_url) {
+  const payload = await apiDecoded("VoiceSession", "/api/v1/voice-session");
+  if (!payload.websocket_url) {
     throw new Error("vibe-talk answered without a voice WebSocket URL");
   }
   return payload;
@@ -2868,7 +2975,7 @@ const DEFAULT_MIC_SETTINGS = {
 function micSettings() {
   const settings = {};
   for (const [id, key] of MIC_TOGGLES) {
-    settings[key] = el(id).checked === true;
+    settings[key] = /** @type {HTMLInputElement} */ (el(id)).checked === true;
   }
   return settings;
 }
@@ -3074,7 +3181,7 @@ function renderControlBar() {
   // member is an entry rather than a branch, and so that "does the bar fit on a 375px phone"
   // is a question something can be asked. A member with no entry is a mistake rather than a
   // default: see the loop below.
-  for (const member of el("bar-pack").children) {
+  for (const member of /** @type {HTMLCollectionOf<HTMLElement>} */ (el("bar-pack").children)) {
     const views = PACK_VIEWS[member.id] || [];
     const unavailable = member.id === "audio-source" && agentReadAloud === null;
     member.hidden = unavailable || !main || !views.includes(currentView) ||
@@ -3094,7 +3201,7 @@ function renderControlBar() {
     el("view-switch"),
     el("compose-text"),
     el("send-text"),
-    ...el("bar-pack").children,
+    .../** @type {HTMLCollectionOf<HTMLElement>} */ (el("bar-pack").children),
   ];
   // `#129 message-search`. On the main screen and nowhere else: there is nothing to filter on
   // Settings, Help or the reply screen, and on the sign-in screen there is nothing at all. Not
@@ -3587,15 +3694,27 @@ async function start(options) {
     // in the console, which is exactly where this page's failures used to go to die. Against the
     // in-page wire fake that could not happen; against a real socket it is one negotiated setting
     // away.
+    //
+    // A `vibe-talk-v1` frame is checked against the public contract first. A `type` this page does
+    // not know is ignored, as the protocol promises a newer server; a known type in the wrong shape
+    // is a peer this page cannot follow, and says so here rather than as a missing field later.
+    // That refusal is the peer's error, so it is reported as one: a refused `turn_complete` would
+    // otherwise leave the no-reply timer to call a talking service silent.
+    let frame = null;
     try {
       if (session.protocol === "vibe-talk-v1") {
-        handleVibeTalk(message);
+        frame = VibeTalkContract.decodeTagged("VibeTalkV1ServerFrame", message);
+        if (frame !== null) handleVibeTalk(frame);
       } else {
         handle(socket, message);
       }
     } catch (error) {
       showError(error.message);
       setStatus("the agent sent something this page cannot handle");
+      if (session.protocol === "vibe-talk-v1" && frame === null) {
+        noteAgentError();
+        reportHealth("error_frame");
+      }
     }
   };
 
@@ -4171,6 +4290,7 @@ function postHealth(cause) {
   }).catch(() => {});
 }
 
+/** @param {VibeTalk.VibeTalkV1ServerFrame} message */
 function handleVibeTalk(message) {
   switch (message.type) {
     case "session_started": {
@@ -4198,7 +4318,7 @@ function handleVibeTalk(message) {
       }
       session.capturePaused = session.waitingForGreeting;
       session.audioSegmentActive = true;
-      session.socket.send(JSON.stringify({ type: "audio_start" }));
+      sendVibeTalkFrame({ type: "audio_start" });
       if (!session.node) {
         startCapture(session.socket);
       }
@@ -4279,7 +4399,7 @@ function vibeTalkTurnComplete() {
     } else {
       session.audioSegmentActive = true;
       session.capturePaused = false;
-      session.socket.send(JSON.stringify({ type: "audio_start" }));
+      sendVibeTalkFrame({ type: "audio_start" });
       setStatus("Connected — say something.");
     }
     return;
@@ -4409,8 +4529,8 @@ function stop() {
     return;
   }
   if (session.protocol === "vibe-talk-v1" && session.socket.readyState === WebSocket.OPEN) {
-    session.socket.send(JSON.stringify({ type: "audio_end" }));
-    session.socket.send(JSON.stringify({ type: "quit" }));
+    sendVibeTalkFrame({ type: "audio_end" });
+    sendVibeTalkFrame({ type: "quit" });
   }
   session.socket.close();
   setStatus("Call ended.");
@@ -4772,6 +4892,18 @@ function dropMessageCache() {
 const cachedRowsValid = (rows) => Array.isArray(rows) && rows.every((row) =>
   row !== null && typeof row === "object" && (typeof row.id === "string" || typeof row.id === "number"));
 
+/**
+ * Saved messages and thread cards are server rows held across a reload, and storage is a boundary
+ * like the network: another version of this page, an interrupted write, or anything else with
+ * access to the origin may have left them. Each row must still match the wire contract, or its
+ * entry is dropped exactly as a damaged one always was — the channel then reads fresh.
+ *
+ * @param {unknown} rows
+ * @param {"Message" | "ThreadSummary"} type
+ */
+const cachedWireRowsValid = (rows, type) =>
+  Array.isArray(rows) && rows.every((row) => VibeTalkContract.is(type, row));
+
 const coverageValid = (views) => views !== null && typeof views === "object" && !Array.isArray(views) &&
   Object.values(views).every((cover) => cover !== null && typeof cover === "object" &&
     (cover.floor === null || Number.isFinite(cover.floor)) && typeof cover.more === "boolean" &&
@@ -4779,7 +4911,8 @@ const coverageValid = (views) => views !== null && typeof views === "object" && 
 
 function validCacheEntry(entry) {
   if (entry === null || typeof entry !== "object" || !Number.isFinite(entry.usedAt) ||
-      !cachedRowsValid(entry.messages) || !cachedRowsValid(entry.threads) ||
+      !cachedWireRowsValid(entry.messages, "Message") ||
+      !cachedWireRowsValid(entry.threads, "ThreadSummary") ||
       !Array.isArray(entry.dismissed)) return false;
   if (entry.mode === "timeline") return coverageValid(entry.views) && typeof entry.hasThreads === "boolean";
   return entry.mode === "page" && Number.isFinite(entry.savedAt) && typeof entry.more === "boolean";
@@ -5740,7 +5873,7 @@ async function loadTimeline(options) {
   const position = channelReadPosition(area);
   renderChannelLoading(true);
   try {
-    const payload = await api(timelinePath());
+    const payload = await apiDecoded("TimelineResponse", timelinePath());
     if (generation !== discordLoadGeneration || context !== channelContextKey()) {
       foldLateTimelinePage(payload, { context, channel, view, thread, canon });
       return;
@@ -5803,7 +5936,7 @@ async function loadOlderTimeline() {
   olderFetchInFlight = true;
   renderOlderControl();
   try {
-    const payload = await api(timelinePath(discordOlderCursor));
+    const payload = await apiDecoded("TimelineResponse", timelinePath(discordOlderCursor));
     if (context !== channelContextKey() || generation !== discordLoadGeneration) return;
     olderFetchInFlight = false;
     preservingScroll(() => applyTimelinePage(payload, true));
@@ -9585,8 +9718,14 @@ async function refreshAfterInboxChange() {
 
 // Keep writes ordered while every visible result happens immediately. This prevents a quick run
 // of Done taps from occupying every provider-adapter worker even against an older server.
+/** @type {Promise<unknown>} */
 let inboxWriteTail = Promise.resolve();
 
+/**
+ * @template T
+ * @param {() => Promise<T>} task
+ * @returns {Promise<T>}
+ */
 function queueInboxWrite(task) {
   const run = inboxWriteTail.then(task, task);
   inboxWriteTail = run.catch(() => {});
@@ -10604,11 +10743,14 @@ function onStreamFrame(frame) {
   if (frame.event !== "message") {
     return;
   }
-  const message = payload && payload.message;
-  if (!message || message.id === undefined || message.id === null) {
+  // Checked against the contract before any of it is believed. A malformed event cannot be
+  // rendered, but it still says the channel changed, so the answer is the authoritative re-read an
+  // edit gets — never silently dropping what may be a real message.
+  if (!VibeTalkContract.is("LiveMessageEvent", payload)) {
+    refreshAfterLiveMutation();
     return;
   }
-  receiveLiveMessage(message, payload.self_posted === true, payload.replayed === true);
+  receiveLiveMessage(payload.message, payload.self_posted, payload.replayed);
 }
 
 let liveMutationRefreshRunning = false;
@@ -10710,7 +10852,7 @@ function receiveLiveMessage(message, selfPosted, replayed) {
 
 /** The label the channel select shows for a snowflake, or the snowflake itself. */
 function channelLabel(channelId) {
-  const option = [...el("discord-channel").children].find(
+  const option = /** @type {HTMLOptionElement[]} */ ([...el("discord-channel").children]).find(
     (child) => child.value === String(channelId)
   );
   return option ? option.textContent : String(channelId);
@@ -11583,9 +11725,10 @@ async function signIn() {
     showScreen("signin");
     return false;
   }
+  /** @type {VibeTalk.ClientConfigResponse | null} */
   let config = null;
   try {
-    config = await api("/api/v1/client-config");
+    config = await apiDecoded("ClientConfigResponse", "/api/v1/client-config");
   } catch (error) {
     if (error.refused) {
       // Whatever this credential read before, it can no longer read it.
@@ -11700,7 +11843,7 @@ el("forget-token").addEventListener("click", forgetToken);
 // The checkboxes are the live truth `start()` reads, so they are what gets restored on load.
 const restoredMicSettings = storedMicSettings();
 for (const [id, key] of MIC_TOGGLES) {
-  el(id).checked = restoredMicSettings[key];
+  /** @type {HTMLInputElement} */ (el(id)).checked = restoredMicSettings[key];
   el(id).addEventListener("change", micSettingsChanged);
 }
 
@@ -11870,7 +12013,7 @@ el("compose-text").addEventListener("input", noteComposing);
 // `#api-token` is: text inside a <textarea> in the markup is its child text, and `.value` and the
 // markup would then be two different answers to "what does this button send".
 for (const entry of CANNED_PROMPTS) {
-  el(entry.field).value = storedPrompts()[entry.key];
+  /** @type {HTMLTextAreaElement} */ (el(entry.field)).value = storedPrompts()[entry.key];
   el(entry.field).addEventListener("change", promptsChanged);
   el(entry.button).addEventListener("click", () => {
     // Shut FIRST, and whether or not the send goes. Choosing from a menu closes it — and when the
@@ -11949,7 +12092,7 @@ el("channel-compose-text").addEventListener("keydown", (event) => {
 let threadBackGesture = null;
 el("scroll-area").addEventListener("pointerdown", (event) => {
   if (channelView !== "thread" || event.pointerType === "mouse") return;
-  if (["TEXTAREA", "INPUT", "BUTTON"].includes(String(event.target && event.target.tagName).toUpperCase())) return;
+  if (["TEXTAREA", "INPUT", "BUTTON"].includes(String(event.target && /** @type {Element} */ (event.target).tagName).toUpperCase())) return;
   threadBackGesture = { x: event.clientX, y: event.clientY };
 });
 el("scroll-area").addEventListener("pointerup", (event) => {

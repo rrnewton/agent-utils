@@ -25,14 +25,8 @@ use crate::store::{ConversationId, ConversationSummary, ReadMark, Speaker, Store
 use crate::summary::DigestEntry;
 use crate::untrusted;
 
-/// A JSON error body.
-#[derive(Debug, Serialize)]
-pub struct ApiErrorBody {
-    /// Stable machine-readable code.
-    pub error: &'static str,
-    /// Human-readable detail. Never contains a secret.
-    pub detail: String,
-}
+use crate::contract::LiveDelivery;
+pub use crate::contract::{ApiErrorBody, ClientConfigResponse, TimelineResponse};
 
 /// An error that can be returned to a caller.
 #[derive(Debug)]
@@ -518,80 +512,6 @@ pub async fn agent_tools(
     Ok(Json(serde_json::json!({ "tools": manifest })))
 }
 
-/// What the web app needs to know at startup.
-#[derive(Debug, Serialize)]
-pub struct ClientConfigResponse {
-    /// Source chat service's human-readable name, supplied by the selected backend.
-    pub chat_provider_name: String,
-    /// Configured channels.
-    pub channels: Vec<ChannelInfo>,
-    /// ElevenLabs agent id, when the deployment has one. Not a secret: it identifies a public
-    /// widget. The API key never leaves the server.
-    pub elevenlabs_agent_id: Option<String>,
-    /// Selected conversational voice provider, named by its implementation.
-    pub conversational_voice: crate::conversation::VoiceDescription,
-    /// Selected read-aloud backend and the playback interface the browser should use.
-    pub read_aloud: crate::speech::Description,
-    /// Server version, so a stale cached page is visible.
-    pub version: &'static str,
-    /// Whether the operator has allowed an earlier transcript to be replayed into a new call.
-    ///
-    /// The page needs it BEFORE it has anything to replay: the Settings screen has to describe
-    /// what resuming will do, and the control's own note has to say what the next call will be —
-    /// both of which are questions asked while there is no conversation to fetch.
-    pub replay_enabled: bool,
-    /// The Discord account this bridge posts as, when it can be known.
-    ///
-    /// NOT a secret: a bot's user id is visible on every message it has ever sent. It is here so
-    /// the channel view can tell the owner's own words -- posted on his behalf by this bridge --
-    /// from everybody else's, on the FIRST render rather than only after he has replied from the
-    /// app. `None` when the token is not in the shape ids can be read from; the page then falls
-    /// back to learning it the old way.
-    pub self_author_id: Option<String>,
-    /// The READER's own Discord account, when the operator has said what it is.
-    ///
-    /// Distinct from `self_author_id`, which is the BRIDGE's account and is read out of the bot
-    /// token. This one cannot be derived from anything the server holds — a bot's account has no
-    /// relationship to the human reading the channel — so it is absent unless configured. The page
-    /// draws both as the owner's own words, because they are: one typed into Discord, one dictated
-    /// through this bridge.
-    pub owner_author_id: Option<String>,
-    /// Seconds between live ingestion ticks, or `0` when live ingestion is OFF.
-    ///
-    /// The page needs this to tell the truth about its own channel view. With ingestion off the
-    /// SSE stream attaches and delivers nothing, which is indistinguishable from a quiet channel;
-    /// a page that showed a "live" indicator on that basis would be claiming a freshness it does
-    /// not have. Not a secret: it is a property of this deployment, and the caller already holds
-    /// a token.
-    pub live_poll_seconds: u64,
-    /// How changes reach the SSE hub: `off`, `poll`, or provider-neutral `push` ingestion.
-    pub live_delivery: &'static str,
-    /// Whether the selected provider accepts channel links or references and manages registration.
-    pub channel_registration_supported: bool,
-    /// Whether the selected provider can list its channels for browsing. `#19 channel-browser`.
-    pub channel_discovery_supported: bool,
-    /// Whether the selected provider exposes a write-through read cursor.
-    pub upstream_read_mark_supported: bool,
-    /// Whether the backend supports channel, thread-list, and flattened timelines.
-    pub threading_supported: bool,
-    /// Whether this server rewrites message bodies for speech before anything says them.
-    ///
-    /// Here for the same reason as `replay_enabled`: Settings has to be able to describe what this
-    /// deployment does, and the page cannot infer this one from any message it holds. An empty
-    /// `spoken_content` means "the rewrite changed nothing" just as often as it means "the pass is
-    /// off" — deliberately, see [`crate::model::Message::spoken_content`] — so a page guessing from
-    /// the data would tell the operator the feature was off every time the channel was plain prose.
-    /// They are flipping this switch to compare two runs; guessing is exactly what they cannot do.
-    pub speech_prep_enabled: bool,
-    /// The scope of the token that asked: `read` or `write`.
-    ///
-    /// The caller's own scope, so it discloses nothing it did not already hold. The page needs it
-    /// to avoid asking for what this token cannot have: stored conversations are write-only (see
-    /// the conversation routes), and a read-scope page that probed them anyway got a 403 and a
-    /// console error on every load. `#38 read-token-conversation-probe`.
-    pub token_scope: &'static str,
-}
-
 /// `GET /api/v1/client-config`
 pub async fn client_config(
     State(state): State<AppState>,
@@ -607,11 +527,11 @@ pub async fn client_config(
         version: env!("CARGO_PKG_VERSION"),
         live_poll_seconds: state.config.discord.live_poll_seconds,
         live_delivery: if state.config.ingest.enabled() {
-            "push"
+            LiveDelivery::Push
         } else if state.config.discord.live_poll_seconds > 0 {
-            "poll"
+            LiveDelivery::Poll
         } else {
-            "off"
+            LiveDelivery::Off
         },
         channel_registration_supported: state.chat.supports_channel_registration(),
         channel_discovery_supported: state.chat.supports_channel_discovery(),
@@ -623,10 +543,7 @@ pub async fn client_config(
             state.config.discord.bot_token.expose(),
         ),
         owner_author_id: state.config.discord.owner_user_id.clone(),
-        token_scope: match scope {
-            Scope::Read => "read",
-            Scope::Write => "write",
-        },
+        token_scope: scope.into(),
     }))
 }
 
@@ -1039,26 +956,6 @@ pub struct TimelineQuery {
     pub limit: Option<u16>,
 }
 
-/// A provider-neutral timeline plus this application's channel and read-state metadata.
-#[derive(Debug, Serialize)]
-pub struct TimelineResponse {
-    /// Configured parent channel, including its local alias and write policy.
-    pub channel: ChannelInfo,
-    /// View represented by this page.
-    pub view: crate::threads::TimelineView,
-    /// Page size actually requested.
-    pub limit: u16,
-    /// Entries on this page, never a channel-wide total.
-    pub returned: usize,
-    /// Thread and message data, ordered by the backend.
-    #[serde(flatten)]
-    pub page: crate::threads::TimelinePage,
-    /// Messages on this page that the reader has archived locally.
-    pub dismissed: Vec<MessageId>,
-    /// Channel content remains untrusted data in every view.
-    pub untrusted_content_notice: &'static str,
-}
-
 /// `GET /api/v1/channels/{channel_id}/timeline` — all views share one allowlist boundary.
 pub async fn timeline(
     State(state): State<AppState>,
@@ -1439,6 +1336,7 @@ pub async fn stream(
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 const VOICE_HTML: &str = include_str!("../../web/voice.html");
 const VOICE_JS: &str = include_str!("../../web/voice.js");
+const CONTRACT_JS: &str = include_str!("../../web/contract.js");
 const VOICE_CSS: &str = include_str!("../../web/voice.css");
 const APP_JS: &str = include_str!("../../web/app.js");
 const STYLE_CSS: &str = include_str!("../../web/style.css");
@@ -1468,6 +1366,11 @@ pub async fn voice_html() -> Response {
 /// `GET /voice.js`
 pub async fn voice_js() -> Response {
     asset("text/javascript; charset=utf-8", VOICE_JS)
+}
+
+/// `GET /contract.js` — the generated wire-contract validators `/voice` loads before its script.
+pub async fn contract_js() -> Response {
+    asset("text/javascript; charset=utf-8", CONTRACT_JS)
 }
 
 /// `GET /voice.css`

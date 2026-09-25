@@ -1,0 +1,512 @@
+{
+  "ApiErrorBody": [
+    {
+      "detail": "why",
+      "error": "bad_request"
+    }
+  ],
+  "ClientConfigResponse": [
+    {
+      "channel_discovery_supported": true,
+      "channel_registration_supported": true,
+      "channels": [
+        {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "writable": true
+        },
+        {
+          "added": true,
+          "alias": "ops",
+          "id": "100",
+          "label": "general",
+          "writable": false
+        }
+      ],
+      "chat_provider_name": "Chat",
+      "conversational_voice": {
+        "instance_id": "instance",
+        "name": "voice",
+        "settings_url": "https://voice.example/settings"
+      },
+      "elevenlabs_agent_id": "agent",
+      "live_delivery": "push",
+      "live_poll_seconds": 5,
+      "owner_author_id": "7",
+      "read_aloud": {
+        "backend": "browser",
+        "label": "This device",
+        "local_only": false,
+        "playback": "audio"
+      },
+      "replay_enabled": true,
+      "self_author_id": "9",
+      "speech_prep_enabled": true,
+      "threading_supported": true,
+      "token_scope": "write",
+      "upstream_read_mark_supported": true,
+      "version": "0.0.0"
+    },
+    {
+      "channel_discovery_supported": false,
+      "channel_registration_supported": false,
+      "channels": [
+        {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "writable": true
+        },
+        {
+          "added": true,
+          "alias": "ops",
+          "id": "100",
+          "label": "general",
+          "writable": false
+        }
+      ],
+      "chat_provider_name": "Chat",
+      "conversational_voice": {
+        "name": "voice"
+      },
+      "elevenlabs_agent_id": null,
+      "live_delivery": "poll",
+      "live_poll_seconds": 5,
+      "owner_author_id": null,
+      "read_aloud": {
+        "backend": "browser",
+        "label": "This device",
+        "local_only": true,
+        "playback": "browser"
+      },
+      "replay_enabled": false,
+      "self_author_id": null,
+      "speech_prep_enabled": false,
+      "threading_supported": false,
+      "token_scope": "read",
+      "upstream_read_mark_supported": false,
+      "version": "0.0.0"
+    },
+    {
+      "channel_discovery_supported": false,
+      "channel_registration_supported": false,
+      "channels": [
+        {
+          "added": false,
+          "alias": null,
+          "id": "100",
+          "label": "general",
+          "writable": true
+        },
+        {
+          "added": true,
+          "alias": "ops",
+          "id": "100",
+          "label": "general",
+          "writable": false
+        }
+      ],
+      "chat_provider_name": "Chat",
+      "conversational_voice": {
+        "name": "voice"
+      },
+      "elevenlabs_agent_id": null,
+      "live_delivery": "off",
+      "live_poll_seconds": 5,
+      "owner_author_id": null,
+      "read_aloud": {
+        "backend": "browser",
+        "label": "This device",
+        "local_only": true,
+        "playback": "browser"
+      },
+      "replay_enabled": false,
+      "self_author_id": null,
+      "speech_prep_enabled": false,
+      "threading_supported": false,
+      "token_scope": "read",
+      "upstream_read_mark_supported": false,
+      "version": "0.0.0"
+    }
+  ],
+  "LiveDeleteEvent": [
+    {
+      "channel_id": "100",
+      "message_id": "300",
+      "replayed": false
+    }
+  ],
+  "LiveMessageEvent": [
+    {
+      "message": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "hello",
+        "id": "300",
+        "reply_to": null,
+        "spoken_time": "",
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "replayed": false,
+      "self_posted": false,
+      "untrusted_content_notice": "third-party text"
+    },
+    {
+      "message": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "hello",
+        "id": "301",
+        "reply_to": "200",
+        "spoken_content": "hello, spoken",
+        "spoken_time": "noon",
+        "thread": {
+          "id": "t1",
+          "is_root": false,
+          "reply_count": 3,
+          "reply_count_exact": true,
+          "root_message_id": "200"
+        },
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "replayed": true,
+      "self_posted": true,
+      "untrusted_content_notice": "third-party text"
+    }
+  ],
+  "LiveResetEvent": [
+    {
+      "detail": "re-read",
+      "missed": 12
+    }
+  ],
+  "Message": [
+    {
+      "author": "someone",
+      "author_id": "7",
+      "author_is_bot": false,
+      "channel_id": "100",
+      "content": "hello",
+      "id": "300",
+      "reply_to": null,
+      "spoken_time": "",
+      "timestamp": "2026-09-25T12:00:00+00:00"
+    },
+    {
+      "author": "someone",
+      "author_id": "7",
+      "author_is_bot": false,
+      "channel_id": "100",
+      "content": "hello",
+      "id": "301",
+      "reply_to": "200",
+      "spoken_content": "hello, spoken",
+      "spoken_time": "noon",
+      "thread": {
+        "id": "t1",
+        "is_root": false,
+        "reply_count": 3,
+        "reply_count_exact": true,
+        "root_message_id": "200"
+      },
+      "timestamp": "2026-09-25T12:00:00+00:00"
+    }
+  ],
+  "ThreadSummary": [
+    {
+      "id": "t1",
+      "reply_count": null,
+      "reply_count_exact": false,
+      "root": {
+        "author": "someone",
+        "author_id": "7",
+        "author_is_bot": false,
+        "channel_id": "100",
+        "content": "hello",
+        "id": "300",
+        "reply_to": null,
+        "spoken_time": "",
+        "timestamp": "2026-09-25T12:00:00+00:00"
+      },
+      "title": "a thread",
+      "updated_at": "2026-09-25T12:00:00+00:00"
+    },
+    {
+      "id": "t1",
+      "reply_count": null,
+      "reply_count_exact": false,
+      "root": null,
+      "title": "a thread",
+      "updated_at": "2026-09-25T12:00:00+00:00"
+    }
+  ],
+  "TimelineResponse": [
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": true,
+      "has_threads": true,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "301",
+          "reply_to": "200",
+          "spoken_content": "hello, spoken",
+          "spoken_time": "noon",
+          "thread": {
+            "id": "t1",
+            "is_root": false,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "root_message_id": "200"
+          },
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_before": "cursor",
+      "notice": "scope note",
+      "returned": 2,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "main"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [],
+      "next_before": null,
+      "notice": null,
+      "returned": 2,
+      "thread": null,
+      "threads": [
+        {
+          "id": "t1",
+          "reply_count": null,
+          "reply_count_exact": false,
+          "root": {
+            "author": "someone",
+            "author_id": "7",
+            "author_is_bot": false,
+            "channel_id": "100",
+            "content": "hello",
+            "id": "300",
+            "reply_to": null,
+            "spoken_time": "",
+            "timestamp": "2026-09-25T12:00:00+00:00"
+          },
+          "title": "a thread",
+          "updated_at": "2026-09-25T12:00:00+00:00"
+        },
+        {
+          "id": "t1",
+          "reply_count": null,
+          "reply_count_exact": false,
+          "root": null,
+          "title": "a thread",
+          "updated_at": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "untrusted_content_notice": "third-party text",
+      "view": "threads"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "301",
+          "reply_to": "200",
+          "spoken_content": "hello, spoken",
+          "spoken_time": "noon",
+          "thread": {
+            "id": "t1",
+            "is_root": false,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "root_message_id": "200"
+          },
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        }
+      ],
+      "next_before": null,
+      "notice": null,
+      "returned": 1,
+      "thread": {
+        "id": "t1",
+        "reply_count": null,
+        "reply_count_exact": false,
+        "root": {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "hello",
+          "id": "300",
+          "reply_to": null,
+          "spoken_time": "",
+          "timestamp": "2026-09-25T12:00:00+00:00"
+        },
+        "title": "a thread",
+        "updated_at": "2026-09-25T12:00:00+00:00"
+      },
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "thread"
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "writable": true
+      },
+      "dismissed": [
+        "150"
+      ],
+      "has_more": false,
+      "has_threads": false,
+      "limit": 50,
+      "messages": [],
+      "next_before": null,
+      "notice": null,
+      "returned": 0,
+      "thread": null,
+      "threads": [],
+      "untrusted_content_notice": "third-party text",
+      "view": "flat"
+    }
+  ],
+  "VibeTalkV1ClientFrame": [
+    {
+      "type": "audio_start"
+    },
+    {
+      "type": "audio_end"
+    },
+    {
+      "text": "hi",
+      "type": "prompt"
+    },
+    {
+      "type": "interrupt"
+    },
+    {
+      "type": "quit"
+    }
+  ],
+  "VibeTalkV1ServerFrame": [
+    {
+      "type": "session_started"
+    },
+    {
+      "greeting": true,
+      "session_id": "s1",
+      "type": "session_started"
+    },
+    {
+      "role": "user",
+      "text": "hi",
+      "type": "transcript"
+    },
+    {
+      "final": false,
+      "role": "assistant",
+      "text": "hello",
+      "turn": 1,
+      "type": "transcript"
+    },
+    {
+      "type": "turn_complete"
+    },
+    {
+      "interrupted": true,
+      "turn": 1,
+      "type": "turn_complete"
+    },
+    {
+      "type": "error"
+    },
+    {
+      "detail": "why",
+      "message": "failed",
+      "type": "error"
+    }
+  ],
+  "VoiceSession": [
+    {
+      "input_sample_rate": 16000,
+      "output_sample_rate": 24000,
+      "protocol": "vibe-talk-v1",
+      "provider": "Voice",
+      "valid_for_seconds": 60,
+      "websocket_url": "wss://voice.example/session"
+    },
+    {
+      "input_sample_rate": 16000,
+      "output_sample_rate": 24000,
+      "protocol": "vibe-talk-v1",
+      "provider": "Voice",
+      "websocket_url": "wss://voice.example/session"
+    }
+  ]
+}

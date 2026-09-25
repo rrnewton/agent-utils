@@ -62,6 +62,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
 ] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+# Derives the checked-in wire contract (`src/contract.rs`) from the same types serde serializes, so the
+# browser's generated declarations and validators cannot describe a shape the server does not send.
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
