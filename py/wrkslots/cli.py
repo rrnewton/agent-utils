@@ -4627,13 +4627,105 @@ def _event_from_path(
     return raw
 
 
+# One validate-batch removal loads the whole append-only log about thirty times
+# per slot.  A 2026-09-25 production log held 12,107 events (38 MB), so every
+# load re-read, re-parsed and re-hashed the complete chain for 0.85 seconds and
+# the batch's evidence deadline expired before the first slot finished.  For
+# the duration of one command, keep each validated event keyed by the file's
+# exact lstat identity and the chain position that validated it.  An event whose
+# change time is recent is never kept: a rewrite inside the same timestamp tick
+# could otherwise leave the identity unchanged.  Any later rewrite or rename
+# moves the change time, so a kept event can never hide a change.  The window
+# assumes the kernel stamps change times from this host's realtime clock, as a
+# local filesystem does; a clock stepped backwards only stops events being kept.
+# Loaded events are shared, never mutated, and consumers copy what they retain.
+_EVENT_MEMO_STABLE_NS = 2_000_000_000
+_EVENT_MEMO_ENTRIES_LIMIT = 1 << 17
+_REPLAY_MEMO_ENTRIES_LIMIT = 8
+
+
+@dataclasses.dataclass
+class _EventMemo:
+    """Validated events and replay prefixes reused within one command."""
+
+    files: dict[
+        tuple[str, str],
+        tuple[tuple[int, int, int, int, int], int, str, dict[str, object]],
+    ] = dataclasses.field(default_factory=dict)
+    replays: dict[tuple[Config, str, bool], tuple[int, str, _ReplayFold]] = (
+        dataclasses.field(default_factory=dict)
+    )
+
+
+_ACTIVE_EVENT_MEMO: list[_EventMemo] = []
+
+
+@contextlib.contextmanager
+def _event_memo_scope() -> Iterator[_EventMemo]:
+    if _ACTIVE_EVENT_MEMO:
+        yield _ACTIVE_EVENT_MEMO[-1]
+        return
+    memo = _EventMemo()
+    _ACTIVE_EVENT_MEMO.append(memo)
+    try:
+        yield memo
+    finally:
+        _ACTIVE_EVENT_MEMO.remove(memo)
+
+
+def _event_memo_clock_ns() -> int:
+    return time.time_ns()
+
+
+def _event_file_identity(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        status = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(status.st_mode):
+        return None
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
 def _load_event_paths(
     paths: Sequence[Path], machine: str
 ) -> tuple[dict[str, object], ...]:
     events: list[dict[str, object]] = []
     previous = "0" * 64
+    if not _ACTIVE_EVENT_MEMO:
+        for expected_sequence, path in enumerate(paths, start=1):
+            raw = _event_from_path(path, machine, expected_sequence, previous)
+            previous = _as_str(raw["sha256"], "append-only event.sha256")
+            events.append(raw)
+        return tuple(events)
+    memo = _ACTIVE_EVENT_MEMO[-1].files
+    observed_ns = _event_memo_clock_ns()
     for expected_sequence, path in enumerate(paths, start=1):
-        raw = _event_from_path(path, machine, expected_sequence, previous)
+        key = (str(path), machine)
+        identity = _event_file_identity(path)
+        cached = memo.get(key)
+        if (
+            identity is not None
+            and cached is not None
+            and cached[:3] == (identity, expected_sequence, previous)
+        ):
+            raw = cached[3]
+        else:
+            raw = _event_from_path(path, machine, expected_sequence, previous)
+            if (
+                identity is not None
+                and identity[4] + _EVENT_MEMO_STABLE_NS <= observed_ns
+                and _event_file_identity(path) == identity
+            ):
+                if len(memo) >= _EVENT_MEMO_ENTRIES_LIMIT:
+                    memo.clear()
+                memo[key] = (identity, expected_sequence, previous, raw)
         previous = _as_str(raw["sha256"], "append-only event.sha256")
         events.append(raw)
     return tuple(events)
@@ -4771,6 +4863,117 @@ def _absent_agent_recovery_event_evidence(
     return archive_id, source_digest
 
 
+@dataclasses.dataclass
+class _ReplayFold:
+    """Derived registry state after one verified prefix of the event log."""
+
+    active_revision: int | None = None
+    active_records: dict[str, ActiveRecord] = dataclasses.field(default_factory=dict)
+    active_agents: dict[str, str] = dataclasses.field(default_factory=dict)
+    archive_revision: int | None = None
+    archive_records: list[dict[str, object]] = dataclasses.field(default_factory=list)
+    archive_ids: set[str] = dataclasses.field(default_factory=set)
+    archived_slots: set[str] = dataclasses.field(default_factory=set)
+    absent_validate_recoveries: set[tuple[str, int, str]] = dataclasses.field(
+        default_factory=set
+    )
+    absent_agent_recoveries: set[tuple[str, int, str]] = dataclasses.field(
+        default_factory=set
+    )
+    # First record for each distinct input of _assert_record_paths, in log order.
+    path_checks: dict[tuple[object, ...], ActiveRecord] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def copy(self) -> _ReplayFold:
+        return _ReplayFold(
+            self.active_revision,
+            dict(self.active_records),
+            dict(self.active_agents),
+            self.archive_revision,
+            list(self.archive_records),
+            set(self.archive_ids),
+            set(self.archived_slots),
+            set(self.absent_validate_recoveries),
+            set(self.absent_agent_recoveries),
+            dict(self.path_checks),
+        )
+
+
+def _record_path_check_key(record: ActiveRecord) -> tuple[object, ...]:
+    """Return every record field that _assert_record_paths reads."""
+
+    return (
+        record.slot,
+        record.slot_type,
+        record.layout,
+        tuple(
+            (
+                checkout.name,
+                checkout.path,
+                checkout.repository,
+                checkout.remote,
+                checkout.landed_ref,
+            )
+            for checkout in record.checkouts
+        ),
+    )
+
+
+def _resume_replay(
+    config: Config,
+    key: tuple[Config, str, bool],
+    events: Sequence[Mapping[str, object]],
+) -> tuple[int, _ReplayFold]:
+    """Return how many events a remembered fold already covers, and its copy.
+
+    Replaying a verified prefix is a pure function of its events and the
+    configuration except for _assert_record_paths, which also inspects the
+    filesystem.  The prefix is identified by its hash-chain tip, and that check
+    is rerun for the prefix's records before the fold is trusted.
+    """
+
+    cached = _ACTIVE_EVENT_MEMO[-1].replays.get(key) if _ACTIVE_EVENT_MEMO else None
+    if cached is None:
+        return 0, _ReplayFold()
+    count, tip, fold = cached
+    if count > len(events) or events[count - 1].get("sha256") != tip:
+        return 0, _ReplayFold()
+    if key[2]:
+        for record in fold.path_checks.values():
+            _assert_record_paths(config, record, require_repository=True)
+    else:
+        # Without require_repository, _assert_record_paths is lexical except for
+        # _stored_repository_reference, whose result depends only on the
+        # repository string.  Recheck each distinct repository in log order so
+        # a failure is the one a full replay would reach first.
+        for repository in dict.fromkeys(
+            checkout.repository
+            for record in fold.path_checks.values()
+            for checkout in record.checkouts
+        ):
+            _stored_repository_reference(config, repository)
+    return count, fold.copy()
+
+
+def _remember_replay(
+    key: tuple[Config, str, bool],
+    events: Sequence[Mapping[str, object]],
+    fold: _ReplayFold,
+) -> None:
+    if not _ACTIVE_EVENT_MEMO:
+        return
+    replays = _ACTIVE_EVENT_MEMO[-1].replays
+    replays.pop(key, None)
+    if len(replays) >= _REPLAY_MEMO_ENTRIES_LIMIT:
+        replays.pop(next(iter(replays)))
+    replays[key] = (
+        len(events),
+        _as_str(events[-1]["sha256"], "append-only event.sha256"),
+        fold,
+    )
+
+
 def _states_from_events(
     config: Config,
     machine: str,
@@ -4780,16 +4983,19 @@ def _states_from_events(
     events = _load_events(config, machine)
     if not events:
         return None
-    active_revision: int | None = None
-    active_records: dict[str, ActiveRecord] = {}
-    active_agents: dict[str, str] = {}
-    archive_revision: int | None = None
-    archive_records: list[dict[str, object]] = []
-    archive_ids: set[str] = set()
-    archived_slots: set[str] = set()
-    absent_validate_recoveries: set[tuple[str, int, str]] = set()
-    absent_agent_recoveries: set[tuple[str, int, str]] = set()
-    for event in events:
+    memo_key = (config, machine, require_repository)
+    start, fold = _resume_replay(config, memo_key, events)
+    active_revision = fold.active_revision
+    active_records = fold.active_records
+    active_agents = fold.active_agents
+    archive_revision = fold.archive_revision
+    archive_records = fold.archive_records
+    archive_ids = fold.archive_ids
+    archived_slots = fold.archived_slots
+    absent_validate_recoveries = fold.absent_validate_recoveries
+    absent_agent_recoveries = fold.absent_agent_recoveries
+    path_checks = fold.path_checks
+    for event in events[start:]:
         payload = _as_mapping(event["payload"], "append-only event.payload")
         kind = _as_str(event["kind"], "append-only event.kind")
         if kind == "state-imported":
@@ -4816,6 +5022,8 @@ def _states_from_events(
                 machine,
                 "append-only imported archive state",
             )
+            for record in active.slots:
+                path_checks.setdefault(_record_path_check_key(record), record)
             active_revision = active.revision
             active_records = {record.slot: record for record in active.slots}
             active_agents = {
@@ -4930,9 +5138,12 @@ def _states_from_events(
                         "append-only active-record event record identity does not "
                         f"match slot {slot} on machine {machine}"
                     )
-                _assert_record_paths(
-                    config, record, require_repository=require_repository
-                )
+                path_key = _record_path_check_key(record)
+                if path_key not in path_checks:
+                    _assert_record_paths(
+                        config, record, require_repository=require_repository
+                    )
+                    path_checks[path_key] = record
                 if current is not None and current.slot_type == "agent" and current.import_source is None:
                     active_agents.pop(current.agent, None)
                 if record.slot_type == "agent" and record.import_source is None:
@@ -5053,6 +5264,22 @@ def _states_from_events(
             archive_revision = revision
     if active_revision is None or archive_revision is None:
         raise StateError("append-only event log has no complete imported state")
+    _remember_replay(
+        memo_key,
+        events,
+        _ReplayFold(
+            active_revision,
+            active_records,
+            active_agents,
+            archive_revision,
+            archive_records,
+            archive_ids,
+            archived_slots,
+            absent_validate_recoveries,
+            absent_agent_recoveries,
+            path_checks,
+        ),
+    )
     return (
         ActiveState(machine, active_revision, tuple(active_records.values())),
         ArchiveState(
@@ -35920,7 +36147,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
     try:
-        result = handler(args)
+        with _event_memo_scope():
+            result = handler(args)
     except Refusal as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         print(f"REMEDY: {_refusal_remedy(args, exc)}", file=sys.stderr)
