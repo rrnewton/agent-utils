@@ -491,6 +491,16 @@ def _inside_delegated_harness() -> bool:
     )
 
 
+def _parent_offers_only_unboxed_delegation() -> bool:
+    """Return whether the outer scheduler explicitly has no cgroup subtree to delegate."""
+
+    return (
+        os.environ.get("DAGRUN_DELEGATED_UNBOXED") == "1"
+        and bool(os.environ.get("DAGRUN_OUTER_RUN"))
+        and not os.environ.get("DAGRUN_DELEGATED_CGROUP")
+    )
+
+
 def run(
     cmd: Sequence[str],
     args: Sequence[str],
@@ -3700,6 +3710,14 @@ def _normalized_trace_csv(path: Path) -> tuple[str, tuple[str, ...], tuple[tuple
 
 def compare_profile_timeseries_trace(py: list[str], rs: list[str], rep: Report) -> None:
     """Compare one real boxed sweep trace after normalizing only volatile measurements."""
+
+    if _parent_offers_only_unboxed_delegation():
+        print(
+            "cross[dagrun]: SKIP time-series trace differential: "
+            "the outer scheduler has no cgroup subtree to delegate"
+        )
+        rep.ok("profile-timeseries:capability-unavailable")
+        return
 
     with tempfile.TemporaryDirectory(prefix="dagrun-trace-cross-") as tmp:
         dag_path = os.path.join(tmp, "trace.json")
@@ -7380,6 +7398,15 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
     Deleting the ``DAGRUN_OPERATOR_BUILD_JOBS`` forwarding in one engine leaves the sentence
     correct and breaks the second observable, which is the whole reason it is here.
     """
+    if _parent_offers_only_unboxed_delegation():
+        for leg in ("stated", "unstated"):
+            print(
+                f"cross[dagrun]: SKIP boxed build-width differential ({leg}): "
+                "the outer scheduler has no cgroup subtree to delegate"
+            )
+            rep.ok(f"operator-build-width:{leg}:capability-unavailable")
+        return
+
     with tempfile.TemporaryDirectory(prefix="dagrun-cross-build-width-") as td:
         dag_path = os.path.join(td, "dag.json")
         # A hard 2 GiB per-step cap makes the derived per-step width small and host-independent
@@ -7703,6 +7730,14 @@ def compare_boxed_cpu_bandwidth(
     py: list[str], rs: list[str], rep: Report, *, validation_jobs: int = DEFAULT_VALIDATION_JOBS
 ) -> None:
     """Anchor ``-j`` / ``--max-cpus`` to live quota and aggregate CPU counters."""
+
+    if _parent_offers_only_unboxed_delegation():
+        print(
+            "cross[dagrun]: SKIP boxed CPU-bandwidth differential: "
+            "the outer scheduler has no cgroup subtree to delegate"
+        )
+        rep.ok("boxed-cpu-bandwidth:capability-unavailable")
+        return
 
     with tempfile.TemporaryDirectory(prefix="dagrun-cross-boxed-cpu-") as td:
         dag_path = os.path.join(td, "dag.json")

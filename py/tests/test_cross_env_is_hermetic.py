@@ -181,6 +181,42 @@ def test_boxed_cpu_bandwidth_case_scales_every_width_observable() -> None:
     assert expected_quota == (4.0,)
 
 
+def test_boxing_only_checks_skip_exact_unboxed_delegation_without_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    differential = _differential()
+    monkeypatch.setenv("DAGRUN_DELEGATED_UNBOXED", "1")
+    monkeypatch.setenv("DAGRUN_OUTER_RUN", "outer-run")
+
+    def unexpected_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a boxing-only check spawned under unboxed delegation")
+
+    monkeypatch.setattr(differential, "run", unexpected_run)
+    report = differential.Report()
+    differential.compare_profile_timeseries_trace(["python"], ["rust"], report)
+    differential.compare_operator_build_width(["python"], ["rust"], report)
+    differential.compare_boxed_cpu_bandwidth(["python"], ["rust"], report)
+
+    assert report.checks == 4
+    assert report.failures == []
+
+
+def test_delegated_cgroup_does_not_disable_boxing_only_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    differential = _differential()
+    monkeypatch.setenv("DAGRUN_DELEGATED_UNBOXED", "1")
+    monkeypatch.setenv("DAGRUN_DELEGATED_CGROUP", "/delegated")
+    monkeypatch.setenv("DAGRUN_OUTER_RUN", "outer-run")
+
+    assert differential._inside_delegated_harness()
+    assert not differential._parent_offers_only_unboxed_delegation()
+
+    monkeypatch.delenv("DAGRUN_DELEGATED_CGROUP")
+    monkeypatch.delenv("DAGRUN_OUTER_RUN")
+    assert not differential._parent_offers_only_unboxed_delegation()
+
+
 def test_run_output_normalization_removes_only_terminal_elapsed_time() -> None:
     differential = _differential()
     python_output = (
