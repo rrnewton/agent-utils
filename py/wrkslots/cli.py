@@ -7160,9 +7160,11 @@ def _scoped_operation_journal_completed(
     and the retry writes the same path again.  Each completion closes an
     episode, and progress after it opens the next one only at the operation's
     first phase and with an operation identity that no earlier episode on the
-    path used, so a replayed opening of a completed operation is refused.  The
-    bytes must equal the latest progress, and completion is that of the latest
-    episode.
+    path used.  Every later progress in an episode carries the identity it
+    opened with, and no progress may carry a completed episode's identity, so
+    a replayed write of a completed operation is refused wherever it lands.
+    The bytes must equal the latest progress, and completion is that of the
+    latest episode.
     """
 
     label = f"scoped {operation} journal"
@@ -7172,7 +7174,8 @@ def _scoped_operation_journal_completed(
     )
     recorded: Mapping[str, object] | None = None
     completed = False
-    identities: set[str] = set()
+    current: str | None = None
+    retired: set[str] = set()
     for event in _load_events(config, machine):
         event_kind = _as_str(event["kind"], "append-only event.kind")
         if event_kind not in {"operation-progress-recorded", "operation-completed"}:
@@ -7199,18 +7202,24 @@ def _scoped_operation_journal_completed(
                     f"{label} path was reused after completion without a new "
                     "operation"
                 )
-            if completed and identity in identities:
+            if identity in retired:
                 raise StateError(
                     f"{label} path was reopened with the identity of a completed "
                     "operation"
                 )
-            if identity is not None:
-                identities.add(identity)
+            if recorded is None or completed:
+                current = identity
+            elif identity != current:
+                raise StateError(
+                    f"{label} progress changed its operation identity"
+                )
             recorded = journal
             completed = False
             continue
         if recorded is None:
             raise StateError(f"scoped {operation} completion has no preceding progress evidence")
+        if current is not None:
+            retired.add(current)
         completed = True
     if recorded is None:
         raise StateError(f"{label} has no matching append-only progress evidence")
