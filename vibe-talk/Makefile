@@ -10,14 +10,14 @@
 # The root one runs everything below by name, so the two cannot drift into different definitions of
 # what validating vibe-talk means.
 
-.PHONY: validate validate-boxed dag-check fmt check test page container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check test page android-speech-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
 # UNBOXED, and deliberately the default: it needs nothing but a Rust and a node toolchain, so it
 # works on a fresh clone and on a CI runner with no cgroup delegation. `validate-boxed` is the
 # better one where it can run.
-validate: fmt check test dag-check
+validate: fmt check test dag-check android-speech-self-test
 
 # The same suites, run through dagrun: per-step wall and CPU timeouts, memory caps, and
 # process-tree teardown inside nested cgroups.
@@ -64,6 +64,12 @@ test:
 # of them is how the second comes to exist without ever being run.
 page:
 	node --test tests/js/*.test.mjs
+
+# The physical-device run is opt-in, but its signal/language evaluator has offline negative
+# controls. Keep those controls in the ordinary gate so a broken harness cannot silently bless a
+# later Android recording.
+android-speech-self-test:
+	python3 scripts/android-device-speech.py --self-test
 
 # The LAUNCHER -- run.sh, the script the owner types -- as opposed to the image it starts, which
 # the `container` CI job covers separately. Not part of `validate` because it needs a container

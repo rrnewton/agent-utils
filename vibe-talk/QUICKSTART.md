@@ -18,8 +18,8 @@ backend = "browser"
 Restart and reload the page in Chrome on Android. Open the message view, press **Read**, and tap
 a message. This uses the phone's configured speech engine and needs an installed voice.
 See [device speech](README.md#reading-messages-with-a-device-voice) for setup,
-offline-voice considerations, and browser limitations. Existing deployments keep ElevenLabs
-read-aloud unless they select this backend.
+offline-voice considerations, browser limitations, and the opt-in rendered-audio regression check.
+Existing deployments keep ElevenLabs read-aloud unless they select this backend.
 
 For a home-screen shortcut, open `/voice` in Chrome and choose **Add to Home screen**. It uses
 the vibe-talk speech-bubble icon. Remove and re-add an older shortcut if its icon stays blank.

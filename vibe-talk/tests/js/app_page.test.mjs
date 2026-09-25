@@ -540,15 +540,17 @@ test("an alias is text the page renders as CHARACTERS, never as markup", async (
 
 test("the digest page selects a local device voice only when that backend is configured", async () => {
   const remote = { name: "Remote", lang: "en-US", localService: false, default: true };
-  const local = { name: "Installed", lang: "en-US", localService: true };
+  const first = { name: "First installed", lang: "en-US", localService: true, default: false };
+  const local = { name: "Configured", lang: "en-US", localService: true, default: true };
+  const wrong = { name: "Wrong default", lang: "fr-FR", localService: true, default: true };
   const page = newPage(undefined, undefined, undefined, { playback: "browser", local_only: true });
-  page.deviceVoices = [remote];
+  page.deviceVoices = [remote, wrong];
   await page.settle();
   await page.el("refresh-digest").click();
   await page.el("speak-digest").click();
   assert.equal(page.spoken.length, 0);
-  assert.match(page.el("status").textContent, /Text-to-speech settings/);
-  page.deviceVoices = [remote, local];
+  assert.match(page.el("status").textContent, /matches this browser's language/);
+  page.deviceVoices = [remote, wrong, first, local];
   await page.el("speak-digest").click();
   assert.equal(page.utterances.length, 1);
   assert.equal(page.utterances[0].voice, local);

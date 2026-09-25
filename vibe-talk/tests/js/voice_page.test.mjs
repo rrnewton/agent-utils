@@ -5516,6 +5516,40 @@ test("device speech picks the device language and applies pace to every subseque
   assert.deepEqual(page.prepareCalls, []);
 });
 
+test("device speech refuses a default local voice in the wrong language", async () => {
+  const french = { name: "French default", lang: "fr-FR", localService: true, default: true };
+  const page = devicePage([french]);
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ content: "This sentence must stay English." })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, 0);
+  assert.match(page.el("error").textContent, /matches this browser's language/);
+  assert.equal(readButton(page).getAttribute("data-read-state"), "failed");
+});
+
+test("device speech accepts a local voice from another region of the same language", async () => {
+  const french = { name: "French default", lang: "fr-FR", localService: true, default: true };
+  const british = { name: "British English", lang: "en_GB", localService: true, default: false };
+  const page = devicePage([french, british]);
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ content: "This sentence stays English." })]);
+  await rows[0].dispatch("click", {});
+  assert.equal(page.deviceSpeech.utterances.length, 1);
+  assert.equal(page.deviceSpeech.utterances[0].voice, british);
+  assert.equal(page.deviceSpeech.utterances[0].lang, "en_GB");
+});
+
+test("device speech prefers the configured default among same-language local voices", async () => {
+  const first = { name: "First English", lang: "en-US", localService: true, default: false };
+  const configured = { name: "Configured English", lang: "en-US", localService: true, default: true };
+  const page = devicePage([first, configured]);
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ content: "Use the configured device voice." })]);
+  await rows[0].dispatch("click", {});
+  assert.equal(page.deviceSpeech.utterances[0].voice, configured);
+});
+
 test("device speech ignores late callbacks from a chunk that has already finished", async () => {
   const page = devicePage();
   await signIn(page);
@@ -5701,9 +5735,15 @@ test("the channel bar switches between configured agent audio and device audio l
   assert.equal(toggle.hidden, false);
   assert.equal(toggle.getAttribute("aria-checked"), "true");
   assert.match(toggle.title, /Internal voice preview/);
+  assert.equal(page.el("audio-device-icon").hidden, true);
+  assert.equal(page.el("audio-agent-icon").hidden, false, "agent audio does not show its cloud icon");
+  assert.match(HTML_CODE, /id="audio-device-icon"[^>]*data-icon="device"/);
+  assert.match(HTML_CODE, /id="audio-agent-icon"[^>]*data-icon="cloud"/);
   const requests = page.prepareCalls.length;
   await toggle.click();
   assert.equal(toggle.getAttribute("aria-checked"), "false");
+  assert.equal(page.el("audio-device-icon").hidden, false, "device speech lost its phone icon");
+  assert.equal(page.el("audio-agent-icon").hidden, true);
   assert.equal(page.prepareCalls.length, requests, "changing the source issued a network request");
   await readButton(page).click();
   await rows[0].dispatch("click", {});

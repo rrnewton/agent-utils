@@ -91,7 +91,43 @@ The app makes no ElevenLabs speech request in browser mode. The phone's configur
 controls its own processing: Chromium's `localService` flag does not prove that every Android
 engine stays offline. Choose a downloaded offline voice and check it in airplane mode when that
 distinction matters. Browser automation verifies the interaction with a simulated speech engine;
-audible output on a physical phone remains a device check.
+the opt-in physical-device check below verifies the audible output itself.
+
+### Checking the audio an Android device actually emits
+
+`scripts/android-device-speech.py` closes the gap between a JavaScript call to `speak()` and sound
+that can be understood. It drives the real served `/voice` page in Android Chrome over ADB, selects
+device speech, records Android's rendered playback, converts it to mono PCM, rejects silence and
+clipping, and passes the recording to an STT adapter. The run fails if the detected language does
+not match Chrome's language or if the recognised words do not match the selected message.
+
+The device must have USB debugging enabled and Chrome open. Python Playwright, ADB and ffmpeg are
+the host dependencies. The STT adapter is an executable outside this repository: it receives the
+WAV path as its only argument and prints JSON containing `text`, `language`, and optionally numeric
+`confidence`. This keeps local models, service credentials, and deployment-specific routing out of
+the reusable source tree.
+
+```sh
+cd vibe-talk
+VIBE_TALK_WRITE_TOKEN=... scripts/android-device-speech.py \
+  --url https://vibe-talk.example.invalid/voice \
+  --serial ANDROID_SERIAL \
+  --transcriber /path/to/stt-adapter
+```
+
+The token is accepted only through the environment and is placed into that Chrome origin through
+the debugging connection; it is never put on the command line or printed. By default the harness
+uses Android `screenrecord` only when its help explicitly advertises internal playback capture. On
+other devices, `--capture-adapter PATH` supplies a recorder; it is called as
+`PATH DURATION_SECONDS OUTPUT_PATH` and may, for example, record the phone's speaker through a host
+microphone. `--channel`, `--message-id`, and `--message-index` choose a known row. Run `--help` for
+all defaults and applicability.
+
+Artifacts—including the source text and STT result—go under the gitignored
+`debug/android-device-speech/` directory by default. `--signal-only` is useful for diagnosing the
+capture route, but it deliberately does not count as the language regression. The evaluator's
+silence, clean-signal, wrong-language, unrelated-words, and malformed-STT negative controls run in
+the ordinary `make validate` suite through `--self-test` and need no device.
 
 Omitting `[read_aloud]`, or setting `backend = "elevenlabs"`, preserves server-generated ElevenLabs
 audio and its existing voice configuration. A deployment whose conversational backend speaks the

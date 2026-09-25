@@ -328,11 +328,29 @@ function speak(text) {
   if (state.readAloud && state.readAloud.playback === "browser") {
     const voices = (window.speechSynthesis.getVoices?.() || [])
       .filter((voice) => voice.localService === true);
-    const language = String(navigator.language || "en").toLowerCase();
-    const voice = voices.find((entry) => String(entry.lang).toLowerCase() === language) ||
-      voices.find((entry) => entry.default) || voices[0];
+    const languages = [
+      ...(Array.isArray(navigator.languages) ? navigator.languages : []),
+      navigator.language,
+    ].map((language) => String(language || "").replace(/_/gu, "-").toLowerCase())
+      .filter((language, index, all) => language && all.indexOf(language) === index);
+    const tagged = voices.map((voice) => ({
+      voice,
+      language: String(voice.lang || "").replace(/_/gu, "-").toLowerCase(),
+    }));
+    let voice = null;
+    for (const language of languages) {
+      const exact = tagged.filter((entry) => entry.language === language);
+      voice = (exact.find((entry) => entry.voice.default) || exact[0])?.voice || null;
+      if (voice) break;
+    }
+    for (const language of languages) {
+      if (voice) break;
+      const base = language.split("-")[0];
+      const compatible = tagged.filter((entry) => entry.language.split("-")[0] === base);
+      voice = (compatible.find((entry) => entry.voice.default) || compatible[0])?.voice || null;
+    }
     if (!voice) {
-      setStatus("No device voice is ready. Download a voice in Android Text-to-speech settings, then tap Read again.");
+      setStatus("No installed device voice matches this browser's language. Download one in Android Text-to-speech settings, then tap Read again.");
       return;
     }
     utterance.voice = voice;

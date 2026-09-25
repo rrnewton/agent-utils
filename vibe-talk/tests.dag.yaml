@@ -72,6 +72,18 @@ steps:
       classification: cpu-bound
       rss_baseline_bytes: 1073741824
 
+  # The physical Android run is opt-in. Its evaluator is not: silence and wrong-language speech
+  # are negative controls here, requiring no phone, browser, capture device or STT service.
+  - group: check
+    job: android-speech-self-test
+    desc: offline controls for the Android rendered-speech evaluator
+    cmd: cd vibe-talk && python3 scripts/android-device-speech.py --self-test
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

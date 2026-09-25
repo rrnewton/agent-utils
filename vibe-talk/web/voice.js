@@ -5872,10 +5872,30 @@ function browserSpeechVoice() {
   // the phone's configured speech engine still determines how it generates audio. An empty list
   // must never select the browser's implicit default.
   const voices = engine.getVoices().filter((voice) => voice.localService === true);
-  const language = String(navigator.language || "en").toLowerCase();
-  return voices.find((voice) => String(voice.lang).toLowerCase() === language) ||
-    voices.find((voice) => String(voice.lang).toLowerCase().split("-")[0] === language.split("-")[0]) ||
-    voices.find((voice) => voice.default) || voices[0] || null;
+  const languages = [
+    ...(Array.isArray(navigator.languages) ? navigator.languages : []),
+    navigator.language,
+  ].map((language) => String(language || "").replace(/_/gu, "-").toLowerCase())
+    .filter((language, index, all) => language && all.indexOf(language) === index);
+  const tagged = voices.map((voice) => ({
+    voice,
+    language: String(voice.lang || "").replace(/_/gu, "-").toLowerCase(),
+  }));
+  // A browser's `default` flag means the engine's default, not "safe for this text". Android may
+  // report a downloaded voice for another language as both local and default; selecting it made
+  // English messages sound like corrupt noise or like another language. Refuse that fallback.
+  for (const language of languages) {
+    const exact = tagged.filter((entry) => entry.language === language);
+    if (exact.length > 0) return (exact.find((entry) => entry.voice.default) || exact[0]).voice;
+  }
+  for (const language of languages) {
+    const base = language.split("-")[0];
+    const compatible = tagged.filter((entry) => entry.language.split("-")[0] === base);
+    if (compatible.length > 0) {
+      return (compatible.find((entry) => entry.voice.default) || compatible[0]).voice;
+    }
+  }
+  return null;
 }
 
 function prepareBrowserSpeech() {
@@ -5905,8 +5925,8 @@ function browserSpeechProblem() {
   }
   if (!browserSpeechVoice()) {
     waitingForBrowserVoice = true;
-    browserVoiceProblem = "No installed device voice is available yet. In Android Settings, open Text-to-speech " +
-      "output and download a voice for your language, then return here and tap the message again.";
+    browserVoiceProblem = "No installed device voice matches this browser's language. In Android Settings, open " +
+      "Text-to-speech output and download a voice for that language, then return here and tap the message again.";
     return browserVoiceProblem;
   }
   return "";
