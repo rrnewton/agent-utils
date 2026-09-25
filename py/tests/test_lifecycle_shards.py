@@ -269,6 +269,39 @@ def _shard(marker: Path, seconds: float) -> tuple[tuple[str, ...], ...]:
     return ((sys.executable, "-c", _SHARD_THAT_RECORDS_HOW_IT_ENDED, str(marker), str(seconds)),)
 
 
+def _taken_if_pending(*signums: int) -> list[int]:
+    """Which of signums are pending for this process, each taken so that it is never delivered."""
+
+    pending = signal.sigpending()
+    taken = [signum for signum in signums if signum in pending]
+    for signum in taken:
+        signal.sigtimedwait((signum,), 0)
+    return taken
+
+
+def _stop_signal_check() -> Callable[[], None]:
+    """A check for each wait of the runner, failing once if a stop signal is blocked or pending.
+
+    It waits only with the caller's mask, which here blocks none of them, so one held back would
+    act only after every shard had run out its sleep: a runner that left them blocked would take
+    minutes to fail.  A pending one is taken, so that it never reaches pytest's own handler.  Only
+    the first failure raises, so that the runner still stops its shards.
+    """
+
+    failed: list[bool] = []
+
+    def check() -> None:
+        if failed:
+            return
+        blocked = set(runner._STOP_SIGNALS) & signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        taken = _taken_if_pending(*runner._STOP_SIGNALS)
+        if blocked or taken:
+            failed.append(True)
+        assert not failed, f"stop signals blocked while shards ran: {blocked} {taken}"
+
+    return check
+
+
 def _interrupt_the_poll_loop(
     monkeypatch: pytest.MonkeyPatch, exceptions: list[BaseException], started: Path
 ) -> None:
@@ -276,10 +309,14 @@ def _interrupt_the_poll_loop(
 
     real_sleep = time.sleep
     pending = list(exceptions)
+    check = _stop_signal_check()
 
     def sleep(seconds: float) -> None:
         if pending and started.exists() and b"shard started" in started.read_bytes():
-            raise pending.pop(0)
+            # Taken first, so that none is raised later, from inside the stopping of the shards.
+            exception = pending.pop(0)
+            check()
+            raise exception
         real_sleep(seconds)
 
     monkeypatch.setattr(runner.time, "sleep", sleep)
@@ -359,11 +396,14 @@ def test_a_fault_stops_shards_at_once_even_after_a_recorded_interrupt(
     logs.mkdir()
     real_sleep = time.sleep
     recorded: list[int] = []
+    sent: list[bool] = []
 
     def sleep(seconds: float) -> None:
         log = logs / "shard-0.log"
-        if not recorded and log.exists() and b"shard started" in log.read_bytes():
+        if not sent and log.exists() and b"shard started" in log.read_bytes():
+            sent.append(True)
             os.kill(os.getpid(), signal.SIGINT)  # Ctrl-C: recorded, not raised.
+            assert not _taken_if_pending(signal.SIGINT), "stop signals blocked while shards ran"
             recorder = getattr(signal.getsignal(signal.SIGINT), "__self__", None)
             assert isinstance(recorder, runner._Signals)
             recorded.extend(recorder.received)
@@ -415,15 +455,21 @@ def test_the_first_of_two_stop_signals_decides_the_grace_and_the_exit(
     logs.mkdir()
     real_sleep = time.sleep
     recorded: list[int] = []
+    sent: list[bool] = []
 
     def sleep(seconds: float) -> None:
         log = logs / "shard-0.log"
-        if not recorded and log.exists() and b"shard started" in log.read_bytes():
+        if not sent and log.exists() and b"shard started" in log.read_bytes():
+            sent.append(True)
             os.kill(os.getpid(), first)
             os.kill(os.getpid(), second)
             recorder = getattr(signal.getsignal(signal.SIGINT), "__self__", None)
             assert isinstance(recorder, runner._Signals)
             recorded.extend(recorder.received)
+            # Sent once: a runner that left them blocked would otherwise be sent them at every
+            # poll, while the shard waits for them forever.  Taken, they fail this test at once
+            # instead of ending pytest when the caller's handlers go back.
+            assert not _taken_if_pending(first, second), "stop signals blocked while shards ran"
         real_sleep(seconds)
 
     monkeypatch.setattr(runner.time, "sleep", sleep)
@@ -510,6 +556,19 @@ time.sleep(120)
 """
 
 
+def _held_back(pid: int) -> set[int]:
+    """The signals that process pid has pending and blocked, as its /proc status shows them."""
+
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return set()
+    fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+    pending = int(fields["SigPnd"], 16) | int(fields["ShdPnd"], 16)
+    held = pending & int(fields["SigBlk"], 16)
+    return {signum for signum in range(1, 65) if held >> (signum - 1) & 1}
+
+
 class _RealRunner:
     def __init__(self, tmp_path: Path, shard_mode: str, grandchild_mode: str) -> None:
         self.state = tmp_path / "state"
@@ -525,6 +584,7 @@ class _RealRunner:
             stderr=subprocess.STDOUT,
         )
         self.pidfds: dict[str, int] = {}
+        self.sent: set[int] = set()
         deadline = time.monotonic() + 30
         while not (self.state / "shard.pid").exists():
             assert self.process.poll() is None, self.process.communicate()[0]
@@ -534,11 +594,29 @@ class _RealRunner:
             self.pidfds[name] = os.pidfd_open(int((self.state / f"{name}.pid").read_text()))
 
     def signal(self, signum: int) -> None:
+        self.sent.add(signum)
         os.kill(self.process.pid, signum)
 
     def finish(self) -> tuple[int, str]:
-        output, _ = self.process.communicate(timeout=60)
-        return self.process.returncode, output.decode()
+        deadline = time.monotonic() + 60
+        held_since: float | None = None
+        while True:
+            try:
+                output, _ = self.process.communicate(timeout=0.05)
+            except subprocess.TimeoutExpired:
+                assert time.monotonic() < deadline, "the runner never ended"
+            else:
+                return self.process.returncode, output.decode()
+            # The runner holds the stop signals back only while its handlers change, which takes
+            # microseconds.  One held at every look for a second was left blocked, and would act
+            # only once the shard had slept out its two minutes.
+            held = self.sent & _held_back(self.process.pid)
+            now = time.monotonic()
+            if not held:
+                held_since = None
+            elif held_since is None:
+                held_since = now
+            assert held_since is None or now - held_since < 1, f"the runner holds back {held}"
 
     def exited(self, name: str) -> bool:
         poller = select.poll()
@@ -799,6 +877,16 @@ def test_a_stop_signal_at_every_line_of_the_start_and_stop_paths_cannot_escape_t
             return line
         return None
 
+    real_sleep = time.sleep
+    check = _stop_signal_check()
+
+    def sleep(seconds: float) -> None:
+        # A runner that left the signal blocked would give no line a chance to deliver it, and
+        # would wait out the shards' minute before the test could fail.
+        check()
+        real_sleep(seconds)
+
+    monkeypatch.setattr(runner.time, "sleep", sleep)
     logs = tmp_path / "logs"
     logs.mkdir()
     previous_trace = sys.gettrace()
@@ -835,6 +923,7 @@ def test_a_stop_signal_inside_popen_neither_loses_that_shard_nor_starts_another(
     def signal_the_runner(count: int) -> None:
         if count == 2:
             os.kill(os.getpid(), signal.SIGTERM)
+            assert not _taken_if_pending(signal.SIGTERM), "stop signals blocked while shards ran"
 
     started_shards.after_start = signal_the_runner
     started_shards.wait_for = b"shard started"
@@ -1577,6 +1666,14 @@ def test_the_first_failure_reaches_the_caller_with_what_putting_things_back_rais
     def fail_to_stop(*_args: object) -> None:
         raise _CallerStop("stopping")
 
+    real_sleep = time.sleep
+
+    def sleep(seconds: float) -> None:
+        # Held back, the shard's one SIGTERM would wait out its minute and then reach pytest.
+        assert not _taken_if_pending(signal.SIGTERM), "stop signals blocked while shards ran"
+        real_sleep(seconds)
+
+    monkeypatch.setattr(runner.time, "sleep", sleep)
     monkeypatch.setattr(runner.signal, "signal", set_handler)
     monkeypatch.setattr(runner.signal, "pthread_sigmask", sigmask)
     if first.startswith("work"):
@@ -1782,6 +1879,8 @@ def test_a_stop_signal_after_the_last_shard_ended_is_still_honoured(
             blocks.append(how)
             if len(blocks) == 2:  # The restoring, not the installing.
                 os.kill(os.getpid(), signal.SIGHUP)
+                # Not yet blocked, so recorded already; held back, it would end pytest at restore.
+                assert not _taken_if_pending(signal.SIGHUP), "stop signals blocked after the run"
         return real_mask(how, mask)
 
     monkeypatch.setattr(runner.signal, "pthread_sigmask", pthread_sigmask)
@@ -1811,6 +1910,7 @@ def test_another_interrupt_during_the_report_ends_the_report_not_the_exit_status
         if not sent and b"shard started" in (logs / "shard-0.log").read_bytes():
             sent.append(True)
             os.kill(os.getpid(), signal.SIGTERM)
+            assert not _taken_if_pending(signal.SIGTERM), "stop signals blocked while shards ran"
         real_sleep(seconds)
 
     reports: list[str] = []
@@ -1845,9 +1945,12 @@ def test_a_runner_killed_outright_interrupts_its_ordinary_shard_but_not_what_the
 
     run.process.kill()
     returncode, _ = run.finish()
+    shard = int((run.state / "shard.pid").read_text())
     deadline = time.monotonic() + 10
     while not run.exited("shard"):
         assert time.monotonic() < deadline, "the shard outlived its runner"
+        # The shard never blocks SIGINT itself, so one held back came blocked from the runner.
+        assert signal.SIGINT not in _held_back(shard), "the shard holds back its SIGINT"
         time.sleep(0.02)
 
     assert returncode == -signal.SIGKILL
