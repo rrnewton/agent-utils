@@ -649,6 +649,9 @@ ok "--screenshots refuses port 18081, naming the ci container"
 out="$(run_sh --screenshots --dry-run)"
 grep -q '127.0.0.1:18091' <<< "$out" \
     || fail "--screenshots --dry-run does not say which port it would use: $out"
+if grep -q 'command not found' <<< "$out"; then
+    fail "--screenshots executes prose from its generated-config heredoc: $out"
+fi
 grep -q -- '--fake-discord' <<< "$out" \
     || fail "--screenshots --dry-run does not show that the server is a fake: $out"
 grep -q 'nothing was built, started, or photographed' <<< "$out" \

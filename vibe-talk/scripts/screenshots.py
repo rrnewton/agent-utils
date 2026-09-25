@@ -864,17 +864,21 @@ class Driver:
             )
         else:
             script += "\ntry { localStorage.removeItem('vibe-talk.token'); } catch (e) {}\n"
-        # Every PREFERENCE the page keeps is cleared on a load, so a self-contained state really is
-        # self-contained. Without this the desktop states inherit the reading column the previous
-        # one dragged out, and every later desktop frame is a picture of the wrong width -- which
-        # is what the first capture of the reply screen actually showed. The token above is the one
-        # thing deliberately carried across, because signing in is not the subject of any state
-        # after the first.
+        # Every page-local preference and snapshot is cleared on a load, so a self-contained state
+        # really is self-contained. Without this the desktop states inherit the reading column the
+        # previous one dragged out, and every later desktop frame is a picture of the wrong width --
+        # which is what the first capture of the reply screen actually showed. The message snapshot
+        # is state rather than a preference, but it belongs here for the same reason: scene 18 walks
+        # the whole channel, while scene 21 must begin with one page so it can photograph the next
+        # page arriving. Letting 21 restore 18's complete snapshot leaves no older page to request.
+        # The token above is the one thing deliberately carried across, because signing in is not
+        # the subject of any state after the first.
         script += (
             "\ntry {\n"
             "  localStorage.removeItem('vibe-talk.voice.width');\n"
             "  localStorage.removeItem('vibe-talk.voice.drafts');\n"
             "  localStorage.removeItem('vibe-talk.voice.bar-placement');\n"
+            "  localStorage.removeItem('vibe-talk.voice.message-cache');\n"
             # `#46 conversation-replay`. It is a persisted preference like the others, and a
             # state that inherited it would photograph a resumed call under a name that does not
             # say so -- or, worse, an ordinary post-call frame carrying the resumed wording.
@@ -1051,7 +1055,9 @@ def _act_discord(driver: Driver) -> None:
     driver.click("view-switch")
     # A real read of the real server's channel; --fake-discord seeds it.
     driver.page.wait_for_function(
-        "() => document.querySelectorAll('#discord-log li').length > 0", timeout=15_000
+        "() => document.querySelectorAll('#discord-log li').length > 0 "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
     )
     driver.settle(400)
 
@@ -1375,8 +1381,13 @@ def _act_open_channel(driver: Driver) -> None:
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     driver.click("view-switch")
+    # Cached rows are deliberately painted before the request answers. They are useful to a reader,
+    # but they cannot certify a scene that says it read the real throwaway server. Wait for both the
+    # rows and the end of the live read, so a saved snapshot alone never satisfies this precondition.
     driver.page.wait_for_function(
-        "() => document.querySelectorAll('#discord-log li').length > 0", timeout=15_000
+        "() => document.querySelectorAll('#discord-log li').length > 0 "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
     )
     driver.settle(300)
 
@@ -1420,6 +1431,26 @@ def _act_whole_channel(driver: Driver) -> None:
 
 def _act_channel_older(driver: Driver) -> None:
     _act_open_channel(driver)
+    # This is the actual precondition of the scene. Checking it before measuring the anchor turns a
+    # stale/complete snapshot into a precise report about a missing cursor, instead of clicking a
+    # hidden no-op control and timing out ten seconds later waiting for rows that cannot arrive.
+    try:
+        driver.page.wait_for_function(
+            "() => window.__visible('load-older') "
+            "&& !document.getElementById('load-older').disabled",
+            timeout=10_000,
+        )
+    except Exception as error:
+        state = driver.js(
+            "(() => { const b = document.getElementById('load-older'); "
+            "return JSON.stringify({ visible: window.__visible('load-older'), "
+            "disabled: b.disabled, rows: document.querySelectorAll('#discord-log li').length }); })()"
+        )
+        raise Unreachable(
+            "21-channel-older-loaded",
+            "an enabled Older messages control proves the server supplied a next-page cursor",
+            f"the completed newest-page read left {state}",
+        ) from error
     # Park in the MIDDLE. At the bottom of a list the page counts the reader as pinned to the
     # newest line, and following it is then the correct behaviour -- so a scene that measured the
     # anchor from there would be asserting the opposite of what it says.
@@ -4064,7 +4095,61 @@ def check_standalone_scene_controls() -> list[str]:
                 "scroll-test-strength` recorded, and it reads as a page bug rather than as a "
                 "harness one."
             )
+
+    for name, act in (
+        ("10-discord-view", _act_discord),
+        ("self-contained channel scenes", _act_open_channel),
+    ):
+        if "channel-loading" not in inspect.getsource(act):
+            problems.append(
+                f"{name} accepts cached channel rows before the live server read finishes. "
+                "A saved snapshot can then be photographed as current, or supply a stale paging cursor."
+            )
+
+    older = inspect.getsource(_act_channel_older)
+    if "window.__visible('load-older')" not in older or ".disabled" not in older:
+        problems.append(
+            "21-channel-older-loaded no longer requires an enabled Older messages control before "
+            "measuring and clicking. A missing cursor would be reported later as a generic row timeout."
+        )
     return problems
+
+
+def check_scene_storage_isolation_controls() -> list[str]:
+    """A prior channel walk must not decide how much history the next scene can request."""
+
+    class PageProbe:
+        def __init__(self) -> None:
+            self.init_scripts: list[str] = []
+
+        def on(self, _event: str, _handler: object) -> None:
+            pass
+
+        def add_init_script(self, script: str) -> None:
+            self.init_scripts.append(script)
+
+        def goto(self, _url: str, *, wait_until: str) -> None:
+            if wait_until != "load":
+                raise AssertionError(f"unexpected wait condition {wait_until!r}")
+
+    page = PageProbe()
+    driver = Driver(
+        cast("Page", page),
+        "http://127.0.0.1:18091",
+        "screenshot-probe-token",
+        Path("."),
+        PROFILES[0],
+        DEFAULT_THEME,
+    )
+    driver.load(with_token=True)
+    script = "\n".join(page.init_scripts)
+    if "localStorage.removeItem('vibe-talk.voice.message-cache')" not in script:
+        return [
+            "a screenshot-scene reload keeps the previous scene's saved channel snapshot. "
+            "A scene that walks to the beginning then makes the older-page and pull scenes "
+            "unreachable, because they restore a channel with no history left above it."
+        ]
+    return []
 
 
 def check_summary_scene_controls() -> list[str]:
@@ -4349,6 +4434,9 @@ SELF_TEST_CHECKS = (
     "record_capture accepts and writes a rendered frame",
     "every state declares at least one expectation before its shutter opens",
     "the three transcript states build the list they photograph, so --only reaches any of them",
+    "channel scenes wait for the live read, not merely for cached rows",
+    "the older-page scene checks its cursor-bearing control before it clicks",
+    "each scene reload drops the prior scene's saved channel snapshot",
     "an unreachable state's error names the state AND the expectation",
     "a phone-class profile with a real device scale factor survives",
     "both a tall and a short phone profile survive",
@@ -4379,6 +4467,7 @@ def run_self_test(tmp: Path) -> int:
         + check_blank_gate_controls(tmp)
         + check_state_controls()
         + check_standalone_scene_controls()
+        + check_scene_storage_isolation_controls()
         + check_summary_scene_controls()
         + check_profile_controls()
         + check_theme_controls()

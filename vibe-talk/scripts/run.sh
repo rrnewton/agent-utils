@@ -491,9 +491,13 @@ the binary yourself and re-run."
     # process group.
     trap shots_cleanup EXIT INT TERM HUP
 
-    cat > "$SHOTS_TMP/vibe-talk.toml" <<EOF
-[server]
-bind = "127.0.0.1:$SHOTS_PORT"
+    # Static prose is in QUOTED heredocs. Backticks in these TOML comments are deliberate
+    # regression inputs: an unquoted heredoc treats them as command substitutions, which once ran
+    # the screenshot state names as shell commands before the server even started. Dynamic values
+    # are emitted separately, one controlled value per printf.
+    {
+        printf '[server]\nbind = "127.0.0.1:%s"\n' "$SHOTS_PORT"
+        cat <<'EOF'
 
 [discord]
 bot_token = "screenshot-run-bot-token-never-sent-anywhere"
@@ -510,15 +514,13 @@ bot_token = "screenshot-run-bot-token-never-sent-anywhere"
 # channel pages three times, which also keeps `10-discord-view` above the five rows it asserts.
 default_fetch_limit = 6
 max_fetch_limit = 6
+EOF
 
-[auth]
-read_token = "$SHOTS_READ_TOKEN"
-write_token = "$SHOTS_WRITE_TOKEN"
-
-[[channels]]
-id = "$SHOTS_CHANNEL"
-label = "lead team"
-writable = true
+        printf '\n[auth]\nread_token = "%s"\nwrite_token = "%s"\n' \
+            "$SHOTS_READ_TOKEN" "$SHOTS_WRITE_TOKEN"
+        printf '\n[[channels]]\nid = "%s"\nlabel = "lead team"\nwritable = true\n' \
+            "$SHOTS_CHANNEL"
+        cat <<'EOF'
 
 # Pointed at the offline mock started above, NOT at ElevenLabs. The agent id and key are the mock's
 # own published constants; they authenticate against an account nobody owns and mean nothing
@@ -528,7 +530,9 @@ writable = true
 [elevenlabs]
 agent_id = "agent_mock00000000000000000000000"
 api_key = "xi-mock-api-key-not-a-real-one"
-api_base = "http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT/v1"
+EOF
+        printf 'api_base = "http://127.0.0.1:%s/v1"\n' "$SHOTS_MOCK_HTTP_PORT"
+        cat <<'EOF'
 
 # Three seconds, not the default thirty, and it is the whole reason the FAILURE state is
 # photographable in under a minute: the state that pictures a red row wedges the mock so that it
@@ -543,8 +547,9 @@ reply_timeout_seconds = 3
 # photograph, or -- worse, if it inherited a real path -- it would write the screenshot script's
 # invented conversations into the owner's own store.
 [storage]
-path = "$SHOTS_TMP/state/vibe-talk.sqlite3"
 EOF
+        printf 'path = "%s/state/vibe-talk.sqlite3"\n' "$SHOTS_TMP"
+    } > "$SHOTS_TMP/vibe-talk.toml"
 
     case "${SHOTS_THEME:-dark}" in
         dark|light|both) ;;
