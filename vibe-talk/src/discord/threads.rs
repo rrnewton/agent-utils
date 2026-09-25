@@ -1030,6 +1030,15 @@ fn parse_bridge_page(
     }
     page.messages = messages;
     page.threads = threads;
+    // Outside the thread view, `thread` names the one conversation a narrowed registration is
+    // scoped to. That channel has no child threads: the only summary it can list is itself, and
+    // offering it under Threads presents the channel as though it were a different conversation.
+    if request.view != TimelineView::Thread {
+        if let Some(scope) = &thread {
+            page.threads.retain(|summary| summary.id != scope.id);
+            page.has_threads = false;
+        }
+    }
     page.thread = thread;
     Ok(page)
 }
@@ -1479,6 +1488,50 @@ mod tests {
             .await
             .expect_err("wrong channel");
         assert!(error.to_string().contains("different channel"));
+    }
+
+    #[tokio::test]
+    async fn a_registration_scoped_to_one_thread_offers_no_child_threads() {
+        // The reported failure: a source registered as one conversation reported `has_threads`, so
+        // its Threads control listed that same conversation as its only, apparently unrelated, entry.
+        let mut routes = Replies::new();
+        let mut root = message("scoped", "root-id", "the linked conversation");
+        root["thread"] = json!({"id":"opaque/scope","root_message_id":"root-id","is_root":true,"reply_count":2,"reply_count_exact":true});
+        let scope = json!({"id":"opaque/scope","root":root.clone(),"title":"Linked","reply_count":2,"reply_count_exact":true,"updated_at":"2026-09-19T10:00:00Z"});
+        ok(
+            &mut routes,
+            "/channels/scoped/timeline?view=main&limit=50",
+            json!({"messages":[root],"threads":[],"thread":scope.clone(),"has_threads":true,"has_more":false,"next_before":null,"notice":null}),
+        );
+        ok(
+            &mut routes,
+            "/channels/scoped/timeline?view=threads&limit=50",
+            json!({"messages":[],"threads":[scope.clone()],"thread":scope,"has_threads":true,"has_more":false,"next_before":null,"notice":null}),
+        );
+        let mock = mock(routes, ThreadApi::Bridge).await;
+        let channel = ChannelId("scoped".into());
+        for view in [TimelineView::Main, TimelineView::Threads] {
+            let page = mock
+                .client
+                .fetch_timeline(
+                    &channel,
+                    &TimelineRequest {
+                        view,
+                        ..TimelineRequest::default()
+                    },
+                )
+                .await
+                .expect("scoped timeline");
+            assert!(
+                !page.has_threads,
+                "{view:?} offered child-thread navigation"
+            );
+            assert!(
+                page.threads.is_empty(),
+                "{view:?} listed the channel as its own child"
+            );
+            assert_eq!(page.thread.expect("scope").id, "opaque/scope");
+        }
     }
 
     #[tokio::test]

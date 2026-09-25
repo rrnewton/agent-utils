@@ -42,8 +42,8 @@ three controls appear above the history:
 A source added through Settings is always a separate entry in the channel picker, even when that
 source identifies one upstream conversation rather than a whole room. The **Threads** control is a
 different projection: it lists child conversations within the currently selected channel, and is
-absent when the configured backend does not provide thread timelines. It is not an alternate
-picker for added sources.
+absent when the configured backend does not provide thread timelines or when the selected channel
+is itself one conversation. It is not an alternate picker for added sources.
 
 The selected channel or space is remembered on this device when you reopen the app. If it is no
 longer configured, the app selects the first available channel.
@@ -874,6 +874,9 @@ carry an optional `thread` object with `id`, `root_message_id`, `is_root`, `repl
 `reply_count_exact`. Summary roots use the same message wire format. Discovery must finish before
 claiming global chronology or exact counts; a cap or provider failure must report an error instead
 of returning a plausible but incomplete flattened page. A notice can explain registration scope.
+A registration narrowed to one conversation names that conversation as `thread` in main, flat,
+and threads responses. Such a channel has no child threads, so vibe-talk reports no thread
+navigation for it and never lists the conversation as a child of itself.
 
 The native backend includes accessible active and archived threads. It bounds discovery at 256
 threads and 100 pages per archived collection, retains pagination inventories for five minutes,
