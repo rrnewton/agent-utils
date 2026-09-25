@@ -1,6 +1,6 @@
 ---
 title: 'voice-connect-latency: make call startup measurable and fast'
-status: in_progress
+status: closed
 priority: 0
 issue_type: bug
 assignee: opus-5.5
@@ -11,7 +11,8 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T03:55:15.301955780+00:00
-updated_at: 2026-09-25T05:09:54.970463188+00:00
+updated_at: 2026-09-25T23:54:35.158742000+00:00
+closed_at: 2026-09-25T23:54:35.158742000+00:00
 claimed_at: 2026-09-25T05:09:54.970463188+00:00
 claimed_until: 2026-09-27T05:09:54.970305732+00:00
 ---

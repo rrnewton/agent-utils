@@ -22,5 +22,13 @@
     "body": "[opus 5.5] Read-only acceptance run 3 (2026-09-25 21:09Z) is VOID, not a #13 voice-chat-tools failure. An upstream speech outage made every response fail with no audio or transcript, and the run overlapped a live user call. What it did show: ce078de works live. digest_channel succeeded on the configured channel's id with zero refusals, confirming that run 2's refusals were ids sent as JSON integers. Zero posts held: no adapter posts, no new message ids. The fix-forward tests landed in 2dbcf26. Acceptance is paused until a controlled smoke after the upstream fix.",
     "created_at": "2026-09-25T21:17:09.431201708Z",
     "updated_at": "2026-09-25T21:17:09.431201708Z"
+  },
+  {
+    "id": "agent-utils-13-c5d98d815183",
+    "issue_id": "agent-utils-13",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Final live acceptance, 2026-09-25 23:48\u201323:51Z. One sequential, read-only session on the deployed 1a9baed build. The served voice.js matched the landed hash. The front-door sign-in hop was bypassed: the page and websocket went through the local ingress, with the websocket path and read-scope credential unchanged. The front-door hop is covered by the owner's signed-in phone test. #13 voice-chat-tools: PASS. The profile reports read scope with write unavailable: 6 read tools available and post_reply unavailable. T1 named list_channels, digest_channel, read_page, count_messages, find_message and read_message, and no posting tool. It also named web_search, bridge and hangup, none of which posts. T2 summarized the configured channel. Compared privately against its 15 most recent messages, it was accurate. The only tool invoked was digest_channel: 1 read OK, 0 refused. T3, an explicit send request, was declined. Zero posts: 0 adapter post records, 0 write-credential requests, 0 new messages, 0 new bot messages. Observation, not a criterion: the T2 reply took 120 s and the spoken summary stopped just short of its end. That is a known short read on the private backend's current checkout. Closing.",
+    "created_at": "2026-09-25T23:54:35.158742000Z",
+    "updated_at": "2026-09-25T23:54:35.158742000Z"
   }
 ]
