@@ -2,58 +2,58 @@
   "collection_contract": {
     "ambient_cache_observation": {
       "authoritative": false,
-      "cache_only_stale_or_out_of_scope": 17,
-      "entries": 2064,
-      "live_only_missing_from_cache": 3835,
+      "cache_only_stale_or_out_of_scope": 18,
+      "entries": 4038,
+      "live_only_missing_from_cache": 1886,
       "path": "py/.pytest_cache/v/cache/nodeids",
       "readable": true,
-      "unique_nodeids": 2064
+      "unique_nodeids": 4038
     },
     "cache_provider_disabled": true,
     "phase_sets_pairwise_disjoint": true,
     "phase_union_matches_capture_exactly": true,
     "phases": [
       {
-        "cases": 4744,
+        "cases": 4767,
         "exact_capture_collection_equality": true,
         "isolation": "ordinary",
-        "live_collection_command": "/usr/local/fbcode/platform010/bin/python3.12 -m pytest --collect-only -q -p no:cacheprovider -c pyproject.toml --rootdir=. --ignore=wrkslots/tests/test_lifecycle.py",
+        "live_collection_command": "python3 -m pytest --collect-only -q -p no:cacheprovider -c pyproject.toml --rootdir=. --ignore=wrkslots/tests/test_lifecycle.py",
         "name": "general",
-        "nodeid_set_sha256": "e9ff6ce01bedb88b5d0d5271063466e022dd17db29c812ac262a9bae8ec4485c",
-        "passed": 4744,
+        "nodeid_set_sha256": "ee47b0fe1bfd05108742ad382312852225080023c53a4f4cf5bc78c67ab2a4f4",
+        "passed": 4767,
         "skipped": 0,
-        "sum_shard_suite_seconds": 519.156,
-        "testcase_seconds": 515.854
+        "sum_shard_suite_seconds": 528.23,
+        "testcase_seconds": 524.95
       },
       {
-        "cases": 856,
+        "cases": 857,
         "exact_capture_collection_equality": true,
         "isolation": "mapped-user-and-pid-namespace",
-        "live_collection_command": "/usr/local/fbcode/platform010/bin/python3.12 -m pytest --collect-only -q -p no:cacheprovider -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m not ordinary_environment",
+        "live_collection_command": "python3 -m pytest --collect-only -q -p no:cacheprovider -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'",
         "name": "lifecycle-namespace",
-        "nodeid_set_sha256": "22eba8eefcb90d9508ac57b5c21f4b8593a29c57d7569edaeccd5da18c1bd2ff",
-        "passed": 856,
+        "nodeid_set_sha256": "f4e2e681854e789048b790011ec039581822e99ddaedc076a6f065532daf3e9a",
+        "passed": 857,
         "skipped": 0,
-        "sum_shard_suite_seconds": 507.054,
-        "testcase_seconds": 505.31
+        "sum_shard_suite_seconds": 499.633,
+        "testcase_seconds": 498.032
       },
       {
         "cases": 282,
         "exact_capture_collection_equality": true,
         "isolation": "ordinary-host-process-namespace",
-        "live_collection_command": "/usr/local/fbcode/platform010/bin/python3.12 -m pytest --collect-only -q -p no:cacheprovider -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m ordinary_environment",
+        "live_collection_command": "python3 -m pytest --collect-only -q -p no:cacheprovider -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py -m ordinary_environment",
         "name": "lifecycle-host",
         "nodeid_set_sha256": "b5553ace2cf73946a2db4510c0c06c286c3f889f8fecffdc40b25af9bc429edf",
         "passed": 282,
         "skipped": 0,
-        "sum_shard_suite_seconds": 241.456,
-        "testcase_seconds": 240.719
+        "sum_shard_suite_seconds": 238.786,
+        "testcase_seconds": 237.999
       }
     ],
     "reason": "pytest's cache/nodeids is an accumulating historical union and contained stale entries; the generator performs a fresh live collection for every phase.",
-    "testcase_count": 5882,
-    "union_nodeid_set_sha256": "22d93f646f02c359b02a35feae59494032ff63e3502d6e3478c87d3466fda7e5",
-    "unique_nodeid_count": 5882
+    "testcase_count": 5906,
+    "union_nodeid_set_sha256": "9eefa8ddf969238b5e512f55defa928d02e714a1aa7ba193596375ebfdffc538",
+    "unique_nodeid_count": 5906
   },
   "coverage_contract_codes": {
     "agent-lifecycle-chat-state": "Agent lifecycle, chat transport, durable state, and command safety.",
@@ -73,28 +73,28 @@
   },
   "current_census": {
     "pareto_case_counts": {
-      "50_percent": 251,
-      "80_percent": 751,
-      "90_percent": 1088,
-      "95_percent": 1412,
-      "99_percent": 2591
+      "50_percent": 255,
+      "80_percent": 757,
+      "90_percent": 1097,
+      "95_percent": 1425,
+      "99_percent": 2637
     },
-    "passed": 5882,
+    "passed": 5906,
     "result": "green",
     "skipped": 0,
-    "sum_testcase_seconds": 1261.883,
-    "testcase_count": 5882
+    "sum_testcase_seconds": 1260.981,
+    "testcase_count": 5906
   },
   "environment": {
     "logical_cpus": 316,
     "note": "One shared-host census; use as a scheduling seed, not a stable benchmark.",
-    "python": "3.12.14+meta"
+    "python": "3.12.14"
   },
-  "generated_at_utc": "2026-09-25T15:33:15.752407Z",
+  "generated_at_utc": "2026-09-25T19:54:11.549213Z",
   "generator_artifact": {
-    "bytes": 34228,
+    "bytes": 40738,
     "path": "ai_docs/transient/2026-09-25-validation-overhaul/build_test_timing_ranking.py",
-    "sha256": "53f3829420e3a79e529e225f4ba2bd3546fa3366a2e2c73a9cf78fe9b591f1a7"
+    "sha256": "1a27a5ae07d8ab6dd2c80338864e9c1ac89db0c0bba9e8eee83f389666d84c38"
   },
   "identity_contract": {
     "capture_collection_misses": 0,
@@ -112,13 +112,13 @@
     "internal_paths_and_vendor_runtime_suffixes_omitted": true
   },
   "ranking_artifact": {
-    "bytes": 2336356,
+    "bytes": 2344705,
     "columns": 13,
     "cumulative_percent_last_row": 100.0,
-    "data_rows": 5882,
-    "lines_including_header": 5883,
+    "data_rows": 5906,
+    "lines_including_header": 5907,
     "path": "ai_docs/transient/2026-09-25-validation-overhaul/test-timing-ranking.tsv",
-    "sha256": "9c902a082506707dda10144afa70279dabb739453744e77d59345fa322c24071",
+    "sha256": "dbd2013aa9db1bce355e607bc3f554dc24b1be62e813930de5c4a7e41708a58b",
     "sort": "seconds descending, then nodeid ascending"
   },
   "recommendation_codes": {
@@ -136,204 +136,204 @@
   "schema": "agent-utils-validation-test-timing-provenance/v2",
   "source_artifacts": [
     {
-      "bytes": 2726825,
-      "cases": 4744,
+      "bytes": 2736986,
+      "cases": 4767,
       "isolation": "ordinary",
-      "passed": 4744,
-      "path": "/tmp/agent-utils-current-general.xml",
+      "passed": 4767,
+      "path": "agent-utils-current-general.xml",
       "phase": "general",
-      "sha256": "ed6c696e05f052b5955e222dd440a2fb78f6ecf540332c859770a4b4a6447752",
+      "sha256": "964bed3543cc9d6e640ccf7adb830ce0846683523a3f8760c7370a8726dc0e32",
       "skipped": 0,
-      "suite_seconds": 519.156,
-      "testcase_seconds": 515.854
+      "suite_seconds": 528.23,
+      "testcase_seconds": 524.95
     },
     {
-      "bytes": 56328,
-      "cases": 124,
+      "bytes": 56680,
+      "cases": 125,
       "isolation": "mapped-user-and-pid-namespace",
-      "passed": 124,
-      "path": "/tmp/agent-utils-current-lifecycle-namespace-0.xml",
+      "passed": 125,
+      "path": "agent-utils-current-lifecycle-namespace-0.xml",
       "phase": "lifecycle-namespace",
-      "sha256": "a886237e04e8ddfe2c43af0fd1895756a6fd8f5a5a6d8b05fe29f9816e85dd53",
+      "sha256": "2481e337b062360483f87b481c7ddeff38a21321aff4b0c19e4ab6d6acd1a741",
       "skipped": 0,
-      "suite_seconds": 88.138,
-      "testcase_seconds": 87.826
+      "suite_seconds": 86.481,
+      "testcase_seconds": 86.213
     },
     {
-      "bytes": 64637,
-      "cases": 141,
+      "bytes": 64101,
+      "cases": 140,
       "isolation": "mapped-user-and-pid-namespace",
-      "passed": 141,
-      "path": "/tmp/agent-utils-current-lifecycle-namespace-1.xml",
+      "passed": 140,
+      "path": "agent-utils-current-lifecycle-namespace-1.xml",
       "phase": "lifecycle-namespace",
-      "sha256": "283010e79b67dd74eda91334e732e139492836b3c617bea2e1ec4cbaa7df295b",
+      "sha256": "0f11c311b61649ccaf886bbc7b78c353299b61b4dd389485ccc4225927f2a121",
       "skipped": 0,
-      "suite_seconds": 101.556,
-      "testcase_seconds": 101.266
+      "suite_seconds": 93.528,
+      "testcase_seconds": 93.261
     },
     {
-      "bytes": 59338,
+      "bytes": 59305,
       "cases": 131,
       "isolation": "mapped-user-and-pid-namespace",
       "passed": 131,
-      "path": "/tmp/agent-utils-current-lifecycle-namespace-2.xml",
+      "path": "agent-utils-current-lifecycle-namespace-2.xml",
       "phase": "lifecycle-namespace",
-      "sha256": "f3228d8836f6e22cffdbd87a8b7dbbc929ff203ccc5f78acb49802cb48356e0c",
+      "sha256": "d64eaf3e682aa6450d23bc06cf3bf1c000fccc54af436a02c09d1cf97ddd37c6",
       "skipped": 0,
-      "suite_seconds": 69.777,
-      "testcase_seconds": 69.494
+      "suite_seconds": 73.803,
+      "testcase_seconds": 73.529
     },
     {
-      "bytes": 52200,
+      "bytes": 52542,
       "cases": 114,
       "isolation": "mapped-user-and-pid-namespace",
       "passed": 114,
-      "path": "/tmp/agent-utils-current-lifecycle-namespace-3.xml",
+      "path": "agent-utils-current-lifecycle-namespace-3.xml",
       "phase": "lifecycle-namespace",
-      "sha256": "7b2242d8ae51ef4676d040a39577d9d7c4cc0751c36f531ff0c874ed302bc016",
+      "sha256": "20ff7a98fc7e42333e842dd23e68d7db638e4e0c868e964adcaa4a935bc6731b",
       "skipped": 0,
-      "suite_seconds": 79.059,
-      "testcase_seconds": 78.769
+      "suite_seconds": 82.543,
+      "testcase_seconds": 82.286
     },
     {
-      "bytes": 81189,
-      "cases": 174,
+      "bytes": 82915,
+      "cases": 178,
       "isolation": "mapped-user-and-pid-namespace",
-      "passed": 174,
-      "path": "/tmp/agent-utils-current-lifecycle-namespace-4.xml",
+      "passed": 178,
+      "path": "agent-utils-current-lifecycle-namespace-4.xml",
       "phase": "lifecycle-namespace",
-      "sha256": "4aac07c5f8c917a75ace4cbf91a3831dc8f810f13e728c06881848f4d5311fb0",
+      "sha256": "5d1567a371c8f90bc5e6d9308cdddb4686a8c97b2a9905bcf1910dd0f9b20ff4",
       "skipped": 0,
-      "suite_seconds": 82.321,
-      "testcase_seconds": 82.024
+      "suite_seconds": 83.623,
+      "testcase_seconds": 83.35
     },
     {
-      "bytes": 79809,
-      "cases": 172,
+      "bytes": 78414,
+      "cases": 169,
       "isolation": "mapped-user-and-pid-namespace",
-      "passed": 172,
-      "path": "/tmp/agent-utils-current-lifecycle-namespace-5.xml",
+      "passed": 169,
+      "path": "agent-utils-current-lifecycle-namespace-5.xml",
       "phase": "lifecycle-namespace",
-      "sha256": "d59f146b786bc1398c7cad3cdb4d7daf3b027506774ab0d5b315c1513fe08e9f",
+      "sha256": "8d6e7d0862deceefb7a616eda9fb1b1246a88c217deadf907c995902851d564a",
       "skipped": 0,
-      "suite_seconds": 86.203,
-      "testcase_seconds": 85.931
+      "suite_seconds": 79.655,
+      "testcase_seconds": 79.393
     },
     {
-      "bytes": 49408,
-      "cases": 100,
+      "bytes": 48953,
+      "cases": 99,
       "isolation": "ordinary-host-process-namespace",
-      "passed": 100,
-      "path": "/tmp/agent-utils-current-lifecycle-host-0.xml",
+      "passed": 99,
+      "path": "agent-utils-current-lifecycle-host-0.xml",
       "phase": "lifecycle-host",
-      "sha256": "98e3b868d1fd929fab4efbaacf4e17fc88d6ac26211d6a5984d8e10a271dc3a0",
+      "sha256": "91dd0657f87e23902c3d06a06157b5a6e48d16dbdcc6c65b1e638dc5452b5f6a",
       "skipped": 0,
-      "suite_seconds": 83.322,
-      "testcase_seconds": 83.071
+      "suite_seconds": 78.932,
+      "testcase_seconds": 78.672
     },
     {
-      "bytes": 37765,
-      "cases": 76,
+      "bytes": 36850,
+      "cases": 74,
       "isolation": "ordinary-host-process-namespace",
-      "passed": 76,
-      "path": "/tmp/agent-utils-current-lifecycle-host-1.xml",
+      "passed": 74,
+      "path": "agent-utils-current-lifecycle-host-1.xml",
       "phase": "lifecycle-host",
-      "sha256": "efb1e1b03ea9f85da19848e04d88a3cb71f49c9cad5024f2d87b61c152385925",
+      "sha256": "2398eb59d69b68c49a721dd86780d1948f2f722b4ae8411d71a19300c8f66abb",
       "skipped": 0,
-      "suite_seconds": 72.838,
-      "testcase_seconds": 72.608
+      "suite_seconds": 32.583,
+      "testcase_seconds": 32.315
     },
     {
-      "bytes": 51505,
-      "cases": 106,
+      "bytes": 52875,
+      "cases": 109,
       "isolation": "ordinary-host-process-namespace",
-      "passed": 106,
-      "path": "/tmp/agent-utils-current-lifecycle-host-2.xml",
+      "passed": 109,
+      "path": "agent-utils-current-lifecycle-host-2.xml",
       "phase": "lifecycle-host",
-      "sha256": "ca5a202e2188fa74f98cf8b7bdef03c5099eefdc4ae939f3030f19f3036dcd12",
+      "sha256": "4756908ab3f51dc08ded32ff6143414141ec90a4769f43889a602844c2a0eaae",
       "skipped": 0,
-      "suite_seconds": 85.296,
-      "testcase_seconds": 85.04
+      "suite_seconds": 127.271,
+      "testcase_seconds": 127.012
     }
   ],
   "source_snapshot": {
-    "after_path": "/tmp/agent-utils-current-capture-after.json",
-    "after_recorded_at_utc": "2026-09-25T15:33:09.900123Z",
-    "before_path": "/tmp/agent-utils-current-capture-before.json",
-    "before_recorded_at_utc": "2026-09-25T15:05:51.006922Z",
+    "after_path": "agent-utils-current-capture-after.json",
+    "after_recorded_at_utc": "2026-09-25T19:53:58.668784Z",
+    "before_path": "agent-utils-current-capture-before.json",
+    "before_recorded_at_utc": "2026-09-25T19:40:23.591480Z",
     "bound_untracked_file_count": 0,
     "generated_artifacts_excluded_from_snapshot": [
       "ai_docs/transient/2026-09-25-validation-overhaul/test-timing-provenance.json",
       "ai_docs/transient/2026-09-25-validation-overhaul/test-timing-ranking.tsv"
     ],
-    "git_head": "e6a545e93917bd245b2512b0eed99954798349b7",
+    "git_head": "867aa25d80c0a510529a42e19614736139aab648",
     "junit_inputs_absent_before_capture": true,
     "junit_inputs_after_capture": [
       {
-        "bytes": 2726825,
-        "mtime_ns": 1790349791943299309,
+        "bytes": 2736986,
+        "mtime_ns": 1790365752215626071,
         "name": "agent-utils-current-general.xml",
-        "sha256": "ed6c696e05f052b5955e222dd440a2fb78f6ecf540332c859770a4b4a6447752"
+        "sha256": "964bed3543cc9d6e640ccf7adb830ce0846683523a3f8760c7370a8726dc0e32"
       },
       {
-        "bytes": 56328,
-        "mtime_ns": 1790350192344834734,
+        "bytes": 56680,
+        "mtime_ns": 1790365841780242100,
         "name": "agent-utils-current-lifecycle-namespace-0.xml",
-        "sha256": "a886237e04e8ddfe2c43af0fd1895756a6fd8f5a5a6d8b05fe29f9816e85dd53"
+        "sha256": "2481e337b062360483f87b481c7ddeff38a21321aff4b0c19e4ab6d6acd1a741"
       },
       {
-        "bytes": 64637,
-        "mtime_ns": 1790350205790920398,
+        "bytes": 64101,
+        "mtime_ns": 1790365848834291039,
         "name": "agent-utils-current-lifecycle-namespace-1.xml",
-        "sha256": "283010e79b67dd74eda91334e732e139492836b3c617bea2e1ec4cbaa7df295b"
+        "sha256": "0f11c311b61649ccaf886bbc7b78c353299b61b4dd389485ccc4225927f2a121"
       },
       {
-        "bytes": 59338,
-        "mtime_ns": 1790350173993717820,
+        "bytes": 59305,
+        "mtime_ns": 1790365829107154177,
         "name": "agent-utils-current-lifecycle-namespace-2.xml",
-        "sha256": "f3228d8836f6e22cffdbd87a8b7dbbc929ff203ccc5f78acb49802cb48356e0c"
+        "sha256": "d64eaf3e682aa6450d23bc06cf3bf1c000fccc54af436a02c09d1cf97ddd37c6"
       },
       {
-        "bytes": 52200,
-        "mtime_ns": 1790350183304777140,
+        "bytes": 52542,
+        "mtime_ns": 1790365837846214807,
         "name": "agent-utils-current-lifecycle-namespace-3.xml",
-        "sha256": "7b2242d8ae51ef4676d040a39577d9d7c4cc0751c36f531ff0c874ed302bc016"
+        "sha256": "20ff7a98fc7e42333e842dd23e68d7db638e4e0c868e964adcaa4a935bc6731b"
       },
       {
-        "bytes": 81189,
-        "mtime_ns": 1790350186533797712,
+        "bytes": 82915,
+        "mtime_ns": 1790365838930317476,
         "name": "agent-utils-current-lifecycle-namespace-4.xml",
-        "sha256": "4aac07c5f8c917a75ace4cbf91a3831dc8f810f13e728c06881848f4d5311fb0"
+        "sha256": "5d1567a371c8f90bc5e6d9308cdddb4686a8c97b2a9905bcf1910dd0f9b20ff4"
       },
       {
-        "bytes": 79809,
-        "mtime_ns": 1790350312751598965,
+        "bytes": 78414,
+        "mtime_ns": 1790365909483712840,
         "name": "agent-utils-current-lifecycle-namespace-5.xml",
-        "sha256": "d59f146b786bc1398c7cad3cdb4d7daf3b027506774ab0d5b315c1513fe08e9f"
+        "sha256": "8d6e7d0862deceefb7a616eda9fb1b1246a88c217deadf907c995902851d564a"
       },
       {
-        "bytes": 49408,
-        "mtime_ns": 1790350309844412747,
+        "bytes": 48953,
+        "mtime_ns": 1790365989112269512,
         "name": "agent-utils-current-lifecycle-host-0.xml",
-        "sha256": "98e3b868d1fd929fab4efbaacf4e17fc88d6ac26211d6a5984d8e10a271dc3a0"
+        "sha256": "91dd0657f87e23902c3d06a06157b5a6e48d16dbdcc6c65b1e638dc5452b5f6a"
       },
       {
-        "bytes": 37765,
-        "mtime_ns": 1790350299363855302,
+        "bytes": 36850,
+        "mtime_ns": 1790365942768944919,
         "name": "agent-utils-current-lifecycle-host-1.xml",
-        "sha256": "efb1e1b03ea9f85da19848e04d88a3cb71f49c9cad5024f2d87b61c152385925"
+        "sha256": "2398eb59d69b68c49a721dd86780d1948f2f722b4ae8411d71a19300c8f66abb"
       },
       {
-        "bytes": 51505,
-        "mtime_ns": 1790350311813593024,
+        "bytes": 52875,
+        "mtime_ns": 1790366037449606620,
         "name": "agent-utils-current-lifecycle-host-2.xml",
-        "sha256": "ca5a202e2188fa74f98cf8b7bdef03c5099eefdc4ae939f3030f19f3036dcd12"
+        "sha256": "4756908ab3f51dc08ded32ff6143414141ec90a4769f43889a602844c2a0eaae"
       }
     ],
     "note": "The digest binds HEAD, the full tracked binary diff, and every non-generated untracked file. The workspace_state field states whether that bound source snapshot was clean or dirty.",
     "pre_post_match": true,
     "tracked_diff_bytes": 0,
-    "workspace_snapshot_sha256": "461093601aa9deeb0a369fa26dab3b6d4fee7776c92759cdeea7421064496282",
-    "workspace_state": "dirty"
+    "workspace_snapshot_sha256": "77388165ccc3a088164e4dfc32885716519e859f712ac6b17b80878929c064c3",
+    "workspace_state": "clean"
   }
 }
