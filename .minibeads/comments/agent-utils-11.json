@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-11-c855c663455",
+    "issue_id": "agent-utils-11",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] 2026-09-25 21:55Z: the private voice backend's speech route is restored. One live smoke passed: greeting and one text prompt each produced audible PCM and an agent transcript, both response groups completed, 0 failed. First assistant audio came 861 ms after the greeting request and 57 ms after the text prompt. Details and route info are kept in private evidence only. Test-harness note: after the client sends audio_end, the bridge replies with an immediate turn_complete ack. Acceptance drivers must consume that ack before sending the next input.",
+    "created_at": "2026-09-25T22:19:06.960322148Z",
+    "updated_at": "2026-09-25T22:19:06.960322148Z"
+  }
+]
