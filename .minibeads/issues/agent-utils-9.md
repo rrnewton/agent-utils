@@ -1,6 +1,6 @@
 ---
 title: 'gchat-thread-selector: make the active conversation easy to choose'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -10,7 +10,8 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T01:32:03.265269974+00:00
-updated_at: 2026-09-25T01:33:45.755798153+00:00
+updated_at: 2026-09-25T18:26:00.918304000+00:00
+closed_at: 2026-09-25T18:26:00.918304000+00:00
 ---
 
 # Description
