@@ -10,6 +10,8 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
@@ -43,7 +45,11 @@ from dagrun.model import (
 )
 
 __all__ = [
+    "MAX_DAG_FLATTENED_STEPS",
+    "MAX_DAG_INCLUDE_DEPTH",
+    "MAX_DAG_INCLUDE_INSTANCES",
     "dag_from_json",
+    "dag_from_path",
     "dag_from_yaml",
     "dag_to_json",
     "dag_to_yaml",
@@ -51,6 +57,13 @@ __all__ = [
 ]
 
 _DEFAULT_MEM_CAP_FLOOR = 8 * 1024**3
+
+# Path-composition safety bounds. The root document is depth zero and is not an include instance.
+# These limits affect only dag_from_path; the context-free legacy parsers retain their existing
+# graph-size behavior.
+MAX_DAG_INCLUDE_DEPTH = 128
+MAX_DAG_INCLUDE_INSTANCES = 4096
+MAX_DAG_FLATTENED_STEPS = 100_000
 
 
 class DagJsonError(ValueError):
@@ -85,7 +98,7 @@ def _check_i64(n: int, where: str) -> int:
 
 def _as_obj(value: object, where: str) -> dict[str, object]:
     if not isinstance(value, dict):
-        raise DagJsonError(f"{where}: expected an object, got {type(value).__name__}")
+        raise DagJsonError(f"{where}: expected an object, got {_json_type_name(value)}")
     out: dict[str, object] = {}
     for key, val in value.items():
         out[str(key)] = val
@@ -351,12 +364,21 @@ def _reject_json_constant(token: str) -> NoReturn:
     raise DagJsonError(f"invalid JSON: non-finite float literal {token!r} is not allowed")
 
 
-def dag_from_json(text: str) -> DagConfig:
-    """Parse a DAG JSON document into a :class:`DagConfig`. Raises :class:`DagJsonError`."""
+def _raw_from_json(text: str) -> object:
+    """Parse JSON without narrowing it to a DAG yet."""
     try:
-        raw: object = json.loads(text, parse_constant=_reject_json_constant)
+        return json.loads(text, parse_constant=_reject_json_constant)
     except json.JSONDecodeError as exc:
         raise DagJsonError(f"invalid JSON: {exc}") from exc
+
+
+def dag_from_json(text: str) -> DagConfig:
+    """Parse one self-contained JSON DAG.
+
+    ``include`` is path-relative source syntax, so it is deliberately refused by this
+    context-free parser. Use :func:`dag_from_path` for a composed DAG.
+    """
+    raw = _raw_from_json(text)
     return _dag_from_obj(raw)
 
 
@@ -468,13 +490,8 @@ def _core_loader() -> type[yaml.SafeLoader]:
     return _CoreLoader
 
 
-def dag_from_yaml(text: str) -> DagConfig:
-    """Parse a DAG YAML document into a :class:`DagConfig`.
-
-    YAML uses the same strict schema as JSON, with YAML 1.2 core scalar resolution.
-    Comments and multi-line block scalars are accepted. Malformed input and a missing
-    declared YAML dependency raise :class:`DagJsonError`.
-    """
+def _raw_from_yaml(text: str) -> object:
+    """Parse YAML without narrowing it to a DAG yet."""
     try:
         import yaml
     except ModuleNotFoundError as exc:
@@ -482,12 +499,371 @@ def dag_from_yaml(text: str) -> DagConfig:
     try:
         # yaml.load returns Any; pin it to `object` at the parse boundary so no Any leaks past here
         # (the strict narrowing in _dag_from_obj re-validates every field's type anyway).
-        raw: object = yaml.load(text, Loader=_core_loader())
+        return yaml.load(text, Loader=_core_loader())
     except yaml.YAMLError as exc:
         # Match the Rust build, which returns a load error (exit 2) on malformed YAML rather than
         # letting an exception escape.
         raise DagJsonError(f"invalid YAML: {exc}") from exc
-    return _dag_from_obj(raw)
+
+
+def dag_from_yaml(text: str) -> DagConfig:
+    """Parse one self-contained YAML DAG.
+
+    YAML uses the same strict schema as JSON, with YAML 1.2 core scalar resolution.
+    Comments and multi-line block scalars are accepted. ``include`` requires filesystem
+    context and is therefore accepted only by :func:`dag_from_path`.
+    """
+    return _dag_from_obj(_raw_from_yaml(text))
+
+
+# ``include`` is SOURCE syntax. It is consumed while loading files and never becomes part of the
+# runtime model or canonical JSON. Keeping composition out of DagConfig means every downstream
+# command sees the same ordinary, flattened graph as if it had been written in one file.
+_INCLUDE_KEYS = frozenset({"after", "namespace", "path"})
+_NAMESPACE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_GLOBAL_POLICY_KEYS = (
+    "mem_cap_factor",
+    "mem_cap_floor_bytes",
+    "outer_mem_safety_factor",
+    "default_step_timeout",
+    "default_jobs_flag",
+    "default_jobs_env",
+    "write_domain_policy",
+)
+
+
+def _include_entries(
+    doc: Mapping[str, object], source: str
+) -> list[tuple[str, str, list[str]]]:
+    """Strictly parse the reserved top-level ``include`` key."""
+    if "include" not in doc:
+        return []
+    raw = doc["include"]
+    if not isinstance(raw, list):
+        raise DagJsonError(f"{source}.include: must be a list")
+    entries: list[tuple[str, str, list[str]]] = []
+    for index, value in enumerate(raw):
+        where = f"{source}.include[{index}]"
+        entry = _as_obj(value, where)
+        _refuse_unknown_keys(entry, _INCLUDE_KEYS, where)
+        path = _req_str(entry, "path", where)
+        namespace = _req_str(entry, "namespace", where)
+        if not path:
+            raise DagJsonError(f"{where}.path: must be non-empty")
+        if not _NAMESPACE_SEGMENT.fullmatch(namespace):
+            raise DagJsonError(
+                f"{where}.namespace: must match [A-Za-z0-9][A-Za-z0-9_-]*"
+            )
+        raw_after = entry.get("after", [])
+        if not isinstance(raw_after, list):
+            raise DagJsonError(f"{where}.after: must be a list of strings")
+        after: list[str] = []
+        for tag in raw_after:
+            if not isinstance(tag, str):
+                raise DagJsonError(f"{where}.after: must contain only strings")
+            after.append(tag)
+        if any(not tag for tag in after):
+            raise DagJsonError(f"{where}.after: tags must be non-empty")
+        if len(after) != len(set(after)):
+            raise DagJsonError(f"{where}.after: duplicate tags are not allowed")
+        entries.append((path, namespace, after))
+    return entries
+
+
+def _qualify(namespace: str, value: str) -> str:
+    return f"{namespace}.{value}" if namespace else value
+
+
+def _rewrite_step(entry: object, namespace: str) -> object:
+    """Copy one raw step and qualify every field whose value is a step identity."""
+    rewritten = deepcopy(entry)
+    if not namespace or not isinstance(rewritten, dict):
+        return rewritten
+
+    group = rewritten.get("group")
+    if isinstance(group, str):
+        rewritten["group"] = _qualify(namespace, group)
+    for key in ("deps", "explains"):
+        values = rewritten.get(key)
+        if isinstance(values, list):
+            rewritten[key] = [
+                _qualify(namespace, value) if isinstance(value, str) else value
+                for value in values
+            ]
+    family = rewritten.get("fail_fast_family")
+    if isinstance(family, str) and family.strip():
+        rewritten["fail_fast_family"] = _qualify(namespace, family)
+    declarations = rewritten.get("result_manifests")
+    if isinstance(declarations, list):
+        for declaration in declarations:
+            if (
+                isinstance(declaration, dict)
+                and declaration.get("kind") == STRUCTURED_TEST_RESULTS_KIND
+                and isinstance(declaration.get("owner"), str)
+                and declaration["owner"]
+            ):
+                declaration["owner"] = _qualify(namespace, declaration["owner"])
+    return rewritten
+
+
+def _policy_config(doc: Mapping[str, object]) -> DagConfig:
+    """Parse only document-global policy, independently of fragment-local steps."""
+    policy_doc = deepcopy(dict(doc))
+    policy_doc.pop("include", None)
+    policy_doc["steps"] = []
+    return _dag_from_obj(policy_doc)
+
+
+def _policy_value(config: DagConfig, key: str) -> object:
+    return getattr(config, key)
+
+
+def _read_dag_source(path: Path, *, syntax_path: Path | None = None) -> dict[str, object]:
+    """Read canonical ``path`` using the extension of the path the author named."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise DagJsonError(f"{path}: cannot read DAG: {exc}") from exc
+    try:
+        raw = (
+            _raw_from_yaml(text)
+            if (syntax_path or path).suffix.lower() in {".yaml", ".yml"}
+            else _raw_from_json(text)
+        )
+        return _as_obj(raw, "<root>")
+    except DagJsonError as exc:
+        detail = str(exc).removeprefix("<root>: ")
+        raise DagJsonError(f"{path}: {detail}") from exc
+
+
+def _resolve_include_path(raw: str, source: Path, root_dir: Path) -> Path:
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        raise DagJsonError(f"{source}: include path {raw!r} must be relative")
+    if (
+        re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", raw)
+        or raw.startswith("~")
+        or "$" in raw
+        or any(marker in raw for marker in ("*", "?", "["))
+    ):
+        raise DagJsonError(
+            f"{source}: include path {raw!r} must be a literal relative path "
+            "(URLs, globs, '~', and environment expansion are not supported)"
+        )
+    try:
+        resolved = (source.parent / candidate).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DagJsonError(f"{source}: cannot resolve include path {raw!r}: {exc}") from exc
+    try:
+        resolved.relative_to(root_dir)
+    except ValueError as exc:
+        raise DagJsonError(
+            f"{source}: include path {raw!r} resolves outside top-level DAG directory {root_dir}"
+        ) from exc
+    if not resolved.is_file():
+        raise DagJsonError(f"{source}: include path {raw!r} does not name a regular file")
+    return resolved
+
+
+def dag_from_path(path: str | Path) -> DagConfig:
+    """Load and flatten a JSON/YAML DAG plus its namespaced includes.
+
+    Included paths are relative to their declaring file and must remain below the top-level DAG
+    directory after symlink resolution. Includes are visited depth-first in declaration order;
+    each included file's local steps follow its own children, and the top-level file's local steps
+    come last. A canonical file may be reused under different namespaces, never twice under the
+    same effective namespace. An include entry's optional ``after`` tags are resolved in the
+    parent's namespace and injected into every entry node of the included flattened subgraph.
+    """
+    requested = Path(path)
+    try:
+        root = requested.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DagJsonError(f"{requested}: cannot read DAG: {exc}") from exc
+    if not root.is_file():
+        raise DagJsonError(f"{requested}: does not name a regular file")
+    root_dir = root.parent
+    root_doc = _read_dag_source(root, syntax_path=requested)
+    _include_entries(root_doc, str(root))
+    try:
+        root_policy = _policy_config(root_doc)
+    except DagJsonError as exc:
+        raise DagJsonError(f"{root}: {str(exc).removeprefix('<root>: ')}") from exc
+
+    flattened_steps: list[object] = []
+    resource_caps: dict[str, int] = {}
+    cap_sources: dict[str, Path] = {}
+    step_sources: dict[str, tuple[Path, int, str]] = {}
+    seen: set[tuple[Path, str]] = set()
+    active: list[Path] = []
+    include_instances = 0
+    declared_steps = 0
+    after_references: list[tuple[str, Path]] = []
+
+    def inject_after(start: int, end: int, after: list[str], source: Path) -> None:
+        if not after:
+            return
+        subgraph_tags = {
+            f"{entry['group']}.{entry['job']}"
+            for entry in flattened_steps[start:end]
+            if isinstance(entry, dict)
+            and isinstance(entry.get("group"), str)
+            and isinstance(entry.get("job"), str)
+        }
+        internal = sorted(set(after) & subgraph_tags)
+        if internal:
+            raise DagJsonError(
+                f"{source}: include after must name outer steps, not tag(s) inside the "
+                f"included subgraph: {', '.join(internal)}"
+            )
+        for entry in flattened_steps[start:end]:
+            if not isinstance(entry, dict):
+                continue
+            deps = entry.get("deps")
+            if deps is None:
+                deps = []
+            if not isinstance(deps, list) or not all(isinstance(dep, str) for dep in deps):
+                continue
+            if any(dep in subgraph_tags for dep in deps):
+                continue
+            entry["deps"] = deps + [tag for tag in after if tag not in deps]
+
+    def visit(
+        source: Path,
+        namespace: str,
+        document: dict[str, object] | None = None,
+        *,
+        syntax_path: Path | None = None,
+        depth: int = 0,
+    ) -> tuple[int, int]:
+        nonlocal declared_steps, include_instances
+        if source in active:
+            start = active.index(source)
+            chain = active[start:] + [source]
+            raise DagJsonError("include cycle: " + " -> ".join(str(item) for item in chain))
+        identity = (source, namespace)
+        if identity in seen:
+            display = namespace or "<root>"
+            raise DagJsonError(
+                f"duplicate include: {source} is loaded more than once as namespace {display!r}"
+            )
+        seen.add(identity)
+        active.append(source)
+        start = len(flattened_steps)
+        try:
+            doc = (
+                document
+                if document is not None
+                else _read_dag_source(source, syntax_path=syntax_path)
+            )
+            try:
+                _refuse_uncarried_config_keys(doc)
+                includes = _include_entries(doc, str(source))
+                steps = doc.get("steps")
+                if not isinstance(steps, list):
+                    raise _steps_list_error(doc)
+                declared_steps += len(steps)
+                if declared_steps > MAX_DAG_FLATTENED_STEPS:
+                    raise DagJsonError(
+                        f"composed DAG exceeds {MAX_DAG_FLATTENED_STEPS} flattened steps"
+                    )
+                fragment_policy = _policy_config(doc)
+            except DagJsonError as exc:
+                detail = str(exc).removeprefix("<root>: ")
+                if detail.startswith(str(source)):
+                    raise
+                raise DagJsonError(f"{source}: {detail}") from exc
+
+            if source != root:
+                for key in _GLOBAL_POLICY_KEYS:
+                    if key in doc and _policy_value(fragment_policy, key) != _policy_value(
+                        root_policy, key
+                    ):
+                        raise DagJsonError(
+                            f"{source}: global policy {key!r} conflicts with top-level DAG {root}"
+                        )
+
+            caps = _opt_str_int_map(doc, "resource_caps", str(source))
+            for name, value in sorted(caps.items()):
+                if name in resource_caps and resource_caps[name] != value:
+                    raise DagJsonError(
+                        f"{source}: resource cap {name!r}={value} conflicts with "
+                        f"{cap_sources[name]} value {resource_caps[name]}"
+                    )
+                resource_caps[name] = value
+                cap_sources.setdefault(name, source)
+
+            for raw_path, segment, after in includes:
+                if depth >= MAX_DAG_INCLUDE_DEPTH:
+                    raise DagJsonError(
+                        f"{source}: include nesting exceeds maximum depth "
+                        f"{MAX_DAG_INCLUDE_DEPTH}"
+                    )
+                if include_instances >= MAX_DAG_INCLUDE_INSTANCES:
+                    raise DagJsonError(
+                        f"{source}: composed DAG exceeds {MAX_DAG_INCLUDE_INSTANCES} "
+                        "include instances"
+                    )
+                include_instances += 1
+                included = _resolve_include_path(raw_path, source, root_dir)
+                child_namespace = _qualify(namespace, segment)
+                child_start, child_end = visit(
+                    included,
+                    child_namespace,
+                    syntax_path=Path(raw_path),
+                    depth=depth + 1,
+                )
+                qualified_after = [_qualify(namespace, tag) for tag in after]
+                after_references.extend((tag, source) for tag in qualified_after)
+                inject_after(
+                    child_start,
+                    child_end,
+                    qualified_after,
+                    source,
+                )
+
+            for index, entry in enumerate(steps):
+                rewritten = _rewrite_step(entry, namespace)
+                if isinstance(rewritten, dict):
+                    group, job = rewritten.get("group"), rewritten.get("job")
+                    if isinstance(group, str) and isinstance(job, str):
+                        tag = f"{group}.{job}"
+                        prior = step_sources.get(tag)
+                        if prior is not None:
+                            prior_path, prior_index, prior_namespace = prior
+                            if not (
+                                source == root
+                                and prior_path == root
+                                and not namespace
+                                and not prior_namespace
+                            ):
+                                raise DagJsonError(
+                                    f"duplicate step tag {tag!r}: {prior_path} "
+                                    f"steps[{prior_index}] (namespace "
+                                    f"{prior_namespace or '<root>'!r}) and {source} "
+                                    f"steps[{index}] (namespace {namespace or '<root>'!r})"
+                                )
+                        else:
+                            step_sources[tag] = (source, index, namespace)
+                flattened_steps.append(rewritten)
+            return start, len(flattened_steps)
+        finally:
+            active.pop()
+
+    visit(root, "", root_doc)
+    for tag, source in after_references:
+        if tag not in step_sources:
+            raise DagJsonError(
+                f"{source}: include after references missing outer step {tag!r}"
+            )
+    flattened = deepcopy(root_doc)
+    flattened.pop("include", None)
+    flattened["steps"] = flattened_steps
+    flattened["resource_caps"] = resource_caps
+    try:
+        return _dag_from_obj(flattened)
+    except DagJsonError as exc:
+        raise DagJsonError(f"{root}: {str(exc).removeprefix('<root>: ')}") from exc
 
 
 #: :class:`DagConfig` fields that the DOCUMENT FORMAT deliberately does not carry.
@@ -549,6 +925,7 @@ STEP_KEYS: frozenset[str] = frozenset(
         "integration_test_binaries",
         "networkonly",
         "engine_only",
+        "delegated_children",
         "timeout",
         "cpu_timeout",
         "jobs_flag",
@@ -762,6 +1139,14 @@ def _dag_from_obj(raw: object) -> DagConfig:
     """
     doc = _as_obj(raw, "<root>")
     _refuse_uncarried_config_keys(doc)
+    # `include` is reserved syntax, not an open-schema extension. Validate it first so a typo in
+    # an entry is never hidden behind the generic context error, then require the path-aware API.
+    _include_entries(doc, "<root>")
+    if "include" in doc:
+        raise DagJsonError(
+            "<root>.include: includes require filesystem context; load this document with "
+            "dag_from_path() or pass its filename to --dag (includes cannot be read from stdin)"
+        )
     # The document-level default_step_timeout is the per-step default for any step that omits
     # its own `timeout`. Parse it BEFORE the step loop so it can be threaded in as each step's
     # default. ABSENT IS NOT 1800: an omitted default leaves both it and the step at the 0
@@ -817,6 +1202,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 hint=_hint_from(sm.get("hint"), f"{where}.hint"),
                 networkonly=_opt_bool(sm, "networkonly", False),
                 engine_only=_opt_bool(sm, "engine_only", False),
+                delegated_children=_opt_bool(sm, "delegated_children", False),
                 timeout=_opt_int(sm, "timeout", default_step_timeout),
                 cpu_timeout=_opt_int(sm, "cpu_timeout", 0),
                 jobs_flag=_opt_str_or_none(sm, "jobs_flag"),
@@ -952,6 +1338,7 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "env": dict(sorted(step.env.items())),
         "networkonly": step.networkonly,
         "engine_only": step.engine_only,
+        "delegated_children": step.delegated_children,
         # Both timeout fields are emitted only when SET. 0 is the "derive it" sentinel, and
         # writing it out would read as "no wall bound" — the opposite of what it means.
         "timeout": step.timeout,
@@ -978,6 +1365,8 @@ def _step_to_json(step: Step) -> dict[str, object]:
         del obj["result_manifests"]
     if step.integration_test_binaries is None:
         del obj["integration_test_binaries"]
+    if not step.delegated_children:
+        del obj["delegated_children"]
     if step.skip_reason is None:
         del obj["skip_reason"]
     # Emitted only when declared, like write_domains below: a graph that does not use the

@@ -23,6 +23,16 @@ fn boxed_stdin_dag_keeps_step_and_cpu_limits_independent() {
         ])
         .env_remove("CI")
         .env_remove("GITHUB_ACTIONS")
+        // This test specifically pins stdin survival across a fresh top-level systemd re-exec.
+        // The cargo-test binary can itself be inside a delegated validation step; inheriting that
+        // authority would skip the transition this test exists to exercise.
+        .env_remove("DAGRUN_OUTER_RUN")
+        .env_remove("DAGRUN_DELEGATED_CGROUP")
+        .env_remove("DAGRUN_DELEGATED_UNBOXED")
+        .env_remove("DAGRUN_IN_SCOPE")
+        .env_remove("DAGRUN_SCOPE_UNIT")
+        .env_remove("DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES")
+        .env_remove("DAGRUN_EXPECTED_OUTER_CPU_COUNT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -46,6 +56,11 @@ fn boxed_stdin_dag_keeps_step_and_cpu_limits_independent() {
     }
     assert!(output.status.success(), "{combined}");
     assert!(combined.contains("containment OBSERVED"), "{combined}");
+    assert!(
+        !combined.contains("parent-owned delegated step root")
+            && !combined.contains("reviewed uncontained nested execution"),
+        "the test must exercise fresh top-level scope creation, not inherited delegation:\n{combined}"
+    );
     assert!(
         combined.contains("per-run CPU cap: CPUQuota=200%"),
         "outer CPUQuota was not read back exactly:\n{combined}"

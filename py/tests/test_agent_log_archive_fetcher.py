@@ -44,13 +44,25 @@ def _local_machine_row(home: Path) -> tuple[str, str]:
 def _run(
     archive: Path, *arguments: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
+    environment = dict(os.environ if env is None else env)
+    # These subprocess tests exercise fetch behavior, not workstation agent discovery. A stale
+    # forwarded socket in tmux otherwise adds the real 10-second liveness ceiling to every run.
+    # Dedicated tests below cover dead, live, and tmux-discovered agent sockets explicitly.
+    environment.pop("SSH_AUTH_SOCK", None)
+    test_bin = archive.parent / "test-bin-no-forwarded-agent"
+    test_bin.mkdir(exist_ok=True)
+    fake_tmux = test_bin / "tmux"
+    if not fake_tmux.exists():
+        fake_tmux.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        fake_tmux.chmod(0o755)
+    environment["PATH"] = f"{test_bin}{os.pathsep}{environment['PATH']}"
     return subprocess.run(
         [str(archive / "fetch_agent_logs.sh"), *arguments],
         cwd=archive,
         capture_output=True,
         text=True,
         check=False,
-        env=env,
+        env=environment,
     )
 
 
@@ -928,6 +940,44 @@ def test_an_agent_holding_no_identities_still_counts_as_an_agent(tmp_path: Path)
             assert module._agent_socket_answers(str(live)) is True  # type: ignore[attr-defined]
         finally:
             os.environ["PATH"] = previous
+    finally:
+        listener.close()
+
+
+def test_a_live_agent_from_tmux_is_discovered_and_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generic fetch tests suppress ambient tmux, so this pins discovery itself."""
+
+    module = _fetcher_module()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    live = tmp_path / "live.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(live))
+    ssh_add = fake_bin / "ssh-add"
+    ssh_add.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    ssh_add.chmod(0o755)
+    tmux = fake_bin / "tmux"
+    tmux.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' 'SSH_AUTH_SOCK={live}'\n", encoding="utf-8"
+    )
+    tmux.chmod(0o755)
+
+    class _Logger:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def line(self, text: str) -> None:
+            self.lines.append(text)
+
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    logger = _Logger()
+    try:
+        module.discover_forwarded_ssh_agent(logger)  # type: ignore[attr-defined]
+        assert os.environ["SSH_AUTH_SOCK"] == str(live)
+        assert logger.lines == ["Using forwarded SSH agent from the tmux environment."]
     finally:
         listener.close()
 

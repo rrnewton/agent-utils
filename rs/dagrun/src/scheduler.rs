@@ -44,7 +44,9 @@ use crate::attribution::{
     mint_step_nonce, process_snapshot, recognize, Culprit, JournalValue, RunEvidence, StepStream,
     TestEvent, STEP_NONCE_ENV, TEST_COUNTS_PATH_ENV,
 };
-use crate::cgroup::CgroupManager;
+use crate::cgroup::{
+    delegated_cgroup_root, CgroupManager, DELEGATED_CGROUP_ENV, DELEGATED_UNBOXED_ENV,
+};
 use crate::model::{
     canonical_cpu_timeout, cmdtype_env_with_inner_jobs, command_with_inner_jobs,
     effective_cpu_count, effective_cpu_timeout, env_with_inner_jobs, graph_structure_violations,
@@ -72,6 +74,37 @@ pub fn nested_run_refusal(allow_unwise_nest_dagruns: bool) -> Option<String> {
     let outer_run = std::env::var_os(OUTER_RUN_ENV)?;
     if allow_unwise_nest_dagruns {
         return None;
+    }
+    match delegated_cgroup_root() {
+        Ok(Some(_)) => return None,
+        Ok(None) => match std::env::var(DELEGATED_UNBOXED_ENV) {
+            Ok(value) if value == "1" => return None,
+            Ok(_) => {
+                return Some(format!(
+                    "refusing nested invocation from outer run step {:?}; pass \
+                     --allow-unwise-nest-dagruns only for a reviewed temporary exception; \
+                     ${DELEGATED_UNBOXED_ENV} must be exactly '1'",
+                    outer_run.to_string_lossy()
+                ));
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Some(format!(
+                    "refusing nested invocation from outer run step {:?}; pass \
+                     --allow-unwise-nest-dagruns only for a reviewed temporary exception; \
+                     ${DELEGATED_UNBOXED_ENV} must be valid UTF-8 and exactly '1'",
+                    outer_run.to_string_lossy()
+                ));
+            }
+            Err(std::env::VarError::NotPresent) => {}
+        },
+        Err(error) => {
+            return Some(format!(
+                "refusing nested invocation from outer run step {:?}; pass \
+                 --allow-unwise-nest-dagruns only for a reviewed temporary exception; \
+                 ${DELEGATED_CGROUP_ENV} was present but invalid: {error}",
+                outer_run.to_string_lossy()
+            ));
+        }
     }
     Some(format!(
         "refusing nested invocation from outer run step {:?}; pass \
@@ -492,8 +525,10 @@ struct Shared {
     /// matching uncount. A supervisor that dies between the two would otherwise leave the count
     /// permanently inflated, and `max_concurrent_steps` is a max over it.
     counted_processes: HashSet<String>,
-    /// Tags whose admission-time accounting (named resources, running/pids/nonces) has already
-    /// been handed back. See [`retire`].
+    /// Tags whose admission-time accounting (named resources, pids/nonces) has already been
+    /// handed back. A retired tag deliberately remains in `running` until its terminal outcome
+    /// is published; otherwise the ready loop can launch it a second time in the narrow
+    /// retire-then-publish window. See [`retire`].
     retired: HashSet<String>,
 }
 
@@ -1132,19 +1167,22 @@ where
     Ok(status)
 }
 
-/// Hand back everything `step`'s admission took, EXACTLY ONCE. Returns whether this call did it.
+/// Hand back `step`'s resource/process accounting EXACTLY ONCE. Returns whether this call did it.
 ///
 /// Every release site -- spawn failure, normal completion, and the supervisor-panic paths added
 /// for #80 runner-supervisor-crash-loud -- gives back the same named-resource counts, and a panic
 /// landing AFTER a normal release would otherwise release a second time. That drifts
 /// `resource_avail` ABOVE its declared cap, which is worse than the leak it resembles: the cap
 /// silently stops being a cap and the next run's over-admission has no visible cause.
+///
+/// This deliberately does NOT remove the tag from `running`. That set also prevents a launched
+/// supervisor from being admitted again, so its tag remains there until `done` is published in
+/// the same critical section that clears it.
 fn retire(sh: &mut Shared, step: &Step) -> bool {
     let tag = step.tag();
     if !sh.retired.insert(tag.clone()) {
         return false;
     }
-    sh.running.remove(&tag);
     sh.running_pids.remove(&tag);
     sh.running_nonces.remove(&tag);
     uncount_process(sh, &tag);
@@ -1292,6 +1330,10 @@ fn publish_supervisor_failure(
                 aborted: false,
             },
         );
+        // `running` is the supervisor-lifecycle guard as well as an admission count. Keep it set
+        // through retirement and clear it only in the same critical section that publishes
+        // `done`; no ready-loop pass can observe the tag in neither state.
+        sh.running.remove(&tag);
         trip_fail_fast(&mut sh, cgroups, keep_going, &tag);
     }
     if let Some(e) = evidence {
@@ -1696,12 +1738,11 @@ impl Runner {
     /// while reporting the first panic, or an abort-on-double-panic), and a wedge is not an
     /// acceptable second-order failure mode.
     ///
-    /// THE KEY IS (launched) AND (finished) AND (no terminal outcome), and deliberately NOT "the
-    /// tag is still in `running`". [`retire`] removes the tag from `running` BEFORE `done` is
-    /// written, so a supervisor that dies between those two lines is in NEITHER set. A
-    /// running-keyed sweep is blind to exactly that window -- which is the window a panic in the
-    /// outcome-construction code lands in. That distinction was found by mutation, not by
-    /// reasoning, and it is the detail most easily lost in a rewrite.
+    /// THE KEY IS (launched) AND (thread finished) AND (no terminal outcome), not merely scheduler
+    /// membership. A retired supervisor remains in `running` until `done` is published so it
+    /// cannot be launched twice; if that thread dies first, only its actual `is_finished` state
+    /// proves that nobody remains to publish the outcome. A running-membership sweep would miss
+    /// exactly that case and wait forever.
     fn sweep_dead_supervisors(&self, handles: &[(thread::JoinHandle<()>, Step)]) {
         let vanished: Vec<Step> = {
             let sh = lock_shared(&self.shared);
@@ -3333,6 +3374,7 @@ fn run_step(ctx: StepCtx) {
                         None,
                     ),
                 );
+                sh.running.remove(&tag);
                 trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
             }
             if let Some(evidence) = &evidence {
@@ -3387,9 +3429,18 @@ fn run_step(ctx: StepCtx) {
     // When boxing is enabled, prepare_command wraps the command so the bash leader self-moves into
     // the step's child cgroup BEFORE forking any grandchild (the cgroup-v2 fork-inheritance rule),
     // applying the inner memory/CPU caps. Disabled / absent -> the command is unchanged.
-    let run_cmd = match &cgroups {
-        Some(cg) if cg.enabled() => cg.prepare_command(&tag, &base_cmd, mem_max, cpu_count),
-        _ => base_cmd,
+    let (run_cmd, delegated_root, delegated_unboxed) = match (&cgroups, step.delegated_children) {
+        (Some(cg), true) if cg.enabled() => {
+            let prepared = cg.prepare_delegated_command(&tag, &base_cmd, mem_max, cpu_count);
+            (prepared.command, prepared.root, false)
+        }
+        (_, true) => (base_cmd, None, true),
+        (Some(cg), false) if cg.enabled() => (
+            cg.prepare_command(&tag, &base_cmd, mem_max, cpu_count),
+            None,
+            false,
+        ),
+        _ => (base_cmd, None, false),
     };
 
     // Parallel-speedup ENRICHMENT capture (only under real cgroup boxing, matching the Python
@@ -3436,6 +3487,15 @@ fn run_step(ctx: StepCtx) {
     cmd.arg("-c").arg(&run_cmd);
     for (k, v) in &step.env {
         cmd.env(k, v);
+    }
+    // Delegation is one-step authority, not an ambient capability. An ordinary descendant must
+    // not inherit its parent's path and silently bypass the nested-run refusal.
+    cmd.env_remove(DELEGATED_CGROUP_ENV);
+    cmd.env_remove(DELEGATED_UNBOXED_ENV);
+    if let Some(root) = &delegated_root {
+        cmd.env(DELEGATED_CGROUP_ENV, root);
+    } else if delegated_unboxed {
+        cmd.env(DELEGATED_UNBOXED_ENV, "1");
     }
     cmd.env_remove(DAGRUN_EXTRA_ARGS_ENV);
     if let Some((name, value)) = &cmdtype_env {
@@ -3504,6 +3564,7 @@ fn run_step(ctx: StepCtx) {
                     None,
                 );
                 sh.done.insert(tag.clone(), outcome);
+                sh.running.remove(&tag);
                 trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
                 drop(sh);
                 emit(&format!(
@@ -3983,12 +4044,12 @@ fn run_step(ctx: StepCtx) {
         ),
         _ => (None, None, None, None),
     };
-    // `oom_detection` is the ATTRIBUTION, and it is what the `capabilities` manifest advertises:
-    // unenforced means the oom_kill counter is not consulted, so nothing downstream can call a
-    // failure an OOM. The rest of memory.events is a recorded measurement, not a guard, and is
-    // kept either way — a profile that stops recording is a different loss from a guard that
-    // stops guarding.
-    let oom = if crate::capabilities::is_enforced("oom_detection", lane) {
+    // `oom_kill` alone is insufficient for a delegated outer step: its root-local `oom` can
+    // record exhaustion at the boundary while the selected victim increments `oom_kill` only in
+    // its descendant cgroup. The local view excludes nested-run siblings' independently owned
+    // OOMs, so classify on every positive kernel OOM facet while retaining `oom_kills` as the
+    // literal process-kill counter. These counters overlap, hence `max` rather than addition.
+    let oom_kills = if crate::capabilities::is_enforced("oom_detection", lane) {
         memory_events
             .as_ref()
             .and_then(|events| events.get("oom_kill").copied())
@@ -3996,6 +4057,21 @@ fn run_step(ctx: StepCtx) {
     } else {
         0
     };
+    let actionable_oom_events = if crate::capabilities::is_enforced("oom_detection", lane) {
+        memory_events.as_ref().map_or(0, |events| {
+            [
+                events.get("oom").copied().unwrap_or(0),
+                oom_kills,
+                events.get("oom_group_kill").copied().unwrap_or(0),
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+        })
+    } else {
+        0
+    };
+    let oomed = actionable_oom_events > 0;
     let step_pressure_end = if boxed {
         cgroups
             .as_ref()
@@ -4050,7 +4126,7 @@ fn run_step(ctx: StepCtx) {
     let ok = returncode == Some(0)
         && !timed_out
         && !cpu_timed_out
-        && oom == 0
+        && !oomed
         && structured_test_results_error.is_none()
         && !test_results_report_failure(&test_counts);
 
@@ -4077,7 +4153,7 @@ fn run_step(ctx: StepCtx) {
     // CPU-time budget enforcement is now at parity with the Python runner: emit the
     // real breach flag so the on-disk schema stays byte-identical across implementations.
     row.insert("cpu_timed_out".into(), cpu_timed_out.to_string());
-    row.insert("oom_kills".into(), oom.to_string());
+    row.insert("oom_kills".into(), oom_kills.to_string());
     row.insert(
         "peak_bytes".into(),
         peak.map(|p| p.to_string()).unwrap_or_default(),
@@ -4107,7 +4183,7 @@ fn run_step(ctx: StepCtx) {
     // memory.events counters, which need no subtraction to be per-step deltas (the child cgroup
     // lives exactly as long as the step). Left blank wholesale when the file could not be read, so
     // "the step had no such event" and "we never looked" stay distinct.
-    for counter in ["low", "high", "max", "oom", "oom_kill"] {
+    for counter in ["low", "high", "max", "oom", "oom_kill", "oom_group_kill"] {
         row.insert(
             format!("memory_events_{counter}"),
             memory_events.as_ref().map_or_else(String::new, |events| {
@@ -4182,8 +4258,8 @@ fn run_step(ctx: StepCtx) {
                 elapsed,
                 summary.clone(),
                 returncode,
-                oom > 0, // oomed: a step (or descendant) hit its inner memory.max
-                oom,
+                oomed,
+                oom_kills,
                 timed_out,
                 wall_budget,
                 cpu_timed_out,
@@ -4199,7 +4275,7 @@ fn run_step(ctx: StepCtx) {
         if let Some(error) = &structured_test_results_error {
             // Required evidence may refuse alongside a real outer failure.
             // Keep both facts without replacing the exact outer cause.
-            if returncode == Some(0) && !timed_out && !cpu_timed_out && oom == 0 && !was_aborted {
+            if returncode == Some(0) && !timed_out && !cpu_timed_out && !oomed && !was_aborted {
                 outcome.reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
             }
             outcome.test_results_error = Some(error.clone());
@@ -4210,7 +4286,7 @@ fn run_step(ctx: StepCtx) {
             returncode,
             timed_out,
             cpu_timed_out,
-            oom,
+            actionable_oom_events,
             was_aborted,
         ) {
             outcome.reason = reason;
@@ -4218,6 +4294,7 @@ fn run_step(ctx: StepCtx) {
         outcome.test_results = test_counts.results;
         let reason = outcome.reason.clone();
         sh.done.insert(tag.clone(), outcome);
+        sh.running.remove(&tag);
         if !was_aborted && !ok {
             // A REAL failure. Eager-exit (default) stops launching NEW steps and reaps every
             // step still running so a fast failure does not wait for a slow in-flight build.
@@ -4284,9 +4361,10 @@ fn run_step(ctx: StepCtx) {
             "[{tag}] \u{2717} FAIL   {} ({dur}s, {reason})",
             step.desc
         )));
-        if oom > 0 {
+        if oomed {
             emit(&format!(
-                "[{tag}] \u{25b2} MEMORY CAP HIT: OOM-killed at its inner cgroup MemoryMax \
+                "[{tag}] \u{25b2} MEMORY CAP HIT: the kernel reported an OOM at its inner \
+                 cgroup MemoryMax \
                  (cap\u{2248}{}, peak\u{2248}{}). Confirm this is genuine growth, not an unbounded \
                  leak, before raising the step's rss_baseline_bytes / hard_mem_max_bytes hint.",
                 fmt_bytes(mem_max),
@@ -6215,6 +6293,7 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             },
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
@@ -7612,7 +7691,7 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
     //
     // A `peak_bytes` recorded while a `memory.max` was clamping is a CENSORED observation: it
     // proves the step used everything it was allowed, not what it wanted. The row columns that
-    // make that detectable — `memory_max_bytes`, the five `memory_events_*` counters, and the
+    // make that detectable — `memory_max_bytes`, the six `memory_events_*` counters, and the
     // run-relative offsets — are wired up in `run_step` above, and these tests are what hold
     // that wiring in place. Mirrors py/tests/test_censored_peak_profiles.py.
 
@@ -7824,6 +7903,53 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
     }
 
     #[test]
+    fn a_boundary_oom_without_a_local_victim_is_still_a_failure() {
+        // A delegated root can own the exhausted memory.max while the kernel accounts the killed
+        // task in a descendant. Its local `oom` / `oom_group_kill` is therefore actionable even
+        // when the local process-kill counter is zero.
+        for counter in ["oom", "oom_group_kill"] {
+            let cgroups = Arc::new(PlantedCgroups::new(&[(
+                "g.boundary",
+                4096,
+                "4096",
+                &[(counter, 3), ("oom_kill", 0)],
+            )]));
+            let cfg = DagConfig {
+                steps: vec![step("g", "boundary", "true", &[], 0.0, &[])],
+                ..Default::default()
+            };
+
+            let result = run_dag_boxed_limited(&cfg, 1, 1, true, 0, Some(cgroups));
+            let outcome = &result.outcomes[0];
+            assert!(!result.ok && !outcome.ok);
+            assert!(outcome.oomed);
+            assert_eq!(outcome.oom_kills, 0);
+            assert_eq!(
+                outcome.reason,
+                "MEMORY CAP EXHAUSTED (kernel reported OOM at inner MemoryMax; no local \
+                 oom_kill counter)"
+            );
+            assert_eq!(profile_cell(&result, "g.boundary", "ok"), "false");
+            assert_eq!(profile_cell(&result, "g.boundary", "oom_kills"), "0");
+            assert_eq!(
+                profile_cell(&result, "g.boundary", "memory_events_oom_kill"),
+                "0"
+            );
+            if counter == "oom" {
+                assert_eq!(
+                    profile_cell(&result, "g.boundary", "memory_events_oom"),
+                    "3"
+                );
+            } else {
+                assert_eq!(
+                    profile_cell(&result, "g.boundary", "memory_events_oom_group_kill"),
+                    "3"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_peak_below_its_cap_is_not_reported_as_touching_it() {
         // The uncensored case must be recognisable, or every sample looks censored.
         let cgroups = Arc::new(PlantedCgroups::new(&[(
@@ -7897,7 +8023,7 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         );
         // An unmeasured step reports no counters at all, rather than zeroes that would read as
         // "we looked and nothing happened".
-        for counter in ["low", "high", "max", "oom", "oom_kill"] {
+        for counter in ["low", "high", "max", "oom", "oom_kill", "oom_group_kill"] {
             assert_eq!(
                 profile_cell(&result, "g.unmeasured", &format!("memory_events_{counter}")),
                 "",
@@ -7917,7 +8043,7 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
 
         assert!(result.ok);
         assert_eq!(profile_cell(&result, "g.only", "memory_max_bytes"), "");
-        for counter in ["low", "high", "max", "oom", "oom_kill"] {
+        for counter in ["low", "high", "max", "oom", "oom_kill", "oom_group_kill"] {
             assert_eq!(
                 profile_cell(&result, "g.only", &format!("memory_events_{counter}")),
                 ""
@@ -8799,9 +8925,9 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
 
     #[test]
     fn the_sweep_sees_a_crash_that_lands_between_retiring_and_publishing() {
-        // `retire` drops the tag from `running` and only then is `done` written. A supervisor that
-        // dies in that window is in NEITHER set, so a sweep keyed on "still in `running`" is blind
-        // to exactly it. This is the case that forced the (finished AND no outcome) key.
+        // `retire` gives admission accounting back before `done` is written. The tag must remain
+        // in `running` during that window so the ready loop cannot launch it again; only the
+        // finished-thread sweep can turn a dead supervisor into a terminal outcome.
         let ghost = step("g", "ghost", "true", &[], 0.0, &[("slot", 1)]);
         let runner = crash_test_runner(vec![ghost.clone()], &[("slot", 1)]);
         {
@@ -8810,7 +8936,10 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             acquire(&mut sh, &ghost);
             // ... and now the supervisor retires, then dies before inserting into `done`.
             retire(&mut sh, &ghost);
-            assert!(!sh.running.contains(&ghost.tag()));
+            assert!(
+                sh.running.contains(&ghost.tag()),
+                "retirement must preserve the one-launch guard until outcome publication"
+            );
             assert!(!sh.done.contains_key(&ghost.tag()));
         }
         let handle = thread::spawn(|| {});
@@ -8823,9 +8952,13 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         assert!(sh
             .done
             .get(&ghost.tag())
-            .expect("the sweep must see a tag that is in neither `running` nor `done`")
+            .expect("the sweep must publish the retired supervisor's missing outcome")
             .reason
             .contains("SUPERVISOR VANISHED"));
+        assert!(
+            !sh.running.contains(&ghost.tag()),
+            "publishing the terminal outcome must clear the launch guard"
+        );
     }
 
     #[test]

@@ -46,6 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Use `dag_from_path(path)` for a JSON/YAML file that may contain namespaced
+`include` fragments. The context-free `dag_from_json` and `dag_from_yaml`
+functions deliberately refuse `include` because they have no safe base directory.
+
 `run_dag(..., combined_limit)` keeps a compatibility combined setting: that
 number bounds active steps and caps each runner-controlled step's width. Call
 `run_dag_limited(..., max_steps, max_cpus, ...)` (or the corresponding boxed

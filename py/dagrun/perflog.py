@@ -162,16 +162,19 @@ ENRICHMENT_COLUMNS = [
 #:   hierarchical and a step given no inner cap is still held by the scope's ceiling. A decimal
 #:   byte count, the literal ``max`` when no such level bounds it, or BLANK when the cap is
 #:   unknown. Blank and ``max`` are different answers and must not be merged: unknown cannot
-#:   rule out censoring, while ``max`` rules out censoring BY THE RUNNER'S OWN CAPS. It does not
-#:   rule out an ancestor above the delegated scope (a container memory limit, a user slice),
-#:   which the runner cannot see.
-#: * ``memory_events_*`` are the step cgroup's ``memory.events`` counters. They need no
+#:   rule out censoring, while ``max`` rules out censoring by the runner's recorded caps. Nested
+#:   schedulers additionally snapshot the validated parent delegation and its visible ancestors;
+#:   limits above a top-level run scope or outside the cgroup namespace remain unknowable.
+#: * ``memory_events_*`` are the step cgroup's owned event counters: ``memory.events`` for an
+#:   ordinary leaf and ``memory.events.local`` for a delegated scheduler root. They need no
 #:   subtraction to be deltas — the cgroup is created for the step and destroyed after it.
-#:   ``memory_events_max > 0`` with ``memory_events_oom_kill == 0`` is the reclaim-at-cap case: a
+#:   ``memory_events_max > 0`` with every OOM counter zero is the reclaim-at-cap case: a
 #:   step that PASSED while pinned to its ceiling, which is precisely the sample a naive reader
-#:   would mistake for a comfortable fit. They are the STEP cgroup's own counters, and the kernel
-#:   does not charge an ancestor's limit events to a descendant, so ``memory_events_max == 0`` is
-#:   not by itself proof that nothing clamped the step.
+#:   would mistake for a comfortable fit. The kernel does not charge an ancestor's limit events
+#:   to a descendant, so ``memory_events_max == 0`` is not by itself proof that nothing clamped
+#:   the step. The local delegated view prevents an inner step's independently owned event from
+#:   being attributed again to its outer scheduler. ``memory_events_oom_group_kill`` preserves
+#:   kernels' group-kill counter; at a delegated boundary it can be the only durable kill signal.
 CENSORING_COLUMNS = [
     "run_id",
     "started_offset_s",
@@ -182,6 +185,7 @@ CENSORING_COLUMNS = [
     "memory_events_max",
     "memory_events_oom",
     "memory_events_oom_kill",
+    "memory_events_oom_group_kill",
 ]
 
 STEP_PROFILE_COLUMNS = [

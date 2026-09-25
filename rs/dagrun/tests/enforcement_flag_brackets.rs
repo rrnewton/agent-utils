@@ -112,6 +112,7 @@ fn one_step(cmd: &str, timeout: i64, cpu_timeout: i64) -> DagConfig {
         hint: ResourceHint::default(),
         networkonly: false,
         engine_only: false,
+        delegated_children: false,
         timeout,
         cpu_timeout,
         jobs_flag: None,

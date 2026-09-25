@@ -2,10 +2,9 @@
 //!
 //! `cpu_timeout_smoke.rs` anchors the BOXED path only, and it SKIPS on any host that cannot box.
 //! Unboxed, `cpu_stats` returns `None` and the scheduler's guard used to be skipped entirely, so
-//! every `cpu_timeout` was inert on exactly the lane that matters most: any caller passing
-//! `--allow-cgroup-failure`, which an originating CI wrapper does unconditionally under
-//! `GITHUB_ACTIONS`/`CI`. Measured before the procfs fallback existed, the spinner below burned
-//! 60 CPU-seconds against a 3-second budget and exited GREEN.
+//! every `cpu_timeout` was inert on exactly the lane that matters most: an explicitly unboxed
+//! caller or a caller whose allowed cgroup setup fails. Measured before the procfs fallback
+//! existed, the spinner below burned 60 CPU-seconds against a 3-second budget and exited GREEN.
 //!
 //! Unlike its boxed sibling this test can NEVER skip: it deliberately runs with boxing off, so it
 //! is a real guard on every machine, including boxing-less CI. It mirrors
@@ -50,7 +49,7 @@ fn write_dag(dir: &PathBuf, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// Run one DAG through the built binary with boxing forced OFF the same way a CI lane does.
+/// Run one DAG through the built binary with boxing deterministically forced OFF.
 fn run_unboxed(dir: &PathBuf, name: &str, body: &str) -> (Option<i32>, String) {
     let bin = env!("CARGO_BIN_EXE_dagrun");
     let dag = write_dag(dir, name, body);
@@ -59,16 +58,15 @@ fn run_unboxed(dir: &PathBuf, name: &str, body: &str) -> (Option<i32>, String) {
             "run",
             "--dag",
             dag.to_str().unwrap(),
-            "--allow-cgroup-failure",
+            "--unsafe-no-cgroups",
             "--keep-going",
             "--max-steps",
             "2",
             "-q",
             "--no-profile",
         ])
-        // Force the unboxed path exactly as an originating CI wrapper does.
-        .env("GITHUB_ACTIONS", "1")
-        .env("CI", "1")
+        // Unlike --allow-cgroup-failure, this explicit opt-out takes precedence over a valid
+        // parent delegation inherited when the test suite itself is a nested validation step.
         .output()
         .expect("failed to spawn the built binary");
     let combined = format!(
@@ -97,9 +95,9 @@ fn unboxed_cpu_timeout_enforces_a_lower_bound_and_exposes_its_escape() {
 
     // --- negative side: the breach must be killed ---
     assert!(
-        out.contains("running UNBOXED"),
-        "this test is only meaningful with boxing OFF; a boxed run exercises the cgroup path and \
-         proves nothing about the fallback:\n{out}"
+        out.contains("DELIBERATELY UNBOXED via --unsafe-no-cgroups"),
+        "this test is only meaningful with the explicit unboxed route; a boxed run exercises the \
+         cgroup path and proves nothing about the fallback:\n{out}"
     );
     assert_eq!(
         code,

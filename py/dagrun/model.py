@@ -280,6 +280,10 @@ class Step:
     hint: ResourceHint = field(default_factory=ResourceHint)
     networkonly: bool = False  # skipped when networking is disabled
     engine_only: bool = False  # selected only by an engine-only subset preset
+    # Permit this step to launch child dagrun schedulers without weakening the default nested-run
+    # refusal.  Under cgroup boxing the scheduler gives the command an empty delegation root,
+    # keeps the command itself in a supervisor leaf, and retains ownership of the whole subtree.
+    delegated_children: bool = False
     # Wall-clock ceiling in seconds. 0 means UNDECLARED, not unlimited: the effective bound is
     # then derived (see :func:`resolved_wall_timeout`) from the step's CPU budget, or falls back
     # to DEFAULT_STEP_TIMEOUT. A hardcoded 1800 here was the load-sensitive number baked into
@@ -455,7 +459,13 @@ def effective_jobs_flag(step: Step, default_jobs_flag: str) -> str:
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RUNNER_ENV_NAMES = frozenset(
-    {"DAGRUN_EXTRA_ARGS", "DAGRUN_OUTER_RUN", "DAGRUN_STEP"}
+    {
+        "DAGRUN_DELEGATED_CGROUP",
+        "DAGRUN_DELEGATED_UNBOXED",
+        "DAGRUN_EXTRA_ARGS",
+        "DAGRUN_OUTER_RUN",
+        "DAGRUN_STEP",
+    }
 )
 
 
@@ -906,11 +916,17 @@ def step_failure_reason(
     may also observe the resulting exit. Distinguishing them keeps the failure reason
     honest about which budget actually tripped.
 
-    A negative ``returncode`` means the child received a Unix signal; that must never be
-    reported as an OOM, since raising a memory baseline when an external supervisor killed
-    the step would hide the real problem.
+    A negative ``returncode`` alone only says that the child received a Unix signal; it must not
+    be reported as an OOM without a positive kernel ``memory.events`` OOM counter. Conversely, a
+    delegated boundary can report ``oom`` while its descendant victim owns ``oom_kill``, so the
+    zero-kill OOM wording remains explicit rather than degrading to an unexplained SIGKILL.
     """
     if oomed:
+        if oom_kills == 0:
+            return (
+                "MEMORY CAP EXHAUSTED (kernel reported OOM at inner MemoryMax; "
+                "no local oom_kill counter)"
+            )
         return f"OOM-KILLED (hit inner MemoryMax; {oom_kills} oom_kill event(s))"
     if cpu_timed_out:
         # When a platform multiplier is in effect the enforced number is NOT the number written

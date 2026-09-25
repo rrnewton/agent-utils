@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from dagrun import admission
+from dagrun import admission, cgroup
 from dagrun.admission import (
     MEM_BUDGET_BYTES_ENV,
     MEM_HEADROOM_BYTES_ENV,
@@ -363,6 +363,12 @@ def test_run_admission_queues_behind_a_live_holder_rather_than_contending(
     """The defect in one line: without the ledger this second run would simply start."""
     from dagrun import cli
 
+    # This invocation is deliberately testing admission BEFORE entering a run scope.  A full
+    # repository validation executes pytest as a child of an outer dagrun scope, so without this
+    # isolation the inherited marker makes the same-process fixture below look like the CLI's own
+    # pre-exec reservation.  That correctly skips duplicate admission, but tests the wrong path
+    # and reaches the unrelated 8-GiB modeled-footprint floor for ``--max-mem 700``.
+    monkeypatch.delenv(cgroup.DEFAULT_NAMING.env_in_scope, raising=False)
     ledger = _ledger(tmp_path)
     _decision, held = request_with_limits(
         700, tag="peer", ledger=ledger, budget=1000, headroom=_QUIET_HOST

@@ -23,7 +23,9 @@ fn cores_flag_refuses_unboxed_soft_affinity() {
             "--cores",
             "1",
             "--no-profile",
-            "--allow-cgroup-failure",
+            // This test is specifically about refusal outside an owned cgroup. A valid
+            // delegation inherited from a parent validation step must not change its route.
+            "--unsafe-no-cgroups",
         ])
         .output()
         .unwrap();

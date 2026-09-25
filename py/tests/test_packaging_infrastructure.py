@@ -63,6 +63,225 @@ def _load_script(name: str) -> ModuleType:
     return module
 
 
+def test_python_package_selectors_accept_both_aliases_and_reject_duplicates() -> None:
+    python_check = _load_script("check_python_packages")
+
+    selected = python_check._select_projects(["parallel_experiment_runner", "tick-hub"])
+
+    assert [project.distribution for project in selected] == [
+        "tick-hub",
+        "parallel-experiment-runner",
+    ]
+    assert python_check._select_projects([]) == python_check.PROJECTS
+    with pytest.raises(python_check.CheckError, match="unknown project 'missing'"):
+        python_check._select_projects(["missing"])
+    with pytest.raises(
+        python_check.CheckError,
+        match="parallel-experiment-runner.*selected more than once",
+    ):
+        python_check._select_projects(
+            ["parallel-experiment-runner", "parallel_experiment_runner"]
+        )
+
+
+def test_python_package_selector_list_and_help_are_discoverable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    python_check = _load_script("check_python_packages")
+
+    assert python_check.main(["--list-projects"]) == 0
+    listed = capsys.readouterr().out
+    assert "tick-hub (directory alias: tick_hub)" in listed
+    assert "dagrun\n" in listed
+    help_text = python_check._argument_parser().format_help()
+    assert "--project NAME" in help_text
+    assert "--list-projects" in help_text
+
+
+def test_python_package_main_only_builds_selected_projects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python_check = _load_script("check_python_packages")
+    observed: list[tuple[str, str]] = []
+    inspection = python_check._WheelInspection("1.0", "guide\n", ())
+
+    monkeypatch.setattr(
+        python_check,
+        "_check_project_topology",
+        lambda: observed.append(("global", "topology")),
+    )
+    monkeypatch.setattr(python_check, "_require_build_backend", lambda: None)
+    monkeypatch.setattr(
+        python_check,
+        "_check_public_docstrings",
+        lambda projects: observed.extend(
+            ("docstrings", project.distribution) for project in projects
+        ),
+    )
+    monkeypatch.setattr(
+        python_check,
+        "_copy_project",
+        lambda project, root: root / project.directory,
+    )
+    monkeypatch.setattr(
+        python_check,
+        "_build_wheel",
+        lambda project, _source, root: root / f"{project.distribution}.whl",
+    )
+
+    def inspect_wheel(_project: object, wheel: Path) -> object:
+        observed.append(("inspect", wheel.stem))
+        return inspection
+
+    monkeypatch.setattr(
+        python_check,
+        "_inspect_wheel",
+        inspect_wheel,
+    )
+    monkeypatch.setattr(
+        python_check,
+        "_build_sdist",
+        lambda project, _source, root: root / f"{project.distribution}.tar.gz",
+    )
+    monkeypatch.setattr(python_check, "_inspect_sdist", lambda *_args: None)
+    monkeypatch.setattr(
+        python_check,
+        "_smoke_wheel",
+        lambda project, *_args: observed.append(("smoke", project.distribution)),
+    )
+
+    assert python_check.main(["--project", "tick_hub"]) == 0
+    assert observed == [
+        ("global", "topology"),
+        ("docstrings", "tick-hub"),
+        ("inspect", "tick-hub"),
+        ("inspect", "tick-hub"),
+        ("smoke", "tick-hub"),
+    ]
+
+
+def test_python_project_topology_rejects_unregistered_and_missing_manifests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python_check = _load_script("check_python_packages")
+    registered = python_check.Project(
+        directory="registered",
+        distribution="registered",
+        package="registered",
+        commands=("registered",),
+        resources=(),
+        required_dependencies=(),
+    )
+    (tmp_path / "registered").mkdir()
+    (tmp_path / "registered" / "pyproject.toml").touch()
+    monkeypatch.setattr(python_check, "PY_ROOT", tmp_path)
+    monkeypatch.setattr(python_check, "PROJECTS", (registered,))
+
+    python_check._check_project_topology()
+    (tmp_path / "unregistered").mkdir()
+    (tmp_path / "unregistered" / "pyproject.toml").touch()
+    with pytest.raises(python_check.CheckError, match="unregistered"):
+        python_check._check_project_topology()
+
+    (tmp_path / "unregistered" / "pyproject.toml").unlink()
+    (tmp_path / "registered" / "pyproject.toml").unlink()
+    with pytest.raises(python_check.CheckError, match="without manifests"):
+        python_check._check_project_topology()
+
+
+def test_rust_package_selectors_resolve_dependency_archive_closure() -> None:
+    rust_check = _load_script("check_rust_packages")
+
+    selected = rust_check._select_crates(["agentctl"])
+    work, reasons = rust_check._crate_work(selected)
+
+    assert [crate.name for crate in selected] == ["agentctl"]
+    assert [crate.name for crate in work] == [
+        "chat-subscription",
+        "chat-subscription-plugin",
+        "agentctl",
+    ]
+    assert reasons == {
+        "chat-subscription": ("agentctl",),
+        "chat-subscription-plugin": ("agentctl",),
+    }
+    assert rust_check._select_crates([]) == rust_check.CRATES
+    with pytest.raises(rust_check.CheckError, match="unknown crate 'missing'"):
+        rust_check._select_crates(["missing"])
+    with pytest.raises(rust_check.CheckError, match="selected more than once"):
+        rust_check._select_crates(["dagrun", "dagrun"])
+
+
+def test_rust_package_selector_list_and_help_are_discoverable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rust_check = _load_script("check_rust_packages")
+
+    assert rust_check.main(["--list-crates"]) == 0
+    listed = capsys.readouterr().out.splitlines()
+    assert listed == [crate.name for crate in rust_check.CRATES]
+    help_text = rust_check._argument_parser().format_help()
+    assert "--crate NAME" in help_text
+    assert "--list-crates" in help_text
+
+
+def test_rust_package_main_globally_checks_topology_but_only_smokes_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rust_check = _load_script("check_rust_packages")
+    observed: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        rust_check,
+        "_check_workspace_topology",
+        lambda: observed.append(("global", "topology")),
+    )
+    monkeypatch.setattr(
+        rust_check,
+        "_check_public_rustdoc",
+        lambda crates: observed.extend(("rustdoc", crate.name) for crate in crates),
+    )
+    monkeypatch.setattr(
+        rust_check,
+        "_check_missing_docs",
+        lambda crates: observed.extend(
+            ("missing-docs", crate.name) for crate in crates
+        ),
+    )
+    monkeypatch.setattr(
+        rust_check,
+        "_metadata",
+        lambda crate: ("1.0", set(crate.bins), {crate.library}),
+    )
+    monkeypatch.setattr(
+        rust_check,
+        "_package",
+        lambda crate, _version, root: root / f"{crate.name}.crate",
+    )
+    monkeypatch.setattr(rust_check, "_inspect", lambda *_args: {})
+    monkeypatch.setattr(
+        rust_check,
+        "_verify_package_archive",
+        lambda crate, *_args: observed.append(("verify", crate.name)),
+    )
+    monkeypatch.setattr(
+        rust_check,
+        "_smoke",
+        lambda crate, *_args: observed.append(("smoke", crate.name)),
+    )
+
+    assert rust_check.main(["--crate", "agentctl"]) == 0
+    assert observed == [
+        ("global", "topology"),
+        ("rustdoc", "agentctl"),
+        ("missing-docs", "agentctl"),
+        ("verify", "chat-subscription"),
+        ("verify", "chat-subscription-plugin"),
+        ("verify", "agentctl"),
+        ("smoke", "agentctl"),
+    ]
+
+
 def test_embed_lint_rejects_unknown_placeholders_and_sibling_packages() -> None:
     docs = _load_script("embed_userguides")
     item = docs.Render("dagrun", "README", "python", "out/README.md")

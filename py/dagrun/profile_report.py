@@ -30,7 +30,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from dagrun import __version__
-from dagrun.io import DagJsonError, dag_from_json, dag_from_yaml
+from dagrun.io import DagJsonError, dag_from_path
 from dagrun.model import DagConfig
 from dagrun.perflog import _profile_file_lock
 
@@ -299,14 +299,9 @@ class CaptureView:
 def load_dag_config(path: Path) -> DagConfig:
     """Load a DAG through the runner's canonical JSON/YAML schema implementation."""
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ReportDataError(f"cannot read DAG {path}: {exc}") from exc
-    loader = dag_from_yaml if path.suffix.lower() in {".yaml", ".yml"} else dag_from_json
-    try:
-        return loader(text)
+        return dag_from_path(path)
     except DagJsonError as exc:
-        raise ReportDataError(f"{path}: {exc}") from exc
+        raise ReportDataError(str(exc)) from exc
 
 
 def dag_document_from_config(cfg: DagConfig) -> DagDocument:

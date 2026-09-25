@@ -1,0 +1,28 @@
+{
+  "aggregate_cpu_seconds": 2916.24,
+  "aggregate_step_wall_seconds": 3272.204,
+  "all_gates_green": true,
+  "canonical_dag": "validation.dag.yaml",
+  "canonical_expanded_dag_sha256": "323aaab87169a01e5f847d68e1ce4430537420417247cfe91de6b82688a0cac1",
+  "canonical_gate_listing_sha256": "7cc05db9703430ad59d2ed805c9b29cd8f4f5b64c2a5532958a5f3626f7e92dc",
+  "canonical_root_dag_sha256": "9f747e489df3d483d2c96e07fc17569781c87832577750cb3782919761f96ac7",
+  "gate_count": 78,
+  "graph_wall_seconds": 371.65,
+  "ranking": "ai_docs/transient/2026-09-25-validation-overhaul/gate-timing-ranking.tsv",
+  "ranking_sha256": "696fef8f55f48fa858c4394ce1f2d57672886faab7f4308c60019ecae37390f8",
+  "run_id": "18d885f0608c7bd9002d2cf9",
+  "run_metadata": {
+    "container_class": "affinity316_cpu-max-3200000_100000",
+    "enforcement_kind": "cgroup-v2",
+    "git_sha": "d893100730bb3a7f115724431c6c619be8164dfe",
+    "machine_id": "AMD_EPYC_9D85_158-Core_Processor",
+    "outer_jobs": "24",
+    "profile_base_sha": "d893100730bb3a7f115724431c6c619be8164dfe",
+    "runner_name": "run",
+    "timestamp": "2026-09-25T09:28:11Z"
+  },
+  "schema": "agent-utils-validation-gate-ranking/v2",
+  "selected_profile_rows_sha256": "b686f0b68cfc3b3f1de7360101e2d39c72a30a411fdb130e382a0809cbf7c2aa",
+  "source_git_sha": "d893100730bb3a7f115724431c6c619be8164dfe",
+  "source_profile": ".dagrun/profiles/step_profiles_AMD_EPYC_9D85_158-Core_Processor_affinity316_cpu-max-3200000_100000.csv"
+}

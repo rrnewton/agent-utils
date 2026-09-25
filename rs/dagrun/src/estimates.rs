@@ -32,7 +32,9 @@ pub const MACHINE_ID_ENV: &str = "DAGRUN_MACHINE_ID";
 /// Environment variable that overrides the container-class component of the feedback identity.
 pub const CONTAINER_CLASS_ENV: &str = "DAGRUN_CONTAINER_CLASS";
 
-/// Minimum recorded samples before the store overrides the DAG hint for a step.
+/// Minimum recorded samples before the store may refine a step. Duration feedback may replace its
+/// hint; ordinary RSS feedback may raise an authored baseline but never lower it. Deliberate
+/// memory-cap lowering is the separate censor-aware `--profile-memory-feedback` contract.
 pub const DEFAULT_MIN_SAMPLES: i64 = 1;
 
 /// MAD-trim: drop duration samples more than this many MADs from the median before re-medianing.
@@ -203,6 +205,7 @@ pub fn sample_from_row(row: &HashMap<String, String>, affinity: Option<i64>) -> 
             "memory_events_max",
             "memory_events_oom",
             "memory_events_oom_kill",
+            "memory_events_oom_group_kill",
         ]
         .iter()
         .any(|column| row.contains_key(*column))
@@ -1087,8 +1090,20 @@ fn resolved_estimate(step: &Step, samples: Option<&StepSamples>, min_samples: i6
         _ => (step.hint.est_duration_s, "default"),
     };
 
+    // Ordinary feedback starts after one sample. That is useful for scheduling, but a quiet
+    // subprocess run is not evidence that the next run's enforced memory.max may safely shrink:
+    // fan-out and allocator high-water marks vary discontinuously. Treat the authored RSS as a
+    // floor here. The explicit censor-aware --profile-memory-feedback path retains authority to
+    // lower it after its five-sample policy and margin.
     let (rss, rss_source) = match samples {
-        Some(s) if store_ok && s.rss_estimate_bytes.is_some() => (s.rss_estimate_bytes, "store"),
+        Some(s)
+            if store_ok
+                && s.rss_estimate_bytes.is_some()
+                && (step.hint.rss_baseline_bytes.is_none()
+                    || s.rss_estimate_bytes > step.hint.rss_baseline_bytes) =>
+        {
+            (s.rss_estimate_bytes, "store")
+        }
         _ if step.hint.rss_baseline_bytes.is_some() => (step.hint.rss_baseline_bytes, "hint"),
         _ => (None, "none"),
     };
@@ -1507,7 +1522,9 @@ fn memory_evidence_at(
     (exact, level.peak_floor_bytes)
 }
 
-/// Resolve the displayed/applied memory value and whether it is exact at `width`.
+/// Resolve the displayed/applied memory value and whether it is exact at `width`. Replicated
+/// width-specific evidence is still ordinary feedback: it may raise the fallback, but only the
+/// explicit censor-aware memory-feedback mode may lower an authored floor.
 fn modeled_memory_at(
     speedups: &HashMap<String, StepSpeedup>,
     tag: &str,
@@ -1515,7 +1532,7 @@ fn modeled_memory_at(
     fallback: Option<i64>,
 ) -> (Option<i64>, bool) {
     let (exact, floor) = memory_evidence_at(speedups, tag, width);
-    if exact.is_some() {
+    if exact.is_some_and(|value| fallback.is_none_or(|base| value > base)) {
         return (exact, true);
     }
     ([fallback, floor].into_iter().flatten().max(), false)
@@ -1536,12 +1553,12 @@ fn cpa_footprint(
         }
         let tag = step.tag();
         let (exact, floor) = memory_evidence_at(speedups, &tag, widths[&tag]);
-        if let Some(peak) = exact {
+        let authored = step.hint.rss_baseline_bytes;
+        if let Some(peak) = exact.filter(|value| authored.is_none_or(|base| *value > base)) {
             step.hint.rss_baseline_bytes = Some(peak);
             step.hint.rss_baseline_inner_jobs = Some(widths[&tag]);
-        } else if let Some(floor) = floor {
-            step.hint.rss_baseline_bytes =
-                Some(step.hint.rss_baseline_bytes.unwrap_or(0).max(floor));
+        } else if exact.is_some() || floor.is_some() {
+            step.hint.rss_baseline_bytes = Some(authored.unwrap_or(0).max(floor.unwrap_or(0)));
             step.hint.rss_baseline_inner_jobs = None;
         }
     }
@@ -2843,6 +2860,7 @@ mod tests {
             },
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
@@ -2897,6 +2915,80 @@ mod tests {
         assert_eq!(out.jobs_flag.as_deref(), Some("-J"));
         assert_eq!(out.cmd, "while :; do :; done");
         assert_eq!(out.env.get("K").map(String::as_str), Some("V"));
+    }
+
+    #[test]
+    fn authored_rss_is_the_floor_for_ordinary_profile_feedback() {
+        // One quiet sample may refine duration, but it is not evidence that a subprocess-heavy
+        // step's enforced memory ceiling may shrink. Ordinary feedback can still raise an
+        // underestimate; deliberate lowering belongs to --profile-memory-feedback.
+        let mut step = mk("g", "variable", &[], 10.0);
+        step.hint.rss_baseline_bytes = Some(8_000);
+        let cfg = DagConfig {
+            steps: vec![step],
+            ..Default::default()
+        };
+        let no_speedups: HashMap<String, StepSpeedup> = HashMap::new();
+
+        let quiet: HashMap<String, StepSamples> = [(
+            "g.variable".to_string(),
+            StepSamples {
+                step: "g.variable".to_string(),
+                samples: 1,
+                est_duration_s: Some(3.0),
+                rss_estimate_bytes: Some(2_000),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let quiet_plan = build_plan(
+            &cfg,
+            &quiet,
+            Planner::GreedyLpt,
+            DEFAULT_MIN_SAMPLES,
+            &no_speedups,
+            None,
+            None,
+        );
+        assert_eq!(quiet_plan.entries[0].est_source, "store");
+        assert_eq!(quiet_plan.entries[0].est_duration_s, 3.0);
+        assert_eq!(quiet_plan.entries[0].rss_source, "hint");
+        assert_eq!(quiet_plan.entries[0].rss_estimate_bytes, Some(8_000));
+        assert_eq!(
+            apply_plan_to_config(&cfg, &quiet_plan).steps[0]
+                .hint
+                .rss_baseline_bytes,
+            Some(8_000)
+        );
+
+        let high: HashMap<String, StepSamples> = [(
+            "g.variable".to_string(),
+            StepSamples {
+                step: "g.variable".to_string(),
+                samples: 1,
+                est_duration_s: Some(3.0),
+                rss_estimate_bytes: Some(12_000),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let high_plan = build_plan(
+            &cfg,
+            &high,
+            Planner::GreedyLpt,
+            DEFAULT_MIN_SAMPLES,
+            &no_speedups,
+            None,
+            None,
+        );
+        assert_eq!(high_plan.entries[0].rss_source, "store");
+        assert_eq!(high_plan.entries[0].rss_estimate_bytes, Some(12_000));
+        assert_eq!(
+            apply_plan_to_config(&cfg, &high_plan).steps[0]
+                .hint
+                .rss_baseline_bytes,
+            Some(12_000)
+        );
     }
 
     #[test]
@@ -3190,6 +3282,50 @@ mod tests {
             crate::sizing::step_mem_cap_for_inner_jobs(&applied.steps[0], Some(8), 1.0),
             3 * GIB
         );
+    }
+
+    #[test]
+    fn replicated_width_memory_cannot_lower_an_authored_rss_floor() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let mut rows = Vec::new();
+        for (width, wall) in [(1, 8.0), (2, 4.0)] {
+            for repeat in 0..3 {
+                rows.push(HashMap::from([
+                    ("step".to_string(), "m.variable".to_string()),
+                    ("inner_jobs".to_string(), width.to_string()),
+                    ("elapsed_s".to_string(), wall.to_string()),
+                    ("user_s".to_string(), "8.0".to_string()),
+                    ("sys_s".to_string(), "0.0".to_string()),
+                    ("peak_bytes".to_string(), GIB.to_string()),
+                    ("observation_id".to_string(), format!("{width}-{repeat}")),
+                ]));
+            }
+        }
+        let speedups = step_speedups_from_buckets(&bucketize_rows(&rows, None), Some(2));
+        let mut step = mk("m", "variable", &[], 8.0);
+        step.hint.classification = crate::model::StepClass::CpuBound;
+        step.hint.preferred_inner_jobs = Some(1);
+        step.hint.rss_baseline_bytes = Some(8 * GIB);
+        let cfg = DagConfig {
+            steps: vec![step],
+            mem_cap_factor: 1.0,
+            ..Default::default()
+        };
+        let plan = build_plan(
+            &cfg,
+            &HashMap::new(),
+            Planner::GreedyLpt,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(2),
+            None,
+        );
+        assert_eq!(plan.entries[0].rss_estimate_bytes, Some(8 * GIB));
+        assert_eq!(plan.entries[0].rss_source, "hint");
+        assert_eq!(plan.entries[0].rss_estimate_inner_jobs, None);
+        let applied = apply_plan_to_config(&cfg, &plan);
+        assert_eq!(applied.steps[0].hint.rss_baseline_bytes, Some(8 * GIB));
+        assert_eq!(applied.steps[0].hint.rss_baseline_inner_jobs, None);
     }
 
     #[test]
@@ -3900,6 +4036,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
             },
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,

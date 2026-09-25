@@ -3150,12 +3150,15 @@ a deployment that would rather state it once.
 ## Running the tests
 
 ```bash
-cd vibe-talk && make validate        # fmt, clippy, the Rust suites and both page suites
+cd vibe-talk && make validate        # fmt, clippy/mypy, suites, DAG and Android evaluator controls
 cd vibe-talk && make page            # just the page suites — seconds
-cd vibe-talk && make validate-boxed  # the same, plus screenshots, under dagrun
+cd vibe-talk && make validate-boxed  # adds PWA/offline-cache/screenshot browser checks under dagrun
 ```
 
-`make validate` needs only a Rust and a node toolchain, so it works on a fresh clone.
+`make validate` needs Rust, Node, and Python with mypy, PyYAML, Playwright, and websockets. The
+Python packages type-check the operator and browser harness scripts; no browser binary, phone, or
+external service is needed by the ordinary gate. The boxed gate additionally needs Chromium for
+its PWA, offline-cache, and screenshot checks.
 
 **Prefer `validate-boxed` locally.** It runs the same suites through `dagrun`, which gives each
 step a wall and CPU timeout, a memory cap, and process-tree teardown inside a cgroup. That last

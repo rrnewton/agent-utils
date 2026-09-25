@@ -35,6 +35,10 @@ dag = DagConfig(steps=(Step("build", "app", "compile", "make build"),))
 print(to_ascii(dag))
 ```
 
+Use `dag_from_path(path)` to load a JSON/YAML file that may contain namespaced
+`include` fragments. The context-free `dag_from_json` and `dag_from_yaml`
+helpers deliberately refuse `include` because they have no safe base directory.
+
 `run_dag(..., jobs=N)` keeps a compatibility combined setting: `N` bounds active
 steps and caps each runner-controlled step's width unless `core_budget` is supplied. New code
 should call `run_dag_limited(..., max_steps=S, max_cpus=P)` when those limits

@@ -191,7 +191,14 @@ def test_a_malformed_name_is_REFUSED_not_ignored() -> None:
 
 
 @pytest.mark.parametrize(
-    "reserved", ["DAGRUN_EXTRA_ARGS", "DAGRUN_OUTER_RUN", "DAGRUN_STEP"]
+    "reserved",
+    [
+        "DAGRUN_DELEGATED_CGROUP",
+        "DAGRUN_DELEGATED_UNBOXED",
+        "DAGRUN_EXTRA_ARGS",
+        "DAGRUN_OUTER_RUN",
+        "DAGRUN_STEP",
+    ],
 )
 def test_runner_owned_names_cannot_become_the_jobs_channel(reserved: str) -> None:
     with pytest.raises(ValueError, match="reserved by dagrun"):

@@ -61,7 +61,7 @@ from dagrun.summary import DEFAULT_RESERVOIR_K, Summary
 from dagrun.io import (
     DagJsonError,
     dag_from_json,
-    dag_from_yaml,
+    dag_from_path,
     dag_to_json,
     dag_to_yaml,
 )
@@ -107,7 +107,12 @@ from dagrun.scheduler import (
     nested_run_refusal,
     run_dag_limited,
 )
-from dagrun.sizing import jobs_for_budget, parse_size, transitive_deps
+from dagrun.sizing import (
+    _step_mem_cap_for_inner_jobs,
+    jobs_for_budget,
+    parse_size,
+    transitive_deps,
+)
 from dagrun.sweep import (
     CpuTopology,
     detect_cpu_topology,
@@ -297,14 +302,16 @@ def _quickstart(c: Palette) -> str:
   {c.dim(f'Use {k("--no-profile-feedback")} to ignore the store and plan from the DAG hints only.')}
 
 {h('DAG schema')}  {c.dim('(only group/job/cmd are required per step; everything else has defaults)')}
-  step:   group, job, desc, description, labels[], cmd, cmdtype, manifest{{lane,category,test?,mode?,backend?}}, result_manifests[], deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}
+  step:   group, job, desc, description, labels[], cmd, cmdtype, manifest{{lane,category,test?,mode?,backend?}}, result_manifests[], deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, delegated_children, hint{{}}
   hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,
           classification("cpu-bound"|"latency-bound"|"light"), preferred_inner_jobs
-  top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,
+  top:    include[{{path,namespace,after[]?}}], description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,
           outer_mem_safety_factor, default_step_timeout, default_jobs_flag, default_jobs_env
   {c.dim('desc = short label; description = long-form docs (often multi-line, great in YAML).')}
   {c.dim('YAML: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + block-scalar')}
   {c.dim('  descriptions). The yaml subcommand emits YAML; json emits canonical JSON.')}
+  {c.dim('include: load-time namespaced file composition; optional after[] wires outer prerequisites.')}
+  {c.dim('delegated_children: opt into child dagrun; preserves cgroups or names an unboxed fallback.')}
   {c.dim('resource_caps bound concurrent demand - e.g. {"browser":1} serializes browser steps.')}
   {c.dim('cmdtype: unknown (default) | make | cargo-build | cargo-test | cargo-nextest |')}
   {c.dim('  generic-dash-j-command | generic-with-flag. Known types append width arguments,')}
@@ -461,7 +468,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--dag",
         required=True,
         metavar="FILE",
-        help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
+        help=(
+            "DAG file; .yaml/.yml load as YAML, else JSON; files may use namespaced "
+            "include fragments ('-' = self-contained JSON stdin only)"
+        ),
     )
     run_p.add_argument(
         "-s",
@@ -480,7 +490,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="outer CPU-bandwidth limit and maximum width of any one runner-controlled step "
-        "(default: effective container/affinity budget tightened by the shared 90%% slice)",
+        "(default: effective container/affinity budget tightened by the shared 90%% slice; "
+        "a nested run is clamped to its delegated parent's effective CPU envelope)",
     )
     run_p.add_argument(
         "--jobs",
@@ -502,7 +513,8 @@ def build_parser() -> argparse.ArgumentParser:
         "process tree (all steps + descendants) to K least-busy FREE cores. Intended for "
         "controlled measurements, not ordinary CI. Never pins a fixed core id. Requires an "
         "exact, hard cgroup cpuset and fails closed when that capability is unavailable. "
-        "Aliases: --cpuset, --pin. Absent leaves CPU placement unchanged.",
+        "A nested request wider than its delegated parent's CPU envelope is refused. Aliases: "
+        "--cpuset, --pin. Absent leaves CPU placement unchanged.",
     )
     run_p.add_argument(
         "--max-mem",
@@ -510,7 +522,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="RAM budget (e.g. 8G, 4096M): becomes the outer scope's MemoryMax (it can tighten the derived host "
         "boundary, never widen it) and derives a conservative model-based --max-steps ceiling; with explicit "
-        "--max-steps, the tighter value wins",
+        "--max-steps, the tighter value wins. A nested run inherits its delegated parent's finite ceiling as "
+        "the default and upper bound, enforced at the nested aggregate root",
     )
     run_p.add_argument(
         "--selected",
@@ -663,8 +676,9 @@ def build_parser() -> argparse.ArgumentParser:
         "for the run), QUEUE (it would fit on a quiet host -- says how many holders are ahead), "
         "REFUSE (bigger than the whole-host budget, so waiting can never help -- says the number "
         "to ask for instead). WAIT_S is how long to wait while queued (default 0 = report and "
-        "exit 4 rather than wait; at most 86400). Requires --max-mem: admission needs a number, "
-        "and guessing one would be worse than not gating.",
+        "exit 4 rather than wait; at most 86400). Requires --max-mem or a finite inherited "
+        "delegated memory ceiling: admission needs a number, and guessing one would be worse "
+        "than not gating.",
     )
     run_p.add_argument(
         "--allow-cgroup-failure",
@@ -745,7 +759,10 @@ Output:
         "--dag",
         required=True,
         metavar="FILE",
-        help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
+        help=(
+            "DAG file; .yaml/.yml load as YAML, else JSON; files may use namespaced "
+            "include fragments ('-' = self-contained JSON stdin only)"
+        ),
     )
     sweep_p.add_argument(
         "--step",
@@ -757,7 +774,8 @@ Output:
         metavar="WIDTHS",
         help="initial inner-parallelism widths: bare N means every width 1..N; LO..HI is an "
         "inclusive dense range. Target mode also accepts sparse comma/range lists such as "
-        "1,2,4,8 or 1,2,4..8. Omit only in target mode to use the topology grid described above.",
+        "1,2,4,8 or 1,2,4..8. Omit only in target mode to use the topology grid described above. "
+        "Delegated sweeps refuse explicit widths beyond the inherited CPU envelope.",
     )
     sweep_p.add_argument(
         "--target-time",
@@ -874,7 +892,10 @@ Output:
         "--dag",
         required=True,
         metavar="FILE",
-        help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
+        help=(
+            "DAG file; .yaml/.yml load as YAML, else JSON; files may use namespaced "
+            "include fragments ('-' = self-contained JSON stdin only)"
+        ),
     )
     plan_p.add_argument(
         "--planner",
@@ -931,7 +952,10 @@ Output:
             "--dag",
             required=True,
             metavar="FILE",
-            help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
+            help=(
+                "DAG file; .yaml/.yml load as YAML, else JSON; files may use namespaced "
+                "include fragments ('-' = self-contained JSON stdin only)"
+            ),
         )
 
     summary_p = sub.add_parser(
@@ -990,7 +1014,10 @@ Output:
     sb_plan.add_argument("--summary", required=True, metavar="FILE", help="summary JSON file")
     sb_plan.add_argument(
         "--dag", required=True, metavar="FILE",
-        help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
+        help=(
+            "DAG file; .yaml/.yml load as YAML, else JSON; files may use namespaced "
+            "include fragments ('-' = self-contained JSON stdin only)"
+        ),
     )
     sb_plan.add_argument(
         "--planner", choices=[p.value for p in Planner], default=Planner.GREEDY_LPT.value,
@@ -1134,11 +1161,7 @@ def _load(dag_arg: str) -> DagConfig:
         text = sys.stdin.read()
         load_text = dag_from_json
     else:
-        path = Path(dag_arg)
-        source = dag_arg
-        text = path.read_text(encoding="utf-8")
-        # Auto-detect the interchange format by extension: .yaml/.yml -> YAML, else JSON.
-        load_text = dag_from_yaml if path.suffix.lower() in (".yaml", ".yml") else dag_from_json
+        return dag_from_path(Path(dag_arg))
     try:
         return load_text(text)
     except DagJsonError as exc:
@@ -1209,19 +1232,15 @@ def _apply_memory_feedback(
 ) -> DagConfig:
     """Apply censoring-aware profile memory feedback to ``cfg``, reporting every decision.
 
-    OFF unless the caller asked for it. The default plan-time feedback already refines
-    ``rss_baseline_bytes`` from recorded peaks WITHOUT asking what those peaks were measured
-    under; this path refuses to learn a smaller number from a peak that met its ceiling, which
-    is a different and stricter contract, so it is a separate opt-in rather than a change of
-    meaning for the existing one.
+    OFF unless the caller asked for it. Default plan-time feedback treats an authored
+    ``rss_baseline_bytes`` as a floor: it may raise that value, but cannot shrink the next run's
+    enforced cap from sparse history. This path is the separate opt-in allowed to lower the
+    authored value, and only from enough uncensored observations plus a margin.
 
     ``cfg`` is the config the ordinary plan has ALREADY been applied to and ``authored`` is the
-    same config before that, which is what lets a decline mean "no learned estimate" instead of
-    "fall back to the censoring-blind one": every step this path does not estimate drops that
-    number for the LARGER of the baseline its author wrote and the peak the store proves it has
-    already reached. Turning the flag on therefore removes the unsafe estimate even where it
-    does not supply a safe one, which is the whole reason the flag exists — and it does so
-    without discarding what the censored samples did prove.
+    same config before that, which is what lets a decline restore the LARGER of the baseline its
+    author wrote and the peak the store proves it has already reached. That also replaces a
+    larger ordinary-feedback estimate only when this stricter path has enough evidence to do so.
 
     Every step the store knows about is reported on stderr, including the ones that did NOT
     move and why, because "the cap did not change" and "the store had nothing usable to say"
@@ -1262,8 +1281,8 @@ def _memory_admission_line(admission: MemoryAdmission, authored: int | None) -> 
 
     ``authored`` is the baseline the step's author wrote, which is what makes the decline half
     of this line specific: a decline that nevertheless raises the step to a proven floor says
-    so and names the number, because "keeping the authored hint" would be as untrue there as it
-    was when the censoring-blind estimate was silently left in place.
+    so and names the number, because "keeping the authored hint" would be as untrue there as
+    retaining a larger ordinary estimate while claiming the authored value had been restored.
     """
     floor = admission.proven_floor_bytes()
     if admission.source == "profile":
@@ -1290,10 +1309,10 @@ def _build_feedback_plan(
 ) -> Plan:
     """Load the profile store (when feedback is on) and build the plan for ``planner``.
 
-    With ``feedback_dir`` set, the store's learned estimates refine each step (store wins when it
-    has enough samples; the DAG hint is the fallback) and the per-step parallel-speedup curves are
-    attached for the plan display. With ``feedback_dir`` ``None`` the plan reflects the DAG hints
-    only. ``core_budget`` (``P``) bounds every displayed speedup recommendation and drives the CPA
+    With ``feedback_dir`` set, learned durations refine each step and learned RSS may raise, but
+    never lower, an authored baseline; per-step parallel-speedup curves are attached for the plan
+    display. With ``feedback_dir`` ``None`` the plan reflects the DAG hints only. ``core_budget``
+    (``P``) bounds every displayed speedup recommendation and drives the CPA
     allocator under ``--planner cpa``; ``mem_budget`` applies only to CPA allocation.
     """
     if feedback_dir is not None:
@@ -1325,7 +1344,10 @@ def _build_feedback_plan(
 
 
 def _planning_budgets(
-    planner: Planner, max_mem_arg: str | None, max_cpus: int | None = None
+    planner: Planner,
+    max_mem_arg: str | None,
+    max_cpus: int | None = None,
+    effective_max_mem_bytes: int | None = None,
 ) -> tuple[int | None, int | None]:
     """Resolve the ``(core_budget, mem_budget)`` used to build a truthful plan.
 
@@ -1339,7 +1361,11 @@ def _planning_budgets(
         if max_cpus is not None
         else (max(1, container_core_budget()) if planner is Planner.CPA else None)
     )
-    mem_budget = parse_size(max_mem_arg) if planner is Planner.CPA and max_mem_arg else None
+    mem_budget = (
+        effective_max_mem_bytes
+        if planner is Planner.CPA and effective_max_mem_bytes is not None
+        else (parse_size(max_mem_arg) if planner is Planner.CPA and max_mem_arg else None)
+    )
     return core_budget, mem_budget
 
 
@@ -1790,7 +1816,13 @@ def _stress_footprints(cfg: DagConfig, n: int, *, expanded: bool) -> tuple[int, 
     return footprint, total
 
 
-def _stress_memory_guard(cfg: DagConfig, n: int, *, expanded: bool) -> int:
+def _stress_memory_guard(
+    cfg: DagConfig,
+    n: int,
+    *,
+    expanded: bool,
+    run_memory_budget_bytes: int | None = None,
+) -> int:
     """Check stress memory either before expansion or after final planning.
 
     The early check receives one selected copy and multiplies its footprint by ``n``. The final
@@ -1810,7 +1842,12 @@ def _stress_memory_guard(cfg: DagConfig, n: int, *, expanded: bool) -> int:
             file=sys.stderr,
         )
         return 2
-    budget = box_mem_budget_bytes()
+    budget_candidates = [
+        value
+        for value in (box_mem_budget_bytes(), run_memory_budget_bytes)
+        if value is not None
+    ]
+    budget = min(budget_candidates) if budget_candidates else None
     if budget is None:
         if expanded:
             print(
@@ -1863,14 +1900,22 @@ def _stress_memory_guard(cfg: DagConfig, n: int, *, expanded: bool) -> int:
     return 0
 
 
-def _stress_guard(cfg: DagConfig, n: int) -> int:
+def _stress_guard(
+    cfg: DagConfig, n: int, run_memory_budget_bytes: int | None = None
+) -> int:
     """Early authored-hint preflight over one selected, CPU-capped graph copy."""
-    return _stress_memory_guard(cfg, n, expanded=False)
+    return _stress_memory_guard(
+        cfg, n, expanded=False, run_memory_budget_bytes=run_memory_budget_bytes
+    )
 
 
-def _final_stress_guard(cfg: DagConfig, n: int) -> int:
+def _final_stress_guard(
+    cfg: DagConfig, n: int, run_memory_budget_bytes: int | None = None
+) -> int:
     """Last no-spawn barrier over the already-expanded, finally planned graph."""
-    return _stress_memory_guard(cfg, n, expanded=True)
+    return _stress_memory_guard(
+        cfg, n, expanded=True, run_memory_budget_bytes=run_memory_budget_bytes
+    )
 
 
 def _print_stress_report(
@@ -2277,10 +2322,12 @@ def _cmd_pin_run(ns: argparse.Namespace) -> int:
         reservation.release()
 
 
-def _effective_sweep_topology() -> CpuTopology:
+def _effective_sweep_topology(max_cpus: int | None = None) -> CpuTopology:
     """Topology available to a sweep, bounded by the effective cgroup CPU budget."""
 
     topology = limit_topology(detect_cpu_topology(), container_core_budget())
+    if max_cpus is not None:
+        topology = limit_topology(topology, max_cpus)
     if topology.physical_core_count is None:
         # Match the Rust/runtime policy: when sysfs cannot prove an SMT boundary, use the logical
         # width rather than inventing a ratio. The pure discovery API retains ``None`` so callers
@@ -2290,6 +2337,39 @@ def _effective_sweep_topology() -> CpuTopology:
             physical_core_count=topology.logical_thread_count,
         )
     return topology
+
+
+def _sweep_memory_error(
+    step: Step,
+    cfg: DagConfig,
+    width: int,
+    inherited_max_mem_bytes: int | None,
+) -> str | None:
+    """Explain why one sweep width cannot fit its delegated parent, if bounded."""
+    if inherited_max_mem_bytes is None:
+        return None
+    cap = _step_mem_cap_for_inner_jobs(
+        step,
+        width,
+        mem_cap_factor=cfg.mem_cap_factor,
+        default_cap_bytes=cfg.default_step_mem_cap_bytes,
+    )
+    if cap is not None and cap <= inherited_max_mem_bytes:
+        return None
+    modeled = "unbounded" if cap is None else f"{cap} bytes"
+    return (
+        f"step {step.tag!r} at width {width} has modeled memory cap {modeled}, exceeding "
+        f"inherited delegated memory ceiling {inherited_max_mem_bytes} bytes"
+    )
+
+
+def _sweep_cpu_error(max_width: int, inherited_max_cpus: int | None) -> str | None:
+    if inherited_max_cpus is None or max_width <= inherited_max_cpus:
+        return None
+    return (
+        f"--jobs reaches {max_width}, exceeding inherited delegated CPU ceiling "
+        f"{inherited_max_cpus}; refusing physically throttled measurements"
+    )
 
 
 def _fixed_step_width(step: Step, cfg: DagConfig, topology: CpuTopology) -> int:
@@ -2499,6 +2579,8 @@ def _run_legacy_sweep(
     c: Palette,
     profile_timeseries_interval_s: float | None = None,
     capture_config: CaptureConfig | None = None,
+    inherited_max_cpus: int | None = None,
+    inherited_max_mem_bytes: int | None = None,
 ) -> int:
     """The original one-step dense-range command, kept byte-compatible in normal output."""
 
@@ -2515,6 +2597,9 @@ def _run_legacy_sweep(
     except ValueError as exc:
         print(f"{PROG}: sweep: {exc}", file=sys.stderr)
         return 2
+    if error := _sweep_cpu_error(hi, inherited_max_cpus):
+        print(f"{PROG}: sweep: {error}", file=sys.stderr)
+        return 2
     base_step = by_tag[step_tag]
     if not step_width_is_resizable(
         base_step, cfg.default_jobs_flag, cfg.default_jobs_env
@@ -2525,6 +2610,11 @@ def _run_legacy_sweep(
             "jobs_env/default_jobs_env to its worker-count environment variable",
             file=sys.stderr,
         )
+        return 2
+    if error := _sweep_memory_error(
+        base_step, cfg, hi, inherited_max_mem_bytes
+    ):
+        print(f"{PROG}: sweep: {error}; refusing", file=sys.stderr)
         return 2
 
     measures: list[tuple[int, _SweepMeasure]] = []
@@ -2598,6 +2688,8 @@ def _run_target_sweep(
     c: Palette,
     profile_timeseries_interval_s: float | None = None,
     capture_config: CaptureConfig | None = None,
+    inherited_max_cpus: int | None = None,
+    inherited_max_mem_bytes: int | None = None,
 ) -> int:
     """Run a graph-wide, soft-target, cumulative multi-pass scaling sweep."""
 
@@ -2617,7 +2709,11 @@ def _run_target_sweep(
             return 2
         ordered = (by_tag[step_tag],)
 
-    topology = _effective_sweep_topology()
+    topology = (
+        _effective_sweep_topology()
+        if inherited_max_cpus is None
+        else _effective_sweep_topology(inherited_max_cpus)
+    )
     physical_cores = topology.physical_core_count or topology.logical_thread_count
     if jobs_spec is None:
         initial_points = labeled_width_grid_for_pass(topology, 1)
@@ -2630,6 +2726,35 @@ def _run_target_sweep(
             print(f"{PROG}: sweep: {exc}", file=sys.stderr)
             return 2
         initial_sources = {width: "explicit" for width in initial_widths}
+    if error := _sweep_cpu_error(max(initial_widths, default=1), inherited_max_cpus):
+        print(f"{PROG}: sweep: {error}", file=sys.stderr)
+        return 2
+
+    max_width = max(initial_widths, default=1)
+    for step in ordered:
+        if step.skip_reason is not None:
+            # Intentional skips never execute, so their authored resource hints do not consume
+            # or violate the inherited envelope. Keep preflight aligned with the run loop below.
+            continue
+        resizable = step_width_is_resizable(
+            step, cfg.default_jobs_flag, cfg.default_jobs_env
+        )
+        width = max_width if resizable else _fixed_step_width(step, cfg, topology)
+        if (
+            step_tag is not None
+            and not resizable
+            and width > topology.logical_thread_count
+        ):
+            print(
+                f"{PROG}: sweep: selected fixed-width step {step.tag!r} requests {width} "
+                f"CPUs, exceeding the effective {topology.logical_thread_count}-CPU budget; "
+                "refusing an empty successful sweep",
+                file=sys.stderr,
+            )
+            return 2
+        if error := _sweep_memory_error(step, cfg, width, inherited_max_mem_bytes):
+            print(f"{PROG}: sweep: {error}; refusing", file=sys.stderr)
+            return 2
 
     from dagrun.perflog import new_run_id
 
@@ -2650,6 +2775,7 @@ def _run_target_sweep(
     sweep_started = time.monotonic()
     pass_number = 1
     pass_one_samples: dict[str, dict[int, list[_SweepMeasure]]] = {}
+    skipped_fixed: list[str] = []
     while True:
         grid = width_grid_for_pass(initial_widths, pass_number)
         grid_text = ",".join(str(width) for width in grid)
@@ -2679,6 +2805,7 @@ def _run_target_sweep(
                         f"sweep: {step.tag}: fixed configured width {fixed_width} exceeds "
                         f"the effective {topology.logical_thread_count}-CPU budget; skipping"
                     )
+                    skipped_fixed.append(step.tag)
                     continue
                 print(
                     f"sweep: {step.tag}: no jobs_flag/jobs_env width channel; characterizing "
@@ -2809,7 +2936,12 @@ def _run_target_sweep(
         f"elapsed {elapsed:.3f}s, target {target_s:.3f}s, "
         f"overrun {max(0.0, elapsed - target_s):.3f}s"
     )
-    if not has_resizable:
+    if skipped_fixed:
+        print(
+            "sweep: fixed nodes skipped without samples because their configured widths exceed "
+            f"the effective CPU budget: {', '.join(skipped_fixed)}"
+        )
+    elif not has_resizable:
         print(
             "sweep: no runnable selected node has a jobs_flag/jobs_env width channel; "
             "fixed nodes were handled once"
@@ -2907,6 +3039,12 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
         print(f"{PROG}: {exc}", file=sys.stderr)
         return 2
     repeat = max(1, int(ns.repeat))
+    inherited_max_cpus, inherited_max_mem_bytes, inherited_error = (
+        _inherited_delegated_limits()
+    )
+    if inherited_error is not None:
+        print(f"{PROG}: ERROR: {inherited_error}.", file=sys.stderr)
+        return 3
 
     # Reject every usage/configuration error before cgroup setup or profile reporting. Besides
     # matching the Rust CLI, this prevents an invalid invocation from claiming old store files as
@@ -2954,7 +3092,10 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
 
     # Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
     cgroups, code = _resolve_cgroup_manager(
-        bool(ns.allow_cgroup_failure), bool(getattr(ns, "unsafe_no_cgroups", False))
+        bool(ns.allow_cgroup_failure),
+        bool(getattr(ns, "unsafe_no_cgroups", False)),
+        max_cpus=inherited_max_cpus,
+        max_mem_bytes=inherited_max_mem_bytes,
     )
     if code != 0:
         return code
@@ -2991,6 +3132,8 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
             c,
             profile_timeseries_interval_s,
             capture_config,
+            inherited_max_cpus,
+            inherited_max_mem_bytes,
         )
     else:
         code = _run_target_sweep(
@@ -3006,6 +3149,8 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
             c=c,
             profile_timeseries_interval_s=profile_timeseries_interval_s,
             capture_config=capture_config,
+            inherited_max_cpus=inherited_max_cpus,
+            inherited_max_mem_bytes=inherited_max_mem_bytes,
         )
     capture_failed = code == _SWEEP_CAPTURE_FAILURE
     explicit_report_failed = False
@@ -3043,7 +3188,33 @@ def _print_sweep_table(
     print(_render_table(headers, table, c))
 
 
-def _select_max_cpus(ns: argparse.Namespace) -> int:
+def _inherited_delegated_limits() -> tuple[int | None, int | None, str | None]:
+    """Return validated nested ``(CPU, memory, error)`` limits before planning starts."""
+    from dagrun import cgroup as cg
+
+    root, error = cg.delegated_cgroup_root()
+    if error is not None:
+        return None, None, f"invalid ${cg.DELEGATED_CGROUP_ENV}: {error}"
+    if root is None:
+        return None, None, None
+    limits = cg.delegated_resource_limits(root)
+    unknown: list[str] = []
+    if not limits.cpu_known:
+        unknown.append("cpu.max")
+    if not limits.memory_known:
+        unknown.append("memory.max")
+    if unknown:
+        return (
+            None,
+            None,
+            f"delegated parent resource envelope has unreadable/malformed {', '.join(unknown)}",
+        )
+    return limits.max_cpus, limits.memory_max_bytes, None
+
+
+def _select_max_cpus(
+    ns: argparse.Namespace, inherited_max_cpus: int | None = None
+) -> int:
     """Resolve the maximum total core-equivalents for one run.
 
     The inherited cgroup quota, process affinity, and shared aggregate-slice budget jointly bound
@@ -3065,19 +3236,96 @@ def _select_max_cpus(ns: argparse.Namespace) -> int:
             f"CPU limit {ns.cores}",
             file=sys.stderr,
         )
-        return int(ns.cores)
+        requested = int(ns.cores)
+    if inherited_max_cpus is not None and requested > inherited_max_cpus:
+        print(
+            f"{PROG}: requested/default --max-cpus {requested} exceeds inherited delegated "
+            f"CPU ceiling {inherited_max_cpus}; using total CPU limit {inherited_max_cpus}",
+            file=sys.stderr,
+        )
+        requested = inherited_max_cpus
     return requested
 
 
-def _select_max_steps(cfg: DagConfig, ns: argparse.Namespace, max_cpus: int) -> int:
+def _select_max_mem_bytes(
+    ns: argparse.Namespace, inherited_max_mem_bytes: int | None = None
+) -> int | None:
+    """Resolve the run memory budget, bounded by a delegated parent's effective ceiling."""
+    raw = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
+    requested = _requested_max_mem_bytes(raw)
+    if inherited_max_mem_bytes is None:
+        return requested
+    if raw is not None and requested is None:
+        if parse_size(raw) is None:
+            print(
+                f"{PROG}: could not parse --max-mem {raw!r}; ignoring that request but "
+                f"retaining inherited delegated memory ceiling {inherited_max_mem_bytes} bytes",
+                file=sys.stderr,
+            )
+            return inherited_max_mem_bytes
+        # Preserve the existing non-positive refusal in _select_max_steps.
+        return None
+    if requested is None:
+        print(
+            f"{PROG}: inherited delegated memory ceiling {inherited_max_mem_bytes} bytes is "
+            "the effective default --max-mem budget",
+            file=sys.stderr,
+        )
+        return inherited_max_mem_bytes
+    if requested > inherited_max_mem_bytes:
+        print(
+            f"{PROG}: --max-mem {requested} bytes exceeds inherited delegated memory ceiling "
+            f"{inherited_max_mem_bytes} bytes; using {inherited_max_mem_bytes} bytes",
+            file=sys.stderr,
+        )
+        return inherited_max_mem_bytes
+    return requested
+
+
+def _uses_inherited_memory_budget(
+    ns: argparse.Namespace,
+    inherited_max_mem_bytes: int | None,
+) -> bool:
+    """Whether the parent's ceiling, rather than a tighter valid CLI request, chose the budget."""
+    if inherited_max_mem_bytes is None:
+        return False
+    raw = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
+    requested = _requested_max_mem_bytes(raw)
+    return requested is None or requested > inherited_max_mem_bytes
+
+
+def _inherited_cores_error(
+    ns: argparse.Namespace, inherited_max_cpus: int | None
+) -> str | None:
+    """Reject an exact cpuset reservation that the delegated quota cannot deliver."""
+    cores = ns.cores if isinstance(ns.cores, int) else None
+    if cores is None or inherited_max_cpus is None or cores <= inherited_max_cpus:
+        return None
+    return (
+        f"--cores {cores} requests an exact reservation wider than the inherited delegated "
+        f"CPU ceiling {inherited_max_cpus}; refusing"
+    )
+
+
+def _select_max_steps(
+    cfg: DagConfig,
+    ns: argparse.Namespace,
+    max_cpus: int,
+    effective_max_mem_bytes: int | None = None,
+    inherited_memory_budget: bool = False,
+) -> int:
     """Resolve the active-step ceiling, combining explicit and memory-derived limits."""
     explicit = int(ns.max_steps) if isinstance(ns.max_steps, int) else None
     base = explicit if explicit is not None else max_cpus
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
-    if max_mem is None:
+    if max_mem is None and effective_max_mem_bytes is None:
         return base
 
-    budget = parse_size(max_mem)
+    budget = (
+        effective_max_mem_bytes
+        if effective_max_mem_bytes is not None
+        else parse_size(max_mem or "")
+    )
     if budget is None:
         print(
             f"{PROG}: could not parse --max-mem {max_mem!r}; falling back to --max-steps "
@@ -3086,17 +3334,27 @@ def _select_max_steps(cfg: DagConfig, ns: argparse.Namespace, max_cpus: int) -> 
         )
         return base
 
-    memory_steps, footprint = jobs_for_budget(cfg, budget)
+    budget_source = (
+        f"--max-mem {max_mem}"
+        if max_mem is not None and parse_size(max_mem) == budget
+        else f"effective delegated --max-mem {budget} bytes"
+    )
+    sized_cfg = (
+        dataclasses.replace(cfg, mem_cap_floor_bytes=min(cfg.mem_cap_floor_bytes, budget))
+        if inherited_memory_budget
+        else cfg
+    )
+    memory_steps, footprint = jobs_for_budget(sized_cfg, budget)
     if memory_steps == 0:
         print(
-            f"{PROG}: --max-mem {max_mem}: REFUSED — minimum runnable footprint "
+            f"{PROG}: {budget_source}: REFUSED — minimum runnable footprint "
             f"{footprint} bytes cannot fit safely within budget {budget} bytes",
             file=sys.stderr,
         )
         return 0
     selected = min(base, memory_steps)
     print(
-        f"{PROG}: --max-mem {max_mem} -> modeled memory ceiling {memory_steps} active steps "
+        f"{PROG}: {budget_source} -> modeled memory ceiling {memory_steps} active steps "
         f"(worst-case {footprint} bytes fits budget {budget} bytes); base active-step ceiling "
         f"{base}; final --max-steps {selected}",
         file=sys.stderr,
@@ -3114,8 +3372,8 @@ def _select_max_steps(cfg: DagConfig, ns: argparse.Namespace, max_cpus: int) -> 
     if memory_steps == ncpu and not modeled:
         print(
             f"{PROG}: note: no runnable step has a positive hard/RSS/default memory cap, so "
-            f"the modeled footprint is only the mem_cap_floor_bytes floor "
-            f"({cfg.mem_cap_floor_bytes} bytes) and --max-mem did not throttle "
+            f"the modeled footprint is only the effective mem_cap_floor_bytes floor "
+            f"({sized_cfg.mem_cap_floor_bytes} bytes) and {budget_source} did not throttle "
             f"(modeled memory ceiling {memory_steps} = CPU count; final --max-steps "
             f"{selected})",
             file=sys.stderr,
@@ -3229,6 +3487,64 @@ def _resolve_cgroup_manager(
         return None, 0
 
     naming = cg.DEFAULT_NAMING
+    delegated_root, delegated_error = cg.delegated_cgroup_root(naming)
+    if delegated_error is not None:
+        print(
+            f"{PROG}: ERROR: invalid ${cg.DELEGATED_CGROUP_ENV}: {delegated_error}.",
+            file=sys.stderr,
+        )
+        return None, 3
+    if delegated_root is not None:
+        manager = cg.Cgroups.from_delegated_root(
+            delegated_root,
+            naming,
+            max_cpus=max_cpus,
+            max_mem_bytes=max_mem_bytes,
+        )
+        if manager.enabled:
+            print(
+                f"{PROG}: cgroup boxing ACTIVE in parent-owned delegated step root "
+                f"{delegated_root}; the outer scheduler retains subtree teardown ownership.",
+                file=sys.stderr,
+            )
+            return manager, 0
+        if not manager.close():
+            print(
+                f"{PROG}: ERROR: failed nested cgroup setup also failed to restore the "
+                "scheduler to its prior delegated cgroup; no step will be started.",
+                file=sys.stderr,
+            )
+            return None, 3
+        if allow_failure:
+            print(
+                f"{PROG}: warning: delegated root {delegated_root} could not be subdivided; "
+                "running inside the parent-owned boundary without inner per-step cgroups "
+                "(--allow-cgroup-failure).",
+                file=sys.stderr,
+            )
+            return None, 0
+        print(
+            f"{PROG}: ERROR: delegated root {delegated_root} could not establish inner "
+            "per-step cgroups.",
+            file=sys.stderr,
+        )
+        return None, 3
+    delegated_unboxed = os.environ.get(cg.DELEGATED_UNBOXED_ENV)
+    if delegated_unboxed is not None:
+        if delegated_unboxed != "1" or not os.environ.get("DAGRUN_OUTER_RUN"):
+            print(
+                f"{PROG}: ERROR: invalid ${cg.DELEGATED_UNBOXED_ENV}: expected exact value "
+                "'1' from an outer delegated_children step.",
+                file=sys.stderr,
+            )
+            return None, 3
+        print(
+            f"{PROG}: WARNING: reviewed uncontained nested execution via "
+            f"${cg.DELEGATED_UNBOXED_ENV}=1; the outer scheduler has no cgroup subtree to "
+            "delegate, so this run uses process-group/procfs fallback teardown and accounting.",
+            file=sys.stderr,
+        )
+        return None, 0
     if os.environ.get(naming.env_in_scope) == "1":
         # THE SENTINEL IS A PROMISE; GO AND LOOK BEFORE CLAIMING ANYTHING. This branch reads an
         # environment variable this process set for itself, and the "boxing ACTIVE" line below
@@ -3682,7 +3998,9 @@ ADMISSION_EXIT_CODE = 4
 MAX_ADMISSION_WAIT_S = 86400.0
 
 
-def _apply_admission(ns: argparse.Namespace) -> int:
+def _apply_admission(
+    ns: argparse.Namespace, effective_max_mem_bytes: int | None = None
+) -> int:
     """Reserve this run's memory against the host-wide ledger, or refuse to start. 0 = proceed.
 
     Absent ``--admission`` this is a no-op: admission is opt-in because a durable cross-process
@@ -3712,14 +4030,18 @@ def _apply_admission(ns: argparse.Namespace) -> int:
         )
         return 2
 
-    requested = _requested_max_mem_bytes(getattr(ns, "max_mem", None))
+    requested = (
+        effective_max_mem_bytes
+        if effective_max_mem_bytes is not None
+        else _requested_max_mem_bytes(getattr(ns, "max_mem", None))
+    )
     if requested is None:
         # REQUIRED, not guessed. The only numbers available without --max-mem describe the whole
         # host, so guessing would reserve everything and turn admission into a global mutex --
         # which would look like it was working right up until it deadlocked a CI fleet.
         print(
-            f"{PROG}: run: --admission requires --max-mem: admission reserves a NUMBER against a "
-            "host-wide ledger, and the only figure available without it is the whole host.",
+            f"{PROG}: run: --admission requires --max-mem or a finite inherited delegated "
+            "memory ceiling: admission reserves a NUMBER against a host-wide ledger.",
             file=sys.stderr,
         )
         return 2
@@ -3829,11 +4151,22 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         print(f"{PROG}: run: {exc}", file=sys.stderr)
         return 2
 
+    inherited_max_cpus, inherited_max_mem_bytes, inherited_error = (
+        _inherited_delegated_limits()
+    )
+    if inherited_error is not None:
+        print(f"{PROG}: ERROR: {inherited_error}.", file=sys.stderr)
+        return 3
+    if cores_error := _inherited_cores_error(ns, inherited_max_cpus):
+        print(f"{PROG}: run: {cores_error}", file=sys.stderr)
+        return 2
+
     # Resolve the maximum CPU capacity before stress sizing or cgroup bring-up. The stress guard
     # must charge the widths that can actually execute under this run's per-step ceiling, not an
     # authored width which will be clamped later. Self-managed commands cannot be clamped, so
     # reject those before either sizing or expansion.
-    max_cpus = _select_max_cpus(ns)
+    max_cpus = _select_max_cpus(ns, inherited_max_cpus)
+    effective_max_mem_bytes = _select_max_mem_bytes(ns, inherited_max_mem_bytes)
     if error := _self_managed_width_error(cfg, max_cpus):
         print(f"{PROG}: run: {error}", file=sys.stderr)
         return 2
@@ -3855,7 +4188,11 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         # Clamp once BEFORE expansion: the guard sizes exactly what will be cloned, and the later
         # post-plan clamp is idempotent instead of warning once for every generated copy.
         cfg = cap_config_max_cpus(cfg, max_cpus)
-        code = _stress_guard(cfg, stress_n)
+        code = (
+            _stress_guard(cfg, stress_n)
+            if effective_max_mem_bytes is None
+            else _stress_guard(cfg, stress_n, effective_max_mem_bytes)
+        )
         if code != 0:
             return code
         cfg = _expand_stress(cfg, stress_n)
@@ -3865,7 +4202,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # be refused should not have created one at all. The reservation is held for the rest of the
     # process (released by admission's atexit hook), so the ledger reflects this run for exactly as
     # long as it is on the machine.
-    admission_code = _apply_admission(ns)
+    admission_code = _apply_admission(ns, effective_max_mem_bytes)
     if admission_code != 0:
         return admission_code
 
@@ -3876,7 +4213,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         bool(getattr(ns, "unsafe_no_cgroups", False)),
         max_cpus=max_cpus,
         run_timeout_s=_effective_run_timeout(ns),
-        max_mem_bytes=_requested_max_mem_bytes(getattr(ns, "max_mem", None)),
+        max_mem_bytes=effective_max_mem_bytes,
     )
     if code != 0:
         return code
@@ -3928,7 +4265,12 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
     feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
-    core_budget, mem_budget = _planning_budgets(planner, max_mem, max_cpus)
+    core_budget, mem_budget = _planning_budgets(
+        planner,
+        max_mem,
+        max_cpus,
+        effective_max_mem_bytes,
+    )
     planning_max_steps = (
         int(ns.max_steps) if isinstance(ns.max_steps, int) else max_cpus
     )
@@ -3982,7 +4324,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # Censoring-aware memory feedback (opt-in), applied AFTER the ordinary plan so it has the last
     # word on rss_baseline_bytes and BEFORE the memory-aware --max-steps sizing that reads it. It
     # is handed the PRE-plan config as well, so a step it declines to estimate goes back to its
-    # authored baseline instead of keeping the censoring-blind one the plan just wrote.
+    # authored baseline (or a larger proven floor) when this stricter path declines to estimate.
     cfg = _apply_memory_feedback(
         cfg, authored, feedback_dir, bool(getattr(ns, "profile_memory_feedback", False))
     )
@@ -4033,13 +4375,25 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # estimates or allocated wider CPU-bound steps since then, so re-check the FINAL, already-
     # expanded graph without multiplying by stress_n again. This is the last no-spawn barrier.
     if stress_active:
-        code = _final_stress_guard(cfg, stress_n)
+        code = (
+            _final_stress_guard(cfg, stress_n)
+            if effective_max_mem_bytes is None
+            else _final_stress_guard(cfg, stress_n, effective_max_mem_bytes)
+        )
         if code != 0:
             if core_reservation is not None:
                 core_reservation.release()
             return code
 
-    max_steps = _select_max_steps(cfg, ns, max_cpus)
+    max_steps = _select_max_steps(
+        cfg,
+        ns,
+        max_cpus,
+        effective_max_mem_bytes,
+        inherited_memory_budget=_uses_inherited_memory_budget(
+            ns, inherited_max_mem_bytes
+        ),
+    )
     if max_steps < 1:
         if core_reservation is not None:
             core_reservation.release()
@@ -4111,7 +4465,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     return 0 if result.ok else 1
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line application and return its process status."""
     parser = build_parser()
     raw = list(argv) if argv is not None else list(sys.argv[1:])
@@ -4219,6 +4573,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run(cfg, ns, c)
     parser.print_help()
     return 2
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one CLI invocation and restore any parent-owned delegated caller afterward."""
+    from dagrun import cgroup as cg
+
+    coordinator_depth = cg.nested_coordinator_depth()
+    try:
+        result = _main(argv)
+    finally:
+        # A normal command-line process exits next, but ``main`` is also a public in-process API.
+        # The nested aggregate cap includes the coordinator while the invocation is active; do
+        # not leak that cgroup membership (or its tighter limits) into its long-lived caller.
+        restored = cg.restore_nested_coordinators_to(coordinator_depth)
+    if not restored:
+        print(
+            f"{PROG}: ERROR: nested scheduler cgroup membership could not be restored; "
+            "refusing to report a successful invocation",
+            file=sys.stderr,
+        )
+        return 3
+    return result
 
 
 if __name__ == "__main__":

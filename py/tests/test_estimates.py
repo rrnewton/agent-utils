@@ -27,6 +27,7 @@ from dagrun import (
 from dagrun.estimates import (
     Planner,
     SpeedupLevel,
+    StepSamples,
     StepSpeedup,
     _affinity_width,
     _parse_float,
@@ -304,6 +305,36 @@ def test_store_wins_over_hint_and_feeds_config(tmp_path: Path) -> None:
     heavy = applied.by_tag()["g.heavy"]
     assert heavy.hint.est_duration_s == 8.0
     assert heavy.hint.rss_baseline_bytes == 6000
+
+
+def test_authored_rss_is_the_floor_for_ordinary_profile_feedback() -> None:
+    """One quiet sample may refine time, but cannot tighten the enforced memory ceiling."""
+
+    step = Step(
+        "g",
+        "variable",
+        "variable",
+        "true",
+        hint=ResourceHint(est_duration_s=10.0, rss_baseline_bytes=8_000),
+    )
+    cfg = DagConfig(steps=(step,))
+
+    quiet = {"g.variable": StepSamples("g.variable", 1, 3.0, 2_000)}
+    quiet_plan = build_plan(cfg, quiet)
+    quiet_entry = quiet_plan.entries[0]
+    assert quiet_entry.est_source == "store"
+    assert quiet_entry.est_duration_s == 3.0
+    assert quiet_entry.rss_source == "hint"
+    assert quiet_entry.rss_estimate_bytes == 8_000
+    assert apply_plan_to_config(cfg, quiet_plan).steps[0].hint.rss_baseline_bytes == 8_000
+
+    # Ordinary feedback remains allowed to raise an underestimate. Safe, deliberate lowering is
+    # the separate censor-aware --profile-memory-feedback contract.
+    high = {"g.variable": StepSamples("g.variable", 1, 3.0, 12_000)}
+    high_plan = build_plan(cfg, high)
+    assert high_plan.entries[0].rss_source == "store"
+    assert high_plan.entries[0].rss_estimate_bytes == 12_000
+    assert apply_plan_to_config(cfg, high_plan).steps[0].hint.rss_baseline_bytes == 12_000
 
 
 def test_apply_plan_preserves_all_non_hint_step_fields() -> None:
@@ -792,7 +823,10 @@ def test_cpa_uses_replicated_width_specific_memory(tmp_path: Path) -> None:
                 "true",
                 hint=ResourceHint(
                     est_duration_s=8.0,
-                    rss_baseline_bytes=8 * GIB,
+                    # Keep the authored floor below the measured width-one peak: this test is
+                    # about choosing among replicated width observations. A separate regression
+                    # below proves that those observations may not lower a larger authored floor.
+                    rss_baseline_bytes=GIB,
                     classification=StepClass.CPU_BOUND,
                 ),
             ),
@@ -852,6 +886,48 @@ def test_applied_exact_width_memory_is_not_scaled_twice(tmp_path: Path) -> None:
     assert applied.steps[0].hint.rss_baseline_inner_jobs == 8
     assert step_mem_cap_for_inner_jobs(applied.steps[0], 8, mem_cap_factor=1.0) == 3 * GIB
     assert jobs_for_budget(applied, 4 * GIB)[1] == 3 * GIB
+
+
+def test_replicated_width_memory_cannot_lower_an_authored_rss_floor(tmp_path: Path) -> None:
+    rows: list[str] = []
+    for width, wall in ((1, "8.0"), (2, "4.0")):
+        rows.extend(
+            _speedup_row(
+                "m.variable",
+                width,
+                wall,
+                user_s="8.0",
+                sys_s="0.0",
+                peak_bytes=str(GIB),
+            )
+            for _ in range(3)
+        )
+    speedups = _cpa_speedups(tmp_path, rows)
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "m",
+                "variable",
+                "",
+                "true",
+                hint=ResourceHint(
+                    est_duration_s=8.0,
+                    rss_baseline_bytes=8 * GIB,
+                    preferred_inner_jobs=1,
+                    classification=StepClass.CPU_BOUND,
+                ),
+            ),
+        ),
+        mem_cap_factor=1.0,
+    )
+
+    plan = build_plan(cfg, {}, speedups=speedups, core_budget=2)
+    assert plan.entries[0].rss_estimate_bytes == 8 * GIB
+    assert plan.entries[0].rss_source == "hint"
+    assert plan.entries[0].rss_estimate_inner_jobs is None
+    applied = apply_plan_to_config(cfg, plan)
+    assert applied.steps[0].hint.rss_baseline_bytes == 8 * GIB
+    assert applied.steps[0].hint.rss_baseline_inner_jobs is None
 
 
 def test_cpa_piles_cores_on_the_chain_and_leaves_plateau_narrow(tmp_path: Path) -> None:

@@ -6,27 +6,28 @@
 # vibe-talk group when vibe-talk changed -- but it is run from the root and reasons about the whole
 # tree, and the loop you actually work in is "I changed one file in here, is this tool still good?"
 #
-# So: `make validate` at the root is the repository's gate, and `make validate` HERE is this tool's.
-# The root one runs everything below by name, so the two cannot drift into different definitions of
-# what validating vibe-talk means.
+# So: `make validate` at the root is the repository's boxed gate, and `make validate` HERE is this
+# tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
+# one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check test page pwa-installability offline-cache-browser android-speech-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check test page pwa-installability offline-cache-browser android-speech-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
-# UNBOXED, and deliberately the default: it needs nothing but a Rust and a node toolchain, so it
-# works on a fresh clone and on a CI runner with no cgroup delegation. `validate-boxed` is the
-# better one where it can run.
-validate: fmt check test dag-check android-speech-self-test
+# UNBOXED, and deliberately the default: it needs Rust, Node, and the repository's Python typing
+# tools, but no cgroup delegation. `validate-boxed` is the bounded version where cgroups exist.
+validate: fmt check scripts-check test dag-check android-speech-self-test
 
-# The same suites, run through dagrun: per-step wall and CPU timeouts, memory caps, and
-# process-tree teardown inside nested cgroups.
+# The complete portable suite, run through dagrun: per-step wall and CPU timeouts, memory caps,
+# and process-tree teardown inside nested cgroups. Container-runtime and alternate-toolchain
+# checks remain focused CI signals because they require a different execution environment.
 #
 # PREFER THIS LOCALLY. It is the only path that bounds what the screenshot harness starts -- the
 # teardown is setsid-proof, so a browser or a throwaway server is reaped with the step whether or
 # not the script's own trap fired. One that was not once ran for six days holding a port.
 #
-# It also adds the screenshot suite, which plain `validate` leaves out because it needs a browser.
+# It also adds PWA installability, offline-cache, and screenshot browser suites, which plain
+# `validate` leaves out because they need a browser.
 validate-boxed:
 	cd .. && ./common/bin/dagrun run --dag vibe-talk/tests.dag.yaml
 
@@ -51,6 +52,14 @@ fmt:
 
 check:
 	cargo clippy --all-targets --locked -- -D warnings
+
+# These are deployed operator tools, not incidental repository helpers. Keep their strict typing
+# in this tool's own gate so changing one does not need the unrelated root workspaces merely to
+# reach a mypy invocation.
+scripts-check:
+	cd .. && python3 -m mypy --config-file py/pyproject.toml --strict \
+		--disallow-any-explicit --disallow-any-decorated vibe-talk
+	cd .. && python3 scripts/check_no_any.py vibe-talk
 
 # `cargo test` runs BOTH served pages' suites through `node --test` as well as the Rust tests, so
 # this is not only the Rust half. Those suites FAIL rather than skip when node is missing, which is

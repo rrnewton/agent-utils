@@ -408,6 +408,25 @@ def test_cpu_timeout_roundtrip_and_conditional_emit() -> None:
     assert dag_to_json(dag_from_json(out)) == out
 
 
+def test_delegated_children_is_explicit_and_roundtrips() -> None:
+    cfg = dag_from_json(
+        '{"steps":['
+        '{"group":"g","job":"delegating","cmd":"true","delegated_children":true},'
+        '{"group":"g","job":"ordinary","cmd":"true"}]}'
+    )
+    assert cfg.steps[0].delegated_children
+    assert not cfg.steps[1].delegated_children
+    encoded = dag_to_json(cfg)
+    assert encoded.count('"delegated_children"') == 1
+    assert dag_to_json(dag_from_json(encoded)) == encoded
+
+    with pytest.raises(DagJsonError, match="delegated_children.*boolean"):
+        dag_from_json(
+            '{"steps":[{"group":"g","job":"bad","cmd":"true",'
+            '"delegated_children":"yes"}]}'
+        )
+
+
 def test_fail_fast_family_roundtrip_and_rejects_empty() -> None:
     doc = (
         "{\"steps\": ["
@@ -628,7 +647,8 @@ def test_a_step_declaring_only_known_fields_still_loads() -> None:
     dag_from_json(
         '{"steps":[{"group":"a","job":"one","desc":"d","description":"long",'
         '"cmd":"true","deps":[],"env":{"K":"V"},"networkonly":false,'
-        '"engine_only":false,"timeout":5,"cpu_timeout":3,"cmdtype":"generic-with-flag",'
+        '"engine_only":false,"delegated_children":false,"timeout":5,"cpu_timeout":3,'
+        '"cmdtype":"generic-with-flag",'
         '"jobs_flag":"-j",'
         '"jobs_env":"J","explains":[],"fail_fast_family":"fam",'
         '"hint":{"resources":{},"est_duration_s":1.0,"classification":"light"}}]}'

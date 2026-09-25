@@ -65,6 +65,15 @@ fn runner_command() -> Command {
         "DAGRUN_IN_SCOPE",
         "DAGRUN_SCOPE_UNIT",
         "DAGRUN_DIRECT_CGROUP",
+        // The test binary can itself be a command inside an explicitly delegated validation
+        // step. These cases exercise fresh top-level scope policy, so inherited one-step nesting
+        // authority would select a different (valid, but irrelevant) route before the branch
+        // under test.
+        "DAGRUN_OUTER_RUN",
+        "DAGRUN_DELEGATED_CGROUP",
+        "DAGRUN_DELEGATED_UNBOXED",
+        "DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES",
+        "DAGRUN_EXPECTED_OUTER_CPU_COUNT",
     ] {
         cmd.env_remove(key);
     }

@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from itertools import count
 from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING
@@ -51,6 +52,8 @@ _SCOPE_DRAIN_ATTEMPTS = 50
 _SCOPE_DRAIN_RETRY_SECONDS = 0.01
 _SCOPE_DRAIN_EMPTY_SAMPLES = 2
 _CONTROLLER_ENABLE_ATTEMPTS = 3
+_NESTED_ROOT_COUNTER = count()
+_NESTED_COORDINATOR_STACK: list[tuple[Path, Path, ScopeNaming]] = []
 
 #: Optional caller override used by containment tests and constrained hosts.
 #: It may only TIGHTEN the derived cap, never widen it.
@@ -59,6 +62,14 @@ OUTER_MEMORY_MAX_ENV = "DAGRUN_OUTER_MEMORY_MAX_BYTES"
 EXPECTED_OUTER_MEMORY_MAX_ENV = "DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES"
 #: Exact total-CPU cap carried across the systemd re-exec for in-scope readback.
 EXPECTED_OUTER_CPU_COUNT_ENV = "DAGRUN_EXPECTED_OUTER_CPU_COUNT"
+#: Exact cgroup root delegated by an outer dagrun step to a nested scheduler.  The nested
+#: process must be observed in this root's immediate ``supervisor`` child before the value is
+#: trusted; an inherited or forged path is not admission.
+DELEGATED_CGROUP_ENV = "DAGRUN_DELEGATED_CGROUP"
+#: Explicit, graph-reviewed fallback for a ``delegated_children`` step whose outer scheduler is
+#: itself unboxed (for example a hosted CI runner using ``--allow-cgroup-failure``). This is an
+#: authorization to nest, never evidence of containment; only the exact value ``1`` is accepted.
+DELEGATED_UNBOXED_ENV = "DAGRUN_DELEGATED_UNBOXED"
 #: Carries the outer scope's requested ``RuntimeMaxSec`` into the in-scope child, so the child can
 #: read the property back off the live unit instead of trusting the argument vector that asked
 #: for it.
@@ -293,6 +304,229 @@ def _memory_max_bytes(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _memory_limit_matches(expected: int, actual: int | None) -> bool:
+    """Whether cgroup v2 retained ``expected``, allowing only safe page rounding down."""
+    if actual is None:
+        return False
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError):
+        return False
+    return actual <= expected and expected - actual < page_size
+
+
+def _delegated_ancestor_memory_max(
+    root: Path,
+    *,
+    cgroup_root: Path = CGROUP_ROOT,
+) -> tuple[int | None, bool]:
+    """Return the tightest visible ancestor cap and whether the scan was complete.
+
+    ``root`` is the exact parent step cgroup already validated by
+    :func:`delegated_cgroup_root`.  A nested scheduler adds a private run root below it, but a
+    newly-created cgroup starts with ``memory.max=max``; reading only that new root would lose a
+    finite cap on the parent step or any ancestor up to the cgroup namespace root.
+
+    The boolean distinguishes a hierarchy known to be wholly unbounded (``None, True``) from an
+    unreadable hierarchy (``None, False``).  That distinction is required by censor-aware
+    profiling: an unknown ancestor may not be treated as proof that a peak was uncensored.
+    """
+    try:
+        boundary = cgroup_root.resolve(strict=True)
+        group = root.resolve(strict=True)
+    except OSError:
+        return None, False
+    if group != boundary and not group.is_relative_to(boundary):
+        return None, False
+
+    tightest: int | None = None
+    complete = True
+    while True:
+        raw = _read_cgroup_value(group, "memory.max")
+        if raw == "max" or (group == boundary and raw is None):
+            # The cgroup-v2 hierarchy root has no parent to constrain and some kernels omit its
+            # controller limit files entirely. That specific absence means unbounded, not unknown.
+            pass
+        else:
+            parsed = _memory_max_bytes(raw)
+            if parsed is None or parsed < 0:
+                complete = False
+            else:
+                tightest = parsed if tightest is None else min(tightest, parsed)
+        if group == boundary:
+            break
+        group = group.parent
+    return tightest, complete
+
+
+def _delegated_ancestor_cpu_count(
+    root: Path,
+    *,
+    cgroup_root: Path = CGROUP_ROOT,
+) -> tuple[int | None, bool]:
+    """Return the tightest visible integer CPU quota and whether the scan was complete."""
+    try:
+        boundary = cgroup_root.resolve(strict=True)
+        group = root.resolve(strict=True)
+    except OSError:
+        return None, False
+    if group != boundary and not group.is_relative_to(boundary):
+        return None, False
+
+    tightest: int | None = None
+    complete = True
+    while True:
+        raw = _read_cgroup_value(group, "cpu.max")
+        fields = raw.split() if raw is not None else []
+        if group == boundary and raw is None:
+            pass
+        elif len(fields) != 2:
+            complete = False
+        elif fields[0] == "max":
+            try:
+                if int(fields[1]) <= 0:
+                    complete = False
+            except ValueError:
+                complete = False
+        else:
+            parsed = _cpu_max_cores(raw)
+            if parsed is None:
+                complete = False
+            else:
+                tightest = parsed if tightest is None else min(tightest, parsed)
+        if group == boundary:
+            break
+        group = group.parent
+    return tightest, complete
+
+
+@dataclass(frozen=True)
+class DelegatedResourceLimits:
+    """Effective parent envelope inherited by one nested scheduler."""
+
+    memory_max_bytes: int | None
+    memory_known: bool
+    max_cpus: int | None
+    cpu_known: bool
+
+
+def delegated_resource_limits(
+    root: Path,
+    *,
+    cgroup_root: Path = CGROUP_ROOT,
+) -> DelegatedResourceLimits:
+    """Read the effective resource envelope above a validated delegated step root."""
+    memory_max, memory_known = _delegated_ancestor_memory_max(
+        root, cgroup_root=cgroup_root
+    )
+    max_cpus, cpu_known = _delegated_ancestor_cpu_count(root, cgroup_root=cgroup_root)
+    # cpu.max bounds bandwidth; cpuset.cpus.effective independently bounds which CPUs are usable.
+    # The latter already reflects every ancestor, so reading it at the delegated root is enough.
+    cpuset_raw = _read_cgroup_value(root, "cpuset.cpus.effective")
+    if cpuset_raw is not None:
+        cpuset_cpus = _cpuset_count(cpuset_raw)
+        if cpuset_cpus is None or cpuset_cpus < 1:
+            cpu_known = False
+        else:
+            max_cpus = cpuset_cpus if max_cpus is None else min(max_cpus, cpuset_cpus)
+    return DelegatedResourceLimits(memory_max, memory_known, max_cpus, cpu_known)
+
+
+def _create_nested_run_root(
+    parent: Path,
+    run_root: Path,
+    *,
+    naming: ScopeNaming = DEFAULT_NAMING,
+    cgroup_root: Path = CGROUP_ROOT,
+    requested_max_cpus: int | None = None,
+    requested_max_mem_bytes: int | None = None,
+) -> DelegatedResourceLimits:
+    """Create ``run_root`` and stamp the effective delegated ancestor resource envelope.
+
+    The returned snapshot is retained by :class:`Cgroups` as profiling provenance.  Failure to
+    mirror an inherited cap is survivable because the physical ancestor still enforces it.
+    Failure to apply a *tighter requested* invocation cap is not: that would silently turn a
+    nested ``--max-cpus``/``--max-mem`` promise into modeling-only advice, so this helper raises.
+    """
+    inherited = delegated_resource_limits(parent, cgroup_root=cgroup_root)
+    memory_candidates = [
+        value
+        for value in (inherited.memory_max_bytes, requested_max_mem_bytes)
+        if value is not None
+    ]
+    cpu_candidates = [
+        value
+        for value in (inherited.max_cpus, requested_max_cpus)
+        if value is not None
+    ]
+    effective_memory = min(memory_candidates) if memory_candidates else None
+    effective_cpus = min(cpu_candidates) if cpu_candidates else None
+    effective = DelegatedResourceLimits(
+        effective_memory,
+        inherited.memory_known,
+        effective_cpus,
+        inherited.cpu_known,
+    )
+    memory_stamp_required = requested_max_mem_bytes is not None and (
+        inherited.memory_max_bytes is None
+        or requested_max_mem_bytes < inherited.memory_max_bytes
+    )
+    cpu_stamp_required = requested_max_cpus is not None and (
+        inherited.max_cpus is None or requested_max_cpus < inherited.max_cpus
+    )
+    run_root.mkdir()
+    if effective.memory_max_bytes is not None:
+        try:
+            memory_max = run_root / "memory.max"
+            memory_max.write_text(str(effective.memory_max_bytes))
+            applied = _memory_max_bytes(memory_max.read_text().strip())
+            if not _memory_limit_matches(effective.memory_max_bytes, applied):
+                message = (
+                    f"nested scheduler cgroup {run_root} did not retain "
+                    f"memory.max={effective.memory_max_bytes} (read back {applied!r})"
+                )
+                if memory_stamp_required:
+                    raise OSError(message)
+                _warn(naming, f"{message}; ancestor cap still applies")
+        except OSError as error:
+            if memory_stamp_required:
+                raise OSError(
+                    f"could not enforce requested nested memory.max="
+                    f"{effective.memory_max_bytes} on {run_root}: {error}"
+                ) from error
+            _warn(
+                naming,
+                f"could not stamp inherited memory.max={effective.memory_max_bytes} on nested "
+                f"scheduler cgroup {run_root} ({error}); ancestor cap still applies",
+            )
+    if effective.max_cpus is not None:
+        try:
+            cpu_max = run_root / "cpu.max"
+            expected = f"{effective.max_cpus * 100_000} 100000"
+            cpu_max.write_text(expected)
+            applied_cpus = _cpu_max_cores(cpu_max.read_text().strip())
+            if applied_cpus != effective.max_cpus:
+                message = (
+                    f"nested scheduler cgroup {run_root} did not retain CPU ceiling "
+                    f"{effective.max_cpus} (read back {applied_cpus!r})"
+                )
+                if cpu_stamp_required:
+                    raise OSError(message)
+                _warn(naming, f"{message}; ancestor quota still applies")
+        except OSError as error:
+            if cpu_stamp_required:
+                raise OSError(
+                    f"could not enforce requested nested CPU ceiling "
+                    f"{effective.max_cpus} on {run_root}: {error}"
+                ) from error
+            _warn(
+                naming,
+                f"could not stamp inherited CPU ceiling {effective.max_cpus} on nested "
+                f"scheduler cgroup {run_root} ({error}); ancestor quota still applies",
+            )
+    return effective
 
 
 def _bounded(value: str | None) -> bool:
@@ -760,6 +994,80 @@ def observe_own_containment(
                 f"{expected_unit}; the caps and the kill path were arranged on a different cgroup",
             )
     return ContainmentEvidence(ContainmentProof(cgroup, pid, expected_unit))
+
+
+def _validate_delegated_cgroup_root_at(
+    root: Path,
+    current: Path,
+    pid: int,
+    *,
+    cgroup_root: Path = CGROUP_ROOT,
+    supervisor_name: str = DEFAULT_NAMING.supervisor_name,
+) -> str | None:
+    """Return an actionable refusal, or ``None`` when ``root`` is this process's delegation.
+
+    The exact immediate-parent shape is deliberate. Merely checking that a supplied path is an
+    ancestor would let a nested process claim the enclosing run scope (and therefore siblings) as
+    its authority. The outer scheduler places the command in ``<root>/supervisor``; both the
+    kernel-side current path and that leaf's roster must agree before the inner scheduler may
+    create descendants under ``root``.
+    """
+    try:
+        resolved_base = cgroup_root.resolve(strict=True)
+        resolved_root = root.resolve(strict=True)
+        resolved_current = current.resolve(strict=True)
+    except OSError as error:
+        return f"delegated cgroup path cannot be resolved: {error}"
+    if resolved_root == resolved_base or not resolved_root.is_relative_to(resolved_base):
+        return f"delegated cgroup {resolved_root} is outside the cgroup-v2 hierarchy"
+    if resolved_current.parent != resolved_root or resolved_current.name != supervisor_name:
+        return (
+            f"current cgroup {resolved_current} is not the exact "
+            f"{supervisor_name!r} leaf beneath delegated root {resolved_root}"
+        )
+    try:
+        roster = (resolved_current / "cgroup.procs").read_text().splitlines()
+    except OSError as error:
+        return f"cannot read delegated supervisor roster: {error}"
+    if str(pid) not in {line.strip() for line in roster}:
+        return (
+            f"pid {pid} is not listed in delegated supervisor "
+            f"{resolved_current / 'cgroup.procs'}"
+        )
+    if not (resolved_root / "cgroup.kill").exists():
+        return f"delegated root {resolved_root} has no cgroup.kill ownership boundary"
+    return None
+
+
+def delegated_cgroup_root(
+    naming: ScopeNaming = DEFAULT_NAMING,
+) -> tuple[Path | None, str | None]:
+    """Validate and return the outer step root delegated to this nested scheduler.
+
+    ``(None, None)`` means no delegation was offered. ``(None, reason)`` means an environment
+    value was present but did not match the live kernel membership and must be refused.
+    """
+    raw = os.environ.get(DELEGATED_CGROUP_ENV)
+    if raw is None:
+        return None, None
+    if not raw or "\0" in raw:
+        return None, f"${DELEGATED_CGROUP_ENV} is empty or malformed"
+    root = Path(raw)
+    current = _my_cgroup_path()
+    if not root.is_absolute() or current is None:
+        return None, (
+            f"${DELEGATED_CGROUP_ENV} must be an absolute live cgroup path and the current "
+            "cgroup must be observable"
+        )
+    refusal = _validate_delegated_cgroup_root_at(
+        root,
+        current,
+        os.getpid(),
+        supervisor_name=naming.supervisor_name,
+    )
+    if refusal is not None:
+        return None, refusal
+    return root.resolve(), None
 
 
 def promised_unit(*, naming: ScopeNaming = DEFAULT_NAMING) -> str | None:
@@ -1251,15 +1559,10 @@ def verify_scope_limits(
     if expected_memory_max is None:
         memory_ok = memory_max == "max"
     else:
-        try:
-            actual_memory_max = int(memory_max or "")
-            # cgroup v2 rounds a byte limit down to its page boundary. Accept
-            # exactly that kernel representation, but never a broader limit.
-            page_size = os.sysconf("SC_PAGE_SIZE")
-            memory_ok = (actual_memory_max <= expected_memory_max
-                         and expected_memory_max - actual_memory_max < page_size)
-        except (OSError, ValueError):
-            memory_ok = False
+        actual_memory_max = _memory_max_bytes(memory_max)
+        # cgroup v2 rounds a byte limit down to its page boundary. Accept exactly that kernel
+        # representation, but never a broader limit.
+        memory_ok = _memory_limit_matches(expected_memory_max, actual_memory_max)
     swap_ok = memory_swap_max == "0"
     oom_group_ok = memory_oom_group == "1"
     cpu_ok = True
@@ -1802,6 +2105,127 @@ def _enable_controller(scope: Path, supervisor: Path, controller: str) -> None:
     )
 
 
+def _remove_empty_cgroup_descendants(root: Path) -> None:
+    """Best-effort depth-first removal of child cgroups, never files or ``root`` itself."""
+    try:
+        children = [entry for entry in root.iterdir() if entry.is_dir()]
+    except OSError:
+        return
+    for child in children:
+        _remove_empty_cgroup_descendants(child)
+        try:
+            child.rmdir()
+        except OSError:
+            pass
+
+
+def _move_current_to_nested_supervisor(
+    run_root: Path,
+    naming: ScopeNaming = DEFAULT_NAMING,
+) -> None:
+    """Move this scheduler into its capped run root and verify live membership.
+
+    Inner steps already join descendants of ``run_root``. The coordinator must join as well or a
+    tighter nested ``--max-mem``/``--max-cpus`` would not be a whole-invocation boundary.
+    """
+    supervisor = run_root / naming.supervisor_name
+    return_supervisor = _my_cgroup_path()
+    if return_supervisor is None:
+        raise OSError("current cgroup is unreadable before nested scheduler migration")
+    pid = os.getpid()
+    (supervisor / "cgroup.procs").write_text(str(pid))
+    try:
+        current = _my_cgroup_path()
+        if current is None or current.resolve() != supervisor.resolve():
+            raise OSError(
+                f"nested scheduler pid {pid} did not enter {supervisor}; "
+                f"current cgroup is {current}"
+            )
+        roster = (supervisor / "cgroup.procs").read_text().split()
+        if str(pid) not in roster:
+            raise OSError(
+                f"nested scheduler pid {pid} is absent from {supervisor / 'cgroup.procs'}"
+            )
+    except OSError:
+        # The write may have migrated us even when the subsequent proof failed. Never strand an
+        # in-process caller under a partial/tighter invocation boundary.
+        try:
+            _restore_pid_to_cgroup(return_supervisor, pid)
+        except OSError as rollback_error:
+            # Retain the exact recovery target. The manager destructor and the public CLI's
+            # invocation boundary will retry; a persistent failure turns success into exit 3.
+            _NESTED_COORDINATOR_STACK.append((run_root, return_supervisor, naming))
+            _warn(
+                naming,
+                f"could not roll back failed nested scheduler migration to "
+                f"{return_supervisor} ({rollback_error})",
+            )
+        raise
+    _NESTED_COORDINATOR_STACK.append((run_root, return_supervisor, naming))
+
+
+def _restore_pid_to_cgroup(target: Path, pid: int) -> None:
+    """Move ``pid`` to ``target`` and prove both path and roster membership."""
+    (target / "cgroup.procs").write_text(str(pid))
+    current = _my_cgroup_path()
+    if current is None or current.resolve() != target.resolve():
+        raise OSError(
+            f"nested scheduler pid {pid} did not return to {target}; "
+            f"current cgroup is {current}"
+        )
+    roster = (target / "cgroup.procs").read_text().split()
+    if str(pid) not in roster:
+        raise OSError(
+            f"nested scheduler pid {pid} is absent from {target / 'cgroup.procs'}"
+        )
+
+
+def restore_nested_coordinator() -> bool:
+    """Restore one in-process nested CLI invocation to its delegated parent supervisor.
+
+    A command-line process normally exits immediately, but the Python API is intentionally
+    callable repeatedly in one process (including the test runner). Leaving that caller in a
+    completed invocation's tighter aggregate cgroup would leak limits and invalidate its original
+    delegation. This LIFO restore is paired with :func:`_move_current_to_nested_supervisor` by the
+    CLI's outer ``finally`` block.
+    """
+    if not _NESTED_COORDINATOR_STACK:
+        return True
+    run_root, return_supervisor, naming = _NESTED_COORDINATOR_STACK[-1]
+    pid = os.getpid()
+    try:
+        _restore_pid_to_cgroup(return_supervisor, pid)
+    except OSError as error:
+        _warn(
+            naming,
+            f"could not restore nested scheduler to delegated parent {return_supervisor} "
+            f"({error}); outer owner must clean up {run_root}",
+        )
+        # Keep the entry so the enclosing public CLI invocation can retry once and, if the
+        # caller is still trapped, turn an otherwise-successful result into a containment error.
+        return False
+    _NESTED_COORDINATOR_STACK.pop()
+    _remove_empty_cgroup_descendants(run_root)
+    try:
+        run_root.rmdir()
+    except OSError as error:
+        _warn(naming, f"could not remove completed nested scheduler cgroup {run_root} ({error})")
+    return True
+
+
+def nested_coordinator_depth() -> int:
+    """Return the process-local nesting depth used to scope one public CLI invocation."""
+    return len(_NESTED_COORDINATOR_STACK)
+
+
+def restore_nested_coordinators_to(depth: int) -> bool:
+    """Restore only placements created after a caller's captured ``depth`` token."""
+    while len(_NESTED_COORDINATOR_STACK) > depth:
+        if not restore_nested_coordinator():
+            return False
+    return True
+
+
 class Cgroups:
     """Per-step child cgroups under the delegated outer scope — the concrete
     :class:`dagrun.protocols.CgroupManager` for a real Linux
@@ -1819,20 +2243,44 @@ class Cgroups:
     :func:`_warn` instead of swallowing the ``OSError``.
     """
 
-    def __init__(self, naming: ScopeNaming = DEFAULT_NAMING) -> None:
+    def __init__(
+        self,
+        naming: ScopeNaming = DEFAULT_NAMING,
+        *,
+        delegated_root: Path | None = None,
+    ) -> None:
         self._naming = naming
         self.enabled: bool = False
         self.root: Path | None = None  # the delegated scope cgroup root
         self._made: set[str] = set()
+        self._delegated: set[str] = set()
+        # A nested scheduler snapshots every visible memory.max from its validated parent step
+        # through the cgroup namespace root before creating its private run root. Keep that
+        # provenance independently of the stamp below: a failed local write does not make the
+        # physical ancestor cap disappear, and an incomplete scan must keep profile rows unknown.
+        self._delegated_ancestor_memory_max: int | None = None
+        self._delegated_ancestor_memory_max_known = True
+        self._delegated_ancestor_max_cpus: int | None = None
+        self._delegated_ancestor_cpu_known = True
+        self._nested_coordinator_depth: int | None = None
         # Uniform per-step ``pids.max`` cap applied to EVERY child cgroup, or None for no cap.
         # Set at runtime (never serialized in the DAG) so a caller like parallel-experiment-runner
         # can bound each worker's PID count — the one axis cpu.max/memory.max cannot contain (a
         # fork bomb exhausts PIDs, not CPU or RAM). See :meth:`set_worker_pids_max`.
         self.worker_pids_max: int | None = None
-        # Only meaningful inside the scope (the re-exec sets this sentinel).
-        if os.environ.get(naming.env_in_scope) != "1":
-            return
-        scope_cg = _my_cgroup_path()
+        # A top-level run discovers its systemd scope from the in-scope sentinel. A nested run
+        # receives an already-empty step root from its parent and adopts that exact root only
+        # after the CLI verified the live ``root/supervisor`` membership.
+        if delegated_root is None:
+            # A process somewhere below a delegated outer step still inherits the top-level
+            # DAGRUN_IN_SCOPE sentinel. Treating its current leaf as a fresh scope root repeatedly
+            # creates ``supervisor/supervisor/...`` and invalidates the delegation. Only the CLI's
+            # validated ``from_delegated_root`` route may construct a manager in this context.
+            if os.environ.get(DELEGATED_CGROUP_ENV) is not None:
+                return
+            if os.environ.get(naming.env_in_scope) != "1":
+                return
+        scope_cg = delegated_root if delegated_root is not None else _my_cgroup_path()
         if scope_cg is None or not scope_cg.is_dir():
             return
         try:
@@ -1870,12 +2318,136 @@ class Cgroups:
         self.root = scope_cg
         self.enabled = True
 
+    @classmethod
+    def from_delegated_root(
+        cls,
+        root: Path,
+        naming: ScopeNaming = DEFAULT_NAMING,
+        *,
+        max_cpus: int | None = None,
+        max_mem_bytes: int | None = None,
+    ) -> "Cgroups":
+        """Create a per-invocation scheduler root below a validated parent delegation.
+
+        Several child schedulers may be launched concurrently by one outer command (the
+        differential harness does exactly that). Giving all of them the same step-root namespace
+        would alias equal inner tags and let one scheduler clean up another's cgroup. A live PID
+        is unique within the parent subtree, so each invocation receives its own empty root.
+        """
+        run_root = root / f"nested-run-{os.getpid()}-{next(_NESTED_ROOT_COUNTER)}"
+        try:
+            inherited = _create_nested_run_root(
+                root,
+                run_root,
+                naming=naming,
+                requested_max_cpus=max_cpus,
+                requested_max_mem_bytes=max_mem_bytes,
+            )
+        except OSError as error:
+            _warn(naming, f"could not create nested scheduler cgroup {run_root} ({error})")
+            return cls(naming, delegated_root=Path("/definitely/missing/dagrun-delegation"))
+        manager = cls(naming, delegated_root=run_root)
+        if manager.enabled:
+            coordinator_depth = nested_coordinator_depth()
+            try:
+                _move_current_to_nested_supervisor(run_root, naming)
+            except OSError as error:
+                _warn(
+                    naming,
+                    f"could not place nested scheduler inside aggregate cgroup {run_root} "
+                    f"({error}); per-step containment disabled",
+                )
+                manager.enabled = False
+                manager.root = None
+                if nested_coordinator_depth() > coordinator_depth:
+                    manager._nested_coordinator_depth = coordinator_depth
+            else:
+                manager._nested_coordinator_depth = coordinator_depth
+        manager._delegated_ancestor_memory_max = inherited.memory_max_bytes
+        manager._delegated_ancestor_memory_max_known = inherited.memory_known
+        manager._delegated_ancestor_max_cpus = inherited.max_cpus
+        manager._delegated_ancestor_cpu_known = inherited.cpu_known
+        return manager
+
+    def close(self) -> bool:
+        """Restore a nested caller placement owned by this manager, if any.
+
+        The CLI also has an invocation-scoped fallback so every early return is covered. Direct
+        library callers can use ``with Cgroups.from_delegated_root(...)`` or call ``close``.
+        """
+        depth = self._nested_coordinator_depth
+        if depth is None:
+            return True
+        if nested_coordinator_depth() <= depth:
+            self._nested_coordinator_depth = None
+            return True
+        if nested_coordinator_depth() != depth + 1:
+            _warn(
+                self._naming,
+                "nested scheduler cgroup managers must be closed in LIFO order",
+            )
+            return False
+        restored = restore_nested_coordinators_to(depth)
+        if restored:
+            self._nested_coordinator_depth = None
+        return restored
+
+    def __enter__(self) -> "Cgroups":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if not self.close():
+            raise RuntimeError("could not restore nested scheduler cgroup membership")
+
+    def __del__(self) -> None:
+        # CPython releases ordinary managers promptly; the explicit context-manager/close API is
+        # the deterministic route. Never let interpreter-shutdown ordering surface from __del__.
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def prepare_command(
         self,
         tag: str,
         cmd: str,
         mem_max: int | None = None,
         cpu_count: int | None = None,
+    ) -> str:
+        """Wrap an ordinary step command with this run's cgroup membership and caps."""
+        return self._prepare_command(tag, cmd, mem_max, cpu_count, delegated_children=False)
+
+    def prepare_delegated_command(
+        self,
+        tag: str,
+        cmd: str,
+        mem_max: int | None = None,
+        cpu_count: int | None = None,
+    ) -> tuple[str, str | None]:
+        """Prepare a step root that a child dagrun may safely subdivide.
+
+        The command itself is moved to ``<step>/supervisor``. The step cgroup remains empty,
+        owns the outer cap, and has controllers enabled for descendants. The returned path is
+        exported by the scheduler only for the opted-in step.
+        """
+        prepared = self._prepare_command(
+            tag, cmd, mem_max, cpu_count, delegated_children=True
+        )
+        root = (
+            self.root / _sanitize(tag)
+            if self.enabled and self.root is not None and tag in self._delegated
+            else None
+        )
+        return prepared, str(root) if root is not None else None
+
+    def _prepare_command(
+        self,
+        tag: str,
+        cmd: str,
+        mem_max: int | None,
+        cpu_count: int | None,
+        *,
+        delegated_children: bool,
     ) -> str:
         """Wrap ``cmd`` so its bash leader joins the step's child cgroup FIRST
         (before forking grandchildren). No-op string-wrap when disabled.
@@ -1971,6 +2543,28 @@ class Cgroups:
                     "delegated — step runs under the outer cap only",
                 )
 
+        process_cgroup = child
+        if delegated_children:
+            supervisor = child / self._naming.supervisor_name
+            try:
+                supervisor.mkdir(exist_ok=True)
+                controllers = (child / "cgroup.controllers").read_text().split()
+                for controller in ("memory", "cpu", "pids"):
+                    if controller in controllers:
+                        _enable_controller(child, supervisor, controller)
+            except OSError as exc:
+                _warn(
+                    self._naming,
+                    f"step {tag}: could not prepare delegated child cgroup {child} ({exc}); "
+                    "refusing nested execution",
+                )
+                return (
+                    "echo 'ERROR: delegated child cgroup could not be prepared; "
+                    "refusing nested execution' >&2\nexit 125\n"
+                )
+            self._delegated.add(tag)
+            process_cgroup = supervisor
+
         # Carry the build ``-j`` WITH the caps just written. cargo (and the NUM_JOBS it
         # exports to build scripts) auto-detects parallelism from the effective CPU quota;
         # an UNPINNED step (cpu_count None -> no per-step cpu.max) inherits the wide scope
@@ -1985,12 +2579,32 @@ class Cgroups:
         # An operator's OWN width, resolved once in the outermost process, is not refined: they
         # sized their caps against that pool. Only the derivation refines downward, and that is
         # the leg `test_unpinned_step_is_bounded_not_284` pins.
-        eff_cores = cpu_count if cpu_count else _cpu_max_cores(
-            _read_cgroup_value(self.root, "cpu.max"))
-        eff_mem = mem_max if mem_max else _memory_max_bytes(
-            _read_cgroup_value(self.root, "memory.max"))
+        core_limits = [
+            limit
+            for limit in (
+                cpu_count,
+                _cpu_max_cores(_read_cgroup_value(self.root, "cpu.max")),
+                self._delegated_ancestor_max_cpus,
+            )
+            if limit is not None and limit > 0
+        ]
+        if not self._delegated_ancestor_cpu_known:
+            # The public scheduler path rejects an unreadable inherited envelope. Library callers
+            # still get the narrowest representable integer width rather than host-width fan-out.
+            core_limits.append(1)
+        memory_limits = [
+            limit
+            for limit in (
+                mem_max,
+                _memory_max_bytes(_read_cgroup_value(self.root, "memory.max")),
+                self._delegated_ancestor_memory_max,
+            )
+            if limit is not None and limit >= 0
+        ]
+        eff_cores = min(core_limits) if core_limits else None
+        eff_mem = min(memory_limits) if memory_limits else None
         jobs = select_build_jobs(eff_cores, eff_mem).jobs
-        procs = child / "cgroup.procs"
+        procs = process_cgroup / "cgroup.procs"
         # $$ is the bash leader's own pid. Writing it migrates the leader; every
         # subsequently-forked child/grandchild inherits this cgroup at fork.
         # A cap on an empty child is not containment. The migration is therefore fail-closed: if
@@ -2027,12 +2641,20 @@ class Cgroups:
         return 0
 
     def memory_events(self, tag: str) -> Mapping[str, int] | None:
-        """The step cgroup's whole ``memory.events`` file as counter -> value.
+        """The step cgroup's owned memory events as counter -> value.
 
         These need no baseline subtraction to be per-step deltas: the child cgroup is
         created by :meth:`prepare_command` for this step and removed by :meth:`cleanup`
         after it, so every counter starts at zero. ``None`` if absent/unreadable. Read
         BEFORE :meth:`cleanup`.
+
+        An ordinary step has no child cgroups, so ``memory.events`` is its owned view. A
+        ``delegated_children`` step deliberately contains a nested scheduler's cgroups;
+        there we read ``memory.events.local``. The hierarchical file would also count an
+        inner step's independently handled OOM and falsely fail the otherwise-correct outer
+        scheduler. The local file still counts an OOM charged at the delegated root's own
+        ``memory.max`` even when the selected victim lives in a descendant, so the outer cap
+        remains an actionable backstop.
 
         A line that does not parse as ``<name> <integer>`` is SKIPPED, not fatal: the kernel is
         free to add counters, and discarding every counter in the file because one line was new
@@ -2041,8 +2663,9 @@ class Cgroups:
         disagree about the same file."""
         if not self.enabled or self.root is None or tag not in self._made:
             return None
+        filename = "memory.events.local" if tag in self._delegated else "memory.events"
         try:
-            lines = (self.root / _sanitize(tag) / "memory.events").read_text().splitlines()
+            lines = (self.root / _sanitize(tag) / filename).read_text().splitlines()
         except OSError:
             return None
         events: dict[str, int] = {}
@@ -2076,11 +2699,14 @@ class Cgroups:
         the case where the two disagree, and only the accepted value explains the measured peak.
         ``None`` (unknown) is deliberately distinct from ``"max"`` (known unbounded).
 
-        ``"max"`` means "no ceiling at any level this runner can see". Ancestors ABOVE the
-        delegated scope — a container memory limit, a user slice — are outside its view, so
-        ``"max"`` rules out censoring by the runner's own caps, not by the whole machine. Read
-        BEFORE :meth:`cleanup`."""
+        A nested scheduler additionally snapshots every readable ``memory.max`` from its
+        validated parent delegation through the cgroup namespace root and stamps the finite
+        minimum onto its own run root. Limits above a top-level run scope or outside the
+        process's cgroup namespace remain outside that run's recorded view. Read BEFORE
+        :meth:`cleanup`."""
         if not self.enabled or self.root is None or tag not in self._made:
+            return None
+        if not self._delegated_ancestor_memory_max_known:
             return None
         try:
             own = (self.root / _sanitize(tag) / "memory.max").read_text().strip()
@@ -2088,20 +2714,26 @@ class Cgroups:
             return None
         if not own:
             return None
-        outer_bytes = _memory_max_bytes(_read_cgroup_value(self.root, "memory.max"))
-        if outer_bytes is None:
-            return own
         own_bytes = _memory_max_bytes(own)
-        return str(outer_bytes if own_bytes is None else min(own_bytes, outer_bytes))
+        limits = [
+            limit
+            for limit in (
+                own_bytes,
+                _memory_max_bytes(_read_cgroup_value(self.root, "memory.max")),
+                self._delegated_ancestor_memory_max,
+            )
+            if limit is not None
+        ]
+        return str(min(limits)) if limits else own
 
     def oom_kills(self, tag: str) -> int:
-        """OOM-kill event count inside the step's cgroup (``memory.events``
-        ``oom_kill``). ``> 0`` means the step (or a descendant) hit its INNER
-        ``memory.max`` AND the kernel killed it — the actionable-OOM signal. It does NOT
-        cover reclaim-at-cap: a step held at its ceiling by eviction reports
-        ``memory.events`` ``max > 0`` with ``oom_kill == 0`` and exits cleanly, which is
-        why :meth:`memory_events` exists alongside this. 0 if absent/unreadable. Read
-        BEFORE :meth:`cleanup`."""
+        """OOM-kill count in the owned view selected by :meth:`memory_events`.
+
+        ``> 0`` means the step's own limit (or a delegated root's boundary limit) killed a
+        process — one actionable-OOM signal. It does not cover root-local ``oom`` whose victim is
+        accounted in a descendant; the scheduler classifies the complete event map. Reclaim at
+        the cap has ``max > 0`` while every OOM counter stays zero and the step exits cleanly.
+        Returns 0 if absent/unreadable. Read BEFORE :meth:`cleanup`."""
         events = self.memory_events(tag)
         return 0 if events is None else events.get("oom_kill", 0)
 
@@ -2172,18 +2804,23 @@ class Cgroups:
         outer-scope stop flushes it at end of run, so this is NOT warned on."""
         if not self.enabled or self.root is None or tag not in self._made:
             return
+        child = self.root / _sanitize(tag)
+        if tag in self._delegated:
+            _remove_empty_cgroup_descendants(child)
         try:
-            (self.root / _sanitize(tag)).rmdir()
+            child.rmdir()
         except OSError:
             pass
         self._made.discard(tag)
+        self._delegated.discard(tag)
 
     def kill_all_remaining(self) -> int:
         """NORMAL-EXIT backstop: ``cgroup.kill`` + ``rmdir`` EVERY step child
         cgroup we ever created that still exists (catches a setsid orphan a step
-        left behind). Does NOT touch the supervisor cgroup, so it never kills the
-        runner — the exit code is preserved. Returns the count of step cgroups
-        that still existed."""
+        left behind). A manager never removes its own root: one CLI command can reuse the same
+        manager for several scheduler passes (notably ``sweep``), and the outer scheduler owns
+        and removes the complete delegated subtree when this process exits. Returns the count of
+        step cgroups that still existed."""
         if not self.enabled or self.root is None:
             return 0
         n = 0
@@ -2201,6 +2838,7 @@ class Cgroups:
             except OSError as exc:
                 _warn(self._naming, f"backstop: cgroup.kill on {child.name} failed ({exc}); "
                       "a leftover orphan may survive the run")
+            _remove_empty_cgroup_descendants(child)
             try:
                 child.rmdir()
             except OSError:
@@ -2227,6 +2865,20 @@ class NoopCgroups:
     ) -> str:
         """Return ``cmd`` unchanged because containment is disabled."""
         return cmd
+
+    def prepare_delegated_command(
+        self,
+        tag: str,
+        cmd: str,
+        mem_max: int | None = None,
+        cpu_count: int | None = None,
+    ) -> tuple[str, str | None]:
+        """Return the command for the explicit unboxed-delegation fallback.
+
+        The scheduler marks only this opted-in step with ``DAGRUN_DELEGATED_UNBOXED=1``. That
+        marker authorizes nesting but does not claim cgroup containment.
+        """
+        return cmd, None
 
     def kill(self, tag: str) -> bool:
         """Report that no cgroup subtree was available to kill."""

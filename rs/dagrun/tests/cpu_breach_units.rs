@@ -129,6 +129,7 @@ fn sleeping_step() -> DagConfig {
         hint: ResourceHint::default(),
         networkonly: false,
         engine_only: false,
+        delegated_children: false,
         // Generous wall backstop: the CPU guard, not the wall clock, must be what fires.
         timeout: WALL_BUDGET_S,
         cpu_timeout: CPU_BUDGET_S,

@@ -73,10 +73,11 @@ fn run_dag(fx: &Fixture, dag: &Path, extra: &[&str]) -> Run {
         "-j",
         "1",
         "--no-profile-feedback",
-        // The unboxed path is deliberate: it is what hosted CI runs today, and the outer budget
-        // has to bound THAT path, not only a boxed one. The boxed path adds the scope-level
-        // backstop on top and is covered by the cgroup smoke tests.
-        "--allow-cgroup-failure",
+        // The unboxed path is deliberate: the scheduler's own budget must bound it, not only the
+        // boxed path (whose scope-level backstop is covered by the cgroup smoke tests). Use the
+        // explicit opt-out so an inherited parent delegation cannot silently change this test's
+        // route.
+        "--unsafe-no-cgroups",
         "--perf-dir",
     ];
     let profiles = fx.profiles();

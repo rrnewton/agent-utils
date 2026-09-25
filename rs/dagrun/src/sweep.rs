@@ -206,6 +206,9 @@ pub fn workload_digest(step: &Step, default_jobs_flag: &str, default_jobs_env: &
     for (key, value) in &step.env {
         field(&format!("{key}={value}"));
     }
+    if step.delegated_children {
+        field("delegated_children=true");
+    }
     format!("{hash:016x}")
 }
 
@@ -393,6 +396,7 @@ mod tests {
             hint: ResourceHint::default(),
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: 0,
             cpu_timeout: 0,
             jobs_flag: None,

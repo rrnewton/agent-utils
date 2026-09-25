@@ -30,6 +30,25 @@ const OK_DAG: &str = r#"{"steps": [{"group": "g", "job": "ok", "cmd": "true"}]}"
 /// unambiguously the binding ceiling and the expected line is deterministic.
 const TINY_BUDGET_BYTES: i64 = 1024 * 1024;
 
+/// These tests exercise creation of a new outer systemd scope. The cargo-test process may itself
+/// run inside a parent dagrun's explicitly delegated step, so scrub that inherited one-step
+/// authority rather than accidentally testing the distinct adoption route.
+fn top_level_command(bin: &str) -> Command {
+    let mut command = Command::new(bin);
+    for name in [
+        "DAGRUN_IN_SCOPE",
+        "DAGRUN_OUTER_RUN",
+        "DAGRUN_DELEGATED_CGROUP",
+        "DAGRUN_DELEGATED_UNBOXED",
+        "DAGRUN_SCOPE_UNIT",
+        "DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES",
+        "DAGRUN_EXPECTED_OUTER_CPU_COUNT",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 #[test]
 fn max_mem_is_the_outer_scope_ceiling_the_run_announces() {
     let bin = env!("CARGO_BIN_EXE_dagrun");
@@ -40,7 +59,7 @@ fn max_mem_is_the_outer_scope_ceiling_the_run_announces() {
     f.write_all(OK_DAG.as_bytes()).unwrap();
     drop(f);
 
-    let with_budget = Command::new(bin)
+    let with_budget = top_level_command(bin)
         .args([
             "run",
             "--dag",
@@ -50,15 +69,13 @@ fn max_mem_is_the_outer_scope_ceiling_the_run_announces() {
             "--max-mem",
             "1M",
         ])
-        .env_remove("DAGRUN_IN_SCOPE")
         .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");
     let with_stderr = String::from_utf8_lossy(&with_budget.stderr).to_string();
 
-    let without_budget = Command::new(bin)
+    let without_budget = top_level_command(bin)
         .args(["run", "--dag", dag.to_str().unwrap(), "-q", "--no-profile"])
-        .env_remove("DAGRUN_IN_SCOPE")
         .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");
@@ -109,7 +126,7 @@ fn a_nonpositive_max_mem_is_refused_by_name_and_no_step_runs() {
     .unwrap();
     drop(f);
 
-    let out = Command::new(bin)
+    let out = top_level_command(bin)
         .args([
             "run",
             "--dag",
@@ -120,7 +137,6 @@ fn a_nonpositive_max_mem_is_refused_by_name_and_no_step_runs() {
             "--max-mem",
             "0",
         ])
-        .env_remove("DAGRUN_IN_SCOPE")
         .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");
@@ -182,7 +198,7 @@ fn max_mem_is_the_memory_max_handed_to_systemd_run() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let out = Command::new(bin)
+    let out = top_level_command(bin)
         .args([
             "run",
             "--dag",
@@ -197,7 +213,6 @@ fn max_mem_is_the_memory_max_handed_to_systemd_run() {
         // Force the scope attempt: under CI/GITHUB_ACTIONS the re-exec is skipped by policy and
         // no argument vector would ever be built.
         .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
-        .env_remove("DAGRUN_IN_SCOPE")
         .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");

@@ -4127,7 +4127,11 @@ mod tests {
         let (close_port, activity) = inert_protocol_controls(&cancellation);
         let worker_activity = Arc::clone(&activity);
         let worker = thread::spawn(move || {
-            worker(receiver, worker_activity);
+            worker(receiver, Arc::clone(&worker_activity));
+            // Production protocol workers publish Stopped from their scope guard after the
+            // terminal response. Keep this synthetic worker faithful: graceful waiters use that
+            // transition to avoid missing the response-channel send between activity checks.
+            worker_activity.stop();
             let _ = worker_done_sender.send(());
         });
         (

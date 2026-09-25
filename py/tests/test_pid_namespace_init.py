@@ -451,16 +451,24 @@ def test_later_cancellation_preserves_primary_failure_during_orphan_cleanup(
     namespace_argv: list[str], tmp_path: Path
 ) -> None:
     ready = tmp_path / "ready"
+    cleanup_started = tmp_path / "cleanup-started"
     code = f"""
 from pathlib import Path
 import os, signal, time
-primary_pid = os.getpid()
 parent = os.fork()
 if parent == 0:
     if os.fork() == 0:
         os.setsid()
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        Path({str(ready)!r}).write_text(str(primary_pid))
+        notified = False
+        def cancel_after_cleanup(_signum, _frame):
+            global notified
+            if notified:
+                return
+            notified = True
+            Path({str(cleanup_started)!r}).touch()
+            os.kill(1, signal.SIGTERM)
+        signal.signal(signal.SIGTERM, cancel_after_cleanup)
+        Path({str(ready)!r}).touch()
         while True:
             time.sleep(1)
     os._exit(0)
@@ -469,34 +477,10 @@ while not Path({str(ready)!r}).exists():
     time.sleep(0.01)
 raise SystemExit(7)
 """
-    process = subprocess.Popen([*namespace_argv, code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    init: NamespaceInit | None = None
-    try:
-        wait_ready(process, ready)
-        init = namespace_init_process(process)
-        # The orphan's readiness does not prove the foreground status was
-        # collected. Observe its namespace PID disappear from this init's
-        # direct children before testing cancellation during orphan cleanup.
-        primary_pid = int(ready.read_text())
-        deadline = time.monotonic() + 3
-        while True:
-            primary_visible = False
-            for child in direct_children(init.pid):
-                try:
-                    status = Path(f"/proc/{child}/status").read_text()
-                except FileNotFoundError:
-                    continue
-                ns_pid = next(line for line in status.splitlines() if line.startswith("NSpid:"))
-                if int(ns_pid.split()[-1]) == primary_pid:
-                    primary_visible = True
-            if not primary_visible:
-                break
-            assert time.monotonic() < deadline, "primary status was not collected"
-            time.sleep(0.01)
-        assert process.poll() is None, "init completed before the late cancellation"
-        signal.pidfd_send_signal(init.pidfd, signal.SIGTERM)
-        stdout, stderr = process.communicate(timeout=5)
-        assert process.returncode == 7, (stdout, stderr)
-        assert "cancellation signal 15" in stderr
-    finally:
-        finish_owned(process, init)
+    # The orphan can receive this SIGTERM only after init has collected the
+    # primary failure and entered orphan cleanup. Its handler then delivers the
+    # later cancellation without relying on load-sensitive host-side polling.
+    result = run_namespace(namespace_argv, code)
+    assert cleanup_started.exists(), result.stderr
+    assert result.returncode == 7, (result.stdout, result.stderr)
+    assert "cancellation signal 15" in result.stderr

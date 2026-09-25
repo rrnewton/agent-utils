@@ -33,11 +33,16 @@ from dagrun.cgroup import NoopCgroups
 from dagrun.cli import (
     MAX_RUN_CPUS,
     MAX_STRESS_GENERATED_NODES,
+    _inherited_cores_error,
     _planning_budgets,
     _select_max_cpus,
+    _select_max_mem_bytes,
     _select_max_steps,
     _stress_expansion_guard,
     _stress_footprints,
+    _sweep_cpu_error,
+    _sweep_memory_error,
+    _uses_inherited_memory_budget,
     build_parser,
     main,
 )
@@ -382,6 +387,61 @@ def test_an_absent_step_ceiling_defaults_to_the_resolved_cpu_budget() -> None:
     both = build_parser().parse_args(["run", "--dag", "dag.json", "-j", "3", "-s", "5"])
     assert _select_max_cpus(both) == 3
     assert _select_max_steps(cfg, both, 3) == 5
+
+
+def test_delegated_parent_clamps_explicit_and_default_run_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gib = 1024**3
+    monkeypatch.setattr("dagrun.cli.container_core_budget", lambda: 16)
+    monkeypatch.setattr(cgroup, "aggregate_slice_max_cpus", lambda: 12)
+    explicit = _run_args(max_cpus=8, max_mem="8G")
+    assert _select_max_cpus(explicit, inherited_max_cpus=2) == 2
+    assert _select_max_mem_bytes(explicit, inherited_max_mem_bytes=2 * gib) == 2 * gib
+
+    defaults = _run_args()
+    assert _select_max_cpus(defaults, inherited_max_cpus=2) == 2
+    assert _select_max_mem_bytes(defaults, inherited_max_mem_bytes=2 * gib) == 2 * gib
+    assert _uses_inherited_memory_budget(defaults, 2 * gib)
+    assert _uses_inherited_memory_budget(explicit, 2 * gib)
+    assert not _uses_inherited_memory_budget(_run_args(max_mem="1G"), 2 * gib)
+    assert (
+        _select_max_mem_bytes(
+            _run_args(max_mem="not-a-size"), inherited_max_mem_bytes=2 * gib
+        )
+        == 2 * gib
+    )
+    assert (
+        _inherited_cores_error(_run_args(cores=8), inherited_max_cpus=2)
+        == "--cores 8 requests an exact reservation wider than the inherited delegated CPU "
+        "ceiling 2; refusing"
+    )
+
+    evidence = capsys.readouterr().err
+    assert evidence.count("inherited delegated CPU ceiling 2") == 2
+    assert "--max-mem 8589934592 bytes exceeds inherited delegated memory ceiling" in evidence
+    assert "inherited delegated memory ceiling 2147483648 bytes is the effective default" in evidence
+    assert "could not parse --max-mem 'not-a-size'" in evidence
+
+    assert _sweep_cpu_error(8, 2) is not None
+    assert _sweep_cpu_error(2, 2) is None
+    assert _sweep_memory_error(_sleep_cfg(count=1).steps[0], _sleep_cfg(count=1), 8, 1) is not None
+
+    # The 8 GiB top-level modeling floor is not a claim that a 1 GiB step cannot run in a
+    # deliberately smaller parent. Clamp only that run-level floor; real step caps still decide.
+    cfg = _sleep_cfg(count=4)
+    assert _select_max_steps(cfg, defaults, 2, 2 * gib) == 0
+    assert (
+        _select_max_steps(
+            cfg,
+            defaults,
+            2,
+            2 * gib,
+            inherited_memory_budget=True,
+        )
+        == 2
+    )
 
 
 def test_max_mem_and_explicit_max_steps_use_tighter_ceiling(
@@ -1177,6 +1237,10 @@ def test_scope_reexec_requests_and_carries_exact_max_cpus(
     monkeypatch.setattr(cgroup, "systemd_scope_available", lambda: True)
     monkeypatch.setattr(cgroup, "ensure_aggregate_slice", lambda naming: False)
     monkeypatch.setattr(os, "execvp", fake_execvp)
+    # Exercise a fresh outer re-exec even when this test shard is itself delegated.
+    monkeypatch.delenv(cgroup.DEFAULT_NAMING.env_in_scope, raising=False)
+    monkeypatch.delenv(cgroup.DELEGATED_CGROUP_ENV, raising=False)
+    monkeypatch.delenv(cgroup.DELEGATED_UNBOXED_ENV, raising=False)
     assert not cgroup.reexec_in_scope(
         ["runner", "run"],
         memory_max=1024,

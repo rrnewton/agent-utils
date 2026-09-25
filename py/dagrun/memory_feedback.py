@@ -3,10 +3,9 @@
 The profile store records what each step's cgroup peaked at. It does NOT follow that the peak
 is what the step wanted: a step whose ``peak_bytes`` equals the ``memory.max`` that was applied
 to it used everything it was allowed, and a step the kernel killed at that ceiling wanted
-strictly more. Both are CENSORED observations. Fitting a cap to them ratchets the cap down to
-whatever it already was and freezes the mistake, which is why the default planner feedback in
-:mod:`dagrun.estimates` is left alone and this is a separate, opt-in path a caller
-must ask for by name.
+strictly more. Both are CENSORED observations. Ordinary planner feedback therefore never lowers
+an authored RSS baseline. This is the separate, opt-in path a caller must ask for by name when
+enough censor-aware evidence should be allowed to lower it.
 
 The rules here are the ones a caller can rely on:
 
@@ -124,9 +123,10 @@ def peak_observation_from_row(row: Mapping[str, str]) -> PeakObservation:
     never recorded, so nothing bounds the interpretation), or when the ``memory_events``
     counters are blank (reclaim at the ceiling cannot be ruled out).
 
-    CENSORED when ANY of the four pressure counters #34 records fired — ``high`` (throttled
+    CENSORED when ANY pressure counter the profile records fired — ``high`` (throttled
     into direct reclaim by a soft ceiling), ``max`` (held at the hard ceiling by reclaim),
-    ``oom`` (the OOM killer was invoked) or ``oom_kill`` (a task was reaped) — when the row
+    ``oom`` (the OOM killer was invoked), ``oom_kill`` (a task was reaped), or
+    ``oom_group_kill`` (a whole cgroup was reaped) — when the row
     records a step that FAILED or was cut short by a guard, or when the peak reached the applied
     cap. The last is a ``>=`` and not a ``==`` deliberately: a cap the kernel rounded down to a
     page boundary still censors a peak that sits above it.
@@ -155,8 +155,15 @@ def peak_observation_from_row(row: Mapping[str, str]) -> PeakObservation:
     oom_kills = oom if (oom is not None and oom >= 0) else None
     throttle = _parse_int(row.get("memory_events_high"))
     throttle_events = throttle if (throttle is not None and throttle >= 0) else None
-    invoked = _parse_int(row.get("memory_events_oom"))
-    oom_events = invoked if (invoked is not None and invoked >= 0) else None
+    oom_candidates = [
+        parsed
+        for parsed in (
+            _parse_int(row.get("memory_events_oom")),
+            _parse_int(row.get("memory_events_oom_group_kill")),
+        )
+        if parsed is not None and parsed >= 0
+    ]
+    oom_events = max(oom_candidates) if oom_candidates else None
     run_failed = _row_records_failure(row)
 
     verdict = _verdict(
@@ -491,13 +498,10 @@ def apply_memory_admissions(
 
     ``authored_baselines`` maps a step tag to the ``rss_baseline_bytes`` its AUTHOR wrote, before
     any planner feedback touched it, and it is what makes a DECLINE mean something. ``cfg`` here
-    has normally already been through
-    :func:`dagrun.estimates.apply_plan_to_config`, whose feedback learns from the
-    same recorded peaks WITHOUT asking whether a cap was clamping them. Without this mapping,
-    every step this module declines to estimate would silently keep that censoring-blind number
-    while the report said "keeping the authored hint" — the unsafe estimate surviving under the
-    name of the safe one. So a declined step loses that number: a decline means no learned
-    estimate at all, not a fall-back to the other one.
+    has normally already been through :func:`dagrun.estimates.apply_plan_to_config`, whose
+    ordinary feedback may have raised the authored floor. Without this mapping, a step this
+    stricter path declines could retain that ordinary estimate while the report said "keeping the
+    authored hint". So a decline explicitly restores the authored value or a larger proven floor.
 
     A decline is nonetheless not amnesia. Where the evidence proves a FLOOR —
     :meth:`MemoryAdmission.proven_floor_bytes`, the largest peak the step is known to have

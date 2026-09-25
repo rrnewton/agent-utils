@@ -1,0 +1,128 @@
+description: Tool-owned cross-language observable-behavior checks
+
+steps:
+  - group: check
+    job: mypy
+    desc: strict typing and no-Any policy for cross-language Python inputs
+    cmd: >-
+      python3 -m mypy --config-file py/pyproject.toml --strict
+      --disallow-any-explicit --disallow-any-decorated
+      cross examples/dagrun-scaling-workload.py &&
+      python3 scripts/check_no_any.py cross examples/dagrun-scaling-workload.py
+    jobs_flag: ""
+    labels: [validation-cross]
+    timeout: 120
+    hint:
+      est_duration_s: 3
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: dagrun
+    job: cpu-footprint
+    desc: CPU-footprint contract tests
+    cmd: python3 -m pytest -q cross/test_cpu_footprint.py
+    jobs_flag: ""
+    labels: [validation-cross, component-dagrun]
+    timeout: 120
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
+  - group: dagrun
+    job: differential
+    desc: dagrun Python and Rust commands agree
+    cmd: python3 cross/differential.py --tool dagrun
+    jobs_flag: ""
+    labels: [validation-cross, component-dagrun]
+    delegated_children: true
+    timeout: 1200
+    cpu_timeout: 2400
+    hint:
+      est_duration_s: 180
+      classification: latency-bound
+      # The boxed aggregate-bandwidth contract launches two eight-worker guests. When this
+      # harness itself is an included delegated node, its parent-owned cgroup must provide the
+      # same eight-core boundary that a standalone top-level run would create.
+      preferred_inner_jobs: 8
+      rss_baseline_bytes: 2147483648
+
+  - group: dagrun
+    job: cpuset-differential
+    desc: cpuset allocator Python and Rust commands agree
+    cmd: python3 cross/differential.py --tool cpuset-alloc
+    jobs_flag: ""
+    labels: [validation-cross, component-dagrun]
+    delegated_children: true
+    timeout: 600
+    cpu_timeout: 1200
+    hint: &cross_hint
+      est_duration_s: 180
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 2147483648
+
+  - group: tick-hub
+    job: differential
+    desc: tick-hub Python and Rust commands agree
+    cmd: python3 cross/differential.py --tool tick-hub
+    jobs_flag: ""
+    labels: [validation-cross, component-tick-hub]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *cross_hint
+
+  - group: planner
+    job: differential
+    desc: pr-landing-planner Python and Rust commands agree
+    cmd: python3 cross/differential.py --tool pr-landing-planner
+    jobs_flag: ""
+    labels: [validation-cross, component-planner]
+    timeout: 600
+    cpu_timeout: 1200
+    hint:
+      est_duration_s: 180
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      rss_baseline_bytes: 2147483648
+      # A successful full-graph sample peaked at 201,678,848 B. Sparse profile feedback lowered
+      # the following run's MemoryMax to 252,096,512 B; it reached that ceiling and recorded three
+      # OOM kills. A boxed retry peaked at 288,268,288 B with no OOM. Keep 512 MiB explicit without
+      # inflating the other differential steps that continue to share the general baseline above.
+      hard_mem_max_bytes: 536870912
+
+  - group: herdr-run
+    job: differential
+    desc: herdr-run Python and Rust commands agree
+    cmd: python3 cross/differential.py --tool herdr-run
+    jobs_flag: ""
+    labels: [validation-cross, component-herdr-run]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *cross_hint
+
+  - group: agentctl
+    job: herdr-agent-differential
+    desc: herdr-agent Python and Rust commands agree
+    cmd: python3 cross/differential.py --tool herdr-agent
+    jobs_flag: ""
+    labels: [validation-cross, component-agentctl]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *cross_hint
+
+  - group: agentctl
+    job: differential
+    desc: agentctl Python and Rust commands agree
+    cmd: python3 cross/differential.py --tool agentctl
+    jobs_flag: ""
+    labels: [validation-cross, component-agentctl]
+    timeout: 600
+    cpu_timeout: 1200
+    hint:
+      est_duration_s: 180
+      classification: latency-bound
+      preferred_inner_jobs: 4
+      # Successful runs peaked as high as 2229.57 MiB. A 2560 MiB authored floor yields a
+      # 3200 MiB runtime cap on an empty profile store instead of relying on local history.
+      rss_baseline_bytes: 2684354560

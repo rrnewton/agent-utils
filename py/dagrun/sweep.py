@@ -143,6 +143,8 @@ def workload_digest(step: Step, default_jobs_flag: str, default_jobs_env: str) -
     )
     payload = "".join(f"{field}\0" for field in fields)
     payload += "".join(f"{key}={value}\0" for key, value in sorted(step.env.items()))
+    if step.delegated_children:
+        payload += "delegated_children=true\0"
     digest = _FNV_OFFSET_BASIS
     for byte in payload.encode("utf-8"):
         digest ^= byte

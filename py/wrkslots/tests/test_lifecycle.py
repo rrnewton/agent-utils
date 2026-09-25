@@ -11099,6 +11099,8 @@ def test_process_entering_after_final_scan_before_path_move_is_not_deleted(
     original_assert = wrkslots._assert_slot_unused
     calls = 0
     entrant: subprocess.Popen[str] | None = None
+    focused_proc = tmp_path / "focused-proc"
+    focused_proc.mkdir()
 
     def enter_after_scan(
         slot_path: Path,
@@ -11116,11 +11118,15 @@ def test_process_entering_after_final_scan_before_path_move_is_not_deleted(
         original_assert(
             slot_path,
             record,
-            use_lsof=use_lsof,
+            # This test owns the one process whose late entry matters. Keep its
+            # real kernel evidence, but do not make the race assertion enumerate
+            # every unrelated process on a shared development host. Dedicated
+            # census tests exercise the all-process and lsof implementations.
+            use_lsof=False,
             ignore_invoking_ancestry=ignore_invoking_ancestry,
             census=census,
             fallback_census=fallback_census,
-            proc_root=proc_root,
+            proc_root=focused_proc,
             ignore_current_process=ignore_current_process,
             live_use_recheck=live_use_recheck,
         )
@@ -11140,6 +11146,9 @@ def test_process_entering_after_final_scan_before_path_move_is_not_deleted(
             )
             assert entrant.stdout is not None
             assert entrant.stdout.readline().strip() == str(checkout(project))
+            (focused_proc / str(entrant.pid)).symlink_to(
+                Path("/proc") / str(entrant.pid), target_is_directory=True
+            )
 
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", enter_after_scan)
     try:
@@ -12307,7 +12316,12 @@ def local_archive_remove(
     *,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return raw_command(
+    # Local-archive cases exercise salvage durability, not the host-wide
+    # process-census implementation.  Keep the command in a separate process
+    # while using the focused census launcher: it still rejects any live
+    # process whose cwd is the fixture slot, without making concurrent tests
+    # inspect every mount and descriptor on a shared host.
+    return raw_command_with_census_authority_stub(
         project,
         "remove",
         "slot01",

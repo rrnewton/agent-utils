@@ -72,8 +72,10 @@ __all__ = [
 MACHINE_ID_ENV = "DAGRUN_MACHINE_ID"
 CONTAINER_CLASS_ENV = "DAGRUN_CONTAINER_CLASS"
 
-#: Minimum recorded samples before the store overrides the DAG hint for a step. Below this the
-#: DAG-authored hint wins (the store has too little signal to trust yet).
+#: Minimum recorded samples before the store may refine a step. Below this the DAG-authored hint
+#: wins (the store has too little signal to trust yet). Duration feedback may replace its hint;
+#: ordinary RSS feedback may raise an authored baseline but never lower it. Deliberate memory-cap
+#: lowering is the separate censor-aware ``--profile-memory-feedback`` contract.
 DEFAULT_MIN_SAMPLES = 1
 
 #: Robust-stat tunables (named so both builds share one source of truth).
@@ -437,6 +439,7 @@ def sample_from_row(row: Mapping[str, str], affinity_width: int | None) -> Sampl
             "memory_events_max",
             "memory_events_oom",
             "memory_events_oom_kill",
+            "memory_events_oom_group_kill",
         )
         if any(column in row for column in provenance_columns):
             from dagrun.memory_feedback import Censoring, peak_observation_from_row
@@ -1038,8 +1041,16 @@ def _resolved_estimate(
     step: Step, samples: StepSamples | None, min_samples: int
 ) -> tuple[float, str, int | None, str, int]:
     """Resolve one step's effective ``(est_duration_s, est_source, rss, rss_source, samples)``:
-    the store wins when it has enough samples and a value; otherwise the DAG hint, then the
-    built-in default."""
+    duration uses store-over-hint-over-default, while an authored RSS baseline is a FLOOR.
+
+    Ordinary feedback starts after one sample and exists to improve scheduling estimates. A
+    quiet subprocess run is not enough evidence to shrink the next run's enforced ``memory.max``:
+    process fan-out and allocator high-water marks vary discontinuously. Therefore a store RSS
+    replaces an authored baseline only when it is larger. The separate, explicit
+    ``--profile-memory-feedback`` path may lower a baseline after its censor-aware five-sample
+    policy and margin; keeping that authority out of the ordinary planner makes the safe default
+    independent of sparse local history.
+    """
     if step.skip_reason is not None:
         return 0.0, "skip", None, "none", 0
 
@@ -1053,7 +1064,15 @@ def _resolved_estimate(
     else:
         est, est_source = step.hint.est_duration_s, "default"
 
-    if store_ok and samples is not None and samples.rss_estimate_bytes is not None:
+    if (
+        store_ok
+        and samples is not None
+        and samples.rss_estimate_bytes is not None
+        and (
+            step.hint.rss_baseline_bytes is None
+            or samples.rss_estimate_bytes > step.hint.rss_baseline_bytes
+        )
+    ):
         rss, rss_source = samples.rss_estimate_bytes, "store"
     elif step.hint.rss_baseline_bytes is not None:
         rss, rss_source = step.hint.rss_baseline_bytes, "hint"
@@ -1406,9 +1425,13 @@ def _modeled_memory_at(
     width: int,
     fallback: int | None,
 ) -> tuple[int | None, bool]:
-    """The displayed/applied memory value and whether it is exact at ``width``."""
+    """The displayed/applied memory value and whether it is exact at ``width``.
+
+    Replicated width-specific evidence is still ordinary profile feedback. It may raise the
+    fallback, but only the explicit censor-aware memory-feedback mode may lower an authored floor.
+    """
     exact, floor = _memory_evidence_at(speedups, tag, width)
-    if exact is not None:
+    if exact is not None and (fallback is None or exact > fallback):
         return exact, True
     candidates = [value for value in (fallback, floor) if value is not None]
     return (max(candidates), False) if candidates else (None, False)
@@ -1422,9 +1445,9 @@ def _cpa_footprint(
 ) -> int:
     """Largest reachable concurrent footprint at the widths and active-step ceiling.
 
-    A per-width measured ``memory.peak`` point wins over the old width-collapsed baseline. The
-    Exact-width provenance prevents the legacy ``base * p/4`` placeholder from scaling an
-    already-at-p measurement a second time. An authored hard cap still wins in
+    A per-width measured ``memory.peak`` point may raise, but never lower, the existing baseline.
+    When it raises, exact-width provenance prevents the legacy ``base * p/4`` placeholder from
+    scaling an already-at-p measurement a second time. An authored hard cap still wins in
     :func:`step_mem_cap_bytes`. Dependency/resource constraints and ``max_steps`` bound the set that
     can actually overlap, matching the runtime memory admission model.
     """
@@ -1439,12 +1462,13 @@ def _cpa_footprint(
         if exact is None and floor is None:
             active.append(step)
             continue
-        if exact is None:
+        authored = step.hint.rss_baseline_bytes
+        if exact is None or (authored is not None and exact <= authored):
             # A censored peak is only a lower bound. Raise the ordinary baseline to that floor but
-            # retain fallback width scaling; marking it exact could replace a larger conservative
-            # estimate by an unsafe smaller number.
-            assert floor is not None
-            baseline = max(step.hint.rss_baseline_bytes or 0, floor)
+            # retain fallback width scaling; the same applies when an exact profile peak is below
+            # the authored floor. Marking either exact could shrink the cap through width
+            # provenance even when the numeric baseline happened to be equal.
+            baseline = max(authored or 0, floor or 0)
             active.append(
                 replace(
                     step,
@@ -1878,8 +1902,9 @@ def build_plan(
     mem_budget: int | None = None,
     max_steps: int | None = None,
 ) -> Plan:
-    """Resolve every step's estimate (store-over-hint-over-default) and build the plan for
-    ``planner``: the per-step resolved estimates, the critical path, and the dispatch order.
+    """Resolve every step's estimate and build the plan for ``planner``: duration uses
+    store-over-hint-over-default, while authored RSS is a floor; the result contains the per-step
+    estimates, critical path, and dispatch order.
 
     ``speedups`` (from :func:`load_step_speedups`) attaches each step's learned parallel-speedup
     curve for the plan display. For ``planner=Planner.CPA`` it also DRIVES runner-controlled width

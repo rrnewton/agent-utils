@@ -40,6 +40,13 @@ const CPU_BREACH_DAG: &str = r#"{"steps": [{"group": "cpu", "job": "breach-defau
   "desc": "undeclared step reads one-core quota and exceeds 10 CPU-seconds",
   "cmd": "python3 -c 'import pathlib,time; cg=next(x.split(\":\",2)[2].strip() for x in open(\"/proc/self/cgroup\") if x.startswith(\"0::\")); quota=pathlib.Path(\"/sys/fs/cgroup\"+cg+\"/cpu.max\").read_text().strip(); assert quota==\"100000 100000\",quota; start=time.process_time(); exec(\"while time.process_time()-start < 12.0: pass\")'"}]}"#;
 
+fn parent_only_offers_unboxed_delegation() -> bool {
+    matches!(
+        std::env::var("DAGRUN_DELEGATED_UNBOXED").as_deref(),
+        Ok("1")
+    ) && std::env::var_os("DAGRUN_OUTER_RUN").is_some()
+}
+
 /// Run `dag_json` through the built binary under default (boxing-required) `run`; returns
 /// `(exit_code, combined_stdout_stderr)`.
 fn run_dag(label: &str, dag_json: &str, extra_args: &[&str]) -> (Option<i32>, String) {
@@ -68,6 +75,13 @@ fn run_dag(label: &str, dag_json: &str, extra_args: &[&str]) -> (Option<i32>, St
 
 #[test]
 fn default_small_cap_boxes_an_undeclared_step() {
+    if parent_only_offers_unboxed_delegation() {
+        eprintln!(
+            "SKIP default_small_cap_boxes_an_undeclared_step: parent validation is explicitly \
+             unboxed; refusing to run the breach workload without the default cgroup cap"
+        );
+        return;
+    }
     // Probe with the breach DAG; a code-3 means boxing is unavailable here -> skip loudly.
     let (breach_code, breach_out) = run_dag("breach", BREACH_DAG, &[]);
     if breach_code == Some(3) {
@@ -113,6 +127,13 @@ fn default_small_cap_boxes_an_undeclared_step() {
 
 #[test]
 fn default_cpu_caps_fire_and_allow_compliant_work() {
+    if parent_only_offers_unboxed_delegation() {
+        eprintln!(
+            "SKIP default_cpu_caps_fire_and_allow_compliant_work: parent validation is explicitly \
+             unboxed; the default cgroup CPU caps cannot be tested"
+        );
+        return;
+    }
     // E: the command reads the kernel control before doing work, so a pass proves the one-core
     // cpu.max was applied and that a workload comfortably below 10 CPU-seconds is untouched.
     let (compliant_code, compliant_out) = run_dag("cpu-compliant", CPU_COMPLIANT_DAG, &[]);

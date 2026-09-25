@@ -47,6 +47,7 @@ def _row(
         "memory_events_max": reclaim,
         "memory_events_oom": oom_invoked,
         "memory_events_oom_kill": oom,
+        "memory_events_oom_group_kill": "0",
     }
     row.update(extra)
     return row
@@ -94,7 +95,8 @@ def test_a_peak_that_met_a_ceiling_is_censored(why: str, kwargs: dict[str, str])
 
 
 def test_every_pressure_counter_the_writer_records_is_read() -> None:
-    """#34 persists five ``memory.events`` counters. A reader that consults only some of them
+    """The profile persists every actionable ``memory.events`` counter. A reader that consults
+    only some of them
     calls a throttled or OOM-invoked step comfortable, which is the exact failure this path
     exists to prevent.
 
@@ -102,7 +104,7 @@ def test_every_pressure_counter_the_writer_records_is_read() -> None:
     PROTECTION, which does not bound the cgroup's own peak.
     """
     censoring = {"memory_events_high", "memory_events_max", "memory_events_oom",
-                 "memory_events_oom_kill"}
+                 "memory_events_oom_kill", "memory_events_oom_group_kill"}
     for column in censoring:
         row = _row()
         row[column] = "1"
@@ -363,10 +365,9 @@ def test_only_a_profile_backed_admission_replaces_the_authored_hint() -> None:
 def test_a_declined_step_is_restored_to_the_baseline_its_author_wrote() -> None:
     """The fully-censored case at the seam where it actually bites.
 
-    By the time this runs, the ordinary censoring-BLIND plan feedback has already replaced the
-    authored 42949672960 B hint with 8589934592 B — the very censored peak this module refuses to
-    learn from. Declining has to UNDO that, or turning the flag on leaves the unsafe number in
-    place under the words "keeping the authored hint".
+    This unit exercises the defensive seam directly with a pre-lowered config, as an older caller
+    or persisted plan may still provide. Declining has to restore the authored 42949672960 B hint,
+    not leave 8589934592 B in place under the words "keeping the authored hint".
     """
     rows = [_row("g.pinned", peak=str(8 * GIB), cap=str(8 * GIB)) for _ in range(6)]
     admissions = memory_admission_from_rows(rows)
@@ -674,13 +675,13 @@ def test_a_censored_peak_cannot_reach_max_mem_admission_once_the_flag_is_on(
     One step, six recorded runs, every one of them pinned to its 8589934592 B cap: the
     all-censored history this whole path exists for. The DAG authors 42949672960 B.
 
-    * Without the flag the ordinary, censoring-blind feedback takes those peaks at face value and
-      ``--max-mem`` models a worst case of 10737418240 B — a cap derived from the cap.
-    * With the flag the step is DECLINED, and a decline has to mean the authored 42949672960 B is
-      what admission sees: worst case 53687091200 B.
+    * Without the flag, the authored 42949672960 B floor prevents ordinary feedback from lowering
+      the step, so ``--max-mem`` models a worst case of 53687091200 B.
+    * With the flag the step is DECLINED because every sample is censored, and the same authored
+      floor remains what admission sees.
 
-    Both numbers are named literally. Reporting "keeping the authored hint" while the censored
-    estimate stayed in the config would leave the second equal to the first.
+    The opt-in report must still say why it declined; equal footprints prove the safe ordinary
+    floor does not depend on the caller remembering the flag.
     """
     machine, container = "synthhost", "affinity4_cpu-max-max"
     store = tmp_path / "store"
@@ -705,7 +706,7 @@ def test_a_censored_peak_cannot_reach_max_mem_admission_once_the_flag_is_on(
 
     assert off_rc == 0, off_err
     assert on_rc == 0, on_err
-    assert "worst-case 10737418240 bytes" in off_err, off_err
+    assert "worst-case 53687091200 bytes" in off_err, off_err
     assert "g.pinned: keeping the authored hint" in on_err, on_err
     assert "worst-case 53687091200 bytes" in on_err, on_err
 

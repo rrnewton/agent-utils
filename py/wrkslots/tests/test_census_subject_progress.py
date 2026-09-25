@@ -124,20 +124,23 @@ def test_exact_final_sweep_cost_completes_without_raising_fixed_budget(
 def test_default_budget_large_root_has_finite_explicit_terminal_outcome(
     tmp_path: Path,
 ) -> None:
-    # These are real regular files. The root itself makes fresh finalization
-    # require 100001 observations under the unchanged 100000-work/5-second limits.
-    fixture = _fixture(tmp_path, {"subject": (100000,)})
+    # Keep the production default pinned independently from the boundary
+    # algorithm. A smaller set of real regular files exercises the identical
+    # N entries plus one root observation without manufacturing 100,000 inodes.
+    assert cli._AUDIT_CACHE_WORK_LIMIT == 100000
+    work_limit = 64
+    fixture = _fixture(tmp_path, {"subject": (work_limit,)})
     cache = fixture.planned["subject"][0].path
-    assert sum(1 for _ in cache.iterdir()) == 100000
+    assert sum(1 for _ in cache.iterdir()) == work_limit
     for _ in range(12):
-        measured, _counters = fixture.run(100000)
+        measured, _counters = fixture.run(work_limit)
         assert measured["subject"].status != "complete"
         if measured["subject"].status == "error":
             assert measured["subject"].bytes is None
             detail = measured["subject"].error
             assert detail is not None
-            assert "100001 work units" in detail
-            assert "fixed allowance of 100000" in detail
+            assert f"{work_limit + 1} work units" in detail
+            assert f"fixed allowance of {work_limit}" in detail
             break
     else:
         pytest.fail("default-budget large root remained partial without a terminal outcome")
@@ -157,6 +160,10 @@ def test_multiple_roots_repeatedly_complete_as_one_subject(
             assert measured["subject"].bytes == fixture.expected_bytes("subject")
             assert counters["directories_finalized"] == root_count
             assert counters["entries_finalized"] == root_count
+            if completions >= 4:
+                break
+    else:
+        pytest.fail("stable subject fell into a post-completion partial cycle")
     assert completions >= 4, "stable subject fell into a post-completion partial cycle"
 
 
@@ -167,15 +174,15 @@ def test_subject_cursor_is_fair_with_different_root_counts_and_oversized_peer(
         tmp_path,
         {
             "small": (1,),
-            "medium": (1, 1, 1),
-            "exact": (1, 1, 1, 1, 1),
-            "oversized": (1, 1, 1, 1, 1, 1),
+            "medium": (1, 1),
+            "exact": (1, 1, 1),
+            "oversized": (1, 1, 1, 1),
         },
     )
     completions = {subject: 0 for subject in ("small", "medium", "exact")}
     terminal_errors = 0
     for _ in range(80):
-        measured, _counters = fixture.run(10)
+        measured, _counters = fixture.run(6)
         for subject in completions:
             assert measured[subject].status != "error"
             if measured[subject].status == "complete":
@@ -185,8 +192,15 @@ def test_subject_cursor_is_fair_with_different_root_counts_and_oversized_peer(
         assert oversized.status != "complete"
         if oversized.status == "error":
             assert oversized.error is not None
-            assert "12 work units" in oversized.error
+            assert "8 work units" in oversized.error
             terminal_errors += 1
+        if terminal_errors >= 3 and all(count >= 3 for count in completions.values()):
+            break
+    else:
+        pytest.fail(
+            f"subject cursor did not meet bounded fairness: "
+            f"completions={completions}, terminal_errors={terminal_errors}"
+        )
     assert all(count >= 3 for count in completions.values()), completions
     assert terminal_errors >= 3
 

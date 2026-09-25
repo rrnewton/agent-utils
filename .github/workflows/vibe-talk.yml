@@ -1,8 +1,9 @@
 name: vibe-talk
 
 # vibe-talk is a service, not one of the paired command-line tools, and it lives outside the `rs/`
-# workspace with its own lockfile. The repository-wide `make check` / `make test` targets therefore
-# do not see it, and this workflow is its whole gate.
+# workspace with its own lockfile. The canonical repository validation graph includes its normal
+# build, unit, and browser contract. This focused workflow retains the distinct MSRV and container
+# artifact checks that the local graph cannot replace.
 on:
   push:
     branches: [main]
@@ -16,32 +17,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  rust:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: vibe-talk
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      # `cargo test` runs BOTH served pages' suites through `node --test` — tests/voice_page.rs
-      # for /voice and tests/app_page.rs for /. Those tests FAIL rather than skip when node is
-      # absent, so the toolchain is pinned here instead of relying on whatever the runner image
-      # happens to ship.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: rustfmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
-      - name: test
-        run: cargo test --locked
-      - name: smoke --help
-        run: cargo run --locked -- --help
-
   msrv:
     runs-on: ubuntu-latest
     defaults:

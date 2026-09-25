@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, inspect, and smoke every independently published Python tool.
+"""Build, inspect, and smoke independently published Python tools.
 
 The check is intentionally artifact-first. Each project is copied out of the
 working tree, built as both a wheel and source distribution with package-index
@@ -10,10 +10,15 @@ sibling packages, import-time networking, or omitted resources.
 
 The build environment must already provide the PEP 517 backend named by each
 project. No backend or runtime dependency is downloaded by this script.
+
+With no selector, every project is checked. ``--project`` may be repeated to
+check only named distributions (or their source-directory aliases) while the
+global project registry and package index remain checked.
 """
 
 from __future__ import annotations
 
+import argparse
 import ast
 import configparser
 import email.parser
@@ -258,6 +263,103 @@ class _WheelInspection:
     resources: tuple[tuple[str, bytes], ...]
 
 
+def _project_aliases() -> dict[str, Project]:
+    """Return exact CLI aliases after checking the complete project registry."""
+
+    aliases: dict[str, Project] = {}
+    distributions: set[str] = set()
+    directories: set[str] = set()
+    packages: set[str] = set()
+    commands: set[str] = set()
+    for project in PROJECTS:
+        if project.distribution in distributions:
+            raise CheckError(
+                f"project registry repeats distribution {project.distribution!r}"
+            )
+        if project.directory in directories:
+            raise CheckError(f"project registry repeats directory {project.directory!r}")
+        if project.package in packages:
+            raise CheckError(f"project registry repeats package {project.package!r}")
+        distributions.add(project.distribution)
+        directories.add(project.directory)
+        packages.add(project.package)
+        for command in project.commands:
+            if command in commands:
+                raise CheckError(f"project registry repeats command {command!r}")
+            commands.add(command)
+        for alias in (project.distribution, project.directory):
+            previous = aliases.get(alias)
+            if previous is not None and previous != project:
+                raise CheckError(
+                    f"project alias {alias!r} names both {previous.distribution!r} "
+                    f"and {project.distribution!r}"
+                )
+            aliases[alias] = project
+    return aliases
+
+
+def _select_projects(names: list[str]) -> tuple[Project, ...]:
+    """Resolve strict, repeatable selectors in canonical registry order."""
+
+    aliases = _project_aliases()
+    if not names:
+        return PROJECTS
+    selected: dict[Project, str] = {}
+    for name in names:
+        project = aliases.get(name)
+        if project is None:
+            choices = ", ".join(sorted(aliases))
+            raise CheckError(f"unknown project {name!r}; choose one of: {choices}")
+        previous = selected.get(project)
+        if previous is not None:
+            raise CheckError(
+                f"project {project.distribution!r} selected more than once "
+                f"({previous!r}, {name!r})"
+            )
+        selected[project] = name
+    return tuple(project for project in PROJECTS if project in selected)
+
+
+def _check_project_topology() -> None:
+    """Require every project manifest to have exactly one registry entry."""
+
+    registered = {project.directory for project in PROJECTS}
+    observed = {
+        path.parent.name
+        for path in PY_ROOT.glob("*/pyproject.toml")
+        if path.is_file()
+    }
+    missing = sorted(registered - observed)
+    if missing:
+        raise CheckError(f"project registry names directories without manifests: {missing}")
+    unregistered = sorted(observed - registered)
+    if unregistered:
+        raise CheckError(
+            f"publishable project manifests are missing from the registry: {unregistered}"
+        )
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--project",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "check only this distribution or source-directory alias; repeat for "
+            "multiple projects (default: all projects)"
+        ),
+    )
+    selection.add_argument(
+        "--list-projects",
+        action="store_true",
+        help="list accepted project names and directory aliases, then exit",
+    )
+    return parser
+
+
 def _public_doc_nodes(tree: ast.Module) -> list[_PublicDocNode]:
     nodes: list[_PublicDocNode] = [tree]
 
@@ -275,10 +377,10 @@ def _public_doc_nodes(tree: ast.Module) -> list[_PublicDocNode]:
     return nodes
 
 
-def _check_public_docstrings() -> None:
+def _check_public_docstrings(projects: tuple[Project, ...] | None = None) -> None:
     """Keep every published package's introspection docs standalone."""
 
-    for project in PROJECTS:
+    for project in PROJECTS if projects is None else projects:
         package = PY_ROOT / project.directory
         for path in sorted(package.rglob("*.py")):
             relative = path.relative_to(package)
@@ -972,10 +1074,23 @@ def _smoke_wheel(
               "import agentctl.foreign.agent_runner, agentctl.foreign.mcp.server"], env=env, cwd=run_root)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = _argument_parser()
+    arguments = parser.parse_args(argv)
     try:
+        projects = _select_projects(arguments.project)
+        if arguments.list_projects:
+            for project in PROJECTS:
+                alias = (
+                    f" (directory alias: {project.directory})"
+                    if project.directory != project.distribution
+                    else ""
+                )
+                print(f"{project.distribution}{alias}")
+            return 0
+        _check_project_topology()
         _require_build_backend()
-        _check_public_docstrings()
+        _check_public_docstrings(projects)
         index_text = (PY_ROOT / "README.md").read_text(encoding="utf-8")
         foreign = _FOREIGN_DOC_TERMS.search(index_text)
         if foreign is not None:
@@ -996,7 +1111,7 @@ def main() -> int:
             sdist_wheel_root.mkdir()
             smoke_root.mkdir()
 
-            for project in PROJECTS:
+            for project in projects:
                 source = _copy_project(project, build_root)
                 source_wheel = _build_wheel(project, source, source_wheel_root)
                 source_result = _inspect_wheel(project, source_wheel)
@@ -1033,7 +1148,13 @@ def main() -> int:
     ) as exc:
         print(f"check_python_packages: FAIL: {exc}", file=sys.stderr)
         return 1
-    print(f"check_python_packages: all {len(PROJECTS)} distributions passed")
+    if len(projects) == len(PROJECTS):
+        print(f"check_python_packages: all {len(PROJECTS)} distributions passed")
+    else:
+        print(
+            f"check_python_packages: selected {len(projects)} "
+            f"distribution{'s' if len(projects) != 1 else ''} passed"
+        )
     return 0
 
 

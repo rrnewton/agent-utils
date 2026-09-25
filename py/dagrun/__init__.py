@@ -59,7 +59,11 @@ from dagrun.estimates import (
 )
 from dagrun.io import (
     DagJsonError,
+    MAX_DAG_FLATTENED_STEPS,
+    MAX_DAG_INCLUDE_DEPTH,
+    MAX_DAG_INCLUDE_INSTANCES,
     dag_from_json,
+    dag_from_path,
     dag_from_yaml,
     dag_to_json,
     dag_to_yaml,
@@ -263,7 +267,11 @@ __all__ = [
     "scaling_model_to_json",
     "write_scaling_model",
     # serialization
+    "MAX_DAG_FLATTENED_STEPS",
+    "MAX_DAG_INCLUDE_DEPTH",
+    "MAX_DAG_INCLUDE_INSTANCES",
     "dag_from_json",
+    "dag_from_path",
     "dag_from_yaml",
     "dag_to_json",
     "dag_to_yaml",

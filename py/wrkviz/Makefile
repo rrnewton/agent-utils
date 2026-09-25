@@ -23,6 +23,7 @@ REPO_ROOT := $(shell cd ../.. && pwd)
 DAGRUN    ?= $(REPO_ROOT)/bin/dagrun
 PYTHON    ?= python3
 BROWSER   := $(REPO_ROOT)/py/tests/js/browser
+NODE22    := $(REPO_ROOT)/scripts/with-node22
 
 # Extra flags for every box. Empty by default, so a developer gets real cgroup enforcement and a
 # hard failure if the machine cannot provide it. CI sets `--allow-cgroup-failure`, because a
@@ -51,7 +52,7 @@ help:
 	  '  make typecheck       mypy over the package and its tests' \
 	  '  make unit            the Python suite for this tool only' \
 	  '  make browser         the Playwright suite against the real static assets' \
-	  '  make benchmark       zoom/pan redraw timings, enforced against a budget' \
+	  '  make benchmark       verify metrics, then enforce zoom/pan redraw budgets' \
 	  '' \
 	  '  make qa-archive ARCHIVE=<dir>   zoom/pan latency on a REAL archive, by level of detail' \
 	  '  make synth-archive OUT=<dir>    generate + build a synthetic archive at scale' \
@@ -87,17 +88,19 @@ unit:
 browser:
 	@printf '\n\033[1m==> browser\033[0m\n'
 	cd $(BROWSER) && $(call BOX,timeline-browser,6G,900,4) \
-	  npx playwright test --reporter=line
+	  $(NODE22) npx playwright test --reporter=line
 
-# 6 GiB / 15 min / 4 cores, same reasoning as `browser`. This one is a pass/fail check AND a
-# measurement: it prints the redraw timings it collected and fails if any breaches the budget.
+# 6 GiB / 15 min / 4 cores, same reasoning as `browser`. The instrument test first proves every
+# advertised metric is recorded; the budget test then prints the redraw timings it collected and
+# fails if any breaches the budget.
 # `dagrun box` summarises a passing step's stdout to a single line, so the measurements are read
 # back from the file the check writes rather than from its console output. Printed here, after
 # the box, so `make benchmark` shows its numbers whether it passed or failed.
 benchmark:
 	@printf '\n\033[1m==> benchmark\033[0m\n'
 	cd $(BROWSER) && $(call BOX,timeline-benchmark,6G,900,4) \
-	  node --test benchmark-budget.test.cjs
+	  $(NODE22) sh -c \
+	  'node --test benchmark-site.test.cjs && node --test benchmark-budget.test.cjs'
 	@printf '\n'; cat $(BROWSER)/benchmark-report.txt
 
 # Manual QA, not part of `validate`: it needs a built archive this repository does not ship, and

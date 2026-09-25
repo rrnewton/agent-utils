@@ -9,7 +9,7 @@
 //! |-----------------------------|---------|
 //! | `hung_test_*` (positive)    | the run RETURNS, names the hung TEST, kills a setsid/double-fork escapee, and leaves the log on disk |
 //! | `clean_suite_*` (control)   | the same suite unhung still PASSES, accuses nobody, and triggers no sweep |
-//! | `bystander_*` (negative)    | a process that is not ours, alive throughout, is UNHARMED — the nonce sweep is an ownership match, not a pattern kill |
+//! | `bystander_*` (negative)    | a process that is not ours, alive throughout, is UNHARMED — cgroup and nonce teardown both follow ownership, not process names |
 //! | `runner_sigkilled_*`        | the CI-cancellation case: SIGKILL the runner mid-suite and the on-disk journal still identifies the in-flight test |
 //!
 //! The escapee bounds itself with a short sleep and is killed by RECORDED PID afterwards, so this
@@ -193,17 +193,27 @@ fn hung_test_is_terminated_named_and_logged_while_a_bystander_survives() {
         "the culprit must travel with how far the suite got:\n{text}"
     );
 
-    // 3) The setsid/double-fork escapee is TERMINATED, by the ownership nonce that reaches it once
-    //    process group and parentage both fail to.
+    // 3) The setsid/double-fork escapee is TERMINATED. An unboxed run reaches it by ownership
+    //    nonce after process group and parentage both fail; a boxed run owns the cgroup subtree
+    //    and kills it atomically. The test binary may itself be inside a delegated validation
+    //    step, so assert the mechanism selected by the actual route rather than demanding the
+    //    weaker fallback while containment is active.
     assert_eq!(
         pid_alive(&fx.escapee_pid_file()),
         Some(false),
         "the setsid/double-fork escapee survived teardown:\n{text}"
     );
-    assert!(
-        text.contains("by ownership nonce"),
-        "the nonce sweep must report the kill it made:\n{text}"
-    );
+    if text.contains("cgroup boxing ACTIVE") {
+        assert!(
+            text.contains("CONTAINMENT: run-boxed"),
+            "the cgroup teardown route must carry an observed containment record:\n{text}"
+        );
+    } else {
+        assert!(
+            text.contains("by ownership nonce"),
+            "the unboxed fallback must report the ownership-nonce kill it made:\n{text}"
+        );
+    }
 
     // 4) NEGATIVE: ownership, not pattern. A process we did not spawn is untouched.
     assert!(

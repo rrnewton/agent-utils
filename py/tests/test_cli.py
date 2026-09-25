@@ -7,6 +7,7 @@ import contextlib
 import csv
 import io
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from dagrun.cli import (
     _load_userguide,
     main,
 )
+from dagrun.io import dag_from_json
 from dagrun.model import DagConfig, Step
 from dagrun.protocols import CgroupManager, MetricsSink
 from dagrun.profile_capture import (
@@ -316,11 +318,13 @@ def test_dot_and_json() -> None:
         assert rc == 0 and '"steps"' in out
 
 
-# Cgroup boxing is ON by default; the in-process CLI tests use --allow-cgroup-failure so `run`
-# does NOT re-exec into a systemd scope (which would replace the pytest process). The default
-# require-boxing path and the require-but-unavailable error are covered by
-# test_run_default_requires_cgroups_or_flag via a subprocess instead.
-_ACF = "--allow-cgroup-failure"
+# Cgroup boxing is ON by default; the in-process CLI tests use the explicit unsafe opt-out so `run`
+# does NOT re-exec into a systemd scope (which would replace the pytest process). Use the
+# deliberate opt-out rather than merely allowing setup failure: under a parent-owned delegated
+# test step, setup succeeds by design and each in-process CLI unit test would otherwise allocate
+# a real nested cgroup. The pytest process itself remains inside the outer step's containment.
+# Default require-boxing and unavailable-host behavior are covered by subprocess tests instead.
+_ACF = "--unsafe-no-cgroups"
 
 
 def test_run_exit_codes() -> None:
@@ -376,6 +380,10 @@ def test_structured_result_descriptor_lists_but_run_refuses_before_execution(
 def test_nested_run_refuses_by_outer_run_and_override_is_explicit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The validation shard itself may be an opted-in delegated child. This test constructs each
+    # nested authority state explicitly while remaining physically inside that outer cgroup.
+    monkeypatch.delenv("DAGRUN_DELEGATED_CGROUP", raising=False)
+    monkeypatch.delenv("DAGRUN_DELEGATED_UNBOXED", raising=False)
     marker = tmp_path / "seen-outer-run"
     dag = tmp_path / "inner.json"
     dag.write_text(
@@ -403,6 +411,30 @@ def test_nested_run_refuses_by_outer_run_and_override_is_explicit(
     assert "--dag outer.json" in err
     assert "--allow-unwise-nest-dagruns" in err
     assert "No such file" not in err
+
+    monkeypatch.setenv("DAGRUN_DELEGATED_UNBOXED", "1")
+    monkeypatch.setenv("DAGRUN_DELEGATED_CGROUP", str(tmp_path / "forged"))
+    rc, _, err = _capture(["run", "--dag", "/does/not/need/to/exist.json"])
+    assert rc == 2
+    assert "was present but invalid" in err
+    assert "delegated cgroup path" in err
+    monkeypatch.delenv("DAGRUN_DELEGATED_CGROUP")
+
+    monkeypatch.setenv("DAGRUN_DELEGATED_UNBOXED", "not-authorized")
+    rc, _, err = _capture(["run", "--dag", "/does/not/need/to/exist.json"])
+    assert rc == 2
+    assert "DAGRUN_DELEGATED_UNBOXED" in err
+    assert "exactly '1'" in err
+
+    monkeypatch.setenv("DAGRUN_DELEGATED_UNBOXED", "1")
+    rc, _, err = _capture(
+        ["run", "--dag", str(dag), "--no-profile", "--no-profile-feedback", "-q"]
+    )
+    assert rc == 0, err
+    assert "reviewed uncontained nested execution" in err
+    assert marker.read_text(encoding="utf-8") == "g.j"
+    marker.unlink()
+    monkeypatch.delenv("DAGRUN_DELEGATED_UNBOXED")
 
     rc, _, err = _capture(
         [
@@ -434,6 +466,295 @@ def test_nested_run_refuses_by_outer_run_and_override_is_explicit(
     )
     assert rc == 0, err
     assert marker.read_text(encoding="utf-8") == "g.j"
+
+
+def test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree(
+    tmp_path: Path,
+    inherited_runner_authority_env: Mapping[str, str],
+) -> None:
+    import os
+    import time
+
+    pid_marker = tmp_path / "descendant.pid"
+    cgroup_marker = tmp_path / "descendant.cgroup"
+    coordinator_cgroup_marker = tmp_path / "coordinator.cgroup"
+    inner = tmp_path / "inner.json"
+    inner.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "inner",
+                        "job": "worker",
+                        "cmd": (
+                            f"cat /proc/$PPID/cgroup > {coordinator_cgroup_marker} && "
+                            f"cat /proc/self/cgroup > {cgroup_marker} && "
+                            f"exec setsid --wait sh -c 'echo $$ > {pid_marker}; exec sleep 60'"
+                        ),
+                        "timeout": 60,
+                    }
+                ]
+            }
+        )
+    )
+    outer = tmp_path / "outer.json"
+    outer.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "outer",
+                        "job": "delegating",
+                        "cmd": shlex.join(
+                            [
+                                sys.executable,
+                                "-m",
+                                "dagrun",
+                                "run",
+                                "--dag",
+                                str(inner),
+                                "--max-cpus",
+                                "1",
+                                "--no-profile",
+                                "--no-profile-feedback",
+                                "-q",
+                            ]
+                        ),
+                        "delegated_children": True,
+                        "timeout": 3,
+                        "cpu_timeout": 60,
+                        # Keep the smoke's own envelope small enough to nest below the canonical
+                        # validation shard; inherited admission clamps the modeling floor.
+                        "hint": {"hard_mem_max_bytes": 1024**3},
+                    }
+                ]
+            }
+        )
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "dagrun",
+            "run",
+            "--dag",
+            str(outer),
+            "--max-cpus",
+            "1",
+            "--no-profile",
+            "--no-profile-feedback",
+            "-q",
+        ],
+        cwd=Path(__file__).parents[1],
+        env={**os.environ, **inherited_runner_authority_env},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output = result.stdout + result.stderr
+    if result.returncode == 3 and (
+        "cgroup boxing could not be established" in output
+        or "cgroup setup failed" in output
+        or "NOT ESTABLISHED AND NOT TESTED" in output
+    ):
+        pytest.skip(f"cgroup delegation unavailable: {output}")
+    assert result.returncode == 1, output
+    assert "TIMEOUT" in output
+    cgroup_path = cgroup_marker.read_text()
+    assert "step-outer.delegating/nested-run-" in cgroup_path
+    assert "/step-inner.worker" in cgroup_path
+    coordinator_cgroup_path = coordinator_cgroup_marker.read_text()
+    assert "step-outer.delegating/nested-run-" in coordinator_cgroup_path
+    assert coordinator_cgroup_path.rstrip().endswith("/supervisor")
+    pid = int(pid_marker.read_text().strip())
+    deadline = time.monotonic() + 5
+    while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not Path(f"/proc/{pid}").exists(), (
+        f"outer timeout left delegated setsid descendant {pid} alive\n{output}"
+    )
+
+
+def test_delegated_process_can_run_twice_in_process_after_aggregate_migration(
+    tmp_path: Path,
+    inherited_runner_authority_env: Mapping[str, str],
+) -> None:
+    coordinator_cgroups = tmp_path / "coordinator-cgroups"
+    returned_cgroups = tmp_path / "returned-cgroups"
+    inner = tmp_path / "inner.json"
+    inner.write_text(
+        json.dumps(
+            {
+                "mem_cap_floor_bytes": 268435456,
+                "steps": [
+                    {
+                        "group": "inner",
+                        "job": "worker",
+                        "cmd": f"cat /proc/$PPID/cgroup >> {coordinator_cgroups}",
+                        "hint": {"hard_mem_max_bytes": 268435456},
+                    }
+                ],
+            }
+        )
+    )
+    driver = tmp_path / "twice.py"
+    inner_args = [
+        "run",
+        "--dag",
+        str(inner),
+        "--max-cpus",
+        "1",
+        "--max-mem",
+        "1G",
+        "--no-profile",
+        "--no-profile-feedback",
+        "-q",
+    ]
+    driver.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).parents[1])!r})\n"
+        "from dagrun.cli import main\n"
+        f"args = {inner_args!r}\n"
+        "first = main(args)\n"
+        f"open({str(returned_cgroups)!r}, 'a').write(open('/proc/self/cgroup').read())\n"
+        "second = main(args)\n"
+        f"open({str(returned_cgroups)!r}, 'a').write(open('/proc/self/cgroup').read())\n"
+        "raise SystemExit(first or second)\n"
+    )
+    outer = tmp_path / "outer.json"
+    outer.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "outer",
+                        "job": "delegating",
+                        "cmd": shlex.join([sys.executable, str(driver)]),
+                        "delegated_children": True,
+                        "hint": {
+                            "preferred_inner_jobs": 2,
+                            "hard_mem_max_bytes": 2 * 1024**3,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "dagrun",
+            "run",
+            "--dag",
+            str(outer),
+            "--max-cpus",
+            "2",
+            "--no-profile",
+            "--no-profile-feedback",
+            "-q",
+        ],
+        cwd=Path(__file__).parents[1],
+        env={**os.environ, **inherited_runner_authority_env},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output = result.stdout + result.stderr
+    if result.returncode == 3 and (
+        "cgroup boxing could not be established" in output
+        or "cgroup setup failed" in output
+        or "NOT ESTABLISHED AND NOT TESTED" in output
+    ):
+        pytest.skip(f"cgroup delegation unavailable: {output}")
+    assert result.returncode == 0, output
+    recorded = coordinator_cgroups.read_text().splitlines()
+    assert len(recorded) == 2
+    assert all("step-outer.delegating/nested-run-" in line for line in recorded)
+    assert all(line.endswith("/supervisor") for line in recorded)
+    assert recorded[0] != recorded[1]
+    returned = returned_cgroups.read_text().splitlines()
+    assert len(returned) == 2
+    assert all("step-outer.delegating/supervisor" in line for line in returned)
+
+
+def test_allow_cgroup_failure_outer_delegates_a_named_unboxed_nested_run(
+    tmp_path: Path,
+) -> None:
+    """Hosted CI may be unboxed, but an explicit graph delegation still reaches its child."""
+    marker = tmp_path / "nested-ran"
+    inner = tmp_path / "inner.json"
+    inner.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "inner",
+                        "job": "worker",
+                        "cmd": f"touch {shlex.quote(str(marker))}",
+                    }
+                ]
+            }
+        )
+    )
+    outer = tmp_path / "outer.json"
+    outer.write_text(
+        json.dumps(
+            {
+                "steps": [
+                    {
+                        "group": "outer",
+                        "job": "delegating",
+                        "cmd": shlex.join(
+                            [
+                                sys.executable,
+                                "-m",
+                                "dagrun",
+                                "run",
+                                "--dag",
+                                str(inner),
+                                "--no-profile",
+                                "--no-profile-feedback",
+                                "-q",
+                            ]
+                        ),
+                        "delegated_children": True,
+                    }
+                ]
+            }
+        )
+    )
+    env = dict(os.environ, CI="1")
+    for inherited in (
+        "DAGRUN_DELEGATED_CGROUP",
+        "DAGRUN_DELEGATED_UNBOXED",
+        "DAGRUN_IN_SCOPE",
+        "DAGRUN_OUTER_RUN",
+    ):
+        env.pop(inherited, None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "dagrun",
+            "run",
+            "--dag",
+            str(outer),
+            "--allow-cgroup-failure",
+            "--no-profile",
+            "--no-profile-feedback",
+            "-vv",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert marker.exists()
+    assert "reviewed uncontained nested execution" in output
 
 
 def test_missing_and_malformed_dag_exit_2() -> None:
@@ -1600,6 +1921,74 @@ def test_target_sweep_characterizes_a_fixed_node_only_once(
     assert err == ""
 
 
+def test_target_sweep_refuses_selected_fixed_width_above_delegated_cpu_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = dag_from_json(
+        '{"steps": [{"group": "g", "job": "fixed", "cmd": "true", '
+        '"jobs_flag": "", "hint": {"preferred_inner_jobs": 8}}]}'
+    )
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda _max_cpus=None: CpuTopology(tuple(range(2)), physical_core_count=2),
+    )
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = cli._run_target_sweep(
+            cfg,
+            step_tag="g.fixed",
+            jobs_spec=None,
+            target_s=0.0,
+            repeat=1,
+            cgroups=None,
+            perf_dir=None,
+            sweep_git_sha="unknown",
+            verbosity=0,
+            c=cli.Palette(enabled=False),
+            inherited_max_cpus=2,
+        )
+
+    assert rc == 2
+    assert out.getvalue() == ""
+    assert "selected fixed-width step 'g.fixed' requests 8 CPUs" in err.getvalue()
+    assert "refusing an empty successful sweep" in err.getvalue()
+
+
+def test_target_sweep_does_not_charge_an_intentionally_skipped_steps_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = dag_from_json(
+        '{"steps": [{"group": "g", "job": "skipped", "cmd": "true", '
+        '"skip_reason": "empty-manifest-bucket", '
+        '"hint": {"hard_mem_max_bytes": 8589934592}}]}'
+    )
+    monkeypatch.setattr(
+        cli,
+        "_effective_sweep_topology",
+        lambda _max_cpus=None: CpuTopology((0, 1), physical_core_count=2),
+    )
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = cli._run_target_sweep(
+            cfg,
+            step_tag=None,
+            jobs_spec=None,
+            target_s=0.0,
+            repeat=1,
+            cgroups=None,
+            perf_dir=None,
+            sweep_git_sha="unknown",
+            verbosity=0,
+            c=cli.Palette(enabled=False),
+            inherited_max_mem_bytes=1024**3,
+        )
+
+    assert rc == 0
+    assert "intentionally skipped by the DAG" in out.getvalue()
+    assert "exceeding inherited delegated memory ceiling" not in err.getvalue()
+
+
 def test_target_sweep_persists_pass_metadata(tmp_path: Path) -> None:
     dag = tmp_path / "dag.json"
     dag.write_text(
@@ -1880,6 +2269,14 @@ def test_run_default_requires_cgroups_or_flag() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
         env = dict(os.environ, CI="1")  # force the boxing re-exec to be skipped
+        # This test models a fresh CI entrypoint even when pytest itself is a delegated child.
+        for inherited in (
+            "DAGRUN_DELEGATED_CGROUP",
+            "DAGRUN_DELEGATED_UNBOXED",
+            "DAGRUN_IN_SCOPE",
+            "DAGRUN_OUTER_RUN",
+        ):
+            env.pop(inherited, None)
         required = subprocess.run(
             [sys.executable, "-m", "dagrun", "run", "--dag", dag, "-q"],
             capture_output=True,
@@ -2068,7 +2465,7 @@ def test_boxed_reexec_via_symlink_imports_package() -> None:
 
 
 def test_cores_flag_refuses_unboxed_soft_affinity() -> None:
-    # `--allow-cgroup-failure` deliberately leaves this process outside an owned runner scope.
+    # `--unsafe-no-cgroups` deliberately leaves dagrun without an owned child scope.
     # `--cores` must therefore fail closed before launching the step; inherited process affinity
     # is escapable and cannot enforce a collision-free reservation.
     with tempfile.TemporaryDirectory() as tmp:
@@ -2117,7 +2514,11 @@ def test_boxed_stdin_dag_survives_scope_reexec() -> None:
             + combined
         )
     assert proc.returncode == 0, combined
-    assert "containment OBSERVED" in combined
+    assert (
+        "containment OBSERVED" in combined
+        or "cgroup boxing ACTIVE in parent-owned delegated step root" in combined
+        or "reviewed uncontained nested execution" in combined
+    )
     assert "invalid JSON" not in combined
     assert "stress.singleton: 3/3 passed" in proc.stdout
     assert (
@@ -2492,7 +2893,9 @@ def test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape() -> None:
         }
     )
     env = dict(os.environ)
-    # Force the unboxed path the same way a CI lane does.
+    # The procfs fallback is the subject of this test. Opt out explicitly so a self-hosting
+    # validation shard with a delegated parent remains physically contained while dagrun itself
+    # does not create or account through per-step cgroups.
     env["GITHUB_ACTIONS"] = "1"
     env["CI"] = "1"
 
@@ -2502,7 +2905,7 @@ def test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape() -> None:
             path.write_text(dag_text, encoding="utf-8")
             return subprocess.run(
                 [sys.executable, "-m", "dagrun", "run", "--dag", str(path),
-                 "--allow-cgroup-failure", "--keep-going", "--max-steps", "2", "-q",
+                 "--unsafe-no-cgroups", "--keep-going", "--max-steps", "2", "-q",
                  "--no-profile"],
                 capture_output=True,
                 text=True,
@@ -2517,7 +2920,7 @@ def test_unboxed_run_enforces_a_lower_bound_and_exposes_its_escape() -> None:
 
         breach = _run(spin, "burn")
         breach_out = breach.stdout + breach.stderr
-        assert "running UNBOXED" in breach_out, (
+        assert "UNBOXED" in breach_out, (
             "this test is only meaningful with boxing OFF; if the run was boxed it is exercising the "
             f"cgroup path and proves nothing about the fallback:\n{breach_out}"
         )

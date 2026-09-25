@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from dagrun.cgroup import NoopCgroups
+from dagrun.cgroup import DELEGATED_CGROUP_ENV, DELEGATED_UNBOXED_ENV, NoopCgroups
 from dagrun.attribution import LOG_DIR_ENV
 from dagrun.model import (
     DEFAULT_SMALL_CPU_COUNT,
@@ -159,6 +159,76 @@ def test_simple_dag_all_pass_respects_deps() -> None:
         assert all(o.ok for o in res.outcomes)
         with open(order, encoding="utf-8") as fh:
             assert fh.read().split() == ["A", "B"]  # dependent runs strictly after its dep
+
+
+def test_delegation_is_exported_only_to_the_opted_in_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class DelegatingManager(NoopCgroups):
+        enabled = True
+
+        def prepare_delegated_command(
+            self,
+            tag: str,
+            cmd: str,
+            mem_max: int | None = None,
+            cpu_count: int | None = None,
+        ) -> tuple[str, str | None]:
+            return cmd, "/verified/outer-step-root"
+
+    delegated = tmp_path / "delegated"
+    ordinary = tmp_path / "ordinary"
+    monkeypatch.setenv(DELEGATED_CGROUP_ENV, "/ambient-value-must-not-leak")
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "delegated",
+                "",
+                f"printf '%s' \"${{{DELEGATED_CGROUP_ENV}}}\" > {delegated}",
+                delegated_children=True,
+            ),
+            Step(
+                "g",
+                "ordinary",
+                "",
+                f"printf '%s' \"${{{DELEGATED_CGROUP_ENV}-absent}}\" > {ordinary}",
+            ),
+        )
+    )
+    result = run_dag(cfg, jobs=2, verbosity=0, cgroups=DelegatingManager())
+    assert result.ok
+    assert delegated.read_text() == "/verified/outer-step-root"
+    assert ordinary.read_text() == "absent"
+
+
+def test_unboxed_delegation_fallback_is_exported_only_to_the_opted_in_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    delegated = tmp_path / "delegated"
+    ordinary = tmp_path / "ordinary"
+    monkeypatch.setenv(DELEGATED_UNBOXED_ENV, "ambient-value-must-not-leak")
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "delegated",
+                "",
+                f"printf '%s' \"${{{DELEGATED_UNBOXED_ENV}-absent}}\" > {delegated}",
+                delegated_children=True,
+            ),
+            Step(
+                "g",
+                "ordinary",
+                "",
+                f"printf '%s' \"${{{DELEGATED_UNBOXED_ENV}-absent}}\" > {ordinary}",
+            ),
+        )
+    )
+    result = run_dag(cfg, jobs=2, verbosity=0, cgroups=NoopCgroups())
+    assert result.ok
+    assert delegated.read_text() == "1"
+    assert ordinary.read_text() == "absent"
 
 
 def test_dep_failure_skips_dependent() -> None:

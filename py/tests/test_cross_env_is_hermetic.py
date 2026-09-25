@@ -57,3 +57,33 @@ def test_a_case_that_is_about_intent_can_still_state_it(
     monkeypatch.delenv("CARGO_BUILD_JOBS", raising=False)
     env = _differential()._env({"CARGO_BUILD_JOBS": "200"})
     assert env["CARGO_BUILD_JOBS"] == "200"
+
+
+def test_only_exact_transient_user_bus_refusals_are_retryable() -> None:
+    differential = _differential()
+    outcome = differential.Outcome
+
+    assert differential._transient_user_bus_refusal(
+        outcome(
+            1,
+            "",
+            "Failed to connect to user scope bus via local transport: Connection refused\n",
+        )
+    )
+    assert differential._transient_user_bus_refusal(
+        outcome(0, "", ""),
+        outcome(1, "", "Failed to connect to user scope bus: Connection refused"),
+    )
+    assert not differential._transient_user_bus_refusal(
+        outcome(1, "", "Failed to connect to user scope bus: Connection refused"),
+        outcome(1, "", "a real allocator failure"),
+    )
+    assert not differential._transient_user_bus_refusal(
+        outcome(1, "", "Failed to connect to user scope bus: Permission denied")
+    )
+    assert not differential._transient_user_bus_refusal(
+        outcome(1, "", "Connection refused")
+    )
+    assert not differential._transient_user_bus_refusal(
+        outcome(0, "", "Failed to connect to user scope bus: Connection refused")
+    )

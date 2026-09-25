@@ -3,9 +3,9 @@
 //! The profile store records what each step's cgroup peaked at. It does NOT follow that the peak
 //! is what the step wanted: a step whose `peak_bytes` equals the `memory.max` applied to it used
 //! everything it was allowed, and a step the kernel killed at that ceiling wanted strictly more.
-//! Both are CENSORED observations. Fitting a cap to them re-derives the cap that produced them and
-//! freezes the mistake, which is why the default planner feedback in [`crate::estimates`] is left
-//! alone and this is a separate, opt-in path a caller must ask for by name.
+//! Both are CENSORED observations. Ordinary planner feedback therefore never lowers an authored
+//! RSS baseline. This is the separate, opt-in path a caller must ask for by name when enough
+//! censor-aware evidence should be allowed to lower it.
 //!
 //! The rules a caller can rely on:
 //!
@@ -104,11 +104,11 @@ fn truthy(row: &HashMap<String, String>, name: &str) -> bool {
 /// Classify one profile row's recorded peak.
 ///
 /// `Unknown` whenever the row cannot answer, which is the safe direction: an unknown row is
-/// excluded from the estimate rather than assumed comfortable. `Censored` when ANY of the four
-/// pressure counters #34 records fired — `high`, `max`, `oom` or `oom_kill` — when a guard cut
-/// the step short, when the row records a step that FAILED, or when the peak reached the applied
-/// cap: a `>=` and not a `==`, because a cap the kernel rounded down to a page boundary still
-/// censors a peak sitting above it.
+/// excluded from the estimate rather than assumed comfortable. `Censored` when ANY persisted
+/// pressure counter fired — `high`, `max`, `oom`, `oom_kill`, or `oom_group_kill` — when a guard
+/// cut the step short, when the row records a step that FAILED, or when the peak reached the
+/// applied cap: a `>=` and not a `==`, because a cap the kernel rounded down to a page boundary
+/// still censors a peak sitting above it.
 ///
 /// `memory_events_low` is deliberately NOT read: it counts reclaim that breached a `memory.low`
 /// PROTECTION, which sets a floor rather than a ceiling, so it does not bound the peak.
@@ -137,7 +137,13 @@ pub fn peak_observation_from_row(row: &HashMap<String, String>) -> PeakObservati
     };
     let oom_kills = parse_int(oom_cell).filter(|v| *v >= 0);
     let throttle_events = parse_int(cell(row, "memory_events_high")).filter(|v| *v >= 0);
-    let oom_events = parse_int(cell(row, "memory_events_oom")).filter(|v| *v >= 0);
+    let oom_events = [
+        parse_int(cell(row, "memory_events_oom")).filter(|v| *v >= 0),
+        parse_int(cell(row, "memory_events_oom_group_kill")).filter(|v| *v >= 0),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
     let run_failed = row_records_failure(row);
     let verdict = verdict(
         peak_bytes,
@@ -504,12 +510,10 @@ pub fn load_memory_admissions(
 ///
 /// `authored_baselines` maps a step tag to the `rss_baseline_bytes` its AUTHOR wrote, before any
 /// planner feedback touched it, and it is what makes a DECLINE mean something. `cfg` here has
-/// normally already been through [`crate::estimates::apply_plan_to_config`], whose feedback learns
-/// from the same recorded peaks WITHOUT asking whether a cap was clamping them. Without this
-/// mapping, every step this module declines to estimate would silently keep that censoring-blind
-/// number while the report said "keeping the authored hint" — the unsafe estimate surviving under
-/// the name of the safe one. So a declined step loses that number: a decline means no learned
-/// estimate at all, not a fall-back to the other one.
+/// normally already been through [`crate::estimates::apply_plan_to_config`], whose ordinary
+/// feedback may have raised the authored floor. Without this mapping, a step this stricter path
+/// declines could retain that ordinary estimate while the report said "keeping the authored
+/// hint". So a decline explicitly restores the authored value or a larger proven floor.
 ///
 /// A decline is nonetheless not amnesia. Where the evidence proves a FLOOR —
 /// [`MemoryAdmission::proven_floor_bytes`], the largest peak the step is known to have reached,
@@ -577,8 +581,8 @@ pub fn apply_memory_admissions(
 ///
 /// `authored` is the baseline the step's author wrote, which is what makes the decline half of
 /// this line specific: a decline that nevertheless raises the step to a proven floor says so and
-/// names the number, because "keeping the authored hint" would be as untrue there as it was when
-/// the censoring-blind estimate was silently left in place.
+/// names the number, because "keeping the authored hint" would be as untrue there as retaining a
+/// larger ordinary estimate while claiming the authored value had been restored.
 pub fn memory_admission_line(
     prog: &str,
     admission: &MemoryAdmission,
@@ -629,6 +633,7 @@ mod tests {
             hint: crate::model::ResourceHint::default(),
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
@@ -744,15 +749,16 @@ mod tests {
 
     #[test]
     fn every_pressure_counter_the_writer_records_is_read() {
-        // #34 persists five `memory.events` counters. A reader that consults only some of them
-        // calls a throttled or OOM-invoked step comfortable, which is the exact failure this
-        // path exists to prevent. `low` is deliberately NOT censoring: it counts reclaim that
-        // breached a `memory.low` PROTECTION, which does not bound the cgroup's own peak.
+        // The profile persists every actionable `memory.events` counter. A reader that consults
+        // only some of them calls a throttled or OOM-invoked step comfortable, which is the exact
+        // failure this path exists to prevent. `low` is deliberately NOT censoring: it counts
+        // reclaim that breached a `memory.low` PROTECTION, which does not bound the cgroup's peak.
         for column in [
             "memory_events_high",
             "memory_events_max",
             "memory_events_oom",
             "memory_events_oom_kill",
+            "memory_events_oom_group_kill",
         ] {
             assert_eq!(
                 peak_observation_from_row(&row(&[(column, "1")])).verdict,
@@ -1091,11 +1097,9 @@ mod tests {
 
     #[test]
     fn a_declined_step_is_restored_to_the_baseline_its_author_wrote() {
-        // The fully-censored case, at the seam where it actually bites. By the time this runs, the
-        // ordinary censoring-BLIND plan feedback has already replaced the authored 40 GiB hint
-        // with 8589934592 B — the very censored peak this module refuses to learn from. Declining
-        // has to UNDO that, or turning the flag on leaves the unsafe number in place under the
-        // words "keeping the authored hint".
+        // Exercise the defensive seam directly with a pre-lowered config, as an older caller or
+        // persisted plan may still provide. Declining has to restore the authored 40 GiB hint,
+        // not leave 8589934592 B in place under the words "keeping the authored hint".
         let rows: Vec<_> = (0..6)
             .map(|_| row(&[("step", "g.pinned"), ("peak_bytes", "8589934592")]))
             .collect();
@@ -1118,7 +1122,7 @@ mod tests {
         assert_eq!(
             applied.steps[0].hint.rss_baseline_bytes,
             Some(42949672960),
-            "a decline must mean no estimate, not the censoring-blind one"
+            "a decline must restore the authored baseline"
         );
         // Clone-and-override: nothing else moves.
         assert_eq!(applied.steps[0].timeout, 1234);
@@ -1332,8 +1336,7 @@ mod tests {
 
     #[test]
     fn the_decision_line_says_when_a_decline_still_raised_the_baseline() {
-        // "keeping the authored hint" would be as untrue on a raised step as it was when the
-        // censoring-blind estimate was silently left in place. The two verdicts are named here
+        // "keeping the authored hint" would be untrue on a raised step. The two verdicts are named here
         // as whole literal strings, because the cross-language differential compares this text
         // byte for byte and a paraphrase in one engine is a divergence in the other.
         let rows: Vec<_> = (0..6)

@@ -444,6 +444,9 @@ pub struct Step {
     pub networkonly: bool,
     /// Selected only by an engine-only subset preset.
     pub engine_only: bool,
+    /// Allow this step to launch nested dagrun schedulers inside a cgroup subtree delegated by
+    /// the outer scheduler. False preserves the default nested-invocation refusal.
+    pub delegated_children: bool,
     /// Wall-clock ceiling in seconds. `0` means UNDECLARED, not unlimited: the effective bound
     /// is then derived (see [`resolved_wall_timeout`]) from the step's CPU budget, or falls back
     /// to [`DEFAULT_STEP_TIMEOUT`]. A hardcoded 1800 here was the load-sensitive number baked
@@ -640,7 +643,11 @@ fn normalize_jobs_env(raw: &str, source: &str) -> Result<String, String> {
     }
     if matches!(
         name,
-        "DAGRUN_EXTRA_ARGS" | "DAGRUN_OUTER_RUN" | "DAGRUN_STEP"
+        "DAGRUN_DELEGATED_CGROUP"
+            | "DAGRUN_DELEGATED_UNBOXED"
+            | "DAGRUN_EXTRA_ARGS"
+            | "DAGRUN_OUTER_RUN"
+            | "DAGRUN_STEP"
     ) {
         return Err(format!(
             "{source}={name:?} is reserved by dagrun and cannot carry a step's worker count"
@@ -1151,8 +1158,10 @@ fn signal_name(sig: i64) -> String {
 /// structured-result refusal or terminal test failure when no outer failure takes precedence;
 /// a simultaneous required-result refusal is retained separately in `test_results_error`.
 ///
-/// A negative `returncode` means the child received a Unix signal; that must never be
-/// reported as an OOM.
+/// A negative `returncode` alone only says that the child received a Unix signal; it must not be
+/// reported as an OOM without a positive kernel `memory.events` OOM counter. A delegated boundary
+/// may report `oom` while its descendant victim owns `oom_kill`, so zero local kills do not erase
+/// otherwise-conclusive OOM evidence.
 #[allow(clippy::too_many_arguments)]
 pub fn step_failure_reason(
     returncode: Option<i64>,
@@ -1170,6 +1179,11 @@ pub fn step_failure_reason(
     cpu_timeout_platform: &str,
 ) -> String {
     if oomed {
+        if oom_kills == 0 {
+            return "MEMORY CAP EXHAUSTED (kernel reported OOM at inner MemoryMax; no local \
+                    oom_kill counter)"
+                .to_string();
+        }
         return format!("OOM-KILLED (hit inner MemoryMax; {oom_kills} oom_kill event(s))");
     }
     if cpu_timed_out {
@@ -2033,6 +2047,7 @@ mod tests {
             hint,
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: None,
@@ -2063,6 +2078,7 @@ mod tests {
             hint: ResourceHint::default(),
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: jobs_flag.map(str::to_string),
@@ -2325,7 +2341,13 @@ mod tests {
                     .contains("shell startup/control variable"));
             }
         }
-        for name in ["DAGRUN_EXTRA_ARGS", "DAGRUN_OUTER_RUN", "DAGRUN_STEP"] {
+        for name in [
+            "DAGRUN_DELEGATED_CGROUP",
+            "DAGRUN_DELEGATED_UNBOXED",
+            "DAGRUN_EXTRA_ARGS",
+            "DAGRUN_OUTER_RUN",
+            "DAGRUN_STEP",
+        ] {
             assert!(resolve_jobs_env(Some(name))
                 .unwrap_err()
                 .contains("reserved by dagrun"));
@@ -2348,7 +2370,13 @@ mod tests {
             step_width_is_resizable(&cfg.steps[0], &cfg.default_jobs_flag, &cfg.default_jobs_env)
         })
         .is_err());
-        for reserved in ["DAGRUN_EXTRA_ARGS", "DAGRUN_OUTER_RUN", "DAGRUN_STEP"] {
+        for reserved in [
+            "DAGRUN_DELEGATED_CGROUP",
+            "DAGRUN_DELEGATED_UNBOXED",
+            "DAGRUN_EXTRA_ARGS",
+            "DAGRUN_OUTER_RUN",
+            "DAGRUN_STEP",
+        ] {
             cfg.default_jobs_env = reserved.to_string();
             cfg.steps.clear();
             assert!(
@@ -2524,6 +2552,7 @@ mod cpu_timeout_multiplier_tests {
             hint: ResourceHint::default(),
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout,
             jobs_flag: None,
@@ -2699,6 +2728,7 @@ mod carry_tests {
             hint: ResourceHint::default(),
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: None,

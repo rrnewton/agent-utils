@@ -73,7 +73,8 @@ pub use estimates::{
     StepSamples, StepSpeedup, DEFAULT_MIN_SAMPLES,
 };
 pub use io::{
-    dag_from_json, dag_from_value, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError,
+    dag_from_json, dag_from_path, dag_from_value, dag_from_yaml, dag_to_json, dag_to_yaml,
+    DagJsonError, MAX_DAG_FLATTENED_STEPS, MAX_DAG_INCLUDE_DEPTH, MAX_DAG_INCLUDE_INSTANCES,
 };
 pub use memory_feedback::{
     apply_memory_admissions, load_memory_admissions, memory_admission_from_rows,

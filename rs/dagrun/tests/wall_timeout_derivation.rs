@@ -43,6 +43,7 @@ fn step(timeout: i64, cpu_timeout: i64) -> Step {
         hint: Default::default(),
         networkonly: false,
         engine_only: false,
+        delegated_children: false,
         timeout,
         cpu_timeout,
         jobs_flag: None,

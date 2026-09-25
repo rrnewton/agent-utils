@@ -34,10 +34,12 @@ use std::time::{Duration, Instant};
 
 use crate::capabilities::enforcement_manifest;
 use crate::cgroup::{
-    aggregate_slice_max_cpus, apply_specific_cores, attempt_scope_reexec, enable_outer_oom_group,
-    expected_outer_cpu_count, expected_outer_memory_max_bytes, expected_scope_runtime_max_s,
-    install_scope_teardown, is_in_scope, observe_own_containment, outer_memory_max_bytes_capped,
-    verify_scope_limits, verify_scope_runtime_max, CgroupManager, Cgroups, ScopeAttempt,
+    aggregate_slice_max_cpus, apply_specific_cores, attempt_scope_reexec, delegated_cgroup_root,
+    delegated_resource_limits, enable_outer_oom_group, expected_outer_cpu_count,
+    expected_outer_memory_max_bytes, expected_scope_runtime_max_s, install_scope_teardown,
+    is_in_scope, nested_coordinator_restore_failures, observe_own_containment,
+    outer_memory_max_bytes_capped, verify_scope_limits, verify_scope_runtime_max, CgroupManager,
+    Cgroups, DelegatedResourceLimits, ScopeAttempt, DELEGATED_CGROUP_ENV, DELEGATED_UNBOXED_ENV,
     DIRECT_CGROUP_ENV, FORCE_ATTEMPT_ENV,
 };
 use crate::estimates::{
@@ -46,7 +48,7 @@ use crate::estimates::{
     step_speedups_from_buckets, write_scaling_model_for_workloads, BucketKey, Plan, Planner,
     Sample, StepSpeedup, DEFAULT_MIN_SAMPLES,
 };
-use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
+use crate::io::{dag_from_json, dag_from_path, dag_to_json, dag_to_yaml, DagJsonError};
 use crate::memory_feedback::{
     apply_memory_admissions, load_memory_admissions, memory_admission_line, DEFAULT_MARGIN_PCT,
     DEFAULT_MIN_UNCENSORED_SAMPLES,
@@ -68,8 +70,9 @@ use crate::scheduler::{
     run_dag_boxed_limited_with_timeseries, validate_max_cpus_rewrite, BoxedCgroups,
 };
 use crate::sizing::{
-    box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_control_floor_bytes,
-    stress_copy_footprint_bytes, transitive_deps,
+    box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size,
+    step_mem_cap_for_inner_jobs_optional, stress_control_floor_bytes, stress_copy_footprint_bytes,
+    transitive_deps,
 };
 use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
 use crate::sweep::{
@@ -216,16 +219,18 @@ dagrun --help\n\n\
 {store}\n  {store_dir}\n  {store_note}\n\n\
 {planning}\n  {pl1}\n  {pl2}\n  {pl3}\n  {plan_note}\n\n\
 {schema}  {schema_note}\n  \
-step:   group, job, desc, description, labels[], cmd, cmdtype, manifest{{lane,category,test?,mode?,backend?}}, result_manifests[], deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, hint{{}}\n  \
+step:   group, job, desc, description, labels[], cmd, cmdtype, manifest{{lane,category,test?,mode?,backend?}}, result_manifests[], deps[], env{{}}, timeout, jobs_flag, jobs_env, networkonly, engine_only, delegated_children, hint{{}}\n  \
 hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,\n          classification(\"cpu-bound\"|\"latency-bound\"|\"light\"), preferred_inner_jobs\n  \
-top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag, default_jobs_env\n  \
+top:    include[{{path,namespace,after[]?}}], description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag, default_jobs_env\n  \
 desc = short label; description = long-form docs (often multi-line, great in YAML)\n  \
 cmdtype: unknown (default) | make | cargo-build | cargo-test | cargo-nextest |\n          generic-dash-j-command | generic-with-flag; known types append width arguments or set\n          DAGRUN_EXTRA_ARGS for an unquoted placement in a compound command\n  \
 jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"->\"-j4\", \"--jobs=\"->\"--jobs=4\"\n  \
           empty/whitespace means a fixed self-managed width: it cannot be rewritten or swept\n  \
 jobs_env: environment variable receiving the same admitted width; absent inherits default_jobs_env\n  \
           (normally resolved from ${JOBS_ENV_ENV})\n  \
-yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi-line block-scalar descriptions); the `yaml` subcommand emits YAML\n\n\
+yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi-line block-scalar descriptions); the `yaml` subcommand emits YAML\n  \
+include: load-time namespaced file composition; optional after[] wires outer prerequisites\n\n\
+delegated_children: opt into child dagrun; preserves cgroups or names an unboxed fallback\n\n\
 {what}\n  \
 - concurrent scheduling honoring deps + resource caps, ordered by the chosen --planner\n  \
   ({maxsteps} bounds active DAG steps; {maxcpus} caps each width + outer CPU bandwidth)\n  \
@@ -370,39 +375,123 @@ fn run_help(c: &Palette) -> String {
         "run --dag FILE [options]",
         "Run a DAG (exit 0 iff every step passes). Boxed per-step with cgroup-v2 by default.",
         &[
-            ("--dag FILE", "DAG file to run ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]"),
-            ("-s, --max-steps N", "maximum active DAG steps; defaults to the effective --max-cpus budget; a bare -sN also works"),
-            ("-j, --max-cpus N", "outer CPU-bandwidth limit and maximum width of any one runner-controlled step (default: effective container/affinity budget tightened by the shared 90% slice); a bare -jN also works"),
-            ("--cores/--cpuset/--pin K", "hard CPU PINNING, opt-in: reserve K least-busy free cores and require an exact cgroup cpuset; fail closed when unavailable"),
-            ("--max-mem SPEC", "RAM budget (e.g. 8G): becomes the outer scope's MemoryMax (it can tighten the derived host boundary, never widen it) and derives a conservative model-based --max-steps ceiling; with explicit --max-steps, the tighter value wins"),
-            ("--selected TAG[,TAG...]", "run the named step(s) and every dependency they require"),
-            ("--labels LABEL[,LABEL...]", "run every step carrying any named label and every dependency they require; labels are independent of group.job tags"),
-            ("--ignore-selected-deps", "valid only with --selected: run only the named steps and drop dependency edges outside the selection"),
-            ("--args STRING", "replace the opt-in {args} token in selected step commands"),
-            ("--stress N", "duplicate the graph into N disconnected components; --max-steps controls active copies, --max-cpus caps each width/shared bandwidth, and expansion is limited to 100,000 generated nodes"),
-            ("--perf-dir DIR", "write per-step + whole-run resource-usage CSVs into DIR"),
-            ("--profile-timeseries DURATION", "opt-in cgroup CPU/thread trace interval (50ms..10s); writes traces/<run_id>.csv"),
-            ("--no-profile", "disable the default auto-logging profile store for this run"),
-            ("--profile", "after the run, print a per-step profile (timing/memory) table"),
-            ("--planner NAME", "dispatch-ordering planner: greedy-lpt (default) | critical-path | cpa"),
+            (
+                "--dag FILE",
+                "DAG file to run; .yaml/.yml load as YAML, else JSON; files may use namespaced include fragments ('-' = self-contained JSON stdin only) [required]",
+            ),
+            (
+                "-s, --max-steps N",
+                "maximum active DAG steps; defaults to the effective --max-cpus budget; a bare -sN also works",
+            ),
+            (
+                "-j, --max-cpus N",
+                "outer CPU-bandwidth limit and maximum width of any one runner-controlled step (default: effective container/affinity budget tightened by the shared 90% slice); a nested run is clamped to its delegated parent's effective CPU envelope; a bare -jN also works",
+            ),
+            (
+                "--cores/--cpuset/--pin K",
+                "hard CPU PINNING, opt-in: reserve K least-busy free cores and require an exact cgroup cpuset; fail closed when unavailable; a nested request wider than its delegated parent's CPU envelope is refused",
+            ),
+            (
+                "--max-mem SPEC",
+                "RAM budget (e.g. 8G): becomes the outer scope's MemoryMax (it can tighten the derived host boundary, never widen it) and derives a conservative model-based --max-steps ceiling; with explicit --max-steps, the tighter value wins. A nested run inherits its delegated parent's finite ceiling as the default and upper bound, enforced at the nested aggregate root",
+            ),
+            (
+                "--selected TAG[,TAG...]",
+                "run the named step(s) and every dependency they require",
+            ),
+            (
+                "--labels LABEL[,LABEL...]",
+                "run every step carrying any named label and every dependency they require; labels are independent of group.job tags",
+            ),
+            (
+                "--ignore-selected-deps",
+                "valid only with --selected: run only the named steps and drop dependency edges outside the selection",
+            ),
+            (
+                "--args STRING",
+                "replace the opt-in {args} token in selected step commands",
+            ),
+            (
+                "--stress N",
+                "duplicate the graph into N disconnected components; --max-steps controls active copies, --max-cpus caps each width/shared bandwidth, and expansion is limited to 100,000 generated nodes",
+            ),
+            (
+                "--perf-dir DIR",
+                "write per-step + whole-run resource-usage CSVs into DIR",
+            ),
+            (
+                "--profile-timeseries DURATION",
+                "opt-in cgroup CPU/thread trace interval (50ms..10s); writes traces/<run_id>.csv",
+            ),
+            (
+                "--no-profile",
+                "disable the default auto-logging profile store for this run",
+            ),
+            (
+                "--profile",
+                "after the run, print a per-step profile (timing/memory) table",
+            ),
+            (
+                "--planner NAME",
+                "dispatch-ordering planner: greedy-lpt (default) | critical-path | cpa",
+            ),
             ("--show-plan", "before running, print the scheduled plan"),
-            ("--no-profile-feedback", "do NOT read the profile store to refine time/RAM estimates"),
+            (
+                "--no-profile-feedback",
+                "do NOT read the profile store to refine time/RAM estimates",
+            ),
             (
                 "--profile-memory-feedback",
                 "OPT-IN: derive rss_baseline_bytes from the store's UNCENSORED peaks only",
             ),
-            ("--profile-sync BACKEND", "download+upload the shared profile summary (for ephemeral CI)"),
-            ("--profile-sync-direction D", "both (default) | download | upload"),
-            ("-k, --keep-going", "after failure, continue independent work; skip failed dependents"),
-            ("--no-color", "suppress ANSI colour in failure output. The searchable DAGRUN STEP ERROR marker still prints: it is what a plain log is grepped for. Colour is also off automatically when NO_COLOR is set or stdout is not a terminal"),
-            ("--run-timeout SECONDS", "OUTER wall budget for the WHOLE run; cuts in-flight steps and still reports"),
-            ("--admission [WAIT_S]", "HOST-WIDE memory admission (opt-in): reserve --max-mem against a durable ledger every runner on the host shares. GRANT / QUEUE (says how many holders are ahead) / REFUSE (says the number to ask for). WAIT_S = how long to wait while queued (default 0 = report and exit 4; at most 86400). Requires --max-mem"),
-            ("--resource-caps-path FILE", "make resource_caps apply across runner processes through this existing state file; otherwise caps are process-local. $DAGRUN_RESOURCE_CAPS_PATH is the secondary route and the flag wins"),
-            ("cmdtype (DAG field)", "unknown (default) | make | cargo-build | cargo-test | cargo-nextest | generic-dash-j-command | generic-with-flag; known types append width arguments unless cmd places unquoted $DAGRUN_EXTRA_ARGS or ${DAGRUN_EXTRA_ARGS}"),
-            ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
-            ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
-            ("--allow-unwise-nest-dagruns", "allow a reviewed temporary nested dagrun exception; flatten the caller instead"),
-            ("--small-default-cap", "compatibility no-op (small caps are already on by default)"),
+            (
+                "--profile-sync BACKEND",
+                "download+upload the shared profile summary (for ephemeral CI)",
+            ),
+            (
+                "--profile-sync-direction D",
+                "both (default) | download | upload",
+            ),
+            (
+                "-k, --keep-going",
+                "after failure, continue independent work; skip failed dependents",
+            ),
+            (
+                "--no-color",
+                "suppress ANSI colour in failure output. The searchable DAGRUN STEP ERROR marker still prints: it is what a plain log is grepped for. Colour is also off automatically when NO_COLOR is set or stdout is not a terminal",
+            ),
+            (
+                "--run-timeout SECONDS",
+                "OUTER wall budget for the WHOLE run; cuts in-flight steps and still reports",
+            ),
+            (
+                "--admission [WAIT_S]",
+                "HOST-WIDE memory admission (opt-in): reserve --max-mem, or the finite inherited delegated memory ceiling, against a durable ledger every runner on the host shares. GRANT / QUEUE (says how many holders are ahead) / REFUSE (says the number to ask for). WAIT_S = how long to wait while queued (default 0 = report and exit 4; at most 86400)",
+            ),
+            (
+                "--resource-caps-path FILE",
+                "make resource_caps apply across runner processes through this existing state file; otherwise caps are process-local. $DAGRUN_RESOURCE_CAPS_PATH is the secondary route and the flag wins",
+            ),
+            (
+                "cmdtype (DAG field)",
+                "unknown (default) | make | cargo-build | cargo-test | cargo-nextest | generic-dash-j-command | generic-with-flag; known types append width arguments unless cmd places unquoted $DAGRUN_EXTRA_ARGS or ${DAGRUN_EXTRA_ARGS}",
+            ),
+            (
+                "--allow-cgroup-failure",
+                "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring",
+            ),
+            (
+                "--unsafe-no-cgroups",
+                "DELIBERATELY skip cgroup boxing entirely (unsafe)",
+            ),
+            (
+                "--allow-unwise-nest-dagruns",
+                "allow a reviewed temporary nested dagrun exception; flatten the caller instead",
+            ),
+            (
+                "--small-default-cap",
+                "compatibility no-op (small caps are already on by default)",
+            ),
             (
                 "--cpu-timeout-multiplier FACTOR",
                 "scale every step's canonical cpu_timeout by FACTOR on THIS platform \
@@ -450,24 +539,78 @@ width and never enter the scaling model. In target-time mode they run after pass
         "sweep --dag FILE [--target-time DURATION] [--step TAG] [--jobs WIDTHS] [options]",
         summary,
         &[
-            ("--dag FILE", "DAG file ('-' = stdin); .yaml/.yml load as YAML, otherwise JSON [required]"),
-            ("--step TAG", "measure only this group.job step; required without --target-time, optional otherwise"),
-            ("--jobs WIDTHS", "initial inner-parallelism widths: bare N means every width 1..N; LO..HI is an inclusive dense range.\nTarget mode also accepts sparse comma/range lists such as 1,2,4,8 or 1,2,4..8.\nOmit only in target mode to use the topology grid described above."),
-            ("--target-time DURATION", "select graph-wide multi-pass mode with this soft wall-time allowance (bare seconds or ms/s/m/h suffix).\nPass 1 and every started pass finish; this is not a timeout."),
-            ("--repeat K", "run every width K times; persist every sample and show the fastest wall time\nin the terminal table (default: 1)"),
-            ("--output-dir DIR", "sweep artifact directory: append whole-run and per-step CSVs, refresh\nscaling_model_*.json and profile_report.html after success, and place opt-in traces\nand profiler captures below DIR. Overrides $DAGRUN_PROFILE_DIR and ./.dagrun/profiles/."),
-            ("--perf-dir DIR", "backward-compatible alias for --output-dir; it does not mean perf(1)\nand does not redirect terminal or child-process output"),
-            ("--report-html FILE", "write the standalone interactive report to FILE instead of\n<output-dir>/profile_report.html; failure at an explicitly requested FILE makes the sweep\nunsuccessful after preserving its measurements"),
-            ("--no-report", "do not generate the interactive HTML report after this sweep"),
-            ("--profile-timeseries DURATION", "OPT-IN: sample each trial's cgroup CPU/thread activity every DURATION\n(50ms..10s); requires active cgroup-v2 and writes traces/<run_id>.csv in the profile store"),
-            ("--perf-record", "OPT-IN: after the uninstrumented sweep, run one separate perf-record trial\nat each selected step's economic plateau width"),
-            ("--perf-window DURATION", "record only a centred perf window of this duration; implies --perf-record.\nWithout it, perf records the centred 80% of the expected trial wall time"),
-            ("--wprof-window DURATION", "OPT-IN, repeatable: run one separate centred wprof capture per occurrence.\nRepeated occurrences currently must use the same positive duration"),
-            ("--profiler-sudo", "explicitly prefix perf/wprof with 'sudo -n'; privilege escalation is never automatic"),
-            ("--no-profile", "write no local profile CSVs, model, report, time-series trace, or profiler capture"),
-            ("--allow-cgroup-failure", "run UNBOXED with a warning when cgroup-v2 is unavailable; cgroup CPU, memory,\nthrottling, and time-series evidence will be unavailable"),
-            ("--unsafe-no-cgroups", "DELIBERATELY run unboxed even when cgroup-v2 is available; profiling is less complete\nand --profile-timeseries cannot be used"),
-            ("-v", "-v shows each trial's captured final line; -vv streams child stdout/stderr"),
+            (
+                "--dag FILE",
+                "DAG file; .yaml/.yml load as YAML, else JSON; files may use namespaced include fragments ('-' = self-contained JSON stdin only) [required]",
+            ),
+            (
+                "--step TAG",
+                "measure only this group.job step; required without --target-time, optional otherwise",
+            ),
+            (
+                "--jobs WIDTHS",
+                "initial inner-parallelism widths: bare N means every width 1..N; LO..HI is an inclusive dense range.\nTarget mode also accepts sparse comma/range lists such as 1,2,4,8 or 1,2,4..8.\nOmit only in target mode to use the topology grid described above. Delegated sweeps refuse explicit widths beyond the inherited CPU envelope.",
+            ),
+            (
+                "--target-time DURATION",
+                "select graph-wide multi-pass mode with this soft wall-time allowance (bare seconds or ms/s/m/h suffix).\nPass 1 and every started pass finish; this is not a timeout.",
+            ),
+            (
+                "--repeat K",
+                "run every width K times; persist every sample and show the fastest wall time\nin the terminal table (default: 1)",
+            ),
+            (
+                "--output-dir DIR",
+                "sweep artifact directory: append whole-run and per-step CSVs, refresh\nscaling_model_*.json and profile_report.html after success, and place opt-in traces\nand profiler captures below DIR. Overrides $DAGRUN_PROFILE_DIR and ./.dagrun/profiles/.",
+            ),
+            (
+                "--perf-dir DIR",
+                "backward-compatible alias for --output-dir; it does not mean perf(1)\nand does not redirect terminal or child-process output",
+            ),
+            (
+                "--report-html FILE",
+                "write the standalone interactive report to FILE instead of\n<output-dir>/profile_report.html; failure at an explicitly requested FILE makes the sweep\nunsuccessful after preserving its measurements",
+            ),
+            (
+                "--no-report",
+                "do not generate the interactive HTML report after this sweep",
+            ),
+            (
+                "--profile-timeseries DURATION",
+                "OPT-IN: sample each trial's cgroup CPU/thread activity every DURATION\n(50ms..10s); requires active cgroup-v2 and writes traces/<run_id>.csv in the profile store",
+            ),
+            (
+                "--perf-record",
+                "OPT-IN: after the uninstrumented sweep, run one separate perf-record trial\nat each selected step's economic plateau width",
+            ),
+            (
+                "--perf-window DURATION",
+                "record only a centred perf window of this duration; implies --perf-record.\nWithout it, perf records the centred 80% of the expected trial wall time",
+            ),
+            (
+                "--wprof-window DURATION",
+                "OPT-IN, repeatable: run one separate centred wprof capture per occurrence.\nRepeated occurrences currently must use the same positive duration",
+            ),
+            (
+                "--profiler-sudo",
+                "explicitly prefix perf/wprof with 'sudo -n'; privilege escalation is never automatic",
+            ),
+            (
+                "--no-profile",
+                "write no local profile CSVs, model, report, time-series trace, or profiler capture",
+            ),
+            (
+                "--allow-cgroup-failure",
+                "run UNBOXED with a warning when cgroup-v2 is unavailable; cgroup CPU, memory,\nthrottling, and time-series evidence will be unavailable",
+            ),
+            (
+                "--unsafe-no-cgroups",
+                "DELIBERATELY run unboxed even when cgroup-v2 is available; profiling is less complete\nand --profile-timeseries cannot be used",
+            ),
+            (
+                "-v",
+                "-v shows each trial's captured final line; -vv streams child stdout/stderr",
+            ),
             ("-h, --help", "show this help and exit"),
         ],
     )
@@ -479,7 +622,10 @@ fn plan_help(c: &Palette) -> String {
         "plan --dag FILE [options]",
         "Show learned estimates + the scheduled order. Does NOT run anything.",
         &[
-            ("--dag FILE", "DAG file ('-' = stdin) [required]"),
+            (
+                "--dag FILE",
+                "DAG file; .yaml/.yml load as YAML, else JSON; files may use namespaced include fragments ('-' = self-contained JSON stdin only) [required]",
+            ),
             (
                 "--planner NAME",
                 "greedy-lpt (default) | critical-path | cpa",
@@ -520,7 +666,7 @@ fn simple_help(c: &Palette, command: &str) -> String {
         &[
             (
                 "--dag FILE",
-                "DAG file to read ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]",
+                "DAG file to read; .yaml/.yml load as YAML, else JSON; files may use namespaced include fragments ('-' = self-contained JSON stdin only) [required]",
             ),
             ("-h, --help", "show this help and exit"),
         ],
@@ -533,8 +679,14 @@ fn summary_help(c: &Palette) -> String {
         "summary <action> [options]",
         "Build / merge / plan / stats the mergeable profile summary.",
         &[
-            ("build", "build a summary from a profile store (--perf-dir DIR, --out FILE, --reservoir-cap N)"),
-            ("merge", "merge one or more summary JSON files (--out FILE, --reservoir-cap N)"),
+            (
+                "build",
+                "build a summary from a profile store (--perf-dir DIR, --out FILE, --reservoir-cap N)",
+            ),
+            (
+                "merge",
+                "merge one or more summary JSON files (--out FILE, --reservoir-cap N)",
+            ),
             ("plan", "build a plan from a summary JSON and DAG"),
             ("stats", "print bucket/sample stats for a summary FILE"),
             ("-h, --help", "show this help and exit"),
@@ -588,7 +740,7 @@ fn summary_plan_help(c: &Palette) -> String {
             ("--summary FILE", "summary JSON file [required]"),
             (
                 "--dag FILE",
-                "DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]",
+                "DAG file; .yaml/.yml load as YAML, else JSON; files may use namespaced include fragments ('-' = self-contained JSON stdin only) [required]",
             ),
             (
                 "--planner NAME",
@@ -745,7 +897,7 @@ fn parse_box_args(rest: &[String]) -> Result<BoxArgs, String> {
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "-q" | "--quiet" => a.quiet = true,
             other if other.starts_with('-') => {
-                return Err(format!("unrecognized argument: {other}"))
+                return Err(format!("unrecognized argument: {other}"));
             }
             _ => {
                 a.command.extend_from_slice(&rest[i..]);
@@ -813,6 +965,7 @@ fn box_config(
             },
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: timeout_s,
             // THE CPU CEILING IS DERIVED, NOT DEFAULTED. Left unset, the step would inherit the
             // deliberately tiny 10-second per-step CPU floor, which exists as a forcing function
@@ -963,23 +1116,7 @@ fn load(dag_arg: &str) -> Result<DagConfig, LoadError> {
             .map_err(|e| LoadError(format!("{e}")))?;
         return dag_from_json(&buf).map_err(|e| load_parse_error("<stdin>", e));
     }
-    let text = std::fs::read_to_string(Path::new(dag_arg)).map_err(|e| {
-        // Match Python's message shape: "[Errno 2] No such file or directory: 'path'".
-        LoadError(format!("{e}: '{dag_arg}'"))
-    })?;
-    // Auto-detect the interchange format by file extension: .yaml/.yml -> YAML, else JSON.
-    let parsed = if is_yaml_path(dag_arg) {
-        dag_from_yaml(&text)
-    } else {
-        dag_from_json(&text)
-    };
-    parsed.map_err(|e| load_parse_error(dag_arg, e))
-}
-
-/// Whether a `--dag` path names a YAML file (case-insensitive `.yaml`/`.yml`).
-fn is_yaml_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".yaml") || lower.ends_with(".yml")
+    dag_from_path(Path::new(dag_arg)).map_err(|e| LoadError(e.to_string()))
 }
 
 struct LoadError(String);
@@ -1348,11 +1485,15 @@ fn set_run_max_cpus(a: &mut RunArgs, raw: &str, source: &'static str) -> Result<
 /// Resolve the maximum total CPU-core budget for the run. The ambient container/affinity budget
 /// is the default; an opt-in hard cpuset is always a tighter upper bound.
 fn select_max_cpus(a: &RunArgs) -> i64 {
+    select_max_cpus_bounded(a, None)
+}
+
+fn select_max_cpus_bounded(a: &RunArgs, inherited_max_cpus: Option<i64>) -> i64 {
     let requested = a
         .max_cpus
         .unwrap_or_else(|| container_core_budget().min(aggregate_slice_max_cpus()))
         .max(1);
-    match a.cores {
+    let requested = match a.cores {
         Some(cores) if requested > cores => {
             eprintln!(
                 "{PROG}: --cores {cores} is tighter than --max-cpus {requested}; using total \
@@ -1361,7 +1502,104 @@ fn select_max_cpus(a: &RunArgs) -> i64 {
             cores
         }
         _ => requested,
+    };
+    match inherited_max_cpus {
+        Some(parent) if requested > parent => {
+            eprintln!(
+                "{PROG}: requested/default --max-cpus {requested} exceeds inherited delegated \
+                 CPU ceiling {parent}; using total CPU limit {parent}"
+            );
+            parent
+        }
+        _ => requested,
     }
+}
+
+fn inherited_delegated_limits() -> Result<Option<DelegatedResourceLimits>, String> {
+    if cfg!(test) {
+        // The repository's own Rust test binary may itself run as one delegated validation node.
+        // That outer envelope is containment for the harness, not input to unit cases that
+        // exercise fresh CLI semantics. Real delegated behavior is covered by integration
+        // smokes, which build the ordinary (non-cfg(test)) library and binary.
+        return Ok(None);
+    }
+    let Some(root) = delegated_cgroup_root()
+        .map_err(|error| format!("invalid ${DELEGATED_CGROUP_ENV}: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let limits = delegated_resource_limits(&root);
+    let mut unknown = Vec::new();
+    if !limits.cpu_known {
+        unknown.push("cpu.max");
+    }
+    if !limits.memory_known {
+        unknown.push("memory.max");
+    }
+    if unknown.is_empty() {
+        Ok(Some(limits))
+    } else {
+        Err(format!(
+            "delegated parent resource envelope has unreadable/malformed {}",
+            unknown.join(", ")
+        ))
+    }
+}
+
+fn select_max_mem_bytes(a: &RunArgs, inherited_max_mem_bytes: Option<i64>) -> Option<i64> {
+    let raw = a.max_mem.as_deref().filter(|value| !value.is_empty());
+    let requested = requested_max_mem_bytes(raw);
+    let Some(parent) = inherited_max_mem_bytes else {
+        return requested;
+    };
+    if raw.is_some() && requested.is_none() {
+        if raw.and_then(parse_size).is_none() {
+            eprintln!(
+                "{PROG}: could not parse --max-mem {:?}; ignoring that request but retaining \
+                 inherited delegated memory ceiling {parent} bytes",
+                raw.unwrap_or("")
+            );
+            return Some(parent);
+        }
+        // Preserve the existing non-positive refusal in select_max_steps_with_budget.
+        return None;
+    }
+    let Some(requested) = requested else {
+        eprintln!(
+            "{PROG}: inherited delegated memory ceiling {parent} bytes is the effective default \
+             --max-mem budget"
+        );
+        return Some(parent);
+    };
+    if requested > parent {
+        eprintln!(
+            "{PROG}: --max-mem {requested} bytes exceeds inherited delegated memory ceiling \
+             {parent} bytes; using {parent} bytes"
+        );
+        Some(parent)
+    } else {
+        Some(requested)
+    }
+}
+
+fn uses_inherited_memory_budget(a: &RunArgs, inherited_max_mem_bytes: Option<i64>) -> bool {
+    let Some(parent) = inherited_max_mem_bytes else {
+        return false;
+    };
+    let requested = requested_max_mem_bytes(a.max_mem.as_deref().filter(|value| !value.is_empty()));
+    requested.is_none_or(|requested| requested > parent)
+}
+
+fn inherited_cores_error(a: &RunArgs, inherited_max_cpus: Option<i64>) -> Option<String> {
+    let (Some(cores), Some(parent)) = (a.cores, inherited_max_cpus) else {
+        return None;
+    };
+    (cores > parent).then(|| {
+        format!(
+            "--cores {cores} requests an exact reservation wider than the inherited delegated \
+             CPU ceiling {parent}; refusing"
+        )
+    })
 }
 
 // Choose the outer active-step ceiling (`-s`). `--max-mem` independently derives a conservative
@@ -1371,12 +1609,25 @@ fn apply_memory_step_ceiling(base: i64, memory_steps: i64) -> i64 {
     base.min(memory_steps)
 }
 
+#[cfg(test)]
 fn select_max_steps(cfg: &DagConfig, a: &RunArgs, max_cpus: i64) -> i64 {
+    select_max_steps_with_budget(cfg, a, max_cpus, None, false)
+}
+
+fn select_max_steps_with_budget(
+    cfg: &DagConfig,
+    a: &RunArgs,
+    max_cpus: i64,
+    effective_max_mem_bytes: Option<i64>,
+    inherited_memory_budget: bool,
+) -> i64 {
     let base = a.max_steps.unwrap_or(max_cpus);
     let max_mem = a.max_mem.as_deref().filter(|s| !s.is_empty());
-    if let Some(mm) = max_mem {
-        match parse_size(mm) {
+    if max_mem.is_some() || effective_max_mem_bytes.is_some() {
+        let parsed = effective_max_mem_bytes.or_else(|| max_mem.and_then(parse_size));
+        match parsed {
             None => {
+                let mm = max_mem.unwrap_or("");
                 eprintln!(
                     "{PROG}: could not parse --max-mem '{mm}'; falling back to --max-steps \
                      {base}"
@@ -1384,17 +1635,30 @@ fn select_max_steps(cfg: &DagConfig, a: &RunArgs, max_cpus: i64) -> i64 {
                 return base;
             }
             Some(budget) => {
-                let (memory_steps, footprint) = jobs_for_budget(cfg, budget);
+                let mut sized_cfg = cfg.clone();
+                if inherited_memory_budget {
+                    sized_cfg.mem_cap_floor_bytes = sized_cfg.mem_cap_floor_bytes.min(budget);
+                }
+                let (memory_steps, footprint) = jobs_for_budget(&sized_cfg, budget);
                 if memory_steps == 0 {
+                    let budget_source = match max_mem.filter(|raw| parse_size(raw) == Some(budget))
+                    {
+                        Some(raw) => format!("--max-mem {raw}"),
+                        None => format!("effective delegated --max-mem {budget} bytes"),
+                    };
                     eprintln!(
-                        "{PROG}: --max-mem {mm}: REFUSED — minimum runnable footprint \
+                        "{PROG}: {budget_source}: REFUSED — minimum runnable footprint \
                          {footprint} bytes cannot fit safely within budget {budget} bytes"
                     );
                     return 0;
                 }
                 let selected = apply_memory_step_ceiling(base, memory_steps);
+                let budget_source = match max_mem.filter(|raw| parse_size(raw) == Some(budget)) {
+                    Some(raw) => format!("--max-mem {raw}"),
+                    None => format!("effective delegated --max-mem {budget} bytes"),
+                };
                 eprintln!(
-                    "{PROG}: --max-mem {mm} -> modeled memory ceiling {memory_steps} active steps \
+                    "{PROG}: {budget_source} -> modeled memory ceiling {memory_steps} active steps \
                      (worst-case {footprint} bytes fits budget {budget} bytes); base active-step \
                      ceiling {base}; final --max-steps {selected}"
                 );
@@ -1410,9 +1674,9 @@ fn select_max_steps(cfg: &DagConfig, a: &RunArgs, max_cpus: i64) -> i64 {
                 if memory_steps == ncpu && !modeled {
                     eprintln!(
                         "{PROG}: note: no runnable step has a positive hard/RSS/default memory \
-cap, so the modeled footprint is only the mem_cap_floor_bytes floor ({} bytes) and --max-mem did \
+cap, so the modeled footprint is only the mem_cap_floor_bytes floor ({} bytes) and {budget_source} did \
 not throttle (modeled memory ceiling {memory_steps} = CPU count; final --max-steps {selected})",
-                        cfg.mem_cap_floor_bytes,
+                        sized_cfg.mem_cap_floor_bytes,
                     );
                 }
                 return selected;
@@ -1509,6 +1773,61 @@ fn resolve_cgroups(
             "{PROG}: WARNING: DELIBERATELY UNBOXED via --unsafe-no-cgroups: per-step \
              memory/CPU-bandwidth/pids caps are NOT enforced; the per-step CPU-time budget uses only a best-effort procfs process-group floor. This is an explicit, reviewable opt-out of \
              cgroup resource boxing (not a capability fallback)."
+        );
+        return Ok(None);
+    }
+    let delegated = match delegated_cgroup_root() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("{PROG}: ERROR: invalid ${DELEGATED_CGROUP_ENV}: {error}.");
+            return Err(3);
+        }
+    };
+    if let Some(root) = delegated {
+        let mut manager =
+            Cgroups::from_delegated_root_with_limits(root.clone(), max_cpus, max_mem_bytes);
+        if manager.enabled() {
+            eprintln!(
+                "{PROG}: cgroup boxing ACTIVE in parent-owned delegated step root {}; the outer \
+                 scheduler retains subtree teardown ownership.",
+                root.display()
+            );
+            return Ok(Some(Arc::new(manager) as Arc<dyn CgroupManager>));
+        }
+        if let Err(error) = manager.restore_nested_coordinator_now() {
+            eprintln!(
+                "{PROG}: ERROR: failed nested cgroup setup also failed to restore the scheduler \
+                 to its prior delegated cgroup ({error}); no step will be started."
+            );
+            return Err(3);
+        }
+        if allow_failure {
+            eprintln!(
+                "{PROG}: warning: delegated root {} could not be subdivided; running inside the \
+                 parent-owned boundary without inner per-step cgroups \
+                 (--allow-cgroup-failure).",
+                root.display()
+            );
+            return Ok(None);
+        }
+        eprintln!(
+            "{PROG}: ERROR: delegated root {} could not establish inner per-step cgroups.",
+            root.display()
+        );
+        return Err(3);
+    }
+    if let Some(value) = std::env::var_os(DELEGATED_UNBOXED_ENV) {
+        if value != "1" || std::env::var_os("DAGRUN_OUTER_RUN").is_none() {
+            eprintln!(
+                "{PROG}: ERROR: invalid ${DELEGATED_UNBOXED_ENV}: expected exact value '1' \
+                 from an outer delegated_children step."
+            );
+            return Err(3);
+        }
+        eprintln!(
+            "{PROG}: WARNING: reviewed uncontained nested execution via \
+             ${DELEGATED_UNBOXED_ENV}=1; the outer scheduler has no cgroup subtree to delegate, \
+             so this run uses process-group/procfs fallback teardown and accounting."
         );
         return Ok(None);
     }
@@ -1754,19 +2073,17 @@ fn validate_planner(value: String) -> Result<String, String> {
 
 // Apply censoring-aware profile memory feedback, reporting every decision.
 //
-// OFF unless the caller asked for it. The default plan-time feedback already refines
-// `rss_baseline_bytes` from recorded peaks WITHOUT asking what those peaks were measured under;
-// this path refuses to learn a smaller number from a peak that met its ceiling, which is a
-// different and stricter contract, so it is a separate opt-in rather than a change of meaning for
-// the existing one. Every step the store knows about is reported, including the ones that did NOT
-// move and why, because otherwise "the cap did not change" and "the store had nothing usable to
-// say" look identical from the outside.
+// OFF unless the caller asked for it. Default feedback treats an authored `rss_baseline_bytes` as
+// a floor: it may raise that value, but cannot shrink the next run's enforced cap from sparse
+// history. This path is the separate opt-in allowed to lower the authored value, and only from
+// enough uncensored observations plus a margin. Every step the store knows about is reported,
+// including the ones that did NOT move and why, because otherwise "the cap did not change" and
+// "the store had nothing usable to say" look identical from the outside.
 //
 // `cfg` is the config the ordinary plan has ALREADY been applied to and `authored` is the same
-// config before that, which is what lets a decline mean "no learned estimate" rather than "fall
-// back to the censoring-blind one": every step this path does not estimate drops that number for
-// the LARGER of the baseline its author wrote and the peak the store proves it has already
-// reached, so the unsafe estimate goes without the censored evidence going with it.
+// config before that, which is what lets a decline restore the LARGER of the baseline its author
+// wrote and the peak the store proves it has already reached. That also replaces a larger
+// ordinary-feedback estimate only when this stricter path has enough evidence to do so.
 //
 // `--no-profile-feedback` turns the store reader off entirely, which makes this flag a no-op.
 // That combination is legal but empty, and it is announced rather than obeyed in silence: a
@@ -2061,13 +2378,25 @@ fn planning_budgets(
     max_mem: Option<&str>,
     max_cpus: Option<i64>,
 ) -> (Option<i64>, Option<i64>) {
+    planning_budgets_with_memory(planner, max_mem, max_cpus, None)
+}
+
+fn planning_budgets_with_memory(
+    planner: Planner,
+    max_mem: Option<&str>,
+    max_cpus: Option<i64>,
+    effective_max_mem_bytes: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
     let core_budget = match max_cpus {
         Some(value) => Some(value.max(1)),
         None if planner == Planner::Cpa => Some(container_core_budget().max(1)),
         None => None,
     };
     let mem_budget = (planner == Planner::Cpa)
-        .then(|| max_mem.filter(|s| !s.is_empty()).and_then(parse_size))
+        .then(|| {
+            effective_max_mem_bytes
+                .or_else(|| max_mem.filter(|s| !s.is_empty()).and_then(parse_size))
+        })
         .flatten();
     (core_budget, mem_budget)
 }
@@ -2353,7 +2682,12 @@ fn stress_footprints(cfg: &DagConfig, n: i64, expanded: bool) -> (i64, i64) {
     (footprint, total)
 }
 
-fn stress_memory_guard(cfg: &DagConfig, n: i64, expanded: bool) -> i32 {
+fn stress_memory_guard(
+    cfg: &DagConfig,
+    n: i64,
+    expanded: bool,
+    run_memory_budget_bytes: Option<i64>,
+) -> i32 {
     let (footprint, total) = stress_footprints(cfg, n, expanded);
     if footprint == i64::MAX || total == i64::MAX {
         let subject = if expanded {
@@ -2367,7 +2701,11 @@ fn stress_memory_guard(cfg: &DagConfig, n: i64, expanded: bool) -> i32 {
         );
         return 2;
     }
-    let Some(budget) = box_mem_budget_bytes() else {
+    let budget = [box_mem_budget_bytes(), run_memory_budget_bytes]
+        .into_iter()
+        .flatten()
+        .min();
+    let Some(budget) = budget else {
         if expanded {
             eprintln!(
                 "{PROG}: --stress {n}: REFUSED — could not read the box memory budget for the \
@@ -2425,12 +2763,12 @@ fn stress_memory_guard(cfg: &DagConfig, n: i64, expanded: bool) -> i32 {
     0
 }
 
-fn stress_guard(cfg: &DagConfig, n: i64) -> i32 {
-    stress_memory_guard(cfg, n, false)
+fn stress_guard_with_budget(cfg: &DagConfig, n: i64, budget: Option<i64>) -> i32 {
+    stress_memory_guard(cfg, n, false, budget)
 }
 
-fn final_stress_guard(cfg: &DagConfig, n: i64) -> i32 {
-    stress_memory_guard(cfg, n, true)
+fn final_stress_guard_with_budget(cfg: &DagConfig, n: i64, budget: Option<i64>) -> i32 {
+    stress_memory_guard(cfg, n, true, budget)
 }
 
 fn print_stress_report(
@@ -3444,6 +3782,85 @@ fn refresh_sweep_report(
     }
 }
 
+fn sweep_memory_error(
+    step: &Step,
+    cfg: &DagConfig,
+    width: i64,
+    inherited_max_mem_bytes: Option<i64>,
+) -> Option<String> {
+    let parent = inherited_max_mem_bytes?;
+    let cap = step_mem_cap_for_inner_jobs_optional(
+        step,
+        Some(width),
+        cfg.mem_cap_factor,
+        cfg.default_step_mem_cap_bytes,
+    );
+    if cap.is_some_and(|bytes| bytes <= parent) {
+        return None;
+    }
+    let modeled = cap.map_or_else(|| "unbounded".to_string(), |bytes| format!("{bytes} bytes"));
+    Some(format!(
+        "step {:?} at width {width} has modeled memory cap {modeled}, exceeding inherited \
+         delegated memory ceiling {parent} bytes",
+        step.tag()
+    ))
+}
+
+fn sweep_cpu_error(max_width: i64, inherited_max_cpus: Option<i64>) -> Option<String> {
+    let parent = inherited_max_cpus?;
+    (max_width > parent).then(|| {
+        format!(
+            "--jobs reaches {max_width}, exceeding inherited delegated CPU ceiling {parent}; \
+             refusing physically throttled measurements"
+        )
+    })
+}
+
+fn selected_fixed_sweep_cpu_error(
+    tag: &str,
+    width: i64,
+    effective_cpus: i64,
+    selected_one: bool,
+) -> Option<String> {
+    (selected_one && width > effective_cpus).then(|| {
+        format!(
+            "selected fixed-width step '{tag}' requests {width} CPUs, exceeding the effective \
+             {effective_cpus}-CPU budget; refusing an empty successful sweep"
+        )
+    })
+}
+
+fn target_sweep_step_resource_error(
+    step: &Step,
+    cfg: &DagConfig,
+    max_width: i64,
+    topology: MachineTopology,
+    inherited_max_mem_bytes: Option<i64>,
+    selected_one: bool,
+) -> Option<String> {
+    if step.skip_reason.is_some() {
+        return None;
+    }
+    let resizable = step_width_is_resizable(step, &cfg.default_jobs_flag, &cfg.default_jobs_env);
+    let width = if resizable {
+        max_width
+    } else {
+        crate::model::effective_cpu_count(step, cfg.default_step_cpu_count)
+            .unwrap_or(topology.logical_cpus)
+            .max(1)
+    };
+    let tag = step.tag();
+    if !resizable {
+        if let Some(error) =
+            selected_fixed_sweep_cpu_error(&tag, width, topology.logical_cpus, selected_one)
+        {
+            return Some(error);
+        }
+    }
+    sweep_memory_error(step, cfg, width, inherited_max_mem_bytes)
+        .map(|error| format!("{error}; refusing"))
+}
+
 /// Per-step parallel-speedup sweep (Feature B).
 fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     if a.target_time.is_some() {
@@ -3477,6 +3894,15 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
             return 2;
         }
     };
+    let inherited = match inherited_delegated_limits() {
+        Ok(limits) => limits,
+        Err(error) => {
+            eprintln!("{PROG}: ERROR: {error}.");
+            return 3;
+        }
+    };
+    let inherited_max_cpus = inherited.and_then(|limits| limits.max_cpus);
+    let inherited_max_mem_bytes = inherited.and_then(|limits| limits.memory_max_bytes);
     let by_tag: HashSet<String> = cfg.steps.iter().map(|s| s.tag()).collect();
     if !by_tag.contains(&step_tag) {
         let mut known: Vec<String> = by_tag.into_iter().collect();
@@ -3496,6 +3922,10 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
             return 2;
         }
     };
+    if let Some(error) = sweep_cpu_error(hi, inherited_max_cpus) {
+        eprintln!("{PROG}: sweep: {error}");
+        return 2;
+    }
     let repeat = a.repeat.max(1);
     let base_index = cfg
         .steps
@@ -3511,14 +3941,18 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         );
         return 2;
     }
+    if let Some(error) = sweep_memory_error(&base, &cfg, hi, inherited_max_mem_bytes) {
+        eprintln!("{PROG}: sweep: {error}; refusing");
+        return 2;
+    }
 
     // Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
     let cgroups = match resolve_cgroups(
         a.allow_cgroup_failure,
         a.unsafe_no_cgroups,
+        inherited_max_cpus,
         None,
-        None,
-        None,
+        inherited_max_mem_bytes,
     ) {
         Ok(cg) => cg,
         Err(code) => return code,
@@ -3633,6 +4067,15 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
             return 2;
         }
     };
+    let inherited = match inherited_delegated_limits() {
+        Ok(limits) => limits,
+        Err(error) => {
+            eprintln!("{PROG}: ERROR: {error}.");
+            return 3;
+        }
+    };
+    let inherited_max_cpus = inherited.and_then(|limits| limits.max_cpus);
+    let inherited_max_mem_bytes = inherited.and_then(|limits| limits.memory_max_bytes);
 
     let order = match stable_topological_order(&cfg.steps) {
         Ok(order) => order,
@@ -3658,7 +4101,12 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         None => order,
     };
 
-    let topology = limit_topology(machine_topology(), container_core_budget());
+    let topology = limit_topology(
+        machine_topology(),
+        inherited_max_cpus.map_or_else(container_core_budget, |parent| {
+            container_core_budget().min(parent)
+        }),
+    );
     let initial_widths = match a.jobs.as_deref() {
         Some(spec) => match parse_widths(spec) {
             Ok(widths) => widths,
@@ -3669,13 +4117,32 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         },
         None => coarse_widths(topology),
     };
+    let max_width = initial_widths.iter().copied().max().unwrap_or(1);
+    if let Some(error) = sweep_cpu_error(max_width, inherited_max_cpus) {
+        eprintln!("{PROG}: sweep: {error}");
+        return 2;
+    }
+    for index in &selected {
+        let step = &cfg.steps[*index];
+        if let Some(error) = target_sweep_step_resource_error(
+            step,
+            &cfg,
+            max_width,
+            topology,
+            inherited_max_mem_bytes,
+            a.step.is_some(),
+        ) {
+            eprintln!("{PROG}: sweep: {error}");
+            return 2;
+        }
+    }
     let repeat = a.repeat.max(1);
     let cgroups = match resolve_cgroups(
         a.allow_cgroup_failure,
         a.unsafe_no_cgroups,
+        inherited_max_cpus,
         None,
-        None,
-        None,
+        inherited_max_mem_bytes,
     ) {
         Ok(cgroups) => cgroups,
         Err(code) => return code,
@@ -3713,6 +4180,7 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
 
     let sweep_start = Instant::now();
     let mut pass = 1usize;
+    let mut skipped_fixed = Vec::new();
     let completed_passes = loop {
         let grid = cumulative_width_grid(&initial_widths, pass);
         let grid_text = grid
@@ -3754,6 +4222,7 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
                         "sweep: {tag}: fixed configured width {max_cpus} exceeds the effective {}-CPU budget; skipping",
                         topology.logical_cpus,
                     );
+                    skipped_fixed.push(tag);
                     continue;
                 }
                 println!(
@@ -3913,7 +4382,13 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         "target-time sweep complete: {completed_passes} pass(es), {sample_number} sample(s), elapsed {:.3}s, target {:.3}s, overrun {:.3}s",
         elapsed_s, target_s, overrun_s,
     );
-    if !has_resizable {
+    if !skipped_fixed.is_empty() {
+        println!(
+            "sweep: fixed nodes skipped without samples because their configured widths exceed \
+             the effective CPU budget: {}",
+            skipped_fixed.join(", ")
+        );
+    } else if !has_resizable {
         println!(
             "sweep: no runnable selected node has a jobs_flag/jobs_env width channel; fixed nodes were handled once"
         );
@@ -4044,17 +4519,22 @@ const ADMISSION_EXIT_CODE: i32 = 4;
 /// Absent `--admission` this is a no-op: admission is opt-in because a durable cross-process
 /// ledger changes WHEN a run may start, and that is not something to switch on underneath existing
 /// callers. The returned reservation must be held for the life of the run.
-fn apply_admission(a: &RunArgs) -> Result<Option<crate::admission::MemoryReservation>, i32> {
+fn apply_admission(
+    a: &RunArgs,
+    effective_max_mem_bytes: Option<i64>,
+) -> Result<Option<crate::admission::MemoryReservation>, i32> {
     let Some(wait_s) = a.admission else {
         return Ok(None);
     };
-    let Some(requested) = requested_max_mem_bytes(a.max_mem.as_deref()) else {
+    let Some(requested) =
+        effective_max_mem_bytes.or_else(|| requested_max_mem_bytes(a.max_mem.as_deref()))
+    else {
         // REQUIRED, not guessed. The only numbers available without --max-mem describe the whole
         // host, so guessing would reserve everything and turn admission into a global mutex --
         // which would look like it was working right up until it deadlocked a CI fleet.
         eprintln!(
-            "{PROG}: run: --admission requires --max-mem: admission reserves a NUMBER against a \
-             host-wide ledger, and the only figure available without it is the whole host."
+            "{PROG}: run: --admission requires --max-mem or a finite inherited delegated memory \
+             ceiling: admission reserves a NUMBER against a host-wide ledger."
         );
         return Err(2);
     };
@@ -4154,10 +4634,25 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         }
     };
 
+    let inherited = match inherited_delegated_limits() {
+        Ok(limits) => limits,
+        Err(error) => {
+            eprintln!("{PROG}: ERROR: {error}.");
+            return 3;
+        }
+    };
+    let inherited_max_cpus = inherited.and_then(|limits| limits.max_cpus);
+    let inherited_max_mem_bytes = inherited.and_then(|limits| limits.memory_max_bytes);
+    if let Some(error) = inherited_cores_error(a, inherited_max_cpus) {
+        eprintln!("{PROG}: run: {error}");
+        return 2;
+    }
+
     // Resolve the CPU target before stress sizing or cgroup bring-up. Stress must charge the
     // runner-controlled widths that can actually execute under this ceiling, while self-managed
     // commands which cannot be clamped must fail before sizing or expansion.
-    let max_cpus = select_max_cpus(a);
+    let max_cpus = select_max_cpus_bounded(a, inherited_max_cpus);
+    let effective_max_mem_bytes = select_max_mem_bytes(a, inherited_max_mem_bytes);
     if let Err(error) = validate_max_cpus_rewrite(&with_args, max_cpus) {
         eprintln!("{PROG}: run: {error}");
         return 2;
@@ -4176,7 +4671,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         // Clamp once before expansion so the guard sizes exactly what gets cloned. The later
         // post-plan clamp is then idempotent rather than warning for every generated copy.
         let stress_sized = cap_config_max_cpus(&with_args, max_cpus);
-        let code = stress_guard(&stress_sized, a.stress);
+        let code = stress_guard_with_budget(&stress_sized, a.stress, effective_max_mem_bytes);
         if code != 0 {
             return code;
         }
@@ -4189,7 +4684,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // going to wait must not be holding a systemd scope while it waits, and a run that is going to
     // be refused should not have created one at all. The reservation is kept alive for the rest of
     // this function, so the ledger reflects this run for exactly as long as it is on the machine.
-    let _memory_admission = match apply_admission(a) {
+    let _memory_admission = match apply_admission(a, effective_max_mem_bytes) {
         Ok(reservation) => reservation,
         Err(code) => return code,
     };
@@ -4202,7 +4697,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         a.unsafe_no_cgroups,
         Some(max_cpus),
         a.run_timeout,
-        requested_max_mem_bytes(a.max_mem.as_deref()),
+        effective_max_mem_bytes,
     ) {
         Ok(cg) => cg,
         Err(code) => return code,
@@ -4248,7 +4743,12 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // The applied cfg (refined hints) feeds both memory-aware --max-steps sizing and the scheduler.
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
     let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
-    let (core_budget, mem_budget) = planning_budgets(planner, a.max_mem.as_deref(), Some(max_cpus));
+    let (core_budget, mem_budget) = planning_budgets_with_memory(
+        planner,
+        a.max_mem.as_deref(),
+        Some(max_cpus),
+        effective_max_mem_bytes,
+    );
     let planning_max_steps = Some(a.max_steps.unwrap_or(max_cpus));
 
     // Profile-artifact SYNC: parse the backend once; DOWNLOAD seeds the planner, UPLOAD (after the
@@ -4305,7 +4805,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // Censoring-aware memory feedback (opt-in), applied AFTER the ordinary plan so it has the last
     // word on rss_baseline_bytes and BEFORE the memory-aware --max-steps sizing that reads it. It
     // is handed the PRE-plan config as well, so a step it declines to estimate goes back to its
-    // authored baseline instead of keeping the censoring-blind one the plan just wrote.
+    // authored baseline (or a larger proven floor) when this stricter path declines to estimate.
     applied = apply_memory_feedback(
         &applied,
         cfg,
@@ -4362,13 +4862,19 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // authored-hint preflight. Re-check the FINAL already-expanded graph directly -- multiplying
     // by stress again would double-count every generated copy. This is the last no-spawn barrier.
     if stress_active {
-        let code = final_stress_guard(cfg, a.stress);
+        let code = final_stress_guard_with_budget(cfg, a.stress, effective_max_mem_bytes);
         if code != 0 {
             return code;
         }
     }
 
-    let max_steps = select_max_steps(cfg, a, max_cpus);
+    let max_steps = select_max_steps_with_budget(
+        cfg,
+        a,
+        max_cpus,
+        effective_max_mem_bytes,
+        uses_inherited_memory_budget(a, inherited_max_mem_bytes),
+    );
     if max_steps < 1 {
         return 2;
     }
@@ -4594,6 +5100,29 @@ fn cmd_pin_run(rest: &[String]) -> i32 {
 
 /// Run the CLI over `argv` (excluding the program name); returns the process exit code.
 pub fn run(argv: &[String]) -> i32 {
+    let restore_failures_before = nested_coordinator_restore_failures();
+    let code = run_inner(argv);
+    let restore_failures_after = nested_coordinator_restore_failures();
+    let checked =
+        restoration_checked_exit_code(code, restore_failures_before, restore_failures_after);
+    if checked != code {
+        eprintln!(
+            "{PROG}: ERROR: nested scheduler cgroup membership could not be restored; refusing \
+             to report a successful invocation"
+        );
+    }
+    checked
+}
+
+fn restoration_checked_exit_code(code: i32, failures_before: u64, failures_after: u64) -> i32 {
+    if code == 0 && failures_after > failures_before {
+        3
+    } else {
+        code
+    }
+}
+
+fn run_inner(argv: &[String]) -> i32 {
     let c = Palette {
         enabled: color_enabled(),
     };
@@ -5996,11 +6525,13 @@ mod tests {
 
         assert_eq!(cmd_sweep(&args, &Palette { enabled: false }), 1);
         assert_eq!(std::fs::read_to_string(&dag).unwrap(), original);
-        assert!(std::fs::read_dir(&output).unwrap().any(|entry| entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("step_profiles_")));
+        assert!(std::fs::read_dir(&output).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("step_profiles_")
+        }));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6034,11 +6565,13 @@ mod tests {
 
         assert_eq!(cmd_sweep(&args, &Palette { enabled: false }), 0);
         assert_eq!(std::fs::read(&report).unwrap(), b"do not overwrite");
-        assert!(std::fs::read_dir(&output).unwrap().any(|entry| entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("step_profiles_")));
+        assert!(std::fs::read_dir(&output).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("step_profiles_")
+        }));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6236,6 +6769,108 @@ mod tests {
 
         args.max_mem = None;
         assert_eq!(select_max_steps(&cfg, &args, 3), 9);
+    }
+
+    #[test]
+    fn delegated_parent_clamps_explicit_run_budgets_and_rejects_wide_cpuset() {
+        let args = parse_run_args(&[
+            "--max-cpus=8".into(),
+            "--max-mem=8G".into(),
+            "--cores=8".into(),
+        ])
+        .unwrap();
+        assert_eq!(select_max_cpus_bounded(&args, Some(2)), 2);
+        assert_eq!(
+            select_max_mem_bytes(&args, Some(2 * 1024_i64.pow(3))),
+            Some(2 * 1024_i64.pow(3))
+        );
+        assert_eq!(
+            inherited_cores_error(&args, Some(2)).as_deref(),
+            Some(
+                "--cores 8 requests an exact reservation wider than the inherited delegated \
+                 CPU ceiling 2; refusing"
+            )
+        );
+
+        let defaults = parse_run_args(&[]).unwrap();
+        assert_eq!(select_max_cpus_bounded(&defaults, Some(2)), 2);
+        assert_eq!(
+            select_max_mem_bytes(&defaults, Some(2 * 1024_i64.pow(3))),
+            Some(2 * 1024_i64.pow(3))
+        );
+        assert!(uses_inherited_memory_budget(
+            &defaults,
+            Some(2 * 1024_i64.pow(3))
+        ));
+        assert!(uses_inherited_memory_budget(
+            &args,
+            Some(2 * 1024_i64.pow(3))
+        ));
+        let tighter = parse_run_args(&["--max-mem=1G".into()]).unwrap();
+        assert!(!uses_inherited_memory_budget(
+            &tighter,
+            Some(2 * 1024_i64.pow(3))
+        ));
+        let invalid = parse_run_args(&["--max-mem=not-a-size".into()]).unwrap();
+        assert_eq!(
+            select_max_mem_bytes(&invalid, Some(2 * 1024_i64.pow(3))),
+            Some(2 * 1024_i64.pow(3))
+        );
+        assert!(sweep_cpu_error(8, Some(2)).is_some());
+        assert!(sweep_cpu_error(2, Some(2)).is_none());
+        assert_eq!(
+            selected_fixed_sweep_cpu_error("g.fixed", 8, 2, true).as_deref(),
+            Some(
+                "selected fixed-width step 'g.fixed' requests 8 CPUs, exceeding the effective \
+                 2-CPU budget; refusing an empty successful sweep"
+            )
+        );
+        assert!(selected_fixed_sweep_cpu_error("g.fixed", 8, 2, false).is_none());
+        let cfg = tiny();
+        assert!(sweep_memory_error(&cfg.steps[0], &cfg, 8, Some(1)).is_some());
+
+        let skipped = dag_from_json(
+            r#"{"steps":[{"group":"g","job":"skipped","cmd":"true","skip_reason":"empty-manifest-bucket","hint":{"hard_mem_max_bytes":8589934592}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            target_sweep_step_resource_error(
+                &skipped.steps[0],
+                &skipped,
+                2,
+                MachineTopology {
+                    physical_cores: 2,
+                    logical_cpus: 2,
+                },
+                Some(1024_i64.pow(3)),
+                false,
+            ),
+            None,
+            "a skipped step cannot violate an inherited budget it never consumes"
+        );
+
+        // The 8 GiB top-level modeling floor is not a claim that an uncharacterized step cannot
+        // run in a deliberately smaller parent. Clamp only that run-level floor for inherited
+        // admission; real per-step caps remain unchanged and still decide whether a step fits.
+        assert_eq!(
+            select_max_steps_with_budget(&cfg, &defaults, 2, Some(2 * 1024_i64.pow(3)), false,),
+            0
+        );
+        assert_eq!(
+            select_max_steps_with_budget(&cfg, &defaults, 2, Some(2 * 1024_i64.pow(3)), true,),
+            2
+        );
+    }
+
+    #[test]
+    fn successful_cli_result_fails_closed_after_coordinator_restore_failure() {
+        assert_eq!(restoration_checked_exit_code(0, 4, 5), 3);
+        assert_eq!(restoration_checked_exit_code(0, 4, 4), 0);
+        assert_eq!(
+            restoration_checked_exit_code(1, 4, 5),
+            1,
+            "an existing command failure remains the primary exit status"
+        );
     }
 
     #[test]

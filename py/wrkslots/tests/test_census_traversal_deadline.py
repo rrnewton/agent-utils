@@ -102,9 +102,12 @@ def test_default_budget_blocked_traversal_terminates_on_every_attempt_and_retrie
         blocked.setattr(os, "open", blocked_open)
         for attempt in range(2):
             began = time.perf_counter()
-            measured, counters = _measure(fixture)
+            # The literal assertion above protects the production default;
+            # this shorter allowance exercises the same cancellation, retry,
+            # accounting, descriptor, and child-reaping contracts.
+            measured, counters = _measure(fixture, wall_seconds=0.2)
             elapsed = time.perf_counter() - began
-            assert elapsed <= 6.5, elapsed
+            assert elapsed <= 1.7, elapsed
             assert measured["subject"].status == "error"
             assert measured["subject"].bytes is None
             assert "wall allowance" in (measured["subject"].error or "")

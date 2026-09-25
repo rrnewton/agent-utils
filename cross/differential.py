@@ -13,6 +13,8 @@ asserts:
 * Every ``.yaml`` fixture is ISOMORPHIC to JSON: loaded in BOTH builds and re-emitted as
   canonical JSON, the bytes match; and each ``examples/NAME.{json,yaml}`` pair loads to the same
   DAG.
+* A shared nested JSON/YAML ``include`` fixture flattens to byte-identical namespaced output,
+  including resource-cap unions and parent-owned ``after`` entry-node wiring.
 * Scalar-resolution PARITY: a battery of adversarial scalars (the YAML "Norway problem",
   octal/underscore/sexagesimal/timestamp tokens, non-finite and overflow floats, and
   out-of-i64-range integers) is loaded in BOTH builds and must yield the SAME accept/reject exit
@@ -356,6 +358,15 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     if extra:
         env.update(extra)
     return env
+
+
+def _inside_delegated_harness() -> bool:
+    """Return whether this differential itself is an outer dagrun delegated child."""
+
+    return bool(
+        os.environ.get("DAGRUN_DELEGATED_CGROUP")
+        or os.environ.get("DAGRUN_DELEGATED_UNBOXED") == "1"
+    )
 
 
 def run(
@@ -1013,6 +1024,198 @@ def compare_yaml_isomorphism(py: list[str], rs: list[str], rep: Report) -> None:
             )
         else:
             rep.ok(plabel)
+
+
+def compare_include_composition(py: list[str], rs: list[str], rep: Report) -> None:
+    """A shared multi-file fixture must flatten identically in both editions.
+
+    It crosses JSON/YAML, nests namespaces, unions caps, rewrites identity fields, and exercises
+    parent-owned ``after`` wiring at both nesting levels.
+    """
+    root = os.path.join(REPO_ROOT, "cross", "include_fixtures", "root.yaml")
+    _static_parity(py, rs, root, "include-composition", rep)
+    po = run(py, ("json", "--dag", root))
+    ro = run(rs, ("json", "--dag", root))
+    if po.returncode != 0 or ro.returncode != 0 or po.stdout != ro.stdout:
+        rep.bad(
+            "include-composition:semantic-shape",
+            f"py={po.returncode}:{po.stderr!r}\nrs={ro.returncode}:{ro.stderr!r}",
+        )
+        return
+    try:
+        flattened: object = json.loads(po.stdout)
+        if not isinstance(flattened, dict):
+            raise TypeError("canonical document is not an object")
+        steps = flattened.get("steps")
+        if not isinstance(steps, list):
+            raise TypeError("canonical document has no steps list")
+        tags = [
+            f"{step['group']}.{step['job']}"
+            for step in steps
+            if isinstance(step, dict)
+            and isinstance(step.get("group"), str)
+            and isinstance(step.get("job"), str)
+        ]
+        expected = [
+            "component.leaf.build.app",
+            "component.test.unit",
+            "component.diagnose.unit",
+            "component.prep.ready",
+            "setup.ready",
+            "publish.all",
+        ]
+        by_tag = {
+            f"{step['group']}.{step['job']}": step
+            for step in steps
+            if isinstance(step, dict)
+            and isinstance(step.get("group"), str)
+            and isinstance(step.get("job"), str)
+        }
+        if (
+            tags != expected
+            or "include" in flattened
+            or flattened.get("resource_caps") != {"browser": 1, "gpu": 2}
+            or by_tag["component.leaf.build.app"].get("deps")
+            != ["component.prep.ready"]
+            or by_tag["component.leaf.build.app"].get("fail_fast_family")
+            != "component.leaf.compile"
+            or by_tag["component.diagnose.unit"].get("deps") != ["setup.ready"]
+            or by_tag["component.prep.ready"].get("deps") != ["setup.ready"]
+            # The parent names one exact internal node.  No synthetic include/completion node or
+            # implicit whole-subgraph barrier may replace or augment this dependency.
+            or by_tag["publish.all"].get("deps") != ["component.test.unit"]
+        ):
+            raise ValueError(f"unexpected flattened graph: {flattened!r}")
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        rep.bad("include-composition:semantic-shape", str(error))
+    else:
+        rep.ok("include-composition:semantic-shape")
+
+    plan_args = ("plan", "--dag", root, "--no-profile-feedback", "--format", "json")
+    pp, rp = run(py, plan_args), run(rs, plan_args)
+    if pp.returncode == rp.returncode == 0 and pp.stdout == rp.stdout:
+        rep.ok("include-composition:plan")
+    else:
+        rep.bad("include-composition:plan", f"py={pp!r}\nrs={rp!r}")
+
+    py_yaml, rs_yaml = run(py, ("yaml", "--dag", root)), run(rs, ("yaml", "--dag", root))
+    if py_yaml.returncode == rs_yaml.returncode == 0:
+        rep.ok("include-composition:yaml")
+    else:
+        rep.bad("include-composition:yaml", f"py={py_yaml!r}\nrs={rs_yaml!r}")
+
+    run_args = (
+        "run",
+        "--dag",
+        root,
+        "--unsafe-no-cgroups",
+        "--no-profile",
+        "--no-profile-feedback",
+        "-q",
+    )
+    pr, rr = run(py, run_args), run(rs, run_args)
+    if pr.returncode == rr.returncode == 0 and _counts(pr.stderr) == _counts(rr.stderr):
+        rep.ok("include-composition:run")
+    else:
+        rep.bad("include-composition:run", f"py={pr!r}\nrs={rr!r}")
+
+    # An outer step may consume one exact nonterminal inside the fragment. Keep one active slot
+    # and rank that consumer ahead of the remaining child terminal: the consumer creates the
+    # marker which the terminal requires. This is deterministic dispatch-order evidence that an
+    # include is not a synthetic completion barrier, without races or wall-clock assertions.
+    exact_root = os.path.join(REPO_ROOT, "cross", "include_fixtures", "exact-edge-root.yaml")
+    exact_args = (
+        "run",
+        "--dag",
+        exact_root,
+        "--unsafe-no-cgroups",
+        "--no-profile",
+        "--no-profile-feedback",
+        "--max-steps",
+        "1",
+        "--planner",
+        "greedy-lpt",
+        "-q",
+    )
+    with tempfile.TemporaryDirectory(prefix="dagrun-include-exact-edge-") as tmp:
+        markers = {
+            "py": os.path.join(tmp, "python-marker"),
+            "rs": os.path.join(tmp, "rust-marker"),
+        }
+        exact_py = run(py, exact_args, {"INCLUDE_EXACT_MARKER": markers["py"]})
+        exact_rs = run(rs, exact_args, {"INCLUDE_EXACT_MARKER": markers["rs"]})
+        if (
+            exact_py.returncode == exact_rs.returncode == 0
+            and all(os.path.isfile(marker) for marker in markers.values())
+            and _counts(exact_py.stderr) == _counts(exact_rs.stderr)
+        ):
+            rep.ok("include-composition:exact-internal-edge-run")
+        else:
+            rep.bad(
+                "include-composition:exact-internal-edge-run",
+                f"py={exact_py!r}\nrs={exact_rs!r}\nmarkers={markers!r}",
+            )
+    invalid_dir = os.path.join(REPO_ROOT, "cross", "include_fixtures", "invalid")
+    for name, phrase in (
+        ("include-shape.json", "include: must be a list"),
+        ("entry-number.json", "expected an object, got number"),
+        ("unknown-entry-field.json", "unknown field(s) 'future'"),
+        ("after-internal.json", "after must name outer steps"),
+        ("cap-conflict.json", "resource cap 'a'=2 conflicts"),
+        ("after-empty.json", "after references missing outer step 'missing.step'"),
+        ("cycle-a.json", "include cycle:"),
+    ):
+        path = os.path.join(invalid_dir, name)
+        pi, ri = run(py, ("json", "--dag", path)), run(rs, ("json", "--dag", path))
+        label = f"include-composition:refusal:{name}"
+        if (
+            pi.returncode == ri.returncode == 2
+            and phrase in pi.stderr
+            and pi.stderr == ri.stderr
+        ):
+            rep.ok(label)
+        else:
+            rep.bad(label, f"py={pi!r}\nrs={ri!r}")
+
+
+def compare_delegated_children_schema(py: list[str], rs: list[str], rep: Report) -> None:
+    """The containment-preserving nested-run opt-in is one typed, cross-edition field."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "delegated.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(
+                '{"steps":['
+                '{"group":"g","job":"delegating","cmd":"true",'
+                '"delegated_children":true},'
+                '{"group":"g","job":"ordinary","cmd":"true"}]}'
+            )
+        _static_parity(py, rs, path, "delegated-children-schema", rep)
+        po, ro = run(py, ("json", "--dag", path)), run(rs, ("json", "--dag", path))
+        if (
+            po.returncode == ro.returncode == 0
+            and po.stdout == ro.stdout
+            and po.stdout.count('"delegated_children"') == 1
+        ):
+            rep.ok("delegated-children-schema:explicit-only")
+        else:
+            rep.bad(
+                "delegated-children-schema:explicit-only",
+                f"py={po!r}\nrs={ro!r}",
+            )
+
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(
+                '{"steps":[{"group":"g","job":"bad","cmd":"true",'
+                '"delegated_children":"yes"}]}'
+            )
+        po, ro = run(py, ("json", "--dag", path)), run(rs, ("json", "--dag", path))
+        if po.returncode == ro.returncode == 2 and po.stderr == ro.stderr:
+            rep.ok("delegated-children-schema:wrong-type-refusal")
+        else:
+            rep.bad(
+                "delegated-children-schema:wrong-type-refusal",
+                f"py={po!r}\nrs={ro!r}",
+            )
 
 
 # --------------------------------------------------------------------------- scalar parity
@@ -1704,8 +1907,12 @@ def compare_uncontained_cpu_budget_notice(py: list[str], rs: list[str], rep: Rep
                 '{"steps": [{"group": "g", "job": "a", '
                 '"cmd": "true", "cpu_timeout": 7, "timeout": 30}]}'
             )
-        po = run(py, ("run", "--dag", live, ACF))
-        ro = run(rs, ("run", "--dag", live, ACF))
+        # This contract is deliberately about the uncontained scheduler.  An outer validation
+        # graph lends this harness a real delegated cgroup, so --allow-cgroup-failure would quite
+        # correctly stay boxed there.  The explicit opt-out selects the same route both at top
+        # level and below that parent-owned containment boundary.
+        po = run(py, ("run", "--dag", live, "--unsafe-no-cgroups"))
+        ro = run(rs, ("run", "--dag", live, "--unsafe-no-cgroups"))
         label = "uncontained-cpu-budget-notice"
         phrase = "best-effort procfs process-group CPU floor"
         py_lines = [ln for ln in po.stderr.splitlines() if phrase in ln]
@@ -1736,8 +1943,8 @@ def compare_uncontained_cpu_budget_notice(py: list[str], rs: list[str], rep: Rep
                 '{"group": "g", "job": "c", "cmd": "true", '
                 '"cpu_timeout": 3, "timeout": 30}]}'
             )
-        po = run(py, ("run", "--dag", many, ACF))
-        ro = run(rs, ("run", "--dag", many, ACF))
+        po = run(py, ("run", "--dag", many, "--unsafe-no-cgroups"))
+        ro = run(rs, ("run", "--dag", many, "--unsafe-no-cgroups"))
         label = "uncontained-cpu-budget-notice:once-per-run"
         py_count = sum(1 for ln in po.stderr.splitlines() if phrase in ln)
         rs_count = sum(1 for ln in ro.stderr.splitlines() if phrase in ln)
@@ -4991,7 +5198,65 @@ def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
                     "10.0",
                     str(5 * gib),
                 )
+                + "".join(
+                    _cpa_row(
+                        _CPA_MACHINE,
+                        _CPA_CONTAINER,
+                        "floor.quiet",
+                        width,
+                        "3.0" if width == 1 else "2.0",
+                        "3.0",
+                        str(gib),
+                    )
+                    for width in (1, 2)
+                    for _ in range(3)
+                )
             )
+        floor_dag = os.path.join(tmp, "authored-rss-floor.json")
+        with open(floor_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "floor",
+                            "job": "quiet",
+                            "cmd": "true",
+                            "hint": {
+                                "est_duration_s": 10.0,
+                                "rss_baseline_bytes": 8 * gib,
+                            },
+                        }
+                    ]
+                },
+                handle,
+            )
+        extra = {
+            "DAGRUN_MACHINE_ID": _CPA_MACHINE,
+            "DAGRUN_CONTAINER_CLASS": _CPA_CONTAINER,
+        }
+        floor_args = ("plan", "--dag", floor_dag, "--perf-dir", store, "--format", "json")
+        pfloor, rfloor = run(py, floor_args, extra), run(rs, floor_args, extra)
+        floor_ok = False
+        if pfloor.returncode == rfloor.returncode == 0 and pfloor.stdout == rfloor.stdout:
+            try:
+                floor_step = json.loads(pfloor.stdout)["steps"][0]
+                floor_ok = (
+                    floor_step["est_duration_s"] == "3.000"
+                    and floor_step["est_source"] == "store"
+                    and floor_step["rss_estimate_bytes"] == 8 * gib
+                    and floor_step["rss_source"] == "hint"
+                )
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                floor_ok = False
+        if floor_ok:
+            rep.ok("memory:ordinary-feedback-keeps-authored-rss-floor")
+        else:
+            rep.bad(
+                "memory:ordinary-feedback-keeps-authored-rss-floor",
+                f"one quiet sample lowered the authored RSS floor or engines diverged\n"
+                f"py={pfloor}\nrs={rfloor}",
+            )
+
         learned_dag = os.path.join(tmp, "learned-rss.json")
         learned_marker = {
             engine: os.path.join(tmp, f"learned-{engine}-spawned")
@@ -5018,10 +5283,6 @@ def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
                 },
                 handle,
             )
-        extra = {
-            "DAGRUN_MACHINE_ID": _CPA_MACHINE,
-            "DAGRUN_CONTAINER_CLASS": _CPA_CONTAINER,
-        }
         plan_args = (
             "plan", "--dag", learned_dag, "--perf-dir", store, "--planner", "cpa",
             "--max-mem", "4G", "--format", "json",
@@ -5317,24 +5578,39 @@ def compare_sweep_report_collisions(py: list[str], rs: list[str], rep: Report) -
 
 
 def _sweep_widths(text: str) -> set[int]:
-    """Return widths from well-formed six-column sweep result rows."""
+    """Return widths from well-formed sweep rows, including humanized boxed RSS."""
 
     widths: set[int] = set()
     for line in text.splitlines():
         fields = line.split()
-        if len(fields) != 6 or not fields[0].isdigit():
+        # Unboxed rows render RSS as one ``-`` field; boxed rows render a value and unit (for
+        # example ``760.0 KiB``).  Both are the same table schema, so do not mistake the extra
+        # display token for a missing width sample.
+        if len(fields) not in (6, 7) or not fields[0].isdigit():
             continue
         try:
             float(fields[1])
             float(fields[2])
             float(fields[3])
-            if fields[4] != "-":
-                int(fields[4])
-            float(fields[5].removesuffix("x"))
+            if len(fields) == 6:
+                if fields[4] != "-":
+                    int(fields[4])
+            else:
+                float(fields[4])
+                if fields[5] not in {"B", "KiB", "MiB", "GiB", "TiB"}:
+                    continue
+            float(fields[-1].removesuffix("x"))
         except ValueError:
             continue
         widths.add(int(fields[0]))
     return widths
+
+
+def _has_sweep_header(text: str) -> bool:
+    """Recognize the fixed sweep columns without coupling parity to display padding."""
+
+    expected = ("jobs", "wall_s", "user_s", "sys_s", "rss_hwm", "speedup(vs", "j1)")
+    return any(tuple(line.split()) == expected for line in text.splitlines())
 
 
 def compare_sweep_success(py: list[str], rs: list[str], rep: Report) -> None:
@@ -5379,11 +5655,10 @@ def compare_sweep_success(py: list[str], rs: list[str], rep: Report) -> None:
                 rs_observed = handle.read().splitlines()
         except OSError:
             rs_observed = []
-        header = "jobs  wall_s  user_s  sys_s  rss_hwm  speedup(vs j1)"
         if (
             po.returncode == ro.returncode == 0
-            and header in po.stdout
-            and header in ro.stdout
+            and _has_sweep_header(po.stdout)
+            and _has_sweep_header(ro.stdout)
             and _sweep_widths(po.stdout) == _sweep_widths(ro.stdout) == {1, 2}
             and py_observed == rs_observed == ["--workers=1", "--workers=2"]
         ):
@@ -5674,13 +5949,14 @@ def _memory_feedback_reaches_admission(
     ONE step, so the modeled worst case is that step's own cap and does not depend on this
     host's CPU count (only the step-count ceiling in the same line does, which is why the
     footprint substring is matched rather than the whole line). Its six uncensored samples
-    peaked at 21474836480 B under a 107374182400 B cap, and the DAG authors a much smaller
-    104857600 B hint.
+    peaked at 21474836480 B under a 107374182400 B cap, and the DAG authors a larger
+    42949672960 B hint.
 
-    Without the flag the ordinary feedback takes the peak at face value and admission models
-    26843545600 B; with it the censoring-aware estimate adds the 20% margin (25769803776 B) and
-    admission models 32212254720 B. Both are named literally: a build that applied the estimate
-    after admission had already read the config would report the first number twice.
+    Without the flag the authored floor survives and admission models 53687091200 B. With the
+    explicit flag, six uncensored samples are enough to lower that floor: the censoring-aware
+    estimate adds the 20% feedback margin (25769803776 B), then admission models 32212254720 B.
+    Both are named literally: this proves that ordinary feedback cannot lower an author's number
+    while the deliberately requested, evidence-gated path still can.
     """
     store = os.path.join(tmp, "admission-store")
     os.makedirs(store, exist_ok=True)
@@ -5695,7 +5971,7 @@ def _memory_feedback_reaches_admission(
     with open(dag_path, "w", encoding="utf-8") as fh:
         fh.write(json.dumps({"steps": [{
             "group": "g", "job": "learned", "cmd": "true",
-            "hint": {"rss_baseline_bytes": 104857600},
+            "hint": {"rss_baseline_bytes": 42949672960},
         }]}))
     args = (
         "run", "--dag", dag_path, "--perf-dir", store, "--no-profile",
@@ -5718,7 +5994,7 @@ def _memory_feedback_reaches_admission(
         for engine, outcome in group.items()
     }
     if (
-        seen != {"py/off": "26843545600", "rs/off": "26843545600",
+        seen != {"py/off": "53687091200", "rs/off": "53687091200",
                  "py/on": "32212254720", "rs/on": "32212254720"}
         or any(o.returncode != 0 for o in (*off.values(), *on.values()))
         or "rss_baseline_bytes=25769803776" not in on["py"].stderr
@@ -5729,20 +6005,18 @@ def _memory_feedback_reaches_admission(
         rep.ok("memory-feedback/reaches-max-mem-admission")
 
 
-def _memory_feedback_declines_reach_admission(
+def _memory_feedback_decline_keeps_authored_floor_at_admission(
     py: list[str], rs: list[str], rep: Report, tmp: str, extra: dict[str, str]
 ) -> None:
-    """Prove a DECLINE removes the censoring-blind estimate too, identically in both builds.
+    """Prove a censored DECLINE preserves the authored floor in both feedback modes.
 
-    This is the point of the flag, and the half that is easy to leave undone. ONE step whose six
-    recorded runs were every one of them pinned to their 8589934592 B cap — the all-censored
-    history the path exists for — and a DAG authoring 42949672960 B.
+    ONE step has six runs, every one pinned to its 8589934592 B cap: the all-censored history the
+    opt-in path exists to reject. The DAG authors 42949672960 B.
 
-    Without the flag the ordinary feedback takes those censored peaks at face value and admission
-    models 10737418240 B: a cap derived from the cap. With the flag the step is declined, and a
-    decline has to mean the AUTHORED figure reaches admission: 53687091200 B. Both are named
-    literally, because a build that reported "keeping the authored hint" while leaving the
-    censored estimate in the config would report the first number twice.
+    Ordinary feedback must not lower that authored floor, so without the flag admission models
+    53687091200 B. With the flag the step is explicitly declined and the same authored figure
+    still reaches admission. Both are named literally: neither the ordinary path nor a declined
+    opt-in path may derive a cap from a capped observation.
 
     The authored 42949672960 B is deliberately ABOVE the 8589934592 B floor those peaks prove, so
     the decline really does land on the author's number here. The opposite arrangement is
@@ -5784,15 +6058,15 @@ def _memory_feedback_declines_reach_admission(
         for engine, outcome in group.items()
     }
     if (
-        seen != {"py/off": "10737418240", "rs/off": "10737418240",
+        seen != {"py/off": "53687091200", "rs/off": "53687091200",
                  "py/on": "53687091200", "rs/on": "53687091200"}
         or any(o.returncode != 0 for o in (*off.values(), *on.values()))
         or "g.pinned: keeping the authored hint" not in on["py"].stderr
         or "g.pinned: keeping the authored hint" not in on["rs"].stderr
     ):
-        rep.bad("memory-feedback/a-decline-undoes-the-censored-estimate", f"footprints={seen!r}")
+        rep.bad("memory-feedback/a-decline-keeps-the-authored-floor", f"footprints={seen!r}")
     else:
-        rep.ok("memory-feedback/a-decline-undoes-the-censored-estimate")
+        rep.ok("memory-feedback/a-decline-keeps-the-authored-floor")
 
 
 def _memory_feedback_floor_survives_a_decline(
@@ -5804,7 +6078,7 @@ def _memory_feedback_floor_survives_a_decline(
     step whose ten recorded runs were every one of them pinned to the ceiling they were given:
     nine at 8589934592 B and one at 34359738368 B. The DAG authors 1073741824 B — BELOW what the
     store proves the step has already used, which is the direction
-    :func:`_memory_feedback_declines_reach_admission` does not cover.
+    :func:`_memory_feedback_decline_keeps_authored_floor_at_admission` does not cover.
 
     Without the flag the censoring-blind feedback fits the 9/10 nearest-rank percentile of those
     peaks — the ninth smallest, 8589934592 B — and admission models 10737418240 B. With the flag
@@ -5997,7 +6271,7 @@ def compare_memory_feedback(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok("memory-feedback/five-uncensored-samples-are-required")
 
         _memory_feedback_reaches_admission(py, rs, rep, tmp, extra)
-        _memory_feedback_declines_reach_admission(py, rs, rep, tmp, extra)
+        _memory_feedback_decline_keeps_authored_floor_at_admission(py, rs, rep, tmp, extra)
         _memory_feedback_floor_survives_a_decline(py, rs, rep, tmp, extra)
 
         inert = (*base, "--profile-memory-feedback", "--no-profile-feedback")
@@ -6980,7 +7254,8 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
             combined = {name: out.stdout + out.stderr for name, out in outcomes.items()}
             said = {name: _BUILD_WIDTH_RE.findall(text) for name, text in combined.items()}
             applied = {name: _STEP_WIDTH_RE.findall(text) for name, text in combined.items()}
-            if not said["py"] or not said["rs"]:
+            delegated = _inside_delegated_harness()
+            if not delegated and (not said["py"] or not said["rs"]):
                 rep.bad(
                     label,
                     "each build must announce which width governs; "
@@ -6990,7 +7265,7 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
             if said["py"] != said["rs"]:
                 rep.bad(label, f"differing announcement py={said['py']!r} rs={said['rs']!r}")
                 continue
-            if want not in said["py"][0]:
+            if not delegated and want not in said["py"][0]:
                 rep.bad(label, f"expected {want!r} in {said['py'][0]!r}")
                 continue
             if not applied["py"] or not applied["rs"]:
@@ -7231,7 +7506,10 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
                 _cpu_guest_dag(
                     (8, 8),
                     duration_s=1.75,
-                    cgroup_parent_levels=1,
+                    # At top level the shared run scope is one level above a step. Under the
+                    # validation graph, the nested scheduler's run root adds one level and the
+                    # parent-owned delegated step is the shared aggregate bandwidth boundary.
+                    cgroup_parent_levels=2 if _inside_delegated_harness() else 1,
                     barrier_participants=2,
                 )
             ),
@@ -7373,6 +7651,8 @@ def compare_dagrun(rand_count: int, seed: int) -> int:
     for fx in examples:
         compare_example_static(py, rs, fx, rep)
     compare_yaml_isomorphism(py, rs, rep)
+    compare_include_composition(py, rs, rep)
+    compare_delegated_children_schema(py, rs, rep)
     compare_scalar_parity(py, rs, rep)
     compare_selected_behavior(py, rs, rep)
     compare_uncarried_config_keys(py, rs, rep)
@@ -7500,6 +7780,23 @@ def _parsed_json(text_value: str) -> tuple[bool, object]:
     except json.JSONDecodeError as exc:
         return False, str(exc)
     return True, value
+
+
+def _transient_user_bus_refusal(*outcomes: Outcome) -> bool:
+    """Return whether a child failed before launch on the systemd user-bus transport.
+
+    A successful capability probe cannot make the later ``systemd-run`` connection atomic: under
+    heavy concurrent scope churn the user bus can briefly refuse that final connection.  Keep the
+    classification deliberately narrow so an allocator failure, a different transport error, or a
+    wrapped command that merely exits nonzero is never retried as infrastructure noise.
+    """
+
+    failures = [outcome for outcome in outcomes if outcome.returncode != 0]
+    return bool(failures) and all(
+        "Failed to connect to user scope bus" in outcome.stderr
+        and "Connection refused" in outcome.stderr
+        for outcome in failures
+    )
 
 
 def compare_package_guides(
@@ -7762,8 +8059,6 @@ def compare_cpuset_alloc() -> int:
                 ("py-then-rs", py, rs),
                 ("rs-then-py", rs, py),
             ):
-                shared_ledger = os.path.join(tmp, f"interop-{label}.json")
-                extra = {"DAGRUN_CORE_LEDGER": shared_ledger}
                 hold = (
                     "run",
                     "--cores",
@@ -7775,34 +8070,54 @@ def compare_cpuset_alloc() -> int:
                     "-c",
                     "import time; time.sleep(2)",
                 )
-                first_proc = subprocess.Popen(
-                    [*first, *hold],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=_env(extra),
-                    start_new_session=True,
-                )
-                deadline = time.monotonic() + 10
-                while first_proc.poll() is None and time.monotonic() < deadline:
+                # Retry the WHOLE pair, never just the second command.  Replaying only one side
+                # would test against a different reservation lifetime and could leave the first
+                # attempt's held core in the comparison.  Each attempt gets an independent ledger
+                # and the first child is reaped before the next begins.
+                interop_attempts = 3
+                for attempt in range(1, interop_attempts + 1):
+                    shared_ledger = os.path.join(tmp, f"interop-{label}-{attempt}.json")
+                    extra = {"DAGRUN_CORE_LEDGER": shared_ledger}
+                    first_started = time.monotonic()
+                    first_proc = subprocess.Popen(
+                        [*first, *hold],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=_env(extra),
+                        start_new_session=True,
+                    )
+                    deadline = time.monotonic() + 10
+                    while first_proc.poll() is None and time.monotonic() < deadline:
+                        try:
+                            payload = json.loads(Path(shared_ledger).read_text(encoding="utf-8"))
+                        except (OSError, json.JSONDecodeError):
+                            payload = {}
+                        if isinstance(payload, dict) and payload.get("reservations"):
+                            break
+                        time.sleep(0.02)
                     try:
-                        payload = json.loads(Path(shared_ledger).read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError):
-                        payload = {}
-                    if isinstance(payload, dict) and payload.get("reservations"):
+                        second_outcome = run(second, hold, extra)
+                    finally:
+                        try:
+                            first_stdout, first_stderr = first_proc.communicate(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            first_proc.kill()
+                            first_stdout, first_stderr = first_proc.communicate()
+                    first_outcome = Outcome(
+                        first_proc.returncode or 0,
+                        first_stdout,
+                        first_stderr,
+                        time.monotonic() - first_started,
+                    )
+                    if not _transient_user_bus_refusal(first_outcome, second_outcome):
                         break
-                    time.sleep(0.02)
-                second_outcome = run(second, hold, extra)
-                try:
-                    first_stdout, first_stderr = first_proc.communicate(timeout=30)
-                except subprocess.TimeoutExpired:
-                    first_proc.kill()
-                    first_stdout, first_stderr = first_proc.communicate()
-                first_outcome = Outcome(
-                    first_proc.returncode or 0,
-                    first_stdout,
-                    first_stderr,
-                )
+                    if attempt < interop_attempts:
+                        print(
+                            f"cross[{tool}]: transient systemd user-bus refusal during "
+                            f"interop:{label} attempt {attempt}/{interop_attempts}; retrying pair",
+                            file=sys.stderr,
+                        )
                 if first_outcome.returncode == second_outcome.returncode == 0:
                     try:
                         first_cores = reserved_cores(first_outcome.stderr)
@@ -11546,25 +11861,36 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
     return 0
 
 
+DIFFERENTIAL_TOOLS = (
+    "dagrun",
+    "cpuset-alloc",
+    "tick-hub",
+    "pr-landing-planner",
+    "herdr-run",
+    "herdr-agent",
+    "agentctl",
+)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="py-vs-rs differential tester")
     parser.add_argument(
         "--tool",
         default="dagrun",
-        choices=(
-            "dagrun",
-            "cpuset-alloc",
-            "tick-hub",
-            "pr-landing-planner",
-            "herdr-run",
-            "herdr-agent",
-            "agentctl",
-            "all",
-        ),
+        choices=(*DIFFERENTIAL_TOOLS, "all"),
+    )
+    parser.add_argument(
+        "--list-tools",
+        action="store_true",
+        help="list the independently selectable differential tools and exit",
     )
     parser.add_argument("--random", type=int, default=24, help="number of randomized fixtures")
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed for randomized fixtures")
     ns = parser.parse_args(list(argv) if argv is not None else None)
+    if ns.list_tools:
+        for name in DIFFERENTIAL_TOOLS:
+            print(name)
+        return 0
     tool = str(ns.tool)
     rand_count = int(ns.random)
     seed = int(ns.seed)

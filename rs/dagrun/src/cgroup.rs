@@ -22,7 +22,8 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,11 @@ const SLICE_NAME: &str = "dagrun.slice";
 const UNIT_PREFIX: &str = "dagrun";
 /// Environment sentinel set in the re-exec'd (in-scope) child.
 const ENV_IN_SCOPE: &str = "DAGRUN_IN_SCOPE";
+/// Exact parent-owned cgroup root offered to one nested dagrun scheduler.
+pub const DELEGATED_CGROUP_ENV: &str = "DAGRUN_DELEGATED_CGROUP";
+/// Exact marker for a graph-reviewed nested step when the outer scheduler is itself unboxed.
+/// This authorizes nesting but is never evidence of cgroup containment.
+pub const DELEGATED_UNBOXED_ENV: &str = "DAGRUN_DELEGATED_UNBOXED";
 /// Env var carrying the outer scope unit name to the in-scope child.
 const ENV_SCOPE_UNIT: &str = "DAGRUN_SCOPE_UNIT";
 /// Optional caller override that may tighten, but never widen, the derived outer cap.
@@ -60,6 +66,14 @@ const SCOPE_DRAIN_ATTEMPTS: usize = 50;
 const SCOPE_DRAIN_RETRY: Duration = Duration::from_millis(10);
 const SCOPE_DRAIN_EMPTY_SAMPLES: usize = 2;
 const CONTROLLER_ENABLE_ATTEMPTS: usize = 3;
+static NEXT_NESTED_ROOT: AtomicU64 = AtomicU64::new(0);
+static NESTED_COORDINATOR_RESTORE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic process-local count used by the public CLI boundary to fail closed when an
+/// otherwise-successful in-process invocation could not escape its temporary aggregate cgroup.
+pub(crate) fn nested_coordinator_restore_failures() -> u64 {
+    NESTED_COORDINATOR_RESTORE_FAILURES.load(Ordering::Relaxed)
+}
 
 /// Per-step containment operations used by the scheduler.
 ///
@@ -87,11 +101,28 @@ pub trait CgroupManager: Send + Sync {
         mem_max: Option<i64>,
         cpu_count: Option<i64>,
     ) -> String;
+    /// Prepare a step as an empty cgroup root whose `supervisor` leaf contains the command, so a
+    /// child dagrun may create descendants while this manager retains subtree kill ownership.
+    fn prepare_delegated_command(
+        &self,
+        _tag: &str,
+        _cmd: &str,
+        _mem_max: Option<i64>,
+        _cpu_count: Option<i64>,
+    ) -> PreparedDelegation {
+        PreparedDelegation {
+            command: "echo 'ERROR: delegated_children requires active cgroup containment' >&2\n\
+                      exit 125\n"
+                .to_string(),
+            root: None,
+        }
+    }
     /// SIGKILL the step's whole cgroup subtree (`cgroup.kill`); `true` if the write landed.
     fn kill(&self, tag: &str) -> bool;
     /// Remove the step's now-empty child cgroup dir (best-effort).
     fn cleanup(&self, tag: &str);
-    /// Kernel OOM-kill events inside the step's cgroup (`memory.events` `oom_kill`).
+    /// Kernel OOM-kill events owned by the step's cgroup (the selected memory-events view's
+    /// `oom_kill`; see [`CgroupManager::memory_events`]).
     fn oom_kills(&self, tag: &str) -> i64;
     /// Peak resident memory (bytes) of the step's cgroup (`memory.peak`).
     ///
@@ -99,11 +130,16 @@ pub trait CgroupManager: Send + Sync {
     /// [`CgroupManager::applied_memory_max`] is a censored observation — the step used all it was
     /// allowed — so read the two together before treating this as an observed maximum.
     fn peak_bytes(&self, tag: &str) -> Option<i64>;
-    /// The step cgroup's whole `memory.events` file as counter -> value.
+    /// The step cgroup's owned memory events as counter -> value.
     ///
     /// These are per-step deltas without subtraction: the child cgroup is created for the step
-    /// and removed after it, so every counter starts at zero. `max > 0` with `oom_kill == 0` is
-    /// reclaim-at-cap — a step that PASSED while pinned to its ceiling.
+    /// and removed after it, so every counter starts at zero. `max > 0` with every OOM counter
+    /// zero is reclaim-at-cap — a step that PASSED while pinned to its ceiling. Ordinary steps read
+    /// hierarchical `memory.events`. A root prepared by `prepare_delegated_command` reads
+    /// `memory.events.local`, excluding child-step OOMs already owned by the nested scheduler
+    /// while retaining events charged at the outer delegation boundary. At that boundary `oom`
+    /// (or `oom_group_kill`) can be positive while the descendant victim owns `oom_kill`; every
+    /// positive OOM facet is actionable even though sibling nested-run counters remain excluded.
     ///
     /// DEFAULTS TO `None`, DELIBERATELY: a manager that does not answer has said nothing, and
     /// nothing must not read as "no events occurred".
@@ -121,8 +157,10 @@ pub trait CgroupManager: Send + Sync {
     /// Read back rather than echoed from the requested cap, because the case that matters — a cap
     /// the kernel never accepted — is exactly where the two disagree.
     ///
-    /// `"max"` means "no ceiling at any level this runner can see"; ancestors ABOVE the delegated
-    /// scope (a container limit, a user slice) are outside its view.
+    /// Nested schedulers additionally snapshot every readable `memory.max` from the validated
+    /// parent delegation through the cgroup namespace root and stamp a finite minimum onto their
+    /// own run root. Limits above a top-level run scope or outside the process's cgroup namespace
+    /// remain outside that run's recorded view.
     ///
     /// DEFAULTS TO `None`, DELIBERATELY. `None` (cap unknown) and `Some("max")` (known unbounded)
     /// are different answers: only the second rules out censoring by the runner's own caps, so a
@@ -149,6 +187,15 @@ pub trait CgroupManager: Send + Sync {
     fn kill_all_remaining(&self) -> i64;
 }
 
+/// Command wrapper plus the exact cgroup root an outer scheduler delegates to its child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedDelegation {
+    /// Fail-closed shell wrapper that moves the command into the delegation's supervisor leaf.
+    pub command: String,
+    /// Root to export through [`DELEGATED_CGROUP_ENV`], absent when delegation failed.
+    pub root: Option<PathBuf>,
+}
+
 /// Shell prologue that migrates the step's bash leader into `child` before it forks anything.
 ///
 /// `$$` is the leader's pid; writing it moves the leader, and every descendant then inherits this
@@ -166,6 +213,21 @@ fn join_cgroup_command(child: &Path, cmd: &str) -> String {
     format!(
         "if ! printf '%s\\n' \"$$\" 2>/dev/null > {quoted}; then\n  echo 'ERROR: step could not join its dagrun cgroup; refusing uncontained run' >&2\n  exit 125\nfi\n{cmd}"
     )
+}
+
+fn remove_empty_cgroup_descendants(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let children: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    for child in children {
+        remove_empty_cgroup_descendants(&child);
+        let _ = fs::remove_dir(child);
+    }
 }
 
 /// Emit a visible degraded-enforcement warning (No Silent Failure).
@@ -202,6 +264,228 @@ fn my_cgroup_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Move this scheduler into its capped nested-run root and verify live membership.
+///
+/// Inner steps already join descendants of `run_root`. The coordinator must join as well or a
+/// tighter nested `--max-mem`/`--max-cpus` would not be a whole-invocation boundary.
+fn move_current_to_nested_supervisor(
+    run_root: &Path,
+) -> Result<NestedCoordinatorGuard, NestedCoordinatorMoveError> {
+    let supervisor = run_root.join(SUPERVISOR);
+    let return_supervisor = my_cgroup_path().ok_or_else(|| NestedCoordinatorMoveError {
+        error: std::io::Error::other(
+            "current cgroup is unreadable before nested scheduler migration",
+        ),
+        recovery: None,
+    })?;
+    let pid = std::process::id();
+    let pid_text = pid.to_string();
+    fs::write(supervisor.join("cgroup.procs"), &pid_text).map_err(|error| {
+        NestedCoordinatorMoveError {
+            error,
+            // A failed cgroup.procs write did not migrate the caller.
+            recovery: None,
+        }
+    })?;
+    let guard = NestedCoordinatorGuard {
+        run_root: run_root.to_path_buf(),
+        return_supervisor,
+        active: true,
+    };
+    let verified = (|| -> std::io::Result<()> {
+        let current = my_cgroup_path().ok_or_else(|| {
+            std::io::Error::other("current cgroup is unreadable after nested scheduler migration")
+        })?;
+        if fs::canonicalize(&current)? != fs::canonicalize(&supervisor)? {
+            return Err(std::io::Error::other(format!(
+                "nested scheduler pid {pid} did not enter {}; current cgroup is {}",
+                supervisor.display(),
+                current.display()
+            )));
+        }
+        let roster = fs::read_to_string(supervisor.join("cgroup.procs"))?;
+        if !roster.split_whitespace().any(|member| member == pid_text) {
+            return Err(std::io::Error::other(format!(
+                "nested scheduler pid {pid} is absent from {}",
+                supervisor.join("cgroup.procs").display()
+            )));
+        }
+        Ok(())
+    })();
+    if let Err(error) = verified {
+        return Err(failed_nested_migration(guard, error));
+    }
+    Ok(guard)
+}
+
+struct NestedCoordinatorGuard {
+    run_root: PathBuf,
+    return_supervisor: PathBuf,
+    active: bool,
+}
+
+struct NestedCoordinatorMoveError {
+    error: std::io::Error,
+    /// Present only when post-write verification failed and rollback could not be proven. Keeping
+    /// the guard alive lets the manager retry on drop and report a persistent failure to the CLI.
+    recovery: Option<NestedCoordinatorGuard>,
+}
+
+impl std::fmt::Display for NestedCoordinatorMoveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+fn failed_nested_migration_with<F>(
+    mut guard: NestedCoordinatorGuard,
+    migration_error: std::io::Error,
+    restore: F,
+) -> NestedCoordinatorMoveError
+where
+    F: FnOnce(&mut NestedCoordinatorGuard) -> std::io::Result<()>,
+{
+    match restore(&mut guard) {
+        Ok(()) => NestedCoordinatorMoveError {
+            error: migration_error,
+            recovery: None,
+        },
+        Err(rollback_error) => NestedCoordinatorMoveError {
+            error: std::io::Error::other(format!(
+                "{migration_error}; rollback to the previous cgroup also failed: {rollback_error}"
+            )),
+            recovery: Some(guard),
+        },
+    }
+}
+
+fn failed_nested_migration(
+    guard: NestedCoordinatorGuard,
+    migration_error: std::io::Error,
+) -> NestedCoordinatorMoveError {
+    failed_nested_migration_with(guard, migration_error, NestedCoordinatorGuard::restore)
+}
+
+impl NestedCoordinatorGuard {
+    fn restore(&mut self) -> std::io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let pid = std::process::id();
+        let pid_text = pid.to_string();
+        fs::write(self.return_supervisor.join("cgroup.procs"), &pid_text)?;
+        let current = my_cgroup_path().ok_or_else(|| {
+            std::io::Error::other("current cgroup is unreadable after nested scheduler restoration")
+        })?;
+        if fs::canonicalize(&current)? != fs::canonicalize(&self.return_supervisor)? {
+            return Err(std::io::Error::other(format!(
+                "nested scheduler pid {pid} did not return to {}; current cgroup is {}",
+                self.return_supervisor.display(),
+                current.display()
+            )));
+        }
+        let roster = fs::read_to_string(self.return_supervisor.join("cgroup.procs"))?;
+        if !roster.split_whitespace().any(|member| member == pid_text) {
+            return Err(std::io::Error::other(format!(
+                "nested scheduler pid {pid} is absent from {}",
+                self.return_supervisor.join("cgroup.procs").display()
+            )));
+        }
+        self.active = false;
+        remove_empty_cgroup_descendants(&self.run_root);
+        if let Err(error) = fs::remove_dir(&self.run_root) {
+            warn(&format!(
+                "could not remove completed nested scheduler cgroup {} ({error})",
+                self.run_root.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NestedCoordinatorGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            NESTED_COORDINATOR_RESTORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            warn(&format!(
+                "could not restore nested scheduler to delegated parent {} ({error}); outer \
+                 owner must clean up {}",
+                self.return_supervisor.display(),
+                self.run_root.display()
+            ));
+        }
+    }
+}
+
+fn validate_delegated_cgroup_root_at(
+    root: &Path,
+    current: &Path,
+    pid: u32,
+    cgroup_root: &Path,
+) -> Result<PathBuf, String> {
+    let base = fs::canonicalize(cgroup_root)
+        .map_err(|e| format!("delegated cgroup hierarchy cannot be resolved: {e}"))?;
+    let root = fs::canonicalize(root)
+        .map_err(|e| format!("delegated cgroup path cannot be resolved: {e}"))?;
+    let current = fs::canonicalize(current)
+        .map_err(|e| format!("current cgroup path cannot be resolved: {e}"))?;
+    if root == base || !root.starts_with(&base) {
+        return Err(format!(
+            "delegated cgroup {} is outside the cgroup-v2 hierarchy",
+            root.display()
+        ));
+    }
+    if current.parent() != Some(root.as_path())
+        || current.file_name().and_then(|name| name.to_str()) != Some(SUPERVISOR)
+    {
+        return Err(format!(
+            "current cgroup {} is not the exact '{SUPERVISOR}' leaf beneath delegated root {}",
+            current.display(),
+            root.display()
+        ));
+    }
+    let roster_path = current.join("cgroup.procs");
+    let roster = fs::read_to_string(&roster_path)
+        .map_err(|e| format!("cannot read delegated supervisor roster: {e}"))?;
+    if !roster
+        .lines()
+        .any(|line| line.trim().parse::<u32>() == Ok(pid))
+    {
+        return Err(format!(
+            "pid {pid} is not listed in delegated supervisor {}",
+            roster_path.display()
+        ));
+    }
+    if !root.join("cgroup.kill").exists() {
+        return Err(format!(
+            "delegated root {} has no cgroup.kill ownership boundary",
+            root.display()
+        ));
+    }
+    Ok(root)
+}
+
+/// Validate the parent-owned cgroup root offered to this nested scheduler.
+///
+/// `Ok(None)` means no delegation was offered. A present but forged, stale, or non-ancestor path
+/// is an error rather than permission to weaken the default nested-run refusal.
+pub fn delegated_cgroup_root() -> Result<Option<PathBuf>, String> {
+    let Some(raw) = std::env::var_os(DELEGATED_CGROUP_ENV) else {
+        return Ok(None);
+    };
+    let root = PathBuf::from(raw);
+    if !root.is_absolute() {
+        return Err(format!(
+            "${DELEGATED_CGROUP_ENV} must be an absolute live cgroup path"
+        ));
+    }
+    let current = my_cgroup_path().ok_or_else(|| {
+        "the current cgroup-v2 path is not observable from /proc/self/cgroup".to_string()
+    })?;
+    validate_delegated_cgroup_root_at(&root, &current, std::process::id(), Path::new(CGROUP_ROOT))
+        .map(Some)
 }
 
 /// Read and trim a cgroup interface file, or `None`.
@@ -342,6 +626,231 @@ fn memory_max_bytes(value: Option<String>) -> Option<i64> {
         return None;
     }
     value.parse().ok()
+}
+
+/// Whether cgroup v2 retained `expected`, allowing only safe page rounding down.
+fn memory_limit_matches(expected: i64, actual: Option<i64>) -> bool {
+    actual.is_some_and(|actual| actual <= expected && expected - actual < 4096)
+}
+
+/// Tightest visible `memory.max` from an exact delegated parent through the cgroup namespace
+/// root, plus whether every level was readable and parseable.
+///
+/// A nested scheduler creates a private run cgroup whose local limit initially reads `max`.
+/// Without carrying this ancestor snapshot forward, its child profiles can call a peak
+/// uncensored even though a finite parent step (or one of that step's ancestors) clamped it.
+fn delegated_ancestor_memory_max(root: &Path, cgroup_root: &Path) -> (Option<i64>, bool) {
+    let Ok(boundary) = fs::canonicalize(cgroup_root) else {
+        return (None, false);
+    };
+    let Ok(mut group) = fs::canonicalize(root) else {
+        return (None, false);
+    };
+    if group != boundary && !group.starts_with(&boundary) {
+        return (None, false);
+    }
+
+    let mut tightest: Option<i64> = None;
+    let mut complete = true;
+    loop {
+        match read_trim(&group, "memory.max") {
+            Some(value) if value == "max" => {}
+            // The hierarchy root has no parent to constrain and some kernels omit its controller
+            // limit files entirely. That specific absence means unbounded, not unknown.
+            None if group == boundary => {}
+            Some(value) => match value.parse::<i64>() {
+                Ok(bytes) if bytes >= 0 => {
+                    tightest = Some(tightest.map_or(bytes, |prior| prior.min(bytes)));
+                }
+                _ => complete = false,
+            },
+            None => complete = false,
+        }
+        if group == boundary {
+            break;
+        }
+        let Some(parent) = group.parent() else {
+            return (tightest, false);
+        };
+        group = parent.to_path_buf();
+    }
+    (tightest, complete)
+}
+
+fn delegated_ancestor_cpu_count(root: &Path, cgroup_root: &Path) -> (Option<i64>, bool) {
+    let Ok(boundary) = fs::canonicalize(cgroup_root) else {
+        return (None, false);
+    };
+    let Ok(mut group) = fs::canonicalize(root) else {
+        return (None, false);
+    };
+    if group != boundary && !group.starts_with(&boundary) {
+        return (None, false);
+    }
+
+    let mut tightest: Option<i64> = None;
+    let mut complete = true;
+    loop {
+        match read_trim(&group, "cpu.max") {
+            None if group == boundary => {}
+            Some(value) => {
+                let fields: Vec<&str> = value.split_whitespace().collect();
+                if fields.len() != 2 {
+                    complete = false;
+                } else if fields[0] == "max" {
+                    if fields[1]
+                        .parse::<i64>()
+                        .ok()
+                        .is_none_or(|period| period <= 0)
+                    {
+                        complete = false;
+                    }
+                } else if let Some(cpus) = cpu_max_cores(Some(value)) {
+                    tightest = Some(tightest.map_or(cpus, |prior| prior.min(cpus)));
+                } else {
+                    complete = false;
+                }
+            }
+            None => complete = false,
+        }
+        if group == boundary {
+            break;
+        }
+        let Some(parent) = group.parent() else {
+            return (tightest, false);
+        };
+        group = parent.to_path_buf();
+    }
+    (tightest, complete)
+}
+
+/// Effective parent envelope inherited by one nested scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DelegatedResourceLimits {
+    pub(crate) memory_max_bytes: Option<i64>,
+    pub(crate) memory_known: bool,
+    pub(crate) max_cpus: Option<i64>,
+    pub(crate) cpu_known: bool,
+}
+
+pub(crate) fn delegated_resource_limits(root: &Path) -> DelegatedResourceLimits {
+    delegated_resource_limits_at(root, Path::new(CGROUP_ROOT))
+}
+
+fn delegated_resource_limits_at(root: &Path, cgroup_root: &Path) -> DelegatedResourceLimits {
+    let (memory_max_bytes, memory_known) = delegated_ancestor_memory_max(root, cgroup_root);
+    let (mut max_cpus, mut cpu_known) = delegated_ancestor_cpu_count(root, cgroup_root);
+    // cpu.max bounds bandwidth; cpuset.cpus.effective independently bounds which CPUs are
+    // usable. The latter already reflects every ancestor, so reading it at the delegation root
+    // is sufficient.
+    if let Some(cpuset) = read_trim(root, "cpuset.cpus.effective") {
+        match crate::sizing::count_cpu_ranges(&cpuset) {
+            Some(cpus) if cpus > 0 => {
+                max_cpus = Some(max_cpus.map_or(cpus, |quota| quota.min(cpus)));
+            }
+            _ => cpu_known = false,
+        }
+    }
+    DelegatedResourceLimits {
+        memory_max_bytes,
+        memory_known,
+        max_cpus,
+        cpu_known,
+    }
+}
+
+/// Create a private nested-run root and stamp its effective delegated ancestor resource envelope.
+///
+/// The returned snapshot remains profiling provenance. Failure to mirror an inherited cap is
+/// survivable because the physical ancestor still enforces it. Failure to apply a *tighter
+/// requested* invocation cap is not: that would silently turn a nested `--max-cpus`/`--max-mem`
+/// promise into modeling-only advice, so this helper returns an error.
+fn create_nested_run_root(
+    parent: &Path,
+    run_root: &Path,
+    cgroup_root: &Path,
+    requested_max_cpus: Option<i64>,
+    requested_max_mem_bytes: Option<i64>,
+) -> std::io::Result<DelegatedResourceLimits> {
+    let inherited = delegated_resource_limits_at(parent, cgroup_root);
+    let effective = DelegatedResourceLimits {
+        memory_max_bytes: [inherited.memory_max_bytes, requested_max_mem_bytes]
+            .into_iter()
+            .flatten()
+            .min(),
+        memory_known: inherited.memory_known,
+        max_cpus: [inherited.max_cpus, requested_max_cpus]
+            .into_iter()
+            .flatten()
+            .min(),
+        cpu_known: inherited.cpu_known,
+    };
+    let memory_stamp_required = requested_max_mem_bytes.is_some_and(|requested| {
+        inherited
+            .memory_max_bytes
+            .is_none_or(|parent| requested < parent)
+    });
+    let cpu_stamp_required = requested_max_cpus
+        .is_some_and(|requested| inherited.max_cpus.is_none_or(|parent| requested < parent));
+    fs::create_dir(run_root)?;
+    if let Some(bytes) = effective.memory_max_bytes {
+        if let Err(error) = stamp_nested_memory_limit(run_root, bytes) {
+            if memory_stamp_required {
+                return Err(std::io::Error::other(format!(
+                    "could not enforce requested nested memory.max={bytes} on {}: {error}",
+                    run_root.display()
+                )));
+            }
+            warn(&format!(
+                "could not stamp inherited memory.max={bytes} on nested scheduler cgroup {} \
+                 ({error}); ancestor cap still applies",
+                run_root.display()
+            ));
+        }
+    }
+    if let Some(cpus) = effective.max_cpus {
+        if let Err(error) = stamp_nested_cpu_limit(run_root, cpus) {
+            if cpu_stamp_required {
+                return Err(std::io::Error::other(format!(
+                    "could not enforce requested nested CPU ceiling {cpus} on {}: {error}",
+                    run_root.display()
+                )));
+            }
+            warn(&format!(
+                "could not stamp inherited CPU ceiling {cpus} on nested scheduler cgroup {} \
+                 ({error}); ancestor quota still applies",
+                run_root.display()
+            ));
+        }
+    }
+    Ok(effective)
+}
+
+fn stamp_nested_memory_limit(run_root: &Path, bytes: i64) -> std::io::Result<()> {
+    fs::write(run_root.join("memory.max"), bytes.to_string())?;
+    let applied = memory_max_bytes(read_trim(run_root, "memory.max"));
+    if memory_limit_matches(bytes, applied) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "memory.max readback was {applied:?}, expected {bytes}"
+        )))
+    }
+}
+
+fn stamp_nested_cpu_limit(run_root: &Path, cpus: i64) -> std::io::Result<()> {
+    fs::write(
+        run_root.join("cpu.max"),
+        format!("{} 100000", cpus * 100_000),
+    )?;
+    let applied = cpu_max_cores(read_trim(run_root, "cpu.max"));
+    if applied == Some(cpus) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "cpu.max readback was {applied:?}, expected {cpus} CPUs"
+        )))
+    }
 }
 
 /// Create a cgroup directory, tolerating "already exists".
@@ -1150,10 +1659,12 @@ fn verify_scope_limits_at(
     let memory_swap_max = read_trim(scope, "memory.swap.max");
     let memory_oom_group = read_trim(scope, "memory.oom.group");
     let cpu_max = read_trim(scope, "cpu.max");
-    let memory_ok = memory_max
-        .as_deref()
-        .and_then(|value| value.parse::<i64>().ok())
-        .is_some_and(|actual| actual <= expected_memory_max && expected_memory_max - actual < 4096);
+    let memory_ok = memory_limit_matches(
+        expected_memory_max,
+        memory_max
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok()),
+    );
     let swap_ok = memory_swap_max.as_deref() == Some("0");
     let oom_group_ok = memory_oom_group.as_deref() == Some("1");
     let cpu_ok = match expected_cpu_count {
@@ -1752,22 +2263,140 @@ pub struct Cgroups {
     root: Option<PathBuf>,
     /// What this manager can enforce. See [`Containment`].
     containment: Containment,
+    /// Effective memory ceiling inherited from a validated parent delegation. This survives a
+    /// failed local stamp because the physical ancestor still enforces the limit.
+    delegated_ancestor_memory_max: Option<i64>,
+    /// False when any visible ancestor's `memory.max` was unreadable or malformed. Such a row's
+    /// cap is unknown and must never be admitted as an uncensored feedback sample.
+    delegated_ancestor_memory_max_known: bool,
+    delegated_ancestor_max_cpus: Option<i64>,
+    delegated_ancestor_cpu_known: bool,
+    /// Restores an in-process caller to the outer step supervisor when this invocation ends.
+    nested_coordinator: Option<NestedCoordinatorGuard>,
+    /// Tags whose roots were delegated to nested schedulers. Their hierarchical
+    /// `memory.events` include child steps already classified by the nested scheduler, so the
+    /// owning scheduler reads `memory.events.local` instead. Cleared on cleanup because sweeps
+    /// may reuse a tag with the same manager.
+    delegated: Mutex<HashSet<String>>,
 }
 
 impl Cgroups {
     /// Construct the manager. Only meaningful inside the re-exec'd scope; otherwise disabled.
     pub fn new() -> Self {
-        let mut cg = Cgroups {
-            enabled: false,
-            root: None,
-            containment: Containment::Full,
-        };
+        // A process below a delegated outer step inherits the top-level in-scope sentinel but
+        // does not own its current supervisor leaf. Only the CLI's validated adoption path may
+        // create a manager here; otherwise repeated library calls would build
+        // `supervisor/supervisor/...` and invalidate the delegation for their peers.
+        if std::env::var_os(DELEGATED_CGROUP_ENV).is_some() {
+            return Self::disabled(Containment::Full);
+        }
         if !in_scope() {
-            return cg;
+            return Self::disabled(Containment::Full);
         }
         let scope = match my_cgroup_path() {
             Some(p) if p.is_dir() => p,
-            _ => return cg,
+            _ => return Self::disabled(Containment::Full),
+        };
+        Self::at_root(scope, Containment::Full)
+    }
+
+    /// Adopt an exact parent-owned delegation root already validated against live membership.
+    pub fn from_delegated_root(root: PathBuf) -> Self {
+        Self::from_delegated_root_with_limits(root, None, None)
+    }
+
+    /// Adopt a delegation while making this invocation's tighter CLI limits physical at its
+    /// private aggregate root.
+    pub fn from_delegated_root_with_limits(
+        root: PathBuf,
+        max_cpus: Option<i64>,
+        max_mem_bytes: Option<i64>,
+    ) -> Self {
+        // One outer command may launch Python and Rust schedulers concurrently. Give each live
+        // process its own namespace so equal inner step tags cannot alias or clean up a peer.
+        let sequence = NEXT_NESTED_ROOT.fetch_add(1, Ordering::Relaxed);
+        let run_root = root.join(format!("nested-run-{}-{sequence}", std::process::id()));
+        let inherited = match create_nested_run_root(
+            &root,
+            &run_root,
+            Path::new(CGROUP_ROOT),
+            max_cpus,
+            max_mem_bytes,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn(&format!(
+                    "could not create nested scheduler cgroup {} ({error})",
+                    run_root.display()
+                ));
+                return Self::disabled(Containment::Full);
+            }
+        };
+        let mut manager = Self::at_root(run_root, Containment::Full);
+        let nested_coordinator = if manager.enabled {
+            let run_root = manager
+                .root
+                .as_deref()
+                .expect("an enabled cgroup manager has a root");
+            match move_current_to_nested_supervisor(run_root) {
+                Ok(guard) => Some(guard),
+                Err(mut error) => {
+                    warn(&format!(
+                        "could not place nested scheduler inside aggregate cgroup {} ({error}); \
+                         per-step containment disabled",
+                        run_root.display()
+                    ));
+                    manager.enabled = false;
+                    manager.root = None;
+                    manager.nested_coordinator = error.recovery.take();
+                    return manager;
+                }
+            }
+        } else {
+            None
+        };
+        manager.nested_coordinator = nested_coordinator;
+        manager.delegated_ancestor_memory_max = inherited.memory_max_bytes;
+        manager.delegated_ancestor_memory_max_known = inherited.memory_known;
+        manager.delegated_ancestor_max_cpus = inherited.max_cpus;
+        manager.delegated_ancestor_cpu_known = inherited.cpu_known;
+        manager
+    }
+
+    /// Retry restoration after a partially successful nested migration. Disabled managers use
+    /// this before honoring `--allow-cgroup-failure`, so no user step starts while the caller's
+    /// placement is uncertain.
+    pub(crate) fn restore_nested_coordinator_now(&mut self) -> std::io::Result<()> {
+        let Some(mut guard) = self.nested_coordinator.take() else {
+            return Ok(());
+        };
+        match guard.restore() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.nested_coordinator = Some(guard);
+                Err(error)
+            }
+        }
+    }
+
+    fn disabled(containment: Containment) -> Self {
+        Cgroups {
+            enabled: false,
+            root: None,
+            containment,
+            delegated_ancestor_memory_max: None,
+            delegated_ancestor_memory_max_known: true,
+            delegated_ancestor_max_cpus: None,
+            delegated_ancestor_cpu_known: true,
+            nested_coordinator: None,
+            delegated: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn at_root(scope: PathBuf, containment: Containment) -> Self {
+        let mut cg = Self::disabled(containment);
+        if !scope.is_dir() {
+            return cg;
         };
         let controllers: HashSet<String> = match read_trim(&scope, "cgroup.controllers") {
             Some(s) => s.split_whitespace().map(String::from).collect(),
@@ -1841,6 +2470,12 @@ impl Cgroups {
             enabled: false,
             root: None,
             containment: Containment::KillOnly,
+            delegated_ancestor_memory_max: None,
+            delegated_ancestor_memory_max_known: true,
+            delegated_ancestor_max_cpus: None,
+            delegated_ancestor_cpu_known: true,
+            nested_coordinator: None,
+            delegated: Mutex::new(HashSet::new()),
         };
         let Some(own) = my_cgroup_path() else {
             return disabled;
@@ -1871,6 +2506,12 @@ impl Cgroups {
             enabled: true,
             root: Some(root),
             containment: Containment::KillOnly,
+            delegated_ancestor_memory_max: None,
+            delegated_ancestor_memory_max_known: true,
+            delegated_ancestor_max_cpus: None,
+            delegated_ancestor_cpu_known: true,
+            nested_coordinator: None,
+            delegated: Mutex::new(HashSet::new()),
         }
     }
 
@@ -2025,8 +2666,30 @@ impl CgroupManager for Cgroups {
         //
         // An operator's OWN width, resolved once in the outermost process, is not refined: they
         // sized their caps against that pool. Only the derivation refines downward.
-        let eff_cores = cpu_count.or_else(|| cpu_max_cores(read_trim(root, "cpu.max")));
-        let eff_mem = mem_max.or_else(|| memory_max_bytes(read_trim(root, "memory.max")));
+        let mut core_limits: Vec<i64> = [
+            cpu_count,
+            cpu_max_cores(read_trim(root, "cpu.max")),
+            self.delegated_ancestor_max_cpus,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| *value > 0)
+        .collect();
+        if !self.delegated_ancestor_cpu_known {
+            // The CLI rejects an unreadable inherited envelope. Library callers still get the
+            // narrowest representable integer width rather than host-width fan-out.
+            core_limits.push(1);
+        }
+        let eff_cores = core_limits.into_iter().min();
+        let eff_mem = [
+            mem_max,
+            memory_max_bytes(read_trim(root, "memory.max")),
+            self.delegated_ancestor_memory_max,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| *value >= 0)
+        .min();
         let jobs = crate::sizing::select_build_jobs(eff_cores, eff_mem).jobs;
         // $$ is the bash leader's pid; writing it migrates the leader so every subsequently
         // forked descendant inherits this cgroup at fork. A cap on an empty child is not
@@ -2035,6 +2698,74 @@ impl CgroupManager for Cgroups {
             &child,
             &format!("export {}={jobs}\n{cmd}", crate::sizing::BUILD_JOBS_ENV),
         )
+    }
+
+    fn prepare_delegated_command(
+        &self,
+        tag: &str,
+        cmd: &str,
+        mem_max: Option<i64>,
+        cpu_count: Option<i64>,
+    ) -> PreparedDelegation {
+        if !self.enabled || self.containment != Containment::Full {
+            return PreparedDelegation {
+                command: "echo 'ERROR: delegated_children requires full cgroup containment' >&2\n\
+                          exit 125\n"
+                    .to_string(),
+                root: None,
+            };
+        }
+        let command = self.prepare_command(tag, cmd, mem_max, cpu_count);
+        let Some(child) = self.child(tag) else {
+            return PreparedDelegation {
+                command,
+                root: None,
+            };
+        };
+        let ordinary_procs = shell_quote(&child.join("cgroup.procs").to_string_lossy());
+        if !command.contains(&ordinary_procs) {
+            return PreparedDelegation {
+                command,
+                root: None,
+            };
+        }
+        let supervisor = child.join(SUPERVISOR);
+        let prepared = (|| -> Result<(), std::io::Error> {
+            make_dir(&supervisor)?;
+            let controllers: HashSet<String> = read_trim(&child, "cgroup.controllers")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(String::from)
+                .collect();
+            for controller in ["memory", "cpu", "pids"] {
+                if controllers.contains(controller) {
+                    enable_controller(&child, &supervisor, controller)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            warn(&format!(
+                "step {tag}: could not prepare delegated child cgroup {} ({error}); refusing \
+                 nested execution",
+                child.display()
+            ));
+            return PreparedDelegation {
+                command: "echo 'ERROR: delegated child cgroup could not be prepared; refusing \
+                          nested execution' >&2\nexit 125\n"
+                    .to_string(),
+                root: None,
+            };
+        }
+        let delegated_procs = shell_quote(&supervisor.join("cgroup.procs").to_string_lossy());
+        self.delegated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(tag.to_string());
+        PreparedDelegation {
+            command: command.replacen(&ordinary_procs, &delegated_procs, 1),
+            root: Some(child),
+        }
     }
 
     fn kill(&self, tag: &str) -> bool {
@@ -2056,8 +2787,13 @@ impl CgroupManager for Cgroups {
 
     fn cleanup(&self, tag: &str) {
         if let Some(child) = self.child(tag) {
+            remove_empty_cgroup_descendants(&child);
             let _ = fs::remove_dir(child); // EBUSY is fine; the outer-scope stop flushes it
         }
+        self.delegated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(tag);
     }
 
     // Derived from `memory_events` rather than parsing `memory.events` a second time, so the OOM
@@ -2073,7 +2809,22 @@ impl CgroupManager for Cgroups {
         if !self.enabled {
             return None;
         }
-        let text = read_trim(&child, "memory.events")?;
+        // `memory.events` is hierarchical. For a delegated step it therefore includes an inner
+        // step's independently handled OOM and would make the successful outer scheduler fail a
+        // second time. `memory.events.local` excludes those descendant-owned events while still
+        // counting an OOM charged at this delegation root's own memory.max (even when the victim
+        // lives below it), preserving the outer cap as an actionable backstop.
+        let delegated = self
+            .delegated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(tag);
+        let filename = if delegated {
+            "memory.events.local"
+        } else {
+            "memory.events"
+        };
+        let text = read_trim(&child, filename)?;
         // A line that does not parse as `<name> <integer>` is SKIPPED, not fatal: the kernel is
         // free to add counters, and discarding the whole file over one unrecognised line would
         // blank all five CSV cells and silently drop the recorded OOM count. The Python build
@@ -2095,22 +2846,28 @@ impl CgroupManager for Cgroups {
         if !self.enabled {
             return None;
         }
+        if !self.delegated_ancestor_memory_max_known {
+            return None;
+        }
         let own = read_trim(&child, "memory.max").filter(|value| !value.is_empty())?;
         // Hierarchical: the step's OWN memory.max is not the ceiling it ran under. The runner
         // always installs an outer scope cap, so a step given no inner cap reads "max" here
         // while the scope's ceiling is what held it — and the child's memory.events does not
         // count an ancestor's limit events, so nothing else in the row would show it. Report the
         // tighter of the two, because that is the number peak_bytes is interpretable against.
-        let Some(root) = self.root.as_ref() else {
-            return Some(own);
-        };
-        let Some(outer_bytes) = memory_max_bytes(read_trim(root, "memory.max")) else {
-            return Some(own);
-        };
-        Some(match memory_max_bytes(Some(own.clone())) {
-            Some(own_bytes) => own_bytes.min(outer_bytes).to_string(),
-            None => outer_bytes.to_string(),
-        })
+        let root_limit = self
+            .root
+            .as_ref()
+            .and_then(|root| memory_max_bytes(read_trim(root, "memory.max")));
+        let tightest = [
+            memory_max_bytes(Some(own.clone())),
+            root_limit,
+            self.delegated_ancestor_memory_max,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        Some(tightest.map_or(own, |bytes| bytes.to_string()))
     }
 
     fn peak_bytes(&self, tag: &str) -> Option<i64> {
@@ -2217,6 +2974,7 @@ impl CgroupManager for Cgroups {
                     path.display()
                 ));
             }
+            remove_empty_cgroup_descendants(&path);
             let _ = fs::remove_dir(&path);
         }
         n
@@ -2226,6 +2984,52 @@ impl CgroupManager for Cgroups {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+
+    #[test]
+    fn delegated_root_requires_exact_supervisor_membership_and_kill_boundary() {
+        let base =
+            std::env::temp_dir().join(format!("dagrun-delegated-root-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("step-owner");
+        let supervisor = root.join(SUPERVISOR);
+        fs::create_dir_all(&supervisor).unwrap();
+        fs::write(root.join("cgroup.kill"), "").unwrap();
+        fs::write(
+            supervisor.join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_delegated_cgroup_root_at(&root, &supervisor, std::process::id(), &base,)
+                .unwrap(),
+            root.canonicalize().unwrap()
+        );
+        let sibling = base.join("sibling");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(
+            sibling.join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        assert!(
+            validate_delegated_cgroup_root_at(&root, &sibling, std::process::id(), &base,)
+                .unwrap_err()
+                .contains("not the exact")
+        );
+        assert!(
+            validate_delegated_cgroup_root_at(&base, &supervisor, std::process::id(), &base,)
+                .unwrap_err()
+                .contains("outside")
+        );
+        fs::write(supervisor.join("cgroup.procs"), "999999\n").unwrap();
+        assert!(
+            validate_delegated_cgroup_root_at(&root, &supervisor, std::process::id(), &base,)
+                .unwrap_err()
+                .contains("is not listed")
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn scope_drain_waits_past_first_empty_sample_for_late_member() {
@@ -2664,6 +3468,12 @@ mod tests {
             enabled: true,
             root: Some(scope.clone()),
             containment: Containment::Full,
+            delegated_ancestor_memory_max: None,
+            delegated_ancestor_memory_max_known: true,
+            delegated_ancestor_max_cpus: None,
+            delegated_ancestor_cpu_known: true,
+            nested_coordinator: None,
+            delegated: Mutex::new(HashSet::new()),
         };
         let marker = scope.join("user-command-ran");
         let wrapped = cg.prepare_command(
@@ -2693,6 +3503,12 @@ mod tests {
             enabled: true,
             root: Some(scope.clone()),
             containment: Containment::Full,
+            delegated_ancestor_memory_max: None,
+            delegated_ancestor_memory_max_known: true,
+            delegated_ancestor_max_cpus: None,
+            delegated_ancestor_cpu_known: true,
+            nested_coordinator: None,
+            delegated: Mutex::new(HashSet::new()),
         };
         let applied = scope.join(sanitize("g.j")).join("memory.max");
 
@@ -2857,6 +3673,12 @@ mod tests {
             enabled: true,
             root: Some(root),
             containment: Containment::Full,
+            delegated_ancestor_memory_max: None,
+            delegated_ancestor_memory_max_known: true,
+            delegated_ancestor_max_cpus: None,
+            delegated_ancestor_cpu_known: true,
+            nested_coordinator: None,
+            delegated: Mutex::new(HashSet::new()),
         }
     }
 
@@ -2967,6 +3789,161 @@ mod tests {
     }
 
     #[test]
+    fn nested_run_preserves_a_finite_delegated_ancestor_cap() {
+        // Parent step -> private run root -> child. The finite limit deliberately lives ABOVE
+        // the delegated parent step, reproducing the path that used to report `max` for the
+        // child even though the kernel held it at 2 GiB.
+        let hierarchy = temp_scope("nested-inherited-memory-cap");
+        let outer = hierarchy.join("outer");
+        let parent = outer.join("step-parent");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(hierarchy.join("memory.max"), "8589934592\n").unwrap();
+        fs::write(outer.join("memory.max"), "2147483648\n").unwrap();
+        fs::write(parent.join("memory.max"), "max\n").unwrap();
+        fs::write(hierarchy.join("cpu.max"), "16 1\n").unwrap();
+        fs::write(outer.join("cpu.max"), "2 1\n").unwrap();
+        fs::write(parent.join("cpu.max"), "max 100000\n").unwrap();
+        let run_root = parent.join("nested-run-fixture");
+
+        let inherited = create_nested_run_root(&parent, &run_root, &hierarchy, None, None).unwrap();
+
+        assert!(inherited.memory_known);
+        assert_eq!(inherited.memory_max_bytes, Some(2_147_483_648));
+        assert!(inherited.cpu_known);
+        assert_eq!(inherited.max_cpus, Some(2));
+        assert_eq!(
+            fs::read_to_string(run_root.join("memory.max")).unwrap(),
+            "2147483648"
+        );
+        assert_eq!(
+            fs::read_to_string(run_root.join("cpu.max")).unwrap(),
+            "200000 100000"
+        );
+
+        let tighter_root = parent.join("nested-run-tighter");
+        let tighter = create_nested_run_root(
+            &parent,
+            &tighter_root,
+            &hierarchy,
+            Some(1),
+            Some(1024_i64.pow(3)),
+        )
+        .unwrap();
+        assert_eq!(tighter.max_cpus, Some(1));
+        assert_eq!(tighter.memory_max_bytes, Some(1024_i64.pow(3)));
+        assert_eq!(
+            fs::read_to_string(tighter_root.join("cpu.max")).unwrap(),
+            "100000 100000"
+        );
+        assert_eq!(
+            fs::read_to_string(tighter_root.join("memory.max")).unwrap(),
+            1024_i64.pow(3).to_string()
+        );
+
+        let child = run_root.join(sanitize("g.job"));
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("memory.max"), "max\n").unwrap();
+        let mut cg = planted_manager(run_root);
+        cg.delegated_ancestor_memory_max = inherited.memory_max_bytes;
+        cg.delegated_ancestor_memory_max_known = inherited.memory_known;
+        cg.delegated_ancestor_max_cpus = inherited.max_cpus;
+        cg.delegated_ancestor_cpu_known = inherited.cpu_known;
+        assert_eq!(
+            cg.applied_memory_max("g.job"),
+            Some("2147483648".to_string())
+        );
+
+        let command = cg.prepare_command("g.job", "true", Some(8 * 1024_i64.pow(3)), Some(8));
+        assert!(command.contains("export CARGO_BUILD_JOBS=2"), "{command}");
+        assert_eq!(
+            cg.applied_memory_max("g.job"),
+            Some("2147483648".to_string())
+        );
+
+        let _ = fs::remove_dir_all(&hierarchy);
+    }
+
+    #[test]
+    fn tighter_nested_limits_fail_closed_when_control_files_are_unwritable() {
+        let root = temp_scope("nested-required-stamp-failure");
+        let memory_root = root.join("memory");
+        fs::create_dir(&memory_root).unwrap();
+        // A directory at the control-file path reliably makes the write fail on an ordinary
+        // fixture filesystem, exercising the same required-stamp path as a refused cgroupfs
+        // write without needing cgroup privileges in the unit test.
+        fs::create_dir(memory_root.join("memory.max")).unwrap();
+        let memory_error = stamp_nested_memory_limit(&memory_root, 1024_i64.pow(3)).unwrap_err();
+        assert!(!memory_error.to_string().is_empty());
+
+        let cpu_root = root.join("cpu");
+        fs::create_dir(&cpu_root).unwrap();
+        fs::create_dir(cpu_root.join("cpu.max")).unwrap();
+        let cpu_error = stamp_nested_cpu_limit(&cpu_root, 1).unwrap_err();
+        assert!(!cpu_error.to_string().is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_nested_migration_retains_guard_when_rollback_also_fails() {
+        let root = temp_scope("nested-rollback-failure");
+        let return_supervisor = root.join("parent-supervisor");
+        let run_root = root.join("nested-run-fixture");
+        fs::create_dir_all(&return_supervisor).unwrap();
+        fs::create_dir_all(&run_root).unwrap();
+        let guard = NestedCoordinatorGuard {
+            run_root: run_root.clone(),
+            return_supervisor: return_supervisor.clone(),
+            active: true,
+        };
+        let mut failure = failed_nested_migration_with(
+            guard,
+            std::io::Error::other("post-write verification failed"),
+            |_guard| Err(std::io::Error::other("rollback write failed")),
+        );
+
+        assert!(failure.to_string().contains("rollback write failed"));
+        let recovery = failure
+            .recovery
+            .take()
+            .expect("an unproven rollback must retain a recovery guard");
+        assert_eq!(recovery.return_supervisor, return_supervisor);
+        assert!(recovery.active);
+        let mut manager = Cgroups::disabled(Containment::Full);
+        manager.nested_coordinator = Some(recovery);
+        assert!(manager.restore_nested_coordinator_now().is_err());
+        let recovery = manager
+            .nested_coordinator
+            .take()
+            .expect("a failed retry must keep the recovery guard for Drop");
+        // This planted fixture is not a real cgroup, so deliberately suppress its production
+        // Drop retry after proving the exact recovery target was retained.
+        std::mem::forget(recovery);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nested_run_inherits_effective_cpuset_when_cpu_quota_is_unbounded() {
+        let hierarchy = temp_scope("nested-inherited-cpuset");
+        let parent = hierarchy.join("step-parent");
+        fs::create_dir(&parent).unwrap();
+        fs::write(hierarchy.join("cpu.max"), "max 100000").unwrap();
+        fs::write(parent.join("cpu.max"), "max 100000").unwrap();
+        fs::write(parent.join("cpuset.cpus.effective"), "4-5").unwrap();
+        let run_root = parent.join("nested-run-cpuset");
+
+        let inherited = create_nested_run_root(&parent, &run_root, &hierarchy, None, None).unwrap();
+
+        assert!(inherited.cpu_known);
+        assert_eq!(inherited.max_cpus, Some(2));
+        assert_eq!(
+            fs::read_to_string(run_root.join("cpu.max")).unwrap(),
+            "200000 100000"
+        );
+        let _ = fs::remove_dir_all(&hierarchy);
+    }
+
+    #[test]
     fn memory_events_carry_every_counter_and_the_oom_count_agrees() {
         let root = temp_scope("memory-events");
         let child = root.join(sanitize("g.job"));
@@ -2978,7 +3955,7 @@ mod tests {
 
         fs::write(
             child.join("memory.events"),
-            "low 0\nhigh 12\nmax 41\noom 3\noom_kill 2\n",
+            "low 0\nhigh 12\nmax 41\noom 3\noom_kill 2\noom_group_kill 1\n",
         )
         .unwrap();
         let events = cg.memory_events("g.job").unwrap();
@@ -2988,7 +3965,43 @@ mod tests {
         assert_eq!(events.get("max"), Some(&41));
         assert_eq!(events.get("oom"), Some(&3));
         assert_eq!(events.get("oom_kill"), Some(&2));
+        assert_eq!(events.get("oom_group_kill"), Some(&1));
         // One parse, one answer: the OOM count cannot drift from the recorded counters.
+        assert_eq!(cg.oom_kills("g.job"), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delegated_memory_events_exclude_child_owned_ooms_but_keep_boundary_ooms() {
+        // A nested scheduler owns its child caps. The parent must not reclassify those OOMs, but
+        // an OOM charged at the parent's delegation boundary remains its actionable backstop.
+        let root = temp_scope("delegated-memory-events");
+        let child = root.join(sanitize("g.job"));
+        fs::create_dir_all(&child).unwrap();
+        let cg = planted_manager(root.clone());
+        cg.delegated.lock().unwrap().insert("g.job".to_string());
+        fs::write(child.join("memory.events"), "max 9\noom 4\noom_kill 4\n").unwrap();
+        fs::write(
+            child.join("memory.events.local"),
+            "max 0\noom 0\noom_kill 0\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            cg.memory_events("g.job"),
+            Some(BTreeMap::from([
+                ("max".to_string(), 0),
+                ("oom".to_string(), 0),
+                ("oom_kill".to_string(), 0),
+            ]))
+        );
+        assert_eq!(cg.oom_kills("g.job"), 0);
+
+        fs::write(
+            child.join("memory.events.local"),
+            "max 3\noom 2\noom_kill 2\n",
+        )
+        .unwrap();
         assert_eq!(cg.oom_kills("g.job"), 2);
         let _ = fs::remove_dir_all(&root);
     }

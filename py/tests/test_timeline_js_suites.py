@@ -1,11 +1,8 @@
 """Run the archive's JavaScript suites from the Python gate that actually runs.
 
-`tests/js/` holds six Node suites over `static/app.js` and `static/timeline-core.js`, and until
-this file existed **one** of them ran anywhere: the GitHub workflow names
-`tests/js/test_timeline_core.js` by hand, and `make validate` -- the gate this repository
-requires before every push -- runs no JavaScript at all. The other five were written, committed,
-and thereafter executed by nobody, which is the same state as not existing except that it looks
-like coverage.
+`tests/js/` holds the plain-Node suites over `static/app.js` and `static/timeline-core.js`.
+This file discovers all of them and is owned by the wrkviz component in the root validation graph;
+the separate browser fragment owns Playwright and benchmark suites.
 
 The suites are discovered by glob rather than listed, for the reason `scripts/validate.py` gives
 about naming one page suite instead of the pattern: a list is how the next suite comes to exist

@@ -15,8 +15,11 @@ import io
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from dagrun.cgroup import Cgroups, NoopCgroups, _sanitize
+import pytest
+
+from dagrun.cgroup import Cgroups, NoopCgroups, _create_nested_run_root, _sanitize
 from dagrun.cli import main
+from dagrun.memory_feedback import Censoring, peak_observation_from_row
 from dagrun.model import DagConfig, ResourceHint, Step
 from dagrun.perflog import CsvMetricsSink, new_run_id
 from dagrun.protocols import CgroupManager
@@ -55,6 +58,15 @@ class _PlantedCgroups:
         cpu_count: int | None = None,
     ) -> str:
         return cmd
+
+    def prepare_delegated_command(
+        self,
+        tag: str,
+        cmd: str,
+        mem_max: int | None = None,
+        cpu_count: int | None = None,
+    ) -> tuple[str, str | None]:
+        return cmd, None
 
     def kill(self, tag: str) -> bool:
         return False
@@ -331,6 +343,52 @@ def test_an_oom_kill_cannot_be_a_false_exit_zero_pass(tmp_path: Path) -> None:
         assert row["oom_kills"] == row["memory_events_oom_kill"] == str(kills)
 
 
+def test_a_boundary_oom_without_a_local_victim_is_still_a_failure(tmp_path: Path) -> None:
+    """A delegated root owns its limit even when the killed task is accounted below it.
+
+    cgroup-v2 can report ``oom`` at the delegation boundary while ``oom_kill`` increments only
+    in the descendant containing the selected victim. The parent's local event view intentionally
+    excludes nested-run siblings, so the boundary counter is sufficient attribution and must not
+    degrade into an unexplained SIGKILL (or, for a surviving supervisor, a false pass).
+    """
+    for counter in ("oom", "oom_group_kill"):
+        store = tmp_path / counter
+        cfg = DagConfig(steps=(_step("boundary", "true"),))
+        cgroups = _PlantedCgroups(
+            {
+                "g.boundary": (
+                    4096,
+                    "4096",
+                    {counter: 3, "oom_kill": 0},
+                )
+            }
+        )
+
+        result = run_dag(
+            cfg,
+            jobs=1,
+            cgroups=cgroups,
+            metrics=CsvMetricsSink(store, git_sha="deadbee"),
+            verbosity=0,
+        )
+
+        outcome = result.outcomes[0]
+        assert not result.ok and not outcome.ok
+        assert outcome.oomed
+        assert outcome.oom_kills == 0
+        assert outcome.reason == (
+            "MEMORY CAP EXHAUSTED (kernel reported OOM at inner MemoryMax; "
+            "no local oom_kill counter)"
+        )
+        row = _by_step(store)["g.boundary"]
+        assert row["ok"] == "false"
+        assert row["oom_kills"] == row["memory_events_oom_kill"] == "0"
+        if counter == "oom":
+            assert row["memory_events_oom"] == "3"
+        else:
+            assert row["memory_events_oom_group_kill"] == "3"
+
+
 def test_an_unbounded_step_says_max_and_an_unmeasured_one_says_nothing(
     tmp_path: Path,
 ) -> None:
@@ -360,6 +418,7 @@ def test_an_unbounded_step_says_max_and_an_unmeasured_one_says_nothing(
     # as "we looked and nothing happened".
     assert rows["g.unmeasured"]["memory_events_max"] == ""
     assert rows["g.unmeasured"]["memory_events_oom_kill"] == ""
+    assert rows["g.unmeasured"]["memory_events_oom_group_kill"] == ""
     assert rows["g.unbounded"]["memory_events_max"] == "0"
 
 
@@ -370,7 +429,7 @@ def test_an_unboxed_run_leaves_every_censoring_column_blank(tmp_path: Path) -> N
 
     row = _by_step(tmp_path)["g.only"]
     assert row["memory_max_bytes"] == ""
-    for counter in ("low", "high", "max", "oom", "oom_kill"):
+    for counter in ("low", "high", "max", "oom", "oom_kill", "oom_group_kill"):
         assert row[f"memory_events_{counter}"] == ""
     # The run context still identifies the execution and its timing, which do not need a cgroup.
     assert row["run_id"] != ""
@@ -449,6 +508,138 @@ def test_applied_memory_max_reports_the_tighter_of_the_step_and_scope_caps(
     assert cgroups.applied_memory_max("g.job") == "8589934592"
 
 
+def test_nested_run_preserves_a_finite_delegated_ancestor_cap(
+    tmp_path: Path,
+) -> None:
+    """Parent step -> private run root -> child keeps the cap and censoring provenance.
+
+    A freshly-created nested-run root starts locally unbounded. The finite limit in this fixture
+    deliberately lives above the delegated parent step, reproducing the path that used to report
+    ``max`` for the child even though the kernel held it at 2 GiB.
+    """
+    hierarchy = tmp_path / "cgroup"
+    outer = hierarchy / "outer"
+    parent = outer / "step-parent"
+    parent.mkdir(parents=True)
+    (hierarchy / "memory.max").write_text("8589934592\n")
+    (outer / "memory.max").write_text("2147483648\n")
+    (parent / "memory.max").write_text("max\n")
+    (hierarchy / "cpu.max").write_text("16 1\n")
+    (outer / "cpu.max").write_text("2 1\n")
+    (parent / "cpu.max").write_text("max 100000\n")
+    run_root = parent / "nested-run-fixture"
+
+    inherited = _create_nested_run_root(
+        parent,
+        run_root,
+        cgroup_root=hierarchy,
+    )
+
+    assert inherited.memory_known
+    assert inherited.memory_max_bytes == 2147483648
+    assert inherited.cpu_known
+    assert inherited.max_cpus == 2
+    assert (run_root / "memory.max").read_text() == "2147483648"
+    assert (run_root / "cpu.max").read_text() == "200000 100000"
+
+    tighter_root = parent / "nested-run-tighter"
+    tighter = _create_nested_run_root(
+        parent,
+        tighter_root,
+        cgroup_root=hierarchy,
+        requested_max_cpus=1,
+        requested_max_mem_bytes=1024**3,
+    )
+    assert tighter.max_cpus == 1
+    assert tighter.memory_max_bytes == 1024**3
+    assert (tighter_root / "cpu.max").read_text() == "100000 100000"
+    assert (tighter_root / "memory.max").read_text() == str(1024**3)
+
+    cgroups, child = _planted_cgroupfs(run_root, "g.job")
+    cgroups._delegated_ancestor_memory_max = inherited.memory_max_bytes
+    cgroups._delegated_ancestor_memory_max_known = inherited.memory_known
+    cgroups._delegated_ancestor_max_cpus = inherited.max_cpus
+    cgroups._delegated_ancestor_cpu_known = inherited.cpu_known
+    (child / "memory.max").write_text("max\n")
+    applied = cgroups.applied_memory_max("g.job")
+    assert applied == "2147483648"
+
+    observation = peak_observation_from_row(
+        {
+            "step": "g.job",
+            "peak_bytes": applied,
+            "memory_max_bytes": applied,
+            "memory_events_high": "0",
+            "memory_events_max": "0",
+            "memory_events_oom": "0",
+            "memory_events_oom_kill": "0",
+            "memory_events_oom_group_kill": "0",
+            "ok": "true",
+            "returncode": "0",
+        }
+    )
+    assert observation.verdict is Censoring.CENSORED
+
+    # A direct/library caller that asks for a wider child cannot make the generated build width
+    # exceed the inherited envelope, even before the CLI-level clamp has rewritten the graph.
+    command = cgroups.prepare_command(
+        "g.job",
+        "true",
+        mem_max=8 * 1024**3,
+        cpu_count=8,
+    )
+    assert "export CARGO_BUILD_JOBS=2" in command
+    assert cgroups.applied_memory_max("g.job") == "2147483648"
+
+
+@pytest.mark.parametrize("refused_control", ["memory.max", "cpu.max"])
+def test_nested_run_refuses_when_a_tighter_requested_root_cap_cannot_be_stamped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refused_control: str,
+) -> None:
+    hierarchy = tmp_path / "cgroup"
+    parent = hierarchy / "step-parent"
+    parent.mkdir(parents=True)
+    (parent / "memory.max").write_text(str(2 * 1024**3))
+    (parent / "cpu.max").write_text("200000 100000")
+    run_root = parent / "nested-run-refused"
+    original_write_text = Path.write_text
+
+    def refuse_selected_control(self: Path, data: str) -> int:
+        if self == run_root / refused_control:
+            raise PermissionError(f"fixture refuses {refused_control}")
+        return original_write_text(self, data)
+
+    monkeypatch.setattr(Path, "write_text", refuse_selected_control)
+    with pytest.raises(OSError, match="could not enforce requested nested"):
+        _create_nested_run_root(
+            parent,
+            run_root,
+            cgroup_root=hierarchy,
+            requested_max_cpus=1,
+            requested_max_mem_bytes=1024**3,
+        )
+
+
+def test_nested_run_inherits_effective_cpuset_when_cpu_quota_is_unbounded(
+    tmp_path: Path,
+) -> None:
+    hierarchy = tmp_path / "cgroup"
+    parent = hierarchy / "step-parent"
+    parent.mkdir(parents=True)
+    (hierarchy / "cpu.max").write_text("max 100000")
+    (parent / "cpu.max").write_text("max 100000")
+    (parent / "cpuset.cpus.effective").write_text("4-5")
+    run_root = parent / "nested-run-cpuset"
+
+    inherited = _create_nested_run_root(parent, run_root, cgroup_root=hierarchy)
+
+    assert inherited.cpu_known
+    assert inherited.max_cpus == 2
+    assert (run_root / "cpu.max").read_text() == "200000 100000"
+
+
 def test_an_unbounded_scope_leaves_the_step_cap_untouched(tmp_path: Path) -> None:
     cgroups, child = _planted_cgroupfs(tmp_path, "g.job")
     (tmp_path / "memory.max").write_text("max\n")
@@ -461,12 +652,40 @@ def test_memory_events_carries_every_counter_and_agrees_with_oom_kills(
     tmp_path: Path,
 ) -> None:
     cgroups, child = _planted_cgroupfs(tmp_path, "g.job")
-    (child / "memory.events").write_text("low 0\nhigh 12\nmax 41\noom 3\noom_kill 2\n")
+    (child / "memory.events").write_text(
+        "low 0\nhigh 12\nmax 41\noom 3\noom_kill 2\noom_group_kill 1\n"
+    )
 
     events = cgroups.memory_events("g.job")
 
-    assert events == {"low": 0, "high": 12, "max": 41, "oom": 3, "oom_kill": 2}
+    assert events == {
+        "low": 0,
+        "high": 12,
+        "max": 41,
+        "oom": 3,
+        "oom_kill": 2,
+        "oom_group_kill": 1,
+    }
     # One parse, one answer: the OOM count cannot drift from the recorded counters.
+    assert cgroups.oom_kills("g.job") == 2
+
+
+def test_delegated_memory_events_exclude_child_owned_ooms_but_keep_boundary_ooms(
+    tmp_path: Path,
+) -> None:
+    """A nested scheduler owns its child caps; the parent owns only its delegation boundary."""
+    cgroups, child = _planted_cgroupfs(tmp_path, "g.job")
+    cgroups._delegated.add("g.job")
+    (child / "memory.events").write_text("max 9\noom 4\noom_kill 4\n")
+    (child / "memory.events.local").write_text("max 0\noom 0\noom_kill 0\n")
+
+    assert cgroups.memory_events("g.job") == {"max": 0, "oom": 0, "oom_kill": 0}
+    assert cgroups.oom_kills("g.job") == 0
+
+    # If the delegation root's own memory.max fires, the kernel charges the event locally even
+    # when it selects a victim in a descendant. That remains the parent's actionable OOM.
+    (child / "memory.events.local").write_text("max 3\noom 2\noom_kill 2\n")
+    assert cgroups.memory_events("g.job") == {"max": 3, "oom": 2, "oom_kill": 2}
     assert cgroups.oom_kills("g.job") == 2
 
 

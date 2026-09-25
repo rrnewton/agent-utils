@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Build and inspect every independently publishable Rust crate.
+"""Build and inspect independently publishable Rust crates.
 
 The repository workspace is convenient for development, but it can hide a
 crate that would be incomplete when uploaded by itself.  This check asks Cargo
 to create the exact registry archive for each public crate, then inspects that
 archive for its binaries, library, license, README, and embedded user guide.
 It also keeps installer-facing documentation specific to the Rust package.
+
+With no selector, every crate is checked. ``--crate`` may be repeated to check
+only named crates while the global workspace topology and crate registry remain
+checked. Local dependency archives required to verify selected dependents are
+prepared and verified automatically, but are not smoke-tested unless selected.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -117,10 +123,114 @@ class CheckError(RuntimeError):
     """A crate failed its publishable-artifact contract."""
 
 
-def _check_public_rustdoc() -> None:
+def _crate_registry() -> dict[str, Crate]:
+    """Return the crate registry after checking names and dependency topology."""
+
+    crates: dict[str, Crate] = {}
+    libraries: set[str] = set()
+    binaries: set[str] = set()
+    positions: dict[str, int] = {}
+    for position, crate in enumerate(CRATES):
+        if crate.name in crates:
+            raise CheckError(f"crate registry repeats name {crate.name!r}")
+        if crate.library in libraries:
+            raise CheckError(f"crate registry repeats library {crate.library!r}")
+        crates[crate.name] = crate
+        libraries.add(crate.library)
+        positions[crate.name] = position
+        for binary in crate.bins:
+            if binary in binaries:
+                raise CheckError(f"crate registry repeats binary {binary!r}")
+            binaries.add(binary)
+    unknown_subjects = sorted(set(LOCAL_PACKAGE_PATCHES) - set(crates))
+    if unknown_subjects:
+        raise CheckError(
+            f"local package dependency map has unknown crates: {unknown_subjects}"
+        )
+    for subject, dependencies in LOCAL_PACKAGE_PATCHES.items():
+        seen: set[str] = set()
+        for dependency in dependencies:
+            if dependency not in crates:
+                raise CheckError(
+                    f"{subject}: local package dependency {dependency!r} is not registered"
+                )
+            if dependency in seen:
+                raise CheckError(
+                    f"{subject}: local package dependency {dependency!r} is repeated"
+                )
+            seen.add(dependency)
+            if positions[dependency] >= positions[subject]:
+                raise CheckError(
+                    f"{subject}: local package dependency {dependency!r} must precede its "
+                    "dependent in the crate registry"
+                )
+    return crates
+
+
+def _select_crates(names: list[str]) -> tuple[Crate, ...]:
+    """Resolve strict, repeatable selectors in canonical registry order."""
+
+    registry = _crate_registry()
+    if not names:
+        return CRATES
+    selected: set[str] = set()
+    for name in names:
+        if name not in registry:
+            choices = ", ".join(sorted(registry))
+            raise CheckError(f"unknown crate {name!r}; choose one of: {choices}")
+        if name in selected:
+            raise CheckError(f"crate {name!r} selected more than once")
+        selected.add(name)
+    return tuple(crate for crate in CRATES if crate.name in selected)
+
+
+def _crate_work(
+    selected: tuple[Crate, ...],
+) -> tuple[tuple[Crate, ...], dict[str, tuple[str, ...]]]:
+    """Return selected crates plus the dependency archives their verification needs."""
+
+    _crate_registry()
+    selected_names = {crate.name for crate in selected}
+    required_by: dict[str, set[str]] = {}
+
+    def add_dependencies(crate_name: str, requested_name: str) -> None:
+        for dependency in LOCAL_PACKAGE_PATCHES.get(crate_name, ()):
+            if dependency not in selected_names:
+                required_by.setdefault(dependency, set()).add(requested_name)
+            add_dependencies(dependency, requested_name)
+
+    for crate in selected:
+        add_dependencies(crate.name, crate.name)
+    work_names = selected_names | set(required_by)
+    work = tuple(crate for crate in CRATES if crate.name in work_names)
+    reasons = {
+        name: tuple(sorted(requesters)) for name, requesters in required_by.items()
+    }
+    return work, reasons
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--crate",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="check only this crate; repeat for multiple crates (default: all crates)",
+    )
+    selection.add_argument(
+        "--list-crates",
+        action="store_true",
+        help="list accepted crate names, then exit",
+    )
+    return parser
+
+
+def _check_public_rustdoc(crates: tuple[Crate, ...] | None = None) -> None:
     """Keep every published crate's public rustdoc standalone."""
 
-    for crate in CRATES:
+    for crate in CRATES if crates is None else crates:
         root = RS_ROOT / crate.name
         for path in sorted((root / "src").rglob("*.rs")):
             in_block_doc = False
@@ -142,25 +252,20 @@ def _check_public_rustdoc() -> None:
                     in_block_doc = False
 
 
-def _check_missing_docs() -> None:
+def _check_missing_docs(crates: tuple[Crate, ...] | None = None) -> None:
     """Ask rustc to reject every undocumented public library item."""
 
     env = dict(os.environ)
     existing = env.get("RUSTFLAGS", "").strip()
     env["RUSTFLAGS"] = f"{existing} -D missing-docs".strip()
-    _run(
-        [
-            "cargo",
-            "check",
-            "--locked",
-            "--offline",
-            "--workspace",
-            "--lib",
-            "--manifest-path",
-            str(RS_ROOT / "Cargo.toml"),
-        ],
-        env=env,
-    )
+    command = ["cargo", "check", "--locked", "--offline"]
+    if crates is None:
+        command.append("--workspace")
+    else:
+        for crate in crates:
+            command.extend(("--package", crate.name))
+    command.extend(("--lib", "--manifest-path", str(RS_ROOT / "Cargo.toml")))
+    _run(command, env=env)
 
 
 def _check_workspace_topology() -> None:
@@ -643,11 +748,20 @@ def _smoke(
                 _run([str(executable), *arguments], cwd=run_root, env=env, timeout=30)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = _argument_parser()
+    arguments = parser.parse_args(argv)
     try:
+        selected = _select_crates(arguments.crate)
+        if arguments.list_crates:
+            for crate in CRATES:
+                print(crate.name)
+            return 0
+        work, dependency_reasons = _crate_work(selected)
+        selected_names = {crate.name for crate in selected}
         _check_workspace_topology()
-        _check_public_rustdoc()
-        _check_missing_docs()
+        _check_public_rustdoc(selected)
+        _check_missing_docs(selected if len(selected) != len(CRATES) else None)
         index_text = (RS_ROOT / "README.md").read_text(encoding="utf-8")
         index_match = _FOREIGN_DOC_TERMS.search(index_text)
         if index_match is not None:
@@ -661,7 +775,7 @@ def main() -> int:
             smoke_root = package_root / "smoke"
             smoke_root.mkdir()
             dependency_archives: dict[str, Path] = {}
-            for crate in CRATES:
+            for crate in work:
                 version, bins, libraries = _metadata(crate)
                 if bins != set(crate.bins):
                     raise CheckError(
@@ -678,11 +792,18 @@ def main() -> int:
                 _verify_package_archive(crate, archive, target_root, dependency_archives)
                 # Only inspected and independently compiled archives become dependency inputs.
                 dependency_archives[crate.name] = archive
-                _smoke(crate, version, documents, target_root, smoke_root / crate.name)
-                print(
-                    f"check_rust_packages: ok {crate.name} {version} "
-                    f"({', '.join(crate.bins)})"
-                )
+                if crate.name in selected_names:
+                    _smoke(crate, version, documents, target_root, smoke_root / crate.name)
+                    print(
+                        f"check_rust_packages: ok {crate.name} {version} "
+                        f"({', '.join(crate.bins)})"
+                    )
+                else:
+                    requesters = ", ".join(dependency_reasons[crate.name])
+                    print(
+                        f"check_rust_packages: dependency archive ok {crate.name} "
+                        f"{version} (required by {requesters}; smoke skipped)"
+                    )
     except (
         CheckError,
         json.JSONDecodeError,
@@ -693,7 +814,20 @@ def main() -> int:
     ) as error:
         print(f"check_rust_packages: FAIL: {error}", file=sys.stderr)
         return 1
-    print(f"check_rust_packages: all {len(CRATES)} crates passed")
+    if len(selected) == len(CRATES):
+        print(f"check_rust_packages: all {len(CRATES)} crates passed")
+    else:
+        dependencies = len(work) - len(selected)
+        suffix = (
+            f"; {dependencies} dependency archive"
+            f"{'s' if dependencies != 1 else ''} prepared"
+            if dependencies
+            else ""
+        )
+        print(
+            f"check_rust_packages: selected {len(selected)} "
+            f"crate{'s' if len(selected) != 1 else ''} passed{suffix}"
+        )
     return 0
 
 

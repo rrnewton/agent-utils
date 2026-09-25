@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::io::{dag_from_json, dag_from_yaml};
+use crate::io::dag_from_path;
 use crate::model::DagConfig;
 use crate::perflog::{parse_csv_records, ProfileFileLock};
 use crate::sweep::stable_topological_order;
@@ -1198,20 +1198,7 @@ fn round3(value: f64) -> f64 {
 
 /// Load a DAG document through dagrun's strict interchange parser.
 pub fn load_report_dag(path: &Path) -> Result<DagConfig, ProfileReportError> {
-    let text = fs::read_to_string(path).map_err(|error| {
-        ProfileReportError::new(format!("cannot read DAG {}: {error}", path.display()))
-    })?;
-    let suffix = path
-        .extension()
-        .and_then(|suffix| suffix.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let parsed = if matches!(suffix.as_str(), "yaml" | "yml") {
-        dag_from_yaml(&text)
-    } else {
-        dag_from_json(&text)
-    };
-    parsed.map_err(|error| ProfileReportError::new(format!("{}: {error}", path.display())))
+    dag_from_path(path).map_err(|error| ProfileReportError::new(error.to_string()))
 }
 
 /// Build the stable JSON payload embedded in a profile report.
@@ -1677,6 +1664,7 @@ mod tests {
             hint: ResourceHint::default(),
             networkonly: false,
             engine_only: false,
+            delegated_children: false,
             timeout: 0,
             cpu_timeout: 0,
             jobs_flag: None,

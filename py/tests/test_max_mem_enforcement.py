@@ -106,6 +106,13 @@ def _capture_reexec(
         return False  # never re-exec under test; the caller then reports and returns nonzero
 
     monkeypatch.delenv("DAGRUN_IN_SCOPE", raising=False)
+    # This unit test exercises the *outer scope setup* branch even when the whole pytest shard is
+    # safely hosted as an opted-in delegated child of the validation DAG. Removing only the
+    # delegation capability for this direct function call does not move or escape the test
+    # process from its real outer cgroup.
+    monkeypatch.delenv(cg.DELEGATED_CGROUP_ENV, raising=False)
+    monkeypatch.delenv(cg.DELEGATED_UNBOXED_ENV, raising=False)
+    monkeypatch.delenv("DAGRUN_OUTER_RUN", raising=False)
     monkeypatch.delenv(cg.OUTER_MEMORY_MAX_ENV, raising=False)
     monkeypatch.setattr(cg, "mem_available_bytes", lambda: available)
     monkeypatch.setattr(cg, "reexec_in_scope", fake_reexec)

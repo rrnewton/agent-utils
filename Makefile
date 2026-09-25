@@ -1,6 +1,8 @@
 # `make` just runs ./setup (both python and rust), per repo convention.
-.PHONY: all both py rs check check-deps check-test-suite-selector mypy test cross check-packages \
-	check-python-packages check-rust-packages fmt clean
+.PHONY: all both py rs check check-workspace check-deps check-test-suite-selector \
+	check-validation-components check-pytest-sharder check-validate-selector check-client-names \
+	check-documented-defaults mypy test cross check-packages check-python-packages \
+	check-rust-packages validate validate-all fmt clean
 
 all: both
 
@@ -20,9 +22,13 @@ mypy:
 	python3 -m mypy --config-file py/pyproject.toml --strict --disallow-any-explicit --disallow-any-decorated .
 	python3 scripts/check_no_any.py .
 
-# Lint/typecheck gates (what CI runs).
-check: check-deps mypy check-test-suite-selector check-validate-selector check-client-names \
-	check-documented-defaults
+# Lint/typecheck gates (what CI runs). The split lets the selective validator run its always-on
+# hygiene group once, then execute only the code-facing half here. `make check` remains the complete
+# standalone target for callers that did not already run those guards.
+check: check-workspace check-validate-selector check-validation-components check-pytest-sharder \
+	check-client-names check-documented-defaults
+
+check-workspace: check-deps mypy check-test-suite-selector
 	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
 	test -n "$$host_target"; \
 	cargo clippy --release --workspace --all-targets --manifest-path rs/Cargo.toml \
@@ -43,7 +49,7 @@ $(error TEST_SUITE must be exactly one of: all, python, rust)
 endif
 
 # Run only the checks the current change can actually affect, and REPORT the rest as skipped.
-# `--all` is the whole contract and is what CI uses; selection is for the edit-run loop.
+# `--all` is the whole portable contract and is what the nightly uses; selection is for the edit-run loop.
 # See scripts/validate.py for the path -> check mapping and why each rule is what it is.
 validate:
 	python3 scripts/validate.py
@@ -54,6 +60,12 @@ validate-all:
 # The selector must not be able to silently under-run. Offline, no build, no network.
 check-validate-selector:
 	python3 scripts/validate.py --self-test
+
+check-validation-components:
+	python3 scripts/run_component_tests.py --self-test
+
+check-pytest-sharder:
+	python3 scripts/run_pytest_shard.py --self-test
 
 # agent-utils is reusable; the projects that consume it must not be named anywhere in the tree.
 check-client-names:
@@ -114,6 +126,7 @@ endif
 
 # Cross-language observable behavior for every paired command.
 cross:
+	python3 -m pytest -q cross/test_cpu_footprint.py
 	python3 cross/differential.py --tool all
 
 # Build and smoke the artifacts users actually install, one distribution at a time.

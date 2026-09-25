@@ -92,6 +92,98 @@ JSON and YAML express the same strict schema. File names ending in `.yaml` or
 `.yml` select YAML; other paths select JSON. Use `--dag -` for JSON on standard
 input.
 
+### Compose DAG files at load time
+
+The top-level `include` list composes reusable DAG fragments before planning or
+execution. It is load-time syntax, not a runtime node: every command sees one
+ordinary flattened graph, and canonical `dagrun json`/`yaml` output contains no
+`include` key.
+
+```yaml
+include:
+  - path: validation/portable.yaml
+    namespace: portable
+  - path: validation/native.yaml
+    namespace: native
+    after: [bootstrap.tools]
+steps:
+  - group: bootstrap
+    job: tools
+    cmd: ./prepare-tools
+  - group: publish
+    job: all
+    cmd: ./publish
+    deps: [portable.test.unit, native.test.unit]
+```
+
+`path` is relative to the file declaring it. After symlinks are resolved it
+must remain beneath the top-level DAG's directory; absolute paths, URLs,
+globs, tilde expansion, environment expansion, missing files, and directory
+targets are refused. `namespace` is one segment matching
+`[A-Za-z0-9][A-Za-z0-9_-]*`; nested namespaces join with dots.
+
+Flattening is depth-first in include order, then local-step order. A namespace
+prefixes each included step's `group`, and therefore its `group.job` tag. It
+also prefixes that fragment's `deps`, `explains`, structured-result `owner`,
+and `fail_fast_family`. Labels, commands, environment, write domains,
+resources, and manifest identities are unchanged. The same canonical file may
+be included under different effective namespaces, but including it twice under
+the same namespace is an error. Include cycles name the complete canonical
+file chain.
+
+Composition is bounded before expansion can exhaust the loader: at most 128
+include edges may be nested, at most 4,096 include instances may be loaded
+(the root is not counted), and the flattened graph may contain at most 100,000
+steps. Reusing one canonical file under different namespaces counts once per
+instance. These bounds apply to path-based composition only; the context-free
+single-document APIs keep their existing graph-size behavior.
+
+Optional `after` is parent-owned cross-boundary wiring. Its tags are resolved
+in the including file's namespace and injected as dependencies into every
+entry node of the included flattened subgraph (a node with no dependency on
+another node in that subgraph). This lets a parent put a fragment after an
+outer setup step without teaching the child about its caller. There is no
+magic `..` syntax. Every `after` tag must name a real step outside the included
+subgraph, even when that subgraph is empty. Dependencies from outer steps to
+the fragment name exact flattened tags, as `publish.all` does above. No
+synthetic include or completion node is created, and `after` does not add an
+implicit whole-subgraph completion barrier.
+
+Nested schedulers are refused by default. A step that intentionally runs dagrun
+may set `delegated_children: true`. Under cgroup boxing, the outer scheduler
+keeps ownership of that step's whole subtree, places the command in a
+`supervisor` leaf, and lends the empty step root to the inner scheduler for its
+own child cgroups. The inner process verifies its live kernel membership before
+accepting that path. The delegation is removed from ordinary child-step
+environments, so it cannot silently authorize another nesting level. If the
+outer run is itself explicitly unboxed, the same graph property authorizes a
+named uncontained fallback for that step only. The child prints a warning and
+uses process-group/procfs teardown and accounting; it never describes that lane
+as cgroup containment. A malformed delegation marker or forged cgroup path is
+still refused.
+
+The parent attributes memory pressure at the boundary it owns. Ordinary steps
+use the hierarchical `memory.events` counters. A delegated step uses
+`memory.events.local`, so an inner step's independently classified OOM is not
+reported again as an outer-step failure. An OOM caused by the parent's own
+`memory.max` remains local to that delegation boundary even when the selected
+victim is in a descendant. In that case the boundary can increment `oom` (or
+`oom_group_kill`) while `oom_kill` is accounted only in the victim's child
+cgroup. Any of those positive kernel OOM counters therefore fails the outer
+step; a bare signal with no counter still does not.
+
+`resource_caps` from all files form one union. Repeating a cap with the same
+value is allowed; conflicting values are refused. The root owns global policy
+(`default_step_timeout`, job channels, memory factors, and
+`write_domain_policy`). A child may omit those fields or repeat the same
+normalized value, but cannot override one. Only the root description is used.
+
+The path-free `dag_from_json`/`dag_from_yaml` APIs and `--dag -` refuse an
+`include` key because they have no safe base directory. Use `dag_from_path` or
+pass a filename. The exact `include` key is reserved and its entry schema is
+closed (`path`, `namespace`, optional `after`), so malformed composition can
+never be silently ignored as an unknown top-level extension.
+
 #### What the loader refuses, and where
 
 **Every** subcommand that reads `--dag` — including the inspection ones (`list`,
@@ -107,6 +199,7 @@ is therefore a complete, cheap graph check that executes no step.
 | a dependency no step declares | the step and the missing tag |
 | a dependency cycle | **the cycle**, as `a.one -> b.two -> a.one` |
 | a demand above a **positive** `resource_caps` entry | the step, the demand, and the cap |
+| a malformed, escaping, cyclic, duplicate, or policy-conflicting `include` | the source file and offending entry/path/namespace |
 | one of the six top-level keys the format does not carry (below) | each key |
 
 Those objects are **closed**: a field they do not define is refused rather than
@@ -114,7 +207,7 @@ ignored, because an ignored field reads exactly like one that took effect —
 `est_duration` for `est_duration_s` is not a smaller estimate, it is no estimate
 at all, silently. The **top level** stays open (a key naming nothing at all is
 tolerated, so forward-compatible additions keep loading), with the six named
-exceptions below.
+exceptions below and the exact reserved `include` key described above.
 
 Two related refusals happen slightly later, at the start of a run rather than at
 load, because they are about capacity rather than about the document:
@@ -220,13 +313,15 @@ The default `greedy-lpt` planner favors the longest ready step. The
 planner additionally chooses inner widths from measured speedup curves. Stable
 tag ordering breaks ties, so repeated plans over the same inputs are identical.
 
-By default, past profile samples refine duration and resident-memory estimates.
+By default, past profile samples refine duration and resident-memory estimates. Duration may move
+in either direction. An authored `rss_baseline_bytes` is a safety floor: ordinary feedback may
+raise it when a run used more, but one quiet run never lowers the next run's enforced memory cap.
 Use `--no-profile-feedback` when only authored hints may influence a plan.
 
 ### Learning a memory cap from profiles, safely
 
-`run --profile-memory-feedback` is a separate, opt-in path that derives
-`rss_baseline_bytes` from the store's **uncensored** peaks only.
+`run --profile-memory-feedback` is the separate, opt-in path allowed to lower an authored
+`rss_baseline_bytes`. It derives the replacement from the store's **uncensored** peaks only.
 
 A recorded `peak_bytes` does not on its own say what it measured. A step whose
 peak reached the `memory.max` applied to it, or that the kernel reclaimed,
@@ -245,13 +340,11 @@ that produced it and freezes the mistake. So:
 - a step needs at least five uncensored samples before its authored hint is
   replaced at all, and the estimate carries a 20% margin above the 9/10
   percentile;
-- a step this path **declines** to estimate goes back to the larger of the
-  baseline its author wrote and the floor its recorded peaks prove. Going back
-  to the author's figure matters because the ordinary feedback above has already
-  refined the same hint from the same peaks *without* asking what they were
-  measured under: turning this flag on has to remove that number too, or a
-  decline would quietly mean "use the censoring-blind estimate instead". Keeping
-  the floor matters for the same reason in the other direction: a step whose
+- a step this path **declines** to estimate uses the larger of the baseline its
+  author wrote and the floor its recorded peaks prove. Ordinary feedback already
+  keeps the authored value as its floor; this opt-in path preserves that same
+  guarantee when it declines to lower. Keeping the recorded floor matters in
+  the other direction: a step whose
   every run was pinned to a 32 GiB ceiling has proven it needs at least that,
   and modelling it at the 1 GiB its author guessed would be the same ratchet
   running the other way. "We do not know the peak" and "we know the peak is at

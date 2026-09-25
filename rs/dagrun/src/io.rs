@@ -22,6 +22,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::attribution::TEST_COUNTS_PATH_ENV;
 use serde_json::Value;
@@ -149,13 +151,14 @@ fn err(msg: impl Into<String>) -> DagJsonError {
 /// `cmds`, `timeouts`, `env_vars`, `description` vs `desc`. Silently ignored, the instruction is
 /// simply not carried out and the document still says it was: the step runs with no timeout, no
 /// dependency, no environment, and nothing anywhere reports it.
-const STEP_KEYS: [&str; 25] = [
+const STEP_KEYS: [&str; 26] = [
     "cmd",
     "cmdtype",
     "cpu_timeout",
     "deps",
     "desc",
     "description",
+    "delegated_children",
     "engine_only",
     "env",
     "explains",
@@ -694,19 +697,613 @@ fn hint_from(value: Option<&Value>, where_: &str) -> Result<ResourceHint, DagJso
     })
 }
 
-/// Parse a JSON DAG document with strict field and type validation.
-pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
-    let raw: Value = serde_json::from_str(text).map_err(|e| err(format!("invalid JSON: {e}")))?;
-    dag_from_value(&raw)
+fn raw_from_json(text: &str) -> Result<Value, DagJsonError> {
+    serde_json::from_str(text).map_err(|e| err(format!("invalid JSON: {e}")))
 }
 
-/// Parse a DAG YAML document into a [`DagConfig`]. YAML is ISOMORPHIC to the JSON schema: it is
-/// deserialized into the same `serde_json::Value` intermediate and funneled through
-/// [`dag_from_value`], so JSON and YAML construct the model identically. Returns [`DagJsonError`]
-/// on any malformed field, mirroring the JSON strictness.
+/// Parse one self-contained JSON DAG with strict field and type validation.
+///
+/// `include` needs a source directory and is therefore accepted only by [`dag_from_path`].
+pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
+    dag_from_value(&raw_from_json(text)?)
+}
+
+fn raw_from_yaml(text: &str) -> Result<Value, DagJsonError> {
+    serde_norway::from_str(text).map_err(|e| err(format!("invalid YAML: {e}")))
+}
+
+/// Parse one self-contained YAML DAG into a [`DagConfig`].
+///
+/// YAML is isomorphic to the JSON schema. `include` requires filesystem context and is accepted
+/// only by [`dag_from_path`].
 pub fn dag_from_yaml(text: &str) -> Result<DagConfig, DagJsonError> {
-    let raw: Value = serde_norway::from_str(text).map_err(|e| err(format!("invalid YAML: {e}")))?;
-    dag_from_value(&raw)
+    dag_from_value(&raw_from_yaml(text)?)
+}
+
+const INCLUDE_KEYS: [&str; 3] = ["after", "namespace", "path"];
+/// Maximum recursively included edges below the root document.
+pub const MAX_DAG_INCLUDE_DEPTH: usize = 128;
+/// Maximum included file instances; the root document is not counted.
+pub const MAX_DAG_INCLUDE_INSTANCES: usize = 4096;
+/// Maximum steps after file composition. Context-free parsers retain their existing behavior.
+pub const MAX_DAG_FLATTENED_STEPS: usize = 100_000;
+const GLOBAL_POLICY_KEYS: [&str; 7] = [
+    "mem_cap_factor",
+    "mem_cap_floor_bytes",
+    "outer_mem_safety_factor",
+    "default_step_timeout",
+    "default_jobs_flag",
+    "default_jobs_env",
+    "write_domain_policy",
+];
+
+fn valid_namespace_segment(namespace: &str) -> bool {
+    let mut chars = namespace.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn include_entries(
+    doc: &serde_json::Map<String, Value>,
+    source: &str,
+) -> Result<Vec<(String, String, Vec<String>)>, DagJsonError> {
+    let Some(raw) = doc.get("include") else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(values) = raw else {
+        return Err(err(format!("{source}.include: must be a list")));
+    };
+    let mut entries = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let where_ = format!("{source}.include[{index}]");
+        let entry = as_obj(value, &where_)?;
+        refuse_unknown_keys(entry, &INCLUDE_KEYS, &where_)?;
+        let path = req_str(entry, "path", &where_)?;
+        let namespace = req_str(entry, "namespace", &where_)?;
+        if path.is_empty() {
+            return Err(err(format!("{where_}.path: must be non-empty")));
+        }
+        if !valid_namespace_segment(&namespace) {
+            return Err(err(format!(
+                "{where_}.namespace: must match [A-Za-z0-9][A-Za-z0-9_-]*"
+            )));
+        }
+        let after = match entry.get("after") {
+            None => Vec::new(),
+            Some(Value::Array(values)) => {
+                let mut after = Vec::with_capacity(values.len());
+                for value in values {
+                    let Value::String(tag) = value else {
+                        return Err(err(format!("{where_}.after: must contain only strings")));
+                    };
+                    after.push(tag.clone());
+                }
+                after
+            }
+            Some(_) => return Err(err(format!("{where_}.after: must be a list of strings"))),
+        };
+        if after.iter().any(String::is_empty) {
+            return Err(err(format!("{where_}.after: tags must be non-empty")));
+        }
+        if after.iter().collect::<BTreeSet<_>>().len() != after.len() {
+            return Err(err(format!(
+                "{where_}.after: duplicate tags are not allowed"
+            )));
+        }
+        entries.push((path, namespace, after));
+    }
+    Ok(entries)
+}
+
+fn qualify(namespace: &str, value: &str) -> String {
+    if namespace.is_empty() {
+        value.to_string()
+    } else {
+        format!("{namespace}.{value}")
+    }
+}
+
+fn rewrite_string_field(object: &mut serde_json::Map<String, Value>, key: &str, namespace: &str) {
+    if let Some(Value::String(value)) = object.get_mut(key) {
+        *value = qualify(namespace, value);
+    }
+}
+
+fn rewrite_string_list(object: &mut serde_json::Map<String, Value>, key: &str, namespace: &str) {
+    if let Some(Value::Array(values)) = object.get_mut(key) {
+        for value in values {
+            if let Value::String(text) = value {
+                *text = qualify(namespace, text);
+            }
+        }
+    }
+}
+
+fn rewrite_step(mut value: Value, namespace: &str) -> Value {
+    if namespace.is_empty() {
+        return value;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    rewrite_string_field(object, "group", namespace);
+    rewrite_string_list(object, "deps", namespace);
+    rewrite_string_list(object, "explains", namespace);
+    if object
+        .get("fail_fast_family")
+        .and_then(Value::as_str)
+        .is_some_and(|family| !family.trim().is_empty())
+    {
+        rewrite_string_field(object, "fail_fast_family", namespace);
+    }
+    if let Some(Value::Array(declarations)) = object.get_mut("result_manifests") {
+        for declaration in declarations {
+            let Some(manifest) = declaration.as_object_mut() else {
+                continue;
+            };
+            if manifest.get("kind").and_then(Value::as_str) == Some(STRUCTURED_TEST_RESULTS_KIND)
+                && manifest
+                    .get("owner")
+                    .and_then(Value::as_str)
+                    .is_some_and(|owner| !owner.is_empty())
+            {
+                rewrite_string_field(manifest, "owner", namespace);
+            }
+        }
+    }
+    value
+}
+
+fn policy_config(doc: &serde_json::Map<String, Value>) -> Result<DagConfig, DagJsonError> {
+    let mut policy = doc.clone();
+    policy.remove("include");
+    policy.insert("steps".to_string(), Value::Array(Vec::new()));
+    dag_from_value(&Value::Object(policy))
+}
+
+fn same_policy(key: &str, left: &DagConfig, right: &DagConfig) -> bool {
+    match key {
+        "mem_cap_factor" => left.mem_cap_factor == right.mem_cap_factor,
+        "mem_cap_floor_bytes" => left.mem_cap_floor_bytes == right.mem_cap_floor_bytes,
+        "outer_mem_safety_factor" => left.outer_mem_safety_factor == right.outer_mem_safety_factor,
+        "default_step_timeout" => left.default_step_timeout == right.default_step_timeout,
+        "default_jobs_flag" => left.default_jobs_flag == right.default_jobs_flag,
+        "default_jobs_env" => left.default_jobs_env == right.default_jobs_env,
+        "write_domain_policy" => left.write_domain_policy == right.write_domain_policy,
+        _ => unreachable!("GLOBAL_POLICY_KEYS contains an unknown field"),
+    }
+}
+
+fn is_yaml_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|suffix| suffix.to_str())
+        .is_some_and(|suffix| matches!(suffix.to_ascii_lowercase().as_str(), "yaml" | "yml"))
+}
+
+fn read_dag_source(
+    path: &Path,
+    syntax_path: &Path,
+) -> Result<serde_json::Map<String, Value>, DagJsonError> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| err(format!("{}: cannot read DAG: {error}", path.display())))?;
+    let raw = if is_yaml_path(syntax_path) {
+        raw_from_yaml(&text)
+    } else {
+        raw_from_json(&text)
+    }
+    .map_err(|error| err(format!("{}: {error}", path.display())))?;
+    as_obj(&raw, "<root>")
+        .cloned()
+        .map_err(|error| err(format!("{}: {error}", path.display())))
+}
+
+fn path_looks_expanded(raw: &str) -> bool {
+    let looks_like_url = raw.split_once("://").is_some_and(|(scheme, _)| {
+        let mut chars = scheme.chars();
+        chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    });
+    looks_like_url
+        || raw.starts_with('~')
+        || raw.contains('$')
+        || raw.chars().any(|ch| matches!(ch, '*' | '?' | '['))
+}
+
+#[derive(Debug)]
+struct StepSource {
+    path: PathBuf,
+    index: usize,
+    namespace: String,
+}
+
+struct IncludeLoader {
+    root: PathBuf,
+    root_dir: PathBuf,
+    root_policy: DagConfig,
+    steps: Vec<Value>,
+    resource_caps: BTreeMap<String, i64>,
+    cap_sources: BTreeMap<String, PathBuf>,
+    step_sources: BTreeMap<String, StepSource>,
+    seen: BTreeSet<(PathBuf, String)>,
+    active: Vec<PathBuf>,
+    include_instances: usize,
+    declared_steps: usize,
+    after_references: Vec<(String, PathBuf)>,
+}
+
+impl IncludeLoader {
+    fn inject_after(
+        &mut self,
+        start: usize,
+        end: usize,
+        after: &[String],
+        source: &Path,
+    ) -> Result<(), DagJsonError> {
+        if after.is_empty() {
+            return Ok(());
+        }
+        let subgraph_tags: BTreeSet<String> = self.steps[start..end]
+            .iter()
+            .filter_map(|step| {
+                let object = step.as_object()?;
+                Some(format!(
+                    "{}.{}",
+                    object.get("group")?.as_str()?,
+                    object.get("job")?.as_str()?
+                ))
+            })
+            .collect();
+        let mut internal: Vec<&str> = after
+            .iter()
+            .filter(|tag| subgraph_tags.contains(*tag))
+            .map(String::as_str)
+            .collect();
+        internal.sort_unstable();
+        if !internal.is_empty() {
+            return Err(err(format!(
+                "{}: include after must name outer steps, not tag(s) inside the included \
+                 subgraph: {}",
+                source.display(),
+                internal.join(", ")
+            )));
+        }
+        for step in &mut self.steps[start..end] {
+            let Some(object) = step.as_object_mut() else {
+                continue;
+            };
+            let existing: Vec<String> = match object.get("deps") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(values)) => {
+                    let Some(values) = values
+                        .iter()
+                        .map(|value| value.as_str().map(ToString::to_string))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    values
+                }
+                Some(_) => continue,
+            };
+            if existing.iter().any(|dep| subgraph_tags.contains(dep)) {
+                continue;
+            }
+            let mut deps = existing;
+            for dependency in after {
+                if !deps.contains(dependency) {
+                    deps.push(dependency.clone());
+                }
+            }
+            object.insert(
+                "deps".to_string(),
+                Value::Array(deps.into_iter().map(Value::String).collect()),
+            );
+        }
+        Ok(())
+    }
+
+    fn resolve_include(&self, raw: &str, source: &Path) -> Result<PathBuf, DagJsonError> {
+        let relative = Path::new(raw);
+        if relative.is_absolute() {
+            return Err(err(format!(
+                "{}: include path '{raw}' must be relative",
+                source.display()
+            )));
+        }
+        if path_looks_expanded(raw) {
+            return Err(err(format!(
+                "{}: include path '{raw}' must be a literal relative path (URLs, globs, '~', and \
+                 environment expansion are not supported)",
+                source.display()
+            )));
+        }
+        let candidate = source
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(relative);
+        let resolved = fs::canonicalize(&candidate).map_err(|error| {
+            err(format!(
+                "{}: cannot resolve include path '{raw}': {error}",
+                source.display()
+            ))
+        })?;
+        if !resolved.starts_with(&self.root_dir) {
+            return Err(err(format!(
+                "{}: include path '{raw}' resolves outside top-level DAG directory {}",
+                source.display(),
+                self.root_dir.display()
+            )));
+        }
+        if !resolved.is_file() {
+            return Err(err(format!(
+                "{}: include path '{raw}' does not name a regular file",
+                source.display()
+            )));
+        }
+        Ok(resolved)
+    }
+
+    fn visit(
+        &mut self,
+        source: PathBuf,
+        namespace: String,
+        document: Option<serde_json::Map<String, Value>>,
+        syntax_path: PathBuf,
+        depth: usize,
+    ) -> Result<(usize, usize), DagJsonError> {
+        if let Some(start) = self.active.iter().position(|path| path == &source) {
+            let mut chain: Vec<String> = self.active[start..]
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            chain.push(source.display().to_string());
+            return Err(err(format!("include cycle: {}", chain.join(" -> "))));
+        }
+        if !self.seen.insert((source.clone(), namespace.clone())) {
+            let display = if namespace.is_empty() {
+                "<root>"
+            } else {
+                namespace.as_str()
+            };
+            return Err(err(format!(
+                "duplicate include: {} is loaded more than once as namespace '{display}'",
+                source.display()
+            )));
+        }
+        self.active.push(source.clone());
+        let start = self.steps.len();
+        let result = self.visit_inner(source, namespace, document, syntax_path, depth);
+        self.active.pop();
+        result.map(|()| (start, self.steps.len()))
+    }
+
+    fn visit_inner(
+        &mut self,
+        source: PathBuf,
+        namespace: String,
+        document: Option<serde_json::Map<String, Value>>,
+        syntax_path: PathBuf,
+        depth: usize,
+    ) -> Result<(), DagJsonError> {
+        let doc = match document {
+            Some(doc) => doc,
+            None => read_dag_source(&source, &syntax_path)?,
+        };
+        if let Some(refusal) = uncarried_config_key(&doc) {
+            return Err(err(format!(
+                "{}: {}",
+                source.display(),
+                refusal.strip_prefix("<root>: ").unwrap_or(&refusal)
+            )));
+        }
+        let includes = include_entries(&doc, &source.display().to_string())?;
+        let steps = match doc.get("steps") {
+            Some(Value::Array(steps)) => steps.clone(),
+            _ => {
+                let error = steps_list_error(&doc).to_string();
+                return Err(err(format!(
+                    "{}: {}",
+                    source.display(),
+                    error.strip_prefix("<root>: ").unwrap_or(&error)
+                )));
+            }
+        };
+        self.declared_steps = self.declared_steps.saturating_add(steps.len());
+        if self.declared_steps > MAX_DAG_FLATTENED_STEPS {
+            return Err(err(format!(
+                "{}: composed DAG exceeds {MAX_DAG_FLATTENED_STEPS} flattened steps",
+                source.display()
+            )));
+        }
+        let fragment_policy = policy_config(&doc).map_err(|error| {
+            let detail = error.0.strip_prefix("<root>: ").unwrap_or(&error.0);
+            err(format!("{}: {detail}", source.display()))
+        })?;
+        if source != self.root {
+            for key in GLOBAL_POLICY_KEYS {
+                if doc.contains_key(key) && !same_policy(key, &fragment_policy, &self.root_policy) {
+                    return Err(err(format!(
+                        "{}: global policy '{key}' conflicts with top-level DAG {}",
+                        source.display(),
+                        self.root.display()
+                    )));
+                }
+            }
+        }
+
+        for (name, value) in opt_str_int_map(&doc, "resource_caps", &source.display().to_string())?
+        {
+            if let Some(previous) = self.resource_caps.get(&name) {
+                if *previous != value {
+                    let previous_source = self.cap_sources.get(&name).expect("cap source");
+                    return Err(err(format!(
+                        "{}: resource cap '{name}'={value} conflicts with {} value {previous}",
+                        source.display(),
+                        previous_source.display()
+                    )));
+                }
+            }
+            self.resource_caps.insert(name.clone(), value);
+            self.cap_sources
+                .entry(name)
+                .or_insert_with(|| source.clone());
+        }
+
+        for (raw_path, segment, after) in includes {
+            if depth >= MAX_DAG_INCLUDE_DEPTH {
+                return Err(err(format!(
+                    "{}: include nesting exceeds maximum depth {MAX_DAG_INCLUDE_DEPTH}",
+                    source.display()
+                )));
+            }
+            if self.include_instances >= MAX_DAG_INCLUDE_INSTANCES {
+                return Err(err(format!(
+                    "{}: composed DAG exceeds {MAX_DAG_INCLUDE_INSTANCES} include instances",
+                    source.display()
+                )));
+            }
+            self.include_instances += 1;
+            let included = self.resolve_include(&raw_path, &source)?;
+            let child_namespace = qualify(&namespace, &segment);
+            let (child_start, child_end) = self.visit(
+                included,
+                child_namespace,
+                None,
+                PathBuf::from(&raw_path),
+                depth + 1,
+            )?;
+            let qualified_after: Vec<String> =
+                after.iter().map(|tag| qualify(&namespace, tag)).collect();
+            self.after_references.extend(
+                qualified_after
+                    .iter()
+                    .map(|tag| (tag.clone(), source.clone())),
+            );
+            self.inject_after(child_start, child_end, &qualified_after, &source)?;
+        }
+
+        for (index, entry) in steps.into_iter().enumerate() {
+            let rewritten = rewrite_step(entry, &namespace);
+            if let Some(object) = rewritten.as_object() {
+                if let (Some(group), Some(job)) = (
+                    object.get("group").and_then(Value::as_str),
+                    object.get("job").and_then(Value::as_str),
+                ) {
+                    let tag = format!("{group}.{job}");
+                    if let Some(previous) = self.step_sources.get(&tag) {
+                        let is_plain_root_duplicate = source == self.root
+                            && previous.path == self.root
+                            && namespace.is_empty()
+                            && previous.namespace.is_empty();
+                        if !is_plain_root_duplicate {
+                            let previous_namespace = if previous.namespace.is_empty() {
+                                "<root>"
+                            } else {
+                                &previous.namespace
+                            };
+                            let this_namespace = if namespace.is_empty() {
+                                "<root>"
+                            } else {
+                                &namespace
+                            };
+                            return Err(err(format!(
+                                "duplicate step tag '{tag}': {} steps[{}] (namespace \
+                                 '{previous_namespace}') and {} steps[{index}] (namespace \
+                                 '{this_namespace}')",
+                                previous.path.display(),
+                                previous.index,
+                                source.display()
+                            )));
+                        }
+                    } else {
+                        self.step_sources.insert(
+                            tag,
+                            StepSource {
+                                path: source.clone(),
+                                index,
+                                namespace: namespace.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            self.steps.push(rewritten);
+        }
+        Ok(())
+    }
+}
+
+/// Load a JSON/YAML DAG and flatten its recursively namespaced `include` fragments.
+///
+/// An include entry's optional `after` tags are resolved in the parent's namespace and injected
+/// into every entry node of the included flattened subgraph.
+pub fn dag_from_path(path: impl AsRef<Path>) -> Result<DagConfig, DagJsonError> {
+    let requested = path.as_ref();
+    let root = fs::canonicalize(requested)
+        .map_err(|error| err(format!("{}: cannot read DAG: {error}", requested.display())))?;
+    if !root.is_file() {
+        return Err(err(format!(
+            "{}: does not name a regular file",
+            requested.display()
+        )));
+    }
+    let root_dir = root
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let root_doc = read_dag_source(&root, requested)?;
+    include_entries(&root_doc, &root.display().to_string())?;
+    let root_policy = policy_config(&root_doc).map_err(|error| {
+        let detail = error.0.strip_prefix("<root>: ").unwrap_or(&error.0);
+        err(format!("{}: {detail}", root.display()))
+    })?;
+    let mut loader = IncludeLoader {
+        root: root.clone(),
+        root_dir,
+        root_policy,
+        steps: Vec::new(),
+        resource_caps: BTreeMap::new(),
+        cap_sources: BTreeMap::new(),
+        step_sources: BTreeMap::new(),
+        seen: BTreeSet::new(),
+        active: Vec::new(),
+        include_instances: 0,
+        declared_steps: 0,
+        after_references: Vec::new(),
+    };
+    loader.visit(
+        root.clone(),
+        String::new(),
+        Some(root_doc.clone()),
+        requested.to_path_buf(),
+        0,
+    )?;
+    for (tag, source) in &loader.after_references {
+        if !loader.step_sources.contains_key(tag) {
+            return Err(err(format!(
+                "{}: include after references missing outer step '{tag}'",
+                source.display()
+            )));
+        }
+    }
+
+    let mut flattened = root_doc;
+    flattened.remove("include");
+    flattened.insert("steps".to_string(), Value::Array(loader.steps));
+    flattened.insert(
+        "resource_caps".to_string(),
+        Value::Object(
+            loader
+                .resource_caps
+                .into_iter()
+                .map(|(name, value)| (name, Value::Number(value.into())))
+                .collect(),
+        ),
+    );
+    dag_from_value(&Value::Object(flattened)).map_err(|error| {
+        let detail = error.0.strip_prefix("<root>: ").unwrap_or(&error.0);
+        err(format!("{}: {detail}", root.display()))
+    })
 }
 
 /// `DagConfig` fields that the DOCUMENT FORMAT deliberately does not carry.
@@ -757,6 +1354,15 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
     let doc = as_obj(raw, "<root>")?;
     if let Some(refusal) = uncarried_config_key(doc) {
         return Err(err(refusal));
+    }
+    // `include` is reserved source syntax. Parse it strictly before reporting that this API has
+    // no source directory, so malformed entries can never degrade into a generic ignored key.
+    include_entries(doc, "<root>")?;
+    if doc.contains_key("include") {
+        return Err(err(
+            "<root>.include: includes require filesystem context; load this document with \
+             dag_from_path() or pass its filename to --dag (includes cannot be read from stdin)",
+        ));
     }
     // ABSENT IS NOT 1800: an omitted default leaves both it and the step at the 0 sentinel, and
     // `resolved_wall_timeout` derives the bound from the step's declared CPU budget (or falls
@@ -815,6 +1421,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             hint: hint_from(sm.get("hint"), &format!("{where_}.hint"))?,
             networkonly: opt_bool(sm, "networkonly", false)?,
             engine_only: opt_bool(sm, "engine_only", false)?,
+            delegated_children: opt_bool(sm, "delegated_children", false)?,
             timeout: opt_int(sm, "timeout", default_step_timeout)?,
             cpu_timeout: opt_int(sm, "cpu_timeout", 0)?,
             jobs_flag: opt_str_or_none(sm, "jobs_flag")?,
@@ -1316,6 +1923,10 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push_str(&format!("\"networkonly\": {},\n", step.networkonly));
     s.push_str(&key);
     s.push_str(&format!("\"engine_only\": {},\n", step.engine_only));
+    if step.delegated_children {
+        s.push_str(&key);
+        s.push_str("\"delegated_children\": true,\n");
+    }
     // Both timeout fields are emitted only when SET. 0 is the "derive it" sentinel, and writing
     // it out would read as "no wall bound" — the opposite of what it means.
     if step.timeout != 0 {
@@ -1924,6 +2535,28 @@ steps:
     }
 
     #[test]
+    fn delegated_children_is_explicit_and_roundtrips() {
+        let doc = r#"{"steps":[
+            {"group":"g","job":"delegating","cmd":"true","delegated_children":true},
+            {"group":"g","job":"ordinary","cmd":"true"}]}"#;
+        let cfg = dag_from_json(doc).unwrap();
+        assert!(cfg.steps[0].delegated_children);
+        assert!(!cfg.steps[1].delegated_children);
+        let encoded = dag_to_json(&cfg);
+        assert_eq!(encoded.matches("\"delegated_children\"").count(), 1);
+        assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
+
+        let error = dag_from_json(
+            r#"{"steps":[{"group":"g","job":"bad","cmd":"true",
+                "delegated_children":"yes"}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("delegated_children"), "{error}");
+        assert!(error.contains("boolean"), "{error}");
+    }
+
+    #[test]
     fn write_domain_policy_roundtrips_and_refuses_omission() {
         let good = r#"{"steps":[
             {"group":"g","job":"reader","cmd":"true","write_domains":[]},
@@ -2235,7 +2868,7 @@ steps:
         dag_from_json(
             r#"{"steps":[{"group":"a","job":"one","desc":"d","description":"long",
                 "cmd":"true","deps":[],"env":{"K":"V"},"networkonly":false,
-                "engine_only":false,"timeout":5,"cpu_timeout":3,
+                "engine_only":false,"delegated_children":false,"timeout":5,"cpu_timeout":3,
                 "cmdtype":"generic-with-flag","jobs_flag":"-j",
                 "jobs_env":"J","explains":[],"fail_fast_family":"fam",
                 "hint":{"resources":{},"est_duration_s":1.0,"classification":"light"}}]}"#,

@@ -140,12 +140,12 @@ def test_a_supervisor_that_vanishes_without_a_traceback_is_still_reaped(
     assert "SUPERVISOR VANISHED" in combined.err
 
 
-def test_the_sweep_sees_a_crash_that_lands_between_running_and_done() -> None:
-    """The sweep's key must be (finished AND no outcome), NOT (still in ``running``).
+def test_the_sweep_sees_a_crash_that_lands_after_retirement_before_done() -> None:
+    """The sweep must find every finished supervisor that has no outcome.
 
-    ``_retire`` drops the tag from ``self.running`` and only then is ``self.done`` written. A
-    supervisor that dies in that window is in NEITHER set, so a sweep keyed on "still running"
-    is blind to exactly it. This test reproduces that window directly.
+    ``_retire`` gives admission accounting back before ``self.done`` is written. A supervisor
+    that dies in that window remains in ``running`` to prevent a relaunch, but only the thread
+    sweep can turn that unfinished publication into a terminal outcome.
     """
     ghost = _step("ghost", hint=ResourceHint(resources={"slot": 1}))
     runner = Runner(
@@ -159,8 +159,8 @@ def test_the_sweep_sees_a_crash_that_lands_between_running_and_done() -> None:
     def retire_then_die(step: Step) -> None:
         with runner.lock:
             runner._retire(step)
-        # Dead here: out of `running`, absent from `done`. `_run_step` is bypassed, so layer one
-        # cannot catch this either.
+        # Dead here: retired but absent from `done`. `_run_step` is bypassed, so layer one cannot
+        # catch this either.
         raise RuntimeError("died after retiring, before publishing")
 
     runner._run_step = retire_then_die  # type: ignore[method-assign]
@@ -179,7 +179,17 @@ class _ExplodingRows(list):  # type: ignore[type-arg]
     step already retired, so it is the only place the once-only guard can be observed.
     """
 
+    def __init__(self, runner: Runner) -> None:
+        super().__init__()
+        self.runner = runner
+        self.append_calls = 0
+        self.running_at_crash: set[str] = set()
+
     def append(self, item: object) -> None:
+        self.append_calls += 1
+        # The caller holds runner.lock. Snapshot directly rather than trying to reacquire the
+        # non-reentrant lock from this planted failure.
+        self.running_at_crash = set(self.runner.running)
         raise RuntimeError("planted defect between retiring and publishing")
 
 
@@ -198,11 +208,17 @@ def test_a_crash_after_a_release_does_not_release_a_second_time() -> None:
         cgroups=NoopCgroups(),
         verbosity=0,
     )
-    runner.step_profile_rows = _ExplodingRows()
+    exploding_rows = _ExplodingRows(runner)
+    runner.step_profile_rows = exploding_rows
 
     assert not _run_with_deadline(runner)
     outcomes = {o.tag: o for o in runner.result().outcomes}
     assert "SUPERVISOR CRASHED" in outcomes[late.tag].reason
+    assert exploding_rows.append_calls == 1, "a retired step must never be launched again"
+    assert exploding_rows.running_at_crash == {late.tag}, (
+        "retirement may release resources, but the supervisor must remain in `running` until "
+        "its terminal outcome is published"
+    )
     assert runner.resource_avail == {"slot": 1}, (
         "the slot must be released exactly once; a second release reads as capacity the declared "
         "cap never had"

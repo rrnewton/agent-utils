@@ -61,15 +61,20 @@ pub const CSV_COLUMNS: [&str; 15] = [
 /// * `memory_max_bytes` is the TIGHTEST cap the KERNEL held over the step across every level the
 ///   runner can see (its own cgroup and the delegated scope): a decimal byte count, the literal
 ///   `max` when no such level bounds it, or BLANK when unknown. Blank and `max` are different
-///   answers — unknown cannot rule out censoring, `max` rules out censoring by the runner's own
-///   caps. It does NOT rule out an ancestor ABOVE the delegated scope (a container limit, a user
-///   slice), which is outside the runner's view.
-/// * `memory_events_*` are the step cgroup's `memory.events` counters, already per-step deltas
-///   because the cgroup lives exactly as long as the step. `memory_events_max > 0` with
-///   `memory_events_oom_kill == 0` is reclaim-at-cap: a PASSING step pinned to its ceiling. They
-///   are the STEP cgroup's own counters: reclaim forced by an ancestor's limit is not counted
-///   here, so `memory_events_max == 0` is not by itself proof of a comfortable fit.
-pub const STEP_PROFILE_COLUMNS: [&str; 58] = [
+///   answers — unknown cannot rule out censoring, while `max` rules it out for the runner's
+///   recorded caps. Nested schedulers additionally snapshot the validated parent delegation and
+///   its visible ancestors; limits above a top-level run scope or outside the cgroup namespace
+///   remain unknowable.
+/// * `memory_events_*` are the step cgroup's owned counters: `memory.events` for an ordinary leaf
+///   and `memory.events.local` for a delegated scheduler root. They are already per-step deltas
+///   because the cgroup lives exactly as long as the step. `memory_events_max > 0` with every
+///   OOM counter zero is reclaim-at-cap: a PASSING step pinned to its ceiling. The
+///   reclaim forced by an ancestor's limit is not counted here, so `memory_events_max == 0` is
+///   not by itself proof of a comfortable fit. The local delegated view prevents an inner step's
+///   independently owned event from being attributed again to its outer scheduler.
+///   `memory_events_oom_group_kill` preserves kernels' group-kill counter; at a delegated
+///   boundary it can be the only durable kill signal.
+pub const STEP_PROFILE_COLUMNS: [&str; 59] = [
     "timestamp",
     "machine_id",
     "container_class",
@@ -130,6 +135,7 @@ pub const STEP_PROFILE_COLUMNS: [&str; 58] = [
     "memory_events_max",
     "memory_events_oom",
     "memory_events_oom_kill",
+    "memory_events_oom_group_kill",
 ];
 
 /// Stable columns for an opt-in per-step CPU/thread time series.

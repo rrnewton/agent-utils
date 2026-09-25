@@ -35,6 +35,15 @@ class _TracingCgroups:
     ) -> str:
         return cmd
 
+    def prepare_delegated_command(
+        self,
+        tag: str,
+        cmd: str,
+        mem_max: int | None = None,
+        cpu_count: int | None = None,
+    ) -> tuple[str, str | None]:
+        return cmd, None
+
     def kill(self, tag: str) -> bool:
         return False
 

@@ -19,6 +19,17 @@ const CPU_DAG: &str = r#"{"steps": [{"group": "cpu", "job": "burn", "desc": "bur
 
 #[test]
 fn boxing_cpu_timeout_reaps_a_step_past_its_budget() {
+    if matches!(
+        std::env::var("DAGRUN_DELEGATED_UNBOXED").as_deref(),
+        Ok("1")
+    ) && std::env::var_os("DAGRUN_OUTER_RUN").is_some()
+    {
+        eprintln!(
+            "SKIP boxing_cpu_timeout_reaps_a_step_past_its_budget: parent validation is \
+             explicitly unboxed; the cgroup CPU-accounting path cannot be tested"
+        );
+        return;
+    }
     let bin = env!("CARGO_BIN_EXE_dagrun");
 
     let dir = std::env::temp_dir().join(format!("dagrun_cpu_smoke_{}", std::process::id()));

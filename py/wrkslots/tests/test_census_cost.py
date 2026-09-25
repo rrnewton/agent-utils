@@ -627,11 +627,13 @@ def test_cache_census_refuses_mutated_resume_path_outside_root(
 def test_cache_census_large_directory_requires_one_bounded_final_sweep(
     tmp_path: Path,
 ) -> None:
+    entry_count = 128
+    work_limit = 32
     config = _config(tmp_path)
     checkout = config.root / "checkout"
     cache = checkout / "target"
     cache.mkdir(parents=True)
-    for index in range(1024):
+    for index in range(entry_count):
         (cache / f"artifact-{index:04d}").write_bytes(b"x")
     checkout_identity = cli._open_directory_identity(checkout, "checkout")
     planned = {
@@ -649,14 +651,14 @@ def test_cache_census_large_directory_requires_one_bounded_final_sweep(
     state_path = tmp_path / "large-cache-state.json"
     consumed: list[int] = []
 
-    for _ in range(34):
+    for _ in range(10):
         measured, counters = cli._audit_cache_census(
             config,
             states,
             planned,
             {},
             state_path=state_path,
-            work_limit=64,
+            work_limit=work_limit,
             wall_seconds=5,
         )
         consumed.append(counters["work_consumed"])
@@ -672,14 +674,14 @@ def test_cache_census_large_directory_requires_one_bounded_final_sweep(
         planned,
         {},
         state_path=state_path,
-        work_limit=2048,
+        work_limit=entry_count * 2,
         wall_seconds=5,
     )
-    assert final_counters["work_consumed"] <= 2048
+    assert final_counters["work_consumed"] <= entry_count * 2
 
     assert measured["subject"].status == "complete"
-    assert all(0 < work <= 64 for work in consumed)
-    assert len(consumed) <= 34
+    assert all(0 < work <= work_limit for work in consumed)
+    assert len(consumed) <= 10
 
 
 def test_cache_census_preserves_nested_git_metadata_refusal(
@@ -781,6 +783,13 @@ def test_cache_census_persisted_cursor_prevents_stable_root_starvation(
             subject for subject, item in measured.items() if item.status == "complete"
         )
         cursors.append(json.loads(state_path.read_text(encoding="utf-8"))["next_subject"])
+        if completed == set(planned) and len(set(cursors)) == len(planned):
+            break
+    else:
+        pytest.fail(
+            f"persisted cursor did not visit every subject: "
+            f"completed={completed}, cursors={cursors}"
+        )
 
     assert completed == set(planned)
     assert len(set(cursors)) == 3

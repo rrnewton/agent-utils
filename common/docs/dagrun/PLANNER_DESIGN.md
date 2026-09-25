@@ -286,7 +286,8 @@ behavioral differential compares plan output byte-for-byte.
 - `speedups: Mapping[tag, StepSpeedup]` — measured curves from `load_step_speedups()`. Each carries
   ascending `levels` with `inner_jobs`, `wall_s`, `cpu_s` (may be `None`), and the per-level
   `speedup`.
-- `est: Mapping[tag, float]` — the resolved scalar duration per step (store-over-hint-over-default),
+- `est: Mapping[tag, float]` — the resolved scalar duration per step (store-over-hint-over-default;
+  ordinary memory feedback separately treats an authored RSS baseline as a floor),
   as `build_plan` already computes. Used when a step has no measured curve and for a self-managed
   fixed width whose curve has no exact point at that width.
 - `P: int | None` — an explicit run uses its resolved total `--max-cpus` budget (including the

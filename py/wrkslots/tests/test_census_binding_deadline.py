@@ -94,12 +94,13 @@ def _assert_reaped(children: list[int]) -> None:
 def test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    assert cli._AUDIT_CACHE_WALL_SECONDS == 5
     fixture = _fixture(
         tmp_path,
         {"subject": (1,) * 12, "empty": (), "refused": ()},
     )
     log = tmp_path / "actual-open-starts.jsonl"
-    _delay_checkout_opens(monkeypatch, fixture, 0.65, log)
+    _delay_checkout_opens(monkeypatch, fixture, 0.1, log)
     original_identity = cli._audit_cache_root_identity
     calls: list[tuple[float, float]] = []
 
@@ -116,12 +117,17 @@ def test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline(
     monkeypatch.setattr(cli, "_audit_cache_root_identity", observed_identity)
     started = time.perf_counter()
 
-    measured, counters = _measure(fixture, errors={"refused": "original refusal"})
+    # The default is asserted above; a short explicit allowance proves the
+    # same shared-deadline and no-late-start behavior without waiting five
+    # wall-clock seconds.
+    measured, counters = _measure(
+        fixture, wall_seconds=0.5, errors={"refused": "original refusal"}
+    )
 
     elapsed = time.perf_counter() - started
-    # Five seconds of work, at most the existing one-second reap allowance,
-    # plus half a second of process scheduling/serialization overhead.
-    assert elapsed <= 6.5, elapsed
+    # The short work allowance, at most the existing one-second reap
+    # allowance, plus half a second of process scheduling/serialization.
+    assert elapsed <= 2.0, elapsed
     assert 0 < len(calls) < 12
     assert all(began < deadline for began, deadline in calls)
     deadlines = {deadline for _began, deadline in calls}
@@ -138,7 +144,7 @@ def test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline(
             assert item.status == "error"
             assert item.bytes is None
     assert measured["refused"].error == "original refusal"
-    print(f"default binding deadline: {elapsed:.3f}s, {len(calls)}/12 bindings started")
+    print(f"bounded binding deadline: {elapsed:.3f}s, {len(calls)}/12 bindings started")
 
 
 def test_one_blocked_open_is_cancelled_before_its_sleep_finishes(

@@ -77,6 +77,20 @@ class CgroupManager(Protocol):
         """
         ...
 
+    def prepare_delegated_command(
+        self,
+        tag: str,
+        cmd: str,
+        mem_max: int | None = None,
+        cpu_count: int | None = None,
+    ) -> tuple[str, str | None]:
+        """Prepare an empty parent-owned step root for a nested scheduler.
+
+        Returns the wrapped command and the verified root path to export. A manager that cannot
+        provide cgroup delegation must return no path so the scheduler can fail closed.
+        """
+        ...
+
     def kill(self, tag: str) -> bool:
         """SIGKILL the step's entire cgroup subtree atomically (``cgroup.kill``), including
         ``setsid`` escapees that changed session/pgid but not cgroup membership.
@@ -153,22 +167,31 @@ class CgroupManager(Protocol):
 
         ``None`` when disabled, unknown, or unreadable — which is DIFFERENT from ``"max"``:
         ``"max"`` says no ceiling was found at any level the runner can see, ``None`` says the
-        cap is unknown. A consumer must not collapse the two, because an unknown cap cannot
-        rule out censoring while ``"max"`` rules out censoring by the runner's own caps (never
-        by ancestors above the delegated scope, which are outside its view). Read BEFORE
-        :meth:`cleanup`.
+        cap is unknown. Nested managers preserve the finite minimum across the validated parent
+        delegation and every visible ancestor through the cgroup namespace root. A consumer
+        must not collapse ``None`` and ``"max"``; limits above a top-level run scope or outside
+        that namespace remain unknowable. Read BEFORE :meth:`cleanup`.
         """
         ...
 
     def memory_events(self, tag: str) -> Mapping[str, int] | None:
-        """The step cgroup's whole ``memory.events`` file as counter -> value (``low``,
-        ``high``, ``max``, ``oom``, ``oom_kill``, and any others the kernel exposes).
+        """The step cgroup's owned memory events as counter -> value (``low``, ``high``,
+        ``max``, ``oom``, ``oom_kill``, ``oom_group_kill``, and any others the kernel exposes).
 
         These are per-step DELTAS without any subtraction: the child cgroup is created for
         this step and removed after it, so every counter starts at zero. ``max > 0`` with
-        ``oom_kill == 0`` is the reclaim-at-cap case — the step completed, but only because
+        every OOM counter zero is the reclaim-at-cap case — the step completed, but only because
         the kernel kept evicting page cache at the ceiling, so its peak is censored and it
         was NOT OOM-killed. ``None`` when disabled, unknown, or unreadable.
+
+        For an ordinary step this is its hierarchical ``memory.events`` file (there are no
+        scheduler-created descendants). For a step prepared by
+        :meth:`prepare_delegated_command`, it is ``memory.events.local``: inner schedulers own
+        and classify their child-cgroup OOMs, while an event charged at the parent delegation
+        boundary remains visible locally even when its victim is a descendant. In that last
+        case ``oom`` (or ``oom_group_kill``) may be positive while the victim's ``oom_kill`` is
+        accounted only in its descendant; schedulers must treat every positive OOM facet as an
+        actionable boundary exhaustion, without reading sibling nested-run counters.
         Read BEFORE :meth:`cleanup`.
         """
         ...

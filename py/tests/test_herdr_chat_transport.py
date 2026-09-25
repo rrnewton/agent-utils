@@ -249,6 +249,46 @@ def _assert_command_child_gone(pid: int, outcome: str) -> None:
     pytest.fail(f"{outcome} adapter child {pid} remains in /proc with state {state}")
 
 
+def _wait_for_process_identities(
+    path: Path, count: int, description: str, *, timeout: float = 2,
+    producer: threading.Thread | None = None,
+    producer_outcome: Callable[[], str] | None = None,
+) -> tuple[int, ...]:
+    """Wait until a fixture publishes its complete, parseable PID payload."""
+    deadline = time.monotonic() + timeout
+    observed = "missing"
+    while time.monotonic() < deadline:
+        try:
+            payload = path.read_text()
+        except FileNotFoundError:
+            observed = "missing"
+        else:
+            values = payload.split()
+            try:
+                identities = tuple(int(value) for value in values)
+            except ValueError:
+                observed = repr(payload)
+            else:
+                if len(identities) == count and all(pid > 0 for pid in identities):
+                    return identities
+                observed = repr(payload)
+        if producer is not None and not producer.is_alive():
+            outcome = producer_outcome() if producer_outcome is not None else "unknown"
+            pytest.fail(
+                f"{description} worker completed before publishing {count} process "
+                f"identities ({outcome}); last payload was {observed}"
+            )
+        time.sleep(0.005)
+    producer_status = ""
+    if producer is not None:
+        outcome = producer_outcome() if producer_outcome is not None else "unknown"
+        producer_status = f"; worker={'running' if producer.is_alive() else 'complete'} ({outcome})"
+    pytest.fail(
+        f"{description} did not publish {count} process identities; "
+        f"last payload was {observed}{producer_status}"
+    )
+
+
 def test_command_supervisor_reaps_nested_descendants_before_return(tmp_path: Path) -> None:
     """An outer subreaper exposes zombies which would otherwise be hidden by PID 1."""
     pids = tmp_path / "descendants"
@@ -936,15 +976,19 @@ def test_command_timeout_contains_group_when_supervisor_is_stopped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup: str,
 ) -> None:
     """The old fallback killed only S's PGID, leaving its separately-sessioned C alive."""
+    command_timeout = 5.0
+    cleanup_grace = 8.0
     pid_path = tmp_path / "stopped-supervisor-pids"
     child_script = "import os,time; os.close(0); os.close(1); os.close(2); time.sleep(60)"
     adapter = (
         "import os,pathlib,subprocess,sys,time; "
         "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
-        "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {child.pid}'); "
+        "path=pathlib.Path(sys.argv[1]); temporary=path.with_suffix('.tmp'); "
+        "temporary.write_text(f'{os.getpid()} {child.pid}'); temporary.replace(path); "
         "time.sleep(60)"
     )
     outcomes: list[BaseException] = []
+    completions: list[subprocess.CompletedProcess[str]] = []
     censuses: list[tuple[chat_module._CommandAnchorIdentity, ...]] = []
     if cleanup != "cooperative":
         original_signal = signal.pidfd_send_signal
@@ -971,30 +1015,44 @@ def test_command_timeout_contains_group_when_supervisor_is_stopped(
 
     def invoke() -> None:
         try:
-            _run_command(
-                (sys.executable, "-c", adapter, str(pid_path), child_script), timeout=0.5)
+            completions.append(_run_command(
+                (sys.executable, "-c", adapter, str(pid_path), child_script),
+                timeout=command_timeout,
+            ))
         except BaseException as exc:
             outcomes.append(exc)
 
+    def worker_outcome() -> str:
+        if outcomes:
+            return f"raised {type(outcomes[0]).__name__}: {outcomes[0]}"
+        if completions:
+            return f"returned {completions[0].returncode}"
+        return "no result recorded"
+
     worker = threading.Thread(target=invoke)
+    invocation_started = time.monotonic()
     worker.start()
-    deadline = time.monotonic() + 2
-    while not pid_path.exists() and time.monotonic() < deadline:
-        time.sleep(0.005)
-    assert pid_path.exists(), "adapter did not publish its process identities"
-    adapter_pid, child_pid = (int(value) for value in pid_path.read_text().split())
+    adapter_pid, child_pid = _wait_for_process_identities(
+        pid_path, 2, "adapter", timeout=command_timeout + 2,
+        producer=worker, producer_outcome=worker_outcome,
+    )
     supervisor_pid = int(next(
         line.split()[1]
         for line in Path(f"/proc/{adapter_pid}/status").read_text().splitlines()
         if line.startswith("PPid:")
     ))
     os.kill(supervisor_pid, signal.SIGSTOP)
-    worker.join(timeout=6)
+    worker_deadline = invocation_started + command_timeout + cleanup_grace
+    worker.join(timeout=max(0, worker_deadline - time.monotonic()))
     if worker.is_alive():
         os.kill(supervisor_pid, signal.SIGCONT)
-        worker.join(timeout=2)
-    assert not worker.is_alive(), "stopped supervisor left command cleanup blocked"
-    assert len(outcomes) == 1 and isinstance(outcomes[0], subprocess.TimeoutExpired)
+        worker.join(timeout=cleanup_grace)
+    assert not worker.is_alive(), (
+        f"stopped supervisor left command cleanup blocked ({worker_outcome()})"
+    )
+    assert not completions and len(outcomes) == 1 and isinstance(
+        outcomes[0], subprocess.TimeoutExpired,
+    ), f"unexpected command worker outcome: {worker_outcome()}"
     if cleanup == "emergency":
         assert len(censuses) >= 2
         assert all(member.state in ("T", "t", "Z") for member in censuses[-1])

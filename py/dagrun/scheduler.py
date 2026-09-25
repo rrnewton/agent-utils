@@ -39,6 +39,11 @@ from dagrun.attribution import (
     sanitize as sanitize_evidence_tag,
 )
 from dagrun.capabilities import Lane, is_enforced
+from dagrun.cgroup import (
+    DELEGATED_CGROUP_ENV,
+    DELEGATED_UNBOXED_ENV,
+    delegated_cgroup_root,
+)
 from dagrun.model import (
     ABORTED_BY_PEER_FAILURE_REASON,
     ABORTED_BY_RUN_BUDGET_REASON,
@@ -99,9 +104,30 @@ def nested_run_refusal(allow_unwise_nest_dagruns: bool) -> str | None:
     outer_run = os.environ.get(OUTER_RUN_ENV)
     if outer_run is None or allow_unwise_nest_dagruns:
         return None
+    delegated_root, delegated_error = delegated_cgroup_root()
+    if delegated_root is not None:
+        return None
+    # A malformed/forged cgroup claim must never be rescued by the weaker unboxed fallback.
+    invalid_delegation: str | None = None
+    if delegated_error is not None:
+        invalid_delegation = (
+            f"${DELEGATED_CGROUP_ENV} was present but invalid: {delegated_error}"
+        )
+    else:
+        unboxed = os.environ.get(DELEGATED_UNBOXED_ENV)
+        if unboxed == "1":
+            return None
+        if unboxed is not None:
+            invalid_delegation = f"${DELEGATED_UNBOXED_ENV} must be exactly '1'"
+    suffix = (
+        f"; {invalid_delegation}"
+        if invalid_delegation is not None
+        else ""
+    )
     return (
         f"refusing nested invocation from outer run step {outer_run!r}; "
         "pass --allow-unwise-nest-dagruns only for a reviewed temporary exception"
+        f"{suffix}"
     )
 
 __all__ = [
@@ -601,6 +627,15 @@ class _NoopCgroupManager:
     ) -> str:
         return cmd
 
+    def prepare_delegated_command(
+        self,
+        tag: str,
+        cmd: str,
+        mem_max: int | None = None,
+        cpu_count: int | None = None,
+    ) -> tuple[str, str | None]:
+        return cmd, None
+
     def kill(self, tag: str) -> bool:
         return False
 
@@ -780,8 +815,10 @@ class Runner:
         # uncounted. A supervisor that dies between the two would otherwise leave the count
         # permanently inflated, and ``max_concurrent_steps`` is a max over it.
         self.counted_processes: set[str] = set()
-        # Tags whose admission-time accounting (named resources, cores_used, running/procs/nonces)
-        # has already been handed back. See :meth:`_retire`.
+        # Tags whose admission-time accounting (named resources, cores_used, proc/nonces) has
+        # already been handed back. A retired tag deliberately remains in ``running`` until its
+        # terminal outcome is published; otherwise the ready loop can launch it a second time in
+        # the narrow retire-then-publish window. See :meth:`_retire`.
         self.retired: set[str] = set()
         # First cause wins: later run deadlines must not relabel a peer cancellation.
         self.aborted: dict[str, _AbortCause] = {}
@@ -862,9 +899,13 @@ class Runner:
             self.active_processes -= 1
 
     def _retire(self, step: Step) -> bool:
-        """Hand back everything ``step``'s admission took, EXACTLY ONCE. Caller holds the lock.
+        """Hand back ``step``'s resource/process accounting EXACTLY ONCE. Caller holds the lock.
 
         Returns ``True`` when this call did the work, ``False`` when the step was already retired.
+
+        This deliberately does NOT remove the tag from :attr:`running`. That set also prevents a
+        launched supervisor from being admitted again, so its tag remains there until ``done`` is
+        published in the same critical section that clears it.
 
         The once-only guard is not defensive tidiness. Every release site (spawn failure, normal
         completion, and the supervisor-crash paths added for #80 runner-supervisor-crash-loud)
@@ -876,7 +917,6 @@ class Runner:
         if step.tag in self.retired:
             return False
         self.retired.add(step.tag)
-        self.running.discard(step.tag)
         self.running_procs.pop(step.tag, None)
         self.running_nonces.pop(step.tag, None)
         self._uncount_process(step.tag)
@@ -1073,12 +1113,11 @@ class Runner:
         ``except BaseException`` in :meth:`_run_step` — cannot cover a failure of layer one
         itself, and a wedge is not an acceptable second-order failure mode.
 
-        THE KEY IS (launched) AND (finished) AND (no terminal outcome), and it is deliberately NOT
-        "the tag is still in :attr:`running`". :meth:`_retire` removes the tag from ``running``
-        BEFORE ``done`` is written, so a supervisor that dies between those two lines is in
-        NEITHER set. A running-keyed sweep is invisible to exactly that window — which is the
-        window a crash in the outcome-construction code lands in. That distinction was found by
-        mutation, not by reasoning, and it is the detail most easily lost in a rewrite.
+        THE KEY IS (launched) AND (thread finished) AND (no terminal outcome), not merely scheduler
+        membership. A retired supervisor remains in ``running`` until ``done`` is published so it
+        cannot be launched twice; if that thread dies first, only its actual ``Thread.is_alive``
+        state proves that nobody remains to publish the outcome. A running-membership sweep would
+        miss exactly that case and wait forever.
 
         A finished thread that DID publish is not touched, so this never contradicts a real
         result. Nothing here uses :meth:`_emit` (which takes :attr:`lock`); it prints directly,
@@ -1392,6 +1431,10 @@ class Runner:
                 aborted=False,
                 pids_events=0,
             )
+            # ``running`` is the supervisor-lifecycle guard as well as an admission count. Keep
+            # it set through retirement and clear it only in the same critical section that
+            # publishes ``done``; no ready-loop pass can observe the tag in neither state.
+            self.running.discard(step.tag)
             self._trip_fail_fast(step.tag)
         if self.evidence is not None:
             self.evidence.record(
@@ -1460,6 +1503,10 @@ class Runner:
         cmdtype_env = cmdtype_env_with_inner_jobs(step, inner_jobs)
         env.pop(DAGRUN_EXTRA_ARGS_ENV, None)
         env.update(cmdtype_env)
+        # A delegation is one-step authority, never ambient inheritance. Ordinary children must
+        # not be able to launch another scheduler merely because their parent was delegated.
+        env.pop(DELEGATED_CGROUP_ENV, None)
+        env.pop(DELEGATED_UNBOXED_ENV, None)
         # Runner authority wins over both DAG-supplied values and the configurable jobs-env
         # channel. The step tag identifies which outer node launched a nested scheduler; the
         # DAGRUN_STEP nonce remains dedicated to process-tree ownership and teardown.
@@ -1507,9 +1554,21 @@ class Runner:
         # leader self-moves into the step's child cgroup BEFORE forking any grandchild (the
         # cgroup-v2 fork-inheritance rule), applying the inner memory/CPU caps. A disabled /
         # noop manager returns the command unchanged.
-        run_cmd = self.cgroups.prepare_command(
-            step.tag, base_cmd, mem_max=mem_max, cpu_count=cpu_count
-        )
+        if step.delegated_children:
+            run_cmd, delegated_root = self.cgroups.prepare_delegated_command(
+                step.tag, base_cmd, mem_max=mem_max, cpu_count=cpu_count
+            )
+            if delegated_root is not None:
+                env[DELEGATED_CGROUP_ENV] = delegated_root
+            elif not self.cgroups.enabled:
+                # The graph explicitly opted this step into nesting, but the outer run is itself
+                # unboxed. Preserve default refusal for every ordinary step while allowing this
+                # reviewed fallback without pretending it is containment.
+                env[DELEGATED_UNBOXED_ENV] = "1"
+        else:
+            run_cmd = self.cgroups.prepare_command(
+                step.tag, base_cmd, mem_max=mem_max, cpu_count=cpu_count
+            )
         # Parallel-speedup ENRICHMENT capture (only under real cgroup boxing, as in the original).
         # prepare_command has already created the step's child cgroup, so cpu.pressure is readable;
         # bracket the step with two host-load snapshots so contention can be attributed later.
@@ -1570,6 +1629,7 @@ class Runner:
             with self.lock:
                 self._retire(step)
                 self.done[step.tag] = outcome
+                self.running.discard(step.tag)
                 self._trip_fail_fast(step.tag)
             self._emit(f"[{step.tag}] ✗ FAIL   {step.desc} ({summary})")
             return
@@ -1912,15 +1972,29 @@ class Runner:
         # recorded event counters can never disagree about the same step.
         memory_events = self.cgroups.memory_events(step.tag)
         # `oom_detection` is the ATTRIBUTION, and it is what the `capabilities` manifest
-        # advertises: unenforced means the oom_kill counter is not consulted, so nothing
-        # downstream can call a failure an OOM. The rest of memory.events is a recorded
-        # measurement, not a guard, and is kept either way -- a profile that stops recording is
-        # a different loss from a guard that stops guarding.
-        oom = (
+        # advertises. `oom_kill` alone is insufficient for a delegated step: when the OUTER
+        # boundary is exhausted, the root-local `oom` counter records that invocation while the
+        # selected victim can live in a descendant and therefore increment `oom_kill` only down
+        # there. The parent's local view deliberately excludes nested-run sibling events, so any
+        # positive local `oom` / `oom_group_kill` is still owned by this step. Keep the historical
+        # `oom_kills` value as the literal process-kill counter, but classify on every kernel OOM
+        # signal. The maximum is only a boolean-strength count here: the counters are overlapping
+        # facets of an OOM, not quantities to add.
+        oom_kills = (
             0
             if memory_events is None or not is_enforced("oom_detection", lane)
             else memory_events.get("oom_kill", 0)
         )
+        actionable_oom_events = (
+            0
+            if memory_events is None or not is_enforced("oom_detection", lane)
+            else max(
+                memory_events.get("oom", 0),
+                oom_kills,
+                memory_events.get("oom_group_kill", 0),
+            )
+        )
+        oomed = actionable_oom_events > 0
         # The cap the KERNEL held, not the cap that was requested: a peak is only
         # interpretable against the ceiling that was actually in force.
         applied_memory_max = self.cgroups.applied_memory_max(step.tag)
@@ -1934,7 +2008,7 @@ class Runner:
         elapsed = time.time() - start
         dur = round(elapsed)
         returncode = proc.returncode
-        ok = returncode == 0 and not timed_out and not cpu_timed_out and oom == 0
+        ok = returncode == 0 and not timed_out and not cpu_timed_out and not oomed
         summary = captured.last_line()
         culprit: Culprit | None = (
             termination_culprit or sink.culprit()
@@ -1953,7 +2027,7 @@ class Runner:
             "ok": ok,
             "timed_out": timed_out,
             "cpu_timed_out": cpu_timed_out,
-            "oom_kills": oom,
+            "oom_kills": oom_kills,
             "peak_bytes": peak,
             "thread_peak": thread_peak,
             # Run-overlap + applied-cap provenance. Offsets share one monotonic run origin, so
@@ -1969,7 +2043,7 @@ class Runner:
         # memory.events counters, which need no subtraction to be per-step deltas (the child
         # cgroup lives exactly as long as the step). Left blank wholesale when the file could
         # not be read, so "the step had no such event" and "we never looked" stay distinct.
-        for counter in ("low", "high", "max", "oom", "oom_kill"):
+        for counter in ("low", "high", "max", "oom", "oom_kill", "oom_group_kill"):
             row[f"memory_events_{counter}"] = (
                 "" if memory_events is None else memory_events.get(counter, 0)
             )
@@ -2037,8 +2111,8 @@ class Runner:
                     duration_s=elapsed,
                     summary=summary,
                     returncode=returncode,
-                    oomed=oom > 0,
-                    oom_kills=oom,
+                    oomed=oomed,
+                    oom_kills=oom_kills,
                     timed_out=timed_out,
                     timeout=wall_budget,
                     cpu_timed_out=cpu_timed_out,
@@ -2055,6 +2129,7 @@ class Runner:
                     detail_write_failure=(),
                 )
             self.done[step.tag] = outcome
+            self.running.discard(step.tag)
             if not was_aborted and not ok:
                 # A REAL failure. The run is failed either way; what differs is COVERAGE.
                 #
@@ -2101,9 +2176,10 @@ class Runner:
                         f"{self.evidence.directory}/{sanitize_evidence_tag(step.tag)}.log"
                     )
             self._emit(f"[{step.tag}] ✗ FAIL   {step.desc} ({dur}s, {outcome.reason})")
-            if oom > 0:
+            if oomed:
                 self._emit(
-                    f"[{step.tag}] ▲ MEMORY CAP HIT: OOM-killed at its inner cgroup "
+                    f"[{step.tag}] ▲ MEMORY CAP HIT: the kernel reported an OOM at its "
+                    f"inner cgroup "
                     f"MemoryMax (cap≈{_fmt_bytes(mem_max)}, peak≈{_fmt_bytes(peak)}). "
                     "Confirm this is genuine growth, not an unbounded leak, before raising the "
                     "step's rss_baseline_bytes / hard_mem_max_bytes hint."

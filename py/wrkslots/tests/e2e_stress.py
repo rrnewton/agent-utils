@@ -34,6 +34,13 @@ def _integer(value: object, label: str) -> int:
     return value
 
 
+def _publish_json(path: Path, value: object) -> None:
+    """Publish one control message only after its JSON is complete."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
 class Trace:
     """Append enough structured evidence to replay a failed seeded run."""
 
@@ -308,7 +315,7 @@ class AgentTree:
         identifier = f"{self.sequence:06d}"
         request = self.control / f"request-{identifier}.json"
         response = self.control / f"response-{identifier}.json"
-        request.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        _publish_json(request, payload)
         result = self._wait_json(response, timeout=timeout)
         response.unlink()
         allowed = {expected} if isinstance(expected, int) else set(expected)

@@ -2,8 +2,8 @@
 #
 # WHY THIS EXISTS
 #
-# `make validate` runs these steps one after another, unboxed, with no ceiling on what any of them
-# may consume. That was tolerable while every suite was cheap. It stopped being tolerable the day a
+# The old tool-local validation ran these steps one after another, unboxed, with no ceiling on what
+# any of them could consume. That was tolerable while every suite was cheap. It stopped being tolerable the day a
 # screenshot server was found still running SIX DAYS after the run that started it, holding a port,
 # reparented to init, with its own configuration directory long deleted. A run that cannot bound
 # what it starts cannot clean up after what it starts.
@@ -11,11 +11,13 @@
 # dagrun is this repository's own answer to exactly that: per-step wall and CPU timeouts, memory
 # limits, and process-tree teardown enforced inside nested cgroups. A step that hangs is reaped
 # with its whole descendant tree, whether or not the step remembered to trap a signal.
+# Repository-level `make validate` now includes this fragment in that shared boxed graph; the
+# tool-local `make -C vibe-talk validate` remains an explicit unboxed escape hatch.
 #
 # WHAT THE SHAPE SAYS
 #
-# The three cheap checks are independent of each other and of the build, so they run concurrently
-# and one failing does not hide the other two. Everything that needs a compiled binary hangs off
+# The six cheap checks are independent of each other and of the build, so they run concurrently
+# and one failing does not hide the others. Everything that needs a compiled binary hangs off
 # `build.release`, which is stated once rather than paid for per step.
 #
 # THE BROWSER CAP IS THE POINT OF THE `resource_caps` BLOCK. Playwright is the only genuinely
@@ -30,7 +32,7 @@
 # from the repository root, which is the working directory every `cmd` below assumes. `make
 # validate-boxed` in vibe-talk/ is the same thing with the paths already right.
 
-description: vibe-talk fmt, lint, unit, page and screenshot suites, boxed
+description: vibe-talk fmt, lint, unit, PWA, offline-cache, page and screenshot suites, boxed
 
 resource_caps:
   # A real browser. One at a time, however many steps ask for it.
@@ -41,7 +43,9 @@ steps:
   - group: check
     job: fmt
     desc: rustfmt, in check mode
+    labels: [validation-vibe-talk]
     cmd: cd vibe-talk && cargo fmt --all -- --check
+    jobs_flag: ""
     cpu_timeout: 60
     hint:
       est_duration_s: 5
@@ -51,33 +55,39 @@ steps:
   - group: check
     job: clippy
     desc: clippy over every target, warnings denied
+    labels: [validation-vibe-talk]
     cmd: cd vibe-talk && cargo clippy --all-targets --locked -- -D warnings
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
     cpu_timeout: 900
     hint:
       est_duration_s: 120
       classification: cpu-bound
+      preferred_inner_jobs: 8
       # Clippy holds the whole crate graph. This is the step most likely to be the memory high
       # water mark of the run, and the one worth a real number rather than a default.
       rss_baseline_bytes: 3221225472
 
-  # The page suites on their own, straight through node. They need no cargo build at all, so they
-  # are the first thing that can go red on a web/ change -- seconds, not minutes.
   - group: check
-    job: page
-    desc: both served pages' suites, against the fake DOM
-    cmd: cd vibe-talk && node --test tests/js/*.test.mjs
-    cpu_timeout: 300
+    job: scripts
+    desc: strict typing and no explicit Any in the Python operator tools
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && make scripts-check
+    jobs_flag: ""
+    cpu_timeout: 120
     hint:
-      est_duration_s: 20
-      classification: cpu-bound
-      rss_baseline_bytes: 1073741824
+      est_duration_s: 5
+      classification: light
+      rss_baseline_bytes: 536870912
 
   # The physical Android run is opt-in. Its evaluator is not: silence and wrong-language speech
   # are negative controls here, requiring no phone, browser, capture device or STT service.
   - group: check
     job: android-speech-self-test
     desc: offline controls for the Android rendered-speech evaluator
+    labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 scripts/android-device-speech.py --self-test
+    jobs_flag: ""
     cpu_timeout: 30
     hint:
       est_duration_s: 2
@@ -89,7 +99,9 @@ steps:
   - group: check
     job: pwa-installability
     desc: current Chromium CDP installability check with an Android viewport
+    labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/pwa_installability.py
+    jobs_flag: ""
     timeout: 60
     cpu_timeout: 30
     hint:
@@ -104,7 +116,9 @@ steps:
   - group: check
     job: offline-cache-browser
     desc: saved-message snapshot in current Chromium at a 412x915 Android viewport
+    labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/offline_cache_browser.py
+    jobs_flag: ""
     timeout: 90
     cpu_timeout: 45
     hint:
@@ -117,27 +131,48 @@ steps:
   - group: build
     job: release
     desc: the release binary the server-shaped suites run against
+    labels: [validation-vibe-talk]
     cmd: cd vibe-talk && cargo build --release --locked
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
     cpu_timeout: 1800
     hint:
       est_duration_s: 240
       classification: cpu-bound
+      preferred_inner_jobs: 16
       rss_baseline_bytes: 4294967296
+
+  - group: smoke
+    job: cli-help
+    desc: the built service binary exposes its operator help without configuration
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && ./target/release/vibe-talk --help >/dev/null
+    jobs_flag: ""
+    deps: [build.release]
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
 
   # ---- suites that need it ----------------------------------------------------------------------
   #
-  # `cargo test` runs the Rust tests AND both page suites through their own harnesses. The overlap
-  # with `check.page` above is deliberate and cheap: that one exists to fail fast on a web/ change
-  # without waiting for a compile, this one proves the harnesses still drive them.
+  # `cargo test` runs the Rust tests AND both page suites through their own harnesses, so each page
+  # suite has one owner in the complete graph rather than being paid for twice.
   - group: test
     job: unit
     desc: the Rust suites, and the page suites through their harnesses
+    labels: [validation-vibe-talk]
     cmd: cd vibe-talk && cargo test --release --locked
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
     deps: [build.release]
     cpu_timeout: 1800
     hint:
       est_duration_s: 180
       classification: cpu-bound
+      preferred_inner_jobs: 8
       rss_baseline_bytes: 3221225472
 
   # THE ONE THAT LEAKED. It starts a real server and drives a real Chromium at it. Boxed, its
@@ -146,7 +181,9 @@ steps:
   - group: shots
     job: screenshots
     desc: the screenshot harness — a real server and a real browser
+    labels: [validation-vibe-talk]
     cmd: cd vibe-talk && ./scripts/run.sh --screenshots --theme dark
+    jobs_flag: ""
     deps: [build.release]
     # Wall, not only CPU: a browser waiting on a page that never loads burns no CPU at all, so a
     # CPU budget alone would let it hang until the run timeout. This is the hang backstop.
@@ -171,6 +208,7 @@ steps:
       # telling the scheduler otherwise makes it reserve cores it will not use. Confirmed by the
       # same run -- 0.60 effective cores over 284 seconds.
       classification: latency-bound
+      preferred_inner_jobs: 4
       # 1GiB against a 682MB observed peak.
       #
       # This is NOT what the planner reserves for this step, and a previous version of this

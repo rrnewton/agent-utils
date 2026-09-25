@@ -68,34 +68,40 @@ a file and check `$?` — never through a pipe.
 
 That runs **only the checks your change can actually affect**, and prints the
 rest as skipped, by name, with the reason. A change confined to `vibe-talk/`
-runs the vibe-talk suite and nothing else, because vibe-talk is outside the
-Rust workspace and shares no code with it — the workspace build, the
-cross-language differential and the packaging smoke tests cannot observe that
-edit, so running them only makes you wait.
+runs the vibe-talk suite plus the always-on repository hygiene; it skips the
+unrelated workspace build, cross-language differential, and packaging smoke
+tests because those checks cannot observe that edit.
 
-The mapping lives in `scripts/validate.py` and has two safety properties, both
-covered by `make check` via `--self-test`:
+Broad path routing lives in `scripts/validate.py`; tool ownership and reverse
+dependencies live in `validation/components.json`. Both are checked by
+`make check`, including fail-closed inventory tests:
 
 - **An unclassified path selects everything.** A new top-level directory cannot
   silently opt out of validation.
 - **A change spanning two areas is the union**, never the cheaper of the two.
 
-Use `make validate-all` for the entire contract regardless of what changed.
-That is what a release path should use, and what to fall back on the moment you
-are unsure the selection is right — selection is a convenience for the edit-run
-loop, not a new definition of "validated".
+Use `make validate-all` for the entire portable, current-toolchain contract
+regardless of what changed. That is what a release path should use, and what to
+fall back on the moment you are unsure the selection is right — selection is a
+convenience for the edit-run loop, not a new definition of "validated".
 
-The full contract, for reference, is the union of these:
+Compatibility checks that inherently require a different compiler version, and
+artifact checks that inherently require a container runtime or deployment
+environment, remain focused CI jobs. They supplement this portable contract;
+they must not duplicate its ordinary build, test, or smoke commands.
+
+Both selected and full validation load `validation.dag.yaml`. Its strict
+compile-time includes flatten the component fragments into one graph, so one
+scheduler can overlap independent Python, Rust, cross-language, packaging,
+browser, and vibe-talk work while enforcing shared resource caps. The graph is
+the source of truth for portable checks; do not recreate its command list in
+this document or in a second CI workflow.
+
+Inspect the plan without running it with:
 
 ```bash
-python3 scripts/embed_userguides.py --check
-cargo fmt --all --manifest-path rs/Cargo.toml -- --check
-make both
-make check
-make test
-python3 -m mypy cross/differential.py
-make cross
-make check-packages
+python3 scripts/validate.py --list
+common/bin/dagrun list --dag validation.dag.yaml
 ```
 
 ### When a PR is warranted
