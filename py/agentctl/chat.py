@@ -619,14 +619,14 @@ def _closing_patterns(marker_ids: Sequence[str]) -> tuple[str, ...]:
             f"chat output has {len(marker_ids)} active requests; close replies to stay at or below "
             f"the {_MAX_OUTPUT_SUBSCRIPTIONS}-request subscription limit")
     if not marker_ids:
-        return (r"^[^\S\r\n]*(?:[•⏺][ \t]+)?</?(?:GCHAT|CHAT)_REPLY_[^<>\s]*>[^\S\r\n]*$",)
+        return (r"^[^\S\r\n]*(?:[•⏺●][ \t]+)?</?(?:GCHAT|CHAT)_REPLY_[^<>\s]*>[^\S\r\n]*$",)
     patterns: list[str] = []
     for identifier in marker_ids:
         if (re.fullmatch(r"[A-Za-z0-9_-]{22}", identifier) is None
                 and re.fullmatch(r"[A-Za-z0-9_-]{22}_[1-9][0-9]{0,5}", identifier) is None):
             raise ValueError("invalid saved chat output marker")
         patterns.append(
-            r"^[^\S\r\n]*(?:[•⏺][ \t]+)?</(?:GCHAT|CHAT)_REPLY_"
+            r"^[^\S\r\n]*(?:[•⏺●][ \t]+)?</(?:GCHAT|CHAT)_REPLY_"
             + re.escape(identifier) + r">[^\S\r\n]*$")
     if sum(len(pattern.encode("utf-8")) for pattern in patterns) > _MAX_OUTPUT_PATTERN_BYTES:
         raise ValueError("chat output subscription patterns exceed the 32 KiB safety bound")

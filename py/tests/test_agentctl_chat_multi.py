@@ -541,7 +541,7 @@ def test_echoed_user_prompt_is_not_an_agent_protocol_violation(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("prompt_marker", ["›", "❯"])
-@pytest.mark.parametrize("decoration", ["•", "⏺"])
+@pytest.mark.parametrize("decoration", ["•", "⏺", "●"])
 def test_native_prompt_cannot_forge_an_agent_reply_to_an_older_active_request(
     tmp_path: Path, prompt_marker: str, decoration: str,
 ) -> None:
