@@ -15552,6 +15552,321 @@ def test_validate_batch_finish_recovery_resumes_destructive_phases(
     assert active_slots(project) == []
 
 
+def interrupt_scoped_private_validate_batch(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """Interrupt one batch removal whose private finish uses the scoped journal.
+
+    The live registry on 2026-09-25 holds this shape: a single-slot
+    ``remove-validate-batch`` whose sealed private finish was written to
+    ``FINISH.<machine>.<slot>.journal`` rather than ``ACTIVE.<machine>.journal``.
+    Redirecting only the journal path handed to ``_begin_finish`` reproduces
+    that writer exactly, including the append-only progress events that name
+    the scoped path.
+    """
+
+    real_begin = wrkslots._begin_finish
+
+    def scoped_begin(
+        config: wrkslots.Config,
+        state: wrkslots.ActiveState,
+        record: wrkslots.ActiveRecord,
+        finish: wrkslots._FinishContext,
+        *,
+        journal_path: Path,
+    ) -> None:
+        assert finish.private_cleanup is not None
+        assert journal_path == wrkslots._journal_path(config)
+        real_begin(
+            config,
+            state,
+            record,
+            finish,
+            journal_path=wrkslots._finish_journal_path(config, record.slot),
+        )
+
+    monkeypatch.setattr(wrkslots, "_begin_finish", scoped_begin)
+    interrupt_validate_batch(project, monkeypatch, boundary, ("slot01",))
+    monkeypatch.setattr(wrkslots, "_begin_finish", real_begin)
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._journal_path(config).exists()
+    scoped = json.loads(
+        finish_journal_path(project).read_text(encoding="utf-8")
+    )
+    assert "private_census_identity" in scoped
+    assert "validation_removal_proof" not in scoped
+    assert wrkslots._validate_batch_seal_journal_path(config).is_file()
+
+
+def recover_main(project: Path, *extra: str) -> int:
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            *extra,
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "interrupt",
+    ("after-finish-journal", "after-path-fence", "after-remove-worktree"),
+)
+@pytest.mark.parametrize("select_slot", (False, True))
+def test_scoped_private_batch_finish_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    interrupt: str,
+    select_slot: bool,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_scoped_private_validate_batch(project, monkeypatch, interrupt)
+    config = wrkslots._load_config(str(project), "testhost")
+    scoped_journal = finish_journal_path(project)
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    capsys.readouterr()
+
+    blocked = command(project, "hold", "slot01", "--reason", "blocked")
+    assert blocked.returncode == 3
+    assert "validation-batch seal" in blocked.stderr
+
+    extra = ("--slot", "slot01") if select_slot else ()
+    assert recover_main(project, *extra) == 0, capsys.readouterr().err
+
+    assert not slot_path.exists()
+    assert not list(slot_path.parent.glob(".slot01.fenced.*"))
+    assert not scoped_journal.exists()
+    assert not wrkslots._journal_path(config).exists()
+    assert not seal_journal.exists()
+    assert active_slots(project) == []
+    archive = wrkslots._load_archive(config, require_repository=False)
+    assert archive.records[-1]["slot"] == "slot01"
+    assert archive.records[-1]["generation"] == 1
+    assert create(project, slot="slot02", slot_type="validate", branch=None).returncode == 0
+
+
+def test_scoped_private_batch_finish_upgrades_legacy_identity_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_scoped_private_validate_batch(
+        project, monkeypatch, "after-finish-journal"
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    finish_path = finish_journal_path(project)
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    finish = json.loads(finish_path.read_text(encoding="utf-8"))
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    metadata = slot_path.stat()
+    legacy_identity = [metadata.st_dev, metadata.st_ino, 865]
+    finish["private_census_identity"] = legacy_identity
+    seal["targets"][0]["identity"] = legacy_identity
+    # Scoped journals always carry append-only provenance, so the legacy
+    # identity is written through the journal writer rather than by hand.
+    wrkslots._write_journal(config, finish, journal_path=finish_path)
+    seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
+    monkeypatch.setattr(wrkslots, "_fd_mount_id", lambda _fd, _label: 3503)
+    written: list[Path] = []
+    real_write = wrkslots._write_journal
+
+    def record_write(
+        config: wrkslots.Config,
+        payload: Mapping[str, object],
+        *,
+        event_writer: wrkslots._EventWriter | None = None,
+        journal_path: Path | None = None,
+    ) -> None:
+        written.append(journal_path or wrkslots._journal_path(config))
+        real_write(
+            config, payload, event_writer=event_writer, journal_path=journal_path
+        )
+
+    monkeypatch.setattr(wrkslots, "_write_journal", record_write)
+
+    assert recover_main(project) == 0
+    assert written and set(written) == {finish_path}
+    assert not slot_path.exists()
+    assert not finish_path.exists()
+    assert not wrkslots._journal_path(config).exists()
+    assert not seal_path.exists()
+    assert active_slots(project) == []
+
+
+def test_scoped_private_batch_finish_shape_still_refuses_malformed_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_scoped_private_validate_batch(project, monkeypatch, "after-path-fence")
+    config = wrkslots._load_config(str(project), "testhost")
+    path = finish_journal_path(project)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    wrkslots._validate_journal_shape(config, path, raw)
+
+    def refused(mutated: dict[str, object], message: str) -> None:
+        with pytest.raises(wrkslots.StateError, match=message):
+            wrkslots._validate_journal_shape(config, path, mutated)
+
+    not_direct = "scoped finish journal is not a direct completed-validation removal"
+    record = dict(raw["record"])
+    record["slot_type"] = "agent"
+    refused({**raw, "record": record}, not_direct)
+    refused({**raw, "validate_complete": False}, not_direct)
+    refused(
+        {key: value for key, value in raw.items() if key != "validate_complete"},
+        not_direct,
+    )
+    refused(
+        {**raw, "validation_removal_proof": {"slot": "slot01", "generation": 1}},
+        not_direct,
+    )
+    refused(
+        {key: value for key, value in raw.items() if key != "original_mode"},
+        "private census identity has no original mode",
+    )
+    refused(
+        {**raw, "private_census_identity": [1, 2]},
+        "private_census_identity",
+    )
+
+
+def test_scoped_private_batch_finish_without_seal_refuses_without_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_scoped_private_validate_batch(project, monkeypatch, "after-path-fence")
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    fenced = tuple(slot_path.parent.glob(".slot01.fenced.1.*"))
+    assert len(fenced) == 1
+    seal_journal.unlink()
+    capsys.readouterr()
+
+    assert recover_main(project) != 0
+    assert "missing its validation-batch seal evidence" in capsys.readouterr().err
+    assert fenced[0].is_dir()
+    assert finish_journal_path(project).is_file()
+    assert len(active_slots(project)) == 1
+
+
+@pytest.mark.parametrize("mismatch", ("identity", "original_mode", "generation"))
+def test_scoped_private_batch_finish_with_mismatched_seal_refuses_without_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mismatch: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_scoped_private_validate_batch(project, monkeypatch, "after-path-fence")
+    config = wrkslots._load_config(str(project), "testhost")
+    seal_journal = wrkslots._validate_batch_seal_journal_path(config)
+    fenced = tuple(slot_path.parent.glob(".slot01.fenced.1.*"))
+    assert len(fenced) == 1
+    seal = json.loads(seal_journal.read_text(encoding="utf-8"))
+    target = dict(seal["targets"][0])
+    if mismatch == "identity":
+        identity = list(target["identity"])
+        identity[1] = int(identity[1]) + 1
+        target["identity"] = identity
+    elif mismatch == "original_mode":
+        target["original_mode"] = int(target["original_mode"]) ^ 0o020
+    else:
+        target["generation"] = 2
+    wrkslots._write_validate_batch_seal_journal(config, {**seal, "targets": [target]})
+    capsys.readouterr()
+
+    assert recover_main(project) != 0
+    assert (
+        "durable seal journal does not match target slot01 generation 1"
+        in capsys.readouterr().err
+    )
+    assert fenced[0].is_dir()
+    assert finish_journal_path(project).is_file()
+    assert seal_journal.is_file()
+    assert len(active_slots(project)) == 1
+
+
+def test_scoped_private_batch_finish_with_substituted_fence_refuses_without_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    census_calls: list[tuple[Path, ...]] = []
+
+    def empty_census(paths: Sequence[Path]) -> wrkslots._ProcessPathCensus:
+        census_calls.append(tuple(paths))
+        return wrkslots._ProcessPathCensus((), ())
+
+    stub_validate_batch_censuses(monkeypatch, empty_census)
+    interrupt_scoped_private_validate_batch(project, monkeypatch, "after-path-fence")
+    fenced = tuple(slot_path.parent.glob(".slot01.fenced.1.*"))
+    assert len(fenced) == 1
+    saved = fenced[0].with_name(f"{fenced[0].name}.saved")
+    fenced[0].rename(saved)
+    fenced[0].mkdir(mode=0o700)
+    census_calls.clear()
+    capsys.readouterr()
+
+    assert recover_main(project) == 3
+    err = capsys.readouterr().err
+    assert "scoped finish journal is not" not in err
+    assert "validation-batch seal recovery retained 1 target(s)" in err
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._validate_batch_seal_journal_path(config).is_file()
+    assert census_calls == []
+    assert fenced[0].is_dir()
+    assert saved.is_dir()
+    assert finish_journal_path(project).is_file()
+    assert len(active_slots(project)) == 1
+
+
+def test_scoped_private_batch_finish_rewritten_without_event_refuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    stub_validate_batch_censuses(monkeypatch)
+    interrupt_scoped_private_validate_batch(project, monkeypatch, "after-path-fence")
+    fenced = tuple(slot_path.parent.glob(".slot01.fenced.1.*"))
+    assert len(fenced) == 1
+    path = finish_journal_path(project)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["removed"] = ["product"]
+    path.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert recover_main(project) != 0
+    assert (
+        "scoped finish journal differs from append-only progress evidence"
+        in capsys.readouterr().err
+    )
+    assert fenced[0].is_dir()
+    assert path.is_file()
+    assert len(active_slots(project)) == 1
+
+
 @pytest.mark.parametrize(
     "interrupt",
     ("after-remove-before-journal", "after-remove-worktree"),

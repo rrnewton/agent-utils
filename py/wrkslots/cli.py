@@ -6611,16 +6611,17 @@ def _validate_journal_shape(
         record = _record_from_obj(raw["record"], "finish journal.record")
         if record.machine != machine or record.slot != slot:
             raise StateError("finish journal record does not match its shard or slot")
+        # A scoped finish journal belongs to exactly one completed validation
+        # slot. It may carry the private census identity of a single-slot
+        # validation-batch removal: recovery accepts it only with a durable
+        # seal target that matches its slot, generation, canonical path,
+        # original mode and identity (see _cmd_recover), and _recover_finish
+        # re-proves the on-disk identity before anything is deleted. A
+        # proof-manifest removal is never written to the scoped path.
         if path == _finish_journal_path(config, slot, machine) and (
             record.slot_type != "validate"
             or raw.get("validate_complete") is not True
-            or any(
-                field in raw
-                for field in (
-                    "private_census_identity",
-                    "validation_removal_proof",
-                )
-            )
+            or "validation_removal_proof" in raw
         ):
             raise StateError(
                 "scoped finish journal is not a direct completed-validation removal"
@@ -19778,6 +19779,8 @@ def _upgrade_legacy_finish_seal_identity(
     config: Config,
     raw: Mapping[str, object],
     record: ActiveRecord,
+    *,
+    journal_path: Path,
 ) -> Mapping[str, object]:
     """Upgrade a paired finish/seal identity before destructive recovery resumes."""
 
@@ -19855,7 +19858,7 @@ def _upgrade_legacy_finish_seal_identity(
 
     updated_finish = dict(raw)
     updated_finish["private_census_identity"] = list(stable)
-    _write_journal(config, updated_finish)
+    _write_journal(config, updated_finish, journal_path=journal_path)
     return updated_finish
 
 
@@ -31713,7 +31716,9 @@ def _cmd_recover(
                     "validation-batch seal evidence coexists with a non-finish journal"
                 )
             record = _record_from_obj(raw.get("record"), "finish journal.record")
-            raw = _upgrade_legacy_finish_seal_identity(config, raw, record)
+            raw = _upgrade_legacy_finish_seal_identity(
+                config, raw, record, journal_path=path
+            )
             private_identity = _finish_private_census_identity(raw)
             if private_identity is None:
                 raise StateError(
