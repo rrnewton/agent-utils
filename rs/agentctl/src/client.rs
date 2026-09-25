@@ -2423,7 +2423,9 @@ mod tests {
             command
                 .args([
                     "-c",
-                    "/bin/sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; /usr/bin/setsid /bin/sleep 30 & printf '%s\\n' \"$!\" > \"$2\"; wait",
+                    // The escaped child, not its parent shell, publishes the PID after setsid.
+                    // A parent-side shell PID marker can race cancellation before the escape.
+                    "/bin/sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; /usr/bin/setsid /bin/sh -c 'printf \"%s\\n\" \"$$\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\" && exec /bin/sleep 30' agentctl-holder \"$2\" & wait",
                     "agentctl-test",
                 ])
                 .arg(&self.group_pid_file)
@@ -3286,7 +3288,10 @@ mod tests {
             wait_until_process_is_gone(escaped.group_pid(), Duration::from_secs(2)),
             "cancellation must kill a live descendant in the supervised group"
         );
-        assert_eq!(unsafe { libc::kill(escaped.escaped_pid(), 0) }, 0);
+        let escaped_pid = escaped.escaped_pid();
+        assert_eq!(unsafe { libc::kill(escaped_pid, 0) }, 0);
+        assert_eq!(unsafe { libc::getsid(escaped_pid) }, escaped_pid);
+        assert_eq!(unsafe { libc::getpgid(escaped_pid) }, escaped_pid);
         escaped.terminate_escaped();
     }
 
