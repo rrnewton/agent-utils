@@ -67,6 +67,10 @@ _KILL_SECONDS = 5.0
 # bytecode, which no Python code can guard against (see "Note on Signal Handlers and Exceptions"
 # in the signal module's documentation), so it can leave the recorder or the mask in place.
 _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+# How many times, at most, each of the caller's handlers is put back.  A call that raises may or may
+# not have changed the handler first, so one whose call raised is tried again.  A call that raises
+# every time leaves that handler as it was, and the first exception still reaches the caller.
+_PUT_BACK_ATTEMPTS = 3
 # Nothing can catch a SIGKILL of the runner itself, as a supervisor that kills the caller's process
 # group sends, so each shard leader is also told to receive a signal when the runner dies.  A mapped
 # shard's `unshare` leader gets SIGKILL and passes it on to the namespace's PID 1 (`--kill-child`),
@@ -278,9 +282,10 @@ def run_commands(
 ) -> int:
     """Run every shard concurrently and report every result before failing.
 
-    Leaves the caller's signal handlers and mask as it found them, whatever stop signals arrive.
+    Leaves the caller's signal handlers and mask as it found them, whatever stop signals arrive,
+    and even if a call that blocks or unblocks them, installs a handler or puts one back raises.
     That holds only for a single-threaded caller, and not if the caller's own handler for some
-    other signal raises at the wrong moment: see _STOP_SIGNALS.
+    other signal raises between two of those calls: see _STOP_SIGNALS.
     """
 
     processes: list[subprocess.Popen[bytes]] = []
@@ -293,22 +298,26 @@ def run_commands(
     interrupted = False
     # Blocking changes the mask before CPython runs pending handlers, one of which may raise, so
     # the caller's mask is read first (this changes nothing) and the block happens inside the try.
-    # If installing a handler raises, those already installed go back while the stop signals are
+    # Each handler is noted before it changes, so one whose call changes it and then raises is noted
+    # too.  If installing a handler raises, every one noted goes back while the stop signals are
     # still held back, so none of them acts on a half-changed set.
     caller_mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
-    previous: dict[signal.Signals, Callable[[int, FrameType | None], object] | int | None] = {}
+    previous: dict[signal.Signals, _Handler] = {}
     try:
         signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
+        for signum in _STOP_SIGNALS:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, signals.record)
+    except BaseException:
         try:
-            for signum in _STOP_SIGNALS:
-                previous[signum] = signal.signal(signum, signals.record)
-        except BaseException:
-            for signum, handler in previous.items():
-                signal.signal(signum, handler)
-            raise
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
+            _put_back(previous)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
+        raise
     try:
+        # Unblocking runs pending handlers too, and the recorders are all installed by now, so it
+        # happens inside the try whose finally puts every handler back.
+        signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
         try:
             for index, command in enumerate(commands):
                 if signals.pending():
@@ -353,13 +362,13 @@ def run_commands(
         # arranged: even one that interrupts a report blocked on a full pipe cannot orphan anything.
         # Stop signals are held back while handlers change, so none acts on a half-changed set;
         # and the caller's handlers and mask come back even if a handler raises out of the call
-        # that holds them back.  If one raises while the handlers are put back, the mask still is.
+        # that holds them back.  If putting one handler back raises, every other one still goes
+        # back, that one is tried again, and the mask comes back too.
         try:
             signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
         finally:
             try:
-                for signum, handler in previous.items():
-                    signal.signal(signum, handler)
+                _put_back(previous)
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
     if interrupted:
@@ -390,6 +399,33 @@ def run_commands(
     if signals.received:
         _exit_for(signals.received[0])  # It arrived after the last shard ended; still honour it.
     return 0 if all(returncode == 0 for returncode in returncodes) else 1
+
+
+_Handler = Callable[[int, FrameType | None], object] | int | None
+
+
+def _put_back(handlers: Mapping[signal.Signals, _Handler]) -> None:
+    """Put back every one of handlers, even if putting one back raises.
+
+    A handler whose call raised is tried again, up to _PUT_BACK_ATTEMPTS calls in all, and then
+    the first exception is raised, so it still reaches the caller.
+    """
+    first: BaseException | None = None
+    remaining = dict(handlers)
+    for _attempt in range(_PUT_BACK_ATTEMPTS):
+        failed: dict[signal.Signals, _Handler] = {}
+        for signum, handler in remaining.items():
+            try:
+                signal.signal(signum, handler)
+            except BaseException as exc:
+                if first is None:
+                    first = exc
+                failed[signum] = handler
+        remaining = failed
+        if not remaining:
+            break
+    if first is not None:
+        raise first
 
 
 class _Signals:
