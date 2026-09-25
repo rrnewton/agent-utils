@@ -811,9 +811,10 @@ const JOURNAL_OPERATIONS: &[&str] = &[
     "recover-absent-agent-row",
 ];
 
-/// Operations whose journal completion is terminal for a recovery attempt.
-/// Finish and the ownerless cleanups also complete journals on rollback or
-/// refusal paths that keep their storage, so they are excluded.
+/// Operations whose journal completion is terminal for a recovery attempt when
+/// the slot has an ACTIVE row. Finish and the ownerless cleanups also complete
+/// journals on rollback or refusal paths that keep their storage, so they are
+/// excluded.
 const TERMINAL_COMPLETION_OPERATIONS: &[&str] = &["create", "import-existing"];
 
 fn active_generation(state: &State, slot: &str) -> Option<u64> {
@@ -1028,12 +1029,16 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
         }
         None => {}
     }
-    if TERMINAL_COMPLETION_OPERATIONS.contains(&operation.as_str()) {
-        // Every Python path that completes a create or import journal leaves
-        // the slot's storage owned by its ACTIVE row or leaves none, so the
-        // completion also ends a recovery attempt bound to the same journal.
+    if TERMINAL_COMPLETION_OPERATIONS.contains(&operation.as_str())
+        && state.active_records.contains_key(&slot)
+    {
+        // A create or import completion that leaves an ACTIVE row also ends a
+        // recovery attempt bound to the same journal: the row now owns the
+        // slot's storage. Without a row the completion proves nothing about
+        // storage, because older writers completed such journals while
+        // leaving provisioned worktrees behind, so the marker stays pending.
         // A recovery bound elsewhere, such as the legacy singleton default,
-        // stays pending.
+        // also stays pending.
         let recovery_key = pending_key(PendingOperationKind::Recovery, &slot, &operation);
         if state
             .pending_operations
@@ -1059,7 +1064,8 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
 /// same generation was archived with removed storage and left ACTIVE. Python's
 /// `operation-completed` means only that a journal was cleared: rollback and
 /// late-refusal paths emit it while deliberately retaining the slot. Create and
-/// import completions are the exception handled in `apply_operation_completed`.
+/// import completions that leave an ACTIVE row are the exception handled in
+/// `apply_operation_completed`.
 fn clear_archived_removal_markers(state: &mut State, slot: &str) {
     let Some(generation) = state.archived_generations.get(slot).copied() else {
         return;
