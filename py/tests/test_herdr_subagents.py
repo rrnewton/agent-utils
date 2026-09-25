@@ -1949,7 +1949,7 @@ def test_legacy_goal_pointer_without_duplicate_map_is_exactly_recovered(
     assert json.loads(artifact_path.read_text(encoding="utf-8"))["kind"] == "goal"
 
 
-@pytest.mark.parametrize("mutation", ("id", "text"))
+@pytest.mark.parametrize("mutation", ("id", "text", "map"))
 def test_legacy_goal_pointer_without_map_refuses_mismatched_artifact(
     mutation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1965,7 +1965,8 @@ def test_legacy_goal_pointer_without_map_refuses_mismatched_artifact(
     artifact_path = queue / "inbox" / f"{identifier}.json"
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
     artifact.pop("kind")
-    artifact[mutation] = "wrong"
+    if mutation != "map":
+        artifact[mutation] = "wrong"
     artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
     path = manager.registry / "worker" / "agent.json"
     stored = _downgrade_current_record_to_v2(
@@ -1974,7 +1975,9 @@ def test_legacy_goal_pointer_without_map_refuses_mismatched_artifact(
     stored["goal"] = objective
     stored["goal_delivery"] = "possibly_submitted"
     stored["goal_message_id"] = identifier
-    stored["goal_messages"] = {}
+    stored["goal_messages"] = (
+        {identifier: "wrong"} if mutation == "map" else {}
+    )
     path.write_text(json.dumps(stored), encoding="utf-8")
 
     with pytest.raises(AgentDeliveryError):
@@ -1997,10 +2000,106 @@ def test_current_goal_pointer_never_accepts_an_untagged_artifact(
     record = manager.get("worker")
     record.goal = "exact"
     record.goal_message_id = identifier
+    with pytest.raises(AgentDeliveryError, match="disagrees with its session record"):
+        manager._save(record)
+
+
+def test_current_goal_pointer_without_artifact_or_transaction_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    stored = json.loads(path.read_text())
+    stored["goal"] = {
+        "schema": "agentctl-goal/v1",
+        "objective": "missing objective",
+        "message_id": "missing-goal",
+        "native_command": None,
+    }
+    agent._atomic_json(str(path), stored)
+
+    with pytest.raises(AgentDeliveryError, match="no durable queue artifact"):
+        manager.status("worker")
+
+
+def test_goal_transaction_recovers_every_publication_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    record_path = manager.registry / "worker" / "agent.json"
+    transaction_path = manager.registry / "worker" / "goal-transaction.json"
+    queue = manager.registry / "worker" / "queue"
+    objective = "recover the retained timerfd worktree"
+    prompt = (
+        f"Your ongoing goal: {objective}\n"
+        "Work toward this goal and report completion or blockers."
+    )
+
+    # Crash after the transaction but before publishing its pointer aborts it.
+    record = manager.get("worker")
+    manager._write_goal_transaction(record, "goal-before-record", objective)
+    manager._reconcile_goal_transaction(record)
+    assert not transaction_path.exists()
+    assert agent.message_state(str(queue), "goal-before-record") is None
+    assert json.loads(record_path.read_text())["goal"]["message_id"] is None
+
+    # Crash after the record publication reconstructs the exact typed artifact.
+    record = manager.get("worker")
+    manager._write_goal_transaction(record, "goal-after-record", objective)
+    record.goal = objective
+    record.goal_message_id = "goal-after-record"
+    manager._save(record)
+    assert manager.status("worker")["goal_delivery"] == "pending"
+    manager._reconcile_goal_transaction(manager.get("worker"))
+    assert not transaction_path.exists()
+    artifact = json.loads(
+        (queue / "inbox" / "goal-after-record.json").read_text()
+    )
+    assert artifact["kind"] == "goal"
+    assert artifact["text"] == prompt
+
+    # Crash after artifact publication is idempotent and creates no duplicate.
+    record = manager.get("worker")
+    manager._write_goal_transaction(record, "goal-after-artifact", objective)
+    record.goal = objective
+    record.goal_message_id = "goal-after-artifact"
+    manager._save(record)
+    agent.enqueue_goal(
+        str(queue), prompt, message_id="goal-after-artifact",
+    )
+    manager._reconcile_goal_transaction(manager.get("worker"))
+    assert not transaction_path.exists()
+    assert agent.message_state(str(queue), "goal-after-artifact") == "pending"
+    assert len(list((queue / "inbox").glob("goal-after-artifact.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("folder", "delivery"),
+    (("inbox", "pending"), ("inflight", "possibly_submitted"),
+     ("failed", "possibly_submitted"), ("processed", "delivered")),
+)
+def test_goal_delivery_is_derived_from_every_exact_queue_transition(
+    folder: str, delivery: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    record = manager.get("worker")
+    objective = "finish exact work"
+    identifier = "goal-transition"
+    queue = manager.registry / "worker" / "queue"
+    agent.enqueue_goal(str(queue), f"/goal {objective}", message_id=identifier)
+    if folder != "inbox":
+        (queue / "inbox" / f"{identifier}.json").rename(
+            queue / folder / f"{identifier}.json"
+        )
+    record.goal = objective
+    record.goal_message_id = identifier
     manager._save(record)
 
-    with pytest.raises(AgentDeliveryError, match="disagrees with its session record"):
-        manager.status("worker")
+    assert manager.status("worker")["goal_delivery"] == delivery
 
 
 def test_send_migrates_legacy_goal_authority_before_queue_delivery(

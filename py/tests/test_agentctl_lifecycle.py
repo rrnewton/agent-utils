@@ -383,8 +383,13 @@ def test_owned_dead_muse_requires_token_and_archives_exact_stale_label_pane(
     result = manager.stop("worker", expected_token=token)
 
     assert result["managed_dead"] is True
-    assert result["pane_closed"] is True
-    assert fake.closed == ["w1:t1"]
+    assert result["pane_closed"] is False
+    assert result["runtime_preserved"] is True
+    assert fake.closed == []
+    assert len(fake.presentations) == 1
+    assert (fake.presentations[0].pane_id, fake.presentations[0].tab_id) == (
+        "w1:p1", "w1:t1",
+    )
     archive = Path(str(result["archive"]))
     assert json.loads((archive / "agent.json").read_text())["lifecycle"] == "stopped"
     assert json.loads((archive / "output.json").read_text())["pane_id"] == pane
@@ -437,6 +442,24 @@ def test_owned_dead_muse_refuses_shell_generation_change(
     monkeypatch.setattr(fake, "pane_idle_shell_identity", changing)
     with pytest.raises(AgentDeliveryError, match="runtime identity changed"):
         manager.stop("worker", expected_token=token)
+    assert fake.closed == []
+
+
+def test_owned_dead_muse_never_closes_a_replacement_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    replacement = replace(fake.presentations[0], terminal_id="replacement-terminal")
+    fake.presentations[0] = replacement
+
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["managed_dead"] is True
+    assert result["pane_closed"] is False
+    assert result["runtime_preserved"] is True
+    assert "conditional close" in str(result["continuation"])
+    assert fake.presentations == [replacement]
     assert fake.closed == []
 
 

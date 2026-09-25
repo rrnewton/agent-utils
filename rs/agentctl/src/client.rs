@@ -383,6 +383,38 @@ fn live_custom_process(_pid: u64) -> Result<LiveCustomProcess> {
     ))
 }
 
+#[cfg(target_os = "linux")]
+fn process_generation_absent_after_failed_inspection(
+    pid: u32,
+    inspection_error: AdapterError,
+    existence: io::Result<bool>,
+) -> Result<bool> {
+    match existence {
+        Ok(false) => Ok(true),
+        Ok(true) => Err(inspection_error),
+        Err(error) => Err(AdapterError::unavailable(format!(
+            "cannot prove recorded process {pid} absent after identity inspection failed ({inspection_error}): {error}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_exists(pid: libc::pid_t) -> io::Result<bool> {
+    // SAFETY: signal zero performs an existence/permission check without
+    // delivering a signal to the checked positive PID.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else if error.raw_os_error() == Some(libc::EPERM) {
+        Ok(true)
+    } else {
+        Err(error)
+    }
+}
+
 fn supported_shell_name(path: &Path) -> bool {
     let Some(mut name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
@@ -1786,15 +1818,19 @@ impl HerdrClient {
         match live_custom_process(expected.pid) {
             Ok(observed) => Ok(observed.identity != *expected),
             Err(error) => {
-                let path = PathBuf::from(format!("/proc/{}", expected.pid));
-                match fs::symlink_metadata(&path) {
-                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(true),
-                    Ok(_) => Err(error),
-                    Err(inspect) => Err(AdapterError::unavailable(format!(
-                        "cannot prove recorded process {} absent: {inspect}",
-                        expected.pid
-                    ))),
-                }
+                let pid = libc::pid_t::try_from(expected.pid)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        AdapterError::unavailable("recorded custom process id is invalid")
+                    })?;
+                process_generation_absent_after_failed_inspection(
+                    u32::try_from(expected.pid).map_err(|_| {
+                        AdapterError::unavailable("recorded custom process id is invalid")
+                    })?,
+                    error,
+                    process_exists(pid),
+                )
             }
         }
     }
@@ -2955,6 +2991,38 @@ mod tests {
         assert_eq!(fields[2], "8");
         assert_eq!(fields[19], "42");
         assert!(process_stat_fields(124, raw).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_process_identity_inspection_requires_a_process_existence_proof() {
+        let inspection = || AdapterError::unavailable("procfs identity unavailable");
+        assert!(
+            process_generation_absent_after_failed_inspection(123, inspection(), Ok(false),)
+                .unwrap()
+        );
+
+        let live = process_generation_absent_after_failed_inspection(123, inspection(), Ok(true))
+            .unwrap_err();
+        assert_eq!(live.message(), "procfs identity unavailable");
+
+        let unavailable = process_generation_absent_after_failed_inspection(
+            123,
+            inspection(),
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+        )
+        .unwrap_err();
+        assert!(unavailable.message().contains("cannot prove"));
+        assert!(unavailable
+            .message()
+            .contains("procfs identity unavailable"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_process_existence_probe_is_not_absence() {
+        let pid = libc::pid_t::try_from(std::process::id()).unwrap();
+        assert!(process_exists(pid).unwrap());
     }
 
     #[test]

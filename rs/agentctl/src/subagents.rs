@@ -42,6 +42,8 @@ const LEGACY_SESSION_STORAGE_SCHEMA: &str = "agentctl-session/v2";
 const LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v2";
 const LEGACY_LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v1";
 const GOAL_STATE_SCHEMA: &str = "agentctl-goal/v1";
+const GOAL_TRANSACTION_SCHEMA: &str = "agentctl-goal-transaction/v1";
+const GOAL_TRANSACTION_FILE: &str = "goal-transaction.json";
 const NATIVE_SESSION_SCHEMA: &str = "agentctl-native-session/v1";
 const RELOCATION_SCHEMA: &str = "agentctl-relocation/v1";
 
@@ -1192,6 +1194,15 @@ struct DeadPaneProof {
     shell: PaneShellProof,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoalArtifactState {
+    Prepared,
+    Pending,
+    Inflight,
+    Processed,
+    Failed,
+}
+
 #[derive(Clone, Debug)]
 struct LegacyRecordSnapshot {
     record: AgentRecord,
@@ -2119,6 +2130,11 @@ impl AgentRecord {
                 .legacy_goal_messages
                 .iter()
                 .any(|(key, value)| !message_id(key) || value.is_empty())
+            || self.goal_message_id.as_ref().is_some_and(|identifier| {
+                self.legacy_goal_messages
+                    .get(identifier)
+                    .is_some_and(|objective| Some(objective) != self.goal.as_ref())
+            })
             || !matches!(
                 self.session_source.as_deref(),
                 None | Some("observed") | Some("asserted")
@@ -3708,6 +3724,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         self.migrate_legacy_goal_messages(record)?;
+        if record.goal_message_id.is_some() {
+            self.goal_artifact_state(record, true)?;
+        }
         agent::atomic_json(&self.directory(&record.name)?.join("agent.json"), &document)
     }
 
@@ -3776,6 +3795,160 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
         }
         Ok(())
+    }
+
+    fn goal_transaction_path(&self, record: &AgentRecord) -> Result<PathBuf> {
+        Ok(self.directory(&record.name)?.join(GOAL_TRANSACTION_FILE))
+    }
+
+    fn read_goal_transaction(&self, record: &AgentRecord) -> Result<Option<(String, String)>> {
+        let path = self.goal_transaction_path(record)?;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(fail(format!("cannot inspect goal transaction: {error}"))),
+            Ok(_) => {}
+        }
+        let document = agent::read_private_json_bounded(&path, MAX_AGENT_RECORD_BYTES as u64)?;
+        let object = document
+            .as_object()
+            .ok_or_else(|| fail("goal transaction is not an object"))?;
+        if object.len() != 4
+            || document["schema"] != GOAL_TRANSACTION_SCHEMA
+            || document["token"].as_str() != Some(&record.token)
+        {
+            return Err(fail(
+                "goal transaction is invalid or belongs to another generation",
+            ));
+        }
+        let identifier = document["message_id"]
+            .as_str()
+            .ok_or_else(|| fail("goal transaction has an invalid message id"))?;
+        agent::validate_message_id(identifier)?;
+        let objective = document["objective"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty() && !value.contains(['\n', '\r']))
+            .ok_or_else(|| fail("goal transaction has an invalid objective"))?;
+        Ok(Some((identifier.to_owned(), objective.to_owned())))
+    }
+
+    fn write_goal_transaction(
+        &self,
+        record: &AgentRecord,
+        identifier: &str,
+        objective: &str,
+    ) -> Result<()> {
+        let path = self.goal_transaction_path(record)?;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(fail(format!("cannot inspect goal transaction: {error}"))),
+            Ok(_) => return Err(fail("unfinished goal transaction must be reconciled first")),
+        }
+        let document = json!({
+            "schema": GOAL_TRANSACTION_SCHEMA,
+            "token": record.token,
+            "message_id": identifier,
+            "objective": objective,
+        });
+        let encoded = serde_json::to_vec_pretty(&document)
+            .map_err(|error| fail(format!("cannot encode goal transaction: {error}")))?;
+        if encoded.len().saturating_add(1) > MAX_AGENT_RECORD_BYTES {
+            return Err(fail("goal transaction exceeds the agent record limit"));
+        }
+        agent::atomic_json_create(&path, &document)
+            .map_err(|error| fail(format!("cannot persist goal transaction: {error}")))
+    }
+
+    fn remove_goal_transaction(&self, record: &AgentRecord) -> Result<()> {
+        let path = self.goal_transaction_path(record)?;
+        fs::remove_file(&path)
+            .map_err(|error| fail(format!("cannot retire goal transaction: {error}")))?;
+        agent::sync_directory(
+            path.parent()
+                .ok_or_else(|| fail("goal transaction has no parent directory"))?,
+        )
+    }
+
+    fn goal_artifact_state(
+        &self,
+        record: &AgentRecord,
+        allow_prepared: bool,
+    ) -> Result<GoalArtifactState> {
+        let identifier = record
+            .goal_message_id
+            .as_deref()
+            .ok_or_else(|| fail("goal message pointer is absent"))?;
+        let objective = record
+            .goal
+            .as_deref()
+            .ok_or_else(|| fail("goal message pointer has no session objective"))?;
+        let queue = self.queue(&record.name)?;
+        let state = agent::message_state(&queue, identifier)?;
+        let Some(state) = state else {
+            if allow_prepared
+                && self.read_goal_transaction(record)?.as_ref()
+                    == Some(&(identifier.to_owned(), objective.to_owned()))
+            {
+                return Ok(GoalArtifactState::Prepared);
+            }
+            return Err(fail(format!(
+                "goal message {identifier:?} has no durable queue artifact"
+            )));
+        };
+        let folder = match state {
+            agent::QueueMessageState::Pending => "inbox",
+            agent::QueueMessageState::Inflight => "inflight",
+            agent::QueueMessageState::Processed => "processed",
+            agent::QueueMessageState::Failed => "failed",
+        };
+        let path = queue.join(folder).join(format!("{identifier}.json"));
+        let document = agent::read_private_json_bounded(&path, MAX_QUEUE_ARTIFACT_BYTES)?;
+        let expected_text = goal_prompt(&record.launch.harness, objective);
+        let kind_matches = document.get("kind").and_then(Value::as_str) == Some("goal")
+            || (document.get("kind").is_none() && record.legacy_goal_pointer);
+        if document.get("id").and_then(Value::as_str) != Some(identifier)
+            || document.get("text").and_then(Value::as_str) != Some(expected_text.as_str())
+            || !kind_matches
+        {
+            return Err(fail(format!(
+                "goal message {identifier:?} disagrees with its session record"
+            )));
+        }
+        Ok(match state {
+            agent::QueueMessageState::Pending => GoalArtifactState::Pending,
+            agent::QueueMessageState::Inflight => GoalArtifactState::Inflight,
+            agent::QueueMessageState::Processed => GoalArtifactState::Processed,
+            agent::QueueMessageState::Failed => GoalArtifactState::Failed,
+        })
+    }
+
+    fn reconcile_goal_transaction(&self, record: &AgentRecord) -> Result<()> {
+        let Some((identifier, objective)) = self.read_goal_transaction(record)? else {
+            return Ok(());
+        };
+        let pointer_matches = record.goal_message_id.as_deref() == Some(&identifier);
+        let state = agent::message_state(&self.queue(&record.name)?, &identifier)?;
+        if !pointer_matches {
+            if state.is_some() {
+                return Err(fail(
+                    "uncommitted goal transaction already has a queue artifact",
+                ));
+            }
+            return self.remove_goal_transaction(record);
+        }
+        if record.goal.as_deref() != Some(&objective) {
+            return Err(fail(
+                "goal transaction disagrees with the session objective",
+            ));
+        }
+        if state.is_none() {
+            agent::enqueue_goal(
+                &self.queue(&record.name)?,
+                &goal_prompt(&record.launch.harness, &objective),
+                &identifier,
+            )?;
+        }
+        self.goal_artifact_state(record, false)?;
+        self.remove_goal_transaction(record)
     }
 
     fn queue(&self, agent_name: &str) -> Result<PathBuf> {
@@ -5373,6 +5546,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<QueueResult> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
+        self.reconcile_goal_transaction(&record)?;
         self.send_record(&record, text, options, message_id)
     }
 
@@ -5387,6 +5561,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<QueueResult> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
+        self.reconcile_goal_transaction(&record)?;
         record.input_allowed()?;
         if !record.legacy_goal_messages.is_empty() {
             self.save(&record)?;
@@ -5474,6 +5649,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn pause(&self, agent_name: &str, paused: bool) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
+        self.reconcile_goal_transaction(&record)?;
         record.supported()?;
         self.checked(&record)?;
         record.paused = paused;
@@ -5587,6 +5763,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
+        self.reconcile_goal_transaction(&record)?;
         if record.lifecycle != "running"
             || record.launch.mode != "interactive"
             || record.launch.backend != "herdr"
@@ -5733,6 +5910,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn drain(&self, agent_name: &str, options: DrainOptions) -> Result<QueueResult> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
+        self.reconcile_goal_transaction(&record)?;
         record.input_allowed()?;
         if !record.legacy_goal_messages.is_empty() {
             self.save(&record)?;
@@ -5940,6 +6118,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock(agent_name)?;
         let _identity_lock = self.identity_lock()?;
         let mut record = self.load(agent_name)?;
+        self.reconcile_goal_transaction(&record)?;
         let info = self.checked(&record)?;
         for existing in [&record.session_value, &info.session_value]
             .into_iter()
@@ -5995,45 +6174,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn goal_delivery(&self, record: &AgentRecord) -> Result<Option<String>> {
-        if let Some(identifier) = &record.goal_message_id {
-            let queue = self.queue(&record.name)?;
-            let state = agent::message_state(&queue, identifier)?.ok_or_else(|| {
-                fail(format!(
-                    "goal message {identifier:?} has no durable queue artifact"
-                ))
-            })?;
-            let folder = match state {
-                agent::QueueMessageState::Pending => "inbox",
-                agent::QueueMessageState::Inflight => "inflight",
-                agent::QueueMessageState::Processed => "processed",
-                agent::QueueMessageState::Failed => "failed",
-            };
-            let path = queue.join(folder).join(format!("{identifier}.json"));
-            let document = agent::read_private_json_bounded(&path, MAX_QUEUE_ARTIFACT_BYTES)?;
-            let objective = record.goal.as_deref().ok_or_else(|| {
-                fail(format!(
-                    "goal message {identifier:?} has no session objective"
-                ))
-            })?;
-            let legacy_match = record.legacy_goal_pointer;
-            let expected_text = goal_prompt(&record.launch.harness, objective);
-            let kind_matches = document.get("kind").and_then(Value::as_str) == Some("goal")
-                || (document.get("kind").is_none() && legacy_match);
-            if document.get("id").and_then(Value::as_str) != Some(identifier)
-                || document.get("text").and_then(Value::as_str) != Some(expected_text.as_str())
-                || !kind_matches
-            {
-                return Err(fail(format!(
-                    "goal message {identifier:?} disagrees with its session record"
-                )));
-            }
+        if record.goal_message_id.is_some() {
             return Ok(Some(
-                match state {
-                    agent::QueueMessageState::Processed => "delivered",
-                    agent::QueueMessageState::Failed | agent::QueueMessageState::Inflight => {
-                        "possibly_submitted"
-                    }
-                    agent::QueueMessageState::Pending => "pending",
+                match self.goal_artifact_state(record, true)? {
+                    GoalArtifactState::Prepared | GoalArtifactState::Pending => "pending",
+                    GoalArtifactState::Inflight | GoalArtifactState::Failed => "possibly_submitted",
+                    GoalArtifactState::Processed => "delivered",
                 }
                 .to_owned(),
             ));
@@ -6095,17 +6241,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
+        self.reconcile_goal_transaction(&record)?;
         record.input_allowed()?;
-        record.goal = Some(text.to_owned());
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?
             .as_nanos();
         let identifier = format!("{timestamp:020}-{}", std::process::id());
+        self.write_goal_transaction(&record, &identifier, text)?;
+        record.goal = Some(text.to_owned());
         record.goal_message_id = Some(identifier.clone());
         self.save(&record)?;
         let prompt = goal_prompt(&record.launch.harness, text);
         let queue = self.queue(agent_name)?;
+        agent::enqueue_goal(&queue, &prompt, &identifier)?;
+        self.remove_goal_transaction(&record)?;
         let client = WorkspaceClient {
             client: self.client,
             record: &record,
@@ -6115,14 +6265,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             check_prompt: true,
             adopted_evidence: Mutex::new(None),
         };
-        let outcome = agent::send_goal_identified(
-            &client,
-            &record.target()?,
-            &queue,
-            &prompt,
-            &identifier,
-            options,
-        );
+        let outcome =
+            agent::drain(&client, &record.target()?, &queue, options).and_then(|drained| {
+                agent::finish_identified_delivery(&queue, identifier.clone(), drained)
+            });
         match outcome {
             Ok(_) => self.goal_result(&record, goal_command),
             Err(error) => Err(error),
@@ -7033,7 +7179,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             || record.launch.backend != "herdr"
         {
             return Err(fail(
-                "managed-dead retirement requires a running owned Herdr record in interactive/herdr mode",
+                "managed-dead retirement requires a running herdr record with owned interactive routing",
             ));
         }
         let before = self.dead_pane_proof(record, "retire dead managed agent")?;
@@ -7161,20 +7307,31 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .pane_id
             .as_deref()
             .expect("proved pane identity");
-        self.client.close_pane(pane_id)?;
+        let close_pane = final_record.launch.adapter == "herdr";
+        if close_pane {
+            self.client.close_pane(pane_id)?;
+        }
         atomic_replace_bytes(pinned, "agent.json", &stopped_bytes).map_err(|error| *error.error)?;
         self.publish_pinned_directory(pinned, &destination, &stopped_bytes)?;
-        let tab_closed = self.client.panes().ok().map(|panes| {
-            panes
-                .iter()
-                .all(|pane| Some(&pane.tab_id) != final_record.tab_id.as_ref())
-        });
+        let tab_closed = if close_pane {
+            self.client.panes().ok().map(|panes| {
+                panes
+                    .iter()
+                    .all(|pane| Some(&pane.tab_id) != final_record.tab_id.as_ref())
+            })
+        } else {
+            Some(false)
+        };
         Ok(json!({
             "name": record.name,
             "archive": destination,
-            "pane_closed": true,
+            "pane_closed": close_pane,
             "tab_closed": tab_closed,
             "managed_dead": true,
+            "runtime_preserved": !close_pane,
+            "continuation": if close_pane { Value::Null } else { json!(
+                "The dead custom runtime was archived; its shell pane was preserved because Herdr does not provide a terminal-generation-conditional close."
+            ) },
         }))
     }
 
@@ -7187,6 +7344,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn stop_with_options(&self, agent_name: &str, options: StopOptions) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
         let mut record = self.load(agent_name)?;
+        self.reconcile_goal_transaction(&record)?;
         record.supported()?;
         if options
             .expected_token
@@ -7312,7 +7470,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 } else {
                     if record.lifecycle != "running" {
                         return Err(fail(
-                            "managed-dead retirement requires a running owned Herdr record",
+                            "managed-dead retirement requires a running herdr record with owned interactive routing",
                         ));
                     }
                     let _pane_lock = self.pane_lock(&recorded[0].pane_id)?;
@@ -9800,7 +9958,7 @@ mod tests {
 
     #[test]
     fn legacy_goal_pointer_without_map_refuses_wrong_id_or_text() {
-        for mutation in ["id", "text"] {
+        for mutation in ["id", "text", "map"] {
             let fixture = Fixture::new();
             let manager = fixture.manager();
             fixture.start(None);
@@ -9815,15 +9973,21 @@ mod tests {
             let artifact_path = queue.join("inbox").join(format!("{identifier}.json"));
             let mut artifact = agent::read_private_json(&artifact_path).unwrap();
             artifact.as_object_mut().unwrap().remove("kind");
-            artifact[mutation] = json!("wrong");
+            if mutation != "map" {
+                artifact[mutation] = json!("wrong");
+            }
             agent::atomic_json(&artifact_path, &artifact).unwrap();
             let path = fixture.root.join("registry/worker/agent.json");
             let mut legacy =
                 downgrade_current_record_to_v2(agent::read_private_json(&path).unwrap());
             legacy["goal"] = json!(objective);
             legacy["goal_delivery"] = json!("possibly_submitted");
-            legacy["goal_message_id"] = json!(identifier);
-            legacy["goal_messages"] = json!({});
+            legacy["goal_message_id"] = json!(identifier.clone());
+            legacy["goal_messages"] = if mutation == "map" {
+                json!({identifier.clone(): "wrong"})
+            } else {
+                json!({})
+            };
             agent::atomic_json(&path, &legacy).unwrap();
 
             assert!(manager.status("worker").is_err(), "mutation {mutation}");
@@ -9848,9 +10012,128 @@ mod tests {
         let mut record = manager.load("worker").unwrap();
         record.goal = Some("exact".to_owned());
         record.goal_message_id = Some(identifier);
-        manager.save(&record).unwrap();
+        assert!(manager.save(&record).is_err());
+    }
 
-        assert!(manager.status("worker").is_err());
+    #[test]
+    fn current_goal_pointer_without_artifact_or_transaction_is_rejected() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut stored = agent::read_private_json(&path).unwrap();
+        stored["goal"] = json!({
+            "schema": GOAL_STATE_SCHEMA,
+            "objective": "missing objective",
+            "message_id": "missing-goal",
+            "native_command": null,
+        });
+        agent::atomic_json(&path, &stored).unwrap();
+
+        let error = manager.status("worker").unwrap_err();
+        assert!(error.to_string().contains("no durable queue artifact"));
+    }
+
+    #[test]
+    fn goal_transaction_recovers_every_publication_prefix() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let transaction_path = fixture.root.join("registry/worker/goal-transaction.json");
+        let queue = fixture.root.join("registry/worker/queue");
+        let objective = "recover the retained timerfd worktree";
+        let prompt = goal_prompt("muse", objective);
+
+        let record = manager.load("worker").unwrap();
+        manager
+            .write_goal_transaction(&record, "goal-before-record", objective)
+            .unwrap();
+        manager.reconcile_goal_transaction(&record).unwrap();
+        assert!(!transaction_path.exists());
+        assert_eq!(
+            agent::message_state(&queue, "goal-before-record").unwrap(),
+            None
+        );
+
+        let mut record = manager.load("worker").unwrap();
+        manager
+            .write_goal_transaction(&record, "goal-after-record", objective)
+            .unwrap();
+        record.goal = Some(objective.to_owned());
+        record.goal_message_id = Some("goal-after-record".to_owned());
+        manager.save(&record).unwrap();
+        assert_eq!(
+            manager.status("worker").unwrap()["goal_delivery"],
+            "pending"
+        );
+        manager
+            .reconcile_goal_transaction(&manager.load("worker").unwrap())
+            .unwrap();
+        assert!(!transaction_path.exists());
+        let artifact =
+            agent::read_private_json(&queue.join("inbox/goal-after-record.json")).unwrap();
+        assert_eq!(artifact["kind"], "goal");
+        assert_eq!(artifact["text"], prompt);
+
+        let mut record = manager.load("worker").unwrap();
+        manager
+            .write_goal_transaction(&record, "goal-after-artifact", objective)
+            .unwrap();
+        record.goal = Some(objective.to_owned());
+        record.goal_message_id = Some("goal-after-artifact".to_owned());
+        manager.save(&record).unwrap();
+        agent::enqueue_goal(&queue, &prompt, "goal-after-artifact").unwrap();
+        manager
+            .reconcile_goal_transaction(&manager.load("worker").unwrap())
+            .unwrap();
+        assert!(!transaction_path.exists());
+        assert_eq!(
+            agent::message_state(&queue, "goal-after-artifact").unwrap(),
+            Some(agent::QueueMessageState::Pending)
+        );
+    }
+
+    #[test]
+    fn goal_delivery_is_derived_from_every_exact_queue_transition() {
+        for (folder, expected) in [
+            ("inbox", "pending"),
+            ("inflight", "possibly_submitted"),
+            ("failed", "possibly_submitted"),
+            ("processed", "delivered"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.start(None);
+            let manager = fixture.manager();
+            let queue = fixture.root.join("registry/worker/queue");
+            let identifier = "goal-transition";
+            agent::enqueue_goal(&queue, "/goal finish exact work", identifier).unwrap();
+            if folder != "inbox" {
+                fs::rename(
+                    queue.join("inbox").join(format!("{identifier}.json")),
+                    queue.join(folder).join(format!("{identifier}.json")),
+                )
+                .unwrap();
+            }
+            let mut record = manager.load("worker").unwrap();
+            record.goal = Some("finish exact work".to_owned());
+            record.goal_message_id = Some(identifier.to_owned());
+            manager.save(&record).unwrap();
+            assert_eq!(manager.status("worker").unwrap()["goal_delivery"], expected);
+        }
     }
 
     #[test]
@@ -12674,8 +12957,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped["managed_dead"], true);
-        assert_eq!(stopped["pane_closed"], true);
-        assert_eq!(*fixture.client.closed.lock().unwrap(), ["owned"]);
+        assert_eq!(stopped["pane_closed"], false);
+        assert_eq!(stopped["runtime_preserved"], true);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(*fixture.client.panes.lock().unwrap(), [Fake::pane("owned")]);
         let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
         assert_eq!(
             agent::read_private_json(
@@ -12774,6 +13059,55 @@ mod tests {
         assert!(
             error.to_string().contains("runtime identity changed"),
             "{error}"
+        );
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn running_owned_dead_muse_never_closes_a_replacement_terminal() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        fixture.client.custom_alive.store(false, Ordering::Relaxed);
+        fixture.client.panes.lock().unwrap()[0].terminal_id =
+            Some("replacement-terminal".to_owned());
+
+        let stopped = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(stopped["managed_dead"], true);
+        assert_eq!(stopped["pane_closed"], false);
+        assert_eq!(stopped["runtime_preserved"], true);
+        assert!(stopped["continuation"]
+            .as_str()
+            .unwrap()
+            .contains("conditional close"));
+        assert_eq!(
+            fixture.client.panes.lock().unwrap()[0]
+                .terminal_id
+                .as_deref(),
+            Some("replacement-terminal")
         );
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }

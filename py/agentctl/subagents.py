@@ -68,6 +68,8 @@ _LEGACY_SESSION_STORAGE_SCHEMA = "agentctl-session/v2"
 _LAUNCH_SPEC_SCHEMA = "agentctl-launch/v2"
 _LEGACY_LAUNCH_SPEC_SCHEMA = "agentctl-launch/v1"
 _GOAL_STATE_SCHEMA = "agentctl-goal/v1"
+_GOAL_TRANSACTION_SCHEMA = "agentctl-goal-transaction/v1"
+_GOAL_TRANSACTION_FILE = "goal-transaction.json"
 _NATIVE_SESSION_SCHEMA = "agentctl-native-session/v1"
 _RELOCATION_SCHEMA = "agentctl-relocation/v1"
 _SESSION_COMPATIBILITY_FIELDS = frozenset({
@@ -588,6 +590,11 @@ class AgentRecord:
             raise AgentDeliveryError(f"invalid goal message id in agent record: {path}")
         if goal_message_id is not None and document.get("goal") is None:
             raise AgentDeliveryError(f"goal message id has no objective in agent record: {path}")
+        if (isinstance(goal_message_id, str) and goal_message_id in goals
+                and goals[goal_message_id] != document.get("goal")):
+            raise AgentDeliveryError(
+                f"legacy goal pointer disagrees with its duplicate objective map in {path}"
+            )
         if document.get("goal_delivery") not in (
             None, "pending", "possibly_submitted", "delivered",
         ):
@@ -2053,6 +2060,8 @@ class ManagedAgents:
         # unwritable session cannot partially advance its compatibility state.
         agent._serialized_json(document, _MAX_AGENT_RECORD_BYTES, allow_nan=False)
         self._migrate_legacy_goal_messages(record)
+        if record.goal_message_id is not None:
+            self._goal_artifact_state(record, allow_prepared=True)
         agent._atomic_json(
             str(self._directory(record.name) / "agent.json"),
             document,
@@ -2123,6 +2132,137 @@ class ManagedAgents:
             record._legacy_goal_pointer = False
         finally:
             os.close(lock)
+
+    def _goal_transaction_path(self, record: AgentRecord) -> Path:
+        return self._directory(record.name) / _GOAL_TRANSACTION_FILE
+
+    def _read_goal_transaction(
+        self, record: AgentRecord,
+    ) -> tuple[str, str] | None:
+        path = self._goal_transaction_path(record)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot inspect goal transaction: {exc}") from exc
+        document = agent._read_queue_json(
+            str(path), "goal transaction", require_private=True,
+            max_artifact_bytes=_MAX_AGENT_RECORD_BYTES,
+        )
+        if (not isinstance(document, dict)
+                or set(document) != {
+                    "schema", "token", "message_id", "objective",
+                }
+                or document.get("schema") != _GOAL_TRANSACTION_SCHEMA
+                or document.get("token") != record.token
+                or not isinstance(document.get("message_id"), str)
+                or agent._MESSAGE_ID.fullmatch(
+                    cast(str, document["message_id"])
+                ) is None
+                or not isinstance(document.get("objective"), str)
+                or not cast(str, document["objective"]).strip()
+                or "\n" in cast(str, document["objective"])
+                or "\r" in cast(str, document["objective"])):
+            raise AgentDeliveryError("goal transaction is invalid or belongs to another generation")
+        return cast(str, document["message_id"]), cast(str, document["objective"])
+
+    def _write_goal_transaction(
+        self, record: AgentRecord, identifier: str, objective: str,
+    ) -> None:
+        path = self._goal_transaction_path(record)
+        if os.path.lexists(path):
+            raise AgentDeliveryError("unfinished goal transaction must be reconciled first")
+        try:
+            agent._atomic_json_create(
+                str(path), {
+                    "schema": _GOAL_TRANSACTION_SCHEMA,
+                    "token": record.token,
+                    "message_id": identifier,
+                    "objective": objective,
+                }, max_artifact_bytes=_MAX_AGENT_RECORD_BYTES,
+            )
+        except FileExistsError as exc:
+            raise AgentDeliveryError(
+                "unfinished goal transaction appeared concurrently"
+            ) from exc
+
+    def _remove_goal_transaction(self, record: AgentRecord) -> None:
+        path = self._goal_transaction_path(record)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            raise AgentDeliveryError("goal transaction disappeared before commit")
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot retire goal transaction: {exc}") from exc
+        agent._fsync_dir(str(path.parent))
+
+    def _goal_artifact_state(
+        self, record: AgentRecord, *, allow_prepared: bool,
+    ) -> str:
+        identifier = record.goal_message_id
+        objective = record.goal
+        if identifier is None or objective is None:
+            raise AgentDeliveryError("goal message pointer has no session objective")
+        queue = self._queue(record.name)
+        state = agent.message_state(queue, identifier)
+        if state is None:
+            transaction = self._read_goal_transaction(record)
+            if (allow_prepared
+                    and transaction == (identifier, objective)):
+                return "prepared"
+            raise AgentDeliveryError(
+                f"goal message {identifier!r} has no durable queue artifact"
+            )
+        folder = {
+            "pending": "inbox", "inflight": "inflight",
+            "processed": "processed", "failed": "failed",
+        }[state]
+        path = Path(queue) / folder / f"{identifier}.json"
+        document = agent._read_queue_json(
+            str(path), "goal message", require_private=True,
+            max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
+        )
+        legacy_match = record._legacy_goal_pointer
+        if (not isinstance(document, dict)
+                or document.get("id") != identifier
+                or document.get("text") != _goal_prompt(
+                    record.launch.harness, objective,
+                )
+                or (document.get("kind") != "goal"
+                    and not (document.get("kind") is None and legacy_match))):
+            raise AgentDeliveryError(
+                f"goal message {identifier!r} disagrees with its session record"
+            )
+        return state
+
+    def _reconcile_goal_transaction(self, record: AgentRecord) -> None:
+        transaction = self._read_goal_transaction(record)
+        if transaction is None:
+            return
+        identifier, objective = transaction
+        pointer_matches = record.goal_message_id == identifier
+        state = agent.message_state(self._queue(record.name), identifier)
+        if not pointer_matches:
+            if state is not None:
+                raise AgentDeliveryError(
+                    "uncommitted goal transaction already has a queue artifact"
+                )
+            self._remove_goal_transaction(record)
+            return
+        if record.goal != objective:
+            raise AgentDeliveryError(
+                "goal transaction disagrees with the session objective"
+            )
+        if state is None:
+            agent.enqueue_goal(
+                self._queue(record.name),
+                _goal_prompt(record.launch.harness, objective),
+                message_id=identifier,
+                max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
+            )
+        self._goal_artifact_state(record, allow_prepared=False)
+        self._remove_goal_transaction(record)
 
     def _queue(self, name: str) -> str:
         return str(self._directory(name) / "queue")
@@ -3216,6 +3356,7 @@ class ManagedAgents:
         """Serialize against stop, then use the existing durable submission transport."""
         with self._lock(name):
             record = self._load_expected(name, expected_token)
+            self._reconcile_goal_transaction(record)
             self._require_automation(record)
             if record.goal_messages:
                 self._save(record)
@@ -3226,6 +3367,7 @@ class ManagedAgents:
         """Retry only messages that the shared queue knows were never submitted."""
         with self._lock(name):
             record = self._load(name)
+            self._reconcile_goal_transaction(record)
             self._require_automation(record)
             if record.goal_messages:
                 self._save(record)
@@ -3324,6 +3466,7 @@ class ManagedAgents:
         with self._lock(name):
             with self._identity_transaction():
                 record = self._load(name)
+                self._reconcile_goal_transaction(record)
                 info = self._checked(record)
                 for existing in (record.session_value, info.session_value):
                     if existing is not None and existing != session_id:
@@ -3362,36 +3505,9 @@ class ManagedAgents:
 
     def _goal_delivery(self, record: AgentRecord) -> str | None:
         if record.goal_message_id is not None:
-            identifier = record.goal_message_id
-            queue = self._queue(record.name)
-            state = agent.message_state(queue, identifier)
-            if state is None:
-                raise AgentDeliveryError(
-                    f"goal message {identifier!r} has no durable queue artifact"
-                )
-            folder = {
-                "pending": "inbox", "inflight": "inflight",
-                "processed": "processed", "failed": "failed",
-            }[state]
-            path = Path(queue) / folder / f"{identifier}.json"
-            document = agent._read_queue_json(
-                str(path), "goal message", require_private=True,
-                max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
-            )
-            objective = record.goal
-            legacy_match = record._legacy_goal_pointer
-            if (not isinstance(document, dict)
-                    or document.get("id") != identifier
-                    or objective is None
-                    or document.get("text") != _goal_prompt(
-                        record.launch.harness, objective,
-                    )
-                    or (document.get("kind") != "goal"
-                        and not (document.get("kind") is None and legacy_match))):
-                raise AgentDeliveryError(
-                    f"goal message {identifier!r} disagrees with its session record"
-                )
+            state = self._goal_artifact_state(record, allow_prepared=True)
             return {
+                "prepared": "pending",
                 "processed": "delivered",
                 "failed": "possibly_submitted",
                 "inflight": "possibly_submitted",
@@ -4423,8 +4539,8 @@ class ManagedAgents:
                 or record.lifecycle != "running"
                 or record.launch.mode != "interactive" or record.launch.backend != "herdr"):
             raise AgentDeliveryError(
-                "managed-dead retirement requires a running owned Herdr record in "
-                "interactive/herdr mode"
+                "managed-dead retirement requires a running herdr record with "
+                "owned interactive routing"
             )
         before = self._dead_pane_proof(record, operation="retire dead managed agent")
         text = self._bounded_terminal_text(
@@ -4534,23 +4650,34 @@ class ManagedAgents:
                 ) from rollback
             raise
         assert final.pane_id is not None
-        self.client.close_pane(final.pane_id)
+        close_pane = final.launch.adapter == "herdr"
+        if close_pane:
+            self.client.close_pane(final.pane_id)
         self._atomic_snapshot_bytes(pinned, stopped_bytes, name="agent.json")
         self._publish_pinned_directory(
             pinned, destination, expected_record=stopped_bytes,
         )
-        try:
-            tab_closed: bool | None = not any(
-                pane.tab_id == final.tab_id for pane in self.client.panes()
-            )
-        except HerdrRunError:
-            tab_closed = None
+        if close_pane:
+            try:
+                tab_closed: bool | None = not any(
+                    pane.tab_id == final.tab_id for pane in self.client.panes()
+                )
+            except HerdrRunError:
+                tab_closed = None
+        else:
+            tab_closed = False
         return {
             "name": record.name,
             "archive": str(destination),
-            "pane_closed": True,
+            "pane_closed": close_pane,
             "tab_closed": tab_closed,
             "managed_dead": True,
+            "runtime_preserved": not close_pane,
+            "continuation": (
+                None if close_pane else
+                "The dead custom runtime was archived; its shell pane was preserved "
+                "because Herdr does not provide a terminal-generation-conditional close."
+            ),
         }
 
     def goal(self, name: str, text: str | None = None, *, goal_command: Sequence[str] | None = None, **options: object) -> dict[str, object]:
@@ -4567,19 +4694,29 @@ class ManagedAgents:
             raise AgentDeliveryError("goal must be a nonempty single line")
         with self._lock(name):
             record = self._load(name)
+            self._reconcile_goal_transaction(record)
             self._require_automation(record)
             record.goal = text
             identifier = f"{time.time_ns():020d}-{os.getpid()}"
+            self._write_goal_transaction(record, identifier, text)
             record.goal_message_id = identifier
             self._save(record)
             prompt = _goal_prompt(record.launch.harness, text)
+            agent.enqueue_goal(
+                self._queue(name), prompt, message_id=identifier,
+                max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
+            )
+            self._remove_goal_transaction(record)
             client = cast(
                 HerdrClient,
                 _WorkspaceClient(self.client, record, queue=self._queue(name)),
             )
-            result = agent.send_goal(
-                client, record.target(), self._queue(name), prompt,
-                message_id=identifier, **options,
+            drained = agent.drain(
+                client, record.target(), self._queue(name), **options,
+            )
+            agent.finish_identified_delivery(
+                self._queue(name), identifier, drained,
+                max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
             )
             return self._goal_result(record, goal_command)
 
@@ -4610,6 +4747,7 @@ class ManagedAgents:
         """
         with self._lock(name):
             record = self._load_expected(name, expected_token)
+            self._reconcile_goal_transaction(record)
             confirmed_record = self._load_expected(name, record.token)
             if confirmed_record.to_document() != record.to_document():
                 raise AgentDeliveryError(f"agent {name!r} record changed before stop")
@@ -4704,7 +4842,8 @@ class ManagedAgents:
                     if dead:
                         if record.lifecycle != "running":
                             raise AgentDeliveryError(
-                                "managed-dead retirement requires a running owned Herdr record"
+                                "managed-dead retirement requires a running herdr record "
+                                "with owned interactive routing"
                             )
                         return self._retire_managed_dead(
                             record, expected_token=expected_token,
@@ -4844,6 +4983,7 @@ class ManagedAgents:
             raise AgentDeliveryError("workspace selector must be nonempty and contain no NUL")
         with self._lock(name):
             record = self._load(name)
+            self._reconcile_goal_transaction(record)
             if (record.lifecycle != "running" or record.launch.mode != "interactive"
                     or record.launch.backend != "herdr" or record.pane_id is None
                     or record.tab_id is None or record.workspace_id is None):
@@ -4947,6 +5087,7 @@ class ManagedAgents:
         """Pause automated input without interrupting an active harness turn."""
         with self._lock(name):
             record = self._load(name)
+            self._reconcile_goal_transaction(record)
             self._checked(record)
             record.paused = paused
             self._save(record)

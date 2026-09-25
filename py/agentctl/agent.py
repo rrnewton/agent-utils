@@ -1194,6 +1194,17 @@ def enqueue(
         )
 
 
+def enqueue_goal(
+    root: str, text: str, *, message_id: str,
+    max_artifact_bytes: int | None = None,
+) -> str:
+    """Persist one typed goal artifact without beginning delivery."""
+    return _enqueue(
+        root, text, message_id=message_id, serialize=True,
+        max_artifact_bytes=max_artifact_bytes, kind="goal",
+    )
+
+
 def _enqueue(
     root: str,
     text: str,
@@ -1923,6 +1934,17 @@ def _send(
     )
     result = drain(client, target, root, max_artifact_bytes=max_artifact_bytes,
                    atomic_policy=atomic_policy, **kwargs)  # type: ignore[arg-type]
+    return finish_identified_delivery(
+        root, identifier, result, max_artifact_bytes=max_artifact_bytes,
+    )
+
+
+def finish_identified_delivery(
+    root: str, identifier: str, result: QueueResult, *,
+    max_artifact_bytes: int | None = None,
+) -> QueueResult:
+    """Resolve one already-enqueued ID from its unique durable queue state."""
+    max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
     filename = f"{identifier}.json"
     failed_path = os.path.join(root, "failed", filename)
     if identifier in result.quarantined or os.path.lexists(failed_path):

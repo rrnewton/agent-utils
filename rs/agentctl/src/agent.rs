@@ -709,6 +709,18 @@ pub fn enqueue(root: &Path, text: &str, message_id: Option<&str>) -> AgentResult
     )
 }
 
+/// Persist one typed goal artifact without beginning delivery.
+pub(crate) fn enqueue_goal(root: &Path, text: &str, message_id: &str) -> AgentResult<String> {
+    enqueue_internal(
+        root,
+        text,
+        Some(message_id),
+        true,
+        QueueMessageKind::Goal,
+        &SystemRuntime::default(),
+    )
+}
+
 fn enqueue_internal(
     root: &Path,
     text: &str,
@@ -1137,28 +1149,6 @@ pub(crate) fn send_identified_with_runtime<A: AgentApi + ?Sized>(
     )
 }
 
-pub(crate) fn send_goal_identified<A: AgentApi + ?Sized>(
-    client: &A,
-    target: &Target,
-    root: &Path,
-    text: &str,
-    message_id: &str,
-    options: DrainOptions,
-) -> AgentResult<QueueResult> {
-    send_identified_with_kind(
-        client,
-        target,
-        root,
-        text,
-        options,
-        &SystemRuntime::default(),
-        QueueMessageIntent {
-            message_id: Some(message_id),
-            kind: QueueMessageKind::Goal,
-        },
-    )
-}
-
 fn send_identified_with_kind<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
@@ -1181,6 +1171,14 @@ fn send_identified_with_kind<A: AgentApi + ?Sized>(
         runtime,
     )?;
     let result = drain_with_runtime(client, target, root, options, runtime)?;
+    finish_identified_delivery(root, identifier, result)
+}
+
+pub(crate) fn finish_identified_delivery(
+    root: &Path,
+    identifier: String,
+    result: QueueResult,
+) -> AgentResult<QueueResult> {
     let filename = format!("{identifier}.json");
     let failed_path = root.join("failed").join(&filename);
     if result.quarantined.contains(&identifier) || fs::symlink_metadata(&failed_path).is_ok() {
@@ -1964,7 +1962,7 @@ pub(crate) fn cleanup_atomic_json_temporaries(directory: &Path) -> AgentResult<(
     Ok(())
 }
 
-fn atomic_json_create(path: &Path, value: &Value) -> io::Result<()> {
+pub(crate) fn atomic_json_create(path: &Path, value: &Value) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("JSON path has no parent"))?;
@@ -2322,7 +2320,7 @@ fn sync_directory_io(path: &Path) -> io::Result<()> {
         .sync_all()
 }
 
-fn validate_message_id(identifier: &str) -> AgentResult<()> {
+pub(crate) fn validate_message_id(identifier: &str) -> AgentResult<()> {
     let bytes = identifier.as_bytes();
     let first_ok = bytes.first().is_some_and(u8::is_ascii_alphanumeric);
     let rest_ok = bytes
