@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -358,6 +359,72 @@ def _tui_record(name: str, cwd: Path) -> lib.AgentRecord:
         mode=lib.TUI_MODE,
         presentation_pane="wT:p2",
     )
+
+
+@pytest.mark.parametrize("failure", ["permission", "malformed"])
+def test_unknown_runner_identity_never_authorizes_a_signal(
+    fake_backend_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    rec = _tui_record("identity-unknown", fake_backend_state)
+    assert rec.runner_pid is not None and rec.runner_started_at is not None
+    lib.ensure_agent_dirs(rec.name)
+    token = "staged"
+    lib.write_staged_runner(
+        rec.name,
+        token,
+        lib.RunnerIdentity(rec.runner_pid, rec.runner_started_at),
+    )
+    (lib.agent_dir(rec.name) / "active-harness.json").write_text(json.dumps({
+        "runner_pid": rec.runner_pid,
+        "runner_started_at": rec.runner_started_at,
+        "pid": rec.runner_pid,
+        "started_at": rec.runner_started_at,
+    }))
+
+    def unreadable(_path: Path) -> bytes:
+        if failure == "permission":
+            raise PermissionError("denied")
+        return b"malformed"
+
+    signals: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(Path, "read_bytes", unreadable)
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda pid, signum: signals.append(("kill", pid, signum)),
+    )
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda pid, signum: signals.append(("killpg", pid, signum)),
+    )
+
+    operations = (
+        lambda: lib.runner_identity_alive(rec),
+        lambda: lib.read_staged_runner(rec.name, token),
+        lambda: lib.terminate_runner_identity(
+            lib.RunnerIdentity(rec.runner_pid or 0, rec.runner_started_at)
+        ),
+        lambda: lib.terminate_active_harness(rec),
+    )
+    for operation in operations:
+        with pytest.raises(lib.AgentOperationError) as excinfo:
+            operation()
+        assert excinfo.value.code == "runner_identity_unknown"
+    assert signals == []
+
+
+def test_unbound_runner_identity_preserves_legacy_signaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, signum: signals.append((pid, signum)))
+    monkeypatch.setattr(lib, "pid_alive", lambda _pid: True)
+    monkeypatch.setattr(lib, "pid_start_time", lambda _pid: "current")
+    assert lib.terminate_runner_identity(lib.RunnerIdentity(4242, None), grace=0)
+    assert signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
 
 
 class _FakeSharedAgentClient:

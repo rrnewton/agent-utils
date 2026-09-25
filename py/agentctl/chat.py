@@ -61,6 +61,7 @@ from agentctl.chat_replies import (
 )
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
 from agentctl.jsonx import as_mapping, as_sequence, get_str
+from agentctl.procstat import parse_process_stat
 from agentctl.subagents import harness_arguments
 
 
@@ -826,19 +827,16 @@ def _command_process_identity(pid: int) -> _CommandAnchorIdentity | None:
         raw = Path(f"/proc/{pid}/stat").read_bytes()
     except FileNotFoundError:
         return None
-    boundary = raw.rfind(b") ")
-    if boundary < 0:
+    parsed = parse_process_stat(raw)
+    if parsed is None or parsed.pid != pid:
         raise ValueError("malformed command process identity record")
-    tail = raw[boundary + 2:].split()
-    if len(tail) < 20:
-        raise ValueError("short command process identity record")
     return _CommandAnchorIdentity(
         pid=pid,
-        state=tail[0].decode("ascii"),
-        ppid=int(tail[1]),
-        pgrp=int(tail[2]),
-        session=int(tail[3]),
-        starttime=int(tail[19]),
+        state=parsed.state,
+        ppid=parsed.ppid,
+        pgrp=parsed.pgrp,
+        session=parsed.session,
+        starttime=parsed.starttime,
     )
 
 

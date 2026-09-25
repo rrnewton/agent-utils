@@ -907,7 +907,7 @@ import pathlib
 import sys
 import time
 libc = ctypes.CDLL(None, use_errno=True)
-if libc.prctl(15, ctypes.c_char_p(b"bad\xffname"), 0, 0, 0) != 0:
+if libc.prctl(15, ctypes.c_char_p(b"p\xff)\n(\x80"), 0, 0, 0) != 0:
     raise OSError(ctypes.get_errno(), "PR_SET_NAME")
 pathlib.Path(sys.argv[1]).write_text("ready")
 time.sleep(60)

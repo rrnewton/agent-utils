@@ -15,6 +15,12 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import FrameType
 
+_PKG_PARENT = str(Path(__file__).resolve().parent.parent)
+if _PKG_PARENT not in sys.path:
+    sys.path.insert(0, _PKG_PARENT)
+
+from agentctl.procstat import parse_process_stat
+
 
 _PR_SET_PDEATHSIG = 1
 _PR_SET_CHILD_SUBREAPER = 36
@@ -98,16 +104,16 @@ def _exit_like_adapter(returncode: int) -> int:
 
 def _identity(pid: int) -> dict[str, int | str]:
     raw = Path(f"/proc/{pid}/stat").read_bytes()
-    tail = raw[raw.rfind(b") ") + 2:].split()
-    if len(tail) < 20:
-        raise ValueError("short process identity record")
+    parsed = parse_process_stat(raw)
+    if parsed is None or parsed.pid != pid:
+        raise ValueError("malformed process identity record")
     return {
         "pid": pid,
-        "state": tail[0].decode("ascii"),
-        "ppid": int(tail[1]),
-        "pgrp": int(tail[2]),
-        "session": int(tail[3]),
-        "starttime": int(tail[19]),
+        "state": parsed.state,
+        "ppid": parsed.ppid,
+        "pgrp": parsed.pgrp,
+        "session": parsed.session,
+        "starttime": parsed.starttime,
     }
 
 

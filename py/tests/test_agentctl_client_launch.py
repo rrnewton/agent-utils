@@ -25,6 +25,7 @@ from agentctl.client import (
     muse_startup_metadata,
 )
 from agentctl.errors import HerdrUnavailable
+from agentctl.procstat import parse_process_stat
 import pytest
 
 
@@ -340,6 +341,61 @@ def test_real_non_shell_process_cannot_be_adopted_as_a_pane_shell() -> None:
         process.wait(timeout=5)
 
 
+def test_process_stat_parser_treats_comm_as_opaque_bytes() -> None:
+    fields = [b"S", b"123", b"888", b"999", *([b"0"] * 15), b"987654321"]
+    raw = b"456 (p\xff)\n(\x80) " + b" ".join(fields) + b"\n"
+    parsed = parse_process_stat(raw)
+    assert parsed is not None
+    assert (
+        parsed.pid,
+        parsed.state,
+        parsed.ppid,
+        parsed.pgrp,
+        parsed.session,
+        parsed.starttime,
+    ) == (456, "S", 123, 888, 999, 987654321)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"456 (unterminated S 1 2 3",
+        b"456 (x)S 1 2 3",
+        b"456 (x) S 1 2 3",
+    ],
+)
+def test_process_stat_parser_refuses_missing_or_truncated_boundaries(raw: bytes) -> None:
+    assert parse_process_stat(raw) is None
+
+
+def test_descendant_census_accepts_an_unrelated_opaque_comm(tmp_path: Path) -> None:
+    ready = tmp_path / "opaque-comm-ready"
+    script = r'''
+import ctypes
+import pathlib
+import sys
+import time
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(15, ctypes.c_char_p(b"p\xff)\n(\x80"), 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "PR_SET_NAME")
+pathlib.Path(sys.argv[1]).write_text("ready")
+time.sleep(60)
+'''
+    leaf = subprocess.Popen((os.path.realpath("/usr/bin/sleep"), "60"))
+    unrelated = subprocess.Popen((sys.executable, "-c", script, str(ready)))
+    try:
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert ready.exists()
+        assert HerdrClient._process_has_no_descendants(leaf.pid)
+    finally:
+        leaf.kill()
+        unrelated.kill()
+        leaf.wait(timeout=2)
+        unrelated.wait(timeout=2)
+
+
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
 def test_process_identity_maps_pidfd_close_failure_to_unavailable(
     monkeypatch: pytest.MonkeyPatch,
@@ -383,11 +439,10 @@ def test_real_supported_shell_with_background_descendant_is_not_idle() -> None:
                 if not entry.name.isdigit():
                     continue
                 try:
-                    raw = (entry / "stat").read_text()
+                    parsed = parse_process_stat((entry / "stat").read_bytes())
                 except (FileNotFoundError, PermissionError):
                     continue
-                close = raw.rfind(")")
-                if close >= 0 and raw[close + 1:].split()[1] == str(shell.pid):
+                if parsed is not None and parsed.ppid == shell.pid:
                     return True
             return False
 

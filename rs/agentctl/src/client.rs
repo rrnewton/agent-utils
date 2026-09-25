@@ -143,38 +143,83 @@ fn current_boot_uuid() -> Result<String> {
     Ok(value.to_owned())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinuxProcessStat {
+    state: u8,
+    parent_pid: u64,
+    process_group_id: u64,
+    starttime_ticks: u64,
+}
+
+fn linux_process_state(state: u8) -> bool {
+    matches!(
+        state,
+        b'R' | b'S' | b'D' | b'Z' | b'T' | b't' | b'X' | b'x' | b'K' | b'W' | b'P' | b'I'
+    )
+}
+
+fn parse_process_stat(value: &[u8], expected_pid: u64) -> Result<LinuxProcessStat> {
+    let bad =
+        || AdapterError::unavailable(format!("cannot parse process stat for pid {expected_pid}"));
+    let opening = value
+        .windows(2)
+        .position(|window| window == b" (")
+        .ok_or_else(bad)?;
+    let close = value
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .filter(|close| *close > opening + 1)
+        .ok_or_else(bad)?;
+    let state = match value.get(close + 1..close + 4) {
+        Some([b' ', state, b' ']) if linux_process_state(*state) => *state,
+        _ => return Err(bad()),
+    };
+    let recorded_pid = std::str::from_utf8(&value[..opening])
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value == expected_pid)
+        .ok_or_else(|| {
+            AdapterError::unavailable(format!(
+                "process stat identity changed for pid {expected_pid}"
+            ))
+        })?;
+    debug_assert_eq!(recorded_pid, expected_pid);
+    let fields = value[close + 2..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() <= 19 {
+        return Err(bad());
+    }
+    let number = |field: &[u8]| {
+        std::str::from_utf8(field)
+            .ok()
+            .and_then(|field| field.parse::<u64>().ok())
+            .ok_or_else(bad)
+    };
+    Ok(LinuxProcessStat {
+        state,
+        parent_pid: number(fields[1])?,
+        process_group_id: number(fields[2])?,
+        starttime_ticks: number(fields[19])?,
+    })
+}
+
 fn process_stat(pid: u64) -> Result<(u64, u64)> {
     let path = PathBuf::from(format!("/proc/{pid}/stat"));
     let value = bounded_file(&path, PROC_STAT_BYTES, "process stat")?;
-    let value = std::str::from_utf8(&value)
-        .map_err(|_| AdapterError::unavailable("Linux process stat is not UTF-8"))?;
-    let close = value.rfind(')').ok_or_else(|| {
-        AdapterError::unavailable(format!("cannot parse process stat for pid {pid}"))
-    })?;
-    let recorded_pid = value[..close]
-        .split_once(" (")
-        .and_then(|(value, _)| value.parse::<u64>().ok())
-        .filter(|value| *value == pid)
-        .ok_or_else(|| {
-            AdapterError::unavailable(format!("process stat identity changed for pid {pid}"))
-        })?;
-    debug_assert_eq!(recorded_pid, pid);
-    let fields = value[close + 1..].split_whitespace().collect::<Vec<_>>();
-    if fields.len() <= 19 || fields[0] == "Z" {
+    let stat = parse_process_stat(&value, pid)?;
+    if stat.state == b'Z' {
         return Err(AdapterError::unavailable(format!(
             "process stat for pid {pid} is incomplete or exited"
         )));
     }
-    let process_group_id = fields[2]
-        .parse::<u64>()
-        .ok()
+    let process_group_id = Some(stat.process_group_id)
         .filter(|value| *value > 0 && *value <= i32::MAX as u64)
         .ok_or_else(|| {
             AdapterError::unavailable(format!("process group is invalid for pid {pid}"))
         })?;
-    let starttime_ticks = fields[19]
-        .parse::<u64>()
-        .ok()
+    let starttime_ticks = Some(stat.starttime_ticks)
         .filter(|value| *value > 0)
         .ok_or_else(|| {
             AdapterError::unavailable(format!("process start time is invalid for pid {pid}"))
@@ -432,7 +477,7 @@ fn process_has_no_descendants(pid: u64) -> Result<bool> {
             let process = name
                 .parse::<u64>()
                 .map_err(|_| AdapterError::unavailable("process table contains an invalid pid"))?;
-            let raw = match fs::read_to_string(entry.path().join("stat")) {
+            let raw = match fs::read(entry.path().join("stat")) {
                 Ok(raw) => raw,
                 Err(error)
                     if error.kind() == io::ErrorKind::NotFound
@@ -446,23 +491,12 @@ fn process_has_no_descendants(pid: u64) -> Result<bool> {
                     )))
                 }
             };
-            if raw.len() > 8192 || !raw.starts_with(&format!("{name} (")) {
+            if raw.len() > PROC_STAT_BYTES {
                 return Err(AdapterError::unavailable(format!(
                     "process {process} stat is invalid"
                 )));
             }
-            let close = raw.rfind(')').ok_or_else(|| {
-                AdapterError::unavailable(format!("process {process} stat is invalid"))
-            })?;
-            let fields: Vec<&str> = raw[close + 1..].split_whitespace().collect();
-            if fields.len() < 2 {
-                return Err(AdapterError::unavailable(format!(
-                    "process {process} stat is incomplete"
-                )));
-            }
-            let parent = fields[1].parse::<u64>().map_err(|_| {
-                AdapterError::unavailable(format!("process {process} parent is invalid"))
-            })?;
+            let parent = parse_process_stat(&raw, process)?.parent_pid;
             if process > 0 {
                 parents.insert(process, parent);
             }
@@ -2239,6 +2273,42 @@ mod tests {
     static EXECUTABLE_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[cfg(target_os = "linux")]
     static SIGNAL_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn process_stat_parser_treats_the_command_as_opaque_bytes() {
+        let mut record = b"4242 (name\xff) Z 999 888\nPPid:\t123 (more)".to_vec();
+        record.extend_from_slice(b") S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0\n");
+        let parsed = parse_process_stat(&record, 4242).unwrap();
+        assert_eq!(parsed.state, b'S');
+        assert_eq!(parsed.parent_pid, 7);
+        assert_eq!(parsed.process_group_id, 9);
+        assert_eq!(parsed.starttime_ticks, 22);
+        assert!(parse_process_stat(&record, 4241).is_err());
+
+        let mut malformed = record;
+        malformed.push(b')');
+        assert!(parse_process_stat(&malformed, 4242).is_err());
+
+        let mut shifted =
+            b"4242 (worker) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0".to_vec();
+        shifted.extend_from_slice(b") 7 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22");
+        assert!(parse_process_stat(&shifted, 4242).is_err());
+
+        for state in b"RSDZTtXxKWPI" {
+            let mut value =
+                b"4242 (worker) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0".to_vec();
+            let closing = value.iter().rposition(|byte| *byte == b')').unwrap();
+            value[closing + 2] = *state;
+            assert_eq!(parse_process_stat(&value, 4242).unwrap().state, *state);
+        }
+        for state in [b'Q', b'0', b')', b'\x7f'] {
+            let mut value =
+                b"4242 (worker) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0".to_vec();
+            let closing = value.iter().rposition(|byte| *byte == b')').unwrap();
+            value[closing + 2] = state;
+            assert!(parse_process_stat(&value, 4242).is_err());
+        }
+    }
 
     #[test]
     fn muse_prompt_must_move_from_composer_to_transcript() {

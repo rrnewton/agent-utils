@@ -42,6 +42,7 @@ from agentctl.agent import send as shared_agent_send  # noqa: E402
 from agentctl.agent import status as shared_agent_status  # noqa: E402
 from agentctl.client import HerdrClient as SharedHerdrClient  # noqa: E402
 from agentctl.errors import HerdrRunError as SharedHerdrError  # noqa: E402
+from agentctl.procstat import parse_process_stat  # noqa: E402
 
 STATE: Path = BASE / "state"
 ARCHIVE: Path = STATE / "_archive"
@@ -906,7 +907,7 @@ def record_active_harness(name: str, runner: RunnerIdentity, harness: RunnerIden
 
 
 def terminate_active_harness(rec: AgentRecord) -> bool:
-    """Kill only the detached harness group pinned to this worker generation."""
+    """Best-effort kill of a harness group after checking its recorded leader."""
     path = agent_dir(rec.name) / "active-harness.json"
     try:
         value = json.loads(path.read_text())
@@ -926,6 +927,8 @@ def terminate_active_harness(rec: AgentRecord) -> bool:
     try:
         if os.getpgid(pid) != pid:
             raise AgentOperationError("harness_identity_changed", "active harness no longer owns its process group")
+        # killpg remains a numeric-PGID operation; the checks narrow but cannot
+        # eliminate reuse between this observation and the syscall.
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         return False
@@ -1027,10 +1030,10 @@ def read_staged_runner(name: str, token: str) -> Optional[RunnerIdentity]:
         started_at = raw.get("started_at")
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
-    if not pid_alive(pid):
-        return None
     current_start = pid_start_time(pid)
-    if started_at is not None and current_start is not None and started_at != current_start:
+    if current_start is None:
+        return None
+    if started_at is not None and started_at != current_start:
         return None
     return RunnerIdentity(pid=pid, started_at=None if started_at is None else str(started_at))
 
@@ -1288,30 +1291,41 @@ def pid_alive(pid: Optional[int]) -> bool:
 
 
 def pid_start_time(pid: int) -> Optional[str]:
-    """Return Linux /proc starttime ticks for PID identity checks."""
+    """Return Linux start ticks, or ``None`` only for positive disappearance.
+
+    Unreadable or malformed procfs evidence is not a death certificate and must
+    not authorize later process signaling.
+    """
     stat = Path(f"/proc/{pid}/stat")
     try:
-        text = stat.read_text()
-    except OSError:
+        raw = stat.read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
         return None
-    try:
-        rest = text.rsplit(")", 1)[1].strip().split()
-    except IndexError:
-        return None
-    if len(rest) <= 19:
-        return None
-    return rest[19]
+    except OSError as exc:
+        raise AgentOperationError(
+            "runner_identity_unknown",
+            f"cannot read runner process {pid} identity: {exc}",
+        ) from exc
+    parsed = parse_process_stat(raw)
+    if parsed is None or parsed.pid != pid:
+        raise AgentOperationError(
+            "runner_identity_unknown",
+            f"cannot parse runner process {pid} identity",
+        )
+    return str(parsed.starttime)
 
 
 def runner_identity_alive(rec: AgentRecord) -> bool:
     """True only when the registry's runner PID still names the same process."""
-    if rec.runner_pid is None or not pid_alive(rec.runner_pid):
+    if rec.runner_pid is None:
+        return False
+    current = pid_start_time(rec.runner_pid)
+    if current is None:
         return False
     if rec.runner_started_at is None:
         # Backward-compatible for rows created before runner starttime existed.
         return True
-    current = pid_start_time(rec.runner_pid)
-    return current is None or current == rec.runner_started_at
+    return current == rec.runner_started_at
 
 
 def wait_for_pause_ack(name: str, old: RunnerIdentity) -> bool:
@@ -1363,10 +1377,11 @@ def _pid_is_descendant(pid: int, ancestor: int) -> bool:
         seen.add(cur)
         stat = Path(f"/proc/{cur}/stat")
         try:
-            text = stat.read_text()
-            rest = text.rsplit(")", 1)[1].strip().split()
-            cur = int(rest[1])
-        except (OSError, IndexError, ValueError):
+            parsed = parse_process_stat(stat.read_bytes())
+            if parsed is None or parsed.pid != cur:
+                return False
+            cur = parsed.ppid
+        except OSError:
             return False
     return False
 
@@ -1917,12 +1932,14 @@ def break_runner_pane_to_window(rec: AgentRecord) -> Optional[str]:
 
 
 def terminate_runner_identity(identity: RunnerIdentity, grace: float = 2.0) -> bool:
-    """Stop a matching process identity with a bounded graceful shutdown and kill fallback."""
-    if not pid_alive(identity.pid):
-        return False
+    """Best-effort stop of a recorded PID with start-time checks around shutdown."""
     current_start = pid_start_time(identity.pid)
-    if identity.started_at is not None and current_start is not None and current_start != identity.started_at:
+    if current_start is None:
         return False
+    if identity.started_at is not None and current_start != identity.started_at:
+        return False
+    # These compatibility signals use a numeric PID. The surrounding checks
+    # narrow but cannot eliminate reuse between an observation and a syscall.
     try:
         os.kill(identity.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -1932,16 +1949,22 @@ def terminate_runner_identity(identity: RunnerIdentity, grace: float = 2.0) -> b
         if not pid_alive(identity.pid):
             return True
         time.sleep(0.1)
-    if pid_alive(identity.pid):
-        try:
-            os.kill(identity.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return True
+    if not pid_alive(identity.pid):
+        return True
+    final_start = pid_start_time(identity.pid)
+    if final_start is None or (
+        identity.started_at is not None and final_start != identity.started_at
+    ):
+        return True
+    try:
+        os.kill(identity.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
     return True
 
 
 def terminate_runner(rec: AgentRecord, grace: float = 2.0) -> bool:
-    """Stop the process identified by the worker record, guarding against PID reuse."""
+    """Best-effort stop of the process recorded for a worker."""
     # Spawn and identity publication use this same lock, so even a zero-grace
     # stop observes the detached child before killing its runner.
     with _harness_lock(rec.name):

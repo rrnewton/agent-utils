@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from agentctl.errors import HerdrUnavailable
 from agentctl.jsonx import as_mapping, as_sequence, get_int, get_str, opt_str
+from agentctl.procstat import parse_process_stat
 
 __all__ = [
     "HerdrClient",
@@ -720,22 +721,20 @@ class HerdrClient:
                 return boot_id if _BOOT_ID.fullmatch(boot_id) is not None else None
 
             def process_stat() -> tuple[int, int] | None:
-                with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+                with open(f"/proc/{pid}/stat", "rb") as stream:
                     raw = stream.read(8193)
                 if not raw or len(raw) > 8192:
                     return None
-                close = raw.rfind(")")
-                if not raw.startswith(f"{pid} (") or close < 0:
+                parsed = parse_process_stat(raw)
+                if (
+                    parsed is None
+                    or parsed.pid != pid
+                    or parsed.state == "Z"
+                    or parsed.pgrp < 1
+                    or parsed.starttime < 1
+                ):
                     return None
-                fields = raw[close + 2:].split()
-                if len(fields) <= 19 or fields[0] == "Z":
-                    return None
-                pgrp = int(fields[2])
-                starttime = int(fields[19])
-                if (not 1 <= pgrp <= _MAX_PROCESS_ID
-                        or not 1 <= starttime <= _MAX_U64):
-                    return None
-                return pgrp, starttime
+                return parsed.pgrp, parsed.starttime
 
             boot_before = boot_identity()
             first = process_stat()
@@ -814,25 +813,16 @@ class HerdrClient:
             for entry in numeric:
                 try:
                     process = int(entry)
-                    with open(f"/proc/{entry}/stat", encoding="utf-8") as stream:
+                    with open(f"/proc/{entry}/stat", "rb") as stream:
                         raw = stream.read(8193)
                 except (FileNotFoundError, ProcessLookupError):
                     continue
                 except (OSError, UnicodeError, ValueError):
                     return None
-                close = raw.rfind(")")
-                if (not raw.startswith(f"{entry} (") or close < 0
-                        or len(raw) > 8192):
+                parsed = parse_process_stat(raw)
+                if parsed is None or parsed.pid != process or len(raw) > 8192:
                     return None
-                fields = raw[close + 2:].split()
-                if len(fields) < 2:
-                    return None
-                try:
-                    parent = int(fields[1])
-                except ValueError:
-                    return None
-                if process > 0 and parent >= 0:
-                    parents[process] = parent
+                parents[process] = parsed.ppid
             return parents
 
         def has_descendant(parents: dict[int, int]) -> bool:
