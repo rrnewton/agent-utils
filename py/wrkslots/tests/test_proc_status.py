@@ -11,7 +11,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Literal, TextIO
 
@@ -23,24 +23,61 @@ from wrkslots import cli
 def scripted_status(
     monkeypatch: pytest.MonkeyPatch,
     pid_dir: Path,
-    samples: list[str | BaseException],
+    samples: Sequence[str | bytes | BaseException],
 ) -> list[Path]:
     pending = iter(samples)
     calls: list[Path] = []
 
-    def read_text(
-        path: Path, encoding: str | None = None, errors: str | None = None,
-    ) -> str:
+    def read_bytes(path: Path) -> bytes:
         assert path == pid_dir / "status"
-        assert encoding == "ascii" and errors is None
         calls.append(path)
         sample = next(pending)
         if isinstance(sample, BaseException):
             raise sample
-        return sample
+        return sample if isinstance(sample, bytes) else sample.encode("ascii")
 
-    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
     return calls
+
+
+def opaque_stat(
+    pid: int, parent: int, *, flags: int = 0, start_ticks: int = 17
+) -> bytes:
+    """One kernel-shaped stat record whose comm is deliberately not text."""
+    fields = [b"S", str(parent).encode(), str(pid).encode(), str(pid).encode()]
+    fields.extend([b"0", b"0", str(flags).encode()])
+    fields.extend([b"0"] * 12)
+    fields.append(str(start_ticks).encode())
+    return str(pid).encode() + b" (p\xff) Z\n(\x80) " + b" ".join(fields) + b"\n"
+
+
+def test_process_stat_and_ancestry_treat_comm_as_opaque_bytes(tmp_path: Path) -> None:
+    proc_root = tmp_path / "proc"
+    pid_dir = proc_root / "123"
+    pid_dir.mkdir(parents=True)
+    (pid_dir / "stat").write_bytes(opaque_stat(123, 42, flags=9, start_ticks=99))
+
+    assert cli._read_process_stat(pid_dir) == cli._ProcessStat(99, 9)
+    assert cli._read_process_parent(123, proc_root=proc_root) == 42
+
+
+def test_global_process_snapshot_accepts_opaque_comm_bytes(tmp_path: Path) -> None:
+    """One valid opaque process name cannot make the all-process census unavailable."""
+    proc_root = tmp_path / "proc"
+    pid_dir = proc_root / "123"
+    (pid_dir / "ns").mkdir(parents=True)
+    (pid_dir / "stat").write_bytes(opaque_stat(123, 42, flags=0, start_ticks=99))
+    uid = os.getuid()
+    (pid_dir / "status").write_bytes(
+        b"Name:\tp\xff\rUid:\t0\vState:\tZ\\n(\x80\nState:\tS (sleeping)\nUid:\t"
+        + f"{uid}\t{uid}\t{uid}\t{uid}\n".encode()
+    )
+    (pid_dir / "cgroup").write_text("0::/fixture\n", encoding="ascii")
+    (pid_dir / "ns" / "mnt").symlink_to("mnt:[123]")
+
+    assert cli._absent_validate_process_snapshot(proc_root) == (
+        cli._AbsentProcessObservation(123, 99, "/fixture", "mnt:[123]"),
+    )
 
 
 @contextlib.contextmanager
@@ -164,10 +201,11 @@ def test_process_uids_refuses_a_second_esrch(monkeypatch: pytest.MonkeyPatch) ->
     "State:\tS (sleeping)\n",
     "Uid:\t1\t2\t3\n",
     "Uid:\t1\tbroken\t3\t4\n",
-    UnicodeDecodeError("ascii", b"\xff", 0, 1, "not ASCII"),
+    b"Name:\topaque\xff\n",
 ])
-def test_process_uids_refuses_missing_malformed_or_undecodable_status(
-    monkeypatch: pytest.MonkeyPatch, after_esrch: bool, status: str | BaseException
+def test_process_uids_refuses_missing_malformed_or_incomplete_status(
+    monkeypatch: pytest.MonkeyPatch, after_esrch: bool,
+    status: str | bytes | BaseException,
 ) -> None:
     samples = [status]
     if after_esrch:

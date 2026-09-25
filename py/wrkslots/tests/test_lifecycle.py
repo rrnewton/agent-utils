@@ -28203,21 +28203,18 @@ def process_census_status_samples(
 ) -> list[Path]:
     pending = iter(samples)
     calls: list[Path] = []
-    original_read = Path.read_text
+    original_read = Path.read_bytes
 
-    def read_text(
-        path: Path, encoding: str | None = None, errors: str | None = None,
-    ) -> str:
+    def read_bytes(path: Path) -> bytes:
         if path != pid_dir / "status":
-            return original_read(path, encoding=encoding, errors=errors)
-        assert encoding == "ascii" and errors is None
+            return original_read(path)
         calls.append(path)
         sample = next(pending)
         if isinstance(sample, BaseException):
             raise sample
-        return sample
+        return sample.encode("ascii")
 
-    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
     return calls
 
 
@@ -28363,15 +28360,15 @@ def test_process_census_reopened_missing_status_requires_absent_generation(
 def test_process_census_reopened_status_needs_readable_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
-    original_read = Path.read_text
-    (tmp_path / "stat").write_text("not process generation evidence\n")
+    original_read = Path.read_bytes
+    (tmp_path / "stat").write_bytes(b"not process generation evidence\n")
 
-    def stat_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+    def stat_read(path: Path) -> bytes:
         if path == tmp_path / "stat" and failure == "unreadable":
             raise PermissionError(errno.EACCES, "generation unreadable")
-        return original_read(path, encoding=encoding, errors=errors)
+        return original_read(path)
 
-    monkeypatch.setattr(Path, "read_text", stat_read)
+    monkeypatch.setattr(Path, "read_bytes", stat_read)
     reads = process_census_status_samples(
         monkeypatch, tmp_path, [ProcessLookupError(errno.ESRCH, "old inode"), "State:\tZ\n"],
     )
@@ -28538,19 +28535,19 @@ def test_process_census_unknown_identity_refuses_without_retry(
     proc_root = tmp_path / "proc"
     proc_root.mkdir()
     (proc_root / str(pid)).symlink_to(pid_dir)
-    original_read = Path.read_text
+    original_read_bytes = Path.read_bytes
     field, failure = evidence.split("-")
 
-    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+    def read_bytes(path: Path) -> bytes:
         if path.parent.name == str(pid) and path.name == field:
             if failure == "denied":
                 raise PermissionError(errno.EACCES, "fixture evidence denied")
             if failure == "missing":
                 raise FileNotFoundError(errno.ENOENT, "fixture evidence missing")
-            return "unparseable process evidence\n"
-        return original_read(path, encoding=encoding, errors=errors)
+            return b"unparseable process evidence\n"
+        return original_read_bytes(path)
 
-    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
     snapshots = 0
 
     def snapshot() -> tuple[wrkslots._AbsentProcessObservation, ...]:
@@ -28626,6 +28623,9 @@ def test_process_census_preflight_discards_attempt_with_shared_bounds(
         wrkslots, "_read_process_stat",
         lambda path: wrkslots._ProcessStat(17 if path.name == "123" else 18, 0),
     )
+    monkeypatch.setattr(
+        wrkslots, "_process_is_zombie", lambda _path, **_kwargs: False
+    )
     monkeypatch.setattr(wrkslots, "_process_observation_is_active", active)
     monkeypatch.setattr(wrkslots, "_absent_validate_find_matches", observer("find"))
     monkeypatch.setattr(wrkslots, "_absent_validate_maps_matches", observer("maps"))
@@ -28649,7 +28649,18 @@ def test_process_census_preflight_discards_attempt_with_shared_bounds(
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
-@pytest.mark.parametrize("evidence", ("clear", "live-link", "live-mount", "stale-link", "stale-map", "mixed"))
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "clear",
+        "live-link",
+        "live-mount",
+        "stale-link",
+        "stale-map",
+        "stale-mount",
+        "mixed",
+    ),
+)
 def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
     monkeypatch: pytest.MonkeyPatch, lane: str, evidence: str,
 ) -> None:
@@ -28698,6 +28709,9 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
     ) -> tuple[tuple[Path, str], ...]:
         calls.append(f"mount:{pid}")
         if pid == 123:
+            if evidence == "stale-mount":
+                reused = True
+                return ((target, str(target)),)
             try:
                 raise FileNotFoundError(errno.ENOENT, "fixture generation is gone")
             except FileNotFoundError as exc:
@@ -28723,10 +28737,18 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
         return wrkslots._capture_same_uid_process_path_census((target,), budget=budget)
 
     if evidence.startswith("stale"):
-        with pytest.raises(wrkslots.Refusal, match="three liveness attempts"):
+        with pytest.raises(
+            wrkslots.Refusal,
+            match="identity changed after .* matched a selected path",
+        ) as refused:
             capture()
-        first = ["snapshot", "find"] + (["maps"] if evidence == "stale-map" else [])
-        assert calls == [*first, "snapshot", "snapshot"]
+        assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
+        expected = ["snapshot", "find"]
+        if evidence in {"stale-map", "stale-mount"}:
+            expected.append("maps")
+        if evidence == "stale-mount":
+            expected.append("mount:123")
+        assert calls == expected
     elif evidence == "mixed":
         with pytest.raises(wrkslots.Refusal, match="Permission denied") as refused:
             capture()
@@ -29809,6 +29831,113 @@ def test_same_uid_path_census_routes_protected_process_to_fresh_fallback(
     )
     assert matches == ()
     assert fallback == (process,)
+
+
+@pytest.mark.parametrize(
+    "disappeared",
+    (
+        FileNotFoundError(errno.ENOENT, "fixture process exited"),
+        ProcessLookupError(errno.ESRCH, "fixture process exited"),
+    ),
+    ids=("enoent", "esrch"),
+)
+def test_same_uid_path_census_keeps_vanished_process_without_retrying_host_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    disappeared: OSError,
+) -> None:
+    """Ordinary process churn is fallback input, not a global retry trigger."""
+
+    vanished = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    target = Path("/fixture/vanished-slot")
+    calls: list[str] = []
+
+    def snapshot(
+        _budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        calls.append("snapshot")
+        return (vanished,)
+
+    monkeypatch.setattr(
+        wrkslots,
+        "_same_uid_process_observations",
+        snapshot,
+    )
+    monkeypatch.setattr(wrkslots, "_read_process_stat", lambda _path: None)
+    monkeypatch.setattr(
+        os, "readlink", lambda _path: (_ for _ in ()).throw(disappeared)
+    )
+
+    def observe(name: str) -> Callable[
+        [
+            Sequence[wrkslots._AbsentProcessObservation],
+            Mapping[Path, str],
+            wrkslots._ReadOnlyCommandBudget,
+        ],
+        tuple[()],
+    ]:
+        def run(
+            processes: Sequence[wrkslots._AbsentProcessObservation],
+            _targets: Mapping[Path, str],
+            _budget: wrkslots._ReadOnlyCommandBudget,
+        ) -> tuple[()]:
+            assert processes == (vanished,)
+            calls.append(name)
+            return ()
+
+        return run
+
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_find_matches", observe("find")
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_maps_matches", observe("maps")
+    )
+    monkeypatch.setattr(
+        wrkslots, "_absent_validate_mount_matches", observe("mount")
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    census = wrkslots._capture_same_uid_process_path_census(
+        (target,), budget=budget
+    )
+
+    assert census == wrkslots._ProcessPathCensus(
+        (vanished,), (), owner_cgroup_complete=False
+    )
+    assert calls == ["snapshot", "find", "maps", "mount"]
+
+
+def test_same_uid_path_census_retries_missing_evidence_for_still_live_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing proc link is not treated as absence while its generation is live."""
+
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    monkeypatch.setattr(
+        os,
+        "readlink",
+        lambda _path: (_ for _ in ()).throw(
+            FileNotFoundError(errno.ENOENT, "fixture evidence missing")
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots, "_process_observation_is_active", lambda _process: True
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+
+    with pytest.raises(
+        wrkslots._ProcessEvidenceChanged,
+        match="proc entries changed before same-UID path census",
+    ):
+        wrkslots._same_uid_direct_path_processes((process,), budget)
 
 
 @pytest.mark.parametrize("fallback", ("clear", "in-use", "refused"))

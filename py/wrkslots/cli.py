@@ -9342,22 +9342,55 @@ def _read_process_cgroup(pid_dir: Path) -> str:
     return paths[0].rstrip("/") or "/"
 
 
-def _read_process_parent(pid: int) -> int | None:
-    try:
-        stat_text = Path("/proc") .joinpath(str(pid), "stat").read_text(encoding="ascii")
-    except FileNotFoundError:
+@dataclasses.dataclass(frozen=True)
+class _ProcStatFields:
+    """The numeric tail of one Linux proc stat record; ``comm`` remains opaque."""
+
+    pid: int
+    state: str
+    parent: int
+    flags: int
+    start_ticks: int
+
+
+_PROC_STATES = frozenset(b"RSDZTWtXxKPI")
+
+
+def _parse_proc_stat(raw: bytes) -> _ProcStatFields | None:
+    """Parse fields needed by wrkslots without decoding the opaque ``comm`` bytes."""
+    opening = raw.find(b" (")
+    closing = raw.rfind(b") ")
+    if opening <= 0 or closing < opening + 2:
         return None
-    except (OSError, UnicodeError) as exc:
-        raise Refusal(f"cannot read process ancestry for PID {pid}: {exc}") from exc
-    close = stat_text.rfind(")")
-    fields = stat_text[close + 2 :].split() if close >= 0 else []
-    if len(fields) < 2:
-        raise Refusal(f"cannot parse process ancestry for PID {pid}")
+    fields = raw[closing + 2 :].split()
+    if len(fields) <= 19 or len(fields[0]) != 1 or fields[0][0] not in _PROC_STATES:
+        return None
     try:
+        process = int(raw[:opening])
         parent = int(fields[1])
-    except ValueError as exc:
-        raise Refusal(f"cannot parse process ancestry for PID {pid}") from exc
-    return parent if parent > 0 and parent != pid else None
+        flags = int(fields[6])
+        start_ticks = int(fields[19])
+        state = fields[0].decode("ascii")
+    except (UnicodeError, ValueError):
+        return None
+    if process <= 0 or parent < 0 or flags < 0 or start_ticks <= 0:
+        return None
+    return _ProcStatFields(process, state, parent, flags, start_ticks)
+
+
+def _read_process_parent(
+    pid: int, *, proc_root: Path = Path("/proc")
+) -> int | None:
+    try:
+        raw = proc_root.joinpath(str(pid), "stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as exc:
+        raise Refusal(f"cannot read process ancestry for PID {pid}: {exc}") from exc
+    parsed = _parse_proc_stat(raw)
+    if parsed is None or parsed.pid != pid:
+        raise Refusal(f"cannot parse process ancestry for PID {pid}")
+    return parsed.parent if parsed.parent > 0 and parsed.parent != pid else None
 
 
 def _assert_caller_process(identity: ProcessIdentity, label: str) -> None:
@@ -10081,14 +10114,19 @@ def _mount_namespace(pid_dir: Path) -> str | None:
 def _read_process_status(
     pid_dir: Path, *, generation: _ProcessStat | None = None,
 ) -> str:
+    def read() -> str:
+        return (pid_dir / "status").read_bytes().decode(
+            "ascii", errors="surrogateescape"
+        )
+
     try:
-        return (pid_dir / "status").read_text(encoding="ascii")
+        return read()
     except OSError as exc:
         if exc.errno != errno.ESRCH:
             raise
     # A held proc inode can become unreadable after reap. Reopen its pathname
     # once; another error remains an error, never proof of terminal state.
-    status = (pid_dir / "status").read_text(encoding="ascii")
+    status = read()
     if generation is not None:
         current = _read_process_stat(pid_dir)
         if current is not None and current.start_ticks != generation.start_ticks:
@@ -10107,7 +10145,10 @@ def _process_uids(pid_dir: Path) -> tuple[int, int, int, int] | None:
         raise Refusal(
             f"process ownership is indeterminate because {pid_dir / 'status'} is unreadable: {exc}"
         ) from exc
-    for line in status.splitlines():
+    # procfs terminates records with LF and escapes LF inside ``Name``.  Do not use
+    # ``splitlines()``: a process may put CR/VT/FF in its opaque name, and Python
+    # would then manufacture a field-looking line from inside that name.
+    for line in status.split("\n"):
         if line.startswith("Uid:"):
             fields = line.split()
             if len(fields) != 5:
@@ -27996,24 +28037,19 @@ class _ProcessStat:
 
 def _read_process_stat(pid_dir: Path) -> _ProcessStat | None:
     try:
-        stat_text = (pid_dir / "stat").read_text(encoding="ascii")
-    except FileNotFoundError:
+        raw = (pid_dir / "stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
         return None
-    except (OSError, UnicodeError) as exc:
+    except OSError as exc:
         raise Refusal(
             f"process generation is indeterminate because {pid_dir / 'stat'} "
             f"is unreadable: {exc}"
         ) from exc
-    close = stat_text.rfind(")")
-    fields = stat_text[close + 2 :].split() if close >= 0 else []
-    try:
-        flags = int(fields[6])
-        ticks = int(fields[19])
-    except (IndexError, ValueError) as exc:
-        raise Refusal(f"process generation is invalid for PID {pid_dir.name}") from exc
-    if flags < 0 or ticks <= 0:
+    parsed = _parse_proc_stat(raw)
+    expected_pid = int(pid_dir.name) if pid_dir.name.isdigit() else None
+    if parsed is None or (expected_pid is not None and parsed.pid != expected_pid):
         raise Refusal(f"process generation is invalid for PID {pid_dir.name}")
-    return _ProcessStat(start_ticks=ticks, flags=flags)
+    return _ProcessStat(start_ticks=parsed.start_ticks, flags=parsed.flags)
 
 
 def _process_start_ticks(pid_dir: Path) -> int | None:
@@ -28037,7 +28073,9 @@ def _process_is_zombie(
         raise Refusal(
             f"process state is indeterminate because {pid_dir / 'status'} is unreadable: {exc}"
         ) from exc
-    states = [line.split() for line in status.splitlines() if line.startswith("State:")]
+    # See `_process_uids`: only the kernel's LF is a record boundary. Other
+    # Unicode line separators may be opaque bytes from the process name.
+    states = [line.split() for line in status.split("\n") if line.startswith("State:")]
     if not states:
         raise Refusal(f"process state is missing for PID {pid_dir.name}")
     # Include state tokens exposed by current and older supported Linux kernels.
@@ -28179,7 +28217,17 @@ def _absent_validate_mount_matches(
             except Refusal as exc:
                 failures.append((process, exc))
                 continue
-            if _process_start_ticks(Path("/proc") / str(process.pid)) != process.start_ticks:
+            current_start = _process_start_ticks(Path("/proc") / str(process.pid))
+            if current_start != process.start_ticks:
+                if any(
+                    _matching_absent_validate_target(observed, targets, match_cache)
+                    is not None
+                    for observed, _detail in candidate_references
+                ):
+                    raise Refusal(
+                        f"PID {process.pid} identity changed after mount matched a selected path; "
+                        "the selected path may still be in use"
+                    )
                 continue
             selected = process
             references = candidate_references
@@ -28687,14 +28735,25 @@ def _assert_process_observations_active(
         budget.remaining_seconds()
         # Retain vanished identities in the original tuple: every downstream
         # observer must still establish absence or reject stale/reused evidence.
-        if _read_process_stat(Path("/proc") / str(process.pid)) is None:
+        pid_dir = Path("/proc") / str(process.pid)
+        if _read_process_stat(pid_dir) is None:
             continue
-        # A present but obsolete identity invalidates this whole attempt. Fresh
-        # selection omits proven terminal generations, including protected links.
-        if not _process_observation_is_active(process):
+        if _process_observation_is_active(process):
+            continue
+        # Ordinary exit/zombie churn is positive terminal evidence. Retain the
+        # identity for downstream observers without restarting the host scan.
+        current = _read_process_stat(pid_dir)
+        if current is None:
+            continue
+        if current.start_ticks != process.start_ticks:
             raise _ProcessEvidenceChanged(
-                f"PID {process.pid} exited or changed before process path census"
+                f"PID {process.pid} changed before process path census"
             )
+        if _process_generation_is_terminal(pid_dir, current):
+            continue
+        raise _ProcessEvidenceChanged(
+            f"PID {process.pid} liveness changed before process path census"
+        )
 
 
 def _allow_only_vanished_process_diagnostics(
@@ -28819,8 +28878,9 @@ def _parse_find_path_matches(
         if matched is None:
             continue
         if not _process_generation_is_current(process):
-            raise _ProcessEvidenceChanged(
-                f"PID {pid} generation changed during {census} find census"
+            raise Refusal(
+                f"PID {pid} identity changed after {census} find matched a selected path; "
+                "the selected path may still be in use"
             )
         _target, slot = matched
         matches.append((pid, slot, "link", raw_target))
@@ -28859,8 +28919,9 @@ def _parse_maps_path_matches(
         if process is None:
             raise Refusal(f"{census} grep census returned an unexpected PID: {pid}")
         if not _process_generation_is_current(process):
-            raise _ProcessEvidenceChanged(
-                f"PID {pid} generation changed during {census} maps census"
+            raise Refusal(
+                f"PID {pid} identity changed after {census} maps matched a selected path; "
+                "the selected path may still be in use"
             )
         _target, slot = matched
         matches.append((pid, slot, "map", str(observed)))
@@ -29054,10 +29115,17 @@ def _same_uid_direct_path_processes(
                     f"PID {process.pid} generation changed before same-UID path census"
                 )
             indeterminate.append(process)
-        except FileNotFoundError as exc:
-            raise _ProcessEvidenceChanged(
-                f"PID {process.pid} proc entries changed before same-UID path census"
-            ) from exc
+        except (FileNotFoundError, ProcessLookupError) as exc:
+            # A short-lived, unrelated process can exit between the snapshot and
+            # these link probes. Keep its identity in the privileged fallback so
+            # every downstream observer still either proves it gone or rejects
+            # stale/reused evidence, but do not discard the whole host snapshot
+            # merely because this generation is positively no longer active.
+            if _process_observation_is_active(process):
+                raise _ProcessEvidenceChanged(
+                    f"PID {process.pid} proc entries changed before same-UID path census"
+                ) from exc
+            indeterminate.append(process)
         except OSError as exc:
             if not _process_generation_is_current(process):
                 raise _ProcessEvidenceChanged(
