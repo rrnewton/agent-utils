@@ -179,78 +179,129 @@ function reportMeasurements(report) {
   );
 }
 
-test("zoom and pan redraw within budget, and the measurements are reported", {
-  timeout: 120_000
-}, async function (context) {
-  const port = await unusedPort();
-  const server = childProcess.spawn(
-    process.execPath,
-    [fixtureServerPath, "--port", String(port)],
-    { cwd: __dirname, stdio: ["ignore", "pipe", "pipe"] }
-  );
-  context.after(function () {
-    if (!server.killed) {
-      server.kill("SIGTERM");
+// Release what a test started, however the test ends. `context.after` runs the releases even
+// when node:test abandons a timed-out test, but it only exists from Node 18.13: on Node 16 the
+// call threw AFTER the fixture server had started, and that live child held the event loop open
+// until the 900-second box killed the whole run -- a one-line incompatibility reported as a
+// wedge. The test body's `finally` covers every runtime; running the releases twice is harmless.
+function releasesFor(context) {
+  const releases = [];
+  function releaseAll() {
+    while (releases.length > 0) {
+      releases.pop()();
     }
-  });
-  await waitForFixture(server);
+  }
+  if (typeof context.after === "function") {
+    context.after(releaseAll);
+  }
+  return { add: function (release) { releases.push(release); }, releaseAll: releaseAll };
+}
 
-  const temporaryDirectory = fs.mkdtempSync(
-    path.join(os.tmpdir(), "agent-timeline-budget-")
-  );
-  context.after(function () {
-    fs.rmSync(temporaryDirectory, { recursive: true, force: true });
-  });
-  const jsonPath = path.join(temporaryDirectory, "benchmark.json");
-  const result = await execFile(
-    process.execPath,
-    [
-      benchmarkPath,
-      "--url", "http://127.0.0.1:" + port + "/",
-      "--json", jsonPath,
-      "--timeout-ms", "30000"
-    ],
-    { cwd: __dirname, maxBuffer: 5 * 1024 * 1024 }
-  );
-  const report = JSON.parse(result.stdout);
+// Run the benchmark with a hard bound: the time left in the test's own timeout, less a reserve
+// so the kill, the releases and the failure report all land before node:test gives up. The
+// releases above cannot help a benchmark that never exits (a wedged browser): node:test abandons
+// the test at its timeout, but the live child still holds the event loop open until the
+// 900-second box kills the run. SIGKILL, because a wedged event loop never runs a SIGTERM handler.
+const CLEANUP_RESERVE_MS = 2_000;
 
-  reportMeasurements(report);
+async function runBenchmark(args, deadline) {
+  const budgetMs = Math.max(1, deadline - Date.now());
+  try {
+    return await execFile(process.execPath, [benchmarkPath].concat(args), {
+      cwd: __dirname,
+      maxBuffer: 5 * 1024 * 1024,
+      timeout: budgetMs,
+      killSignal: "SIGKILL"
+    });
+  } catch (error) {
+    if (error.killed) {
+      throw new Error(
+        `benchmark-site did not exit within the ${budgetMs}ms left in the test's timeout and ` +
+          `was killed; stderr: ${error.stderr}`
+      );
+    }
+    throw error;
+  }
+}
 
-  assert.equal(report.success, true, "the page raised a runtime error while being measured");
-  assert.deepEqual(report.diagnostics.page_errors, []);
+const TEST_TIMEOUT_MS = 120_000;
 
-  // --- strict, and independent of how fast the machine is ------------------------------------
-  //
-  // A harness that stopped sampling would otherwise satisfy every timing bound below by
-  // measuring nothing at all.
-  assert.equal(
-    report.interaction.sample_count,
-    EXPECTED_SAMPLES,
-    "the wheel sequence did not produce the expected number of samples"
-  );
-  assert.equal(report.interaction.input_to_raf_ms.count, EXPECTED_SAMPLES);
-  // The real interaction gate: every wheel event is supposed to change what is on screen. Zero
-  // changed frames means zoom and pan do nothing -- a defect no timing bound would catch, and
-  // one that needs no knowledge of the hardware to detect.
-  assert.ok(
-    report.interaction.render_change_count > 0,
-    "no wheel event changed the rendering: zoom and pan are not redrawing at all"
-  );
+test("zoom and pan redraw within budget, and the measurements are reported", {
+  timeout: TEST_TIMEOUT_MS
+}, async function (context) {
+  const deadline = Date.now() + TEST_TIMEOUT_MS - CLEANUP_RESERVE_MS;
+  const releases = releasesFor(context);
+  try {
+    const port = await unusedPort();
+    const server = childProcess.spawn(
+      process.execPath,
+      [fixtureServerPath, "--port", String(port)],
+      { cwd: __dirname, stdio: ["ignore", "pipe", "pipe"] }
+    );
+    releases.add(function () {
+      if (!server.killed) {
+        server.kill("SIGTERM");
+      }
+    });
+    await waitForFixture(server);
 
-  // --- generous, and only for the catastrophic case --------------------------------------------
-  const input = report.interaction.input_to_raf_ms;
-  assert.ok(
-    input.p95 <= BUDGET.input_to_raf_p95_ms,
-    `zoom/pan p95 redraw was ${input.p95}ms against a ${BUDGET.input_to_raf_p95_ms}ms ` +
-      "completely-broken ceiling; this is not a regression bound, so breaching it means " +
-      "rendering is catastrophically slow rather than merely slower"
-  );
-  assert.ok(
-    input.max <= BUDGET.input_to_raf_max_ms,
-    `slowest zoom/pan redraw was ${input.max}ms against a ${BUDGET.input_to_raf_max_ms}ms ceiling`
-  );
-  assert.ok(
-    report.timings.usable_ms <= BUDGET.usable_ms,
-    `first usable frame took ${report.timings.usable_ms}ms against a ${BUDGET.usable_ms}ms ceiling`
-  );
+    const temporaryDirectory = fs.mkdtempSync(
+      path.join(os.tmpdir(), "agent-timeline-budget-")
+    );
+    releases.add(function () {
+      fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+    });
+    const jsonPath = path.join(temporaryDirectory, "benchmark.json");
+    const result = await runBenchmark(
+      [
+        "--url", "http://127.0.0.1:" + port + "/",
+        "--json", jsonPath,
+        "--timeout-ms", "30000"
+      ],
+      deadline
+    );
+    const report = JSON.parse(result.stdout);
+
+    reportMeasurements(report);
+
+    assert.equal(report.success, true, "the page raised a runtime error while being measured");
+    assert.deepEqual(report.diagnostics.page_errors, []);
+
+    // --- strict, and independent of how fast the machine is ------------------------------------
+    //
+    // A harness that stopped sampling would otherwise satisfy every timing bound below by
+    // measuring nothing at all.
+    assert.equal(
+      report.interaction.sample_count,
+      EXPECTED_SAMPLES,
+      "the wheel sequence did not produce the expected number of samples"
+    );
+    assert.equal(report.interaction.input_to_raf_ms.count, EXPECTED_SAMPLES);
+    // The real interaction gate: every wheel event is supposed to change what is on screen. Zero
+    // changed frames means zoom and pan do nothing -- a defect no timing bound would catch, and
+    // one that needs no knowledge of the hardware to detect.
+    assert.ok(
+      report.interaction.render_change_count > 0,
+      "no wheel event changed the rendering: zoom and pan are not redrawing at all"
+    );
+
+    // --- generous, and only for the catastrophic case --------------------------------------------
+    const input = report.interaction.input_to_raf_ms;
+    assert.ok(
+      input.p95 <= BUDGET.input_to_raf_p95_ms,
+      `zoom/pan p95 redraw was ${input.p95}ms against a ${BUDGET.input_to_raf_p95_ms}ms ` +
+        "completely-broken ceiling; this is not a regression bound, so breaching it means " +
+        "rendering is catastrophically slow rather than merely slower"
+    );
+    assert.ok(
+      input.max <= BUDGET.input_to_raf_max_ms,
+      `slowest zoom/pan redraw was ${input.max}ms against a ${BUDGET.input_to_raf_max_ms}ms ceiling`
+    );
+    assert.ok(
+      report.timings.usable_ms <= BUDGET.usable_ms,
+      `first usable frame took ${report.timings.usable_ms}ms against a ${BUDGET.usable_ms}ms ceiling`
+    );
+  } finally {
+    releases.releaseAll();
+  }
 });
