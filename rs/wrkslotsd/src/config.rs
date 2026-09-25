@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::canonical::canonical_sha256;
+use crate::replay::validate_name;
 use crate::ObserverError;
 
 const INPUT_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
@@ -205,20 +206,6 @@ pub(crate) fn load_typed_json_with_post_inspect_hook<T: DeserializeOwned>(
     after_inspect: impl FnOnce(),
 ) -> Result<Digested<T>, ObserverError> {
     load_typed_json_after_inspect(path, label, after_inspect)
-}
-
-pub(crate) fn validate_name(value: &str, label: &str) -> Result<(), ObserverError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        return Err(ObserverError::invalid(format!(
-            "invalid {label}: {value:?}"
-        )));
-    }
-    Ok(())
 }
 
 pub(crate) fn is_sha256(value: &str) -> bool {

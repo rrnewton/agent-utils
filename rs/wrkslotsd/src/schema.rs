@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 
 use crate::canonical::canonical_sha256;
 use crate::evidence::ScopeIdentity;
+use crate::replay::validate_name;
 use crate::ObserverError;
 
 const ACTIVE_STATUSES: &[&str] = &[
@@ -719,10 +720,13 @@ fn python_aware_iso_instant(value: &str) -> Option<DateTime<Utc>> {
 
 fn python_offset_microseconds(body: &str) -> Option<i64> {
     let (hours, minutes, seconds, microseconds) = python_clock_value(body.as_bytes())?;
-    Some(
-        (i64::from(hours) * 3_600 + i64::from(minutes) * 60 + i64::from(seconds)) * 1_000_000
-            + i64::from(microseconds),
-    )
+    let whole_seconds = i64::from(hours) * 3_600 + i64::from(minutes) * 60 + i64::from(seconds);
+    // CPython's `tzinfo_from_isoformat_results` returns UTC for a zero
+    // whole-second offset and discards its fractional seconds.
+    if whole_seconds == 0 {
+        return Some(0);
+    }
+    Some(whole_seconds * 1_000_000 + i64::from(microseconds))
 }
 
 /// Mirror the value assignment of CPython's `parse_hh_mm_ss_ff` for a clock the
@@ -1187,18 +1191,6 @@ fn digest<'a>(value: &'a Value, length: usize, label: &str) -> Result<&'a str, O
         return Err(invalid(format!("{label} is not a lowercase digest")));
     }
     Ok(value)
-}
-
-fn validate_name(value: &str, label: &str) -> Result<(), ObserverError> {
-    let bytes = value.as_bytes();
-    let first_is_valid = bytes.first().is_some_and(u8::is_ascii_alphanumeric);
-    let rest_is_valid = bytes
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-    if bytes.len() > 64 || !first_is_valid || !rest_is_valid {
-        return Err(invalid(format!("{label} is not a valid name: {value:?}")));
-    }
-    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> ObserverError {
