@@ -1187,7 +1187,9 @@ def _read_json(path: Path, label: str) -> object:
             return json.load(handle)
     except FileNotFoundError as exc:
         raise StateError(f"missing {label}: {path}") from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except json.JSONDecodeError as exc:
+        raise StateError(f"{label} is malformed JSON: {exc}") from exc
+    except OSError as exc:
         raise StateError(f"cannot read {label} {path}: {exc}") from exc
 
 
@@ -6665,13 +6667,7 @@ def _validate_journal_shape(
         if path == _finish_journal_path(config, slot, machine) and (
             record.slot_type != "validate"
             or raw.get("validate_complete") is not True
-            or any(
-                field in raw
-                for field in (
-                    "private_census_identity",
-                    "validation_removal_proof",
-                )
-            )
+            or "validation_removal_proof" in raw
         ):
             raise StateError(
                 "scoped finish journal is not a direct completed-validation removal"
@@ -13307,8 +13303,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
         # with every sealed path before this create writes anything.
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, archives = _validate_global_state(config)
+        paired_finish_path = _validate_batch_paired_finish_path(config)
+        cleanup_exclusions = (
+            frozenset({paired_finish_path})
+            if paired_finish_path is not None
+            else frozenset()
+        )
         interrupted_creates = _classify_create_journals(
-            config, states, archives
+            config,
+            states,
+            archives,
+            excluded_paths=cleanup_exclusions,
         )
         _assert_interrupted_creates_unrelated(
             config,
@@ -13350,8 +13355,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
             config, states, args.slot, args.slot_type, plan, vcs
         )
         interrupted_creates = _classify_create_journals(
-            config, states, archives
+            config,
+            states,
+            archives,
+            excluded_paths=cleanup_exclusions,
         )
+        if _validate_batch_paired_finish_path(config) != paired_finish_path:
+            raise Refusal(
+                "private validation finish changed while create was prepared"
+            )
         _assert_interrupted_creates_unrelated(
             config,
             interrupted_creates,
@@ -14527,14 +14539,23 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
     _validate_name(args.agent, "agent")
     owner = _capture_caller_process(args.owner_pid, "owner")
     with _mutation_locks(config, args.wait_lock):
-        _refuse_partial_state(config)
-        _assert_no_journal(config)
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, archives = _validate_global_state(config)
-        _assert_command_registry_storage(config, states, args)
-        before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
+        _assert_validate_batch_seals_disjoint_from_record(
+            config, record, action="heartbeat"
+        )
+        _assert_validate_cleanup_journals_disjoint_from_record(
+            config,
+            states,
+            archives,
+            record,
+            action="heartbeat",
+        )
+        _assert_command_registry_storage(config, states, args)
+        before = _global_rows(states, archives)
         updated = dataclasses.replace(record, heartbeat_at=_utc_now())
         _write_active_state(
             config,
@@ -20006,6 +20027,80 @@ def _assert_validate_batch_seals_disjoint_from_create(
                     )
 
 
+def _assert_validate_batch_seals_disjoint_from_record(
+    config: Config,
+    record: ActiveRecord,
+    *,
+    action: str,
+) -> None:
+    """Permit a slot-local mutation only beside disjoint validation seals."""
+
+    requested = _slot_directory(config, record.slot, record.slot_type)
+    for path in _validate_batch_seal_journals(config):
+        _raw, targets = _validate_batch_seal_journal(
+            config,
+            path,
+            _read_json(path, "validation-batch seal journal"),
+        )
+        for sealed_slot, sealed_generation, target in targets:
+            if sealed_slot == record.slot or _path_is_within(
+                requested, target.path
+            ) or _path_is_within(target.path, requested):
+                raise Refusal(
+                    f"{action} target {record.slot!r} overlaps validation cleanup "
+                    f"seal {path.name} target {sealed_slot!r} generation "
+                    f"{sealed_generation}"
+                )
+
+
+def _assert_validate_cleanup_journals_disjoint_from_record(
+    config: Config,
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+    record: ActiveRecord,
+    *,
+    action: str,
+) -> None:
+    """Allow a slot-local action beside only an exact disjoint cleanup."""
+
+    loaded = _load_validate_batch_seal_journal(config)
+    if loaded is None:
+        _assert_no_journal(config)
+        return
+    _seal_path, _seal_raw, targets = loaded
+    paired = _validate_batch_seal_paired_finish(config, targets)
+    excluded = (
+        frozenset({_journal_path_for_slot(config, paired.slot)})
+        if paired is not None
+        else frozenset()
+    )
+    create_rows = _classify_disjoint_create_journals_for_record(
+        config,
+        states,
+        archives,
+        record,
+        excluded_paths=excluded,
+    )
+    _recheck_disjoint_create_journals_for_record(
+        config,
+        create_rows,
+        states,
+        archives,
+        record,
+        excluded_paths=excluded,
+    )
+    if paired is not None:
+        paired_path = _slot_directory(config, paired.slot, paired.slot_type)
+        record_path = _slot_directory(config, record.slot, record.slot_type)
+        if paired.slot == record.slot or _path_is_within(
+            paired_path, record_path
+        ) or _path_is_within(record_path, paired_path):
+            raise Refusal(
+                f"{action} target {record.slot!r} overlaps private validation "
+                f"finish for {paired.slot!r}"
+            )
+
+
 def _assert_validate_batch_seal_target(
     config: Config,
     record: ActiveRecord,
@@ -20165,29 +20260,193 @@ def _upgrade_legacy_finish_seal_identity(
     return updated_finish
 
 
+def _finish_journal_record_is_archived(
+    config: Config,
+    journal: Mapping[str, object],
+    record: ActiveRecord,
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+) -> bool:
+    """Bind a finish journal to its exact durable ACTIVE or archive record."""
+
+    current = next(
+        (
+            active
+            for state in states
+            for active in state.slots
+            if active.slot == record.slot
+        ),
+        None,
+    )
+    if current is not None:
+        if (
+            current.machine != config.machine
+            or _record_to_obj(current) != _record_to_obj(record)
+        ):
+            raise StateError("finish journal record does not exactly match ACTIVE")
+        return False
+
+    archive_id = _as_str(journal["archive_id"], "finish journal.archive_id")
+    matches = [
+        archived
+        for archive in archives
+        if archive.machine == config.machine
+        for archived in archive.records
+        if archived.get("archive_id") == archive_id
+    ]
+    if not matches:
+        raise StateError(
+            "finish journal has neither its active record nor a durable archive entry"
+        )
+    if len(matches) != 1:
+        raise StateError("finish journal archive_id is not unique")
+    if not _json_equal(matches[0], _archive_entry(journal, record)):
+        raise StateError("durable archive entry differs from the finish journal")
+    return True
+
+
+def _validate_batch_seal_paired_finish(
+    config: Config,
+    targets: Sequence[tuple[str, int, _PrivateCleanupTarget]],
+) -> ActiveRecord | None:
+    """Classify the only mutation state allowed beside a private seal.
+
+    A single finish can pair with one exact sealed slot.  Every other durable
+    mutation must be a stable create proven disjoint from every still-sealed
+    path.  Merely counting journals would make an unrelated create either look
+    like the paired finish or strand the private directory forever.
+    """
+
+    finish_paths: list[Path] = []
+    paired: ActiveRecord | None = None
+    paired_raw: Mapping[str, object] | None = None
+    for journal_path in _outstanding_journals(config):
+        _loaded_path, journal = _load_journal(
+            config, selected_path=journal_path
+        )
+        kind = _as_str(journal.get("kind"), "journal.kind")
+        if kind != "finish":
+            continue
+        finish_paths.append(journal_path)
+        record = _record_from_obj(journal.get("record"), "finish journal.record")
+        identity = _finish_private_census_identity(journal)
+        original_mode = _as_int(
+            journal.get("original_mode"), "finish journal.original_mode"
+        )
+        matches = [
+            target
+            for slot, generation, target in targets
+            if record.machine == config.machine
+            and record.slot_type == "validate"
+            and record.slot == slot
+            and record.generation == generation
+            and journal.get("validate_complete") is True
+            and not _as_list(journal.get("salvage", []), "finish journal.salvage")
+            and target.path == _slot_directory(config, slot, "validate")
+            and target.original_mode == original_mode
+            and identity is not None
+            and (
+                identity == target.identity
+                or (
+                    len(identity) != len(target.identity)
+                    and (len(identity) == 3 or len(target.identity) == 3)
+                    and identity[:2] == target.identity[:2]
+                )
+            )
+        ]
+        if len(matches) != 1:
+            raise StateError(
+                "finish journal does not exactly pair with one validation-batch "
+                "seal target"
+            )
+        if paired is not None:
+            raise StateError(
+                "validation-batch seal has multiple paired finish journals"
+            )
+        paired = record
+        paired_raw = journal
+
+    excluded = frozenset(finish_paths)
+    if paired_raw is None:
+        states, archives = _validate_global_state(
+            config, require_repository=False
+        )
+    else:
+        states, archives = _validate_global_state_for_finish_recovery(
+            config, paired_raw
+        )
+        assert paired is not None
+        _finish_journal_record_is_archived(
+            config, paired_raw, paired, states, archives
+        )
+    create_rows = _classify_create_journals(
+        config, states, archives, excluded_paths=excluded
+    )
+    active_records = {
+        (state.machine, record.slot): record
+        for state in states
+        for record in state.slots
+    }
+    for sealed_slot, sealed_generation, target in targets:
+        active = active_records.get((config.machine, sealed_slot))
+        if active is not None and active.generation == sealed_generation:
+            _assert_interrupted_creates_unrelated_to_record(
+                config, create_rows, active
+            )
+        for row in create_rows:
+            if row.slot == sealed_slot or _path_is_within(
+                row.slot_path, target.path
+            ) or _path_is_within(target.path, row.slot_path):
+                raise Refusal(
+                    f"interrupted create {row.machine}/{row.slot} overlaps sealed "
+                    f"validation slot {sealed_slot!r}"
+                )
+    _assert_create_journal_classifications_stable(
+        config, create_rows, states, archives, excluded_paths=excluded
+    )
+    return paired
+
+
+def _validate_batch_paired_finish_path(config: Config) -> Path | None:
+    """Return the exact finish paired with the current seal, if one exists."""
+
+    loaded = _load_validate_batch_seal_journal(config)
+    if loaded is None:
+        return None
+    _seal_path, _seal_raw, targets = loaded
+    paired = _validate_batch_seal_paired_finish(config, targets)
+    if paired is None:
+        return None
+    return _journal_path_for_slot(config, paired.slot)
+
+
 def _assert_validate_batch_seal_recovery_kind(
     config: Config, recovery_kind: _ValidateBatchSealRecoveryKind
 ) -> ActiveRecord | None:
-    """Require the named recovery boundary to match durable journal state."""
+    """Require the named recovery boundary to match typed durable state."""
 
-    journals = _outstanding_journals(config)
+    loaded = _load_validate_batch_seal_journal(config)
+    if loaded is None:
+        if recovery_kind is _ValidateBatchSealRecoveryKind.PAIRED_FINISH:
+            raise StateError(
+                "paired-finish validation-batch recovery has no seal journal"
+            )
+        return None
+    _path, _raw, targets = loaded
+    paired = _validate_batch_seal_paired_finish(config, targets)
     if recovery_kind is _ValidateBatchSealRecoveryKind.SEAL_ONLY:
-        if journals:
+        if paired is not None:
             raise StateError(
                 "seal-only validation-batch recovery cannot run with a paired "
                 "mutation journal"
             )
         return None
-    if len(journals) != 1:
+    if paired is None:
         raise StateError(
-            "paired-finish validation-batch recovery requires one mutation journal"
+            "paired-finish validation-batch recovery requires one mutation journal "
+            "that exactly matches a sealed target"
         )
-    _path, raw = _load_journal(config)
-    if _as_str(raw.get("kind"), "journal.kind") != "finish":
-        raise StateError(
-            "paired-finish validation-batch recovery requires a finish journal"
-        )
-    return _record_from_obj(raw.get("record"), "finish journal.record")
+    return paired
 
 
 def _recover_validate_batch_seal_journal(
@@ -20197,12 +20456,12 @@ def _recover_validate_batch_seal_journal(
     emit: bool = True,
     retain_evidence: bool = False,
 ) -> bool:
-    paired_finish = _assert_validate_batch_seal_recovery_kind(config, recovery_kind)
     loaded = _load_validate_batch_seal_journal(config)
     if loaded is None:
         return False
     path, raw, targets = loaded
     states, archives = _validate_global_state(config, require_repository=False)
+    paired_finish = _assert_validate_batch_seal_recovery_kind(config, recovery_kind)
     records = {record.slot: record for state in states for record in state.slots}
     raw, targets = _upgrade_legacy_validate_batch_seal_targets(
         config, raw, targets, records, paired_finish
@@ -20344,6 +20603,7 @@ def _begin_or_resume_path_fence(
     fenced = _finish_fenced_slot(config, record, journal)
     original_present = original.exists() or original.is_symlink()
     fenced_present = fenced.exists() or fenced.is_symlink()
+    newly_fenced = False
     if original_present and fenced_present:
         raise Refusal(f"both canonical and fenced slot paths exist for {record.slot}")
     if original_present:
@@ -20370,6 +20630,7 @@ def _begin_or_resume_path_fence(
             raise Refusal(f"cannot establish path fence {original} -> {fenced}: {exc}") from exc
         _interrupt_for_test("after-path-fence-before-journal")
         fenced_present = True
+        newly_fenced = True
     if not fenced_present:
         return journal, fenced
     if fenced.is_symlink() or not fenced.is_dir():
@@ -20384,7 +20645,8 @@ def _begin_or_resume_path_fence(
             _repair_registration_at_slot(config, record, checkout, fenced, vcs)
     journal["phase"] = "fenced"
     _write_journal(config, journal, journal_path=journal_path)
-    _interrupt_for_test("after-path-fence")
+    if newly_fenced:
+        _interrupt_for_test("after-path-fence")
     return journal, fenced
 
 
@@ -20427,6 +20689,33 @@ def _finish_remove_paths(
                 f"private cleanup fence identity changed after its shared census: "
                 f"{fenced_slot}"
             )
+    use_check_record = _record_for_slot_use_check(
+        record,
+        validate_complete=finish.validate_complete,
+        allow_live_validate_owner=finish.allow_live_validate_owner,
+    )
+    if private_fence_identity is not None:
+        assert finish.private_cleanup is not None
+        fresh_census = finish.private_cleanup.fresh_census
+        if fresh_census is None:
+            # Interrupted-operation recovery still establishes this snapshot
+            # while holding the recovery lock. Ordinary removal supplies the
+            # post-fence census captured outside mutation locks.
+            finish.private_cleanup.same_uid_census_performed = True
+            fresh_census = _capture_same_uid_process_path_census(
+                (fenced_slot,),
+                budget=finish.private_cleanup.census_budget,
+            )
+        fresh_census.assert_slot_unused(
+            fenced_slot,
+            use_check_record,
+            ignore_invoking_ancestry=(
+                finish.allow_live_validate_owner
+                and record.slot_type == "validate"
+            ),
+        )
+        # Do not begin destructive work after the batch evidence deadline.
+        finish.private_cleanup.census_budget.remaining_seconds()
     present: list[Checkout] = []
     missing_after_remove: list[Checkout] = []
     for checkout in record.checkouts:
@@ -20512,11 +20801,6 @@ def _finish_remove_paths(
                     paths=moved_paths,
                     checkouts=remaining,
                 )
-            use_check_record = _record_for_slot_use_check(
-                record,
-                validate_complete=finish.validate_complete,
-                allow_live_validate_owner=finish.allow_live_validate_owner,
-            )
             if private_fence_identity is None:
                 _assert_slot_unused(
                     fenced_slot,
@@ -20528,31 +20812,6 @@ def _finish_remove_paths(
                     ),
                     live_use_recheck=finish.live_use_recheck,
                 )
-            else:
-                if (
-                    _private_cleanup_fence_identity(config, fenced_slot)
-                    != private_fence_identity
-                ):
-                    raise Refusal(
-                        f"private cleanup fence identity changed before its fresh census: "
-                        f"{fenced_slot}"
-                    )
-                assert finish.private_cleanup is not None
-                finish.private_cleanup.same_uid_census_performed = True
-                same_uid_census = _capture_same_uid_process_path_census(
-                    (fenced_slot,),
-                    budget=finish.private_cleanup.census_budget,
-                )
-                same_uid_census.assert_slot_unused(
-                    fenced_slot,
-                    use_check_record,
-                    ignore_invoking_ancestry=(
-                        finish.allow_live_validate_owner
-                        and record.slot_type == "validate"
-                    ),
-                )
-                # Do not begin destructive work after the batch evidence deadline.
-                finish.private_cleanup.census_budget.remaining_seconds()
             if finish.validation_removal_proof is not None:
                 canonical_checkout, _active_checkout = _single_validation_checkout(
                     config, record, fenced_slot
@@ -20807,7 +21066,8 @@ def _begin_finish(
     finish: _FinishContext,
     *,
     journal_path: Path,
-) -> None:
+    defer_private_census: bool = False,
+) -> _PreparedPrivateFinish | None:
     vcs = _GitVcs()
     _load_archive(config, require_repository=False)
     _assert_not_held(config, record)
@@ -20851,6 +21111,33 @@ def _begin_finish(
     )
     _write_journal(config, journal, journal_path=journal_path)
     _interrupt_for_test("after-finish-journal")
+    if defer_private_census:
+        if finish.private_cleanup is None:
+            raise StateError("only a private cleanup can defer its fresh census")
+        try:
+            journal, _fenced_slot = _begin_or_resume_path_fence(
+                config,
+                final_record,
+                journal,
+                vcs,
+                finish,
+                journal_path=journal_path,
+            )
+        except Refusal:
+            canonical = _slot_directory(
+                config, final_record.slot, final_record.slot_type
+            )
+            fenced = _finish_fenced_slot(config, final_record, journal)
+            if (
+                canonical.is_dir()
+                and not canonical.is_symlink()
+                and not fenced.exists()
+                and not fenced.is_symlink()
+                and not _as_list(journal["removed"], "journal.removed")
+            ):
+                _clear_journal(config, journal, journal_path=journal_path)
+            raise
+        return _PreparedPrivateFinish(final_record, journal, journal_path)
     try:
         journal = _finish_remove_paths(
             config,
@@ -20879,6 +21166,135 @@ def _begin_finish(
         journal,
         journal_path=journal_path,
     )
+    return None
+
+
+def _load_prepared_private_finish(
+    config: Config, prepared: _PreparedPrivateFinish
+) -> Mapping[str, object]:
+    """Reload one deferred finish without accepting journal substitution."""
+
+    path, journal = _load_journal(config, selected_path=prepared.journal_path)
+    if path != prepared.journal_path or not _json_equal(journal, prepared.journal):
+        raise Refusal(
+            f"private finish journal changed during its out-of-lock census: {path}"
+        )
+    paired = _assert_validate_batch_seal_recovery_kind(
+        config, _ValidateBatchSealRecoveryKind.PAIRED_FINISH
+    )
+    if paired is None or _record_to_obj(paired) != _record_to_obj(prepared.record):
+        raise StateError("private finish no longer pairs with its exact seal target")
+    return journal
+
+
+def _rollback_prepared_private_finish(
+    config: Config, prepared: _PreparedPrivateFinish, refusal: Refusal
+) -> None:
+    """Return a census-refused private target to its canonical pathname."""
+
+    try:
+        journal = dict(_load_prepared_private_finish(config, prepared))
+        _rollback_path_fence(
+            config,
+            prepared.record,
+            journal,
+            _GitVcs(),
+            journal_path=prepared.journal_path,
+        )
+    except (Refusal, StateError) as rollback:
+        raise Refusal(
+            f"{refusal}; deferred path-fence rollback failed: {rollback}; "
+            "run 'wrkslots recover'"
+        ) from rollback
+
+
+def _complete_prepared_private_finish(
+    config: Config,
+    prepared: _PreparedPrivateFinish,
+    finish: _FinishContext,
+    *,
+    coordinator: ProcessIdentity,
+    runner: ProcessIdentity,
+    handoff_writer: ProcessIdentity | None,
+    proof_fd: int | None,
+) -> None:
+    """Revalidate and complete the short destructive phase under mutation locks."""
+
+    raw = _load_prepared_private_finish(config, prepared)
+    states, archives = _validate_global_state_for_finish_recovery(config, raw)
+    before = _global_rows(states, archives)
+    state = next(item for item in states if item.machine == config.machine)
+    current = _find_record(state, prepared.record.slot)
+    if _record_to_obj(current) != _record_to_obj(prepared.record):
+        raise Refusal(
+            f"slot {prepared.record.slot} changed during its out-of-lock census"
+        )
+    _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
+    _assert_not_held(config, current)
+    owner_state, owner_detail = _process_state(current.owner)
+    live_validate_owner = bool(
+        finish.validate_complete
+        and owner_state == "live"
+        and current.owner == coordinator
+    )
+    if live_validate_owner:
+        if handoff_writer is None:
+            _assert_caller_process(coordinator, "validate owner")
+    else:
+        _assert_registered_liveness(config, current)
+    if (
+        owner_state != "dead"
+        and not live_validate_owner
+        and not _owner_record_is_absent(current)
+    ):
+        raise Refusal(
+            "remove requires a proven-dead recorded owner after its final census; "
+            f"owner is {owner_state}: {owner_detail}"
+        )
+    private_cleanup = finish.private_cleanup
+    if private_cleanup is None or private_cleanup.fresh_census is None:
+        raise StateError("deferred private finish has no fresh same-UID census")
+    _assert_validate_batch_seal_target(
+        config,
+        current,
+        private_cleanup.target.original_mode,
+        private_cleanup.target.identity,
+    )
+    fenced_slot = _finish_fenced_slot(config, current, raw)
+    if (
+        _private_cleanup_fence_identity(config, fenced_slot)
+        != private_cleanup.target.identity
+    ):
+        raise Refusal(
+            f"private cleanup fence identity changed after its fresh census: "
+            f"{fenced_slot}"
+        )
+    resumed_finish = dataclasses.replace(
+        finish, allow_live_validate_owner=live_validate_owner
+    )
+    journal = _finish_remove_paths(
+        config,
+        current,
+        dict(raw),
+        _GitVcs(),
+        resumed_finish,
+        journal_path=prepared.journal_path,
+    )
+    _finish_state_update(
+        config,
+        state,
+        current,
+        journal,
+        journal_path=prepared.journal_path,
+    )
+    after_states, after_archives = _validate_global_state(
+        config, require_repository=False
+    )
+    _assert_only_slot_changed(
+        before,
+        _global_rows(after_states, after_archives),
+        current.slot,
+    )
 
 
 def _cmd_finish(args: argparse.Namespace) -> int:
@@ -20893,14 +21309,23 @@ def _cmd_finish(args: argparse.Namespace) -> int:
     if any(not item.strip() for item in limitations):
         raise Refusal("finish limitations must be non-empty")
     with _mutation_locks(config, args.wait_lock):
-        _refuse_partial_state(config)
-        _assert_no_journal(config)
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, archives = _validate_global_state(config)
-        _assert_command_registry_storage(config, states, args)
-        before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
+        _assert_validate_batch_seals_disjoint_from_record(
+            config, record, action="finish"
+        )
+        _assert_validate_cleanup_journals_disjoint_from_record(
+            config,
+            states,
+            archives,
+            record,
+            action="finish",
+        )
+        _assert_command_registry_storage(config, states, args)
+        before = _global_rows(states, archives)
         if record.handoff is not None:
             raise Refusal(f"slot {record.slot} already has a recorded handoff")
         _slot_path, final_checkouts = _handoff_preconditions(
@@ -20961,15 +21386,26 @@ def _cmd_remove(
             "--validation-proof-manifest and --completed-record must be supplied "
             "together for registered validation removal"
         )
-    if proof_manifest is not None and private_cleanup is None:
-        assert completed_record is not None
+    if (
+        private_cleanup is None
+        and (proof_manifest is not None or bool(args.validate_complete))
+    ):
         batch_args = argparse.Namespace(**vars(args))
         batch_args.command = "remove-validate-batch"
         batch_args.slots = [f"{args.slot}={args.expected_generation}"]
-        batch_args.validation_proof_manifests = [proof_manifest]
-        batch_args.completed_records = [completed_record]
+        batch_args.validation_proof_manifests = (
+            [] if proof_manifest is None else [proof_manifest]
+        )
+        batch_args.completed_records = (
+            [] if completed_record is None else [completed_record]
+        )
         batch_args.format = "json"
-        payload = _remove_validate_batch(batch_args)
+        payload = _remove_validate_batch(
+            batch_args,
+            single_validate_complete=(
+                bool(args.validate_complete) and proof_manifest is None
+            ),
+        )
         retained = _as_list(payload["retained"], "validation removal result.retained")
         if retained:
             row = _as_mapping(retained[0], "validation removal result.retained[0]")
@@ -20995,13 +21431,17 @@ def _cmd_remove(
         if private_cleanup is not None
         else _LiveUseRecheckBudget()
     )
-    scoped_validation_finish = bool(args.validate_complete) and private_cleanup is None
+    scoped_validation_finish = bool(args.validate_complete) and (
+        private_cleanup is None or private_cleanup.scoped_finish
+    )
     wait_deadline = getattr(args, "_wait_deadline", None)
     lock_scope = (
         _mutation_locks(config, args.wait_lock)
         if wait_deadline is None
         else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
     )
+    prepared_private_finish: _PreparedPrivateFinish | None = None
+    finish_context: _FinishContext | None = None
     with lock_scope:
         _refuse_partial_state(
             config,
@@ -21253,34 +21693,106 @@ def _cmd_remove(
                 },
                 require_repository=False,
             )
-        _begin_finish(
+        finish_context = _FinishContext(
+            mode="remove",
+            actor="coordinator",
+            salvage=salvage,
+            validate_complete=bool(args.validate_complete),
+            allow_live_validate_owner=live_validate_owner,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=validation_removal_proof,
+            live_use_recheck=live_use_recheck,
+        )
+        prepared_private_finish = _begin_finish(
             config,
             state,
             record,
-            _FinishContext(
-                mode="remove",
-                actor="coordinator",
-                salvage=salvage,
-                validate_complete=bool(args.validate_complete),
-                allow_live_validate_owner=live_validate_owner,
-                private_cleanup=private_cleanup,
-                validation_removal_proof=validation_removal_proof,
-                live_use_recheck=live_use_recheck,
-            ),
+            finish_context,
             journal_path=(
                 _finish_journal_path(config, record.slot)
                 if scoped_validation_finish
                 else _journal_path(config)
             ),
+            defer_private_census=private_cleanup is not None,
         )
-        after_states, after_archives = _validate_global_state(
-            config, require_repository=False
-        )
+        if prepared_private_finish is None:
+            after_states, after_archives = _validate_global_state(
+                config, require_repository=False
+            )
+        else:
+            after_states, after_archives = _validate_global_state_for_finish_recovery(
+                config, prepared_private_finish.journal
+            )
         _assert_only_slot_changed(
             before,
             _global_rows(after_states, after_archives),
             args.slot,
         )
+    if prepared_private_finish is not None:
+        assert private_cleanup is not None
+        assert finish_context is not None
+        fenced_slot = _finish_fenced_slot(
+            config,
+            prepared_private_finish.record,
+            prepared_private_finish.journal,
+        )
+        try:
+            if (
+                _private_cleanup_fence_identity(config, fenced_slot)
+                != private_cleanup.target.identity
+            ):
+                raise Refusal(
+                    f"private cleanup fence identity changed before its fresh census: "
+                    f"{fenced_slot}"
+                )
+            private_cleanup.same_uid_census_performed = True
+            private_cleanup.fresh_census = _capture_same_uid_process_path_census(
+                (fenced_slot,), budget=private_cleanup.census_budget
+            )
+            private_cleanup.census_budget.remaining_seconds()
+            if (
+                _private_cleanup_fence_identity(config, fenced_slot)
+                != private_cleanup.target.identity
+            ):
+                raise Refusal(
+                    f"private cleanup fence identity changed during its fresh census: "
+                    f"{fenced_slot}"
+                )
+            _interrupt_for_test("after-validate-batch-fresh-census")
+        except Refusal as exc:
+            rollback_scope = (
+                _mutation_locks(config, args.wait_lock)
+                if wait_deadline is None
+                else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+            )
+            with rollback_scope:
+                _rollback_prepared_private_finish(
+                    config, prepared_private_finish, exc
+                )
+            raise
+        completion_scope = (
+            _mutation_locks(config, args.wait_lock)
+            if wait_deadline is None
+            else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+        )
+        with completion_scope:
+            _refuse_partial_state(config, allow_validate_batch_seals=True)
+            try:
+                _complete_prepared_private_finish(
+                    config,
+                    prepared_private_finish,
+                    finish_context,
+                    coordinator=coordinator,
+                    runner=runner,
+                    handoff_writer=handoff_writer,
+                    proof_fd=proof_fd,
+                )
+            except Refusal as exc:
+                if prepared_private_finish.journal_path.exists():
+                    _rollback_prepared_private_finish(
+                        config, prepared_private_finish, exc
+                    )
+                raise
     if emit:
         print(f"removed and archived slot={record.slot} generation={record.generation}")
     return 0
@@ -21317,15 +21829,34 @@ def _seal_validate_batch_targets(
     proof_manifests: Mapping[str, str],
     completed_records: Mapping[str, Path],
     removal_proofs: dict[str, _ValidationRemovalProof],
+    *,
+    single_validate_complete: bool = False,
 ) -> None:
     """Preflight and seal each eligible target while the mutation locks are held."""
 
     with _mutation_locks(config, wait_seconds):
         _refuse_partial_state(config)
-        _assert_no_journal(config)
-        states, _archives = _validate_global_state(
+        states, archives = _validate_global_state(
             config, require_repository=False
         )
+        if single_validate_complete:
+            if len(requested) != 1:
+                raise StateError(
+                    "internal completed-validation cleanup requires one exact slot"
+                )
+            selected_slot, selected_generation = requested[0]
+            selected_state = next(
+                state for state in states if state.machine == config.machine
+            )
+            selected_record = _find_record(selected_state, selected_slot)
+            _expected_generation(selected_record, selected_generation)
+            create_rows = _classify_disjoint_create_journals_for_record(
+                config, states, archives, selected_record
+            )
+        else:
+            _assert_no_journal(config)
+            selected_record = None
+            create_rows = ()
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
         seal_journal: dict[str, object] = {
             "schema": _VALIDATE_BATCH_SEAL_SCHEMA,
@@ -21347,17 +21878,38 @@ def _seal_validate_batch_targets(
                     )
                 _expected_generation(record, generation)
                 if record.slot_type != "validate":
-                    raise Refusal(
-                        "batch validation cleanup accepts only validate slots"
-                    )
+                    if single_validate_complete:
+                        raise Refusal(
+                            "--validate-complete applies only to a slot created with "
+                            "--slot-type validate. state: REFUSED -- no checkout was "
+                            "salvaged or removed. remedy: omit the flag and satisfy the "
+                            "ordinary agent-slot reclaim conditions"
+                        )
+                    raise Refusal("batch validation cleanup accepts only validate slots")
                 _assert_not_held(config, record)
-                _assert_registered_liveness(config, record)
                 owner_state, owner_detail = _process_state(record.owner)
-                if owner_state != "dead":
-                    raise Refusal(
-                        "batch validation cleanup requires a proven-dead recorded owner; "
-                        f"owner is {owner_state}: {owner_detail}"
-                    )
+                live_validate_owner = bool(
+                    single_validate_complete
+                    and owner_state == "live"
+                    and record.owner == coordinator
+                )
+                if live_validate_owner:
+                    if handoff_writer is None:
+                        _assert_caller_process(coordinator, "validate owner")
+                else:
+                    _assert_registered_liveness(config, record)
+                owner_unrecorded = _owner_record_is_absent(record)
+                if owner_state != "dead" and not live_validate_owner:
+                    if not (single_validate_complete and owner_unrecorded):
+                        prefix = (
+                            "remove requires"
+                            if single_validate_complete
+                            else "batch validation cleanup requires"
+                        )
+                        raise Refusal(
+                            f"{prefix} a proven-dead recorded owner; owner is "
+                            f"{owner_state}: {owner_detail}"
+                        )
                 slot_path = _assert_slot_contents(config, record)
                 proof_manifest = proof_manifests.get(slot)
                 if proof_manifest is not None:
@@ -21417,9 +21969,35 @@ def _seal_validate_batch_targets(
                 retained.append(
                     {"slot": slot, "generation": generation, "reason": str(exc)}
                 )
+        if single_validate_complete and private_targets:
+            assert selected_record is not None
+            boundary_states, boundary_archives = _validate_global_state(
+                config, require_repository=False
+            )
+            boundary_state = next(
+                state for state in boundary_states if state.machine == config.machine
+            )
+            boundary_record = _find_record(boundary_state, selected_record.slot)
+            if _record_to_obj(boundary_record) != _record_to_obj(selected_record):
+                raise Refusal(
+                    f"slot {selected_record.slot} changed while its private cleanup "
+                    "fence was established"
+                )
+            _assert_target_record_storage_consistent(
+                config, boundary_states, boundary_record
+            )
+            _recheck_disjoint_create_journals_for_record(
+                config,
+                create_rows,
+                boundary_states,
+                boundary_archives,
+                boundary_record,
+            )
 
 
-def _remove_validate_batch(args: argparse.Namespace) -> dict[str, object]:
+def _remove_validate_batch(
+    args: argparse.Namespace, *, single_validate_complete: bool = False
+) -> dict[str, object]:
     requested = tuple(_parse_validate_batch_slot(raw) for raw in args.slots)
     if len(requested) > VALIDATE_REMOVE_BATCH_LIMIT:
         raise Refusal(
@@ -21511,6 +22089,7 @@ def _remove_validate_batch(args: argparse.Namespace) -> dict[str, object]:
             proof_manifests,
             completed_records,
             removal_proofs,
+            single_validate_complete=single_validate_complete,
         )
         private_paths = [
             private_target.path for private_target in private_targets.values()
@@ -21569,10 +22148,10 @@ def _remove_validate_batch(args: argparse.Namespace) -> dict[str, object]:
                 target,
                 privileged_census,
                 census_budget,
+                scoped_finish=single_validate_complete,
                 live_use_recheck=live_use_recheck,
             )
             try:
-                privileged_census.assert_slot_unused(target.path, None)
                 _cmd_remove(
                     item_args,
                     private_cleanup=private_cleanup,
@@ -21606,7 +22185,16 @@ def _remove_validate_batch(args: argparse.Namespace) -> dict[str, object]:
                 )
     finally:
         with _mutation_locks(config, args.wait_lock):
-            if not _outstanding_journals(config):
+            loaded_seal = _load_validate_batch_seal_journal(config)
+            has_finish = any(
+                _as_str(
+                    _load_journal(config, selected_path=journal_path)[1].get("kind"),
+                    "journal.kind",
+                )
+                == "finish"
+                for journal_path in _outstanding_journals(config)
+            )
+            if loaded_seal is not None and not has_finish:
                 _recover_validate_batch_seal_journal(
                     config,
                     recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
@@ -22650,27 +23238,18 @@ def _recover_finish(
                 "finish journal salvage does not cover every checkout or names an "
                 "unrelated nested repository"
             )
-    current = next((item for item in state.slots if item.slot == record.slot), None)
     archive = _load_archive(config, require_repository=False)
-    archive_id = _as_str(raw["archive_id"], "finish journal.archive_id")
-    already_archived = any(item.get("archive_id") == archive_id for item in archive.records)
-    if current is None and already_archived:
-        expected_entry = _archive_entry(raw, record)
-        matching_entry = next(
-            item for item in archive.records if item.get("archive_id") == archive_id
-        )
-        if not _json_equal(matching_entry, expected_entry):
-            raise StateError("durable archive entry differs from the finish journal")
+    already_archived = _finish_journal_record_is_archived(
+        config, raw, record, (state,), (archive,)
+    )
+    if already_archived:
         _assert_physical_slot_removed(config, record, _GitVcs(), raw)
         _atomic_write_json(_archive_path(config), _archive_to_obj(archive))
         _remove_handoff_sidecar_after_archive(config, record)
         _clear_journal(config, raw, journal_path=path)
         print(f"recovered finish: cleared completed journal for {record.slot}")
         return
-    if current is None:
-        raise StateError("finish journal has neither its active record nor a durable archive entry")
-    if _record_to_obj(current) != _record_to_obj(record):
-        raise StateError("finish journal record does not exactly match ACTIVE")
+    current = next(item for item in state.slots if item.slot == record.slot)
     _assert_recovery_processes(coordinator, processes)
     _assert_not_held(config, current)
     age, expired = _heartbeat_diagnosis(current)
@@ -22689,12 +23268,8 @@ def _recover_finish(
             f"slot {current.slot} time-to-live is no longer expired after renewal; "
             "preserve it and do not resume deletion"
         )
-    if current.owner is None:
-        raise Refusal(
-            f"slot {current.slot} has no recorded owner process, so owner death is unknown; "
-            "preserve it rather than completing deletion"
-        )
-    if owner_state != "dead" and not live_validate_owner:
+    owner_unrecorded = _owner_record_is_absent(current)
+    if owner_state != "dead" and not live_validate_owner and not owner_unrecorded:
         raise Refusal(f"recorded owner is {owner_state}: {detail}")
     journal = dict(raw)
     phase = _as_str(journal["phase"], "finish journal.phase")
@@ -30826,6 +31401,8 @@ class _PrivateCleanupContext:
     target: _PrivateCleanupTarget
     shared_census: _ProcessPathCensus
     census_budget: _ReadOnlyCommandBudget
+    scoped_finish: bool = False
+    fresh_census: _ProcessPathCensus | None = None
     same_uid_census_performed: bool = False
     live_use_recheck: _LiveUseRecheckBudget = dataclasses.field(
         default_factory=_LiveUseRecheckBudget
@@ -30922,6 +31499,15 @@ class _FinishContext:
     private_cleanup: _PrivateCleanupContext | None = None
     validation_removal_proof: _ValidationRemovalProof | None = None
     live_use_recheck: _LiveUseRecheckBudget | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedPrivateFinish:
+    """Durable path fence awaiting its final out-of-lock liveness census."""
+
+    record: ActiveRecord
+    journal: Mapping[str, object]
+    journal_path: Path
 
 
 def _capture_process_path_census(
@@ -33102,21 +33688,45 @@ def _cmd_recover(
             path = _journal_path(config)
             raw: Mapping[str, object] = journal
         else:
-            journals = _outstanding_journals(config)
             seal_journals = _validate_batch_seal_journals(config)
-            if not journals and seal_journals:
-                _assert_caller_process(coordinator, "coordinator")
-                _recover_validate_batch_seal_journal(
-                    config,
-                    recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
-                )
-                return 0
             selected_slot = getattr(args, "slot", None)
-            selected_path = (
-                _journal_path_for_slot(config, selected_slot)
-                if selected_slot is not None
-                else None
-            )
+            selected_path: Path | None
+            if seal_journals:
+                loaded_seal = _load_validate_batch_seal_journal(config)
+                assert loaded_seal is not None
+                _seal_path, _seal_raw, sealed_targets = loaded_seal
+                paired_finish = _validate_batch_seal_paired_finish(
+                    config,
+                    sealed_targets,
+                )
+                if paired_finish is None:
+                    sealed_slots = {slot for slot, _generation, _target in sealed_targets}
+                    if selected_slot is not None and selected_slot not in sealed_slots:
+                        raise Refusal(
+                            "a private validation seal must be recovered before the "
+                            f"unrelated mutation for slot {selected_slot!r}"
+                        )
+                    _assert_caller_process(coordinator, "coordinator")
+                    _recover_validate_batch_seal_journal(
+                        config,
+                        recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
+                    )
+                    return 0
+                if selected_slot is not None and selected_slot != paired_finish.slot:
+                    raise Refusal(
+                        "a private validation finish must be recovered before the "
+                        f"unrelated mutation for slot {selected_slot!r}; rerun with "
+                        f"--slot {paired_finish.slot}"
+                    )
+                selected_path = _journal_path_for_slot(
+                    config, paired_finish.slot
+                )
+            else:
+                selected_path = (
+                    _journal_path_for_slot(config, selected_slot)
+                    if selected_slot is not None
+                    else None
+                )
             path, raw = _load_journal(config, selected_path=selected_path)
         kind_hint = _as_str(raw.get("kind"), "journal.kind")
         if kind_hint == "finish":

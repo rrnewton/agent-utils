@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import replace
@@ -13576,11 +13577,12 @@ def test_validate_slot_removes_dirty_checkout_without_salvage(tmp_path: Path) ->
     tree = checkout(project, slot_type="validate")
     assert tree == project / "worktrees" / "validate" / "slot01" / "product"
     (tree / "result.tmp").write_text("disposable result\n", encoding="utf-8")
-    removed = command(
+    removed = raw_command_with_census_authority_stub(
         project,
         "remove",
         "slot01",
         "--validate-complete",
+        "--coordinator-authorized",
         "--coordinator-pid",
         str(os.getpid()),
         "--expected-generation",
@@ -13613,26 +13615,48 @@ def test_validate_slot_removes_dirty_checkout_without_salvage(tmp_path: Path) ->
 
 def test_validate_complete_removes_dead_owner_checkout_despite_shared_cgroup(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project, slot_type="validate", branch=None)
     assert made.returncode == 0, made.stderr
     tree = checkout(project, slot_type="validate")
+    config = wrkslots._load_config(str(project), "testhost")
+    live_record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
     mark_owner_dead_in_current_cgroup(project)
     set_liveness(project, "dead")
+    record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+    assert record.owner is not None
+    shared_cgroup_process = wrkslots._AbsentProcessObservation(
+        pid=os.getpid() + 100_000,
+        start_ticks=1,
+        cgroup_path=record.owner.cgroup_path,
+        mount_namespace="mnt:[test]",
+    )
+    shared_census = wrkslots._ProcessPathCensus((shared_cgroup_process,), ())
+    with pytest.raises(wrkslots.Refusal, match="remains in recorded owner cgroup"):
+        shared_census.assert_slot_unused(
+            tree, live_record, ignore_current_process=False
+        )
+    stub_validate_batch_censuses(monkeypatch, lambda _paths: shared_census)
 
-    removed = command(
-        project,
-        "remove",
-        "slot01",
-        "--validate-complete",
-        "--coordinator-pid",
-        str(os.getpid()),
-        "--expected-generation",
-        "1",
+    removed = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--validate-complete",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
     )
 
-    assert removed.returncode == 0, removed.stderr
+    assert removed == 0, capsys.readouterr().err
     assert not tree.exists()
     assert active_slots(project) == []
 
@@ -13650,11 +13674,12 @@ def test_validate_complete_removes_nested_git_metadata_in_configured_cache(
     mark_owner_dead_in_current_cgroup(project)
     set_liveness(project, "dead")
 
-    removed = command(
+    removed = raw_command_with_census_authority_stub(
         project,
         "remove",
         "slot01",
         "--validate-complete",
+        "--coordinator-authorized",
         "--coordinator-pid",
         str(os.getpid()),
         "--expected-generation",
@@ -13720,6 +13745,7 @@ def test_validate_complete_still_refuses_live_owner_from_shared_cgroup(
         terminate_process(owner)
 
 
+@pytest.mark.ordinary_environment
 def test_validate_complete_still_refuses_live_path_use_after_owner_dies(
     tmp_path: Path,
 ) -> None:
@@ -15114,6 +15140,450 @@ def test_validate_batch_shared_census_explicitly_omits_owner_cgroups(
     assert report["removed"] == [{"generation": 1, "slot": "slot01"}]
 
 
+@pytest.mark.parametrize("blocked_census", ("shared", "fresh"))
+@pytest.mark.parametrize(
+    "operation_case", ("single-live", "single-absent", "public-batch-dead")
+)
+def test_validation_cleanup_releases_locks_during_both_censuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_census: str,
+    operation_case: str,
+) -> None:
+    """Private censuses cannot starve disjoint owner operations or creation."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(
+        project, slot="target", slot_type="validate", branch=None
+    ).returncode == 0
+    assert create(
+        project,
+        slot="neighbor",
+        agent="codex-neighbor",
+        branch="codex/neighbor",
+    ).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    target_record = wrkslots._find_record(state, "target")
+    neighbor = wrkslots._find_record(state, "neighbor")
+    old_heartbeat = "2000-01-01T00:00:00+00:00"
+    if operation_case == "single-absent":
+        target_record = replace(
+            target_record, owner=None, heartbeat_at=old_heartbeat
+        )
+    elif operation_case == "public-batch-dead":
+        assert target_record.owner is not None
+        target_record = replace(
+            target_record,
+            owner=replace(target_record.owner, boot_id="finished-boot"),
+            heartbeat_at=old_heartbeat,
+        )
+    if operation_case != "single-live":
+        wrkslots._write_active_state(
+            config,
+            wrkslots._replace_record(state, target_record),
+            action="test-validation-owner-unrecorded",
+            slot="target",
+        )
+        state = wrkslots._load_active(config)
+        neighbor = wrkslots._find_record(state, "neighbor")
+        set_liveness(project, "dead")
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(
+            state, replace(neighbor, heartbeat_at=old_heartbeat)
+        ),
+        action="test-neighbor-heartbeat-aged",
+        slot="neighbor",
+    )
+    canonical = wrkslots._slot_directory(config, "target", "validate")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def block() -> None:
+        entered.set()
+        assert release.wait(30), "test did not release blocked census"
+
+    def shared(
+        paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        del budget, include_owner_cgroups
+        assert tuple(paths) == (canonical,)
+        assert stat.S_IMODE(canonical.stat().st_mode) == 0o700
+        assert wrkslots._validate_batch_seal_journal_path(config).is_file()
+        assert not wrkslots._finish_journal_path(config, "target").exists()
+        if blocked_census == "shared":
+            block()
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    def fresh(
+        paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        assert len(paths) == 1
+        fenced = paths[0]
+        assert fenced.parent == canonical.parent
+        assert fenced.name.startswith(".target.fenced.1.")
+        assert not canonical.exists()
+        assert stat.S_IMODE(fenced.stat().st_mode) == 0o700
+        assert wrkslots._validate_batch_seal_journal_path(config).is_file()
+        expected_finish = (
+            wrkslots._journal_path(config)
+            if operation_case == "public-batch-dead"
+            else wrkslots._finish_journal_path(config, "target")
+        )
+        assert expected_finish.is_file()
+        if blocked_census == "fresh":
+            block()
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
+    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+    result: list[int] = []
+    failures: list[BaseException] = []
+
+    def remove_target() -> None:
+        try:
+            operation = (
+                [
+                    "remove-validate-batch",
+                    "--slot",
+                    "target=1",
+                    "--format",
+                    "json",
+                ]
+                if operation_case == "public-batch-dead"
+                else [
+                    "remove",
+                    "target",
+                    "--validate-complete",
+                    "--expected-generation",
+                    "1",
+                ]
+            )
+            result.append(
+                wrkslots.main(
+                    [
+                        "--project-root",
+                        str(project),
+                        *operation,
+                        "--coordinator-authorized",
+                        "--coordinator-pid",
+                        str(os.getpid()),
+                    ]
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion relay
+            failures.append(exc)
+
+    worker = threading.Thread(target=remove_target, daemon=True)
+    worker.start()
+    assert entered.wait(15), f"{blocked_census} census did not start"
+    try:
+        if operation_case == "single-live":
+            target_heartbeat = command(
+                project,
+                "heartbeat",
+                "target",
+                "--agent",
+                "codex-1",
+                "--owner-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            )
+            assert target_heartbeat.returncode == 3
+            assert "overlaps validation cleanup" in target_heartbeat.stderr
+
+            target_finish = command(
+                project,
+                "finish",
+                "target",
+                "--agent",
+                "codex-1",
+                "--owner-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+                "--validation",
+                "must not finish a sealed slot",
+            )
+            assert target_finish.returncode == 3
+            assert "overlaps validation cleanup" in target_finish.stderr
+
+        neighbor_heartbeat = command(
+            project,
+            "heartbeat",
+            "neighbor",
+            "--agent",
+            "codex-neighbor",
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        )
+        assert neighbor_heartbeat.returncode == 0, neighbor_heartbeat.stderr
+        refreshed = wrkslots._find_record(
+            wrkslots._load_active(config), "neighbor"
+        )
+        assert refreshed.heartbeat_at != old_heartbeat
+
+        finished = command(
+            project,
+            "finish",
+            "neighbor",
+            "--agent",
+            "codex-neighbor",
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--validation",
+            "disjoint finish completed while validation census was blocked",
+        )
+        assert finished.returncode == 0, finished.stderr
+
+        created = create(
+            project,
+            slot="during-census",
+            agent="codex-during-census",
+            branch="codex/during-census",
+        )
+        assert created.returncode == 0, created.stderr
+    finally:
+        release.set()
+        worker.join(30)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert result == [0]
+    assert not canonical.exists()
+    assert all(
+        not isinstance(row, dict) or row.get("slot") != "target"
+        for row in active_slots(project)
+    )
+    assert checkout(project, slot="neighbor").is_dir()
+    neighbor_after = wrkslots._find_record(
+        wrkslots._load_active(config), "neighbor"
+    )
+    assert neighbor_after.heartbeat_at == refreshed.heartbeat_at
+    assert neighbor_after.handoff is not None
+    assert neighbor_after.handoff.validation == (
+        "disjoint finish completed while validation census was blocked",
+    )
+    assert checkout(project, slot="during-census").is_dir()
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    assert not wrkslots._finish_journal_path(config, "target").exists()
+    assert not wrkslots._journal_path(config).exists()
+
+
+@pytest.mark.parametrize("refusing_census", ("shared", "fresh"))
+def test_single_validate_complete_census_refusal_restores_exact_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    refusing_census: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(
+        project, slot="target", slot_type="validate", branch=None
+    ).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    canonical = wrkslots._slot_directory(config, "target", "validate")
+    original = canonical.stat(follow_symlinks=False)
+
+    def shared(
+        paths: Sequence[Path], **_kwargs: object
+    ) -> wrkslots._ProcessPathCensus:
+        assert tuple(paths) == (canonical,)
+        if refusing_census == "shared":
+            return wrkslots._ProcessPathCensus(
+                (), ((os.getpid() + 100_000, str(canonical), "cwd", str(canonical)),)
+            )
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    def fresh(
+        paths: Sequence[Path], **_kwargs: object
+    ) -> wrkslots._ProcessPathCensus:
+        assert len(paths) == 1
+        fenced = paths[0]
+        if refusing_census == "fresh":
+            return wrkslots._ProcessPathCensus(
+                (), ((os.getpid() + 100_000, str(fenced), "cwd", str(fenced)),)
+            )
+        return wrkslots._ProcessPathCensus((), (), owner_cgroup_complete=False)
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", shared)
+    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", fresh)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "target",
+                "--validate-complete",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+        == 3
+    )
+    assert "live process" in capsys.readouterr().err
+    restored = canonical.stat(follow_symlinks=False)
+    assert (restored.st_dev, restored.st_ino) == (original.st_dev, original.st_ino)
+    assert stat.S_IMODE(restored.st_mode) == stat.S_IMODE(original.st_mode)
+    assert wrkslots._find_record(
+        wrkslots._load_active(config), "target"
+    ).generation == 1
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    assert not wrkslots._finish_journal_path(config, "target").exists()
+    assert not tuple(canonical.parent.glob(".target.fenced.1.*"))
+
+
+def test_fresh_census_veto_precedes_missing_checkout_branch_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even an externally removed checkout cannot bypass the fresh census."""
+
+    project, repository, _remote = make_project(tmp_path)
+    assert create(
+        project, slot="target", slot_type="validate", branch=None
+    ).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    branch = "wrkslots/validate/testhost/target/product"
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus(
+            (), (), owner_cgroup_complete=False
+        ),
+    )
+    delete_calls: list[tuple[Path, str, str]] = []
+
+    def forbid_branch_delete(
+        self: wrkslots._GitVcs,
+        source: Path,
+        selected_branch: str,
+        expected: str,
+    ) -> None:
+        del self
+        delete_calls.append((source, selected_branch, expected))
+        raise AssertionError("branch deletion preceded fresh census veto")
+
+    def remove_checkout_then_report_use(
+        paths: Sequence[Path], **_kwargs: object
+    ) -> wrkslots._ProcessPathCensus:
+        assert len(paths) == 1
+        fenced = paths[0]
+        git(repository, "worktree", "remove", "--force", str(fenced / "product"))
+        return wrkslots._ProcessPathCensus(
+            (), ((os.getpid() + 100_000, str(fenced), "cwd", str(fenced)),)
+        )
+
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", remove_checkout_then_report_use
+    )
+    monkeypatch.setattr(wrkslots._GitVcs, "delete_branch_at", forbid_branch_delete)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "target",
+                "--validate-complete",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+        == 3
+    )
+    assert delete_calls == []
+    assert (
+        git(
+            repository,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            check=False,
+        ).returncode
+        == 0
+    )
+    assert any(
+        isinstance(row, dict) and row.get("slot") == "target"
+        for row in active_slots(project)
+    )
+    archive = json.loads(
+        (control_directory(project) / "ARCHIVED.testhost.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert archive["records"] == []
+
+
+@pytest.mark.parametrize("owner_record", ("absent", "machine-init"))
+def test_single_validate_complete_preserves_unrecorded_owner_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_record: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(
+        project, slot="target", slot_type="validate", branch=None
+    ).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    record = wrkslots._find_record(state, "target")
+    assert record.owner is not None
+    owner = (
+        None
+        if owner_record == "absent"
+        else replace(record.owner, pid=1, cgroup_path="/init.scope")
+    )
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, replace(record, owner=owner)),
+        action="test-validation-owner-unrecorded",
+        slot="target",
+    )
+    set_liveness(project, "dead")
+    stub_validate_batch_censuses(monkeypatch)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "target",
+                "--validate-complete",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert not wrkslots._slot_directory(config, "target", "validate").exists()
+    assert not active_slots(project)
+
+
 def test_incomplete_owner_cgroup_census_refuses_only_when_it_will_compare(
     tmp_path: Path,
 ) -> None:
@@ -15757,6 +16227,198 @@ def test_seal_only_legacy_identity_upgrade_allows_dirty_retained_output(
     assert retained.read_text(encoding="utf-8") == "dirty retained output\n"
     assert stat.S_IMODE(slot_path.stat().st_mode) == original_mode
     assert not seal_path.exists()
+
+
+def prepare_paired_validation_finish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    journal_kind: str,
+) -> tuple[Path, wrkslots.Config, Path, dict[str, object], wrkslots.ActiveRecord]:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(
+        project, slot="target", slot_type="validate", branch=None
+    ).returncode == 0
+    assert create(
+        project,
+        slot="neighbor",
+        agent="codex-neighbor",
+        branch="codex/neighbor",
+    ).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    stub_validate_batch_censuses(monkeypatch)
+    if journal_kind == "scoped":
+        class StopAfterFinishJournal(RuntimeError):
+            pass
+
+        def interrupt(point: str) -> None:
+            if point == "after-finish-journal":
+                raise StopAfterFinishJournal
+
+        monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+        with pytest.raises(StopAfterFinishJournal):
+            wrkslots.main(
+                [
+                    "--project-root",
+                    str(project),
+                    "remove",
+                    "target",
+                    "--validate-complete",
+                    "--coordinator-authorized",
+                    "--coordinator-pid",
+                    str(os.getpid()),
+                    "--expected-generation",
+                    "1",
+                ]
+            )
+        monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+        finish_path = wrkslots._finish_journal_path(config, "target")
+    elif journal_kind == "global":
+        mark_owner_dead(project, slot="target")
+        set_liveness(project, "dead")
+        interrupt_validate_batch(
+            project, monkeypatch, "after-finish-journal", ("target",)
+        )
+        finish_path = wrkslots._journal_path(config)
+    else:  # pragma: no cover - fixed parametrization
+        raise AssertionError(f"unknown journal kind {journal_kind}")
+    raw: dict[str, object] = json.loads(finish_path.read_text(encoding="utf-8"))
+    record = wrkslots._record_from_obj(raw["record"], "finish journal.record")
+    assert wrkslots._validate_batch_seal_journal_path(config).is_file()
+    assert finish_path.is_file()
+    return project, config, finish_path, raw, record
+
+
+@pytest.mark.parametrize("journal_kind", ("scoped", "global"))
+@pytest.mark.parametrize(
+    ("durable_state", "accepted", "message"),
+    (
+        ("exact-active", True, None),
+        ("changed-active", False, "does not exactly match ACTIVE"),
+        ("absent", False, "neither its active record nor a durable archive"),
+        ("wrong-archive", False, "durable archive entry differs"),
+        ("exact-archive", True, None),
+        ("exact-active-archive", True, None),
+    ),
+)
+def test_private_finish_pairing_requires_exact_durable_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    journal_kind: str,
+    durable_state: str,
+    accepted: bool,
+    message: str | None,
+) -> None:
+    _project, config, finish_path, raw, record = prepare_paired_validation_finish(
+        tmp_path, monkeypatch, journal_kind
+    )
+    state = wrkslots._load_active(config, require_repository=False)
+    archive = wrkslots._load_archive(config, require_repository=False)
+    if durable_state in {"wrong-archive", "exact-archive", "exact-active-archive"}:
+        entry = wrkslots._archive_entry(raw, record)
+        if durable_state == "wrong-archive":
+            entry["purpose"] = "different archived purpose"
+        wrkslots._append_archive_once(
+            config,
+            archive,
+            entry,
+            action="test-private-finish-archive-boundary",
+            require_repository=False,
+        )
+    if durable_state == "changed-active":
+        wrkslots._write_active_state(
+            config,
+            wrkslots._replace_record(
+                state, replace(record, purpose="different active purpose")
+            ),
+            action="test-private-finish-active-change",
+            slot=record.slot,
+            require_repository=False,
+        )
+    elif durable_state in {"absent", "wrong-archive", "exact-archive"}:
+        wrkslots._write_active_state(
+            config,
+            wrkslots._delete_record(state, record.slot),
+            action="test-private-finish-active-removal",
+            slot=record.slot,
+            require_repository=False,
+        )
+
+    if accepted:
+        assert wrkslots._validate_batch_paired_finish_path(config) == finish_path
+    else:
+        assert message is not None
+        with pytest.raises(wrkslots.StateError, match=message):
+            wrkslots._validate_batch_paired_finish_path(config)
+
+
+@pytest.mark.parametrize("journal_kind", ("scoped", "global"))
+@pytest.mark.parametrize("operation", ("heartbeat", "finish", "create"))
+def test_nonexact_private_finish_blocks_disjoint_mutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    journal_kind: str,
+    operation: str,
+) -> None:
+    project, config, finish_path, _raw, record = prepare_paired_validation_finish(
+        tmp_path, monkeypatch, journal_kind
+    )
+    state = wrkslots._load_active(config, require_repository=False)
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(
+            state, replace(record, purpose="different active purpose")
+        ),
+        action="test-private-finish-active-change",
+        slot=record.slot,
+        require_repository=False,
+    )
+    active_path = wrkslots._active_path(config)
+    active_before = active_path.read_bytes()
+    finish_before = finish_path.read_bytes()
+    seal_path = wrkslots._validate_batch_seal_journal_path(config)
+    seal_before = seal_path.read_bytes()
+
+    if operation == "heartbeat":
+        result = command(
+            project,
+            "heartbeat",
+            "neighbor",
+            "--agent",
+            "codex-neighbor",
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        )
+    elif operation == "finish":
+        result = command(
+            project,
+            "finish",
+            "neighbor",
+            "--agent",
+            "codex-neighbor",
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--validation",
+            "must not pass a nonexact private finish",
+        )
+    else:
+        result = create(
+            project,
+            slot="during-nonexact-finish",
+            agent="codex-during-nonexact-finish",
+            branch="codex/during-nonexact-finish",
+        )
+
+    assert result.returncode == 3
+    assert "finish journal record does not exactly match ACTIVE" in result.stderr
+    assert active_path.read_bytes() == active_before
+    assert finish_path.read_bytes() == finish_before
+    assert seal_path.read_bytes() == seal_before
+    assert checkout(project, slot="neighbor").is_dir()
+    assert not checkout(project, slot="during-nonexact-finish").exists()
 
 
 @pytest.mark.parametrize(
@@ -16407,11 +17069,12 @@ def test_recover_resumes_dead_validate_owner_cleanup_from_shared_cgroup(
     tree = checkout(project, slot_type="validate")
     mark_owner_dead_in_current_cgroup(project)
     set_liveness(project, "dead")
-    interrupted = command(
+    interrupted = raw_command_with_census_authority_stub(
         project,
         "remove",
         "slot01",
         "--validate-complete",
+        "--coordinator-authorized",
         "--coordinator-pid",
         str(os.getpid()),
         "--expected-generation",
@@ -16421,9 +17084,10 @@ def test_recover_resumes_dead_validate_owner_cleanup_from_shared_cgroup(
     assert interrupted.returncode == 86
     assert tree.is_dir()
 
-    recovered = command(
+    recovered = raw_command_with_census_authority_stub(
         project,
         "recover",
+        "--coordinator-authorized",
         "--coordinator-pid",
         str(os.getpid()),
     )
@@ -16468,7 +17132,7 @@ def test_validate_remove_with_recursive_submodules_preserves_peers_and_config(
     orphan.write_text("must remain\n", encoding="utf-8")
     environment = {} if interrupt is None else {"WRKSLOTS_TEST_INTERRUPT": interrupt}
 
-    removed = raw_command(
+    removed = raw_command_with_census_authority_stub(
         project,
         "--allow-existing-unregistered-worktrees",
         "remove",
@@ -16488,7 +17152,7 @@ def test_validate_remove_with_recursive_submodules_preserves_peers_and_config(
         assert removed.returncode == 86, removed.stderr
         assert submodule_peer_snapshot(repository, peer) == before
         assert orphan.read_text(encoding="utf-8") == "must remain\n"
-        recovered = raw_command(
+        recovered = raw_command_with_census_authority_stub(
             project,
             "--allow-existing-unregistered-worktrees",
             "recover",
@@ -16594,11 +17258,12 @@ def test_validate_slot_removes_checkout_with_unfinished_git_operation(
     merge_head = Path(git(tree, "rev-parse", "--git-path", "MERGE_HEAD").stdout.strip())
     merge_head.write_text(git(tree, "rev-parse", "HEAD").stdout, encoding="utf-8")
 
-    removed = command(
+    removed = raw_command_with_census_authority_stub(
         project,
         "remove",
         "slot01",
         "--validate-complete",
+        "--coordinator-authorized",
         "--coordinator-pid",
         str(os.getpid()),
         "--expected-generation",
@@ -16719,11 +17384,12 @@ def test_later_participant_finishes_interrupted_validate_removal(
     (tree / "result.tmp").write_text("disposable result\n", encoding="utf-8")
     set_original_coordinator_dead(project)
 
-    interrupted = command(
+    interrupted = raw_command_with_census_authority_stub(
         project,
         "remove",
         "slot01",
         "--validate-complete",
+        "--coordinator-authorized",
         "--coordinator-pid",
         str(os.getpid()),
         "--expected-generation",
@@ -16741,9 +17407,10 @@ def test_later_participant_finishes_interrupted_validate_removal(
         check=False,
     ).returncode == 0
 
-    recovered = raw_command(
+    recovered = raw_command_with_census_authority_stub(
         project,
         "recover",
+        "--coordinator-authorized",
         "--coordinator-pid",
         str(os.getpid()),
     )
@@ -16820,6 +17487,7 @@ def test_remove_guards_uncommitted_handoffs_for_every_slot_type(
         "_assert_slot_unused",
         lambda *_args, **_kwargs: None,
     )
+    stub_validate_batch_censuses(monkeypatch)
     args = [
         "--project-root",
         str(project),
@@ -20536,6 +21204,7 @@ def test_host_context_runner_removes_live_validate_owner_with_pipe_proof(
         assert made.returncode == 0, made.stderr
         replace_owner(project, identity)
         set_host_context_handoff(monkeypatch, identity, proof_fd)
+        stub_validate_batch_censuses(monkeypatch)
 
         removed = wrkslots.main(
             [
@@ -25540,6 +26209,7 @@ def test_remove_validates_the_target_without_unrelated_storage(
     monkeypatch.setattr(
         wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
     )
+    stub_validate_batch_censuses(monkeypatch)
 
     rc = wrkslots.main(
         [
@@ -25652,6 +26322,9 @@ def test_remove_completed_validation_with_unrelated_interrupted_create(
             ),
         )
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    # The operation now reaches the same two census boundaries as batch
+    # cleanup; keep this journal-coexistence test isolated from host churn.
+    stub_validate_batch_censuses(monkeypatch)
 
     assert remove_completed_validation(project) == 0, capsys.readouterr().err
     assert not checkout(project, slot="target", slot_type="validate").exists()
@@ -25662,6 +26335,92 @@ def test_remove_completed_validation_with_unrelated_interrupted_create(
         slot_before.st_ino,
         slot_before.st_mtime_ns,
     )
+
+
+@pytest.mark.parametrize("legacy_journal", (False, True))
+@pytest.mark.parametrize(
+    "interrupt",
+    (
+        "after-validate-batch-seal-target",
+        "after-finish-journal",
+        "after-path-fence",
+        "after-validate-batch-fresh-census",
+        "after-remove-before-journal",
+        "after-remove-worktree",
+        "after-archive-before-active",
+    ),
+)
+def test_single_validate_complete_crash_preserves_disjoint_create_and_recovers(
+    tmp_path: Path,
+    interrupt: str,
+    legacy_journal: bool,
+) -> None:
+    project, create_journal = prepare_validation_remove_beside_create(
+        tmp_path, legacy_journal=legacy_journal
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    target = wrkslots._slot_directory(config, "target", "validate")
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+    unfinished = checkout(project, slot="unrelated") / "unfinished.txt"
+    unfinished.write_text("authored work\n", encoding="utf-8")
+    create_before = stable_file(create_journal)
+    unfinished_before = stable_file(unfinished)
+
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        "remove",
+        "target",
+        "--validate-complete",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": interrupt},
+    )
+
+    assert interrupted.returncode == 86, interrupted.stderr
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+    finish_journal = wrkslots._finish_journal_path(config, "target")
+    assert seal.is_file()
+    paired = interrupt != "after-validate-batch-seal-target"
+    assert finish_journal.exists() is paired
+    if interrupt in {"after-path-fence", "after-validate-batch-fresh-census"}:
+        assert not target.exists()
+        fenced = tuple(target.parent.glob(".target.fenced.1.*"))
+        assert len(fenced) == 1
+        assert stat.S_IMODE(fenced[0].stat().st_mode) == 0o700
+    elif not paired or interrupt == "after-finish-journal":
+        assert target.is_dir()
+        assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert stable_file(create_journal) == create_before
+    assert stable_file(unfinished) == unfinished_before
+    assert checkout(project, slot="unrelated").is_dir()
+    assert not seal.exists()
+    assert not finish_journal.exists()
+    if paired:
+        assert not target.exists()
+        assert all(
+            not isinstance(row, dict) or row.get("slot") != "target"
+            for row in active_slots(project)
+        )
+    else:
+        assert target.is_dir()
+        assert stat.S_IMODE(target.stat().st_mode) == original_mode
+        assert any(
+            isinstance(row, dict) and row.get("slot") == "target"
+            for row in active_slots(project)
+        )
 
 
 @pytest.mark.parametrize("change_create", (False, True))
@@ -25676,6 +26435,7 @@ def test_recover_exact_scoped_finish_beside_unrelated_create(
     )
     create_before = stable_file(create_journal)
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    stub_validate_batch_censuses(monkeypatch)
     monkeypatch.setattr(
         wrkslots, "_interrupt_for_test", interrupt_after_finish_journal
     )
@@ -25721,7 +26481,177 @@ def test_recover_exact_scoped_finish_beside_unrelated_create(
     assert stable_file(create_journal) == create_before
 
 
-def test_remove_rechecks_unrelated_create_before_first_mutation(
+def test_private_seal_recovery_refuses_duplicate_finish_path_before_pairing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(
+        project, slot="target", slot_type="validate", branch=None
+    ).returncode == 0
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(
+        wrkslots, "_interrupt_for_test", interrupt_after_finish_journal
+    )
+    with pytest.raises(_FinishInterrupted):
+        remove_completed_validation(project)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    scoped = wrkslots._finish_journal_path(config, "target")
+    legacy = wrkslots._journal_path(config)
+    raw = json.loads(scoped.read_text(encoding="utf-8"))
+    wrkslots._write_journal(config, raw, journal_path=legacy)
+    scoped_before = scoped.read_bytes()
+    legacy_before = legacy.read_bytes()
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+    seal_before = seal.read_bytes()
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 3
+    )
+
+    assert (
+        "same pending operation under multiple journal paths"
+        in capsys.readouterr().err
+    )
+    assert scoped.read_bytes() == scoped_before
+    assert legacy.read_bytes() == legacy_before
+    assert seal.read_bytes() == seal_before
+    target = wrkslots._slot_directory(config, "target", "validate")
+    assert target.is_dir()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("mutation", ("not-complete", "agent-record"))
+def test_private_seal_never_pairs_an_untyped_global_finish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(
+        project, slot="target", slot_type="validate", branch=None
+    ).returncode == 0
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(
+        wrkslots, "_interrupt_for_test", interrupt_after_finish_journal
+    )
+    with pytest.raises(_FinishInterrupted):
+        remove_completed_validation(project)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+    config = wrkslots._load_config(str(project), "testhost")
+    scoped = wrkslots._finish_journal_path(config, "target")
+    raw = json.loads(scoped.read_text(encoding="utf-8"))
+    wrkslots._clear_journal(config, raw, journal_path=scoped)
+    if mutation == "not-complete":
+        raw["validate_complete"] = False
+    else:
+        record = raw["record"]
+        assert isinstance(record, dict)
+        record["slot_type"] = "agent"
+    legacy = wrkslots._journal_path(config)
+    wrkslots._write_journal(config, raw, journal_path=legacy)
+    legacy_before = legacy.read_bytes()
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+    seal_before = seal.read_bytes()
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 3
+    )
+    assert "does not exactly pair" in capsys.readouterr().err
+    assert legacy.read_bytes() == legacy_before
+    assert seal.read_bytes() == seal_before
+    target = wrkslots._slot_directory(config, "target", "validate")
+    assert target.is_dir()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("owner_record", ("absent", "machine-init"))
+@pytest.mark.parametrize(
+    "interrupt", ("after-finish-journal", "after-validate-batch-fresh-census")
+)
+def test_private_finish_recovery_preserves_unrecorded_owner_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner_record: str,
+    interrupt: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(
+        project, slot="target", slot_type="validate", branch=None
+    ).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    record = wrkslots._find_record(state, "target")
+    assert record.owner is not None
+    owner = (
+        None
+        if owner_record == "absent"
+        else replace(record.owner, pid=1, cgroup_path="/init.scope")
+    )
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, replace(record, owner=owner)),
+        action="test-validation-owner-unrecorded",
+        slot="target",
+    )
+    set_liveness(project, "dead")
+    stub_validate_batch_censuses(monkeypatch)
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt_at_boundary(point: str) -> None:
+        if point == interrupt:
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt_at_boundary)
+    with pytest.raises(Interrupted):
+        remove_completed_validation(project)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-authorized",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert not wrkslots._slot_directory(config, "target", "validate").exists()
+    assert not active_slots(project)
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    assert not wrkslots._finish_journal_path(config, "target").exists()
+
+
+def test_remove_rechecks_unrelated_create_before_destructive_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -25736,11 +26666,24 @@ def test_remove_rechecks_unrelated_create_before_first_mutation(
         journal.write_text(json.dumps(raw, sort_keys=True) + "\n", encoding="utf-8")
 
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", change_journal)
+    stub_validate_batch_censuses(monkeypatch)
 
     assert remove_completed_validation(project) == 3
-    assert "changed while it was classified" in capsys.readouterr().err
+    # The slot is already sealed when this injected write occurs.  Its now-
+    # untrusted provenance blocks both destructive progress and automatic
+    # unsealing, retaining the exact evidence for explicit recovery.
+    assert "differs from append-only progress evidence" in capsys.readouterr().err
     assert active.read_bytes() == active_before
     assert checkout(project, slot="target", slot_type="validate").is_dir()
+    config = wrkslots._load_config(str(project), "testhost")
+    target = wrkslots._slot_directory(config, "target", "validate")
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    assert wrkslots._validate_batch_seal_journal_path(
+        config
+    ).is_file()
+    assert json.loads(journal.read_text(encoding="utf-8"))["purpose"] == (
+        "changed during removal classification"
+    )
     assert not finish_journal_path(project, "target").exists()
 
 
@@ -25873,6 +26816,7 @@ def test_remove_refuses_unrelated_finish_journal_before_target_mutation(
     )
     set_liveness(project, "dead")
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    stub_validate_batch_censuses(monkeypatch)
     monkeypatch.setattr(
         wrkslots, "_interrupt_for_test", interrupt_after_finish_journal
     )
@@ -25884,7 +26828,10 @@ def test_remove_refuses_unrelated_finish_journal_before_target_mutation(
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
 
     assert remove_completed_validation(project) == 3
-    assert "interrupted 'finish' mutation" in capsys.readouterr().err
+    # The private removal now publishes its seal before the paired finish
+    # journal. A second removal must stop at that outer durable boundary; it
+    # still cannot mutate either slot until recovery resolves the pair.
+    assert "interrupted validation-batch seal" in capsys.readouterr().err
     assert active.read_bytes() == active_before
     assert checkout(project, slot="target", slot_type="validate").is_dir()
     assert other_journal.is_file()
@@ -25893,7 +26840,7 @@ def test_remove_refuses_unrelated_finish_journal_before_target_mutation(
 @pytest.mark.parametrize(
     ("obstruction", "expected"),
     (("partial", "partial atomic update found"),
-     ("batch-seal", "interrupted validation-batch seal")),
+     ("batch-seal", "validation-batch seal journal has invalid fields")),
 )
 def test_scoped_validation_remove_keeps_global_recovery_obstructions(
     tmp_path: Path,
@@ -25964,6 +26911,7 @@ def test_remove_ignores_unrelated_unavailable_repository(
     monkeypatch.setattr(
         wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
     )
+    stub_validate_batch_censuses(monkeypatch)
 
     rc = wrkslots.main(
         [
@@ -26025,6 +26973,7 @@ def test_remove_recovery_ignores_unrelated_unavailable_repository(
     monkeypatch.setattr(
         wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
     )
+    stub_validate_batch_censuses(monkeypatch)
 
     class Interrupted(RuntimeError):
         pass
@@ -26097,7 +27046,9 @@ def test_remove_still_refuses_when_the_target_storage_is_missing(
     )
 
     assert rc == 3
-    assert "record names checkout 'product' but it is not in" in capsys.readouterr().err
+    assert "slot directory does not match its record: missing checkouts product" in (
+        capsys.readouterr().err
+    )
     assert any(
         isinstance(row, dict) and row.get("slot") == "target"
         for row in active_slots(project)
@@ -26179,6 +27130,7 @@ def test_remove_rechecks_exact_target_extra_registration_at_delete_boundary(
     monkeypatch.setattr(
         wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
     )
+    stub_validate_batch_censuses(monkeypatch)
 
     rc = wrkslots.main(
         [
@@ -26274,6 +27226,7 @@ def test_remove_rechecks_cross_repository_registration_at_delete_boundary(
     monkeypatch.setattr(
         wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None
     )
+    stub_validate_batch_censuses(monkeypatch)
 
     rc = wrkslots.main(
         [

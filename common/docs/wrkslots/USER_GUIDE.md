@@ -35,7 +35,12 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    and process, mount, Git, and path checks agree. Unknown evidence refuses; it is not treated as
    free. `--validate-complete` lets the exact live owner remove its completed validation slot, or
    lets a later participant remove it after proven owner death without waiting out the heartbeat.
-   Process-use, path, and Git checks still run.
+   Process-use, path, and Git checks still run. A newly started validation removal first records an
+   identity-bound private seal, releases the registry locks for both bounded process censuses, then
+   reacquires the locks and revalidates the exact seal, finish journal, owner, and ACTIVE row before deletion.
+   Heartbeats, handoff finishes, and creates for provably disjoint slots can proceed during either
+   census; operations on the sealed slot refuse. The short Git and registry mutation phase remains
+   serialized.
 6. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
    untracked files outside configured regenerable cache paths to the recorded remote. It never
    uploads gitignored content. It records and rechecks the exact remote ref and commit before
