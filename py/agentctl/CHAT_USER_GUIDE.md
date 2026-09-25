@@ -133,6 +133,14 @@ harness executable, or an already initialized state directory. Use one bridge
 per Chat space: stop the old coordinator before launching a replacement against
 the same space, and give the replacement a new state directory.
 
+Routing is per space, not per thread. Every authorized message in the space,
+in any thread, goes to the bridge's one target agent. To give several managed
+agents their own conversations, give each agent its own space, its own
+`chat.json`, and its own state directory. Two bridges cannot split one shared
+space by thread, because each would ingest every thread. To connect an existing
+managed agent rather than launching a new coordinator, use the two-process setup
+below and put that agent's pane identity in `target`.
+
 The explicit two-process setup below remains useful when a service manager owns
 the bridge independently of the coordinator.
 
