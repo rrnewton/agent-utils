@@ -31624,10 +31624,9 @@ def _direct_process_identity_matches(
                     "in use"
                 )
             # A socket inode alone names no path. A still-live socket bound
-            # inside a target has no current holder in the namespace table
-            # that lists it, which the Unix association refuses. Recording
-            # this holder would instead make every socket it closed on exit
-            # look unaccounted there.
+            # inside a target then has no holder in the namespace table that
+            # lists it, which the Unix association hard-refuses. Recording
+            # this exited holder would downgrade that to a retryable change.
             continue
         link_matches.extend(process_link_matches)
         inode_matches.extend(process_inode_matches)

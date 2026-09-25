@@ -210,3 +210,37 @@ def test_holder_needing_fallback_keeps_the_evidence_it_found(
     assert identities == ()
     assert sockets == {}
     assert fallback == (_process(),)
+
+
+def test_holder_needing_fallback_keeps_an_inode_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The cwd lies outside every target but its inode is a selected identity,
+    # and the descriptor table is unreadable.
+    target, held = _target(tmp_path)
+    alias_directory = tmp_path / "alias-cwd"
+    alias_directory.mkdir()
+    identity = alias_directory.stat()
+    proc_root = _proc(tmp_path, cwd=alias_directory)
+    descriptors = proc_root / str(PID) / "fd"
+    descriptors.chmod(0)
+    inodes = {(identity.st_dev, identity.st_ino): ((str(target), f"{held}"),)}
+    try:
+        if os.access(descriptors, os.R_OK):
+            pytest.skip("descriptor permissions are not enforced for this user")
+        _patch(monkeypatch, current=True)
+        links, identities, sockets, fallback = (
+            wrkslots._direct_process_identity_matches(
+                (_process(),), {target: str(target)}, inodes, _budget(),
+                proc_root=proc_root,
+            )
+        )
+    finally:
+        descriptors.chmod(0o700)
+
+    assert links == ()
+    assert [(pid, kind) for pid, _slot, kind, _detail in identities] == [
+        (PID, "inode")
+    ]
+    assert sockets == {}
+    assert fallback == (_process(),)
