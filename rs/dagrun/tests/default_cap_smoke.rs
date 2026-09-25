@@ -8,7 +8,7 @@
 //!
 //!   A (breach)    : NO hint, allocate ~1.4 GiB  -> OOM-killed at the 1 GiB default (exit 1)
 //!   B (compliant) : NO hint, allocate ~0.3 GiB  -> passes (the default does NOT kill everything)
-//!   C (control)   : SAME ~1.4 GiB but DECLARES hard_mem_max 4 GiB -> passes, proving it was the
+//!   C (control)   : SAME ~1.4 GiB but DECLARES hard_mem_max 2 GiB -> passes, proving it was the
 //!                   1 GiB *default* (not an ambient/outer limit) that killed A.
 //!   D (opt-out)   : SAME ~1.4 GiB with --unsafe-no-cgroups -> passes unboxed.
 //!   E (CPU pass)  : NO hint, read back a 1-core cpu.max and burn 1 CPU-second -> passes.
@@ -28,11 +28,12 @@ const BREACH_DAG: &str = r#"{"steps": [{"group": "mem", "job": "breach-default",
 const COMPLIANT_DAG: &str = r#"{"steps": [{"group": "mem", "job": "compliant-default",
   "desc": "undeclared step allocates 300MiB",
   "cmd": "python3 -c 'b=bytearray(300*1024*1024); print(len(b))'"}]}"#;
-// Same allocation as BREACH but declares a 4 GiB cap: escapes the 1 GiB default.
+// Same allocation as BREACH but declares a 2 GiB cap: escapes the 1 GiB default while fitting
+// inside the delegated validation harness's own memory envelope on a four-core runner.
 const DECLARED_DAG: &str = r#"{"steps": [{"group": "mem", "job": "breach-but-declared",
-  "desc": "1.4GiB alloc but declares hard_mem_max 4GiB",
+  "desc": "1.4GiB alloc but declares hard_mem_max 2GiB",
   "cmd": "python3 -c 'b=bytearray(1400*1024*1024); print(len(b))'",
-  "hint": {"hard_mem_max_bytes": 4294967296}}]}"#;
+  "hint": {"hard_mem_max_bytes": 2147483648}}]}"#;
 const CPU_COMPLIANT_DAG: &str = r#"{"steps": [{"group": "cpu", "job": "compliant-default",
   "desc": "undeclared step reads one-core quota and burns 1 CPU-second",
   "cmd": "python3 -c 'import pathlib,time; cg=next(x.split(\":\",2)[2].strip() for x in open(\"/proc/self/cgroup\") if x.startswith(\"0::\")); quota=pathlib.Path(\"/sys/fs/cgroup\"+cg+\"/cpu.max\").read_text().strip(); assert quota==\"100000 100000\",quota; start=time.process_time(); exec(\"while time.process_time()-start < 1.0: pass\")'"}]}"#;
@@ -114,13 +115,13 @@ fn default_small_cap_boxes_an_undeclared_step() {
          {compliant_code:?}\n{compliant_out}"
     );
 
-    // C: the SAME 1.4GiB allocation passes when the step declares a 4 GiB cap -> it was the 1 GiB
+    // C: the SAME 1.4GiB allocation passes when the step declares a 2 GiB cap -> it was the 1 GiB
     // *default* (not an ambient/outer limit) that killed A.
     let (declared_code, declared_out) = run_dag("declared", DECLARED_DAG, &[]);
     assert_eq!(
         declared_code,
         Some(0),
-        "1.4GiB step declaring hard_mem_max 4GiB must escape the default and PASS; got \
+        "1.4GiB step declaring hard_mem_max 2GiB must escape the default and PASS; got \
          {declared_code:?}\n{declared_out}"
     );
 }
