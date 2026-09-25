@@ -3381,22 +3381,44 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         after_preopen_check: impl FnOnce(),
     ) -> Result<PinnedAgentDirectory> {
         let path = self.directory(agent_name)?;
-        agent::validate_private_directory(&path, "agent directory", false)?;
+        Self::pinned_agent_directory_at_with(
+            agent_name,
+            path,
+            "agent directory",
+            after_preopen_check,
+        )
+    }
+
+    fn pinned_agent_directory_at(
+        agent_name: &str,
+        path: PathBuf,
+        label: &str,
+    ) -> Result<PinnedAgentDirectory> {
+        Self::pinned_agent_directory_at_with(agent_name, path, label, || {})
+    }
+
+    fn pinned_agent_directory_at_with(
+        agent_name: &str,
+        path: PathBuf,
+        label: &str,
+        after_preopen_check: impl FnOnce(),
+    ) -> Result<PinnedAgentDirectory> {
+        agent::validate_private_directory(&path, label, false)?;
         let before = fs::symlink_metadata(&path)
-            .map_err(|error| fail(format!("cannot inspect agent directory: {error}")))?;
-        let (device, inode) = Self::private_directory_identity(&before, "agent directory")?;
+            .map_err(|error| fail(format!("cannot inspect {label}: {error}")))?;
+        let (device, inode) = Self::private_directory_identity(&before, label)?;
         after_preopen_check();
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(&path)
-            .map_err(|error| fail(format!("cannot pin agent directory: {error}")))?;
+            .map_err(|error| fail(format!("cannot pin {label}: {error}")))?;
         let metadata = file
             .metadata()
-            .map_err(|error| fail(format!("cannot inspect pinned agent directory: {error}")))?;
-        let opened = Self::private_directory_identity(&metadata, "pinned agent directory")?;
+            .map_err(|error| fail(format!("cannot inspect pinned {label}: {error}")))?;
+        let opened = Self::private_directory_identity(&metadata, label)?;
         if opened != (device, inode) {
-            return Err(fail("agent directory changed while being pinned"));
+            return Err(fail(format!("{label} changed while being pinned")));
         }
         let pinned = PinnedAgentDirectory {
             name: agent_name.to_owned(),
@@ -3565,14 +3587,30 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         pinned: &PinnedAgentDirectory,
         require_active_name: bool,
     ) -> Result<Vec<u8>> {
-        if require_active_name {
+        Self::pinned_artifact_bytes(
+            pinned,
+            "agent.json",
+            MAX_AGENT_RECORD_BYTES,
+            "agent record",
+            require_active_name,
+        )
+    }
+
+    fn pinned_artifact_bytes(
+        pinned: &PinnedAgentDirectory,
+        name: &str,
+        limit: usize,
+        label: &str,
+        require_named_directory: bool,
+    ) -> Result<Vec<u8>> {
+        if require_named_directory {
             Self::verify_pinned_agent_directory(pinned)?;
         }
-        let path = pinned.path.join("agent.json");
-        let mut file = Self::open_pinned_file(pinned, "agent.json", libc::O_RDONLY)?;
+        let path = pinned.path.join(name);
+        let mut file = Self::open_pinned_file(pinned, name, libc::O_RDONLY)?;
         let before = file.metadata().map_err(|error| {
             fail(format!(
-                "cannot inspect agent record {}: {error}",
+                "cannot inspect {label} {}: {error}",
                 path.display()
             ))
         })?;
@@ -3581,30 +3619,22 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             || before.uid() != uid
             || before.permissions().mode() & 0o077 != 0
             || before.nlink() != 1
-            || before.len() > MAX_AGENT_RECORD_BYTES as u64
+            || before.len() > limit as u64
         {
-            return Err(fail(format!(
-                "unsafe agent record for recovery: {}",
-                path.display()
-            )));
+            return Err(fail(format!("unsafe {label}: {}", path.display())));
         }
         let mut content = Vec::with_capacity(before.len() as usize);
         Read::by_ref(&mut file)
-            .take((MAX_AGENT_RECORD_BYTES + 1) as u64)
+            .take((limit + 1) as u64)
             .read_to_end(&mut content)
-            .map_err(|error| {
-                fail(format!(
-                    "cannot read agent record {}: {error}",
-                    path.display()
-                ))
-            })?;
+            .map_err(|error| fail(format!("cannot read {label} {}: {error}", path.display())))?;
         let after = file.metadata().map_err(|error| {
             fail(format!(
-                "cannot reinspect agent record {}: {error}",
+                "cannot reinspect {label} {}: {error}",
                 path.display()
             ))
         })?;
-        if content.len() > MAX_AGENT_RECORD_BYTES
+        if content.len() > limit
             || before.len() != content.len() as u64
             || after.dev() != before.dev()
             || after.ino() != before.ino()
@@ -3618,11 +3648,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             || after.ctime_nsec() != before.ctime_nsec()
         {
             return Err(fail(format!(
-                "agent record changed while reading: {}",
+                "{label} changed while reading: {}",
                 path.display()
             )));
         }
-        if require_active_name {
+        if require_named_directory {
             Self::verify_pinned_agent_directory(pinned)?;
         }
         Ok(content)
@@ -7162,14 +7192,49 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         })
     }
 
+    fn managed_dead_retirement_exists(&self, record: &AgentRecord) -> Result<bool> {
+        let pinned = self.pinned_agent_directory(&record.name)?;
+        let Some(file) =
+            Self::open_optional_pinned_file(&pinned, MANAGED_DEAD_RETIREMENT_FILE, libc::O_RDONLY)?
+        else {
+            Self::verify_pinned_agent_directory(&pinned)?;
+            return Ok(false);
+        };
+        let metadata = file.metadata().map_err(|error| {
+            fail(format!(
+                "cannot inspect managed-dead retirement receipt: {error}"
+            ))
+        })?;
+        let uid = unsafe { libc::getuid() };
+        if !metadata.is_file()
+            || metadata.uid() != uid
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.nlink() != 1
+        {
+            return Err(fail("unsafe managed-dead retirement receipt"));
+        }
+        Self::verify_pinned_agent_directory(&pinned)?;
+        Ok(true)
+    }
+
     fn read_managed_dead_retirement(
         &self,
-        directory: &Path,
+        pinned: &PinnedAgentDirectory,
         record: &AgentRecord,
         record_bytes: &[u8],
     ) -> Result<Value> {
-        let path = directory.join(MANAGED_DEAD_RETIREMENT_FILE);
-        let document = agent::read_private_json_bounded(&path, MAX_AGENT_RECORD_BYTES as u64)?;
+        let bytes = Self::pinned_artifact_bytes(
+            pinned,
+            MANAGED_DEAD_RETIREMENT_FILE,
+            MAX_AGENT_RECORD_BYTES,
+            "managed-dead retirement receipt",
+            true,
+        )?;
+        let document = agent::decode_json_strict(&bytes).map_err(|error| {
+            fail(format!(
+                "cannot decode managed-dead retirement receipt: {error}"
+            ))
+        })?;
         let expected = Self::managed_dead_retirement_value(record, record_bytes);
         if document != expected {
             return Err(fail(
@@ -7177,64 +7242,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             ));
         }
         Ok(expected)
-    }
-
-    fn bounded_private_file_bytes(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|error| fail(format!("cannot open {label}: {error}")))?;
-        let before = file
-            .metadata()
-            .map_err(|error| fail(format!("cannot inspect {label}: {error}")))?;
-        let uid = unsafe { libc::getuid() };
-        if !before.is_file()
-            || before.uid() != uid
-            || before.permissions().mode() & 0o077 != 0
-            || before.nlink() != 1
-            || before.len() > limit as u64
-        {
-            return Err(fail(format!("unsafe {label}")));
-        }
-        let mut bytes = Vec::with_capacity(before.len() as usize);
-        Read::by_ref(&mut file)
-            .take((limit + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|error| fail(format!("cannot read {label}: {error}")))?;
-        let after = file
-            .metadata()
-            .map_err(|error| fail(format!("cannot reinspect {label}: {error}")))?;
-        if bytes.len() > limit
-            || before.len() != bytes.len() as u64
-            || (
-                before.dev(),
-                before.ino(),
-                before.mode(),
-                before.uid(),
-                before.nlink(),
-            ) != (
-                after.dev(),
-                after.ino(),
-                after.mode(),
-                after.uid(),
-                after.nlink(),
-            )
-            || (
-                before.mtime(),
-                before.mtime_nsec(),
-                before.ctime(),
-                before.ctime_nsec(),
-            ) != (
-                after.mtime(),
-                after.mtime_nsec(),
-                after.ctime(),
-                after.ctime_nsec(),
-            )
-        {
-            return Err(fail(format!("{label} changed while it was read")));
-        }
-        Ok(bytes)
     }
 
     fn managed_dead_result(name: &str, destination: &Path) -> Value {
@@ -7254,6 +7261,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent_name: &str,
         expected_token: Option<&str>,
     ) -> Result<Option<Value>> {
+        self.managed_dead_archive_receipt_with(agent_name, expected_token, || {}, || {})
+    }
+
+    fn managed_dead_archive_receipt_with<AfterRecord, AfterReceipt>(
+        &self,
+        agent_name: &str,
+        expected_token: Option<&str>,
+        after_record_read: AfterRecord,
+        after_receipt_read: AfterReceipt,
+    ) -> Result<Option<Value>>
+    where
+        AfterRecord: FnOnce(),
+        AfterReceipt: FnOnce(),
+    {
         let Some(expected_token) = expected_token else {
             return Ok(None);
         };
@@ -7279,12 +7300,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
             Ok(_) => {}
         }
-        agent::validate_private_directory(&destination, "managed-dead agent archive", false)?;
+        let pinned = Self::pinned_agent_directory_at(
+            agent_name,
+            destination.clone(),
+            "managed-dead agent archive",
+        )?;
         let record_path = destination.join("agent.json");
-        let record_bytes = Self::bounded_private_file_bytes(
-            &record_path,
+        let record_bytes = Self::pinned_artifact_bytes(
+            &pinned,
+            "agent.json",
             MAX_AGENT_RECORD_BYTES,
             "managed-dead archived record",
+            true,
         )?;
         let record = AgentRecord::from_storage_value(
             agent::decode_json_strict(&record_bytes).map_err(|error| {
@@ -7298,12 +7325,23 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if record.token != expected_token
             || record.lifecycle != "stopped"
             || record.launch.adapter != "herdr-pane"
+            || record.launch.harness != "muse"
+            || record.launch.mode != "interactive"
+            || record.launch.backend != "herdr"
+            || record.launch.runtime_ownership != "owned"
+            || record.custom_process_identity.is_none()
+            || record.workspace_id.is_none()
+            || record.tab_id.is_none()
+            || record.pane_id.is_none()
         {
             return Err(fail(
                 "managed-dead archive is not an exact preserved-runtime receipt",
             ));
         }
-        self.read_managed_dead_retirement(&destination, &record, &record_bytes)?;
+        after_record_read();
+        self.read_managed_dead_retirement(&pinned, &record, &record_bytes)?;
+        after_receipt_read();
+        Self::verify_pinned_agent_directory(&pinned)?;
         Ok(Some(Self::managed_dead_result(agent_name, &destination)))
     }
 
@@ -7323,7 +7361,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "preserved managed-dead publication requires an exact stopped herdr-pane record",
             ));
         }
-        self.read_managed_dead_retirement(pinned.path.as_path(), &final_record, &snapshot.content)?;
+        self.read_managed_dead_retirement(pinned, &final_record, &snapshot.content)?;
         let (_archive, destination) = self.archive_destination(&final_record)?;
         self.publish_pinned_directory(pinned, &destination, &snapshot.content)?;
         Ok(self
@@ -7582,7 +7620,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "--expected-record-sha256 requires --recover-legacy-adoption",
             ));
         }
-        if record.launch.adapter == "herdr-pane" && record.lifecycle == "stopped" {
+        if record.launch.adapter == "herdr-pane"
+            && record.lifecycle == "stopped"
+            && self.managed_dead_retirement_exists(&record)?
+        {
             let pane_id = record
                 .pane_id
                 .as_deref()
@@ -13423,6 +13464,113 @@ mod tests {
         assert_eq!(second, first);
         assert_eq!(*fixture.client.panes.lock().unwrap(), retained);
         assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_muse_stop_retries_stopped_before_archive_without_retirement_receipt() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let token = started["token"].as_str().unwrap().to_owned();
+        fixture.client.panes.lock().unwrap().clear();
+        let mut record = manager.load("worker").unwrap();
+        record.lifecycle = "stopped".to_owned();
+        manager.save(&record).unwrap();
+        let active = fixture.root.join("registry/worker");
+        assert!(!active.join(MANAGED_DEAD_RETIREMENT_FILE).exists());
+
+        let result = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result["pane_closed"], false);
+        assert!(!active.exists());
+        assert!(Path::new(result["archive"].as_str().unwrap()).is_dir());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn running_owned_dead_muse_archive_receipt_pins_one_directory_generation() {
+        for swap_after_receipt in [false, true] {
+            let fixture = Fixture::new();
+            fixture
+                .client
+                .report_session
+                .store(false, Ordering::Relaxed);
+            let manager = fixture.manager();
+            let started = manager
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        workspace_id: Some("workspace".to_owned()),
+                        harness: "muse".to_owned(),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap();
+            fixture.client.custom_alive.store(false, Ordering::Relaxed);
+            let token = started["token"].as_str().unwrap().to_owned();
+            let first = manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(token.clone()),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap();
+            let destination = PathBuf::from(first["archive"].as_str().unwrap());
+            let replacement = destination.with_extension("replacement");
+            let displaced = destination.with_extension("displaced");
+            agent::create_private_directory(
+                &replacement,
+                "replacement managed-dead archive",
+                true,
+                true,
+            )
+            .unwrap();
+            for name in ["agent.json", MANAGED_DEAD_RETIREMENT_FILE] {
+                fs::copy(destination.join(name), replacement.join(name)).unwrap();
+            }
+            let replace = || {
+                fs::rename(&destination, &displaced).unwrap();
+                fs::rename(&replacement, &destination).unwrap();
+            };
+            let retained = fixture.client.panes.lock().unwrap().clone();
+
+            let result = if swap_after_receipt {
+                manager.managed_dead_archive_receipt_with("worker", Some(&token), || {}, replace)
+            } else {
+                manager.managed_dead_archive_receipt_with("worker", Some(&token), replace, || {})
+            };
+
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("directory changed"),
+                "archive replacement after receipt={swap_after_receipt} was accepted"
+            );
+            assert_eq!(*fixture.client.panes.lock().unwrap(), retained);
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

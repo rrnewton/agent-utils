@@ -513,6 +513,78 @@ def test_owned_dead_muse_stop_result_loss_reconciles_from_archive_receipt(
     assert fake.closed == []
 
 
+def test_ordinary_muse_stop_retries_stopped_before_archive_without_retirement_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start(
+        "worker", cwd=str(tmp_path), harness="muse", workspace_id="w1",
+    )
+    token = str(started["token"])
+    # This is the ordinary teardown prefix: its pane was already closed, then
+    # lifecycle=stopped was committed, but archive rename did not happen.
+    fake.presentations.clear()
+    record = manager.get("worker")
+    record.lifecycle = "stopped"
+    manager._save(record)
+    active = manager.registry / "worker"
+    assert not (active / "managed-dead-retirement.json").exists()
+
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["pane_closed"] is False
+    assert not active.exists()
+    assert Path(str(result["archive"])).is_dir()
+    assert fake.closed == []
+
+
+@pytest.mark.parametrize("swap_after", ["agent.json", "managed-dead-retirement.json"])
+def test_owned_dead_muse_archive_receipt_refuses_directory_replacement_between_reads(
+    swap_after: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    first = manager.stop("worker", expected_token=token)
+    destination = Path(str(first["archive"]))
+    saved = {
+        name: (destination / name).read_bytes()
+        for name in ("agent.json", "managed-dead-retirement.json")
+    }
+    retained = list(fake.presentations)
+    original = manager._pinned_artifact_bytes
+    swapped = False
+
+    def replace_after_read(
+        pinned: subagents_module._PinnedAgentDirectory, *, name: str,
+        limit: int, purpose: str, require_named_directory: bool = True,
+    ) -> bytes:
+        nonlocal swapped
+        content = original(
+            pinned, name=name, limit=limit, purpose=purpose,
+            require_named_directory=require_named_directory,
+        )
+        if name == swap_after and not swapped:
+            swapped = True
+            displaced = destination.with_name(destination.name + "-displaced")
+            destination.rename(displaced)
+            destination.mkdir(mode=0o700)
+            for artifact, artifact_bytes in saved.items():
+                replacement = destination / artifact
+                replacement.write_bytes(artifact_bytes)
+                replacement.chmod(0o600)
+        return content
+
+    monkeypatch.setattr(manager, "_pinned_artifact_bytes", replace_after_read)
+    with pytest.raises(AgentDeliveryError, match="directory changed"):
+        manager.stop("worker", expected_token=token)
+
+    assert swapped
+    assert fake.presentations == retained
+    assert fake.closed == []
+
+
 def test_managed_dead_stop_refuses_expanded_stopped_record_before_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -4536,13 +4536,42 @@ class ManagedAgents:
             "runtime_preserved": True,
         }
 
+    def _managed_dead_retirement_exists(self, record: AgentRecord) -> bool:
+        """Distinguish a preserved-runtime stop prefix from an ordinary stop."""
+        with self._pinned_agent_directory(record.name) as pinned:
+            try:
+                metadata = os.stat(
+                    _MANAGED_DEAD_RETIREMENT_FILE,
+                    dir_fd=pinned.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                self._verify_pinned_agent_directory(pinned)
+                return False
+            except OSError as exc:
+                raise AgentDeliveryError(
+                    f"cannot inspect managed-dead retirement receipt: {exc}"
+                ) from exc
+            if (not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                    or metadata.st_nlink != 1):
+                raise AgentDeliveryError("unsafe managed-dead retirement receipt")
+            self._verify_pinned_agent_directory(pinned)
+            return True
+
     def _read_managed_dead_retirement(
-        self, directory: Path, record: AgentRecord, record_bytes: bytes,
+        self, pinned: _PinnedAgentDirectory, record: AgentRecord,
+        record_bytes: bytes,
     ) -> dict[str, object]:
-        path = directory / _MANAGED_DEAD_RETIREMENT_FILE
-        document = agent._read_queue_json(
-            str(path), "managed-dead retirement receipt", require_private=True,
-            max_artifact_bytes=_MAX_AGENT_RECORD_BYTES,
+        path = pinned.path / _MANAGED_DEAD_RETIREMENT_FILE
+        content = self._pinned_artifact_bytes(
+            pinned, name=_MANAGED_DEAD_RETIREMENT_FILE,
+            limit=_MAX_AGENT_RECORD_BYTES,
+            purpose="managed-dead retirement receipt",
+        )
+        document = agent._decode_json_bytes(
+            content, "managed-dead retirement receipt", path,
         )
         expected = self._managed_dead_retirement_document(record, record_bytes)
         if document != expected:
@@ -4559,24 +4588,29 @@ class ManagedAgents:
         destination = self.registry / "archive" / f"{name}-{expected_token}"
         if not os.path.lexists(destination):
             return None
-        agent._validate_private_directory(
-            str(destination), "managed-dead agent archive",
-        )
-        record_path = destination / "agent.json"
-        record_bytes = agent._read_bounded_queue_bytes(
-            str(record_path), "managed-dead archived record", require_private=True,
-            max_artifact_bytes=_MAX_AGENT_RECORD_BYTES,
-        )
-        document = agent._decode_json_bytes(
-            record_bytes, "managed-dead archived record", record_path,
-        )
-        record = AgentRecord._from_value(document, record_path, name)
-        if (record.token != expected_token or record.lifecycle != "stopped"
-                or record.launch.adapter != "herdr-pane"):
-            raise AgentDeliveryError(
-                "managed-dead archive is not an exact preserved-runtime receipt"
+        with self._pinned_agent_directory(
+            name, path=destination, label="managed-dead agent archive",
+        ) as pinned:
+            snapshot = self._managed_record_snapshot(
+                pinned, expected_token=expected_token,
             )
-        self._read_managed_dead_retirement(destination, record, record_bytes)
+            record = snapshot.record
+            if (record.lifecycle != "stopped"
+                    or record.launch.adapter != "herdr-pane"
+                    or record.launch.harness != "muse"
+                    or record.launch.mode != "interactive"
+                    or record.launch.backend != "herdr"
+                    or record.launch.runtime_ownership != "owned"
+                    or record.custom_process_identity is None
+                    or not record.workspace_id or not record.tab_id
+                    or not record.pane_id):
+                raise AgentDeliveryError(
+                    "managed-dead archive is not an exact preserved-runtime receipt"
+                )
+            self._read_managed_dead_retirement(
+                pinned, record, snapshot.content,
+            )
+            self._verify_pinned_agent_directory(pinned)
         return {
             "name": name,
             "archive": str(destination),
@@ -4605,7 +4639,7 @@ class ManagedAgents:
             raise AgentDeliveryError(
                 "preserved managed-dead publication requires an exact stopped herdr-pane record"
             )
-        self._read_managed_dead_retirement(pinned.path, final, snapshot.content)
+        self._read_managed_dead_retirement(pinned, final, snapshot.content)
         _archive, destination = self._archive_destination(final)
         self._publish_pinned_directory(
             pinned, destination, expected_record=snapshot.content,
@@ -4883,7 +4917,8 @@ class ManagedAgents:
                     "--expected-record-sha256 requires --recover-legacy-adoption"
                 )
             if (record.launch.adapter == "herdr-pane"
-                    and record.lifecycle == "stopped"):
+                    and record.lifecycle == "stopped"
+                    and self._managed_dead_retirement_exists(record)):
                 return self._retire_managed_dead(
                     record, expected_token=expected_token,
                     expected_token_explicit=expected_token_explicit,
