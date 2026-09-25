@@ -235,13 +235,15 @@ pub fn nproc() -> i64 {
 /// `0-7,16-23`), matching `len(os.sched_getaffinity(0))`. `None` when the field is absent or
 /// unparsable.
 fn affinity_width() -> Option<i64> {
-    let text = fs::read_to_string("/proc/self/status").ok()?;
-    for line in text.lines() {
-        if let Some(list) = line.strip_prefix("Cpus_allowed_list:") {
-            return crate::sizing::count_cpu_ranges(list.trim());
-        }
-    }
-    None
+    let status = fs::read("/proc/self/status").ok()?;
+    affinity_width_from_status(&status)
+}
+
+fn affinity_width_from_status(status: &[u8]) -> Option<i64> {
+    let list = crate::procstat::status_field(status, b"Cpus_allowed_list")
+        .ok()
+        .flatten()?;
+    crate::sizing::count_cpu_ranges(std::str::from_utf8(list).ok()?)
 }
 
 /// Stable CPU-container key: affinity width plus the cgroup-v2 CPU quota (`/sys/fs/cgroup/cpu.max`).
@@ -358,25 +360,12 @@ pub fn store_paths(output_dir: &Path) -> Vec<PathBuf> {
 /// `cutime`/`cstime` (fields 16/17, in clock ticks). The getrusage(RUSAGE_CHILDREN) analogue.
 /// Public so the sweep (`cli.rs`) can bracket a single-step run and derive its user/sys CPU.
 pub fn child_cpu_seconds() -> (f64, f64) {
-    let text = match fs::read_to_string("/proc/self/stat") {
-        Ok(t) => t,
-        Err(_) => return (0.0, 0.0),
+    let stat = match crate::procstat::read(std::process::id()) {
+        Ok(Some(stat)) => stat,
+        Ok(None) | Err(_) => return (0.0, 0.0),
     };
-    // The comm field (2) may contain spaces/parens; fields resume after the LAST ')'.
-    let after = match text.rfind(')') {
-        Some(i) => &text[i + 1..],
-        None => return (0.0, 0.0),
-    };
-    let fields: Vec<&str> = after.split_whitespace().collect();
-    // After ')', token[0] is field 3 (state); field N is token[N-3].
-    let cutime = fields
-        .get(13)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let cstime = fields
-        .get(14)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0);
+    let cutime = stat.child_utime_ticks as f64;
+    let cstime = stat.child_stime_ticks as f64;
     let tck = clk_tck() as f64;
     (cutime / tck, cstime / tck)
 }
@@ -902,6 +891,22 @@ mod tests {
         assert_eq!(&ts[4..5], "-");
         assert_eq!(&ts[10..11], "T");
         assert!(ts.ends_with('Z'));
+    }
+
+    #[test]
+    fn affinity_width_rejects_a_field_forged_inside_the_process_name() {
+        assert_eq!(
+            affinity_width_from_status(
+                b"Name:\topaque\xff\rCpus_allowed_list:\t99\nCpus_allowed_list:\t0-3,8\n"
+            ),
+            Some(5)
+        );
+        assert_eq!(
+            affinity_width_from_status(
+                b"Name:\topaque\xff\nCpus_allowed_list:\t99\nCpus_allowed_list:\t0-3,8\n"
+            ),
+            None
+        );
     }
 
     #[test]

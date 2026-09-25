@@ -183,19 +183,18 @@ fn fd_pid(text: &str) -> Result<i64, Unavailable> {
 struct Proc {
     root: File,
 }
-fn verify_namespace_status(status: &str, pid: u32) -> Result<(), Unavailable> {
-    let namespaces: Vec<_> = status
-        .lines()
-        .filter_map(|line| line.strip_prefix("NSpid:"))
-        .map(str::split_whitespace)
-        .map(Iterator::collect::<Vec<_>>)
-        .collect();
-    if namespaces.is_empty() {
-        return Err(unavailable(
-            "procfs namespace metadata unavailable: NSpid missing",
-        ));
-    }
-    if namespaces != vec![vec![pid.to_string().as_str()]] {
+fn verify_namespace_status(status: &[u8], pid: u32) -> Result<(), Unavailable> {
+    let namespace = crate::procstat::status_field(status, b"NSpid")
+        .map_err(unavailable)?
+        .ok_or_else(|| unavailable("procfs namespace metadata unavailable: NSpid missing"))?;
+    let mut ids = namespace
+        .split(|byte| matches!(byte, b' ' | b'\t'))
+        .filter(|value| !value.is_empty());
+    let observed = ids
+        .next()
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<u32>().ok());
+    if observed != Some(pid) || ids.next().is_some() {
         return Err(unavailable("procfs PID namespace mismatch"));
     }
     Ok(())
@@ -219,7 +218,7 @@ impl Proc {
         let proc = Self { root };
         let deadline = Instant::now() + SCAN_TIME;
         let status = read_record(&proc.open("self/status", deadline)?, deadline)?;
-        verify_namespace_status(&status, std::process::id())?;
+        verify_namespace_status(status.as_bytes(), std::process::id())?;
         let own = stat(&read_record(&proc.open("self/stat", deadline)?, deadline)?)?;
         if own.pid != std::process::id() {
             return Err(unavailable("procfs PID namespace mismatch"));
@@ -1339,12 +1338,17 @@ mod tests {
                 .to_string()
                 .contains("SC_CLK_TCK unavailable"));
         }
-        assert!(verify_namespace_status("NSpid:\t100\n", 100).is_ok());
-        assert!(verify_namespace_status("Name:\ttest\n", 100)
+        assert!(verify_namespace_status(b"NSpid:\t100\n", 100).is_ok());
+        assert!(verify_namespace_status(b"Name:\ttest\n", 100)
             .unwrap_err()
             .to_string()
             .contains("NSpid missing"));
-        for text in ["NSpid: 100 1\n", "NSpid: 101\n", "NSpid: 100\nNSpid: 100\n"] {
+        for text in [
+            b"NSpid: 100 1\n".as_slice(),
+            b"NSpid: 101\n".as_slice(),
+            b"NSpid: 100\nNSpid: 100\n".as_slice(),
+            b"Name:\tx\nNSpid:\t100\nState:\tS\nNSpid:\t100\n".as_slice(),
+        ] {
             assert!(verify_namespace_status(text, 100).is_err());
         }
     }

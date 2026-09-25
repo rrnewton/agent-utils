@@ -121,21 +121,22 @@ pub fn default_ledger_path() -> PathBuf {
         .join("core-reservations.json")
 }
 
-fn proc_starttime(pid: u32) -> Option<u64> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rparen = text.rfind(')')?;
-    text.get(rparen + 2..)?
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+fn proc_starttime(pid: u32) -> Result<Option<u64>, String> {
+    crate::procstat::read(pid)
+        .map(|stat| stat.map(|stat| stat.starttime_ticks))
+        .map_err(|error| error.to_string())
 }
 
-fn holder_alive(record: &Record) -> bool {
-    match proc_starttime(record.pid) {
-        None => false,
-        Some(_) if record.starttime.is_none() => true,
-        Some(current) => record.starttime == Some(current),
+fn current_starttime(pid: u32) -> Result<u64, String> {
+    proc_starttime(pid)?
+        .ok_or_else(|| format!("could not read current process identity from /proc/{pid}/stat"))
+}
+
+fn holder_alive(record: &Record) -> Result<bool, String> {
+    match proc_starttime(record.pid)? {
+        None => Ok(false),
+        Some(_) if record.starttime.is_none() => Ok(true),
+        Some(current) => Ok(record.starttime == Some(current)),
     }
 }
 
@@ -293,8 +294,17 @@ fn store(path: &Path, records: &[Record]) -> Result<(), String> {
     result
 }
 
-fn sweep(records: Vec<Record>) -> (Vec<Record>, Vec<Record>) {
-    records.into_iter().partition(holder_alive)
+fn sweep(records: Vec<Record>) -> Result<(Vec<Record>, Vec<Record>), String> {
+    let mut live = Vec::new();
+    let mut dead = Vec::new();
+    for record in records {
+        if holder_alive(&record)? {
+            live.push(record);
+        } else {
+            dead.push(record);
+        }
+    }
+    Ok((live, dead))
 }
 
 /// A collision-free core reservation.  Dropping it releases its ledger record.
@@ -369,9 +379,9 @@ pub fn acquire(
         .map(Path::to_path_buf)
         .unwrap_or_else(default_ledger_path);
     let pid = std::process::id();
-    let starttime = proc_starttime(pid);
+    let starttime = Some(current_starttime(pid)?);
     let _lock = LedgerLock::acquire(&path)?;
-    let (live, _) = sweep(load(&path)?);
+    let (live, _) = sweep(load(&path)?)?;
     let mut held = exclude.clone();
     for record in &live {
         held.extend(record.cores.iter().copied());
@@ -419,7 +429,7 @@ pub fn reclaim_dead(ledger: Option<&Path>) -> Result<Vec<Value>, String> {
         .map(Path::to_path_buf)
         .unwrap_or_else(default_ledger_path);
     let _lock = LedgerLock::acquire(&path)?;
-    let (live, dead) = sweep(load(&path)?);
+    let (live, dead) = sweep(load(&path)?)?;
     if !dead.is_empty() {
         store(&path, &live)?;
     }
@@ -432,7 +442,7 @@ pub fn held_cores(ledger: Option<&Path>) -> Result<Vec<usize>, String> {
         .map(Path::to_path_buf)
         .unwrap_or_else(default_ledger_path);
     let _lock = LedgerLock::acquire(&path)?;
-    let (live, dead) = sweep(load(&path)?);
+    let (live, dead) = sweep(load(&path)?)?;
     if !dead.is_empty() {
         store(&path, &live)?;
     }

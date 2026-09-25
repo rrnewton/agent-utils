@@ -13,6 +13,8 @@ from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from dagrun.procstat import parse_process_stat
+
 __all__ = [
     "command_basename",
     "proc_cwd",
@@ -84,13 +86,12 @@ def ancestor_pids(start_pid: int | None = None) -> set[int]:
     while pid and pid not in pids:
         pids.add(pid)
         try:
-            with open(f"/proc/{pid}/stat") as handle:
-                # comm (field 2) may contain spaces/parens, so split AFTER the closing ')'
-                # of comm; PPID is then the 2nd remaining field.
-                stat = handle.read()
-                after_comm = stat[stat.rindex(")") + 1:].split()
-                pid = int(after_comm[1])
-        except (OSError, ValueError, IndexError):
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                stat = parse_process_stat(handle.read())
+            if stat is None or stat.pid != pid:
+                break
+            pid = stat.ppid
+        except OSError:
             break
     return pids
 

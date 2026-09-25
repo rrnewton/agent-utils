@@ -30,6 +30,7 @@ pub mod memory_feedback;
 pub mod model;
 pub mod perflog;
 pub mod proccpu;
+mod procstat;
 pub mod profile_capture;
 pub mod profile_enrich;
 pub mod profile_report;

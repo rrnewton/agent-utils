@@ -150,24 +150,9 @@ fn value_i64(value: &Value) -> Option<i64> {
 }
 
 fn proc_starttime(pid: u32) -> Result<Option<u64>, String> {
-    let path = format!("/proc/{pid}/stat");
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("read process identity {path}: {error}")),
-    };
-    let rparen = text
-        .rfind(')')
-        .ok_or_else(|| format!("process identity {path} has no command terminator"))?;
-    let starttime = text
-        .get(rparen + 2..)
-        .ok_or_else(|| format!("process identity {path} has no fields"))?
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| format!("process identity {path} has no starttime"))?
-        .parse()
-        .map_err(|error| format!("parse process identity {path} starttime: {error}"))?;
-    Ok(Some(starttime))
+    crate::procstat::read(pid)
+        .map(|stat| stat.map(|stat| stat.starttime_ticks))
+        .map_err(|error| error.to_string())
 }
 
 fn holder_alive(record: &Record) -> Result<bool, String> {

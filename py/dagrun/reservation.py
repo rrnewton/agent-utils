@@ -51,6 +51,7 @@ from types import TracebackType
 from typing import IO
 
 from dagrun.cgroup import pick_least_busy_free_cores
+from dagrun.procstat import parse_process_stat
 
 _MAX_U32 = (1 << 32) - 1
 _MAX_U64 = (1 << 64) - 1
@@ -88,24 +89,22 @@ def _proc_starttime(pid: int) -> int | None:
     """The holder's start time (clock ticks since boot, ``/proc/<pid>/stat``
     field 22). Combined with the PID it fingerprints a process across PID reuse:
     a recycled PID has a different starttime, so a dead holder is never mistaken
-    for a live one. Returns ``None`` if the process is gone."""
+    for a live one. Returns ``None`` only if the process is positively gone;
+    unreadable or malformed evidence raises rather than releasing its cores."""
     try:
-        data = Path(f"/proc/{pid}/stat").read_text()
-    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
         return None
-    # comm (field 2) is parenthesized and may contain spaces/parens; everything
-    # after the LAST ')' is space-separated. starttime is field 22 → after comm
-    # the fields start at field 3 (index 0), so starttime is index 22-3 = 19.
-    rparen = data.rfind(")")
-    if rparen < 0:
-        return None
-    rest = data[rparen + 2 :].split()
-    if len(rest) <= 19:
-        return None
-    try:
-        return int(rest[19])
-    except ValueError:
-        return None
+    except OSError as exc:
+        raise ReservationStateError(
+            f"cannot inspect process {pid} for core-ledger ownership: {exc}"
+        ) from exc
+    parsed = parse_process_stat(data)
+    if parsed is None or parsed.pid != pid:
+        raise ReservationStateError(
+            f"cannot parse process {pid} identity for core-ledger ownership"
+        )
+    return parsed.starttime
 
 
 def _holder_alive(pid: int, starttime: int | None) -> bool:

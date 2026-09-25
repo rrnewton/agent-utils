@@ -54,6 +54,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import IO
 
+from dagrun.procstat import parse_process_stat
+
 __all__ = [
     "AdmissionStateError",
     "Decision",
@@ -269,21 +271,23 @@ def _proc_starttime(pid: int) -> int | None:
 
     Combined with the PID it fingerprints a process across PID reuse, so a dead holder's memory
     is reclaimed and a live unrelated process that inherited the number is never released.
+    ``None`` means positive disappearance; unreadable or malformed evidence raises so it cannot
+    authorize reclaim.
     """
     try:
-        data = Path(f"/proc/{pid}/stat").read_text()
-    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
         return None
-    rparen = data.rfind(")")
-    if rparen < 0:
-        return None
-    rest = data[rparen + 2 :].split()
-    if len(rest) <= 19:
-        return None
-    try:
-        return int(rest[19])
-    except ValueError:
-        return None
+    except OSError as exc:
+        raise AdmissionStateError(
+            f"cannot inspect process {pid} for memory-ledger ownership: {exc}"
+        ) from exc
+    parsed = parse_process_stat(data)
+    if parsed is None or parsed.pid != pid:
+        raise AdmissionStateError(
+            f"cannot parse process {pid} identity for memory-ledger ownership"
+        )
+    return parsed.starttime
 
 
 def _holder_alive(pid: int, starttime: int | None) -> bool:

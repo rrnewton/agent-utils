@@ -233,19 +233,19 @@ def test_an_outer_budget_cut_names_the_budget_and_never_a_peer(tmp_path: Path) -
     records = _records(
         tmp_path / "outer",
         (
-            Step("a", "first", "spends the budget", "sleep 2", timeout=3, cpu_timeout=30),
+            Step("a", "first", "spends the budget", "sleep 4", timeout=7, cpu_timeout=30),
             Step(
                 "a",
                 "long",
                 "is cut by the run bound",
                 "sleep 30",
                 deps=["a.first"],
-                timeout=3,
+                timeout=7,
                 cpu_timeout=30,
             ),
         ),
         jobs=1,
-        run_timeout_s=4,
+        run_timeout_s=8,
     )
     record = _by_step(records, "a.long")
     assert record["aborted"] == "true", record

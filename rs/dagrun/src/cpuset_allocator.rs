@@ -139,14 +139,18 @@ fn systemd_run_available() -> bool {
         .is_ok_and(|status| status.is_some_and(|status| status.success()))
 }
 
-fn read_allowed(pid: u32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
+fn allowed_from_status(status: &[u8]) -> Option<String> {
+    crate::procstat::status_field(status, b"Cpus_allowed_list")
         .ok()
-        .and_then(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("Cpus_allowed_list:").map(str::trim))
-                .map(str::to_string)
-        })
+        .flatten()
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .map(str::to_owned)
+}
+
+fn read_allowed(pid: u32) -> String {
+    std::fs::read(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| allowed_from_status(&status))
         .unwrap_or_default()
 }
 
@@ -682,6 +686,16 @@ mod tests {
     #[test]
     fn cpulist_is_sorted() {
         assert_eq!(cpulist(&[7, 2, 4]), "2,4,7");
+    }
+
+    #[test]
+    fn allowed_cpu_field_cannot_be_forged_by_opaque_name_bytes() {
+        let valid = b"Name:\tbad\xff\rCpus_allowed_list:\t99\x0bmore\nState:\tS\nCpus_allowed_list:\t0-2,7\n";
+        assert_eq!(allowed_from_status(valid).as_deref(), Some("0-2,7"));
+
+        let forged =
+            b"Name:\tbad\xff\nCpus_allowed_list:\t99\nState:\tS\nCpus_allowed_list:\t0-2,7\n";
+        assert_eq!(allowed_from_status(forged), None);
     }
 
     #[test]

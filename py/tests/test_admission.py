@@ -253,6 +253,36 @@ def test_an_unmeasurable_host_is_unknown_and_not_zero(
     assert live_headroom_bytes() is None
 
 
+@pytest.mark.parametrize("failure", [PermissionError("denied"), b"malformed"])
+def test_holder_identity_uncertainty_refuses_to_reclaim_memory(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException | bytes,
+) -> None:
+    """Only positive procfs disappearance may release another run's reservation."""
+
+    def read_bytes(_path: Path) -> bytes:
+        if isinstance(failure, BaseException):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    record = admission._Record(pid=4242, starttime=7, bytes_=1024, tag="live", ts=1.0)
+    with pytest.raises(admission.AdmissionStateError, match="process 4242"):
+        admission._sweep([record])
+
+
+def test_disappeared_holder_can_be_reclaimed_from_memory_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ENOENT remains positive evidence that the recorded process is gone."""
+
+    def disappeared(_path: Path) -> bytes:
+        raise FileNotFoundError("exited during procfs scan")
+
+    monkeypatch.setattr(Path, "read_bytes", disappeared)
+    record = admission._Record(pid=4242, starttime=7, bytes_=1024, tag="dead", ts=1.0)
+    assert admission._sweep([record]) == ([], [record])
+
+
 def test_an_unknown_host_gates_on_nothing_rather_than_refusing_everything(
     tmp_path: Path,
 ) -> None:

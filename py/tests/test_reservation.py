@@ -293,6 +293,36 @@ def test_pid_reuse_does_not_keep_stale_holder_alive(ledger: Path) -> None:
     assert res.held_cores(ledger) == [], "stale (mismatched-starttime) record must be swept"
 
 
+@pytest.mark.parametrize("failure", [PermissionError("denied"), b"malformed"])
+def test_holder_identity_uncertainty_refuses_to_reclaim_cores(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException | bytes,
+) -> None:
+    """Only positive procfs disappearance may release another run's reservation."""
+
+    def read_bytes(_path: Path) -> bytes:
+        if isinstance(failure, BaseException):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    record = res._Record(pid=4242, starttime=7, cores=[0], tag="live", ts=1.0)
+    with pytest.raises(res.ReservationStateError, match="process 4242"):
+        res._sweep([record])
+
+
+def test_disappeared_holder_can_be_reclaimed_from_core_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ENOENT remains positive evidence that the recorded process is gone."""
+
+    def disappeared(_path: Path) -> bytes:
+        raise FileNotFoundError("exited during procfs scan")
+
+    monkeypatch.setattr(Path, "read_bytes", disappeared)
+    record = res._Record(pid=4242, starttime=7, cores=[0], tag="dead", ts=1.0)
+    assert res._sweep([record]) == ([], [record])
+
+
 def test_insufficient_cores_refuses(ledger: Path) -> None:
     """When the free-and-unheld pool is smaller than K, acquire RAISES rather
     than returning an overlapping set."""

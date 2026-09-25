@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Literal
 
+from dagrun.procstat import parse_process_stat
+
 LOG_DIR_ENV = "DAGRUN_LOG_DIR"
 NO_LOGS_ENV = "DAGRUN_NO_STEP_LOGS"
 LOG_MAX_BYTES_ENV = "DAGRUN_LOG_MAX_BYTES"
@@ -450,15 +452,14 @@ def process_snapshot(root: int, nonce: str | None) -> tuple[ProcessObservation, 
             continue
         pid = int(entry.name)
         try:
-            stat_text = (entry / "stat").read_text(encoding="utf-8")
-            fields = stat_text[stat_text.rfind(")") + 1 :].split()
-            if len(fields) <= 19:
+            stat = parse_process_stat((entry / "stat").read_bytes())
+            if stat is None or stat.pid != pid:
                 continue
-            state = fields[0]
-            ppid = int(fields[1])
-            utime = int(fields[11])
-            stime = int(fields[12])
-            start = int(fields[19])
+            state = stat.state
+            ppid = stat.ppid
+            utime = stat.utime
+            stime = stat.stime
+            start = stat.starttime
             raw_cmd = (entry / "cmdline").read_bytes()
             argv = [part.decode(errors="replace") for part in raw_cmd.split(b"\0") if part]
             carries = False
@@ -467,7 +468,7 @@ def process_snapshot(root: int, nonce: str | None) -> tuple[ProcessObservation, 
                     carries = needle in (entry / "environ").read_bytes().split(b"\0")
                 except OSError:
                     pass
-        except (OSError, ValueError):
+        except OSError:
             continue
         rows[pid] = (ppid, state, utime, stime, start, argv, carries)
     owned = {root}

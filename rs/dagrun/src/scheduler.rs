@@ -571,18 +571,8 @@ fn signal_pid(pid: u32, signal: i32) -> bool {
 /// after its final `)`. Zombies deliberately return `None`: their group leader cannot be
 /// wait-reaped until the supervisor regains control, and treating it as live would spend the whole
 /// diagnostic grace after a cooperative SIGTERM exit.
-fn live_process_group_from_stat(stat: &str) -> Option<u32> {
-    let close = stat.rfind(')')?;
-    // Fields after comm begin at field 3: state, ppid, pgrp.
-    let mut fields = stat[close + 1..].split_whitespace();
-    let (Some(state), Some(_ppid), Some(pgrp)) = (fields.next(), fields.next(), fields.next())
-    else {
-        return None;
-    };
-    if state == "Z" {
-        return None;
-    }
-    pgrp.parse::<u32>().ok()
+fn live_process_group(stat: crate::procstat::ProcStat) -> Option<u32> {
+    (stat.state != b'Z').then_some(stat.pgrp)
 }
 
 /// Requested process groups containing at least one non-zombie process.
@@ -593,14 +583,20 @@ fn live_process_group_from_stat(stat: &str) -> Option<u32> {
 fn live_process_groups(groups: &HashSet<u32>) -> Option<HashSet<u32>> {
     let entries = std::fs::read_dir("/proc").ok()?;
     let mut live = HashSet::new();
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+    for entry in entries {
+        let entry = entry.ok()?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
-        let Some(pgrp) = live_process_group_from_stat(&stat) else {
+        let stat = match crate::procstat::read(pid) {
+            Ok(Some(stat)) => stat,
+            Ok(None) => continue,
+            Err(_) => return None,
+        };
+        let Some(pgrp) = live_process_group(stat) else {
             continue;
         };
         if groups.contains(&pgrp) {
@@ -637,31 +633,39 @@ fn terminate_groups(pids: &[u32]) {
 
 /// Every live descendant of `root`, deepest-first, from `/proc` parentage.
 ///
-/// Reads `PPid:` out of `/proc/<pid>/status` rather than field 4 of `/proc/<pid>/stat`, because a
-/// process name can contain spaces and parentheses and positional parsing of `stat` mis-attributes
-/// parentage for exactly the adversarial names a test corpus is most likely to contain.
+/// Reads field 4 from the byte representation of `/proc/<pid>/stat`. The process name can contain
+/// spaces, parentheses, newlines, and non-UTF-8 bytes; [`crate::procstat`] skips that opaque field
+/// before interpreting the ASCII tail. `/proc/<pid>/status` cannot safely supply `PPid:` because
+/// its raw `Name:` value can itself contain a newline and a forged-looking `PPid:` line.
 ///
 /// Deepest-first matters: killing a parent before its children can leave the children reparented
 /// to init and out of reach on the next sweep.
-fn proc_descendants(root: u32) -> Vec<u32> {
+fn proc_descendants(root: u32) -> (Vec<u32>, bool) {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+    let mut complete = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue; // not a pid directory
         };
-        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-            continue; // exited between readdir and read: benign
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
         };
-        if let Some(ppid) = status
-            .lines()
-            .find_map(|l| l.strip_prefix("PPid:"))
-            .and_then(|v| v.trim().parse::<u32>().ok())
-        {
-            children.entry(ppid).or_default().push(pid);
-        }
+        let stat = match crate::procstat::read(pid) {
+            Ok(Some(stat)) => stat,
+            Ok(None) => continue, // exited between readdir and read: benign
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        children.entry(stat.ppid).or_default().push(pid);
     }
     // Iterative DFS, then reverse, so parents are signalled after their children.
     let mut out = Vec::new();
@@ -676,46 +680,55 @@ fn proc_descendants(root: u32) -> Vec<u32> {
         }
     }
     out.reverse();
-    out
+    (out, complete)
 }
 
-/// SIGKILL every descendant of `root`, sweeping until no new ones appear.
+/// A sweep proves emptiness only when every process-table record was readable and no descendant
+/// remains in that snapshot. Whether a PID was newly discovered is irrelevant: a previously
+/// signalled descendant can remain alive (or unreaped) and must keep the bounded sweep incomplete.
+fn descendant_sweep_proves_empty(descendants: &[u32], snapshot_complete: bool) -> bool {
+    snapshot_complete && descendants.is_empty()
+}
+
+/// SIGKILL every descendant of `root`, sweeping until none remain.
 ///
 /// This is the fallback for the UNBOXED path, where there is no `cgroup.kill` to clear a subtree
 /// atomically. A process-group kill alone misses `setsid`/double-fork escapees — an escapee changes
 /// session and pgid but stays a descendant — and the strict-compat lane demonstrably has them. A
 /// budget that detects without terminating is indistinguishable from no budget at all.
 ///
-/// Sweeps repeatedly because the walk races a tree that may still be forking; it stops when a sweep
-/// finds nothing new or after [`DESCENDANT_KILL_SWEEPS`], so a pathological forker degrades to a
-/// bounded, reported failure rather than an unbounded loop.
+/// Sweeps repeatedly because the walk races a tree that may still be forking; it stops only when a
+/// complete snapshot contains no descendants or after [`DESCENDANT_KILL_SWEEPS`], so a
+/// pathological forker or a descendant that survives SIGKILL degrades to a bounded, reported
+/// failure rather than an unbounded loop. The returned boolean says whether a final complete
+/// snapshot proved that the known descendant set was empty.
 ///
 /// SAFETY: the set is derived strictly by parentage from `root`, never from a name or command-line
 /// pattern, so it cannot reach a sibling process belonging to somebody else. `root` itself is left
 /// to the caller's process-group kill; this only reaches things that escaped it. Returns the number
-/// of distinct pids signalled.
-fn kill_descendants(root: u32) -> usize {
+/// of distinct pids signalled and whether a complete snapshot proved that none remained.
+fn kill_descendants(root: u32) -> (usize, bool) {
     if root <= 1 {
-        return 0; // never walk from init, and never from a bogus pid
+        return (0, true); // never walk from init, and never from a bogus pid
     }
     let own = std::process::id();
     let mut killed: HashSet<u32> = HashSet::new();
+    let mut completed = false;
     for _ in 0..DESCENDANT_KILL_SWEEPS {
-        let mut fresh = 0usize;
-        for pid in proc_descendants(root) {
+        let (descendants, complete) = proc_descendants(root);
+        if descendant_sweep_proves_empty(&descendants, complete) {
+            completed = true;
+            break;
+        }
+        for pid in descendants {
             if pid <= 1 || pid == own {
                 continue; // a reap must never signal the runner itself
             }
-            if killed.insert(pid) {
-                fresh += 1;
-            }
+            killed.insert(pid);
             let _ = signal_pid(pid, libc::SIGKILL);
         }
-        if fresh == 0 {
-            break;
-        }
     }
-    killed.len()
+    (killed.len(), completed)
 }
 
 /// SIGKILL processes carrying this step's exact ownership nonce in their environment.
@@ -3128,11 +3141,18 @@ fn hard_reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
     };
     let _ = signal_group(pid, libc::SIGKILL);
     if !contained {
-        let swept = kill_descendants(pid);
+        let (swept, complete) = kill_descendants(pid);
         if swept > 0 {
             eprintln!(
                 "[scheduler] step {tag}: killed {swept} descendant(s) the process-group kill \
-                 missed (setsid/double-fork escapees)."
+                missed (setsid/double-fork escapees)."
+            );
+        }
+        if !complete {
+            eprintln!(
+                "[scheduler] WARNING: step {tag}: the bounded /proc descendant sweep never \
+                 obtained one complete and empty process-table snapshot; an unreadable or \
+                 malformed process record, or a surviving descendant, prevented the proof."
             );
         }
     }
@@ -6250,15 +6270,33 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
     #[test]
     fn proc_stat_parser_excludes_zombies_from_the_term_grace() {
         assert_eq!(
-            live_process_group_from_stat("123 (worker ) with parens) Z 1 777 0 0"),
+            crate::procstat::parse(
+                b"123 (worker ) with parens) Z 1 777 0 0 0 0 0 0 0 0 0 1 2 3 4 0 0 1 0 5",
+                None,
+            )
+            .ok()
+            .and_then(live_process_group),
             None
         );
         assert_eq!(
-            live_process_group_from_stat("456 (worker ) with parens) S 1 888 0 0"),
+            crate::procstat::parse(
+                b"456 (worker \xff)\nPPid: 999) S 1 888 0 0 0 0 0 0 0 0 0 1 2 3 4 0 0 1 0 5",
+                None,
+            )
+            .ok()
+            .and_then(live_process_group),
             Some(888)
         );
-        assert_eq!(live_process_group_from_stat("malformed"), None);
-        assert_eq!(live_process_group_from_stat("1 (x) S 0 nope"), None);
+        assert!(crate::procstat::parse(b"malformed", None).is_err());
+        assert!(crate::procstat::parse(b"1 (x) S 0 nope", None).is_err());
+    }
+
+    #[test]
+    fn descendant_sweep_requires_a_complete_and_empty_snapshot() {
+        assert!(descendant_sweep_proves_empty(&[], true));
+        assert!(!descendant_sweep_proves_empty(&[], false));
+        assert!(!descendant_sweep_proves_empty(&[1234], true));
+        assert!(!descendant_sweep_proves_empty(&[1234], false));
     }
 
     fn step(

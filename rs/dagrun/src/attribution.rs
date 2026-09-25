@@ -681,18 +681,12 @@ fn boot_elapsed_s() -> Option<f64> {
 }
 
 fn proc_row(pid: u32, nonce: Option<&str>) -> Option<ProcRow> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let close = stat.rfind(')')?;
-    let fields = stat[close + 1..].split_whitespace().collect::<Vec<_>>();
-    // fields[0] is process field 3 (state); starttime is process field 22 => index 19.
-    if fields.len() <= 19 {
-        return None;
-    }
-    let state = fields[0].chars().next()?;
-    let ppid = fields[1].parse().ok()?;
-    let utime_ticks = fields[11].parse().ok()?;
-    let stime_ticks = fields[12].parse().ok()?;
-    let start_ticks = fields[19].parse().ok()?;
+    let stat = crate::procstat::read(pid).ok().flatten()?;
+    let state = char::from(stat.state);
+    let ppid = stat.ppid;
+    let utime_ticks = stat.utime_ticks;
+    let stime_ticks = stat.stime_ticks;
+    let start_ticks = stat.starttime_ticks;
     let argv = std::fs::read(format!("/proc/{pid}/cmdline"))
         .ok()
         .map(|raw| {

@@ -60,10 +60,14 @@ pub fn parse_cpu_list(spec: &str) -> Option<Vec<usize>> {
 
 /// Extract this process's allowed CPU identifiers from `/proc/self/status` text.
 pub fn affinity_cpus_from_status(status: &str) -> Option<Vec<usize>> {
-    status.lines().find_map(|line| {
-        line.strip_prefix("Cpus_allowed_list:")
-            .and_then(|value| parse_cpu_list(value.trim()))
-    })
+    affinity_cpus_from_status_bytes(status.as_bytes())
+}
+
+fn affinity_cpus_from_status_bytes(status: &[u8]) -> Option<Vec<usize>> {
+    let value = crate::procstat::status_field(status, b"Cpus_allowed_list")
+        .ok()
+        .flatten()?;
+    parse_cpu_list(std::str::from_utf8(value).ok()?)
 }
 
 /// Derive physical/logical topology for an allowed CPU set.
@@ -101,9 +105,9 @@ where
 
 /// Discover process-visible topology from affinity plus Linux sysfs core identities.
 pub fn machine_topology() -> MachineTopology {
-    let allowed = std::fs::read_to_string("/proc/self/status")
+    let allowed = std::fs::read("/proc/self/status")
         .ok()
-        .and_then(|status| affinity_cpus_from_status(&status))
+        .and_then(|status| affinity_cpus_from_status_bytes(&status))
         .unwrap_or_else(|| {
             let logical = crate::perflog::nproc().max(1) as usize;
             (0..logical).collect()
@@ -437,6 +441,12 @@ mod tests {
         assert_eq!(
             affinity_cpus_from_status("Name:\tx\nCpus_allowed_list:\t0-2,7\n"),
             Some(vec![0, 1, 2, 7])
+        );
+        assert_eq!(
+            affinity_cpus_from_status(
+                "Name:\tx\nCpus_allowed_list:\t99\nState:\tS\nCpus_allowed_list:\t0-2,7\n"
+            ),
+            None
         );
     }
 

@@ -229,11 +229,22 @@ excluded = int(sys.argv[1])
 assigned = [int(value) for value in sys.argv[2].split(",") if value]
 
 def allowed_list(pid):
-    with open(f"/proc/{pid}/status") as fh:
-        for line in fh:
-            if line.startswith("Cpus_allowed_list:"):
-                return line.split(":", 1)[1].strip()
-    return ""
+    try:
+        with open(f"/proc/{pid}/status", "rb") as fh:
+            payload = fh.read(65537)
+    except OSError:
+        return ""
+    if len(payload) > 65536:
+        return ""
+    prefix = b"Cpus_allowed_list:\t"
+    values = [line[len(prefix):].strip() for line in payload.split(b"\n")
+              if line.startswith(prefix)]
+    if len(values) != 1:
+        return ""
+    try:
+        return values[0].decode("ascii")
+    except UnicodeError:
+        return ""
 
 # --- NEGATIVE: a child cannot be moved to an excluded core ---
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])

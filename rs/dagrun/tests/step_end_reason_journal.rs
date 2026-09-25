@@ -171,11 +171,11 @@ fn an_outer_budget_abort_records_the_budget_and_never_a_peer() {
     let dag = fx.write_dag(
         "outer",
         concat!(
-            r#"{"group":"a","job":"first","cmd":"sleep 2","timeout":3,"cpu_timeout":60},"#,
-            r#"{"group":"a","job":"long","deps":["a.first"],"cmd":"sleep 30","timeout":3,"cpu_timeout":60}"#
+            r#"{"group":"a","job":"first","cmd":"sleep 4","timeout":7,"cpu_timeout":60},"#,
+            r#"{"group":"a","job":"long","deps":["a.first"],"cmd":"sleep 30","timeout":7,"cpu_timeout":60}"#
         ),
     );
-    let records = step_end_records(&fx, &dag, "1", &["--run-timeout", "4"]);
+    let records = step_end_records(&fx, &dag, "1", &["--run-timeout", "8"]);
     let record = record_for(&records, "a.long");
     assert!(
         record.contains(r#""aborted":"true""#),

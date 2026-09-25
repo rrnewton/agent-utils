@@ -7,8 +7,9 @@ working directory. Enforcement degradation is reported visibly.
 
 from __future__ import annotations
 
-import os
+import errno
 import itertools
+import os
 import shutil
 import signal
 import subprocess
@@ -20,6 +21,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Protocol, runtime_checkable
 
+from dagrun.procstat import parse_process_stat
 from dagrun.protocols import CgroupManager
 
 __all__ = [
@@ -58,31 +60,45 @@ def mint_step_nonce() -> str:
     return f"{os.getpid()}:{next(_nonce_sequence)}:{time.time_ns()}"
 
 
-def _proc_descendants(root: int) -> list[int]:
-    """Return live descendants of ``root`` deepest-first from `/proc/*/status`."""
+def _proc_entry_disappeared(exc: OSError) -> bool:
+    """Whether a procfs read failed because the snapshotted PID vanished.
+
+    Only the kernel's explicit disappearance errors are safe to omit.  Treating
+    permission, I/O, or malformed-path failures as disappearance would turn an
+    incomplete process scan into a false proof that teardown succeeded.
+    """
+    return exc.errno in (errno.ENOENT, errno.ESRCH)
+
+
+def _proc_descendants(
+    root: int, *, proc_root: Path = Path("/proc")
+) -> tuple[list[int], bool]:
+    """Return descendants deepest-first and whether the procfs scan was complete.
+
+    A PID disappearing after ``listdir`` is a benign race.  Every other read or
+    parse failure makes the result incomplete: the unreadable record could be a
+    descendant, so callers must not interpret its omission as an empty tree.
+    """
     children: dict[int, list[int]] = {}
     try:
-        entries = os.listdir("/proc")
+        entries = os.listdir(proc_root)
     except OSError:
-        return []
+        return [], False
+    complete = True
     for entry in entries:
         if not entry.isdigit():
             continue
         pid = int(entry)
         try:
-            with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
-                parent = next(
-                    (
-                        int(line.removeprefix("PPid:").strip())
-                        for line in handle
-                        if line.startswith("PPid:")
-                    ),
-                    None,
-                )
-        except (OSError, ValueError):
+            stat = parse_process_stat((proc_root / str(pid) / "stat").read_bytes())
+        except OSError as exc:
+            if not _proc_entry_disappeared(exc):
+                complete = False
             continue
-        if parent is not None:
-            children.setdefault(parent, []).append(pid)
+        if stat is None or stat.pid != pid:
+            complete = False
+            continue
+        children.setdefault(stat.ppid, []).append(pid)
     out: list[int] = []
     stack = [root]
     seen: set[int] = set()
@@ -94,32 +110,44 @@ def _proc_descendants(root: int) -> list[int]:
                 out.append(child)
                 stack.append(child)
     out.reverse()
-    return out
+    return out, complete
 
 
 def _kill_descendants(root: int) -> int:
-    """SIGKILL descendants missed by a process-group signal, on a fixed sweep bound."""
+    """SIGKILL descendants and require a complete empty scan before success.
+
+    Forking races require repeated snapshots.  An incomplete or non-empty final
+    snapshot is not evidence that the tree is gone, so the bounded fallback
+    reports that degradation visibly instead of silently declaring success.
+    """
     if root <= 1:
         return 0
     killed: set[int] = set()
+    confirmed_empty = False
     for _ in range(_DESCENDANT_KILL_SWEEPS):
-        fresh = 0
-        for pid in _proc_descendants(root):
+        descendants, complete = _proc_descendants(root)
+        if complete and not descendants:
+            confirmed_empty = True
+            break
+        for pid in descendants:
             if pid <= 1 or pid == os.getpid():
                 continue
-            if pid not in killed:
-                killed.add(pid)
-                fresh += 1
+            killed.add(pid)
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
-        if fresh == 0:
-            break
+    if not confirmed_empty:
+        _warn(
+            f"could not confirm an empty descendant tree for process group {root} "
+            f"after {_DESCENDANT_KILL_SWEEPS} procfs sweep(s)"
+        )
     return len(killed)
 
 
-def _live_process_group_from_stat(stat: str) -> int | None:
+def _live_process_group_from_stat(
+    stat: bytes | str, *, expected_pid: int | None = None
+) -> int | None:
     """Return a live process's group from one Linux ``/proc/PID/stat`` record.
 
     The parenthesized command may itself contain spaces and parentheses, so fields must be
@@ -127,20 +155,19 @@ def _live_process_group_from_stat(stat: str) -> int | None:
     leader cannot be wait-reaped until the supervisor regains control, and treating that leader as
     live would spend the whole diagnostic grace after a cooperative SIGTERM exit.
     """
-    close = stat.rfind(")")
-    if close < 0:
-        return None
-    fields = stat[close + 2 :].split()
-    # fields begin at proc field 3: state, ppid, pgrp.
-    if len(fields) < 3 or fields[0] == "Z":
-        return None
-    try:
-        return int(fields[2])
-    except ValueError:
-        return None
+    parsed = parse_process_stat(stat)
+    return (
+        None
+        if parsed is None
+        or parsed.state == "Z"
+        or (expected_pid is not None and parsed.pid != expected_pid)
+        else parsed.pgrp
+    )
 
 
-def _live_process_groups(pgids: set[int]) -> set[int] | None:
+def _live_process_groups(
+    pgids: set[int], *, proc_root: Path = Path("/proc")
+) -> set[int] | None:
     """Return requested groups containing a non-zombie process.
 
     ``killpg(pgid, 0)`` reports success while an unreaped group leader is a zombie. A supervisor
@@ -148,13 +175,14 @@ def _live_process_groups(pgids: set[int]) -> set[int] | None:
     SIGTERM exit consume the entire grace. `/proc/<pid>/stat` exposes both state and process-group id;
     one walk handles a whole cancellation batch and deliberately excludes zombies.
 
-    ``None`` means `/proc` could not be inspected at all. Callers then retain the conservative
-    signal-probe fallback rather than assuming every group disappeared.
+    ``None`` means the procfs snapshot was incomplete. Callers then retain the
+    conservative signal-probe fallback rather than assuming an unreadable or
+    malformed process disappeared.
     """
     if not pgids:
         return set()
     try:
-        entries = os.listdir("/proc")
+        entries = os.listdir(proc_root)
     except OSError:
         return None
     live: set[int] = set()
@@ -162,16 +190,18 @@ def _live_process_groups(pgids: set[int]) -> set[int] | None:
         if not entry.isdigit():
             continue
         try:
-            stat = Path(f"/proc/{entry}/stat").read_text(encoding="utf-8")
-        except OSError:
+            stat = (proc_root / entry / "stat").read_bytes()
+        except OSError as exc:
+            if not _proc_entry_disappeared(exc):
+                return None
             continue
-        pgrp = _live_process_group_from_stat(stat)
-        if pgrp is None:
+        parsed = parse_process_stat(stat)
+        if parsed is None or parsed.pid != int(entry):
+            return None
+        if parsed.state == "Z":
             continue
-        if pgrp in pgids:
-            live.add(pgrp)
-            if live == pgids:
-                break
+        if parsed.pgrp in pgids:
+            live.add(parsed.pgrp)
     return live
 
 

@@ -308,21 +308,22 @@ pub fn live_headroom_bytes() -> Option<u64> {
     Some(headroom_from(available, scale))
 }
 
-fn proc_starttime(pid: u32) -> Option<u64> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rparen = text.rfind(')')?;
-    text.get(rparen + 2..)?
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+fn proc_starttime(pid: u32) -> Result<Option<u64>, String> {
+    crate::procstat::read(pid)
+        .map(|stat| stat.map(|stat| stat.starttime_ticks))
+        .map_err(|error| error.to_string())
 }
 
-fn holder_alive(record: &Record) -> bool {
-    match proc_starttime(record.pid) {
-        None => false,
-        Some(_) if record.starttime.is_none() => true,
-        Some(current) => record.starttime == Some(current),
+fn current_starttime(pid: u32) -> Result<u64, String> {
+    proc_starttime(pid)?
+        .ok_or_else(|| format!("could not read current process identity from /proc/{pid}/stat"))
+}
+
+fn holder_alive(record: &Record) -> Result<bool, String> {
+    match proc_starttime(record.pid)? {
+        None => Ok(false),
+        Some(_) if record.starttime.is_none() => Ok(true),
+        Some(current) => Ok(record.starttime == Some(current)),
     }
 }
 
@@ -473,8 +474,17 @@ fn store(path: &Path, records: &[Record]) -> Result<(), String> {
     result
 }
 
-fn sweep(records: Vec<Record>) -> (Vec<Record>, Vec<Record>) {
-    records.into_iter().partition(holder_alive)
+fn sweep(records: Vec<Record>) -> Result<(Vec<Record>, Vec<Record>), String> {
+    let mut live = Vec::new();
+    let mut dead = Vec::new();
+    for record in records {
+        if holder_alive(&record)? {
+            live.push(record);
+        } else {
+            dead.push(record);
+        }
+    }
+    Ok((live, dead))
 }
 
 /// How many live holders must finish before `need` more bytes fit. Largest first.
@@ -619,14 +629,14 @@ pub fn request_with_limits(
     };
     // SAFETY: getpid has no preconditions and does not access memory.
     let pid = std::process::id();
-    let starttime = proc_starttime(pid);
+    let starttime = Some(current_starttime(pid)?);
 
     let decision;
     let granted;
     {
         let _lock = LedgerLock::acquire(&path)?;
         let records = load(&path)?;
-        let (live, dead) = sweep(records);
+        let (live, dead) = sweep(records)?;
         if !dead.is_empty() {
             store(&path, &live)?;
         }
@@ -804,7 +814,7 @@ pub fn held_by_this_process(ledger: Option<&Path>) -> Result<u64, String> {
         None => default_ledger_path(),
     };
     let pid = std::process::id();
-    let starttime = proc_starttime(pid);
+    let starttime = Some(current_starttime(pid)?);
     let _lock = LedgerLock::acquire(&path)?;
     let records = load(&path)?;
     Ok(records
@@ -822,7 +832,7 @@ pub fn held_bytes(ledger: Option<&Path>) -> Result<u64, String> {
     };
     let _lock = LedgerLock::acquire(&path)?;
     let records = load(&path)?;
-    let (live, dead) = sweep(records);
+    let (live, dead) = sweep(records)?;
     if !dead.is_empty() {
         store(&path, &live)?;
     }
