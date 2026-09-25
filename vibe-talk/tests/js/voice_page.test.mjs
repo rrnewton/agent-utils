@@ -12484,6 +12484,83 @@ test("a typed call's greeting is judged as an ordinary turn and is not timed", a
   assert.deepStrictEqual(page.healthPosts, [], "one silent typed turn was reported as a silent greeting");
 });
 
+async function startTypedNeutralCall(page, greeting) {
+  await signIn(page);
+  page.setFetch(async () =>
+    json(200, {
+      websocket_url: "wss://example.invalid/private-voice",
+      protocol: "vibe-talk-v1",
+      provider: "Internal voice preview",
+      input_sample_rate: 24000,
+      output_sample_rate: 24000,
+    })
+  );
+  await page.el("text-entry").click();
+  await page.settle();
+  const socket = page.sockets[0];
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting }) });
+  return socket;
+}
+
+const promptsSent = (socket) =>
+  socket.sent
+    .filter((frame) => typeof frame === "string" && JSON.parse(frame).type === "prompt")
+    .map((frame) => JSON.parse(frame).text);
+
+test("a typed call holds its prompts behind a greeting that is already arriving", async () => {
+  // Sent into the greeting, a prompt's reply could not be told from it: the greeting's
+  // turn_complete would be taken as the prompt's and release the next prompt early.
+  const page = newPage();
+  const socket = await startTypedNeutralCall(page, true);
+  speech(socket, "assistant", 0, "Hello, what would you like", false);
+  await compose(page, "first");
+  await page.el("send-text").click();
+  await compose(page, "second");
+  await page.el("send-text").click();
+  assert.deepStrictEqual(promptsSent(socket), [], "a prompt was sent into the greeting");
+  agentTurn(page, socket, 0, { text: "Hello, what would you like to know?" });
+  assert.deepStrictEqual(promptsSent(socket), ["first"], "the greeting's end did not release exactly one prompt");
+  agentTurn(page, socket, 1, { text: "The first answer." });
+  assert.deepStrictEqual(promptsSent(socket), ["first", "second"]);
+  agentTurn(page, socket, 2, { text: "The second answer." });
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts, []);
+});
+
+test("a greeting heard only as PCM holds a typed prompt too, and a greeting that stalls is bounded", async () => {
+  const page = newPage();
+  const socket = await startTypedNeutralCall(page, true);
+  socket.onmessage({ data: page.pcmFrame(2400, SPEECH) }); // a typed call plays none of it
+  await compose(page, "anyone there");
+  await page.el("send-text").click();
+  assert.deepStrictEqual(promptsSent(socket), [], "a prompt was sent into the greeting");
+  const bounds = () => [...page.timers].filter(([, t]) => t.ms === NO_REPLY_MS).map(([id]) => id);
+  const held = bounds();
+  assert.equal(held.length, 1, "a held prompt was given no bound");
+  // Every further piece of the greeting restarts the bound rather than ending it: it measures the
+  // greeting going quiet without completing. Text used to end it, and PCM never restarted it.
+  socket.onmessage({ data: page.pcmFrame(2400, SPEECH) });
+  const afterAudio = bounds();
+  assert.equal(afterAudio.length, 1);
+  assert.notEqual(afterAudio[0], held[0], "more greeting audio did not restart the bound");
+  speech(socket, "assistant", 0, "Hello", false);
+  assert.equal(bounds().length, 1, "greeting text ended the held prompt's bound");
+  assert.equal(page.expireTimers(NO_REPLY_MS), 1, "a greeting that stopped mid-way was not bounded");
+  await page.settle();
+  assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), ["no_reply"]);
+});
+
+test("a typed prompt sent before any greeting arrives is not held: the documented limitation", async () => {
+  // Pinned so that closing it is a deliberate change: the page cannot know whether a greeting
+  // is coming to a client that never opened an audio segment.
+  const page = newPage();
+  const socket = await startTypedNeutralCall(page, true);
+  await compose(page, "first");
+  await page.el("send-text").click();
+  assert.deepStrictEqual(promptsSent(socket), ["first"]);
+});
+
 test("recovery restores live and is logged once per logged episode", async () => {
   const page = newPage();
   const socket = await startNeutralCall(page);

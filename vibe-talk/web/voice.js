@@ -222,6 +222,9 @@ const session = {
   waitingForGreeting: false,
   waitingForAudioEnd: false,
   typedTurnInFlight: false,
+  // Assistant output has arrived since the last `turn_complete`: a turn is being answered, whether
+  // or not the page asked for it. A typed call holds its next prompt behind it.
+  replyArriving: false,
   pendingPrompts: [],
   // `#15 transcript-dedup`. One row per (turn, role) for the life of the call; see `upsertSpoken`.
   liveTurns: new Map(),
@@ -1926,6 +1929,13 @@ function advanceVibeTalkInput() {
   ) {
     return;
   }
+  if (session.chat && session.replyArriving) {
+    // A reply the page did not ask for is still arriving: a greeting this typed call did not wait
+    // for. Sent now, the prompt could not be told apart from it. Its `turn_complete` sends the
+    // prompt; see `noteReplyArriving` for the bound on a reply that stops before then.
+    armNoReply();
+    return;
+  }
   if (!session.chat && session.audioSegmentActive) {
     session.capturePaused = true;
     session.waitingForAudioEnd = true;
@@ -1939,6 +1949,21 @@ function advanceVibeTalkInput() {
   session.socket.send(JSON.stringify({ type: "prompt", text }));
   setStatus("Waiting for the assistant…");
   armNoReply();
+}
+
+/**
+ * Output of a turn in progress arrived: PCM, or assistant text.
+ *
+ * While a typed call holds a prompt behind that turn, each piece restarts the no-reply bound, so
+ * the bound measures the turn going quiet without completing. A typed call plays none of the PCM
+ * and so never judges it as heard; without the restart, a greeting still speaking after the bound
+ * would be reported as no reply, and one that stalled after its next transcript never would.
+ */
+function noteReplyArriving() {
+  session.replyArriving = true;
+  if (session.chat && !session.typedTurnInFlight && session.pendingPrompts.length > 0) {
+    armNoReply();
+  }
 }
 
 /** Is there a live conversation for a client event or typed text to reach? */
@@ -3429,6 +3454,7 @@ async function start(options) {
   session.waitingForGreeting = false;
   session.waitingForAudioEnd = false;
   session.typedTurnInFlight = false;
+  session.replyArriving = false;
   session.pendingPrompts = [];
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
   // racing `onopen` — a payload that arrived after the agent had already spoken would be a
@@ -3537,6 +3563,9 @@ async function start(options) {
 
   socket.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) {
+      if (session.protocol === "vibe-talk-v1") {
+        noteReplyArriving();
+      }
       if (session.protocol === "vibe-talk-v1" && !session.chat) {
         // Before the speaker-off drop: silencing the agent must not look like a dead service.
         noteAgentAudio(new Uint8Array(event.data));
@@ -4149,13 +4178,15 @@ function handleVibeTalk(message) {
       addDetail(`voice session ${message.session_id || "started"}`);
       session.v1Ready = true;
       if (session.chat) {
-        // A typed call does not wait for a promised greeting. KNOWN LIMITATION: the protocol does
-        // not say whether a server greets a client that never sends `audio_start`, nor which turn
-        // number a greeting carries, so waiting could stall every typed call on a greeting that
-        // never comes. The cost: if a greeting DOES arrive after a prompt went out, the page
-        // cannot tell the two apart. The greeting's first frame disarms the prompt's no-reply
-        // bound, its `turn_complete` is taken as the prompt's, and a second queued prompt is sent
-        // while the first is still being answered.
+        // A typed call does not wait for a promised greeting: the protocol does not say whether a
+        // server greets a client that never sends `audio_start`, nor which turn number a greeting
+        // carries, so waiting would hold every typed call's first prompt behind a greeting that
+        // may never come. A prompt typed once the greeting is audibly or visibly arriving is held
+        // until it completes (`replyArriving`). KNOWN LIMITATION: a prompt sent BEFORE any of the
+        // greeting arrives, including one queued before `session_started`, cannot be told apart
+        // from it. The greeting's first text disarms that prompt's no-reply bound, its
+        // `turn_complete` is taken as the prompt's, and a second queued prompt is sent while the
+        // first is still being answered.
         setStatus("Connected — type a message.");
         advanceVibeTalkInput();
         break;
@@ -4190,6 +4221,7 @@ function handleVibeTalk(message) {
       const key = `${message.turn ?? ""}:${who}:${final}:${said}`;
       if (who === "assistant" && said.trim()) {
         noteAgentText();
+        noteReplyArriving();
       }
       if (!said || key === session.lastTranscriptKey) {
         break;
@@ -4212,6 +4244,7 @@ function handleVibeTalk(message) {
       const closingSegment = session.waitingForAudioEnd;
       // Cleared FIRST: completing this turn may send the next typed prompt, which arms its own.
       clearNoReply();
+      session.replyArriving = false;
       vibeTalkTurnComplete();
       judgeTurn(message, closingSegment);
       break;
@@ -4249,7 +4282,10 @@ function vibeTalkTurnComplete() {
       session.socket.send(JSON.stringify({ type: "audio_start" }));
       setStatus("Connected — say something.");
     }
+    return;
   }
+  // A turn the page did not start has ended, so a prompt held behind it may go.
+  advanceVibeTalkInput();
 }
 
 function startCapture(socket) {
@@ -4351,6 +4387,7 @@ function teardown() {
   session.waitingForGreeting = false;
   session.waitingForAudioEnd = false;
   session.typedTurnInFlight = false;
+  session.replyArriving = false;
   session.pendingPrompts = [];
   // Chat is a property of ONE conversation, decided when its socket opened. Carrying it into the
   // next one would mean the big control silently started a typed conversation because the previous
