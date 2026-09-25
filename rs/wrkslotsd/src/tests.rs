@@ -1363,6 +1363,10 @@ fn python_timestamp_matrix() -> (usize, Vec<String>) {
         "+12345678",
         "-23275192",
         "+12:34:56:7",
+        // CPython returns UTC and discards the fraction of a zero-second offset.
+        "+00.5",
+        "-00:00:00.5",
+        "+00:00,9",
     ];
     let mut accepted = BTreeSet::new();
     for date in dates {
@@ -1448,8 +1452,10 @@ fn python_timestamp_matrix() -> (usize, Vec<String>) {
 #[test]
 fn timestamp_parser_matches_python_generated_matrix() {
     let (accepted_count, values) = python_timestamp_matrix();
-    assert_eq!(accepted_count, 17_823);
-    assert_eq!(values.len(), 17_868);
+    // 6 dates x 6 separators x 33 times x 18 zones, plus 3 explicit values.
+    assert_eq!(accepted_count, 21_387);
+    // The accepted values plus 45 explicit rejected values.
+    assert_eq!(values.len(), 21_432);
     let python = python_timestamp_acceptance(&values);
     assert_eq!(python.len(), values.len());
     for (index, (value, python_accepts)) in values.iter().zip(python).enumerate() {
@@ -4946,6 +4952,60 @@ fn schema_valid_non_rfc3339_heartbeats_keep_their_ttl_blockers() -> Result<(), c
 }
 
 #[test]
+fn policy_input_names_use_the_replay_name_grammar() {
+    // Evidence names must match names replay has already validated, so the
+    // policy inputs use the same leading-alphanumeric grammar as replay.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let record = scoped_active_record("slot-a", 1);
+    import_log(&events, vec![record.clone()], vec![]);
+    let (config, evidence) = write_policy_inputs(
+        &scratch,
+        std::slice::from_ref(&record),
+        "2026-09-22T09:40:01+00:00",
+        |_| {},
+    );
+    ShadowConfig::load(&config).expect("baseline configuration loads");
+    EvidenceBundle::load(&evidence).expect("baseline evidence loads");
+    let original_config = fs::read(&config).expect("read configuration");
+    let original_evidence = fs::read(&evidence).expect("read evidence");
+    for prefix in [".", "_", "-"] {
+        fs::write(&config, &original_config).expect("restore configuration");
+        rewrite_json(&config, |value| {
+            value["machine"] = Value::String(format!("{prefix}node-a"));
+        });
+        let error = ShadowConfig::load(&config)
+            .err()
+            .unwrap_or_else(|| panic!("configuration machine {prefix:?} must be refused"))
+            .to_string();
+        assert!(error.contains("is not a valid name"), "{error}");
+        fs::write(&config, &original_config).expect("restore configuration");
+
+        type EvidenceMutation = fn(&mut Value, &str);
+        let mutations: [(&str, EvidenceMutation); 3] = [
+            ("machine", |value, name| {
+                value["machine"] = Value::String(name.to_owned());
+            }),
+            ("slot", |value, name| {
+                value["slots"][0]["slot"] = Value::String(name.to_owned());
+            }),
+            ("checkout", |value, name| {
+                value["slots"][0]["checkouts"][0]["name"] = Value::String(name.to_owned());
+            }),
+        ];
+        for (field, mutate) in mutations {
+            fs::write(&evidence, &original_evidence).expect("restore evidence");
+            rewrite_json(&evidence, |value| mutate(value, &format!("{prefix}name")));
+            let error = EvidenceBundle::load(&evidence)
+                .err()
+                .unwrap_or_else(|| panic!("evidence {field} {prefix:?} must be refused"))
+                .to_string();
+            assert!(error.contains("is not a valid name"), "{field}: {error}");
+        }
+    }
+}
+
+#[test]
 fn heartbeat_fields_that_cannot_be_aged_never_drop_blockers() -> Result<(), crate::ObserverError> {
     let scratch = Scratch::new();
     let base = policy_decision(
@@ -4963,7 +5023,7 @@ fn heartbeat_fields_that_cannot_be_aged_never_drop_blockers() -> Result<(), crat
         (
             &config,
             |decision| decision.heartbeat_at = None,
-            Verdict::Unknown,
+            Verdict::Blocked,
             &["ACTIVE_HEARTBEAT_MISSING"],
         ),
         (
@@ -5369,6 +5429,526 @@ fn recovery_of_a_completed_scoped_journal_leaves_no_phantom_marker() {
 }
 
 #[test]
+fn recovery_binds_the_most_recent_completed_journal_path() {
+    // Recovery of an operation with no pending journal reloads the journal
+    // that completed last. Binding the path that merely sorts first would
+    // leave a phantom legacy-journal marker once another slot reuses it.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let slot_a = active_record("slot-a", 1);
+    let slot_b = active_record("slot-b", 1);
+    let finish_path = "FINISH.6.node-a.6.slot-a.journal";
+    let singleton = "ACTIVE.node-a.journal";
+    let completion =
+        |slot: &str, path: &str| json!({"slot": slot, "operation": "finish", "journal_path": path});
+    let mut tip = import_log(&events, vec![slot_a.clone(), slot_b.clone()], vec![]);
+    // 1. slot-a finishes through the singleton path and rolls back.
+    tip = singleton_finish_progress(&events, 2, &tip, "slot-a");
+    tip = append_event(
+        &events,
+        3,
+        &tip,
+        "operation-completed",
+        completion("slot-a", singleton),
+    );
+    // 2. A scoped finish advances through its archive and remove phases and
+    //    completes while slot-a is retained.
+    for (sequence, phase) in [(4, "prepared"), (5, "archive"), (6, "remove")] {
+        tip = append_event(
+            &events,
+            sequence,
+            &tip,
+            "operation-progress-recorded",
+            json!({
+                "slot": "slot-a",
+                "operation": "finish",
+                "journal_path": finish_path,
+                "journal": {
+                    "schema": 2,
+                    "kind": "finish",
+                    "machine": "node-a",
+                    "slot": "slot-a",
+                    "phase": phase,
+                },
+            }),
+        );
+    }
+    tip = append_event(
+        &events,
+        7,
+        &tip,
+        "operation-completed",
+        completion("slot-a", finish_path),
+    );
+    // 3. Recovery starts while slot-a is still ACTIVE.
+    tip = append_event(
+        &events,
+        8,
+        &tip,
+        "recovery-started",
+        json!({
+            "slot": "slot-a",
+            "operation": "finish",
+            "actor": identity(12),
+            "runner": identity(13),
+            "handoff_writer": null,
+            "coordinator_authorized": true,
+        }),
+    );
+    // 4. slot-b reuses the singleton path and completes.
+    tip = singleton_finish_progress(&events, 9, &tip, "slot-b");
+    tip = append_event(
+        &events,
+        10,
+        &tip,
+        "operation-completed",
+        completion("slot-b", singleton),
+    );
+    // 5. slot-a is archived, removed, and its finish completes.
+    tip = append_event(
+        &events,
+        11,
+        &tip,
+        "archive-state-recorded",
+        json!({
+            "action": "slot-removed",
+            "slot": "slot-a",
+            "previous_revision": 0,
+            "revision": 1,
+            "record": archive_record("slot-a", 1),
+            "evidence": {},
+        }),
+    );
+    tip = append_event(
+        &events,
+        12,
+        &tip,
+        "active-state-recorded",
+        json!({
+            "action": "slot-removed",
+            "slot": "slot-a",
+            "previous_revision": 0,
+            "revision": 1,
+            "previous_record_sha256": canonical_sha256(&slot_a).expect("active digest"),
+            "record": null,
+            "evidence": {},
+        }),
+    );
+    append_event(
+        &events,
+        13,
+        &tip,
+        "operation-completed",
+        completion("slot-a", finish_path),
+    );
+    assert_eq!(python_pending_journals(&events), json!({}));
+    let replayed = replay_stream(&events, None, |_| Ok(())).expect("replay history");
+    assert!(
+        replayed.pending_operations.is_empty(),
+        "{:?}",
+        replayed.pending_operations
+    );
+}
+
+/// Where a create or import recovery writes the slot's ACTIVE row relative to
+/// the `recovery-started` event, or whether it writes none at all.
+#[derive(Clone, Copy, Debug)]
+enum CreateImportOutcome {
+    /// The row was durable before recovery began (`_recover_create` and
+    /// `_recover_import_existing` clear an already-durable journal).
+    RowDurable,
+    /// Recovery publishes the row, then clears the journal.
+    RowPublishedByRecovery,
+    /// `--abort-create` / `--abort-import`: no row is ever published.
+    Aborted,
+}
+
+fn recovery_started_payload(slot: &str, operation: &str) -> Value {
+    json!({
+        "slot": slot,
+        "operation": operation,
+        "actor": identity(12),
+        "runner": identity(13),
+        "handoff_writer": null,
+        "coordinator_authorized": true,
+    })
+}
+
+/// Replays one interrupted create or import through a recovery that completes
+/// its journal, returning the event directory's scratch owner and the record.
+fn create_import_recovery_log(
+    operation: &str,
+    journal_path: &str,
+    outcome: CreateImportOutcome,
+) -> (Scratch, PathBuf, Value) {
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let record = if operation == "import-existing" {
+        imported_active_record("slot-a", "agent-slot-a", 1)
+    } else {
+        active_record("slot-a", 1)
+    };
+    let publish = |sequence: u64, tip: &str, action: &str| {
+        append_event(
+            &events,
+            sequence,
+            tip,
+            "active-state-recorded",
+            json!({
+                "action": action,
+                "slot": "slot-a",
+                "previous_revision": 0,
+                "revision": 1,
+                "previous_record_sha256": null,
+                "record": record.clone(),
+                "evidence": {},
+            }),
+        )
+    };
+    let (published, recovered) = if operation == "import-existing" {
+        ("slot-imported", "slot-imported-by-recovery")
+    } else {
+        ("slot-created", "slot-created-by-recovery")
+    };
+    let mut sequence = 1;
+    let mut tip = import_log(&events, vec![], vec![]);
+    sequence += 1;
+    tip = append_event(
+        &events,
+        sequence,
+        &tip,
+        "operation-progress-recorded",
+        json!({
+            "slot": "slot-a",
+            "operation": operation,
+            "journal_path": journal_path,
+            "journal": {"schema": 2, "kind": operation, "machine": "node-a", "slot": "slot-a"},
+        }),
+    );
+    if matches!(outcome, CreateImportOutcome::RowDurable) {
+        sequence += 1;
+        tip = publish(sequence, &tip, published);
+    }
+    sequence += 1;
+    tip = append_event(
+        &events,
+        sequence,
+        &tip,
+        "recovery-started",
+        recovery_started_payload("slot-a", operation),
+    );
+    if matches!(outcome, CreateImportOutcome::RowPublishedByRecovery) {
+        sequence += 1;
+        tip = publish(sequence, &tip, recovered);
+    }
+    sequence += 1;
+    append_event(
+        &events,
+        sequence,
+        &tip,
+        "operation-completed",
+        json!({"slot": "slot-a", "operation": operation, "journal_path": journal_path}),
+    );
+    (scratch, events, record)
+}
+
+#[test]
+fn completed_create_and_import_recoveries_close_their_recovery_marker() {
+    // Every Python path that completes a create or import journal leaves the
+    // slot's storage either owned by its ACTIVE row or gone, so the matching
+    // completion is terminal for the recovery attempt as well.
+    let create_path = "CREATE.6.node-a.6.slot-a.journal";
+    let singleton = "ACTIVE.node-a.journal";
+    for (operation, journal_path) in [
+        ("create", create_path),
+        ("create", singleton),
+        ("import-existing", singleton),
+    ] {
+        for outcome in [
+            CreateImportOutcome::RowDurable,
+            CreateImportOutcome::RowPublishedByRecovery,
+            CreateImportOutcome::Aborted,
+        ] {
+            let case = format!("{operation} at {journal_path} ({outcome:?})");
+            let (scratch, events, record) =
+                create_import_recovery_log(operation, journal_path, outcome);
+            assert_eq!(
+                python_pending_journals(&events),
+                json!({}),
+                "Python pending view for {case}"
+            );
+            let replayed = replay_stream(&events, None, |_| Ok(()))
+                .unwrap_or_else(|error| panic!("replay {case}: {error}"));
+            assert!(
+                replayed.pending_operations.is_empty(),
+                "{case} left {:?}",
+                replayed.pending_operations
+            );
+            let records = match outcome {
+                CreateImportOutcome::Aborted => vec![],
+                _ => vec![record],
+            };
+            let (config, evidence) =
+                write_policy_inputs(&scratch, &records, "2026-09-22T09:40:01+00:00", |_| {});
+            let decisions =
+                evaluate_policy_at(&events, &config, &evidence, "2026-09-22T09:40:01+00:00")
+                    .unwrap_or_else(|error| panic!("evaluate {case}: {error}"));
+            match outcome {
+                // Abort leaves no ACTIVE row and no operation-owned storage,
+                // so the slot is not an observer subject at all.
+                CreateImportOutcome::Aborted => {
+                    assert!(decisions.is_empty(), "{case}: {decisions:?}")
+                }
+                _ => {
+                    assert_eq!(decisions.len(), 1, "{case}");
+                    for reason in ["RECOVERY_PENDING", "OPERATION_JOURNAL_PENDING"] {
+                        assert!(
+                            !decisions[0].reason_codes.iter().any(|code| code == reason),
+                            "{case}: {:?}",
+                            decisions[0].reason_codes
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn create_recovery_marker_closes_only_on_its_bound_journal() {
+    // Python refuses two pending journals for one slot operation, so the only
+    // binding that can differ from a later completion is the legacy default:
+    // a recovery with no journal in the history is bound to the singleton.
+    // Completing a create journal elsewhere does not prove that one ended.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let create_path = "CREATE.6.node-a.6.slot-a.journal";
+    let singleton = "ACTIVE.node-a.journal";
+    let mut tip = import_log(&events, vec![], vec![]);
+    tip = append_event(
+        &events,
+        2,
+        &tip,
+        "recovery-started",
+        recovery_started_payload("slot-a", "create"),
+    );
+    tip = append_event(
+        &events,
+        3,
+        &tip,
+        "operation-progress-recorded",
+        json!({
+            "slot": "slot-a",
+            "operation": "create",
+            "journal_path": create_path,
+            "journal": {"schema": 2, "kind": "create", "machine": "node-a", "slot": "slot-a"},
+        }),
+    );
+    append_event(
+        &events,
+        4,
+        &tip,
+        "operation-completed",
+        json!({"slot": "slot-a", "operation": "create", "journal_path": create_path}),
+    );
+    assert_eq!(python_pending_journals(&events), json!({}));
+    let pending = replay_stream(&events, None, |_| Ok(()))
+        .expect("valid replay")
+        .pending_operations;
+    let kinds = pending
+        .iter()
+        .map(|pending| (pending.kind, pending.journal_path.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, [(PendingOperationKind::Recovery, Some(singleton))]);
+}
+
+#[test]
+fn finish_recovery_marker_survives_a_rollback_completion() {
+    // Negative control: finish rollbacks (`_rollback_path_fence`,
+    // `_begin_finish`) complete the journal while deliberately retaining the
+    // slot, so completion alone must not close a finish recovery attempt.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let record = scoped_active_record("slot-a", 1);
+    let finish_path = "FINISH.6.node-a.6.slot-a.journal";
+    let mut tip = import_log(&events, vec![record.clone()], vec![]);
+    tip = append_event(
+        &events,
+        2,
+        &tip,
+        "operation-progress-recorded",
+        json!({
+            "slot": "slot-a",
+            "operation": "finish",
+            "journal_path": finish_path,
+            "journal": {"schema": 2, "kind": "finish", "machine": "node-a", "slot": "slot-a"},
+        }),
+    );
+    tip = append_event(
+        &events,
+        3,
+        &tip,
+        "recovery-started",
+        recovery_started_payload("slot-a", "finish"),
+    );
+    append_event(
+        &events,
+        4,
+        &tip,
+        "operation-completed",
+        json!({"slot": "slot-a", "operation": "finish", "journal_path": finish_path}),
+    );
+    assert_eq!(python_pending_journals(&events), json!({}));
+    let pending = replay_stream(&events, None, |_| Ok(()))
+        .expect("valid replay")
+        .pending_operations;
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].kind, PendingOperationKind::Recovery);
+    assert_eq!(pending[0].journal_path.as_deref(), Some(finish_path));
+    let (config, evidence) =
+        write_policy_inputs(&scratch, &[record], "2026-09-22T09:40:01+00:00", |_| {});
+    let decision = evaluate_policy_at(&events, &config, &evidence, "2026-09-22T09:40:01+00:00")
+        .expect("evaluate retained slot")
+        .remove(0);
+    assert_eq!(decision.verdict, Verdict::Blocked);
+    assert!(
+        decision
+            .reason_codes
+            .iter()
+            .any(|code| code == "RECOVERY_PENDING"),
+        "{:?}",
+        decision.reason_codes
+    );
+}
+
+/// Interrupts a real Python create or import, completes it through Python's
+/// own `recover`, and reports the event log with Python's pending view.
+fn python_recovered_create_or_import(
+    root: &Path,
+    operation: &str,
+    mode: &str,
+) -> std::process::Output {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repository root");
+    let script = r#"
+import contextlib
+import io
+import json
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+from wrkslots import cli as w
+import test_lifecycle as t
+os.environ['WRKSLOTS_MACHINE'] = 'testhost'
+root, operation, mode = Path(sys.argv[3]), sys.argv[4], sys.argv[5]
+project, repository, _remote = t.make_project(root)
+if operation == 'create':
+    point = 'after-active-write' if mode == 'durable' else 'after-create-worktree'
+    interrupted = t.create(project, env={'WRKSLOTS_TEST_INTERRUPT': point})
+else:
+    point = 'after-import-active-write' if mode == 'durable' else 'after-import-journal'
+    tree = t.checkout(project)
+    tree.parent.mkdir()
+    t.git(repository, 'worktree', 'add', '-b', 'codex/imported', str(tree), 'origin/main')
+    interrupted = t.command(
+        project, 'import-existing', 'slot01', '--agent', 'codex-1',
+        '--task', 'task-import', '--purpose', 'interrupted import',
+        '--repo', 'product=repo', '--apply', '--verified-live',
+        '--owner-pid', str(os.getpid()), '--coordinator-pid', str(os.getpid()),
+        env={'WRKSLOTS_TEST_INTERRUPT': point},
+    )
+assert interrupted.returncode == 86, interrupted.stderr
+argv = ['--project-root', str(project), 'recover', '--coordinator-authorized',
+        '--coordinator-pid', str(os.getpid())]
+if mode == 'abort':
+    argv.append('--abort-create' if operation == 'create' else '--abort-import')
+captured = io.StringIO()
+with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+    rc = w.main(argv)
+assert rc == 0, captured.getvalue()
+config = w._load_config(str(project), 'testhost')
+pending = w._pending_operations_from_events(config, 'testhost')
+active, _archive = w._states_from_events(config, 'testhost', require_repository=False)
+print(json.dumps({
+    'events': str(config.control / 'EVENTS.testhost'),
+    'pending': {path.name: journal.get('kind') for path, journal in pending.items()},
+    'kinds': [event['kind'] for event in w._load_events(config)],
+    'active_slots': sorted(record.slot for record in active.slots),
+}, sort_keys=True, separators=(',', ':')))
+"#;
+    Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(repository.join("py"))
+        .arg(repository.join("py/wrkslots/tests"))
+        .arg(root)
+        .arg(operation)
+        .arg(mode)
+        .output()
+        .expect("run recovered Python create or import fixture")
+}
+
+#[test]
+fn real_python_create_and_import_recoveries_leave_no_marker() {
+    // End-to-end counterpart of the synthetic matrix: histories written by
+    // Python's own interrupted create/import and `recover`, not by the test.
+    let cases = ["create", "import-existing"]
+        .into_iter()
+        .flat_map(|operation| {
+            ["durable", "republish", "abort"].map(|mode| (operation, mode, Scratch::new()))
+        })
+        .collect::<Vec<_>>();
+    // Each fixture builds its own Git project; run them concurrently.
+    let outputs = std::thread::scope(|scope| {
+        cases
+            .iter()
+            .map(|(operation, mode, scratch)| {
+                scope.spawn(move || python_recovered_create_or_import(&scratch.0, operation, mode))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("fixture thread"))
+            .collect::<Vec<_>>()
+    });
+    for ((operation, mode, _scratch), output) in cases.iter().zip(outputs) {
+        let case = format!("{operation} {mode}");
+        assert!(
+            output.status.success(),
+            "Python fixture {case} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let oracle: Value = serde_json::from_slice(&output.stdout).expect("parse fixture");
+        assert_eq!(
+            oracle["pending"],
+            json!({}),
+            "Python pending view for {case}"
+        );
+        let kinds = oracle["kinds"].as_array().expect("event kinds");
+        assert!(
+            kinds.contains(&json!("recovery-started"))
+                && kinds.last() == Some(&json!("operation-completed")),
+            "{case}: {kinds:?}"
+        );
+        let expected_active: &[&str] = if *mode == "abort" { &[] } else { &["slot01"] };
+        assert_eq!(oracle["active_slots"], json!(expected_active), "{case}");
+        let events = PathBuf::from(oracle["events"].as_str().expect("events path"));
+        let replayed = replay_stream(&events, None, |_| Ok(()))
+            .unwrap_or_else(|error| panic!("replay {case}: {error}"));
+        let expected_count: u64 = if *mode == "abort" { 0 } else { 1 };
+        assert_eq!(replayed.summary.active_count, expected_count, "{case}");
+        assert!(
+            replayed.pending_operations.is_empty(),
+            "{case} left {:?}",
+            replayed.pending_operations
+        );
+    }
+}
+
+#[test]
 fn plain_rebuild_after_a_policy_rebuild_requires_a_fresh_index() -> Result<(), crate::ObserverError>
 {
     let scratch = Scratch::new();
@@ -5396,6 +5976,32 @@ fn plain_rebuild_after_a_policy_rebuild_requires_a_fresh_index() -> Result<(), c
     assert_eq!(plain.evidence_sha256, None);
     assert_eq!(plain.reason_codes, ["POLICY_INPUTS_MISSING"]);
     Ok(())
+}
+
+#[test]
+fn zero_second_offsets_discard_their_fraction_like_python() {
+    // CPython's `tzinfo_from_isoformat_results` returns UTC whenever the
+    // whole-second offset is zero, dropping any fractional offset seconds.
+    let values = [
+        "2026-W39-2T10:30:45+00.3045",
+        "0001-W01-1+034628+00,77551173",
+        "99991231 14055036+00.2916815",
+        "2026-09-22T10:00:00-00:00:00.5",
+        "2026-09-22T10:00:00+00:00,9",
+        "2026-09-22T10:00:00-00:00:01.5",
+    ]
+    .map(str::to_owned);
+    let python = python_timestamp_instants(&values);
+    assert_eq!(python[0], 1_790_073_045_000_000);
+    for (value, python_microseconds) in values.iter().zip(python) {
+        let rust = crate::schema::parse_timestamp_instant(value, "fixture timestamp")
+            .unwrap_or_else(|error| panic!("{value:?}: {error}"));
+        assert_eq!(
+            rust.timestamp_micros(),
+            python_microseconds,
+            "Rust/Python instant mismatch for {value:?}"
+        );
+    }
 }
 
 #[test]

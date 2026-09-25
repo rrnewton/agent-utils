@@ -87,8 +87,12 @@ Conversely, a heartbeat later than that instant has a negative age and still cou
 TTL and minimum stale age, so a heartbeat written after the census began cannot drop those
 blockers either; a lead beyond `maximum_future_skew_seconds` additionally records
 `CLOCK_BEFORE_HEARTBEAT`. Heartbeats and the event-tip timestamp are parsed with the same
-CPython `datetime.fromisoformat` grammar that replay accepts, not only RFC 3339; a heartbeat that
-still cannot be aged is `BLOCKED` with `HEARTBEAT_TIMESTAMP_UNSUPPORTED`, and a missing TTL records
+CPython `datetime.fromisoformat` grammar that replay accepts, not only RFC 3339. That includes
+CPython's offset rule: an offset whose whole-second part is zero is UTC and its fractional seconds
+are discarded, so `+00.5`, `-00:00:00.5`, and `+00:00,9` all mean `+00:00`, while `-00:00:01.5`
+keeps its fraction. A heartbeat that still cannot be aged is `BLOCKED` with
+`HEARTBEAT_TIMESTAMP_UNSUPPORTED`, a record with no heartbeat is `BLOCKED` with
+`ACTIVE_HEARTBEAT_MISSING` (either may be recent), and a missing TTL records
 `ACTIVE_HEARTBEAT_TTL_MISSING` without skipping the minimum-stale check. Missing evidence for an
 active slot adds a digest-bound `EVIDENCE_MISSING` reason; the heartbeat and minimum-stale blockers
 are still evaluated because they depend only on the record and the census clock. The SQLite index retains canonical policy inputs and the
@@ -104,15 +108,67 @@ cannot be mistaken for a reclaim candidate and does not require an invented evid
 This remains true for a plain rebuild without optional policy inputs; that decision also carries
 `POLICY_INPUTS_MISSING` and null policy/evidence bindings.
 
+The index is disposable and derived: rebuild it after upgrading the observer. `INDEX_SCHEMA`
+versions only the table layout, so a change to replay or policy semantics does not bump it. Bumping
+it would not produce a clearer refusal: readers would report only `unsupported derived index schema
+N`, and `rebuild` deliberately refuses to overwrite an index whose schema it does not recognize, so
+the operator would have to delete the file by hand. Keeping the schema also keeps the evidence
+high-water check in force across the upgrade. Old stored results cannot be served under new
+semantics, because every read replays the indexed event chain again. Without policy inputs, `explain`
+and `plan` derive their decisions from that replay and do not read the stored ones. With policy
+inputs, a stored decision that the new code would not produce is refused as `indexed policy decision
+differs from canonical re-evaluation` or `indexed policy decisions do not exactly cover replayed
+active and pending state`. In both cases the remedy is `wrkslotsd rebuild` over the same index path,
+using the same or newer evidence.
+
 This marker treatment is deliberately stricter than the current Python audit, not a parity claim.
 Python records `reclaim-started`, `recovery-started`, and `retirement-attempted` as attempt evidence
 but has no separate abort event when a checked operation refuses. The Rust shadow therefore keeps
 such an attempt blocked until the append-only history contains both the exact-generation archive
 record with `physical_storage: removed` and removal of that generation from ACTIVE. Python's
-`operation-completed` records only journal cleanup; rollback and late-refusal paths emit it while
-retaining the slot, so it does not clear reclaim, recovery, or retirement markers. Until a future
-producer adds an explicit terminal outcome for non-removing operations, those attempts remain a
-rollout blocker; the observer can explain them but cannot clear or override them.
+`operation-completed` records only journal cleanup. Finish and ownerless-cleanup rollbacks and late
+refusals emit it while retaining the slot, so for those operations it does not clear reclaim,
+recovery, or retirement markers. Until a future producer adds an explicit terminal outcome for
+non-removing operations, those attempts remain a rollout blocker; the observer can explain them but
+cannot clear or override them.
+
+Create and import-existing are the exception. Their completion closes the `recovery-started` marker
+for the same slot and operation when that marker is bound to the completed journal path. A marker
+bound to another path stays open, such as the default for a journal that predates the event log.
+This rests on the following enumeration of `py/wrkslots/cli.py`. Line numbers are at `3156e0f`.
+
+- `_clear_journal` (5472) is the only writer of `operation-completed` (5483). Every
+  `_write_event_file` and `writer.append` call passes a literal kind. The other occurrences, at 5558
+  and 7128, are readers. The append happens before the journal is unlinked, with the test
+  interrupt `after-operation-completed` at 5490 between them.
+- Create journals come only from `_create_journal_payload` (kind `create`, 13197). Import journals
+  come only from `_import_journal_payload` (kind `import-existing`, 14182).
+- `_recover_create` and `_recover_import_existing` are dispatched at 32143 and 32154, after
+  `recovery-started` is appended at 32079.
+
+The eight `_clear_journal` calls on a create or import journal, and the state each leaves:
+
+| Call site | Line | Storage and ACTIVE state when the journal completes |
+| --- | --- | --- |
+| `_cmd_create` | 13500 | `_write_active_state(action="slot-created")` (13491) runs first, so the new ACTIVE row owns the storage |
+| `_recover_create` | 22424 | The ACTIVE row is already durable and must match the journal exactly. Every checkout HEAD is verified first, and `--abort-create` is refused (22387) |
+| `_recover_create` | 22543 | Recovery provisions and runs hooks, then publishes the row with `action="slot-created-by-recovery"` (22535) |
+| `_abort_create` | 22152 | Called at 22428 only when there is no ACTIVE row. It removes caches and worktrees, deletes branches at their expected heads, and removes the slot directory. Any unexpected state raises before the clear, so neither storage nor a row remains |
+| `_publish_import` | 14224 | `_write_active_state(action="slot-imported")` (14214) runs first |
+| `_recover_import_existing` | 22582 | The row is already durable and matches exactly, and `_verify_import_record` passes. `--abort-import` is refused (22579) |
+| `_recover_import_existing` | 22588 | `--abort-import` with no row. An import publishes rows only for checkouts that already exist, so it changes no files and owns no provisional storage. The checkout was never registered, so it has neither a row nor a marker; the observer emits no decision for it, and it cannot be a reclaim target |
+| `_recover_import_existing` | 22612 | Recovery publishes the row with `action="slot-imported-by-recovery"` (22603) |
+
+The checks that run after these clears never undo them. They are `_validate_global_state` and
+`_assert_only_slot_changed`, in `_cmd_create`, in `_cmd_import_existing`, and after recovery
+dispatch (32281). They only read state, so a refusal there leaves the slot in the state the table
+records. A recovery refused before its clear appends no completion, which leaves both the journal
+marker and the recovery marker open.
+
+Finish is different. `_rollback_path_fence` (20375) and the refusal rollback in `_begin_finish`
+(20917) complete a finish journal while retaining the slot. `_rollback_validation_fence` (25466,
+called from `_recover_ownerless_validation` at 26597, 26685, and 26753) does the same for an
+ownerless validation. Those operations therefore keep the archived-removal rule above.
 For a pre-event-log finish journal, recovery can import snapshots that are already at any side of
 the archive/ACTIVE publication boundary. Once those snapshots prove physical removal, the observer
 retains a synthetic legacy-journal cleanup marker until the following `operation-completed`; this

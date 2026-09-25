@@ -498,12 +498,13 @@ pub(crate) fn evaluate_time(
     config: &ShadowConfig,
     lifecycle_at: DateTime<chrono::FixedOffset>,
 ) -> Result<(), ObserverError> {
+    // Replay requires a heartbeat it can parse, so neither branch below is
+    // reachable from a replayed record. A missing or unageable heartbeat may
+    // be recent, so both block rather than merely withholding a verdict.
     let Some(heartbeat_at) = decision.heartbeat_at.as_deref() else {
-        decision.unknown("ACTIVE_HEARTBEAT_MISSING");
+        decision.block("ACTIVE_HEARTBEAT_MISSING");
         return Ok(());
     };
-    // Replay admits every heartbeat this parser accepts. Anything else cannot
-    // be aged, and an unageable heartbeat may be recent.
     let Ok(heartbeat) = parse_timestamp_instant(heartbeat_at, "active heartbeat") else {
         decision.block("HEARTBEAT_TIMESTAMP_UNSUPPORTED");
         return Ok(());
