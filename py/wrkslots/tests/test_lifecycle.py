@@ -316,7 +316,12 @@ def validation_exclusion_guard_identities(
         for child in root.iterdir():
             if not child.name.startswith(_VALIDATION_EXCLUSION_GUARD_PREFIX):
                 continue
-            metadata = child.stat(follow_symlinks=False)
+            try:
+                metadata = child.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                # Parallel lifecycle shards share the host temporary directory.
+                # A guard owned by another shard may disappear after enumeration.
+                continue
             result[child] = (
                 metadata.st_dev,
                 metadata.st_ino,
