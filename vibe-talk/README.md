@@ -2695,8 +2695,12 @@ result lists the ids to use instead, so a wrong guess costs one retry rather tha
 `channel_id`, `message_id`, `before` or `reply_to` as an exact unsigned integer means the id
 with those digits, and gets it. Anything else in that place — a float, a negative number,
 `null`, an array — names nothing: a float has already lost digits, and rounding it would pick a
-different message rather than none. The `tool` access line's `channel` field says which shape
-an unreadable id arrived in (`<inexact number>`, `<null>`, …), and `<string arguments>` when
+different message rather than none. What this cannot catch is an integer some earlier hop
+already rounded through a float and wrote back out as a whole number: it arrives looking exact
+and is read as written. A channel id rounded that way falls outside the allowlist, but a
+rounded `reply_to` is handed to the provider as it is — so a caller that can, should send ids
+as strings. The `tool` access line's `channel` field says which shape
+an unreadable id arrived in (`<unreadable number>`, `<null>`, …), and `<string arguments>` when
 `arguments` itself was a string; `-` still means an object with no `channel_id` at all.
 
 **Every message a tool renders carries its author's mention token**, written as

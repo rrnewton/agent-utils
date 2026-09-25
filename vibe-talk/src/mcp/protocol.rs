@@ -268,7 +268,8 @@ fn arg_str(args: &Value, key: &str) -> Option<String> {
 /// the same channel. Refusing it as `unknown_channel` while the error lists that very id is how
 /// a live agent came to report "the id I used is the one it says to use". Only an exact
 /// unsigned integer is read: a float has already lost digits, and rounding one would name a
-/// different message or channel rather than none.
+/// different message or channel rather than none. An integer rounded by an earlier hop and
+/// written back out whole is indistinguishable from an exact one, and is read as written.
 fn arg_id(args: &Value, key: &str) -> Option<String> {
     match args.get(key)? {
         Value::String(text) => Some(text.clone()),
@@ -289,7 +290,7 @@ fn unreadable_id_kind(args: &Value, key: &str) -> Option<&'static str> {
     Some(match value {
         Value::Null => "<null>",
         Value::Bool(_) => "<bool>",
-        Value::Number(_) => "<inexact number>",
+        Value::Number(_) => "<unreadable number>",
         Value::Array(_) => "<array>",
         Value::Object(_) => "<object>",
         Value::String(_) => unreachable!("a string is always readable"),
@@ -1307,5 +1308,72 @@ mod tests {
         let posted = fake.posted();
         assert_eq!(posted.len(), 1, "{posted:?}");
         assert_eq!(posted[0].channel.as_str(), WRITE_CHANNEL);
+    }
+
+    #[tokio::test]
+    async fn an_integer_before_pages_back_from_the_message_it_names() {
+        let (state, fake) = testing::state();
+        let channel = ChannelId(READ_CHANNEL.to_owned());
+        fake.seed(&channel, "lead", "the older message");
+        fake.seed(&channel, "lead", "the newer message");
+        let window = ops::messages(&state, READ_CHANNEL, None)
+            .await
+            .expect("seeded channel reads");
+        let newer = window
+            .messages
+            .iter()
+            .find(|m| m.content == "the newer message")
+            .expect("seeded")
+            .id
+            .clone();
+        let number: u64 = newer.as_str().parse().expect("the fake's ids are digits");
+        let by_number = dispatch(
+            &state,
+            Scope::Read,
+            &call(
+                "read_page",
+                json!({ "channel_id": READ_CHANNEL, "before": number }),
+            ),
+        )
+        .await;
+        let by_string = dispatch(
+            &state,
+            Scope::Read,
+            &call(
+                "read_page",
+                json!({ "channel_id": READ_CHANNEL, "before": newer.as_str() }),
+            ),
+        )
+        .await;
+        let text = result_text(&by_number);
+        assert!(!is_error(&by_number), "{text}");
+        assert!(text.contains("the older message"), "{text}");
+        assert!(!text.contains("the newer message"), "{text}");
+        assert_eq!(text, result_text(&by_string));
+    }
+
+    #[tokio::test]
+    async fn an_integer_reply_to_replies_to_the_message_it_names() {
+        let (state, fake) = testing::state();
+        let channel = ChannelId(WRITE_CHANNEL.to_owned());
+        fake.seed(&channel, "lead", "can someone look at the runner");
+        let window = ops::messages(&state, WRITE_CHANNEL, None)
+            .await
+            .expect("seeded channel reads");
+        let target = window.messages[0].id.clone();
+        let number: u64 = target.as_str().parse().expect("the fake's ids are digits");
+        let outcome = dispatch(
+            &state,
+            Scope::Write,
+            &call(
+                "post_reply",
+                json!({ "channel_id": WRITE_CHANNEL, "text": "on it", "reply_to": number }),
+            ),
+        )
+        .await;
+        assert!(!is_error(&outcome), "{}", result_text(&outcome));
+        let posted = fake.posted();
+        assert_eq!(posted.len(), 1, "{posted:?}");
+        assert_eq!(posted[0].reply_to.as_ref(), Some(&target));
     }
 }

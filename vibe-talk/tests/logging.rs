@@ -473,7 +473,7 @@ async fn a_tool_line_names_an_integer_channel_and_the_shape_of_an_unreadable_one
         ),
         (
             json!({ "channel_id": near }),
-            "channel=\"<inexact number>\"".to_owned(),
+            "channel=\"<unreadable number>\"".to_owned(),
         ),
         (
             json!({ "channel_id": null }),
