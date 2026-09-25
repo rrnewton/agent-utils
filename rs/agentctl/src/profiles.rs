@@ -807,7 +807,7 @@ mod tests {
             serde_json::from_str(r#"{"schema":"agentctl-profiles/v2","profiles":{}}"#).unwrap();
         assert!(matches!(missing.default_workspace, FieldPresence::Missing));
         let exact: Document = serde_json::from_str(
-            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":{"label":"dev-hermit-014"}}"#,
+            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":{"label":"project-workspace"}}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -815,7 +815,7 @@ mod tests {
             FieldPresence::Present(RawWorkspaceSelector {
                 id: FieldPresence::Missing,
                 label: FieldPresence::Present(value),
-            }) if value == "dev-hermit-014"
+            }) if value == "project-workspace"
         ));
     }
 }
