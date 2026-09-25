@@ -560,6 +560,9 @@
                 -->
                 <button id="remove-channel" class="secondary" type="button" hidden>Remove</button>
                 <button id="open-add-channel" class="secondary" type="button" aria-expanded="false" aria-controls="add-channel-fields">Add a channel</button>
+                <!-- `#19 channel-browser`. Only offered when the server says the bridge can list its
+                     channels; otherwise pasting a link under "Add a channel" is the way in. -->
+                <button id="open-browse-channels" class="secondary" type="button" aria-expanded="false" aria-controls="browse-channel-fields" hidden>Browse channels</button>
               </div>
               <p id="remove-channel-state" class="hint" aria-live="polite"></p>
 
@@ -588,8 +591,8 @@
 
               <div id="add-channel-fields" hidden>
                 <p id="new-channel-help" class="hint">
-                  Enter the channel ID supplied by this deployment. The bridge must already
-                  have access to the channel in your chat service.
+                  Enter the channel ID supplied by this deployment. The chat connector must
+                  already have access to the channel in the chat service.
                 </p>
                 <label id="new-channel-id-label" for="new-channel-id">Channel ID</label>
                 <input
@@ -616,13 +619,39 @@
                 -->
                 <label id="new-channel-writable-row" class="row" for="new-channel-writable">
                   <input id="new-channel-writable" type="checkbox" />
-                  <span>Let the bridge post here</span>
+                  <span>Let this app post here</span>
                 </label>
                 <div class="channel-actions">
                   <button id="add-channel" class="secondary" type="button">Add</button>
                   <button id="cancel-add-channel" class="secondary" type="button">Cancel</button>
                 </div>
                 <p id="add-channel-state" class="hint" aria-live="polite"></p>
+              </div>
+
+              <!--
+                `#19 channel-browser`. The channels the bridge can see, searchable, one tap to add.
+                Rows are built by `renderChannelDirectory` in web/voice.js; a channel this app
+                already reads is marked and has no Add button, so it cannot be added twice.
+              -->
+              <div id="browse-channel-fields" hidden>
+                <label for="channel-directory-search">Search channels</label>
+                <input
+                  id="channel-directory-search"
+                  type="search"
+                  maxlength="100"
+                  autocomplete="off"
+                  enterkeyhint="search"
+                  placeholder="type part of a name"
+                  aria-describedby="channel-directory-state"
+                  aria-controls="channel-directory-list"
+                />
+                <p id="channel-directory-state" class="hint" aria-live="polite"></p>
+                <ul id="channel-directory-list" class="channel-directory" aria-label="Channels you can add"></ul>
+                <div class="channel-actions">
+                  <button id="channel-directory-more" class="secondary" type="button" hidden>Show more</button>
+                  <button id="channel-directory-retry" class="secondary" type="button" hidden>Try again</button>
+                  <button id="close-browse-channels" class="secondary" type="button">Done</button>
+                </div>
               </div>
 
               <!--
@@ -1097,14 +1126,14 @@
               </p>
               <p class="hint">
                 <strong>Adding a channel</strong> needs the channel ID supplied by this deployment.
-                The bridge must already have access to that channel in your chat service.
+                The chat connector must already have access to that channel in the chat service.
                 The channel is
                 <strong>read before it is accepted</strong>, so a mistyped id or a channel the bot
                 cannot see is refused straight away rather than joining the list and failing later.
               </p>
               <p class="hint">
-                <strong>Let the bridge post here</strong> is off unless you turn it on, and it is
-                the one switch that widens what this bridge can <em>say</em> rather than what it can
+                <strong>Let this app post here</strong> is off unless you turn it on, and it is
+                the one switch that widens what this app can <em>say</em> rather than what it can
                 read. Leaving it off means the channel can be read and replied to from this app but
                 is not somewhere the agent can be told to post.
               </p>

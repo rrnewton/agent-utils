@@ -2745,3 +2745,41 @@ textarea {
   gap: 0.4rem;
   margin: 0.4rem 0 0;
 }
+
+/* `#19 channel-browser`. One row per channel: the name takes the width and wraps rather than
+   pushing the Add button off a narrow phone, and the button keeps a finger-sized target. */
+.channel-directory {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  max-height: 22rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.channel-directory li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--edge);
+}
+
+.channel-directory .directory-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.channel-directory .directory-tracked {
+  flex: 0 0 auto;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.channel-directory button {
+  flex: 0 0 auto;
+  min-height: 2.75rem;
+  min-width: 4rem;
+}

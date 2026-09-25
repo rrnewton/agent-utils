@@ -567,6 +567,8 @@ pub struct ClientConfigResponse {
     pub live_delivery: &'static str,
     /// Whether the selected provider accepts channel links or references and manages registration.
     pub channel_registration_supported: bool,
+    /// Whether the selected provider can list its channels for browsing. `#19 channel-browser`.
+    pub channel_discovery_supported: bool,
     /// Whether the selected provider exposes a write-through read cursor.
     pub upstream_read_mark_supported: bool,
     /// Whether the backend supports channel, thread-list, and flattened timelines.
@@ -604,6 +606,7 @@ pub async fn client_config(
             "off"
         },
         channel_registration_supported: state.chat.supports_channel_registration(),
+        channel_discovery_supported: state.chat.supports_channel_discovery(),
         upstream_read_mark_supported: state.chat.supports_upstream_read_mark(),
         threading_supported: state.chat.supports_threading(),
         speech_prep_enabled: state.config.speakable.enabled,
@@ -2589,6 +2592,173 @@ where
     }
 }
 
+/// One page of the channel directory, as the browser asks for it. `#19 channel-browser`.
+#[derive(Debug, Deserialize)]
+pub struct ChannelDirectoryQuery {
+    /// Case-insensitive name filter. Trimmed; blank lists everything.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Opaque continuation returned by the previous page of the same search.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Entries per page, `1..=50`, default 25.
+    #[serde(default)]
+    pub limit: Option<u16>,
+}
+
+/// A channel the bridge can see, and whether this app already tracks it.
+#[derive(Debug, Serialize)]
+pub struct ChannelDirectoryEntry {
+    /// Opaque reference to send back as `source` when adding it.
+    pub source: String,
+    /// The channel's display name upstream.
+    pub name: String,
+    /// Whether a channel in this app's list already reads this source.
+    pub tracked: bool,
+    /// That channel's id, when tracked.
+    pub channel_id: Option<ChannelId>,
+}
+
+/// One page of the channel directory.
+#[derive(Debug, Serialize)]
+pub struct ChannelDirectoryResponse {
+    /// Entries in the bridge's order.
+    pub entries: Vec<ChannelDirectoryEntry>,
+    /// Continuation for the next page, or null on the last one.
+    pub next_cursor: Option<String>,
+    /// Whether the bridge stopped listing before the end of what its account can see.
+    pub truncated: bool,
+}
+
+/// `GET /api/v1/channel-directory` — browse the channels the bridge can see. `#19 channel-browser`.
+///
+/// WRITE SCOPE, like adding. The list names every channel the bridge's account can see, not only
+/// the ones this app reads, and its only purpose is choosing one to add, so a read-only token has
+/// no business enumerating it. No MCP tool, for the reason `add_channel` has none.
+///
+/// Tracked entries are marked here rather than by the bridge alone: a source is tracked when the
+/// bridge's existing registration for it, or the source itself, is a channel in this app's list.
+pub async fn channel_directory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChannelDirectoryQuery>,
+) -> Result<Response, ApiError> {
+    use crate::directory::{
+        DirectoryRequest, DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_CHARS, MAX_TOKEN_BYTES,
+    };
+
+    require(&headers, &state, Scope::Write)?;
+    if !state.chat.supports_channel_discovery() {
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "channel_directory_unsupported",
+            format!(
+                "{} cannot list channels through this chat connector; add one by link or reference instead",
+                state.chat.provider_name()
+            ),
+        ));
+    }
+    let search = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    if search.is_some_and(|text| {
+        text.chars().count() > MAX_QUERY_CHARS || text.chars().any(char::is_control)
+    }) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_directory_query",
+            format!("a search must be at most {MAX_QUERY_CHARS} characters of ordinary text"),
+        ));
+    }
+    if query.cursor.as_deref().is_some_and(|cursor| {
+        cursor.is_empty() || cursor.len() > MAX_TOKEN_BYTES || cursor.chars().any(char::is_control)
+    }) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_directory_cursor",
+            "cursor must be a continuation returned by the previous page",
+        ));
+    }
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+    if !(1..=MAX_LIMIT).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_directory_limit",
+            format!("limit must be between 1 and {MAX_LIMIT}"),
+        ));
+    }
+    let request = DirectoryRequest {
+        query: search.map(str::to_owned),
+        cursor: query.cursor,
+        limit,
+    };
+    let page = state
+        .chat
+        .discover_channels(&request)
+        .await
+        .map_err(directory_error)?;
+    let local: std::collections::BTreeSet<String> = state
+        .all_channels()
+        .into_iter()
+        .map(|channel| channel.id.as_str().to_owned())
+        .collect();
+    let entries = page
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let channel_id = entry
+                .registered_channel_id
+                .filter(|id| local.contains(id.as_str()))
+                .or_else(|| {
+                    local
+                        .contains(&entry.source)
+                        .then(|| ChannelId(entry.source.clone()))
+                });
+            ChannelDirectoryEntry {
+                source: entry.source,
+                name: entry.name,
+                tracked: channel_id.is_some(),
+                channel_id,
+            }
+        })
+        .collect();
+    Ok(no_store(Json(ChannelDirectoryResponse {
+        entries,
+        next_cursor: page.next_cursor,
+        truncated: page.truncated,
+    })))
+}
+
+/// Keep the three failures a person can act on apart: the bridge said no, the bridge does not
+/// offer a directory, and the bridge refused this particular request. Everything else is the
+/// ordinary upstream failure.
+fn directory_error(error: ChatError) -> ApiError {
+    let status = match error.cause() {
+        ChatError::Status { status, .. } => Some(*status),
+        _ => None,
+    };
+    match status {
+        Some(401 | 403) => ApiError::new(
+            StatusCode::FORBIDDEN,
+            "channel_directory_denied",
+            error.to_string(),
+        ),
+        Some(404 | 405 | 501) => ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "channel_directory_unsupported",
+            error.to_string(),
+        ),
+        Some(400) => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "channel_directory_rejected",
+            error.to_string(),
+        ),
+        _ => error.into(),
+    }
+}
+
 /// Adding a channel from inside the app.
 #[derive(Debug, Deserialize)]
 pub struct AddChannelRequest {
@@ -2741,7 +2911,7 @@ pub async fn add_channel(
         let (code, detail) = if managed {
             (
                 "channel_is_configured",
-                "the bridge resolved this source to a channel owned by the static configuration; managed registration cannot replace it",
+                "this source resolves to a channel owned by the static configuration; managed registration cannot replace it",
             )
         } else {
             (

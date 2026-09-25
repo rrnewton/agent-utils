@@ -135,6 +135,7 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
         ("GET", "/api/v1/channels".to_owned(), None),
         ("GET", "/api/v1/client-config".to_owned(), None),
         ("GET", "/api/v1/agent-tools".to_owned(), None),
+        ("GET", "/api/v1/channel-directory".to_owned(), None),
         ("GET", "/api/v1/signed-url".to_owned(), None),
         (
             "GET",
@@ -3852,5 +3853,253 @@ async fn only_a_channel_added_in_the_app_can_be_removed_from_it() {
         status,
         StatusCode::NOT_FOUND,
         "a removed channel is still readable"
+    );
+}
+
+fn directory_entry(
+    source: &str,
+    name: &str,
+    registered: Option<&str>,
+) -> vibe_talk::directory::DirectoryEntry {
+    vibe_talk::directory::DirectoryEntry {
+        source: source.to_owned(),
+        name: name.to_owned(),
+        registered_channel_id: registered.map(|id| ChannelId(id.to_owned())),
+    }
+}
+
+/// A registration-capable backend that can also list channels, with one of them already tracked.
+fn directory_harness() -> (Harness, std::sync::Arc<vibe_talk::store::fake::FakeStore>) {
+    let (harness, store, _ids) = todo_harness();
+    let managed = ChannelId("3333333333333333777".to_owned());
+    harness
+        .discord
+        .enable_channel_registration(&managed, true, false);
+    harness.discord.enable_channel_directory(
+        vec![
+            directory_entry("room/release", "Release Train", None),
+            directory_entry("room/write", "Already Here", Some(WRITE_CHANNEL)),
+            directory_entry("room/elsewhere", "Registered Elsewhere", Some("9999999999")),
+        ],
+        false,
+    );
+    (harness, store)
+}
+
+/// `#19 channel-browser`: the page is offered the directory only when the backend has one.
+#[tokio::test]
+async fn client_config_offers_the_directory_only_when_the_backend_lists_channels() {
+    let plain = harness();
+    let (status, config) = call(
+        &plain,
+        "GET",
+        "/api/v1/client-config",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["channel_discovery_supported"], false);
+    let (status, body) = call(
+        &plain,
+        "GET",
+        "/api/v1/channel-directory",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(body["error"], "channel_directory_unsupported");
+    assert!(
+        !body.to_string().to_lowercase().contains("bridge"),
+        "implementation wording reached a caller: {body}"
+    );
+
+    let (browsing, _store) = directory_harness();
+    let (status, config) = call(
+        &browsing,
+        "GET",
+        "/api/v1/client-config",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(config["channel_discovery_supported"], true);
+}
+
+/// `#19 channel-browser`: browsing needs the token that can add, since that is all it is for.
+#[tokio::test]
+async fn the_channel_directory_needs_write_scope() {
+    let (harness, _store) = directory_harness();
+    let (status, _) = call(
+        &harness,
+        "GET",
+        "/api/v1/channel-directory",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        harness.discord.directory_calls().is_empty(),
+        "a read token reached the backend"
+    );
+}
+
+/// `#19 channel-browser`: tracked marking, search and cursors pass through untouched.
+#[tokio::test]
+async fn the_channel_directory_marks_tracked_channels_and_pages_through_the_backend() {
+    let (harness, _store) = directory_harness();
+    let (status, page) = call(
+        &harness,
+        "GET",
+        "/api/v1/channel-directory?limit=2",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let entries = page["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2, "{page}");
+    assert_eq!(entries[0]["source"], "room/release");
+    assert_eq!(entries[0]["name"], "Release Train");
+    assert_eq!(entries[0]["tracked"], false);
+    assert_eq!(entries[0]["channel_id"], Value::Null);
+    assert_eq!(
+        entries[1]["tracked"], true,
+        "a configured channel was offered again"
+    );
+    assert_eq!(entries[1]["channel_id"], WRITE_CHANNEL);
+    assert_eq!(page["truncated"], false);
+    let cursor = page["next_cursor"]
+        .as_str()
+        .expect("a second page")
+        .to_owned();
+
+    let (status, rest) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channel-directory?limit=2&cursor={cursor}"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rest}");
+    let entries = rest["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "{rest}");
+    assert_eq!(entries[0]["source"], "room/elsewhere");
+    assert_eq!(
+        entries[0]["tracked"], false,
+        "a registration this app does not read is not tracked"
+    );
+    assert_eq!(rest["next_cursor"], Value::Null);
+
+    let (status, found) = call(
+        &harness,
+        "GET",
+        "/api/v1/channel-directory?q=%20%20release%20",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(
+        found["entries"].as_array().map(Vec::len),
+        Some(1),
+        "{found}"
+    );
+
+    let calls = harness.discord.directory_calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].query, None);
+    assert_eq!(calls[0].limit, 2);
+    assert_eq!(calls[1].cursor.as_deref(), Some(cursor.as_str()));
+    assert_eq!(
+        calls[2].query.as_deref(),
+        Some("release"),
+        "the search was not trimmed"
+    );
+    assert_eq!(calls[2].limit, vibe_talk::directory::DEFAULT_LIMIT);
+}
+
+/// `#19 channel-browser`: a bad request is refused here, before anything reaches the backend.
+#[tokio::test]
+async fn malformed_directory_requests_are_refused_locally() {
+    let (harness, _store) = directory_harness();
+    let long = "a".repeat(vibe_talk::directory::MAX_QUERY_CHARS + 1);
+    for (uri, code) in [
+        (
+            format!("/api/v1/channel-directory?q={long}"),
+            "invalid_directory_query",
+        ),
+        (
+            "/api/v1/channel-directory?q=a%0Ab".to_owned(),
+            "invalid_directory_query",
+        ),
+        (
+            "/api/v1/channel-directory?cursor=".to_owned(),
+            "invalid_directory_cursor",
+        ),
+        (
+            "/api/v1/channel-directory?cursor=a%07b".to_owned(),
+            "invalid_directory_cursor",
+        ),
+        (
+            "/api/v1/channel-directory?limit=0".to_owned(),
+            "invalid_directory_limit",
+        ),
+        (
+            "/api/v1/channel-directory?limit=51".to_owned(),
+            "invalid_directory_limit",
+        ),
+    ] {
+        let (status, body) = call(&harness, "GET", &uri, Some(WRITE_TOKEN), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert_eq!(body["error"], code, "{uri}: {body}");
+    }
+    assert!(harness.discord.directory_calls().is_empty());
+}
+
+/// `#19 channel-browser`: the backend's refusals stay distinguishable to the page.
+#[tokio::test]
+async fn directory_failures_upstream_keep_their_meaning() {
+    let (harness, _store) = directory_harness();
+    for (upstream, status, code) in [
+        (403, StatusCode::FORBIDDEN, "channel_directory_denied"),
+        (401, StatusCode::FORBIDDEN, "channel_directory_denied"),
+        (
+            404,
+            StatusCode::NOT_IMPLEMENTED,
+            "channel_directory_unsupported",
+        ),
+        (400, StatusCode::BAD_REQUEST, "channel_directory_rejected"),
+    ] {
+        harness
+            .discord
+            .fail_next_directory(upstream, "{\"error\":\"no\"}");
+        let (got, body) = call(
+            &harness,
+            "GET",
+            "/api/v1/channel-directory",
+            Some(WRITE_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(got, status, "upstream {upstream}: {body}");
+        assert_eq!(body["error"], code, "upstream {upstream}: {body}");
+    }
+    harness.discord.fail_next_directory(503, "busy");
+    let (got, body) = call(
+        &harness,
+        "GET",
+        "/api/v1/channel-directory",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert!(
+        got.is_server_error(),
+        "an outage is not the caller's fault: {got} {body}"
     );
 }

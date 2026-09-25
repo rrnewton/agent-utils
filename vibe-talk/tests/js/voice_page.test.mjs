@@ -971,6 +971,7 @@ function newPage(store = new Map(), script = SCRIPT) {
         live_poll_seconds: page.livePollSeconds,
         live_delivery: page.liveDelivery,
         channel_registration_supported: page.channelRegistrationSupported,
+        channel_discovery_supported: page.channelDiscoverySupported,
         threading_supported: page.threadingSupported,
         upstream_read_mark_supported: page.upstreamReadMarkSupported,
         replay_enabled: page.replayEnabled,
@@ -1014,6 +1015,16 @@ function newPage(store = new Map(), script = SCRIPT) {
     registeredChannelId: "1110000000000000099",
     /** Whether the fake registration bridge permits posting into the registered channel. */
     registeredChannelWritable: false,
+    /** Whether the server offers the channel directory. `#19 channel-browser`. */
+    channelDiscoverySupported: false,
+    /** What the directory lists, in order, as `{source, name, channel_id}`. */
+    directory: [],
+    /** Every directory request, as a URL, so search, limit and cursor are all checkable. */
+    directoryCalls: [],
+    /** Failures the next directory reads answer with, one each, as `{status, error, detail}`. */
+    directoryFailures: [],
+    /** Make adding answer 409, the way the server does for a source it already reads. */
+    addChannelConflict: false,
     /** Whether the provider can move its own read cursor. Default false, like production. */
     upstreamReadMarkSupported: false,
     /** Every explicit provider read-boundary request. Separate from local Done/archive calls. */
@@ -1457,9 +1468,42 @@ function newPage(store = new Map(), script = SCRIPT) {
       // Adding and removing a channel. A real little store, like the alias one below and for the
       // same reason: what is worth asserting is that the page redraws from what the SERVER now
       // says exists, which a canned body could not tell apart from the page trusting the form.
+      // `#19 channel-browser`. A real little directory: search, limit and an offset cursor, and
+      // `tracked` computed from the channels the fixture now holds, as the server computes it.
+      if (String(path).startsWith("/api/v1/channel-directory")) {
+        const url = new URL(path, "http://fixture.test");
+        page.directoryCalls.push(url);
+        const failure = page.directoryFailures.shift();
+        if (failure) {
+          return json(failure.status, { error: failure.error, detail: failure.detail });
+        }
+        const query = (url.searchParams.get("q") || "").toLowerCase();
+        const limit = Number(url.searchParams.get("limit") || 25);
+        const offset = Number((url.searchParams.get("cursor") || "o:0").slice(2));
+        const matching = page.directory.filter((entry) =>
+          entry.name.toLowerCase().includes(query)
+        );
+        const entries = matching.slice(offset, offset + limit).map((entry) => {
+          const tracked = page.channels.some((c) => String(c.id) === entry.channel_id);
+          return {
+            source: entry.source,
+            name: entry.name,
+            tracked,
+            channel_id: tracked ? entry.channel_id : null,
+          };
+        });
+        return json(200, {
+          entries,
+          next_cursor: offset + limit < matching.length ? `o:${offset + limit}` : null,
+          truncated: false,
+        });
+      }
       if (String(path) === "/api/v1/channels" && (options && options.method) === "POST") {
         const asked = JSON.parse(options.body || "{}");
         page.addChannelCalls.push(asked);
+        if (page.addChannelConflict) {
+          return json(409, { error: "channel_exists", detail: "that source is already a channel" });
+        }
         if (page.addChannelError) {
           return json(502, { error: "channel_unreadable", detail: page.addChannelError });
         }
@@ -1942,6 +1986,14 @@ const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
 // The bands are deliberately WIDE. They are not a second opinion about the tuning; they are the
 // boundary between a judgement and a different behaviour wearing the same name.
 const TUNING_BANDS = {
+  DIRECTORY_SEARCH_DELAY_MS: [100, 1000,
+    "the pause that ends a search: shorter asks the server once per keystroke, longer makes the " +
+    "list feel as if it ignored what was typed (#19 channel-browser)"],
+  DIRECTORY_PAGE_SIZE: [10, 50,
+    "channels per page: fewer is a Show more tap every screenful, more than the server's own " +
+    "limit of 50 is refused outright"],
+  CHANNEL_LABEL_MAX: [60, 60,
+    "a browsed channel's label must fit the same 60 characters the Add form's field allows"],
   BROWSER_SPEECH_CHUNK_CHARS: [60, 300,
     "device voices need short utterances to avoid mobile synthesis stalls without pausing every word"],
   BROWSER_SPEECH_START_MS: [5000, 20000,
@@ -14900,7 +14952,8 @@ test("MANAGED REGISTRATION HIDES THE CHECKBOX AND ACCEPTS BRIDGE WRITE POLICY", 
   await page.el("open-add-channel").click();
 
   assert.match(page.el("new-channel-id-label").text(), /Channel link or provider reference/);
-  assert.match(page.el("new-channel-help").text(), /bridge resolves it/);
+  assert.match(page.el("new-channel-help").text(), /from Discord\. The channel is checked/);
+  assert.doesNotMatch(page.el("new-channel-help").text(), /bridge/i);
   assert.equal(
     page.el("new-channel-writable-row").hidden,
     true,
@@ -16713,4 +16766,209 @@ test("an older in-flight poll cannot erase a sent message after its live confirm
   assert.match(page.el("pane-discord").text(), /confirmed while the old read waited/,
     "an older in-flight page erased the message after its live confirmation");
   assert.equal(shownIds(page).filter((id) => id === posted.id).length, 1);
+});
+
+// --- `#19 channel-browser` ------------------------------------------------------------------------
+
+/** A page whose server can register and list channels, with `count` channels to list. */
+function browsingPage(count = 3) {
+  const page = newPage();
+  page.channelRegistrationSupported = true;
+  page.channelDiscoverySupported = true;
+  page.directory = Array.from({ length: count }, (_, n) => ({
+    source: `room/${n}`,
+    name: n === 1 ? "Release Train" : `Room ${String(n).padStart(2, "0")}`,
+    channel_id: null,
+  }));
+  return page;
+}
+
+async function openBrowser(page) {
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.el("open-browse-channels").click();
+  await page.settle();
+}
+
+/** The directory's rows as `name | Add` or `name | Already added`. */
+function directoryRows(page) {
+  return page.el("channel-directory-list").children.map((row) => {
+    const button = row.children.find((kid) => kid.tagName === "button");
+    return `${row.children[0].textContent} | ${button ? button.textContent : row.children[1].textContent}`;
+  });
+}
+
+test("channel browser: offered only when the server can register AND list channels", async () => {
+  const plain = newPage();
+  await signIn(plain);
+  assert.equal(plain.el("open-browse-channels").hidden, true, "offered with no directory");
+
+  const registering = newPage();
+  registering.channelRegistrationSupported = true;
+  await signIn(registering);
+  assert.equal(registering.el("open-browse-channels").hidden, true, "offered without discovery");
+
+  const listing = newPage();
+  listing.channelDiscoverySupported = true;
+  await signIn(listing);
+  assert.equal(
+    listing.el("open-browse-channels").hidden,
+    true,
+    "offered a list whose Add buttons the server would refuse"
+  );
+
+  const browsing = browsingPage();
+  await signIn(browsing);
+  assert.equal(browsing.el("open-browse-channels").hidden, false);
+});
+
+test("channel browser: lists what the server sees and marks what is already here", async () => {
+  const page = browsingPage();
+  page.directory[2].channel_id = CHANNEL.id;
+  await openBrowser(page);
+
+  assert.equal(page.el("browse-channel-fields").hidden, false);
+  assert.deepEqual(directoryRows(page), [
+    "Room 00 | Add",
+    "Release Train | Add",
+    "Room 02 | Already added",
+  ]);
+  assert.equal(page.el("channel-directory-state").text(), "3 channels shown.");
+  assert.equal(page.el("channel-directory-more").hidden, true);
+  assert.equal(page.directoryCalls.length, 1);
+  assert.equal(page.directoryCalls[0].searchParams.get("limit"), "25");
+  assert.equal(page.directoryCalls[0].searchParams.get("q"), null);
+});
+
+test("channel browser: search waits for typing to pause, then asks the server", async () => {
+  const page = browsingPage();
+  await openBrowser(page);
+  const search = page.el("channel-directory-search");
+
+  await search.setValue("rel");
+  await search.setValue("release");
+  assert.equal(page.directoryCalls.length, 1, "searched on every keystroke");
+  assert.equal(page.expireTimers(250), 1, "the pauses were not collapsed into one search");
+  await page.settle();
+  assert.equal(page.directoryCalls.length, 2);
+  assert.equal(page.directoryCalls[1].searchParams.get("q"), "release");
+  assert.deepEqual(directoryRows(page), ["Release Train | Add"]);
+
+  await search.setValue("nothing like it");
+  await search.dispatch("keydown", { key: "Enter" });
+  await page.settle();
+  assert.equal(page.expireTimers(250), 0, "Enter left the pending search armed");
+  assert.equal(page.el("channel-directory-state").text(), 'No channels match "nothing like it".');
+  assert.equal(page.el("channel-directory-list").children.length, 0);
+});
+
+test("channel browser: an empty directory names the chat service, never the connector", async () => {
+  const named = browsingPage(0);
+  await openBrowser(named);
+  assert.equal(named.el("channel-directory-state").text(), "No channels are available in Discord yet.");
+
+  const unnamed = browsingPage(0);
+  unnamed.chatProviderName = undefined;
+  await openBrowser(unnamed);
+  assert.equal(
+    unnamed.el("channel-directory-state").text(),
+    "No channels are available in the chat service yet."
+  );
+});
+
+test("channel browser: pages through with Show more, keeping the rows already shown", async () => {
+  const page = browsingPage(30);
+  await openBrowser(page);
+  assert.equal(page.el("channel-directory-list").children.length, 25);
+  assert.equal(page.el("channel-directory-more").hidden, false);
+  assert.equal(page.el("channel-directory-state").text(), "25 channels shown. More are available.");
+
+  page.directoryFailures.push({ status: 502, error: "upstream_error", detail: "try later" });
+  await page.el("channel-directory-more").click();
+  await page.settle();
+  assert.equal(page.el("channel-directory-list").children.length, 25, "a failed page lost the list");
+  assert.match(page.el("channel-directory-state").text(), /Could not load channels\. try later/);
+  assert.equal(page.el("channel-directory-retry").hidden, false);
+
+  await page.el("channel-directory-retry").click();
+  await page.settle();
+  assert.equal(page.el("channel-directory-list").children.length, 30);
+  assert.equal(page.directoryCalls.at(-1).searchParams.get("cursor"), "o:25");
+  assert.equal(page.el("channel-directory-more").hidden, true);
+  assert.equal(page.el("channel-directory-retry").hidden, true);
+  assert.equal(page.el("channel-directory-state").text(), "30 channels shown.");
+});
+
+test("channel browser: a refusal is final, stays on screen, and never signs the reader out", async () => {
+  for (const [failure, said] of [
+    [
+      { status: 403, error: "channel_directory_denied", detail: "no" },
+      /^Discord does not allow this app to list channels\. A channel can still be added/,
+    ],
+    [
+      { status: 501, error: "channel_directory_unsupported", detail: "no" },
+      /^This chat connector cannot list channels\./,
+    ],
+    [{ status: 403, error: "forbidden", detail: "read token" }, /needs the token that can add/],
+  ]) {
+    const page = browsingPage();
+    page.directoryFailures.push(failure);
+    await openBrowser(page);
+    assert.equal(page.screen(), "settings", `${failure.error} bounced the reader to sign-in`);
+    assert.match(page.el("channel-directory-state").text(), said);
+    assert.doesNotMatch(page.el("channel-directory-state").text(), /bridge/i);
+    assert.equal(page.el("channel-directory-retry").hidden, true, `${failure.error} offered a retry`);
+  }
+});
+
+test("channel browser: Add registers the source through the ordinary add route", async () => {
+  const page = browsingPage();
+  await openBrowser(page);
+  const row = page.el("channel-directory-list").children[1];
+  const add = row.children.find((kid) => kid.tagName === "button");
+  assert.equal(add.getAttribute("aria-label"), "Add Release Train");
+  await add.click();
+  await page.settle();
+
+  assert.deepEqual(page.addChannelCalls, [{ source: "room/1", label: "Release Train" }]);
+  assert.equal(directoryRows(page)[1], "Release Train | Already added");
+  assert.match(page.el("channel-directory-state").text(), /^Added\. "Release Train" is now in/);
+  assert.ok(
+    page.el("discord-channel").children.some((option) => option.value === page.registeredChannelId),
+    "the added channel is not in the picker"
+  );
+});
+
+test("channel browser: a duplicate is shown as already added, not as a failure", async () => {
+  const page = browsingPage();
+  page.addChannelConflict = true;
+  await openBrowser(page);
+  const add = page.el("channel-directory-list").children[0].children.find(
+    (kid) => kid.tagName === "button"
+  );
+  await add.click();
+  await page.settle();
+
+  assert.equal(directoryRows(page)[0], "Room 00 | Already added");
+  assert.equal(page.el("channel-directory-state").text(), '"Room 00" is already in the channel list.');
+  assert.equal(page.screen(), "settings", "a duplicate bounced the reader out of Settings");
+});
+
+test("channel browser: its visible and accessible copy never says bridge", () => {
+  const panel = /<div id="browse-channel-fields"[\s\S]*?<\/div>\s*<\/div>/.exec(HTML_CODE)[0];
+  const form = /<div id="add-channel-fields"[\s\S]*?<\/div>\s*<p id="add-channel-state"/.exec(HTML_CODE)[0];
+  for (const markup of [panel, form]) {
+    assert.doesNotMatch(markup, /bridge/i, "implementation wording in the page's own copy");
+  }
+  assert.match(panel, /aria-label="Channels you can add"/);
+  assert.match(form, /Let this app post here/);
+});
+
+test("channel browser: rows are finger-sized and the list scrolls inside the panel", () => {
+  const list = cssBlock(".channel-directory");
+  assert.match(list, /max-height:\s*22rem/);
+  assert.match(list, /overflow-y:\s*auto/);
+  assert.match(cssBlock(".channel-directory li"), /min-height:\s*2\.75rem/);
+  assert.match(cssBlock(".channel-directory button"), /min-height:\s*2\.75rem/);
+  assert.match(cssBlock(".channel-directory .directory-name"), /overflow-wrap:\s*anywhere/);
 });

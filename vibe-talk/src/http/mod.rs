@@ -131,6 +131,9 @@ pub fn router(state: AppState) -> Router {
         // Adding a channel from inside the app. WRITE scope, and deliberately NO MCP tool: this
         // widens what the bridge can read, and what it can say. See `api::add_channel`.
         .route("/api/v1/channels", post(api::add_channel))
+        // `#19 channel-browser`. WRITE scope too: it lists every channel the bridge can see, and
+        // exists only to choose one to add. See `api::channel_directory`.
+        .route("/api/v1/channel-directory", get(api::channel_directory))
         .route("/api/v1/channels/{channel_id}", delete(api::remove_channel))
         .route("/api/v1/channels/{channel_id}/todo", get(api::todo))
         .route("/api/v1/channels/{channel_id}/dismiss", post(api::dismiss))
