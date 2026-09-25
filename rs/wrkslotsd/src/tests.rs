@@ -2807,6 +2807,59 @@ fn assert_rollout_gated(decision: &crate::policy::PolicyDecision) {
 }
 
 #[test]
+fn active_state_cannot_remove_or_replace_a_held_generation() {
+    let held_log = |next: Value| {
+        let scratch = Scratch::new();
+        let events = scratch.events();
+        let record = scoped_active_record("slot-a", 1);
+        let first = import_log(&events, vec![record.clone()], vec![]);
+        let held = append_event(
+            &events,
+            2,
+            &first,
+            "slot-held",
+            json!({"slot": "slot-a", "generation": 1, "reason": "owner pause"}),
+        );
+        append_event(
+            &events,
+            3,
+            &held,
+            "active-state-recorded",
+            json!({
+                "action": "heartbeat",
+                "slot": "slot-a",
+                "previous_revision": 0,
+                "revision": 1,
+                "previous_record_sha256": canonical_sha256(&record).expect("record digest"),
+                "record": next,
+                "evidence": {},
+            }),
+        );
+        replay(&events)
+    };
+
+    // Control: the held generation itself may still be rewritten.
+    let mut heartbeat = scoped_active_record("slot-a", 1);
+    heartbeat["heartbeat_at"] = Value::String("2026-09-22T09:31:00+00:00".to_owned());
+    let summary = held_log(heartbeat).expect("heartbeat on the held generation replays");
+    assert_eq!((summary.active_revision, summary.active_count), (1, 1));
+
+    for (case, next) in [
+        ("removal", Value::Null),
+        ("new generation", scoped_active_record("slot-a", 2)),
+    ] {
+        let error = held_log(next)
+            .err()
+            .unwrap_or_else(|| panic!("{case} under a hold must be refused"))
+            .to_string();
+        assert!(
+            error.contains("active-state-recorded changes held generation for slot-a"),
+            "{case}: {error}"
+        );
+    }
+}
+
+#[test]
 fn hold_events_are_typed_generation_bound_and_released() {
     let scratch = Scratch::new();
     let events = scratch.events();
@@ -4271,6 +4324,49 @@ fn indexed_decisions_are_fully_recomputed_and_holds_cannot_be_hidden() {
         "unexpected error: {error}"
     );
 
+    // The stored JSON alone must also match: once with a changed decision under
+    // an unchanged verdict column, once with the same decision re-encoded.
+    type Forgery = fn(&str) -> String;
+    let forgeries: [(&str, Forgery); 2] = [
+        ("changed reasons", |stored| {
+            let mut forged: Value = serde_json::from_str(stored).expect("parse stored decision");
+            assert_ne!(forged["reason_codes"], json!(["ACTIVE_HOLD"]));
+            forged["reason_codes"] = json!(["ACTIVE_HOLD"]);
+            serde_json::to_string(&forged).expect("encode reasons-only forgery")
+        }),
+        ("re-encoded decision", |stored| {
+            let decision: crate::policy::PolicyDecision =
+                serde_json::from_str(stored).expect("decode stored decision");
+            let forged = serde_json::to_string_pretty(&decision).expect("re-encode decision");
+            assert_ne!(forged, stored);
+            forged
+        }),
+    ];
+    for (case, forge) in forgeries {
+        rebuild_policy_index(&events, &index, &config, &evidence).expect("restore policy index");
+        let connection = Connection::open(&index).expect("reopen policy index");
+        let stored: String = connection
+            .query_row(
+                "SELECT decision_json FROM policy_decisions WHERE slot = 'slot-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read restored decision");
+        read_decision(&index, "slot-a").expect("restored decision reads");
+        connection
+            .execute(
+                "UPDATE policy_decisions SET decision_json = ?1 WHERE slot = 'slot-a'",
+                [forge(&stored)],
+            )
+            .expect("forge stored decision JSON");
+        drop(connection);
+        let error = read_decision(&index, "slot-a")
+            .err()
+            .unwrap_or_else(|| panic!("{case} must fail"))
+            .to_string();
+        assert!(error.contains("canonical re-evaluation"), "{case}: {error}");
+    }
+
     rebuild_policy_index(&events, &index, &config, &evidence).expect("restore policy index");
     let connection = Connection::open(&index).expect("reopen policy index");
     connection
@@ -5031,6 +5127,118 @@ fn policy_input_names_use_the_replay_name_grammar() {
                 .to_string();
             assert!(error.contains("is not a valid name"), "{field}: {error}");
         }
+    }
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+#[test]
+fn policy_inputs_refuse_unknown_keys_schemas_variants_and_verifications() {
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let record = scoped_active_record("slot-a", 1);
+    import_log(&events, vec![record.clone()], vec![]);
+    let (config, evidence) = write_policy_inputs(
+        &scratch,
+        std::slice::from_ref(&record),
+        "2026-09-22T09:40:01+00:00",
+        |_| {},
+    );
+    ShadowConfig::load(&config).expect("baseline configuration loads");
+    EvidenceBundle::load(&evidence).expect("baseline evidence loads");
+    let original_config = fs::read(&config).expect("read configuration");
+    let original_evidence = fs::read(&evidence).expect("read evidence");
+
+    type Mutation = fn(&mut Value);
+    let config_cases: [(&str, Mutation, &str); 2] = [
+        (
+            "unknown configuration key",
+            |value| value["unexpected"] = json!(1),
+            "unknown field `unexpected`",
+        ),
+        (
+            "configuration schema 2",
+            |value| value["schema"] = json!(2),
+            "unsupported shadow policy configuration schema 2",
+        ),
+    ];
+    for (case, mutate, expected) in config_cases {
+        fs::write(&config, &original_config).expect("restore configuration");
+        rewrite_json(&config, mutate);
+        let error = ShadowConfig::load(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{case} must be refused"));
+        let error = error_chain(&error);
+        assert!(error.contains(expected), "{case}: {error}");
+    }
+
+    let evidence_cases: [(&str, Mutation, &str); 9] = [
+        (
+            "unknown bundle key",
+            |value| value["unexpected"] = json!(1),
+            "unknown field `unexpected`",
+        ),
+        (
+            "unknown slot key",
+            |value| value["slots"][0]["unexpected"] = json!(1),
+            "unknown field `unexpected`",
+        ),
+        (
+            "unknown scope key",
+            |value| value["slots"][0]["scope"]["unexpected"] = json!(1),
+            "unknown field `unexpected`",
+        ),
+        (
+            "unknown scope identity key",
+            |value| value["slots"][0]["scope"]["recorded"]["unexpected"] = json!(1),
+            "unknown field `unexpected`",
+        ),
+        (
+            "unknown checkout key",
+            |value| value["slots"][0]["checkouts"][0]["unexpected"] = json!(1),
+            "unknown field `unexpected`",
+        ),
+        (
+            "unknown process-use variant",
+            |value| value["slots"][0]["process_use"] = json!("maybe"),
+            "unknown variant `maybe`",
+        ),
+        (
+            "unknown journal variant",
+            |value| value["slots"][0]["journal"] = json!("maybe"),
+            "unknown variant `maybe`",
+        ),
+        (
+            "evidence schema 2",
+            |value| value["schema"] = json!(2),
+            "unsupported shadow policy evidence schema 2",
+        ),
+        (
+            "unsupported scope verification",
+            |value| {
+                value["slots"][0]["scope"]["recorded"]["verification"] =
+                    json!("systemd-runtime-invocation-symlink-v2");
+            },
+            "scope.verification is not a supported writer verification",
+        ),
+    ];
+    for (case, mutate, expected) in evidence_cases {
+        fs::write(&evidence, &original_evidence).expect("restore evidence");
+        rewrite_json(&evidence, mutate);
+        let error = EvidenceBundle::load(&evidence)
+            .err()
+            .unwrap_or_else(|| panic!("{case} must be refused"));
+        let error = error_chain(&error);
+        assert!(error.contains(expected), "{case}: {error}");
     }
 }
 
