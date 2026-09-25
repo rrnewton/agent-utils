@@ -1,6 +1,6 @@
 ---
 title: 'gchat-deployment-handoff: reproduce the mobile reader on the intended host'
-status: in_progress
+status: closed
 priority: 0
 issue_type: task
 assignee: opus-5.5
@@ -10,7 +10,8 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T01:32:01.933921963+00:00
-updated_at: 2026-09-25T04:46:58.029027043+00:00
+updated_at: 2026-09-25T06:45:49.441915605+00:00
+closed_at: 2026-09-25T06:45:49.441914914+00:00
 claimed_at: 2026-09-25T04:46:58.029027043+00:00
 claimed_until: 2026-09-27T04:46:58.028846853+00:00
 ---
