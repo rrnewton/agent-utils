@@ -16641,6 +16641,74 @@ def test_one_agent_may_own_multiple_concurrent_validate_slots(tmp_path: Path) ->
     assert {record["agent"] for record in records} == {"codex-1"}
 
 
+def test_unrelated_create_proceeds_beside_interrupted_validation_batch_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    paths = prepare_dead_validate_slots(project, ("old-validation",))
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(
+        wrkslots,
+        "_recover_validate_batch_seal_journal",
+        lambda *_args, **_kwargs: None,
+    )
+    interrupt_validate_batch(
+        project,
+        monkeypatch,
+        "after-validate-batch-seal-target",
+        ("old-validation",),
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+    seal_before = stable_file(seal)
+
+    made = create(
+        project,
+        slot="new-validation",
+        agent="codex-2",
+        slot_type="validate",
+        branch=None,
+    )
+
+    assert made.returncode == 0, made.stderr
+    assert seal.is_file()
+    assert stable_file(seal) == seal_before
+    assert paths["old-validation"].is_dir()
+    assert checkout(
+        project, slot="new-validation", slot_type="validate"
+    ).is_dir()
+
+
+def test_create_refuses_exact_slot_named_by_validation_batch_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("sealed",))
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(
+        wrkslots,
+        "_recover_validate_batch_seal_journal",
+        lambda *_args, **_kwargs: None,
+    )
+    interrupt_validate_batch(
+        project,
+        monkeypatch,
+        "after-validate-batch-seal-target",
+        ("sealed",),
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+
+    with pytest.raises(wrkslots.Refusal, match="overlaps validation cleanup seal"):
+        wrkslots._assert_validate_batch_seals_disjoint_from_create(
+            config,
+            slot="sealed",
+            slot_type="validate",
+            plan=(),
+        )
+
+
 def test_later_participant_finishes_interrupted_validate_removal(
     tmp_path: Path,
 ) -> None:

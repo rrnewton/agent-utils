@@ -13105,7 +13105,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _assert_create_processes(
             owner, coordinator_lease, stage="before create mutation"
         )
-        _refuse_partial_state(config)
+        # A validation cleanup seal protects only the exact slot paths recorded
+        # in that seal. It may remain after its worker exits unexpectedly, and
+        # must not turn an unrelated cleanup failure into a global admission
+        # outage. The disjointness check below still rejects reuse or overlap
+        # with every sealed path before this create writes anything.
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, archives = _validate_global_state(config)
         interrupted_creates = _classify_create_journals(
             config, states, archives
@@ -13126,6 +13131,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
         if slot_path.exists() or slot_path.is_symlink():
             raise Refusal(f"slot path already exists: {slot_path}")
         plan = _create_plan(config, args, vcs)
+        _assert_validate_batch_seals_disjoint_from_create(
+            config,
+            slot=args.slot,
+            slot_type=args.slot_type,
+            plan=plan,
+        )
         _assert_interrupted_creates_unrelated(
             config,
             interrupted_creates,
@@ -19758,6 +19769,46 @@ def _write_validate_batch_seal_journal(
     path = _validate_batch_seal_journal_path(config)
     _validate_batch_seal_journal(config, path, payload)
     _atomic_write_json(path, dict(payload))
+
+
+def _assert_validate_batch_seals_disjoint_from_create(
+    config: Config,
+    *,
+    slot: str,
+    slot_type: str,
+    plan: Sequence[PlannedCheckout],
+) -> None:
+    """Permit progress beside a seal without reusing any fenced identity."""
+
+    requested_slot_path = _slot_directory(config, slot, slot_type)
+    requested_checkout_paths = tuple(
+        _stored_path(config, item.destination, "checkout destination")
+        for item in plan
+    )
+    for path in _validate_batch_seal_journals(config):
+        _raw, targets = _validate_batch_seal_journal(
+            config,
+            path,
+            _read_json(path, "validation-batch seal journal"),
+        )
+        for sealed_slot, sealed_generation, target in targets:
+            if sealed_slot == slot or _path_is_within(
+                requested_slot_path, target.path
+            ) or _path_is_within(target.path, requested_slot_path):
+                raise Refusal(
+                    f"requested slot {slot!r} overlaps validation cleanup seal "
+                    f"{path.name} target {sealed_slot!r} generation "
+                    f"{sealed_generation}"
+                )
+            for requested_path in requested_checkout_paths:
+                if _path_is_within(requested_path, target.path) or _path_is_within(
+                    target.path, requested_path
+                ):
+                    raise Refusal(
+                        f"checkout destination {requested_path} overlaps validation "
+                        f"cleanup seal {path.name} target {sealed_slot!r} generation "
+                        f"{sealed_generation}"
+                    )
 
 
 def _assert_validate_batch_seal_target(
