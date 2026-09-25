@@ -132,10 +132,18 @@ recovery, or retirement markers. Until a future producer adds an explicit termin
 non-removing operations, those attempts remain a rollout blocker; the observer can explain them but
 cannot clear or override them.
 
-Create and import-existing are the exception. Their completion closes the `recovery-started` marker
-for the same slot and operation when that marker is bound to the completed journal path. A marker
-bound to another path stays open, such as the default for a journal that predates the event log.
-This rests on the following enumeration of `py/wrkslots/cli.py`. Line numbers are at `3156e0f`.
+Create and import-existing are the exception, but only when the slot has an ACTIVE row at the
+completion. Such a completion closes the `recovery-started` marker for the same slot and operation
+when that marker is bound to the completed journal path, because the row now owns the slot's
+storage. A marker bound to another path stays open, such as the default for a journal that predates
+the event log. A completion that leaves no ACTIVE row also leaves the marker open. The current
+abort paths below leave no provisional storage, but replay reads histories written by every past
+writer, and a production history contains a create journal completed after `recovery-started` with
+no row ever published while its provisioned worktree, holding commits beyond the recorded start
+point, remained on disk. Such a slot therefore stays `BLOCKED` with `ACTIVE_RECORD_MISSING` and
+`RECOVERY_PENDING` instead of disappearing from the observer. The cost is a persistent blocker for a
+slot that current code aborted cleanly. The enumeration of `py/wrkslots/cli.py` below supports the
+row-present cases for histories written by that code. Line numbers are at `3156e0f`.
 
 - `_clear_journal` (5472) is the only writer of `operation-completed` (5483). Every
   `_write_event_file` and `writer.append` call passes a literal kind. The other occurrences, at 5558
@@ -153,10 +161,10 @@ The eight `_clear_journal` calls on a create or import journal, and the state ea
 | `_cmd_create` | 13500 | `_write_active_state(action="slot-created")` (13491) runs first, so the new ACTIVE row owns the storage |
 | `_recover_create` | 22424 | The ACTIVE row is already durable and must match the journal exactly. Every checkout HEAD is verified first, and `--abort-create` is refused (22387) |
 | `_recover_create` | 22543 | Recovery provisions and runs hooks, then publishes the row with `action="slot-created-by-recovery"` (22535) |
-| `_abort_create` | 22152 | Called at 22428 only when there is no ACTIVE row. It removes caches and worktrees, deletes branches at their expected heads, and removes the slot directory. Any unexpected state raises before the clear, so neither storage nor a row remains |
+| `_abort_create` | 22152 | Called at 22428 only when there is no ACTIVE row. It removes caches and worktrees, deletes branches at their expected heads, and removes the slot directory. Any unexpected state raises before the clear, so neither storage nor a row remains. The marker stays open because a completion without a row cannot distinguish this from an older writer that left storage |
 | `_publish_import` | 14224 | `_write_active_state(action="slot-imported")` (14214) runs first |
 | `_recover_import_existing` | 22582 | The row is already durable and matches exactly, and `_verify_import_record` passes. `--abort-import` is refused (22579) |
-| `_recover_import_existing` | 22588 | `--abort-import` with no row. An import publishes rows only for checkouts that already exist, so it changes no files and owns no provisional storage. The checkout was never registered, so it has neither a row nor a marker; the observer emits no decision for it, and it cannot be a reclaim target |
+| `_recover_import_existing` | 22588 | `--abort-import` with no row. An import publishes rows only for checkouts that already exist, so it changes no files and owns no provisional storage. The checkout was never registered and has no row, so the recovery marker stays open and the slot remains blocked rather than leaving the observer |
 | `_recover_import_existing` | 22612 | Recovery publishes the row with `action="slot-imported-by-recovery"` (22603) |
 
 The checks that run after these clears never undo them. They are `_validate_global_state` and
