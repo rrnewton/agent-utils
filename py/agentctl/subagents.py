@@ -70,6 +70,8 @@ _LEGACY_LAUNCH_SPEC_SCHEMA = "agentctl-launch/v1"
 _GOAL_STATE_SCHEMA = "agentctl-goal/v1"
 _GOAL_TRANSACTION_SCHEMA = "agentctl-goal-transaction/v1"
 _GOAL_TRANSACTION_FILE = "goal-transaction.json"
+_MANAGED_DEAD_RETIREMENT_SCHEMA = "agentctl-managed-dead-retirement/v1"
+_MANAGED_DEAD_RETIREMENT_FILE = "managed-dead-retirement.json"
 _NATIVE_SESSION_SCHEMA = "agentctl-native-session/v1"
 _RELOCATION_SCHEMA = "agentctl-relocation/v1"
 _SESSION_COMPATIBILITY_FIELDS = frozenset({
@@ -3712,7 +3714,10 @@ class ManagedAgents:
         pinned: _PinnedAgentDirectory, content: bytes, *, name: str = "output.json",
     ) -> _InstalledArtifact:
         """Replace one private snapshot with exact bytes and durable directory metadata."""
-        if name not in {"agent.json", "output.json", "stop-result.json"}:
+        if name not in {
+            "agent.json", "output.json", "stop-result.json",
+            _MANAGED_DEAD_RETIREMENT_FILE,
+        }:
             raise AgentDeliveryError("unsupported pinned registry artifact name")
         limit = _MAX_AGENT_RECORD_BYTES if name == "agent.json" else _MAX_SNAPSHOT_BYTES
         if len(content) > limit:
@@ -4518,6 +4523,104 @@ class ManagedAgents:
                     expected_token_explicit=expected_token_explicit,
                 )
 
+    @staticmethod
+    def _managed_dead_retirement_document(
+        record: AgentRecord, record_bytes: bytes,
+    ) -> dict[str, object]:
+        return {
+            "schema": _MANAGED_DEAD_RETIREMENT_SCHEMA,
+            "name": record.name,
+            "token": record.token,
+            "record_sha256": hashlib.sha256(record_bytes).hexdigest(),
+            "pane_closed": False,
+            "runtime_preserved": True,
+        }
+
+    def _read_managed_dead_retirement(
+        self, directory: Path, record: AgentRecord, record_bytes: bytes,
+    ) -> dict[str, object]:
+        path = directory / _MANAGED_DEAD_RETIREMENT_FILE
+        document = agent._read_queue_json(
+            str(path), "managed-dead retirement receipt", require_private=True,
+            max_artifact_bytes=_MAX_AGENT_RECORD_BYTES,
+        )
+        expected = self._managed_dead_retirement_document(record, record_bytes)
+        if document != expected:
+            raise AgentDeliveryError(
+                "managed-dead retirement receipt disagrees with its stopped record"
+            )
+        return expected
+
+    def _managed_dead_archive_receipt(
+        self, name: str, expected_token: str | None,
+    ) -> dict[str, object] | None:
+        if expected_token is None or os.path.lexists(self._directory(name)):
+            return None
+        destination = self.registry / "archive" / f"{name}-{expected_token}"
+        if not os.path.lexists(destination):
+            return None
+        agent._validate_private_directory(
+            str(destination), "managed-dead agent archive",
+        )
+        record_path = destination / "agent.json"
+        record_bytes = agent._read_bounded_queue_bytes(
+            str(record_path), "managed-dead archived record", require_private=True,
+            max_artifact_bytes=_MAX_AGENT_RECORD_BYTES,
+        )
+        document = agent._decode_json_bytes(
+            record_bytes, "managed-dead archived record", record_path,
+        )
+        record = AgentRecord._from_value(document, record_path, name)
+        if (record.token != expected_token or record.lifecycle != "stopped"
+                or record.launch.adapter != "herdr-pane"):
+            raise AgentDeliveryError(
+                "managed-dead archive is not an exact preserved-runtime receipt"
+            )
+        self._read_managed_dead_retirement(destination, record, record_bytes)
+        return {
+            "name": name,
+            "archive": str(destination),
+            "pane_closed": False,
+            "tab_closed": False,
+            "managed_dead": True,
+            "runtime_preserved": True,
+            "continuation": (
+                "The dead custom runtime was archived; its shell pane was preserved "
+                "because Herdr does not provide a terminal-generation-conditional close."
+            ),
+        }
+
+    def _complete_preserved_managed_dead_publication(
+        self, record: AgentRecord, *, pinned: _PinnedAgentDirectory,
+        expected_token: str,
+    ) -> dict[str, object]:
+        snapshot = self._managed_record_snapshot(
+            pinned, expected_token=expected_token,
+        )
+        final = snapshot.record
+        if (final.lifecycle != "stopped"
+                or final.launch.adapter != "herdr-pane"
+                or final.launch.mode != "interactive"
+                or final.launch.backend != "herdr"):
+            raise AgentDeliveryError(
+                "preserved managed-dead publication requires an exact stopped herdr-pane record"
+            )
+        self._read_managed_dead_retirement(pinned.path, final, snapshot.content)
+        _archive, destination = self._archive_destination(final)
+        self._publish_pinned_directory(
+            pinned, destination, expected_record=snapshot.content,
+        )
+        return self._managed_dead_archive_receipt(
+            final.name, expected_token,
+        ) or {
+            "name": final.name,
+            "archive": str(destination),
+            "pane_closed": False,
+            "tab_closed": False,
+            "managed_dead": True,
+            "runtime_preserved": True,
+        }
+
     def _retire_managed_dead_locked(
         self, record: AgentRecord, *, pinned: _PinnedAgentDirectory,
         expected_token: str | None,
@@ -4535,6 +4638,11 @@ class ManagedAgents:
                 f"refusing to retire dead managed agent {record.name!r}: registry record changed"
             )
         record = initial.record
+        if (record.lifecycle == "stopped"
+                and record.launch.adapter == "herdr-pane"):
+            return self._complete_preserved_managed_dead_publication(
+                record, pinned=pinned, expected_token=expected_token,
+            )
         if (record.launch.adapter not in ("herdr", "herdr-pane")
                 or record.lifecycle != "running"
                 or record.launch.mode != "interactive" or record.launch.backend != "herdr"):
@@ -4653,6 +4761,13 @@ class ManagedAgents:
         close_pane = final.launch.adapter == "herdr"
         if close_pane:
             self.client.close_pane(final.pane_id)
+        else:
+            retirement_bytes = _snapshot_json_bytes(
+                self._managed_dead_retirement_document(final, stopped_bytes)
+            )
+            self._atomic_snapshot_bytes(
+                pinned, retirement_bytes, name=_MANAGED_DEAD_RETIREMENT_FILE,
+            )
         self._atomic_snapshot_bytes(pinned, stopped_bytes, name="agent.json")
         self._publish_pinned_directory(
             pinned, destination, expected_record=stopped_bytes,
@@ -4746,6 +4861,11 @@ class ManagedAgents:
         identity, or extra human-created panes refuses teardown and keeps state.
         """
         with self._lock(name):
+            if (expected_token_explicit and not recover_legacy_adoption
+                    and expected_record_sha256 is None):
+                receipt = self._managed_dead_archive_receipt(name, expected_token)
+                if receipt is not None:
+                    return receipt
             record = self._load_expected(name, expected_token)
             self._reconcile_goal_transaction(record)
             confirmed_record = self._load_expected(name, record.token)
@@ -4761,6 +4881,12 @@ class ManagedAgents:
             if expected_record_sha256 is not None:
                 raise AgentDeliveryError(
                     "--expected-record-sha256 requires --recover-legacy-adoption"
+                )
+            if (record.launch.adapter == "herdr-pane"
+                    and record.lifecycle == "stopped"):
+                return self._retire_managed_dead(
+                    record, expected_token=expected_token,
+                    expected_token_explicit=expected_token_explicit,
                 )
             if record.launch.adapter == "herdr-foreign":
                 # This registry owns only delivery state.  Revalidate and retain

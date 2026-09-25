@@ -44,6 +44,8 @@ const LEGACY_LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v1";
 const GOAL_STATE_SCHEMA: &str = "agentctl-goal/v1";
 const GOAL_TRANSACTION_SCHEMA: &str = "agentctl-goal-transaction/v1";
 const GOAL_TRANSACTION_FILE: &str = "goal-transaction.json";
+const MANAGED_DEAD_RETIREMENT_SCHEMA: &str = "agentctl-managed-dead-retirement/v1";
+const MANAGED_DEAD_RETIREMENT_FILE: &str = "managed-dead-retirement.json";
 const NATIVE_SESSION_SCHEMA: &str = "agentctl-native-session/v1";
 const RELOCATION_SCHEMA: &str = "agentctl-relocation/v1";
 
@@ -148,10 +150,13 @@ where
     AfterRename: FnOnce(&PinnedAgentDirectory, &str, &str) -> Result<()>,
 {
     let (after_write, after_rename) = hooks;
-    if !matches!(name, "agent.json" | "output.json") {
+    if !matches!(
+        name,
+        "agent.json" | "output.json" | MANAGED_DEAD_RETIREMENT_FILE
+    ) {
         return Err(fail("unsupported pinned registry artifact name").into());
     }
-    let limit = if name == "agent.json" {
+    let limit = if matches!(name, "agent.json" | MANAGED_DEAD_RETIREMENT_FILE) {
         MAX_AGENT_RECORD_BYTES
     } else {
         MAX_SNAPSHOT_BYTES
@@ -7146,6 +7151,186 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )
     }
 
+    fn managed_dead_retirement_value(record: &AgentRecord, record_bytes: &[u8]) -> Value {
+        json!({
+            "schema": MANAGED_DEAD_RETIREMENT_SCHEMA,
+            "name": record.name,
+            "token": record.token,
+            "record_sha256": format!("{:x}", Sha256::digest(record_bytes)),
+            "pane_closed": false,
+            "runtime_preserved": true,
+        })
+    }
+
+    fn read_managed_dead_retirement(
+        &self,
+        directory: &Path,
+        record: &AgentRecord,
+        record_bytes: &[u8],
+    ) -> Result<Value> {
+        let path = directory.join(MANAGED_DEAD_RETIREMENT_FILE);
+        let document = agent::read_private_json_bounded(&path, MAX_AGENT_RECORD_BYTES as u64)?;
+        let expected = Self::managed_dead_retirement_value(record, record_bytes);
+        if document != expected {
+            return Err(fail(
+                "managed-dead retirement receipt disagrees with its stopped record",
+            ));
+        }
+        Ok(expected)
+    }
+
+    fn bounded_private_file_bytes(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| fail(format!("cannot open {label}: {error}")))?;
+        let before = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot inspect {label}: {error}")))?;
+        let uid = unsafe { libc::getuid() };
+        if !before.is_file()
+            || before.uid() != uid
+            || before.permissions().mode() & 0o077 != 0
+            || before.nlink() != 1
+            || before.len() > limit as u64
+        {
+            return Err(fail(format!("unsafe {label}")));
+        }
+        let mut bytes = Vec::with_capacity(before.len() as usize);
+        Read::by_ref(&mut file)
+            .take((limit + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| fail(format!("cannot read {label}: {error}")))?;
+        let after = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot reinspect {label}: {error}")))?;
+        if bytes.len() > limit
+            || before.len() != bytes.len() as u64
+            || (
+                before.dev(),
+                before.ino(),
+                before.mode(),
+                before.uid(),
+                before.nlink(),
+            ) != (
+                after.dev(),
+                after.ino(),
+                after.mode(),
+                after.uid(),
+                after.nlink(),
+            )
+            || (
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec(),
+            ) != (
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            )
+        {
+            return Err(fail(format!("{label} changed while it was read")));
+        }
+        Ok(bytes)
+    }
+
+    fn managed_dead_result(name: &str, destination: &Path) -> Value {
+        json!({
+            "name": name,
+            "archive": destination,
+            "pane_closed": false,
+            "tab_closed": false,
+            "managed_dead": true,
+            "runtime_preserved": true,
+            "continuation": "The dead custom runtime was archived; its shell pane was preserved because Herdr does not provide a terminal-generation-conditional close.",
+        })
+    }
+
+    fn managed_dead_archive_receipt(
+        &self,
+        agent_name: &str,
+        expected_token: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let Some(expected_token) = expected_token else {
+            return Ok(None);
+        };
+        match fs::symlink_metadata(self.directory(agent_name)?) {
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot inspect active managed-dead record: {error}"
+                )))
+            }
+        }
+        let destination = self
+            .registry
+            .join("archive")
+            .join(format!("{agent_name}-{expected_token}"));
+        match fs::symlink_metadata(&destination) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot inspect managed-dead archive: {error}"
+                )))
+            }
+            Ok(_) => {}
+        }
+        agent::validate_private_directory(&destination, "managed-dead agent archive", false)?;
+        let record_path = destination.join("agent.json");
+        let record_bytes = Self::bounded_private_file_bytes(
+            &record_path,
+            MAX_AGENT_RECORD_BYTES,
+            "managed-dead archived record",
+        )?;
+        let record = AgentRecord::from_storage_value(
+            agent::decode_json_strict(&record_bytes).map_err(|error| {
+                fail(format!(
+                    "cannot decode managed-dead archived record: {error}"
+                ))
+            })?,
+            &record_path,
+            agent_name,
+        )?;
+        if record.token != expected_token
+            || record.lifecycle != "stopped"
+            || record.launch.adapter != "herdr-pane"
+        {
+            return Err(fail(
+                "managed-dead archive is not an exact preserved-runtime receipt",
+            ));
+        }
+        self.read_managed_dead_retirement(&destination, &record, &record_bytes)?;
+        Ok(Some(Self::managed_dead_result(agent_name, &destination)))
+    }
+
+    fn complete_preserved_managed_dead_publication(
+        &self,
+        pinned: &PinnedAgentDirectory,
+        expected_token: &str,
+    ) -> Result<Value> {
+        let snapshot = self.managed_record_snapshot(pinned, expected_token)?;
+        let final_record = snapshot.record;
+        if final_record.lifecycle != "stopped"
+            || final_record.launch.adapter != "herdr-pane"
+            || final_record.launch.mode != "interactive"
+            || final_record.launch.backend != "herdr"
+        {
+            return Err(fail(
+                "preserved managed-dead publication requires an exact stopped herdr-pane record",
+            ));
+        }
+        self.read_managed_dead_retirement(pinned.path.as_path(), &final_record, &snapshot.content)?;
+        let (_archive, destination) = self.archive_destination(&final_record)?;
+        self.publish_pinned_directory(pinned, &destination, &snapshot.content)?;
+        Ok(self
+            .managed_dead_archive_receipt(&final_record.name, Some(expected_token))?
+            .unwrap_or_else(|| Self::managed_dead_result(&final_record.name, &destination)))
+    }
+
     fn retire_managed_dead_locked_with<AfterWrite, AfterInstall>(
         &self,
         record: &AgentRecord,
@@ -7173,6 +7358,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         let record = &initial.record;
+        if record.lifecycle == "stopped" && record.launch.adapter == "herdr-pane" {
+            return self.complete_preserved_managed_dead_publication(pinned, expected_token);
+        }
         if !matches!(record.launch.adapter.as_str(), "herdr" | "herdr-pane")
             || record.lifecycle != "running"
             || record.launch.mode != "interactive"
@@ -7310,6 +7498,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let close_pane = final_record.launch.adapter == "herdr";
         if close_pane {
             self.client.close_pane(pane_id)?;
+        } else {
+            let receipt = Self::managed_dead_retirement_value(&final_record, &stopped_bytes);
+            let mut receipt_bytes = serde_json::to_vec_pretty(&receipt)
+                .map_err(|error| fail(format!("cannot serialize retirement receipt: {error}")))?;
+            receipt_bytes.push(b'\n');
+            atomic_replace_bytes(pinned, MANAGED_DEAD_RETIREMENT_FILE, &receipt_bytes)
+                .map_err(|error| *error.error)?;
         }
         atomic_replace_bytes(pinned, "agent.json", &stopped_bytes).map_err(|error| *error.error)?;
         self.publish_pinned_directory(pinned, &destination, &stopped_bytes)?;
@@ -7322,17 +7517,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         } else {
             Some(false)
         };
-        Ok(json!({
-            "name": record.name,
-            "archive": destination,
-            "pane_closed": close_pane,
-            "tab_closed": tab_closed,
-            "managed_dead": true,
-            "runtime_preserved": !close_pane,
-            "continuation": if close_pane { Value::Null } else { json!(
-                "The dead custom runtime was archived; its shell pane was preserved because Herdr does not provide a terminal-generation-conditional close."
-            ) },
-        }))
+        if close_pane {
+            Ok(json!({
+                "name": record.name,
+                "archive": destination,
+                "pane_closed": true,
+                "tab_closed": tab_closed,
+                "managed_dead": true,
+                "runtime_preserved": false,
+                "continuation": Value::Null,
+            }))
+        } else {
+            Ok(Self::managed_dead_result(&record.name, &destination))
+        }
     }
 
     /// Close an owned pane, or only unregister a foreign runtime, then archive state.
@@ -7343,6 +7540,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// Stop with explicit generation assertions or the loud adoption-recovery gate.
     pub fn stop_with_options(&self, agent_name: &str, options: StopOptions) -> Result<Value> {
         let _lock = self.lock(agent_name)?;
+        if !options.recover_legacy_adoption && options.expected_record_sha256.is_none() {
+            if let Some(receipt) =
+                self.managed_dead_archive_receipt(agent_name, options.expected_token.as_deref())?
+            {
+                return Ok(receipt);
+            }
+        }
         let mut record = self.load(agent_name)?;
         self.reconcile_goal_transaction(&record)?;
         record.supported()?;
@@ -7377,6 +7581,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return Err(fail(
                 "--expected-record-sha256 requires --recover-legacy-adoption",
             ));
+        }
+        if record.launch.adapter == "herdr-pane" && record.lifecycle == "stopped" {
+            let pane_id = record
+                .pane_id
+                .as_deref()
+                .ok_or_else(|| fail("managed-dead stopped record has no pane identity"))?;
+            let _pane_lock = self.pane_lock(pane_id)?;
+            let pinned = self.pinned_agent_directory(agent_name)?;
+            return self.retire_managed_dead_locked(
+                &record,
+                &pinned,
+                options.expected_token.as_deref(),
+            );
         }
         if record.launch.adapter == "herdr-foreign" {
             let (live, info, presentation) = self.inspect_foreign(agent_name, &record)?;
@@ -13109,6 +13326,102 @@ mod tests {
                 .as_deref(),
             Some("replacement-terminal")
         );
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn running_owned_dead_muse_retries_stopped_publication_without_touching_pane() {
+        for replace_terminal in [false, true] {
+            let fixture = Fixture::new();
+            fixture
+                .client
+                .report_session
+                .store(false, Ordering::Relaxed);
+            let manager = fixture.manager();
+            let started = manager
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        workspace_id: Some("workspace".to_owned()),
+                        harness: "muse".to_owned(),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap();
+            fixture.client.custom_alive.store(false, Ordering::Relaxed);
+            let active = fixture.root.join("registry/worker");
+            let mut stopped = manager.load("worker").unwrap();
+            stopped.lifecycle = "stopped".to_owned();
+            agent::atomic_json(
+                &active.join("agent.json"),
+                &stopped.storage_value().unwrap(),
+            )
+            .unwrap();
+            let stopped_bytes = fs::read(active.join("agent.json")).unwrap();
+            agent::atomic_json(
+                &active.join(MANAGED_DEAD_RETIREMENT_FILE),
+                &ManagedAgents::<Fake>::managed_dead_retirement_value(&stopped, &stopped_bytes),
+            )
+            .unwrap();
+            if replace_terminal {
+                fixture.client.panes.lock().unwrap()[0].terminal_id =
+                    Some("replacement-terminal".to_owned());
+            }
+            let retained = fixture.client.panes.lock().unwrap().clone();
+
+            let result = manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(result["pane_closed"], false);
+            assert_eq!(result["runtime_preserved"], true);
+            assert_eq!(*fixture.client.panes.lock().unwrap(), retained);
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(!active.exists());
+        }
+    }
+
+    #[test]
+    fn running_owned_dead_muse_stop_result_loss_reconciles_from_archive_receipt() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        fixture.client.custom_alive.store(false, Ordering::Relaxed);
+        let token = started["token"].as_str().unwrap().to_owned();
+        let options = StopOptions {
+            expected_token: Some(token),
+            ..StopOptions::default()
+        };
+
+        let first = manager
+            .stop_with_options("worker", options.clone())
+            .unwrap();
+        let retained = fixture.client.panes.lock().unwrap().clone();
+        let second = manager.stop_with_options("worker", options).unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(*fixture.client.panes.lock().unwrap(), retained);
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 

@@ -463,6 +463,56 @@ def test_owned_dead_muse_never_closes_a_replacement_terminal(
     assert fake.closed == []
 
 
+@pytest.mark.parametrize("replace_terminal", [False, True])
+def test_owned_dead_muse_retries_stopped_before_archive_without_touching_pane(
+    replace_terminal: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    original_publish = manager._publish_pinned_directory
+
+    def fail_before_rename(*_args: object, **_kwargs: object) -> None:
+        raise AgentDeliveryError("injected failure before archive rename")
+
+    monkeypatch.setattr(manager, "_publish_pinned_directory", fail_before_rename)
+    with pytest.raises(AgentDeliveryError, match="before archive rename"):
+        manager.stop("worker", expected_token=token)
+    active = manager.registry / "worker"
+    assert json.loads((active / "agent.json").read_text())["lifecycle"] == "stopped"
+    assert (active / "managed-dead-retirement.json").is_file()
+
+    if replace_terminal:
+        fake.presentations[0] = replace(
+            fake.presentations[0], terminal_id="replacement-terminal",
+        )
+    retained = list(fake.presentations)
+    monkeypatch.setattr(manager, "_publish_pinned_directory", original_publish)
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["pane_closed"] is False
+    assert result["runtime_preserved"] is True
+    assert fake.presentations == retained
+    assert fake.closed == []
+    assert not active.exists()
+
+
+def test_owned_dead_muse_stop_result_loss_reconciles_from_archive_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    first = manager.stop("worker", expected_token=token)
+    retained = list(fake.presentations)
+
+    second = manager.stop("worker", expected_token=token)
+
+    assert second == first
+    assert fake.presentations == retained
+    assert fake.closed == []
+
+
 def test_managed_dead_stop_refuses_expanded_stopped_record_before_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
