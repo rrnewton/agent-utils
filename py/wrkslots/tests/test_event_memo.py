@@ -421,7 +421,8 @@ def test_refused_resumed_replay_leaves_the_remembered_fold_unchanged(
     """A replay that folds part of a suffix and then refuses must not alter the fold.
 
     The retry resumes from the same remembered prefix and refolds the suffix,
-    so an event already applied to a shared fold would no longer match.
+    so an event already applied to a shared fold would no longer match, or
+    would be applied twice.
     """
 
     project, repository, _remote = make_project(tmp_path)
@@ -434,12 +435,12 @@ def test_refused_resumed_replay_leaves_the_remembered_fold_unchanged(
 
     def replay() -> tuple[str, str]:
         try:
-            cli._states_from_events(
+            states = cli._states_from_events(
                 config, config.machine, require_repository=require_repository
             )
         except cli.Refusal as exc:
             return "refused", str(exc)
-        return "ok", ""
+        return "ok", repr(states)
 
     def cold(action: Callable[[], T]) -> T:
         memo_stack = list(cli._ACTIVE_EVENT_MEMO)
@@ -451,28 +452,54 @@ def test_refused_resumed_replay_leaves_the_remembered_fold_unchanged(
             work.counting = True
             cli._ACTIVE_EVENT_MEMO.extend(memo_stack)
 
+    def replace_path(checkout: cli.Checkout, slot: str) -> cli.Checkout:
+        return dataclasses.replace(checkout, path=checkout.path.replace("/memo", f"/{slot}"))
+
     def append_suffix() -> None:
-        # The first suffix event changes a record the fold already holds; the
-        # second adds a slot whose repository crosses a symlink.
+        # The first suffix event changes a record the fold already holds, the
+        # second archives a slot, and the third adds a slot whose repository
+        # crosses a symlink.
         record = next(item for item in cli._load_active(config).slots if item.slot == "memo")
         changed = dataclasses.replace(record, heartbeat_at="2030-01-01T00:00:00+00:00")
         _append_active_record(config, changed, record)
         checkout = record.checkouts[0]
+        finished_at = "2030-01-01T00:00:01+00:00"
+        archived = replace_path(checkout, "memo-archived")
+        cli._append_archive_once(
+            config,
+            cli._load_archive(config),
+            {
+                "archive_id": f"{config.machine}:memo-archived:1:{finished_at}",
+                "slot": "memo-archived",
+                "agent": record.agent,
+                "task": record.task,
+                "purpose": record.purpose,
+                "slot_type": record.slot_type,
+                "machine": config.machine,
+                "generation": 1,
+                "created_at": record.created_at,
+                "finished_at": finished_at,
+                "mode": "remove",
+                "actor": "coordinator",
+                "physical_storage": "removed",
+                "validation": ["memo-test"],
+                "limitations": [],
+                "continuation": "none",
+                "checkouts": [cli._checkout_to_obj(archived)],
+            },
+            require_repository=False,
+        )
         added = dataclasses.replace(
             record,
             slot="memo-other",
             checkouts=(
-                dataclasses.replace(
-                    checkout,
-                    path=checkout.path.replace("/memo", "/memo-other"),
-                    repository="other",
-                ),
+                dataclasses.replace(replace_path(checkout, "memo-other"), repository="other"),
             ),
         )
         _append_active_record(config, added, None)
 
     with cli._event_memo_scope():
-        assert replay() == ("ok", "")
+        assert replay()[0] == "ok"
         cold(append_suffix)
         work.folded.clear()
 
@@ -485,8 +512,11 @@ def test_refused_resumed_replay_leaves_the_remembered_fold_unchanged(
         other.with_name("other-real").rename(other)
         retried = replay()
 
-        assert work.folded == [2, 2]
-        assert retried == cold(replay) == ("ok", "")
+        assert work.folded == [3, 3]
+        assert retried == cold(replay)
+        assert retried[0] == "ok"
+        archive = cli._load_archive(config).records
+        assert [item["slot"] for item in archive].count("memo-archived") == 1
 
 
 @pytest.mark.parametrize(
