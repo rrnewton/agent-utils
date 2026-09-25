@@ -1,8 +1,9 @@
 ---
 title: 'agent-space-linking: support or document one-space-per-agent linking'
-status: open
+status: in_progress
 priority: 2
 issue_type: task
+assignee: opus-5.5
 labels:
 - agentctl
 - chat
@@ -10,7 +11,9 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T01:32:03.478573636+00:00
-updated_at: 2026-09-25T01:32:03.478573636+00:00
+updated_at: 2026-09-25T04:48:21.466739184+00:00
+claimed_at: 2026-09-25T04:48:21.466739184+00:00
+claimed_until: 2026-09-27T04:48:21.466611662+00:00
 ---
 
 # Description
