@@ -1575,18 +1575,26 @@ def drain(
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
     atomic_policy: AtomicWritePolicy | None = None,
+    require_existing: bool = False,
 ) -> QueueResult:
-    """Drain a queue, optionally sharing a bounded atomic staging domain."""
+    """Drain a queue, optionally requiring a previously bound queue.
+
+    Registry-backed callers prepare the queue while holding their short
+    lifecycle transaction, then set ``require_existing`` so a concurrent stop
+    cannot be followed by accidental recreation of the retired directory.
+    """
     with atomic_write_policy(atomic_policy):
         return _drain(client, target, root, ready_timeout=ready_timeout,
                       working_timeout=working_timeout, max_attempts=max_attempts,
-                      max_artifact_bytes=max_artifact_bytes, sleep=sleep, monotonic=monotonic)
+                      max_artifact_bytes=max_artifact_bytes, sleep=sleep,
+                      monotonic=monotonic, require_existing=require_existing)
 
 
 def _drain(
     client: HerdrClient, target: Target, root: str, *, ready_timeout: float,
     working_timeout: float, max_attempts: int, max_artifact_bytes: int | None,
     sleep: Callable[[float], None], monotonic: Callable[[], float],
+    require_existing: bool,
 ) -> QueueResult:
     """Serialize and drain a FIFO; poison prompts are retained in ``failed``.
 
@@ -1596,133 +1604,229 @@ def _drain(
     intact; a failed post-submission update retains the durable inflight barrier.
     """
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
-    _bind_queue(root, target, max_artifact_bytes=max_artifact_bytes)
-    inbox, inflight, processed, failed = _prepare(root)
+    if require_existing:
+        _validate_existing_queue(root)
+        _validate_existing_binding(root, target)
+        inbox, inflight, processed, failed = _dirs(root)
+        if not all(os.path.isdir(path) for path in (inbox, inflight, processed, failed)):
+            raise AgentDeliveryError("delivery queue is incomplete")
+    else:
+        _bind_queue(root, target, max_artifact_bytes=max_artifact_bytes)
+        inbox, inflight, processed, failed = _prepare(root)
     lock_path = os.path.join(root, ".delivery.lock")
     delivered: list[str] = []
     quarantined: list[str] = []
     blocked: str | None = None
     descriptor = _open_private_lock(lock_path, "queue delivery lock")
-    target_descriptor = -1
-    locked_pane_id = ""
-    initial_info: AgentPaneInfo | None = None
+    recovered = False
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        policy = _ACTIVE_ATOMIC_POLICY.get()
-        if policy is not None:
-            # enqueue's create-only final may still share the fixed slot after
-            # a crash. Recover under delivery -> atomic before bounded reads
-            # can mistake that committed prompt for an unsafe hardlink.
-            with atomic_write_recovery(policy):
-                pass
-        quarantined.extend(_recover_inflight(inflight, failed, max_artifact_bytes=max_artifact_bytes))
-        for path in sorted(os.path.join(inbox, name) for name in os.listdir(inbox) if name.endswith(".json")):
-            _check_artifact_size(path, max_artifact_bytes)
+        while blocked is None:
+            # The queue lock protects only durable transitions. A busy agent can
+            # run for hours; readiness polling must not hide status or block
+            # lifecycle inspection for that entire turn.
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
             try:
-                document = _load(path, max_artifact_bytes=max_artifact_bytes)
-                attempts = _delivery_attempts(document, path)
-            except AgentDeliveryError as exc:
-                quarantined.append(
-                    _quarantine_raw(
-                        path, failed, outcome="invalid_message", error=str(exc),
-                        max_artifact_bytes=max_artifact_bytes,
-                    )
-                )
-                continue
-            recorded_error = document.get("delivery_error")
-            if isinstance(recorded_error, str):
-                document["delivery_error"] = _bounded_error(recorded_error, max_artifact_bytes)
-            identifier = str(document.get("id", os.path.basename(path)[:-5]))
-            if attempts >= max_attempts:
-                blocked = _bounded_error(
-                    f"message {identifier} reached the maximum delivery-attempt count "
-                    f"({attempts} >= {max_attempts}); retained pending",
-                    max_artifact_bytes,
-                )
-                if (document.get("delivery_state") != "pending"
-                        or document.get("delivery_error") != blocked):
-                    document["delivery_state"] = "pending"
-                    document["delivery_error"] = blocked
-                    document["delivery_blocked_at"] = time.time()
-                    _atomic_json(path, document, max_artifact_bytes=max_artifact_bytes)
-                break
-            while attempts < max_attempts:
-                # Readiness is entirely pre-injection. Keep the artifact in inbox while the pane
-                # is busy so a process death during an ordinary wait remains safely retryable.
-                try:
-                    if target_descriptor < 0:
-                        # Resolve before choosing the lock so exact-pane and stable-session
-                        # callers serialize on the same live pane. Re-resolve after acquisition
-                        # and on every readiness poll so a moving session cannot escape the lock.
-                        target_descriptor, locked_pane_id, initial_info = _lock_resolved_target(
-                            client, target
+                if not recovered:
+                    policy = _ACTIVE_ATOMIC_POLICY.get()
+                    if policy is not None:
+                        # enqueue's create-only final may still share the fixed slot after
+                        # a crash. Recover under delivery -> atomic before bounded reads
+                        # can mistake that committed prompt for an unsafe hardlink.
+                        with atomic_write_recovery(policy):
+                            pass
+                    quarantined.extend(
+                        _recover_inflight(
+                            inflight, failed,
+                            max_artifact_bytes=max_artifact_bytes,
                         )
-                    info = _wait_ready(
-                        client,
-                        target,
-                        ready_timeout,
-                        sleep=sleep,
-                        monotonic=monotonic,
-                        locked_pane_id=locked_pane_id,
-                        initial_info=initial_info,
                     )
-                    initial_info = None
-                except (AgentDeliveryError, HerdrUnavailable) as exc:
+                    recovered = True
+
+                selected: tuple[str, dict[str, object], int, str] | None = None
+                for path in sorted(
+                    os.path.join(inbox, name)
+                    for name in os.listdir(inbox)
+                    if name.endswith(".json")
+                ):
+                    _check_artifact_size(path, max_artifact_bytes)
+                    try:
+                        document = _load(path, max_artifact_bytes=max_artifact_bytes)
+                        attempts = _delivery_attempts(document, path)
+                    except AgentDeliveryError as exc:
+                        quarantined.append(
+                            _quarantine_raw(
+                                path, failed, outcome="invalid_message", error=str(exc),
+                                max_artifact_bytes=max_artifact_bytes,
+                            )
+                        )
+                        continue
+                    recorded_error = document.get("delivery_error")
+                    if isinstance(recorded_error, str):
+                        document["delivery_error"] = _bounded_error(
+                            recorded_error, max_artifact_bytes,
+                        )
+                    identifier = str(
+                        document.get("id", os.path.basename(path)[:-5])
+                    )
+                    if attempts >= max_attempts:
+                        blocked = _bounded_error(
+                            f"message {identifier} reached the maximum delivery-attempt count "
+                            f"({attempts} >= {max_attempts}); retained pending",
+                            max_artifact_bytes,
+                        )
+                        if (document.get("delivery_state") != "pending"
+                                or document.get("delivery_error") != blocked):
+                            document["delivery_state"] = "pending"
+                            document["delivery_error"] = blocked
+                            document["delivery_blocked_at"] = time.time()
+                            _atomic_json(
+                                path, document,
+                                max_artifact_bytes=max_artifact_bytes,
+                            )
+                        break
+                    selected = (path, document, attempts, identifier)
+                    break
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+            if blocked is not None or selected is None:
+                break
+            path, document, attempts, identifier = selected
+
+            # Poll without either queue or pane lock. Before crossing the
+            # injection barrier we reacquire both locks, prove this exact FIFO
+            # head is unchanged, and repeat the readiness proof.
+            try:
+                initial = resolve_target(client, target)
+                info = _wait_ready(
+                    client,
+                    target,
+                    ready_timeout,
+                    sleep=sleep,
+                    monotonic=monotonic,
+                    locked_pane_id=initial.pane_id,
+                    initial_info=initial,
+                )
+            except _ArtifactTooLarge:
+                # Size validation before the durable inflight transition is a
+                # definite pre-submission refusal, not a readiness failure.
+                raise
+            except (AgentDeliveryError, HerdrUnavailable) as exc:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                try:
+                    if not os.path.lexists(path):
+                        # Another drainer completed this FIFO head while we
+                        # waited. Re-scan rather than updating a stale path.
+                        continue
+                    current = _load(path, max_artifact_bytes=max_artifact_bytes)
+                    if current != document:
+                        raise AgentDeliveryError(
+                            f"queued message {path} changed during readiness wait"
+                        )
                     blocked = _bounded_error(str(exc), max_artifact_bytes)
                     if (document.get("delivery_state") != "pending"
                             or document.get("delivery_error") != blocked):
                         document["delivery_state"] = "pending"
                         document["delivery_error"] = blocked
                         document["delivery_blocked_at"] = time.time()
-                        _atomic_json(path, document, max_artifact_bytes=max_artifact_bytes)
-                    break
+                        _atomic_json(
+                            path, document,
+                            max_artifact_bytes=max_artifact_bytes,
+                        )
+                finally:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                break
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            target_descriptor = -1
+            try:
+                if not os.path.lexists(path):
+                    # A concurrent drainer won the submission boundary. The
+                    # queue itself determines the next FIFO head.
+                    continue
+                current = _load(path, max_artifact_bytes=max_artifact_bytes)
+                if current != document:
+                    raise AgentDeliveryError(
+                        f"queued message {path} changed during readiness wait"
+                    )
+                target_descriptor, locked_pane_id, confirmed = _lock_resolved_target(
+                    client, target,
+                )
+                if locked_pane_id != info.pane_id:
+                    raise AgentDeliveryError(
+                        f"target moved from ready pane {info.pane_id!r} to "
+                        f"{locked_pane_id!r} before submission"
+                    )
+                info = _wait_ready(
+                    client,
+                    target,
+                    0.0,
+                    sleep=sleep,
+                    monotonic=monotonic,
+                    locked_pane_id=locked_pane_id,
+                    initial_info=confirmed,
+                )
+
                 # ``inflight`` is a durable at-most-once barrier. Once this rename commits, a
                 # crash is treated as possibly submitted. Readiness was already proven above;
                 # this transition occurs immediately before pane.run.
                 inflight_path = os.path.join(inflight, os.path.basename(path))
-                # Rename first: a crash at every later instruction leaves the artifact in the
-                # restart-quarantined directory. Updating the inbox file before this rename
-                # would leave a small but real restart-resubmission window.
                 document["possibly_submitted"] = True
                 document["delivery_state"] = "inflight"
                 document["inflight_at"] = time.time()
                 if max_artifact_bytes is not None:
                     _serialized_json(document, max_artifact_bytes)
                 _transition(path, inflight_path, max_artifact_bytes=max_artifact_bytes)
-                _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
+                _atomic_json(
+                    inflight_path, document,
+                    max_artifact_bytes=max_artifact_bytes,
+                )
                 retained_path = inflight_path
                 try:
                     try:
                         _deliver_one(
-                            client, info, str(document["text"]), working_timeout=working_timeout,
+                            client, info, str(document["text"]),
+                            working_timeout=working_timeout,
                         )
                     except _PossiblySubmitted as exc:
                         attempts += 1
                         document["delivery_attempts"] = attempts
                         document["tui_delivery_attempts"] = attempts
-                        document["delivery_error"] = _bounded_error(str(exc), max_artifact_bytes)
+                        document["delivery_error"] = _bounded_error(
+                            str(exc), max_artifact_bytes,
+                        )
                         document["possibly_submitted"] = True
                         document["delivery_failed_at"] = time.time()
-                        _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
-                        failed_path = os.path.join(failed, os.path.basename(path))
-                        _transition(inflight_path, failed_path, max_artifact_bytes=max_artifact_bytes)
+                        _atomic_json(
+                            inflight_path, document,
+                            max_artifact_bytes=max_artifact_bytes,
+                        )
+                        failed_path = os.path.join(
+                            failed, os.path.basename(path),
+                        )
+                        _transition(
+                            inflight_path, failed_path,
+                            max_artifact_bytes=max_artifact_bytes,
+                        )
                         retained_path = failed_path
                         _failed_metadata(
                             failed_path, outcome="possibly_submitted", error=str(exc),
                             max_artifact_bytes=max_artifact_bytes,
                         )
                         quarantined.append(identifier)
-                        break
                     else:
                         document["delivery_state"] = "processed"
                         document["confirmed_at"] = time.time()
-                        _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
+                        _atomic_json(
+                            inflight_path, document,
+                            max_artifact_bytes=max_artifact_bytes,
+                        )
                         _transition(
-                            inflight_path, os.path.join(processed, os.path.basename(path)),
+                            inflight_path,
+                            os.path.join(processed, os.path.basename(path)),
                             max_artifact_bytes=max_artifact_bytes,
                         )
                         delivered.append(identifier)
-                        break
                 except _ArtifactTooLarge as exc:
                     raise AgentPossiblySubmitted(
                         _bounded_error(
@@ -1732,11 +1836,31 @@ def _drain(
                         ),
                         message_id=identifier, artifact=retained_path,
                     ) from exc
-            if blocked is not None:
-                break
+            except _ArtifactTooLarge:
+                # A pre-transition size refusal remains definitely unsent.
+                raise
+            except (AgentDeliveryError, HerdrUnavailable) as exc:
+                if os.path.lexists(path):
+                    blocked = _bounded_error(str(exc), max_artifact_bytes)
+                    current = _load(path, max_artifact_bytes=max_artifact_bytes)
+                    if current != document:
+                        raise AgentDeliveryError(
+                            f"queued message {path} changed before blocked-state publication"
+                        ) from exc
+                    document["delivery_state"] = "pending"
+                    document["delivery_error"] = blocked
+                    document["delivery_blocked_at"] = time.time()
+                    _atomic_json(
+                        path, document,
+                        max_artifact_bytes=max_artifact_bytes,
+                    )
+                else:
+                    raise
+            finally:
+                if target_descriptor >= 0:
+                    os.close(target_descriptor)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
     finally:
-        if target_descriptor >= 0:
-            os.close(target_descriptor)
         os.close(descriptor)
     pending = tuple(name[:-5] for name in sorted(os.listdir(inbox)) if name.endswith(".json"))
     outcome = "pending" if blocked is not None else ("possibly_submitted" if quarantined else "delivered")
@@ -1768,6 +1892,39 @@ def send_goal(
         return _send(
             client, target, root, text, message_id=message_id,
             atomic_policy=_ACTIVE_ATOMIC_POLICY.get(), kind="goal", **kwargs,
+        )
+
+
+def enqueue_bound(
+    root: str,
+    target: Target,
+    text: str,
+    *,
+    message_id: str | None = None,
+    kind: str = "message",
+    max_artifact_bytes: int | None = None,
+    atomic_policy: AtomicWritePolicy | None = None,
+) -> str:
+    """Bind and enqueue without waiting for the remote agent.
+
+    Registry-backed callers use this while holding their short lifecycle
+    transaction, then drain the already-bound queue without retaining that
+    transaction throughout the agent's current turn.
+    """
+    if kind not in ("message", "goal"):
+        raise AgentDeliveryError("queue message kind must be message or goal")
+    if atomic_policy is not None and not isinstance(atomic_policy, AtomicWritePolicy):
+        raise AgentDeliveryError("atomic_policy must be an AtomicWritePolicy or None")
+    max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
+    with atomic_write_policy(atomic_policy):
+        _bind_queue(root, target, max_artifact_bytes=max_artifact_bytes)
+        return _enqueue(
+            root,
+            text,
+            message_id=message_id,
+            serialize=message_id is not None,
+            max_artifact_bytes=max_artifact_bytes,
+            kind=kind,
         )
 
 
@@ -1922,15 +2079,16 @@ def _send(
     if max_artifact_bytes is not None and not isinstance(max_artifact_bytes, int):
         raise AgentDeliveryError("max_artifact_bytes must be a positive integer or None")
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
-    _bind_queue(root, target, max_artifact_bytes=max_artifact_bytes)
-    # Generated identifiers are collision-resistant and the no-replace inbox create is atomic.
-    # Do not wait behind a long-running drain merely to persist a new prompt; the subsequent drain
-    # and terminal-artifact inspection resolve any cross-sender consumption safely.
-    # A caller-selected ID can move out of inbox while another caller is checking
-    # it. Serialize that check with delivery, so the same ID cannot be recreated.
-    identifier = _enqueue(
-        root, text, message_id=message_id, serialize=message_id is not None,
-        max_artifact_bytes=max_artifact_bytes, kind=kind,
+    # Generated identifiers are collision-resistant and the no-replace inbox
+    # create is atomic. A selected ID serializes against delivery transitions.
+    identifier = enqueue_bound(
+        root,
+        target,
+        text,
+        message_id=message_id,
+        kind=kind,
+        max_artifact_bytes=max_artifact_bytes,
+        atomic_policy=atomic_policy,
     )
     result = drain(client, target, root, max_artifact_bytes=max_artifact_bytes,
                    atomic_policy=atomic_policy, **kwargs)  # type: ignore[arg-type]

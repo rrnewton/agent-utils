@@ -11,10 +11,12 @@ an explicitly configured policy; they are not discovered from the filesystem.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import datetime
 import enum
 import fcntl
+import functools
 import json
 import os
 import re
@@ -30,7 +32,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Iterator, NoReturn, Optional, cast
+from typing import Callable, Concatenate, Iterator, NoReturn, Optional, ParamSpec, TypeVar, cast
 
 TMUX_SESSION: str = os.environ.get("SUBAGENTS_TMUX_SESSION", "subagents")
 PACKAGE: Path = Path(__file__).resolve().parent
@@ -39,6 +41,7 @@ BASE: Path = Path(os.environ.get(
     str(Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "herdr-agent/foreign"),
 )).expanduser().resolve()
 from agentctl.agent import Target as SharedAgentTarget  # noqa: E402
+from agentctl.agent import _decode_json_bytes as _decode_json_strict  # noqa: E402
 from agentctl.agent import _rename_directory_noreplace_at  # noqa: E402
 from agentctl.agent import drain as shared_agent_drain  # noqa: E402
 from agentctl.agent import read as shared_agent_read  # noqa: E402
@@ -46,7 +49,15 @@ from agentctl.agent import send as shared_agent_send  # noqa: E402
 from agentctl.agent import status as shared_agent_status  # noqa: E402
 from agentctl.client import CustomProcessIdentity  # noqa: E402
 from agentctl.client import HerdrClient as SharedHerdrClient  # noqa: E402
+from agentctl.errors import AgentDeliveryError  # noqa: E402
 from agentctl.errors import HerdrRunError as SharedHerdrError  # noqa: E402
+from agentctl.launch_contract import (  # noqa: E402
+    LEGACY_UNDETERMINED_CONTROL,
+    OUTER_SESSION_CONTROL,
+    STANDALONE_CONTROL,
+    RuntimeControl,
+    RuntimeLaunchContract,
+)
 
 shared_rename_directory_noreplace_at = _rename_directory_noreplace_at
 
@@ -70,7 +81,8 @@ SUPPORTED_BACKENDS: tuple[str, ...] = ("tmux", "herdr")
 HEADLESS_MODE: str = "headless"
 TUI_MODE: str = "tui"
 SUPPORTED_MODES: tuple[str, ...] = (HEADLESS_MODE, TUI_MODE)
-RUNTIME_RECORD_SCHEMA: str = "agentctl-runtime/v2"
+RUNTIME_RECORD_SCHEMA: str = "agentctl-runtime/v3"
+LEGACY_RUNTIME_RECORD_SCHEMA: str = "agentctl-runtime/v2"
 CODEX_BIN: str = os.environ.get("CODEX_BIN", "codex")
 AGY_BIN: str = os.environ.get("AGY_BIN", "agy")
 MUSE_BIN: str = os.environ.get("MUSE_BIN", "muse")
@@ -129,10 +141,12 @@ MAX_RUNTIME_REGISTRY_BYTES: int = 8 << 20
 MAX_STOP_RECEIPT_BYTES: int = 64 << 10
 MAX_IDENTITY_RECORD_BYTES: int = 64 << 10
 MAX_QUEUE_MESSAGE_BYTES: int = 8 << 20
+MAX_READ_OUTPUT_BYTES: int = 8 << 20
 MAX_PROC_ENTRIES: int = 1 << 20
 MAX_HARNESS_GROUP_MEMBERS: int = 4096
 MAX_HARNESS_FREEZE_ROUNDS: int = 64
-STOP_RECEIPT_SCHEMA: str = "agentctl-stop-receipt/v1"
+STOP_RECEIPT_SCHEMA: str = "agentctl-stop-receipt/v2"
+LEGACY_STOP_RECEIPT_SCHEMA: str = "agentctl-stop-receipt/v1"
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _HERDR_TAB_ID_RE = re.compile(r"^w[^:]+:t[0-9]+$")
@@ -478,31 +492,117 @@ class AgentRecord:
     # Literal non-secret Muse options. Profiles reject credential-shaped
     # arguments before these durable launch settings are recorded.
     harness_args: tuple[str, ...] = ()
-    # Generation token issued by the canonical outer agentctl registry. Direct
-    # users receive a locally generated token. Every private worker RPC is
-    # bound to this value before it may observe or mutate runtime state.
-    owner_token: Optional[str] = dataclasses.field(
-        default_factory=lambda: secrets.token_hex(16)
-    )
+    # One explicit control-plane authority owns every current runtime. The
+    # outer session form carries its generation token; the compatibility form
+    # is deliberately tokenless and can be mutated only by the standalone
+    # frontend under the same per-runtime operation lock.
+    control: Optional[RuntimeControl] = None
     # New rows use the complete boot-bound identity.  The two scalar fields
     # above are accepted only while loading legacy rows and are not emitted
     # when this field is present.
     runner_identity: Optional[CustomProcessIdentity] = None
+    # Exact normalized outer launch contract. Mutable runtime evidence
+    # (PID/session/presentation) is deliberately excluded.
+    owner_launch: Optional[RuntimeLaunchContract] = None
+
+    @property
+    def owner_token(self) -> Optional[str]:
+        """Return the outer generation token; standalone runtimes have none."""
+        if self.control is None or self.control.kind == STANDALONE_CONTROL:
+            return None
+        return self.control.generation
+
+    @property
+    def control_generation(self) -> Optional[str]:
+        """Return the generation nonce shared with the exact runner process."""
+        return None if self.control is None else self.control.generation
+
+    def launch_contract(
+        self, runtime_home: Path | str | None = None,
+    ) -> RuntimeLaunchContract:
+        """Return the canonical immutable owner launch, deriving legacy rows only."""
+        return self.owner_launch or RuntimeLaunchContract.create(
+            cwd=self.cwd,
+            harness=self.harness,
+            model=self.model,
+            backend=self.backend,
+            mode=self.mode,
+            harness_args=self.harness_args,
+            permission_mode="bypass" if self.codex_bypass_permissions else "native",
+            runtime_home=BASE if runtime_home is None else runtime_home,
+        )
+
+    def launch_fingerprint(self, runtime_home: Path | str | None = None) -> str:
+        """Derive the one immutable owner/runtime launch identity."""
+        return self.launch_contract(runtime_home).fingerprint()
+
     @staticmethod
     def from_dict(d: dict[str, object]) -> "AgentRecord":
         """Load a strict current row or normalize one supported untagged row."""
         fields = {f.name for f in dataclasses.fields(AgentRecord)}
         schema = d.get("schema")
         current = schema == RUNTIME_RECORD_SCHEMA
-        if schema is not None and not current:
+        tagged = schema in (RUNTIME_RECORD_SCHEMA, LEGACY_RUNTIME_RECORD_SCHEMA)
+        if schema is not None and not tagged:
             die("registry row has an unsupported schema")
+        if not tagged and set(d) & {"control", "launch", "owner_token", "owner_launch"}:
+            die("untagged registry row cannot assert runtime control")
+        control: RuntimeControl | None = None
+        owner_launch: RuntimeLaunchContract | None = None
         if current:
-            expected = (fields - {"runner_pid", "runner_started_at"}) | {"schema"}
+            try:
+                control = RuntimeControl.from_document(d.get("control"))
+                owner_launch = RuntimeLaunchContract.from_document(
+                    d.get("launch")
+                )
+            except ValueError as exc:
+                die(f"registry row has invalid runtime control ({exc})")
+        if tagged:
+            derived_launch_fields = {
+                "harness", "cwd", "model", "harness_args",
+                "codex_bypass_permissions",
+            }
+            if current:
+                expected = (
+                    fields
+                    - {"runner_pid", "runner_started_at", "control", "owner_launch"}
+                    - derived_launch_fields
+                    | {"schema", "control", "launch"}
+                )
+            else:
+                # V2 is accepted only at the decode edge. It carried an outer
+                # token but predated the immutable launch envelope and nested
+                # control authority.
+                expected = (
+                    fields
+                    - {"runner_pid", "runner_started_at", "control", "owner_launch"}
+                    | {"schema", "owner_token"}
+                )
             if set(d) != expected:
-                die(f"registry row for {d.get('name')!r} has invalid v2 fields")
+                die(f"registry row for {d.get('name')!r} has invalid tagged fields")
+            if current:
+                assert owner_launch is not None and control is not None
+                d = dict(d)
+                d.update({
+                    "harness": owner_launch.harness,
+                    "cwd": owner_launch.cwd,
+                    "model": owner_launch.model,
+                    "harness_args": list(owner_launch.harness_args),
+                    "codex_bypass_permissions": (
+                        owner_launch.permission_mode == "bypass"
+                    ),
+                })
+            else:
+                raw_token = d.get("owner_token")
+                if not isinstance(raw_token, str):
+                    die("registry row has an invalid v2 owner token")
+                try:
+                    control = RuntimeControl.legacy_undetermined(raw_token)
+                except ValueError as exc:
+                    die(f"registry row has an invalid v2 owner token ({exc})")
             required_strings = (
                 "name", "harness", "backend", "tmux_target", "cwd", "status",
-                "created_at", "mode", "owner_token",
+                "created_at", "mode",
             )
             if any(not isinstance(d[field], str) or not d[field] for field in required_strings):
                 die("registry row has an invalid v2 string field")
@@ -516,11 +616,11 @@ class AgentRecord:
         missing = fields - set(d) - {
             "runner_pid", "runner_started_at", "runner_identity", "backend", "mode",
             "presentation_pane", "codex_bypass_permissions", "harness_args",
-            "owner_token",
+            "control", "owner_launch",
         }
         if missing:
             die(f"registry row for {d.get('name')!r} missing keys: {sorted(missing)}")
-        preserved = None if current else _load_presentation_identity(d)
+        preserved = None if tagged else _load_presentation_identity(d)
         raw_backend = d.get("backend")
         raw_mode = d.get("mode")
         raw_pane = d.get("presentation_pane")
@@ -539,7 +639,7 @@ class AgentRecord:
         )
         bypass = (
             d.get("codex_bypass_permissions")
-            if current else _load_codex_permission_policy(d)
+            if tagged else _load_codex_permission_policy(d)
         )
         if not isinstance(bypass, bool):
             die("registry row has invalid codex_bypass_permissions")
@@ -566,17 +666,11 @@ class AgentRecord:
                 die("registry row has contradictory runner identity")
             legacy_pid = runner_identity.pid
             legacy_started = str(runner_identity.starttime_ticks)
-        owner_token = d.get("owner_token")
-        if owner_token is not None and (
-            not isinstance(owner_token, str)
-            or re.fullmatch(r"[a-z0-9-]{1,80}", owner_token) is None
-        ):
-            die("registry row has invalid owner_token")
-        if current and owner_token is None:
-            die("registry row has no owner_token")
+        if current and (control is None or owner_launch is None):
+            die("registry row has no runtime control")
         harness = str(d["harness"])
         status = str(d["status"])
-        if current:
+        if tagged:
             try:
                 require_valid_name(str(d["name"]))
                 require_supported_harness(harness)
@@ -599,7 +693,7 @@ class AgentRecord:
                 die("headless registry row must not contain a TUI presentation pane")
             if bypass and harness != "codex":
                 die("non-Codex registry row cannot enable Codex permission bypass")
-        return AgentRecord(
+        record = AgentRecord(
             name=str(d["name"]),
             harness=harness,
             backend=backend,
@@ -617,12 +711,54 @@ class AgentRecord:
             presentation_pane=presentation_pane,
             codex_bypass_permissions=bypass,
             harness_args=tuple(raw_harness_args),
-            owner_token=owner_token,
+            control=control,
             runner_identity=runner_identity,
+            owner_launch=owner_launch,
         )
+        if not current and mode == TUI_MODE:
+            # The outer Sessions implementation never used this inner TUI
+            # registry. A legacy TUI row is therefore unambiguously owned by
+            # the compatibility frontend and has no background runner that
+            # could retain the old name-only write authority.
+            generation = (
+                control.generation
+                if control is not None
+                else "legacy-" + uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{BASE}:{record.name}:{record.created_at}:{record.tmux_target}",
+                ).hex
+            )
+            record.control = RuntimeControl.standalone(generation)
+            record.owner_launch = record.launch_contract()
+            owner_launch = record.owner_launch
+        if owner_launch is not None and (
+            record.cwd != owner_launch.cwd
+            or record.harness != owner_launch.harness
+            or record.model != owner_launch.model
+            or record.harness_args != owner_launch.harness_args
+            or record.codex_bypass_permissions
+            != (owner_launch.permission_mode == "bypass")
+            or owner_launch.harness not in SUPPORTED_HARNESSES
+            or owner_launch.backend not in SUPPORTED_BACKENDS
+            or owner_launch.mode not in SUPPORTED_MODES
+            or owner_launch.permission_mode not in ("native", "bypass")
+            or owner_launch.runtime_home != str(BASE)
+        ):
+            die("registry row mutable fields disagree with its immutable owner launch")
+        return record
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the strict current runtime schema without scalar identity copies."""
+        if self.control is None or self.owner_launch is None:
+            raise AgentOperationError(
+                "owner_launch_unbound",
+                f"runtime {self.name!r} requires exact launch recovery before serialization",
+            )
+        if not _launch_immutable_fields_match(self, self.owner_launch):
+            raise AgentOperationError(
+                "owner_launch_mismatch",
+                f"runtime {self.name!r} compatibility fields disagree with owner launch",
+            )
         if self.mode == TUI_MODE:
             durable_identity = None
         else:
@@ -636,10 +772,23 @@ class AgentRecord:
         document = dataclasses.asdict(self)
         document.pop("runner_pid", None)
         document.pop("runner_started_at", None)
-        document["harness_args"] = list(self.harness_args)
+        document.pop("control", None)
+        document.pop("owner_launch", None)
+        for field_name in (
+            "harness", "cwd", "model", "harness_args",
+            "codex_bypass_permissions",
+        ):
+            document.pop(field_name, None)
         document["runner_identity"] = (
             dataclasses.asdict(durable_identity) if durable_identity is not None else None
         )
+        try:
+            document["control"] = self.control.to_document()
+        except ValueError as exc:
+            raise AgentOperationError(
+                "owner_launch_unbound", f"runtime {self.name!r} has invalid control: {exc}",
+            ) from exc
+        document["launch"] = self.owner_launch.to_document()
         document["schema"] = RUNTIME_RECORD_SCHEMA
         # Persist only documents accepted by the current reader. This keeps
         # every writer behind the same schema and cross-field invariants.
@@ -648,7 +797,17 @@ class AgentRecord:
 
     def to_public_dict(self) -> dict[str, object]:
         """Expose derived compatibility fields without storing duplicate authority."""
-        return dataclasses.asdict(self)
+        document = self.to_dict()
+        document.update({
+            "harness": self.harness,
+            "cwd": self.cwd,
+            "model": self.model,
+            "harness_args": list(self.harness_args),
+            "codex_bypass_permissions": self.codex_bypass_permissions,
+            "runner_pid": self.runner_pid,
+            "runner_started_at": self.runner_started_at,
+        })
+        return document
 
 
 @dataclasses.dataclass
@@ -826,10 +985,10 @@ def _load_presentation_identity(row: dict[str, object]) -> Optional[Presentation
     if not path.exists():
         return None
     try:
-        raw = json.loads(_read_bounded_private_text(
+        raw = _read_bounded_private_json(
             path, MAX_IDENTITY_RECORD_BYTES, "presentation identity",
-        ))
-    except json.JSONDecodeError as exc:
+        )
+    except AgentOperationError as exc:
         die(f"presentation identity {path} is corrupt ({exc}); inspect it before sending work")
     if not isinstance(raw, dict):
         die(f"presentation identity {path} must contain a JSON object")
@@ -864,10 +1023,10 @@ def _load_codex_permission_policy(row: dict[str, object]) -> bool:
         path = _permission_policy_path(str(row["name"]))
         if path.exists():
             try:
-                saved = json.loads(_read_bounded_private_text(
+                saved = _read_bounded_private_json(
                     path, MAX_IDENTITY_RECORD_BYTES, "worker permissions",
-                ))
-            except (OSError, json.JSONDecodeError) as exc:
+                )
+            except (OSError, AgentOperationError) as exc:
                 raise AgentOperationError("invalid_permission_policy", f"cannot read worker permissions {path}: {exc}") from exc
             if not isinstance(saved, dict):
                 raise AgentOperationError("invalid_permission_policy", f"worker permissions {path} must contain an object")
@@ -888,11 +1047,14 @@ def _clear_legacy_sidecars(name: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _read_bounded_private_text(path: Path, limit: int, label: str) -> str:
+def _read_bounded_private_text(
+    path: Path | str, limit: int, label: str, *, directory_fd: int | None = None,
+) -> str:
     """Read one regular private control file without an unbounded allocation."""
     try:
         descriptor = os.open(
             path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
         )
     except FileNotFoundError:
         # Absence is meaningful to optional control-record readers; do not
@@ -933,6 +1095,19 @@ def _read_bounded_private_text(path: Path, limit: int, label: str) -> str:
         os.close(descriptor)
 
 
+def _read_bounded_private_json(
+    path: Path | str, limit: int, label: str, *, directory_fd: int | None = None,
+) -> object:
+    """Read one bounded control file with duplicate-key/depth/number rejection."""
+    text = _read_bounded_private_text(
+        path, limit, label, directory_fd=directory_fd,
+    )
+    try:
+        return _decode_json_strict(text.encode("utf-8"), label, Path(path))
+    except AgentDeliveryError as exc:
+        raise AgentOperationError("control_record_invalid", str(exc)) from exc
+
+
 class _RegistryRows(dict[str, AgentRecord]):
     """Canonical rows plus legacy serialization state kept at the I/O boundary."""
 
@@ -947,10 +1122,10 @@ def _load_unlocked() -> tuple[_RegistryRows, bool]:
     if not REGISTRY.exists():
         return _RegistryRows(), False
     try:
-        raw = json.loads(_read_bounded_private_text(
+        raw = _read_bounded_private_json(
             REGISTRY, MAX_RUNTIME_REGISTRY_BYTES, "runtime registry",
-        ))
-    except json.JSONDecodeError as exc:
+        )
+    except AgentOperationError as exc:
         die(f"registry.json is corrupt ({exc}); inspect {REGISTRY} by hand")
     if not isinstance(raw, list):
         die(f"registry.json must be a JSON array, found {type(raw).__name__}")
@@ -960,6 +1135,8 @@ def _load_unlocked() -> tuple[_RegistryRows, bool]:
         if not isinstance(row, dict):
             die("registry.json rows must be JSON objects")
         rec = AgentRecord.from_dict(row)
+        if rec.name in out:
+            die(f"registry.json contains duplicate agent name {rec.name!r}")
         out[rec.name] = rec
         if row.get("schema") != RUNTIME_RECORD_SCHEMA:
             out.legacy_documents[rec.name] = dict(row)
@@ -968,7 +1145,7 @@ def _load_unlocked() -> tuple[_RegistryRows, bool]:
         # durable presentation identity rehydrates them above; record that the
         # registry itself needs repair so the next read makes the canonical row
         # whole again instead of leaving a live TUI stranded on disk.
-        migrate = rec.owner_token is not None and (
+        migrate = rec.control is not None and rec.owner_launch is not None and (
             row.get("schema") != RUNTIME_RECORD_SCHEMA
             or (rec.mode == TUI_MODE and any(
                 row.get(field) != getattr(rec, field)
@@ -1003,10 +1180,14 @@ def _save_unlocked(agents: dict[str, AgentRecord]) -> None:
                 and original_records.get(name) == rec):
             payload.append(dict(legacy_documents[name]))
             continue
-        # Only the row actually changed by the current transaction receives a
-        # local owner generation.  Unrelated legacy rows above stay untouched.
-        if rec.owner_token is None:
-            rec.owner_token = secrets.token_hex(16)
+        # Compatibility ends at decode. A changed legacy row must first be
+        # upgraded by an exact launch-bound adoption transaction; ordinary
+        # mutations may not invent ownership from the row's mutable route.
+        if rec.control is None or rec.owner_launch is None:
+            raise AgentOperationError(
+                "owner_launch_unbound",
+                f"runtime {name!r} requires exact launch recovery before mutation",
+            )
         payload.append(rec.to_dict())
         emitted_current.add(name)
     tmp = REGISTRY.with_suffix(".json.tmp")
@@ -1070,103 +1251,235 @@ def _validate_owner_token(owner_token: str) -> None:
         raise AgentOperationError("invalid_owner_token", "owner token has an invalid shape")
 
 
-def _bind_owner_record(rec: AgentRecord, owner_token: str) -> None:
-    """Bind one already validated row without sampling missing identity."""
-    if rec.owner_token is None:
-        if (rec.mode == HEADLESS_MODE and rec.runner_pid is not None
-                and rec.runner_identity is None):
-            raise AgentOperationError(
-                "runner_identity_incomplete",
-                f"runtime {rec.name!r} has only a legacy PID/start identity; "
-                "explicit recovery is required before it can be adopted",
-            )
-        rec.owner_token = owner_token
-    elif rec.owner_token != owner_token:
+def _upgrade_legacy_outer_control(rec: AgentRecord, owner_token: str) -> None:
+    """Upgrade an ambiguous V2 token only after its old runner cannot write."""
+    assert rec.control is not None
+    if rec.control.generation != owner_token:
         raise AgentOperationError(
             "owner_token_mismatch",
             f"runtime {rec.name!r} belongs to another session generation",
         )
+    if rec.mode == HEADLESS_MODE:
+        state = (
+            ProcessLiveness.UNKNOWN
+            if rec.runner_pid is None
+            else runner_liveness(rec)
+        )
+        if state is not ProcessLiveness.DEAD:
+            raise AgentOperationError(
+                "runner_generation_unbound",
+                f"runtime {rec.name!r} was launched by a name-only V2 runner; "
+                "retire or explicitly replace that runner before control migration",
+            )
+    rec.control = RuntimeControl.outer_session(owner_token)
 
 
-def bind_owner_token(name: str, owner_token: str) -> AgentRecord:
-    """Bind or verify the canonical session generation for one runtime row."""
-    valid_name = require_valid_name(name)
-    _validate_owner_token(owner_token)
-    with registry_lock() as agents:
-        rec = agents.get(valid_name)
-        if rec is None:
-            raise AgentOperationError("unknown_agent", f"unknown agent {valid_name!r}")
-        _bind_owner_record(rec, owner_token)
-        return dataclasses.replace(rec)
+def _bind_owner_record(rec: AgentRecord, owner_token: str) -> None:
+    """Verify one already-bound generation; adoption requires exact launch proof."""
+    if rec.control is None:
+        raise AgentOperationError(
+            "owner_launch_unbound",
+            f"runtime {rec.name!r} has no immutable owner launch; retry through exact start recovery",
+        )
+    if rec.control.kind not in (
+        OUTER_SESSION_CONTROL, LEGACY_UNDETERMINED_CONTROL,
+    ):
+        raise AgentOperationError(
+            "owner_control_mismatch",
+            f"runtime {rec.name!r} is controlled by the standalone compatibility interface",
+        )
+    if rec.owner_token != owner_token:
+        raise AgentOperationError(
+            "owner_token_mismatch",
+            f"runtime {rec.name!r} belongs to another session generation",
+        )
+    if rec.control.kind == LEGACY_UNDETERMINED_CONTROL:
+        _upgrade_legacy_outer_control(rec, owner_token)
+
+
+def _validate_owner_launch_contract(
+    owner_launch: RuntimeLaunchContract,
+) -> None:
+    """Validate the sole immutable launch proof accepted by the turn runner."""
+    if (
+        owner_launch.harness not in SUPPORTED_HARNESSES
+        or owner_launch.backend not in SUPPORTED_BACKENDS
+        or owner_launch.mode != HEADLESS_MODE
+        or owner_launch.permission_mode not in ("native", "bypass")
+        or owner_launch.runtime_home != str(BASE)
+        or (owner_launch.permission_mode == "bypass"
+            and owner_launch.harness != "codex")
+    ):
+        raise AgentOperationError(
+            "owner_launch_mismatch", "owner launch contract is invalid for this runtime",
+        )
+
+
+def _launch_immutable_fields_match(
+    rec: AgentRecord, owner_launch: RuntimeLaunchContract,
+) -> bool:
+    """Compare fields that cannot change during a runtime route migration."""
+    return (
+        rec.cwd == owner_launch.cwd
+        and rec.harness == owner_launch.harness
+        and rec.model == owner_launch.model
+        and rec.harness_args == owner_launch.harness_args
+        and rec.codex_bypass_permissions
+        == (owner_launch.permission_mode == "bypass")
+    )
 
 
 def bind_owner_launch(
-    name: str, owner_token: str, *, cwd: str, harness: str,
-    model: str | None, backend: str, harness_args: tuple[str, ...],
-    bypass_permissions: bool | None = None,
+    name: str, owner_token: str, owner_launch: RuntimeLaunchContract,
 ) -> AgentRecord:
     """Compare the full existing launch and bind its owner in one transaction."""
     valid_name = require_valid_name(name)
     _validate_owner_token(owner_token)
-    resolved_cwd = str(Path(cwd).expanduser().resolve())
+    _validate_owner_launch_contract(owner_launch)
     with registry_lock() as agents:
         rec = agents.get(valid_name)
         if rec is None:
             raise AgentOperationError("unknown_agent", f"unknown agent {valid_name!r}")
-        if (
-            rec.cwd != resolved_cwd
-            or rec.harness != harness
-            or rec.model != model
-            or rec.backend != backend
-            or rec.mode != HEADLESS_MODE
-            or rec.harness_args != harness_args
-            or (
-                bypass_permissions is not None
-                and rec.codex_bypass_permissions != bypass_permissions
-            )
-        ):
+        if not _launch_immutable_fields_match(rec, owner_launch):
             raise AgentOperationError(
                 "owner_launch_mismatch",
                 f"runtime {valid_name!r} exists with a different launch specification",
             )
-        _bind_owner_record(rec, owner_token)
+        if rec.control is None and (
+            rec.backend != owner_launch.backend or rec.mode != owner_launch.mode
+        ):
+            raise AgentOperationError(
+                "owner_launch_mismatch",
+                f"unowned runtime {valid_name!r} has a different launch route",
+            )
+        if rec.control is None:
+            if rec.mode == HEADLESS_MODE:
+                if rec.runner_pid is None:
+                    raise AgentOperationError(
+                        "runner_generation_unbound",
+                        f"runtime {rec.name!r} has no generation-bound runner identity; "
+                        "explicit replacement is required before it can be adopted",
+                    )
+                if rec.runner_identity is None:
+                    raise AgentOperationError(
+                        "runner_identity_incomplete",
+                        f"runtime {rec.name!r} has only a legacy PID/start identity; "
+                        "explicit recovery is required before it can be adopted",
+                    )
+                if runner_liveness(rec) is not ProcessLiveness.DEAD:
+                    raise AgentOperationError(
+                        "runner_generation_unbound",
+                        f"runtime {rec.name!r} has a live or unverified name-only runner; "
+                        "explicit replacement is required before it can be adopted",
+                    )
+            try:
+                rec.control = RuntimeControl.outer_session(owner_token)
+            except ValueError as exc:
+                raise AgentOperationError("invalid_owner_token", str(exc)) from exc
+        elif rec.control.kind == LEGACY_UNDETERMINED_CONTROL:
+            _upgrade_legacy_outer_control(rec, owner_token)
+        elif rec.control.kind != OUTER_SESSION_CONTROL:
+            raise AgentOperationError(
+                "owner_control_mismatch",
+                f"runtime {valid_name!r} belongs to the standalone compatibility interface",
+            )
+        elif rec.owner_token != owner_token:
+            raise AgentOperationError(
+                "owner_token_mismatch",
+                f"runtime {rec.name!r} belongs to another session generation",
+            )
+        if rec.owner_launch is not None and rec.owner_launch != owner_launch:
+            raise AgentOperationError(
+                "owner_launch_mismatch",
+                f"runtime {valid_name!r} belongs to another immutable launch",
+            )
+        rec.owner_launch = owner_launch
         return dataclasses.replace(rec)
 
 
-def verify_owner_permission(
-    name: str, owner_token: str, permission_mode: str | None,
+def verify_owner_launch(
+    name: str, owner_token: str, owner_launch: RuntimeLaunchContract,
 ) -> AgentRecord:
-    """Verify one outer generation's immutable permission policy."""
-    if permission_mode not in (None, "native", "bypass"):
-        raise AgentOperationError(
-            "invalid_permission_policy", "permission mode must be native or bypass",
-        )
+    """Verify one outer generation and its complete immutable launch contract."""
     valid_name = require_valid_name(name)
     _validate_owner_token(owner_token)
+    _validate_owner_launch_contract(owner_launch)
     with registry_lock() as agents:
         rec = agents.get(valid_name)
         if rec is None:
             raise AgentOperationError("unknown_agent", f"unknown agent {valid_name!r}")
         _bind_owner_record(rec, owner_token)
-        if (
-            permission_mode is not None
-            and rec.codex_bypass_permissions != (permission_mode == "bypass")
-        ):
+        if rec.owner_launch is None:
+            # A token-bearing v2 row predates the immutable launch envelope.
+            # The exact outer contract may upgrade it once; tokenless rows may
+            # only be adopted by explicit start recovery above.
+            if not _launch_immutable_fields_match(rec, owner_launch):
+                raise AgentOperationError(
+                    "owner_launch_mismatch",
+                    f"runtime {valid_name!r} has different immutable launch fields",
+                )
+            rec.owner_launch = owner_launch
+        elif rec.owner_launch != owner_launch:
             raise AgentOperationError(
                 "owner_launch_mismatch",
-                f"runtime {valid_name!r} has a different permission policy",
+                f"runtime {valid_name!r} belongs to another immutable launch",
             )
         return dataclasses.replace(rec)
 
 
-def reconcile_automation_pause(name: str, owner_token: str, paused: bool) -> None:
-    """Apply the canonical outer pause intent to one token-bound runtime."""
-    rec = bind_owner_token(name, owner_token)
+def require_runner_generation(
+    rec: AgentRecord,
+    control_generation: str | None,
+    launch_fingerprint: str | None,
+) -> None:
+    """Refuse a runner callback that does not own this exact runtime row."""
+    if rec.control is None or rec.owner_launch is None:
+        if control_generation is None and launch_fingerprint is None:
+            return
+        raise AgentOperationError(
+            "runner_authority_mismatch",
+            f"legacy runtime {rec.name!r} cannot accept a current runner generation",
+        )
+    if (
+        control_generation is None
+        or launch_fingerprint is None
+        or rec.control.generation != control_generation
+        or rec.owner_launch.fingerprint() != launch_fingerprint
+    ):
+        raise AgentOperationError(
+            "runner_authority_mismatch",
+            f"runner callback does not own runtime generation {rec.name!r}",
+        )
+
+
+def verify_runner_generation(
+    name: str,
+    control_generation: str | None,
+    launch_fingerprint: str | None,
+) -> AgentRecord:
+    """Read and prove one runner generation under the registry lock."""
+    valid_name = require_valid_name(name)
+    with registry_lock() as agents:
+        rec = agents.get(valid_name)
+        if rec is None:
+            raise AgentOperationError(
+                "unknown_agent", f"runner started for unknown agent {valid_name!r}",
+            )
+        require_runner_generation(rec, control_generation, launch_fingerprint)
+        return dataclasses.replace(rec)
+
+
+def reconcile_automation_pause(rec: AgentRecord, paused: bool) -> None:
+    """Apply outer pause intent to an already owner-launch-verified runtime."""
+    if rec.control is None or rec.control.kind != OUTER_SESSION_CONTROL:
+        raise AgentOperationError(
+            "owner_launch_unbound", "pause reconciliation requires an owned runtime",
+        )
     marker = automation_pause_path(rec)
     if paused:
         _write_durable_json(marker, {
             "schema": "agentctl-pause/v1",
-            "owner_token": owner_token,
+            "owner_token": rec.owner_token,
             "paused": True,
         })
     else:
@@ -1174,7 +1487,7 @@ def reconcile_automation_pause(name: str, owner_token: str, paused: bool) -> Non
     # Once an outer generation owns this runtime, an old unscoped marker can
     # no longer be authoritative.  A token-specific path makes a late request
     # from a retired generation harmless to its replacement.
-    (agent_dir(name) / "automation-paused").unlink(missing_ok=True)
+    (agent_dir(rec.name) / "automation-paused").unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -1265,28 +1578,271 @@ def _stop_lock(name: str) -> Iterator[None]:
         os.close(fd)
 
 
-def record_active_harness(name: str, runner: RunnerIdentity, harness: RunnerIdentity) -> None:
+@contextlib.contextmanager
+def owner_operation_lock(name: str) -> Iterator[None]:
+    """Serialize operations for one inner runtime name across worker RPCs."""
+    valid_name = require_valid_name(name)
+    BASE.mkdir(parents=True, exist_ok=True)
+    path = BASE / f".owner-operation-{valid_name}.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def owner_launch_operation(
+    name: str,
+    owner_token: str,
+    owner_launch: RuntimeLaunchContract,
+    *,
+    allow_terminal_receipt: bool = False,
+) -> Iterator[AgentRecord | None]:
+    """Serialize one RPC and prove its immutable owner launch before mutation."""
+    valid_name = require_valid_name(name)
+    with owner_operation_lock(valid_name):
+        verified: AgentRecord | None
+        try:
+            verified = verify_owner_launch(
+                valid_name, owner_token, owner_launch,
+            )
+        except AgentOperationError as exc:
+            if not (allow_terminal_receipt and exc.code == "unknown_agent"):
+                raise
+            verified = None
+        marker = _ACTIVE_OWNER_OPERATION.set((
+            valid_name, owner_token, owner_launch.fingerprint(),
+        ))
+        try:
+            yield verified
+        finally:
+            _ACTIVE_OWNER_OPERATION.reset(marker)
+
+
+@contextlib.contextmanager
+def owner_start_operation(
+    name: str, owner_token: str, owner_launch: RuntimeLaunchContract,
+) -> Iterator[None]:
+    """Serialize first publication of one outer-owned runtime generation."""
+    valid_name = require_valid_name(name)
+    _validate_owner_token(owner_token)
+    _validate_owner_launch_contract(owner_launch)
+    with owner_operation_lock(valid_name):
+        marker = _ACTIVE_OWNER_OPERATION.set((
+            valid_name, owner_token, owner_launch.fingerprint(),
+        ))
+        try:
+            yield
+        finally:
+            _ACTIVE_OWNER_OPERATION.reset(marker)
+
+
+_ACTIVE_OWNER_OPERATION: contextvars.ContextVar[
+    tuple[str, str | None, str | None] | None
+] = contextvars.ContextVar("agentctl_owner_operation", default=None)
+_MutationParams = ParamSpec("_MutationParams")
+_MutationResult = TypeVar("_MutationResult")
+
+
+def owner_mutation(
+    function: Callable[Concatenate[str, _MutationParams], _MutationResult],
+) -> Callable[Concatenate[str, _MutationParams], _MutationResult]:
+    """Keep legacy mutation entrypoints from writing owner-bound runtimes.
+
+    The canonical worker RPC establishes an exact token/LaunchSpec context
+    while holding the per-runtime operation lock. Compatibility frontends may
+    still operate on genuinely unowned legacy rows, but take the same lock and
+    refuse as soon as a current owner binding exists.
+    """
+    @functools.wraps(function)
+    def guarded(
+        name: str, *args: _MutationParams.args, **kwargs: _MutationParams.kwargs,
+    ) -> _MutationResult:
+        valid_name = require_valid_name(name)
+        active = _ACTIVE_OWNER_OPERATION.get()
+        if active is not None:
+            if active[0] != valid_name:
+                raise AgentOperationError(
+                    "owner_launch_mismatch",
+                    f"runtime mutation authority belongs to {active[0]!r}, not {valid_name!r}",
+                )
+            return function(valid_name, *args, **kwargs)
+        with owner_operation_lock(valid_name):
+            record = read_registry().get(valid_name)
+            if record is not None and (
+                record.control is None or record.owner_launch is None
+            ):
+                raise AgentOperationError(
+                    "owner_launch_unbound",
+                    f"runtime {valid_name!r} requires explicit control recovery before mutation",
+                )
+            if record is not None and record.control is not None and (
+                record.control.kind != STANDALONE_CONTROL
+            ):
+                raise AgentOperationError(
+                    "owner_launch_required",
+                    f"runtime {valid_name!r} is managed by agentctl; use its canonical named session command",
+                )
+            marker = _ACTIVE_OWNER_OPERATION.set((
+                valid_name,
+                None,
+                None if record is None else record.launch_fingerprint(),
+            ))
+            try:
+                return function(valid_name, *args, **kwargs)
+            finally:
+                _ACTIVE_OWNER_OPERATION.reset(marker)
+
+    return guarded
+
+
+def record_active_harness(
+    name: str,
+    runner: RunnerIdentity,
+    harness: RunnerIdentity,
+    control_generation: str | None,
+    launch_fingerprint: str | None,
+) -> None:
     """Record an owned harness process group for bounded stop and orphan cleanup."""
-    _write_durable_json(agent_dir(name) / "active-harness.json", {
-        "schema": "agentctl-active-harness/v2",
-        "runner": dataclasses.asdict(runner),
-        "harness": dataclasses.asdict(harness),
-    })
+    with registry_lock() as agents:
+        record = agents.get(name)
+        if record is None:
+            raise AgentOperationError(
+                "unknown_agent", f"runtime {name!r} disappeared before harness launch",
+            )
+        require_runner_generation(
+            record, control_generation, launch_fingerprint,
+        )
+        if record.runner_identity != runner:
+            raise AgentOperationError(
+                "runner_authority_mismatch",
+                f"runtime {name!r} changed runner before harness launch",
+            )
+        _write_durable_json(agent_dir(name) / "active-harness.json", {
+            "schema": "agentctl-active-harness/v3",
+            "control_generation": control_generation,
+            "launch_fingerprint": launch_fingerprint,
+            "runner": dataclasses.asdict(runner),
+            "harness": dataclasses.asdict(harness),
+        })
+
+
+def clear_active_harness(
+    name: str,
+    control_generation: str | None,
+    launch_fingerprint: str | None,
+    runner: RunnerIdentity,
+    harness: RunnerIdentity,
+) -> bool:
+    """Remove only the sidecar published for this exact runner generation."""
+    path = agent_dir(name) / "active-harness.json"
+    with _harness_lock(name):
+        try:
+            value = _read_bounded_private_json(
+                path, MAX_IDENTITY_RECORD_BYTES, "active harness identity",
+            )
+        except FileNotFoundError:
+            return False
+        if (
+            not isinstance(value, dict)
+            or value.get("schema") != "agentctl-active-harness/v3"
+            or value.get("control_generation") != control_generation
+            or value.get("launch_fingerprint") != launch_fingerprint
+            or value.get("runner") != dataclasses.asdict(runner)
+            or value.get("harness") != dataclasses.asdict(harness)
+        ):
+            return False
+        current = read_registry().get(name)
+        if current is None:
+            return False
+        try:
+            require_runner_generation(
+                current, control_generation, launch_fingerprint,
+            )
+        except AgentOperationError:
+            return False
+        if current.runner_identity != runner:
+            return False
+        path.unlink()
+        _sync_directory(path.parent)
+        return True
 
 
 def terminate_active_harness(rec: AgentRecord) -> bool:
     """Kill only the detached harness group pinned to this worker generation."""
     path = agent_dir(rec.name) / "active-harness.json"
     try:
-        value = json.loads(_read_bounded_private_text(
+        value = _read_bounded_private_json(
             path, MAX_IDENTITY_RECORD_BYTES, "active harness identity",
-        ))
+        )
     except FileNotFoundError:
         return False
     except (OSError, ValueError, AgentOperationError) as exc:
         raise AgentOperationError("harness_identity_unknown", f"cannot read active harness identity: {exc}") from exc
-    if not isinstance(value, dict) or value.get("schema") != "agentctl-active-harness/v2":
+    legacy_fields = {"runner_pid", "runner_started_at", "pid", "started_at"}
+    if isinstance(value, dict) and set(value) == legacy_fields:
+        # Pre-v2 sidecars do not contain enough identity to signal safely.  A
+        # confirmed-dead owner may retire the sidecar only after proving that
+        # both its numeric leader generation and process group are gone.  Live
+        # stops never upgrade or consume this weaker evidence.
+        if runner_liveness(rec) is not ProcessLiveness.DEAD:
+            raise AgentOperationError(
+                "harness_identity_unknown",
+                "legacy active harness identity belongs to a runner that is not proved dead",
+            )
+        if (value.get("runner_pid") != rec.runner_pid
+                or value.get("runner_started_at") != rec.runner_started_at):
+            return False
+        pid = value.get("pid")
+        started_at = value.get("started_at")
+        if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1
+                or not isinstance(started_at, str) or not started_at):
+            raise AgentOperationError(
+                "harness_identity_unknown", "malformed legacy active harness identity",
+            )
+        observed = pid_start_time(pid)
+        if observed == started_at or _process_group_members(pid):
+            raise AgentOperationError(
+                "harness_identity_unknown",
+                "legacy active harness generation or process group may still be live; "
+                "state was preserved",
+            )
+        try:
+            path.unlink()
+            _sync_directory(path.parent)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise AgentOperationError(
+                "harness_identity_unknown",
+                f"cannot retire legacy active harness identity: {exc}",
+            ) from exc
+        return False
+    if not isinstance(value, dict) or value.get("schema") not in {
+        "agentctl-active-harness/v2", "agentctl-active-harness/v3",
+    }:
         raise AgentOperationError("harness_identity_unknown", "malformed active harness identity")
+    expected_fields = (
+        {"schema", "runner", "harness"}
+        if value.get("schema") == "agentctl-active-harness/v2"
+        else {
+            "schema", "control_generation", "launch_fingerprint",
+            "runner", "harness",
+        }
+    )
+    if set(value) != expected_fields:
+        raise AgentOperationError(
+            "harness_identity_unknown", "active harness identity has invalid fields",
+        )
+    if value.get("schema") == "agentctl-active-harness/v3" and (
+        value.get("control_generation") != rec.control_generation
+        or value.get("launch_fingerprint") != (
+            None if rec.owner_launch is None else rec.owner_launch.fingerprint()
+        )
+    ):
+        return False
     try:
         runner = _process_identity_from_value(value["runner"], "active harness runner")
         harness = _process_identity_from_value(value["harness"], "active harness process")
@@ -1401,11 +1957,11 @@ def acknowledge_migration_pause(name: str, identity: RunnerIdentity) -> None:
 def pause_acknowledged(name: str, old: RunnerIdentity) -> bool:
     """Check that the pause acknowledgement belongs to the expected source process."""
     try:
-        raw = cast(dict[str, object], json.loads(_read_bounded_private_text(
+        raw = cast(dict[str, object], _read_bounded_private_json(
             migration_pause_ack_path(name), MAX_IDENTITY_RECORD_BYTES,
             "migration pause acknowledgement",
-        )))
-    except (OSError, json.JSONDecodeError, AgentOperationError):
+        ))
+    except (OSError, AgentOperationError):
         return False
     return (
         raw.get("schema") == "agentctl-migration-pause-ack/v2"
@@ -1426,17 +1982,17 @@ def write_staged_runner(name: str, token: str, identity: RunnerIdentity) -> None
 def read_staged_runner(name: str, token: str) -> Optional[RunnerIdentity]:
     """Read a replacement-runner identity, returning None when no valid record exists."""
     try:
-        raw = json.loads(_read_bounded_private_text(
+        raw = _read_bounded_private_json(
             staged_runner_path(name, token), MAX_IDENTITY_RECORD_BYTES,
             "staged runner identity",
-        ))
+        )
         if (not isinstance(raw, dict)
                 or raw.get("schema") != "agentctl-staged-runner/v2"
                 or raw.get("token") != token
                 or not isinstance(raw.get("runner"), dict)):
             return None
         identity = _process_identity_from_value(raw["runner"], "staged runner")
-    except (OSError, json.JSONDecodeError, KeyError, AgentOperationError):
+    except (OSError, KeyError, AgentOperationError):
         return None
     return (
         identity
@@ -1460,19 +2016,87 @@ def clear_migration_markers(name: str, token: str) -> None:
             pass
 
 
-def acknowledge_staged_runner_activation(name: str, token: str) -> None:
-    """Record that the staged runner has accepted its activation marker."""
-    staged_runner_activated_path(name, token).write_text(now_iso() + "\n")
+def acknowledge_staged_runner_activation(
+    name: str,
+    token: str,
+    identity: RunnerIdentity,
+    control_generation: str | None,
+    launch_fingerprint: str | None,
+) -> None:
+    """Bind activation to the exact staged process and runtime generation."""
+    record = verify_runner_generation(
+        name, control_generation, launch_fingerprint,
+    )
+    if record.runner_identity != identity:
+        raise AgentOperationError(
+            "runner_authority_mismatch",
+            "staged runner is not the process generation committed to the registry",
+        )
+    if read_staged_runner(name, token) != identity:
+        raise AgentOperationError(
+            "migration_destination_unconfirmed",
+            "staged runner identity changed before activation acknowledgement",
+        )
+    _write_durable_json(staged_runner_activated_path(name, token), {
+        "schema": "agentctl-staged-runner-activation/v2",
+        "token": token,
+        "runner": dataclasses.asdict(identity),
+        "control_generation": control_generation,
+        "launch_fingerprint": launch_fingerprint,
+        "acknowledged_at": now_iso(),
+    })
 
 
-def wait_for_staged_runner_activation(name: str, token: str) -> bool:
-    """Wait up to the configured migration bound for replacement-runner acknowledgement."""
+def staged_runner_activation_acknowledged(
+    name: str,
+    token: str,
+    identity: RunnerIdentity,
+    control_generation: str | None,
+    launch_fingerprint: str | None,
+) -> bool:
+    """Check one activation receipt against the exact committed generation."""
+    try:
+        raw = _read_bounded_private_json(
+            staged_runner_activated_path(name, token),
+            MAX_IDENTITY_RECORD_BYTES,
+            "staged runner activation acknowledgement",
+        )
+    except (OSError, AgentOperationError):
+        return False
+    return (
+        isinstance(raw, dict)
+        and set(raw) == {
+            "schema", "token", "runner", "control_generation",
+            "launch_fingerprint", "acknowledged_at",
+        }
+        and raw.get("schema") == "agentctl-staged-runner-activation/v2"
+        and raw.get("token") == token
+        and raw.get("runner") == dataclasses.asdict(identity)
+        and raw.get("control_generation") == control_generation
+        and raw.get("launch_fingerprint") == launch_fingerprint
+        and isinstance(raw.get("acknowledged_at"), str)
+        and bool(raw.get("acknowledged_at"))
+    )
+
+
+def wait_for_staged_runner_activation(
+    name: str,
+    token: str,
+    identity: RunnerIdentity,
+    control_generation: str | None,
+    launch_fingerprint: str | None,
+) -> bool:
+    """Wait up to the migration bound for this exact activation receipt."""
     deadline = time.monotonic() + MIGRATION_READY_TIMEOUT_S
     while time.monotonic() < deadline:
-        if staged_runner_activated_path(name, token).exists():
+        if staged_runner_activation_acknowledged(
+            name, token, identity, control_generation, launch_fingerprint,
+        ):
             return True
         time.sleep(0.05)
-    return staged_runner_activated_path(name, token).exists()
+    return staged_runner_activation_acknowledged(
+        name, token, identity, control_generation, launch_fingerprint,
+    )
 
 
 def ensure_agent_dirs(name: str) -> None:
@@ -1553,9 +2177,9 @@ class Message:
     @staticmethod
     def from_path(path: Path) -> "Message":
         """Read a queued turn, accepting records that omit optional model and effort overrides."""
-        d = json.loads(_read_bounded_private_text(
+        d = _read_bounded_private_json(
             path, MAX_QUEUE_MESSAGE_BYTES, "queued turn",
-        ))
+        )
         return Message(
             seq=int(d["seq"]),
             text=str(d["text"]),
@@ -1615,10 +2239,10 @@ def pending_count(name: str) -> int:
 def _record_tui_delivery_failure(path: Path, exc: AgentOperationError) -> int:
     """Persist a failed attempt before retrying or quarantining a TUI message."""
     try:
-        raw = json.loads(_read_bounded_private_text(
+        raw = _read_bounded_private_json(
             path, MAX_QUEUE_MESSAGE_BYTES, "TUI inbox message",
-        ))
-    except json.JSONDecodeError as error:
+        )
+    except AgentOperationError as error:
         raise AgentOperationError(
             "tui_inbox_corrupt", f"TUI inbox message {path} is invalid JSON: {error}",
         ) from error
@@ -2841,70 +3465,150 @@ def _owned_stop_destination(name: str, owner_token: str) -> Path:
 
 def _owned_stop_receipt(
     destination: Path, name: str, owner_token: str,
+    launch_fingerprint: str | None,
 ) -> DownResult:
     """Validate one terminal archive as the receipt for this exact generation."""
-    path = destination / "stop-receipt.json"
     try:
-        value = json.loads(_read_bounded_private_text(
-            path, MAX_STOP_RECEIPT_BYTES, "stop receipt",
-        ))
-    except json.JSONDecodeError as exc:
-        raise AgentOperationError(
-            "stop_receipt_invalid", f"stop receipt is not valid JSON: {exc}",
-        ) from exc
-    fields = {
-        "schema", "name", "owner_token", "killed_window", "forced",
-        "unverified_presentation",
-    }
-    if (not isinstance(value, dict) or set(value) != fields
-            or value.get("schema") != STOP_RECEIPT_SCHEMA
-            or value.get("name") != name or value.get("owner_token") != owner_token
-            or not isinstance(value.get("killed_window"), bool)
-            or not isinstance(value.get("forced"), bool)
-            or (value.get("unverified_presentation") is not None
-                and not isinstance(value.get("unverified_presentation"), str))):
-        raise AgentOperationError(
-            "stop_receipt_invalid",
-            f"stop archive does not contain an exact receipt for {name!r}",
+        descriptor = os.open(
+            destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
         )
-    with registry_lock() as agents:
-        current = agents.get(name)
-        if current is not None and current.owner_token != owner_token:
-            raise AgentOperationError(
-                "owner_token_mismatch",
-                f"runtime {name!r} belongs to another session generation",
-            )
-        if os.path.lexists(agent_dir(name)) or not destination.is_dir():
+    except OSError as exc:
+        raise AgentOperationError(
+            "stop_receipt_invalid", f"cannot pin stop archive: {exc}",
+        ) from exc
+    try:
+        pinned = os.fstat(descriptor)
+        value = _read_bounded_private_json(
+            "stop-receipt.json", MAX_STOP_RECEIPT_BYTES, "stop receipt",
+            directory_fd=descriptor,
+        )
+        legacy_fields = {
+            "schema", "name", "owner_token", "killed_window", "forced",
+            "unverified_presentation",
+        }
+        current_fields = legacy_fields | {"owner_launch_fingerprint"}
+        if (not isinstance(value, dict)
+                or (value.get("schema") == STOP_RECEIPT_SCHEMA
+                    and set(value) != current_fields)
+                or (value.get("schema") == LEGACY_STOP_RECEIPT_SCHEMA
+                    and set(value) != legacy_fields)
+                or value.get("schema") not in {
+                    STOP_RECEIPT_SCHEMA, LEGACY_STOP_RECEIPT_SCHEMA,
+                }
+                or value.get("name") != name or value.get("owner_token") != owner_token
+                or not isinstance(value.get("killed_window"), bool)
+                or not isinstance(value.get("forced"), bool)
+                or (value.get("unverified_presentation") is not None
+                    and not isinstance(value.get("unverified_presentation"), str))
+                or (value.get("schema") == STOP_RECEIPT_SCHEMA
+                    and (not isinstance(value.get("owner_launch_fingerprint"), str)
+                        or re.fullmatch(
+                            r"[0-9a-f]{64}",
+                            cast(str, value.get("owner_launch_fingerprint")),
+                        ) is None))):
             raise AgentOperationError(
                 "stop_receipt_invalid",
-                f"stop archive state changed while reconciling {name!r}",
+                f"stop archive does not contain an exact receipt for {name!r}",
             )
-        agents.pop(name, None)
-    return DownResult(
-        name=name,
-        killed_window=cast(bool, value["killed_window"]),
-        archived_to=str(destination),
-        state_path=None,
-        was_registered=True,
-        forced=cast(bool, value["forced"]),
-        unverified_presentation=cast(Optional[str], value["unverified_presentation"]),
-    )
+        if launch_fingerprint is not None and (
+            value.get("schema") != STOP_RECEIPT_SCHEMA
+            or value.get("owner_launch_fingerprint") != launch_fingerprint
+        ):
+            raise AgentOperationError(
+                "owner_launch_mismatch",
+                f"stop archive does not bind the immutable launch for {name!r}",
+            )
+        with registry_lock() as agents:
+            current = agents.get(name)
+            if current is not None and current.owner_token != owner_token:
+                raise AgentOperationError(
+                    "owner_token_mismatch",
+                    f"runtime {name!r} belongs to another session generation",
+                )
+            try:
+                final = os.stat(destination, follow_symlinks=False)
+            except OSError as exc:
+                raise AgentOperationError(
+                    "stop_receipt_invalid",
+                    f"stop archive state changed while reconciling {name!r}: {exc}",
+                ) from exc
+            if (os.path.lexists(agent_dir(name)) or not stat.S_ISDIR(final.st_mode)
+                    or (final.st_dev, final.st_ino) != (pinned.st_dev, pinned.st_ino)):
+                raise AgentOperationError(
+                    "stop_receipt_invalid",
+                    f"stop archive state changed while reconciling {name!r}",
+                )
+            agents.pop(name, None)
+        return DownResult(
+            name=name,
+            killed_window=cast(bool, value["killed_window"]),
+            archived_to=str(destination),
+            state_path=None,
+            was_registered=True,
+            forced=cast(bool, value["forced"]),
+            unverified_presentation=cast(Optional[str], value["unverified_presentation"]),
+        )
+    except (AgentOperationError, OSError) as exc:
+        if isinstance(exc, AgentOperationError) and exc.code in (
+            "owner_launch_mismatch", "owner_token_mismatch",
+        ):
+            raise
+        raise AgentOperationError(
+            "stop_receipt_invalid", f"stop receipt is invalid: {exc}",
+        ) from exc
+    finally:
+        os.close(descriptor)
 
 
-def stop_owned_agent(name: str, owner_token: str, *, grace: float = 10.0) -> DownResult:
+def stop_owned_agent(
+    name: str, owner_token: str, *, grace: float = 10.0,
+    launch_fingerprint: str | None = None,
+) -> DownResult:
     """Stop or reconcile exactly one outer-session-owned runtime generation."""
     valid_name = require_valid_name(name)
+    unbound_call = _ACTIVE_OWNER_OPERATION.get() is None
+    if unbound_call:
+        record = read_registry().get(valid_name)
+        if record is not None:
+            _bind_owner_record(record, owner_token)
+            if record.owner_launch is None:
+                raise AgentOperationError(
+                    "owner_launch_unbound",
+                    f"runtime {valid_name!r} has no immutable owner launch",
+                )
+            if (
+                launch_fingerprint is not None
+                and record.owner_launch.fingerprint() != launch_fingerprint
+            ):
+                raise AgentOperationError(
+                    "owner_launch_mismatch",
+                    f"runtime {valid_name!r} belongs to another immutable launch",
+                )
+            with owner_launch_operation(valid_name, owner_token, record.owner_launch):
+                return stop_owned_agent(
+                    valid_name,
+                    owner_token,
+                    grace=grace,
+                    launch_fingerprint=launch_fingerprint,
+                )
     destination = _owned_stop_destination(valid_name, owner_token)
     with _stop_lock(valid_name):
         source_exists = os.path.lexists(agent_dir(valid_name))
         destination_exists = os.path.lexists(destination)
+        if unbound_call and source_exists:
+            raise AgentOperationError(
+                "owner_launch_unbound",
+                f"runtime {valid_name!r} has state but no live outer ownership record",
+            )
         if source_exists and destination_exists:
             raise AgentOperationError(
                 "stop_archive_collision",
                 "both live and terminal state exist for this runtime generation",
             )
         if destination_exists:
-            return _owned_stop_receipt(destination, valid_name, owner_token)
+            return _owned_stop_receipt(
+                destination, valid_name, owner_token, launch_fingerprint,
+            )
         if not source_exists:
             raise AgentOperationError(
                 "stop_receipt_missing",
@@ -2913,22 +3617,132 @@ def stop_owned_agent(name: str, owner_token: str, *, grace: float = 10.0) -> Dow
         return bring_down_agent(
             valid_name, grace=grace, archive=True,
             expected_owner_token=owner_token,
+            expected_launch_fingerprint=launch_fingerprint,
             deterministic_archive=destination,
         )
 
 
-def _write_workspace_loss_snapshot(rec: AgentRecord, workspace_id: str) -> Path:
+def retire_legacy_undetermined_runtime(
+    name: str,
+    expected_generation: str,
+    *,
+    grace: float = 10.0,
+) -> DownResult:
+    """Safely retire, but never relabel, one ambiguous V2 headless runtime.
+
+    V2 did not record whether its token belonged to an outer session or the
+    standalone compatibility frontend. The only safe automatic operation is
+    an explicitly generation-bound retirement: stop the exact boot-bound
+    runner, preserve its presentation, and archive its state transactionally.
+    """
+    valid_name = require_valid_name(name)
+    _validate_owner_token(expected_generation)
+    destination = _owned_stop_destination(valid_name, expected_generation)
+    with owner_operation_lock(valid_name), _stop_lock(valid_name):
+        source_exists = os.path.lexists(agent_dir(valid_name))
+        destination_exists = os.path.lexists(destination)
+        if source_exists and destination_exists:
+            raise AgentOperationError(
+                "stop_archive_collision",
+                "both live and terminal state exist for this runtime generation",
+            )
+        record = read_registry().get(valid_name)
+        if destination_exists:
+            return _owned_stop_receipt(
+                destination, valid_name, expected_generation, None,
+            )
+        if record is None or not source_exists:
+            raise AgentOperationError(
+                "stop_receipt_missing",
+                f"runtime {valid_name!r} has neither live state nor a terminal receipt",
+            )
+        if (
+            record.control is None
+            or record.control.kind != LEGACY_UNDETERMINED_CONTROL
+            or record.control.generation != expected_generation
+            or record.owner_launch is not None
+            or record.mode != HEADLESS_MODE
+        ):
+            raise AgentOperationError(
+                "legacy_control_mismatch",
+                f"runtime {valid_name!r} is not the requested ambiguous V2 headless generation",
+            )
+        if record.runner_identity is None:
+            raise AgentOperationError(
+                "runner_identity_incomplete",
+                f"runtime {valid_name!r} has no boot-bound runner identity",
+            )
+        state = runner_liveness(record)
+        if state is ProcessLiveness.UNKNOWN:
+            raise AgentOperationError(
+                "runner_liveness_unknown",
+                f"runtime {valid_name!r} runner identity cannot be verified",
+            )
+        if state is ProcessLiveness.LIVE:
+            terminate_runner(record, grace=grace)
+        if runner_liveness(record) is not ProcessLiveness.DEAD:
+            raise AgentOperationError(
+                "runner_liveness_unknown",
+                f"runtime {valid_name!r} runner did not reach a proved-dead state",
+            )
+        launch_fingerprint = record.launch_fingerprint()
+        unverified = (
+            f"{record.backend} presentation "
+            f"{record.presentation_pane or record.tmux_target} preserved"
+        )
+        _write_durable_json(agent_dir(valid_name) / "stop-receipt.json", {
+            "schema": STOP_RECEIPT_SCHEMA,
+            "name": valid_name,
+            "owner_token": expected_generation,
+            "owner_launch_fingerprint": launch_fingerprint,
+            "killed_window": False,
+            "forced": True,
+            "unverified_presentation": unverified,
+        })
+        ARCHIVE.mkdir(parents=True, exist_ok=True)
+        with registry_lock() as agents:
+            current = agents.get(valid_name)
+            if current != record:
+                raise AgentOperationError(
+                    "legacy_control_mismatch",
+                    f"runtime {valid_name!r} changed before legacy retirement publication",
+                )
+            archived = archive_state(valid_name, destination=destination)
+            assert archived == destination
+            _sync_directory(ARCHIVE)
+            agents.pop(valid_name)
+        write_event("agent_down_legacy_recovery", valid_name)
+        return DownResult(
+            name=valid_name,
+            killed_window=False,
+            archived_to=str(destination),
+            state_path=None,
+            was_registered=True,
+            forced=True,
+            unverified_presentation=unverified,
+        )
+
+
+def _write_workspace_loss_snapshot(
+    rec: AgentRecord, workspace_id: str,
+    legacy_document: dict[str, object] | None = None,
+) -> Path:
     """Preserve identity/context before archiving a hard Herdr workspace loss."""
     ensure_agent_dirs(rec.name)
-    if rec.owner_token is None:
-        # Reaping is a state transition. Give an unowned legacy row one final
-        # generation before serializing its canonical recovery record.
-        rec.owner_token = secrets.token_hex(16)
+    if rec.owner_launch is None:
+        if legacy_document is None:
+            raise AgentOperationError(
+                "owner_launch_unbound",
+                "legacy workspace-loss recovery requires its exact source document",
+            )
+        saved_agent = dict(legacy_document)
+    else:
+        saved_agent = rec.to_dict()
     path = agent_dir(rec.name) / "WORKSPACE_LOST.json"
     payload: dict[str, object] = {
         "detected_at": now_iso(),
         "workspace_id": workspace_id,
-        "agent": rec.to_dict(),
+        "agent": saved_agent,
         "recovery": (
             "The Herdr workspace disappeared. Read transcript.log and this saved registry row before "
             "starting a replacement agent. A TUI's visible-only scrollback may be unavailable after "
@@ -2941,10 +3755,15 @@ def _write_workspace_loss_snapshot(rec: AgentRecord, workspace_id: str) -> Path:
     return path
 
 
-def _reap_workspace_loss(rec: AgentRecord, workspace_id: str) -> str:
-    snapshot = _write_workspace_loss_snapshot(rec, workspace_id)
+def _reap_workspace_loss(
+    rec: AgentRecord, workspace_id: str,
+    legacy_document: dict[str, object] | None = None,
+) -> str:
     if rec.mode == HEADLESS_MODE:
         terminate_active_harness(rec)
+    snapshot = _write_workspace_loss_snapshot(
+        rec, workspace_id, legacy_document,
+    )
     dest = archive_state(rec.name)
     saved_snapshot = snapshot if dest is None else dest / snapshot.name
     tail = f"; state archived to {dest}" if dest else ""
@@ -2979,6 +3798,12 @@ def gc() -> list[str]:
     with registry_lock() as agents:
         for name in list(agents):
             rec = agents[name]
+            # Outer-owned rows are observed and retired only through their
+            # session state machine. Standalone rows retain the compatibility
+            # collector, but the explicit control kind prevents it from ever
+            # racing an outer generation.
+            if rec.control is not None and rec.control.kind != STANDALONE_CONTROL:
+                continue
             if _within_startup_grace(rec):
                 continue
             if rec.backend == "herdr":
@@ -3012,7 +3837,24 @@ def gc() -> list[str]:
                             )
                             write_event("herdr_workspace_lost", name, preview=last_message_preview(name))
                             continue
-                        notes.append(_reap_workspace_loss(rec, workspace_id))
+                        legacy_document = (
+                            agents.legacy_documents.get(name)
+                            if isinstance(agents, _RegistryRows) else None
+                        )
+                        try:
+                            note = _reap_workspace_loss(
+                                rec, workspace_id, legacy_document,
+                            )
+                        except (AgentOperationError, OSError) as exc:
+                            code = getattr(exc, "code", "filesystem_error")
+                            message = getattr(exc, "message", str(exc))
+                            notes.append(
+                                f"{name} degraded: workspace is gone but active harness "
+                                f"cleanup/publication could not be completed ({code}: {message}); "
+                                "preserving state"
+                            )
+                            continue
+                        notes.append(note)
                         del agents[name]
                         continue
             if rec.mode == TUI_MODE:
@@ -3064,10 +3906,19 @@ def gc() -> list[str]:
                 reason = "runner pid missing after startup grace"
             else:
                 reason = f"runner pid {rec.runner_pid} not alive or reused"
-            terminate_active_harness(rec)
-            if win:
-                kill_window(rec)
-            dest = archive_state(name)
+            try:
+                terminate_active_harness(rec)
+                if win:
+                    kill_window(rec)
+                dest = archive_state(name)
+            except (AgentOperationError, OSError) as exc:
+                code = getattr(exc, "code", "filesystem_error")
+                message = getattr(exc, "message", str(exc))
+                notes.append(
+                    f"{name} degraded: cleanup/publication could not be completed "
+                    f"({code}: {message}); preserving state"
+                )
+                continue
             del agents[name]
             tail = f"; state archived to {dest}" if dest else ""
             notes.append(f"reaped {name} ({reason}){tail}")
@@ -3191,9 +4042,23 @@ def _child_python_command(script: Path, *args: str) -> str:
     return f"env {prefix} {shlex.join([sys.executable, str(script), *args])}"
 
 
-def runner_wrapper(name: str, *, stage_token: Optional[str] = None) -> str:
+def runner_wrapper(
+    name: str,
+    *,
+    control_generation: str | None,
+    launch_fingerprint: str | None,
+    stage_token: Optional[str] = None,
+) -> str:
     """Shell command used by every backend to host a runner visibly."""
-    inner = _child_python_command(RUNNER, name)
+    if (control_generation is None) != (launch_fingerprint is None):
+        raise AgentOperationError(
+            "runner_authority_incomplete",
+            "runner control generation and launch fingerprint must be supplied together",
+        )
+    arguments = [name]
+    if control_generation is not None and launch_fingerprint is not None:
+        arguments.extend((control_generation, launch_fingerprint))
+    inner = _child_python_command(RUNNER, *arguments)
     if stage_token is not None:
         inner = f"SUBAGENTS_MIGRATION_STAGE={shlex.quote(stage_token)} {inner}"
     stderr = shlex.quote(str(runner_stderr_path(name)))
@@ -3204,6 +4069,7 @@ def runner_wrapper(name: str, *, stage_token: Optional[str] = None) -> str:
     )
 
 
+@owner_mutation
 def bring_up_agent(
     name: str,
     *,
@@ -3217,6 +4083,7 @@ def bring_up_agent(
     harness_args: Sequence[str] = (),
     owner_token: Optional[str] = None,
     bypass_permissions: Optional[bool] = None,
+    expected_owner_launch: Optional[RuntimeLaunchContract] = None,
 ) -> UpResult:
     """Validate policy and launch a named worker, optionally enqueueing its first task."""
     harness = require_supported_harness(harness)
@@ -3257,16 +4124,41 @@ def bring_up_agent(
             f"{backend} is selected but is not available; check its binary and running server",
         )
     valid_name = require_valid_name(name)
-    if owner_token is None:
-        owner_token = secrets.token_hex(16)
-    elif re.fullmatch(r"[a-z0-9-]{1,80}", owner_token) is None:
-        raise AgentOperationError("invalid_owner_token", "owner token has an invalid shape")
+    if expected_owner_launch is None:
+        if owner_token is not None:
+            raise AgentOperationError(
+                "owner_launch_required",
+                "an outer owner token requires its exact launch contract",
+            )
+        control = RuntimeControl.standalone(secrets.token_hex(16))
+    else:
+        if owner_token is None:
+            raise AgentOperationError(
+                "invalid_owner_token", "an outer launch requires an owner token",
+            )
+        try:
+            control = RuntimeControl.outer_session(owner_token)
+        except ValueError as exc:
+            raise AgentOperationError("invalid_owner_token", str(exc)) from exc
     root = Path(cwd).expanduser().resolve()
     if not root.is_dir():
         raise AgentOperationError("bad_cwd", f"cwd is not a directory: {root}")
     require_harness_quota(harness, model, purpose)
     if harness == "agy":
         require_antigravity_preflight(root)
+    owner_launch = RuntimeLaunchContract.create(
+        cwd=str(root), harness=harness, model=model, backend=backend, mode=mode,
+        harness_args=harness_args,
+        permission_mode="bypass" if bypass_permissions else "native",
+        runtime_home=BASE,
+    )
+    if expected_owner_launch is not None:
+        _validate_owner_launch_contract(expected_owner_launch)
+        if expected_owner_launch != owner_launch:
+            raise AgentOperationError(
+                "owner_launch_mismatch",
+                "owner launch contract disagrees with the requested launch specification",
+            )
 
     notes = gc()
     with registry_lock() as agents:
@@ -3297,7 +4189,8 @@ def bring_up_agent(
             mode=mode,
             codex_bypass_permissions=bypass_permissions,
             harness_args=tuple(harness_args),
-            owner_token=owner_token,
+            control=control,
+            owner_launch=owner_launch,
         )
 
     ensure_agent_dirs(valid_name)
@@ -3305,7 +4198,16 @@ def bring_up_agent(
         if mode == TUI_MODE:
             target, pane_id, probe = _launch_herdr_tui(valid_name, str(root), model, bypass_permissions=bypass_permissions)
         else:
-            target = launch_window(backend, valid_name, str(root), runner_wrapper(valid_name))
+            target = launch_window(
+                backend,
+                valid_name,
+                str(root),
+                runner_wrapper(
+                    valid_name,
+                    control_generation=control.generation,
+                    launch_fingerprint=owner_launch.fingerprint(),
+                ),
+            )
             pane_id = None
             probe = None
     except Exception as exc:
@@ -3634,6 +4536,7 @@ def _submit_tui_text(
         raise AgentOperationError("tui_delivery_failed", str(exc)) from exc
 
 
+@owner_mutation
 def drain_tui_inbox(name: str, *, clear_composer: bool = False) -> TuiInboxResult:
     """Retry a TUI inbox after optionally clearing a stale human-visible draft."""
     rec = _require_live_agent(require_valid_name(name))
@@ -3647,6 +4550,7 @@ def drain_tui_inbox(name: str, *, clear_composer: bool = False) -> TuiInboxResul
     return tui_inbox_snapshot(rec.name)
 
 
+@owner_mutation
 def send_message_to_agent(name: str, text: str, *, model: Optional[str] = None) -> SendResult:
     """Queue a prompt for a live worker and attempt bounded delivery for an interactive TUI."""
     if text == "":
@@ -3678,6 +4582,7 @@ def send_message_to_agent(name: str, text: str, *, model: Optional[str] = None) 
     )
 
 
+@owner_mutation
 def reset_agent_context(name: str) -> ResetResult:
     """Clear one idle agent's harness session without disturbing its warm slot.
 
@@ -3825,6 +4730,17 @@ def read_agent_output(
             "unknown_agent",
             f"unknown agent {valid_name!r} and no archived transcript",
         )
+
+    def read_output_file(path: Path, label: str) -> str:
+        try:
+            return _read_bounded_private_text(
+                path, MAX_READ_OUTPUT_BYTES, label,
+            )
+        except FileNotFoundError as exc:
+            raise AgentOperationError(
+                "output_unavailable", f"{label} disappeared while being read",
+            ) from exc
+
     if mode == "last":
         p = last_message_path(valid_name)
         if not p.exists():
@@ -3832,7 +4748,10 @@ def read_agent_output(
                 "no_completed_turn",
                 f"no completed turn yet for {valid_name!r} (no last-message.txt)",
             )
-        return ReadResult(name=valid_name, mode=mode, text=p.read_text())
+        return ReadResult(
+            name=valid_name, mode=mode,
+            text=read_output_file(p, "last completed message"),
+        )
     if mode == "since_turn":
         if since_turn is None:
             raise AgentOperationError("bad_read_mode", "since_turn mode requires since_turn")
@@ -3840,7 +4759,7 @@ def read_agent_output(
         if not p.exists():
             raise AgentOperationError("no_transcript", f"no transcript yet for {valid_name!r}")
         marker = f"===TURN {since_turn} START"
-        lines = p.read_text().splitlines()
+        lines = read_output_file(p, "agent transcript").splitlines()
         for i, line in enumerate(lines):
             if line.startswith(marker):
                 return ReadResult(name=valid_name, mode=mode, text="\n".join(lines[i:]) + "\n")
@@ -3856,7 +4775,7 @@ def read_agent_output(
         p = transcript_path(valid_name)
         if not p.exists():
             raise AgentOperationError("no_transcript", f"no transcript yet for {valid_name!r}")
-        lines = p.read_text().splitlines()
+        lines = read_output_file(p, "agent transcript").splitlines()
         selected = [] if tail == 0 else lines[-tail:]
         return ReadResult(name=valid_name, mode=mode, text="\n".join(selected) + "\n")
     if mode != "all":
@@ -3867,12 +4786,17 @@ def read_agent_output(
     p = transcript_path(valid_name)
     if not p.exists():
         raise AgentOperationError("no_transcript", f"no transcript yet for {valid_name!r}")
-    return ReadResult(name=valid_name, mode=mode, text=p.read_text())
+    return ReadResult(
+        name=valid_name, mode=mode,
+        text=read_output_file(p, "agent transcript"),
+    )
 
 
+@owner_mutation
 def bring_down_agent(
     name: str, *, grace: float = 10.0, archive: bool = True, force: bool = False,
     expected_owner_token: str | None = None,
+    expected_launch_fingerprint: str | None = None,
     deterministic_archive: Path | None = None,
 ) -> DownResult:
     """Retire an agent, optionally without probing an unavailable backend.
@@ -3899,6 +4823,14 @@ def bring_down_agent(
         raise AgentOperationError(
             "owner_token_mismatch",
             f"runtime {valid_name!r} does not belong to the requested session generation",
+        )
+    if expected_launch_fingerprint is not None and (
+        rec is None or rec.owner_launch is None
+        or rec.owner_launch.fingerprint() != expected_launch_fingerprint
+    ):
+        raise AgentOperationError(
+            "owner_launch_mismatch",
+            f"runtime {valid_name!r} does not belong to the requested immutable launch",
         )
     if rec is not None:
         if rec.mode == HEADLESS_MODE and (
@@ -3949,6 +4881,12 @@ def bring_down_agent(
             "schema": STOP_RECEIPT_SCHEMA,
             "name": valid_name,
             "owner_token": expected_owner_token,
+            "owner_launch_fingerprint": (
+                expected_launch_fingerprint
+                or (rec.owner_launch.fingerprint()
+                    if rec.owner_launch is not None else None)
+                or rec.launch_fingerprint()
+            ),
             "killed_window": killed_window,
             "forced": False,
             "unverified_presentation": None,
@@ -4000,7 +4938,16 @@ def _restore_legacy_tmux_runner(name: str, old: AgentRecord) -> RunnerIdentity:
         )
     if window_exists(old):
         kill_window(old)
-    target = launch_window("tmux", name, old.cwd, runner_wrapper(name))
+    target = launch_window(
+        "tmux", name, old.cwd,
+        runner_wrapper(
+            name,
+            control_generation=old.control_generation,
+            launch_fingerprint=(
+                None if old.owner_launch is None else old.owner_launch.fingerprint()
+            ),
+        ),
+    )
     restored = wait_for_restarted_runner(
         name, recorded_runner_identity(old, "restore legacy runner")
     )
@@ -4074,7 +5021,17 @@ def _migrate_legacy_tmux_source(name: str, old: AgentRecord, to_backend: str) ->
     staged_identity: Optional[RunnerIdentity] = None
     try:
         new_target = launch_window(
-            to_backend, name, old.cwd, runner_wrapper(name, stage_token=token)
+            to_backend,
+            name,
+            old.cwd,
+            runner_wrapper(
+                name,
+                control_generation=old.control_generation,
+                launch_fingerprint=(
+                    None if old.owner_launch is None else old.owner_launch.fingerprint()
+                ),
+                stage_token=token,
+            ),
         )
         staged_identity = wait_for_staged_runner(name, token)
         if staged_identity is None:
@@ -4109,7 +5066,10 @@ def _migrate_legacy_tmux_source(name: str, old: AgentRecord, to_backend: str) ->
             current.runner_identity = staged_identity
             staged_runner_activate_path(name, token).write_text(now_iso() + "\n")
             session_id = current.session_id
-        if not wait_for_staged_runner_activation(name, token):
+        if not wait_for_staged_runner_activation(
+            name, token, staged_identity, old.control_generation,
+            None if old.owner_launch is None else old.owner_launch.fingerprint(),
+        ):
             raise AgentOperationError(
                 "migration_activation_unconfirmed",
                 "staged destination did not acknowledge activation before marker cleanup",
@@ -4252,7 +5212,18 @@ def _restore_headless_runner(name: str, old: AgentRecord) -> RunnerIdentity:
     """Restore a stopped source runner using its durable registry session id."""
     if window_exists(old):
         kill_window(old)
-    target = launch_window(old.backend, name, old.cwd, runner_wrapper(name))
+    target = launch_window(
+        old.backend,
+        name,
+        old.cwd,
+        runner_wrapper(
+            name,
+            control_generation=old.control_generation,
+            launch_fingerprint=(
+                None if old.owner_launch is None else old.owner_launch.fingerprint()
+            ),
+        ),
+    )
     restored = wait_for_restarted_runner(
         name, recorded_runner_identity(old, "restore headless runner")
     )
@@ -4494,6 +5465,7 @@ def _convert_legacy_tmux_headless_to_tui(name: str, old: AgentRecord) -> Migrati
     return _tui_conversion_result(old, committed)
 
 
+@owner_mutation
 def migrate_agent(
     name: str, *, to_backend: str = "herdr", to_mode: Optional[str] = None
 ) -> MigrationResult:
@@ -4565,7 +5537,17 @@ def migrate_agent(
     staged_identity: Optional[RunnerIdentity] = None
     try:
         new_target = launch_window(
-            to_backend, valid_name, rec.cwd, runner_wrapper(valid_name, stage_token=token)
+            to_backend,
+            valid_name,
+            rec.cwd,
+            runner_wrapper(
+                valid_name,
+                control_generation=rec.control_generation,
+                launch_fingerprint=(
+                    None if rec.owner_launch is None else rec.owner_launch.fingerprint()
+                ),
+                stage_token=token,
+            ),
         )
         staged_identity = wait_for_staged_runner(valid_name, token)
         if staged_identity is None:
@@ -4614,7 +5596,10 @@ def migrate_agent(
             current.runner_identity = staged_identity
             staged_runner_activate_path(valid_name, token).write_text(now_iso() + "\n")
             session_id = current.session_id
-        if not wait_for_staged_runner_activation(valid_name, token):
+        if not wait_for_staged_runner_activation(
+            valid_name, token, staged_identity, rec.control_generation,
+            None if rec.owner_launch is None else rec.owner_launch.fingerprint(),
+        ):
             raise AgentOperationError(
                 "migration_activation_unconfirmed",
                 "staged destination did not acknowledge activation before marker cleanup",
@@ -4678,6 +5663,7 @@ def migrate_agent(
     )
 
 
+@owner_mutation
 def recreate_window(name: str) -> RecreateWindowResult:
     """Restore a worker presentation while retaining the conversation and queued prompts."""
     valid_name = require_valid_name(name)

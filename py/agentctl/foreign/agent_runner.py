@@ -76,17 +76,56 @@ class _AgyOutcome:
     message_if_empty: str = ""
 
 
+@dataclass(frozen=True)
+class _RunnerAuthority:
+    """Exact runtime generation this long-lived runner may mutate."""
+
+    control_generation: str | None
+    launch_fingerprint: str | None
+
+    @classmethod
+    def from_record(cls, record: lib.AgentRecord) -> "_RunnerAuthority":
+        return cls(
+            control_generation=record.control_generation,
+            launch_fingerprint=(
+                None if record.owner_launch is None
+                else record.owner_launch.fingerprint()
+            ),
+        )
+
+    def verify(self, record: lib.AgentRecord) -> None:
+        lib.require_runner_generation(
+            record, self.control_generation, self.launch_fingerprint,
+        )
+
+    def load(self, name: str) -> lib.AgentRecord:
+        return lib.verify_runner_generation(
+            name, self.control_generation, self.launch_fingerprint,
+        )
+
+
+@dataclass(frozen=True)
+class _HarnessOwnership:
+    """Boot-bound runner and harness identities published before execution."""
+
+    runner: lib.RunnerIdentity
+    harness: lib.RunnerIdentity
+
+
 def _handle_sigterm(_signum: int, _frame: Optional[FrameType]) -> None:
     global _STOP_REQUESTED
     _STOP_REQUESTED = True
 
 
 @contextlib.contextmanager
-def _owned_harness(name: str, proc: subprocess.Popen[str]) -> Iterator[threading.Event]:
+def _owned_harness(
+    name: str,
+    proc: subprocess.Popen[str],
+    authority: _RunnerAuthority,
+    ownership: _HarnessOwnership,
+) -> Iterator[threading.Event]:
     """Keep process ownership visible while a watchdog handles stop and timeout."""
     timed_out, finished = threading.Event(), threading.Event()
-    path = lib.agent_dir(name) / "active-harness.json"
-
     def kill_group() -> None:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -117,22 +156,42 @@ def _owned_harness(name: str, proc: subprocess.Popen[str]) -> Iterator[threading
     finally:
         finished.set()
         watcher.join(timeout=1)
-        path.unlink(missing_ok=True)
-        lib._sync_directory(path.parent)
+        lib.clear_active_harness(
+            name,
+            authority.control_generation,
+            authority.launch_fingerprint,
+            ownership.runner,
+            ownership.harness,
+        )
 
 
-def _spawn_harness(name: str, argv: list[str], cwd: str, *, stdin: bool = False) -> subprocess.Popen[str]:
+def _spawn_harness(
+    name: str,
+    argv: list[str],
+    cwd: str,
+    authority: _RunnerAuthority,
+    *,
+    stdin: bool = False,
+) -> tuple[subprocess.Popen[str], _HarnessOwnership]:
     with lib._harness_lock(name):
         if _STOP_REQUESTED or lib.stop_path(name).exists():
             raise InterruptedError("worker was stopped before harness launch")
+        authority.load(name)
         proc = subprocess.Popen(argv, cwd=cwd,
                                 stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True)
         try:
+            ownership = _HarnessOwnership(
+                runner=lib.capture_process_identity(os.getpid()),
+                harness=lib.capture_process_identity(proc.pid),
+            )
             lib.record_active_harness(name,
-                lib.capture_process_identity(os.getpid()),
-                lib.capture_process_identity(proc.pid))
+                ownership.runner,
+                ownership.harness,
+                authority.control_generation,
+                authority.launch_fingerprint,
+            )
         except BaseException:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -140,7 +199,7 @@ def _spawn_harness(name: str, argv: list[str], cwd: str, *, stdin: bool = False)
                 pass
             proc.wait()
             raise
-    return proc
+    return proc, ownership
 
 
 def _append(name: str, text: str) -> None:
@@ -154,11 +213,18 @@ def _exit_reason(name: str, reason: str) -> None:
     print(f"[subagents] runner clean exit: {reason}", file=sys.stderr, flush=True)
 
 
-def _set_status(name: str, status: str, *, mark_turn: bool = False) -> None:
+def _set_status(
+    name: str,
+    status: str,
+    authority: _RunnerAuthority,
+    *,
+    mark_turn: bool = False,
+) -> None:
     with lib.registry_lock() as agents:
         rec = agents.get(name)
         if rec is None:
             return
+        authority.verify(rec)
         rec.status = status
         if mark_turn:
             rec.last_turn_at = lib.now_iso()
@@ -193,23 +259,34 @@ def _pane_echo(stripped: str) -> None:
         print(f"[session {ev.get('thread_id', '?')}]", flush=True)
 
 
-def _record_session_id(name: str, session_id: str) -> None:
+def _record_session_id(
+    name: str, session_id: str, authority: _RunnerAuthority,
+) -> None:
     with lib.registry_lock() as agents:
         rec = agents.get(name)
-        if rec is not None and not rec.session_id:
+        if rec is None:
+            return
+        authority.verify(rec)
+        if not rec.session_id:
             rec.session_id = session_id
 
 
-def _record_runner_pid(name: str, stage_token: Optional[str] = None) -> None:
+def _record_runner_pid(
+    name: str,
+    authority: _RunnerAuthority,
+    stage_token: Optional[str] = None,
+) -> None:
     pid = os.getpid()
     identity = lib.capture_process_identity(pid)
     if stage_token is not None:
+        authority.load(name)
         lib.write_staged_runner(name, stage_token, identity)
         return
     with lib.registry_lock() as agents:
         rec = agents.get(name)
         if rec is None:
             lib.die(f"runner started for unknown agent {name!r} (no registry row)")
+        authority.verify(rec)
         rec.runner_pid = pid
         rec.runner_started_at = str(identity.starttime_ticks)
         rec.runner_identity = identity
@@ -421,7 +498,10 @@ def _timeout_text(value: object) -> str:
     return ""
 
 
-def _run_codex_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
+def _run_codex_turn(
+    name: str, rec: lib.AgentRecord, msg: lib.Message,
+    authority: _RunnerAuthority,
+) -> None:
     resume = bool(rec.session_id)
     argv = _build_codex_argv(rec, msg)
     model_note = msg.model or rec.model or "<codex-default>"
@@ -430,7 +510,7 @@ def _run_codex_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
     answer_path.unlink(missing_ok=True)
     lib.last_message_path(name).write_text("")
 
-    _set_status(name, "busy")
+    _set_status(name, "busy", authority)
     lib.write_event("turn_started", name, seq=msg.seq, preview=lib.last_message_preview(name))
     _append(
         name,
@@ -438,7 +518,9 @@ def _run_codex_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
         f"model={model_note}===\n>>> {msg.text}",
     )
 
-    proc = _spawn_harness(name, argv, rec.cwd, stdin=True)
+    proc, ownership = _spawn_harness(
+        name, argv, rec.cwd, authority, stdin=True,
+    )
     assert proc.stdin is not None and proc.stdout is not None
 
     captured_session: Optional[str] = None
@@ -451,7 +533,7 @@ def _run_codex_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
             if len(stderr_chunks) > 4:
                 del stderr_chunks[0]
 
-    with _owned_harness(name, proc) as timed_out:
+    with _owned_harness(name, proc, authority, ownership) as timed_out:
         stderr_reader = threading.Thread(target=drain_stderr, daemon=True)
         stderr_reader.start()
         try:
@@ -490,7 +572,7 @@ def _run_codex_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
     stderr_tail = "".join(stderr_chunks).strip()
 
     if captured_session and not resume:
-        _record_session_id(name, captured_session)
+        _record_session_id(name, captured_session, authority)
 
     last_msg = ""
     lm_path = lib.last_message_path(name)
@@ -509,10 +591,15 @@ def _run_codex_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
     _append(name, f"===TURN-DONE {msg.seq} rc={rc_label} {lib.now_iso()}===")
     lib.write_event("TURN-DONE", name, seq=msg.seq, rc=rc_label, preview=lib.last_message_preview(name))
 
-    _set_status(name, "idle" if rc == 0 else "error", mark_turn=True)
+    _set_status(
+        name, "idle" if rc == 0 else "error", authority, mark_turn=True,
+    )
 
 
-def _run_agy_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
+def _run_agy_turn(
+    name: str, rec: lib.AgentRecord, msg: lib.Message,
+    authority: _RunnerAuthority,
+) -> None:
     resume = bool(rec.session_id)
     turn_log = _agy_turn_log_path(name, msg.seq)
     argv = _build_agy_argv(rec, msg, turn_log)
@@ -520,7 +607,7 @@ def _run_agy_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
     model_note = requested_model or "<agy-default>"
     mode = "resume" if resume else "exec"
 
-    _set_status(name, "busy")
+    _set_status(name, "busy", authority)
     lib.write_event("turn_started", name, seq=msg.seq, preview=lib.last_message_preview(name))
     _append(
         name,
@@ -528,8 +615,8 @@ def _run_agy_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
         f"harness=agy model={model_note} log={turn_log}===\n>>> {msg.text}",
     )
 
-    proc = _spawn_harness(name, argv, rec.cwd)
-    with _owned_harness(name, proc) as timed_out:
+    proc, ownership = _spawn_harness(name, argv, rec.cwd, authority)
+    with _owned_harness(name, proc, authority, ownership) as timed_out:
         stdout_text, stderr_text = proc.communicate()
     rc = proc.returncode
 
@@ -540,7 +627,7 @@ def _run_agy_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
         if captured_session is None:
             nosession = True
         else:
-            _record_session_id(name, captured_session)
+            _record_session_id(name, captured_session, authority)
 
     raw_rc_label = "timeout" if timed_out.is_set() else str(rc)
     if nosession:
@@ -579,21 +666,24 @@ def _run_agy_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
         preview=lib.last_message_preview(name),
     )
 
-    _set_status(name, outcome.status, mark_turn=True)
+    _set_status(name, outcome.status, authority, mark_turn=True)
 
 
-def _run_muse_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
+def _run_muse_turn(
+    name: str, rec: lib.AgentRecord, msg: lib.Message,
+    authority: _RunnerAuthority,
+) -> None:
     """Run and validate one bounded Muse JSONL turn with a stable session id."""
     argv = _build_muse_argv(rec, msg)
     requested_model = msg.model or rec.model or "<muse-default>"
-    _set_status(name, "busy")
+    _set_status(name, "busy", authority)
     lib.write_event("turn_started", name, seq=msg.seq, preview=lib.last_message_preview(name))
     _append(
         name,
         f"===TURN {msg.seq} START {lib.now_iso()} mode=exec harness=muse "
         f"model={requested_model} session={rec.session_id}===\n>>> {msg.text}",
     )
-    proc = _spawn_harness(name, argv, rec.cwd)
+    proc, ownership = _spawn_harness(name, argv, rec.cwd, authority)
     assert proc.stdout is not None
     stderr_chunks: list[str] = []
 
@@ -617,7 +707,7 @@ def _run_muse_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
     saw_workspace_epilogue = False
     answer = ""
     protocol_error: str | None = None
-    with _owned_harness(name, proc) as timed_out:
+    with _owned_harness(name, proc, authority, ownership) as timed_out:
         stderr_reader = threading.Thread(target=drain_stderr, daemon=True)
         stderr_reader.start()
         with lib.transcript_path(name).open("a") as transcript:
@@ -759,20 +849,22 @@ def _run_muse_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
     _append(name, f"===TURN-DONE {msg.seq} rc={outcome} {lib.now_iso()}===")
     lib.write_event("TURN-DONE", name, seq=msg.seq, rc=outcome,
                     preview=lib.last_message_preview(name))
-    _set_status(name, "idle" if outcome == "0" else "error", mark_turn=True)
+    _set_status(
+        name, "idle" if outcome == "0" else "error", authority,
+        mark_turn=True,
+    )
 
 
-def _run_turn(name: str, msg: lib.Message) -> None:
-    with lib.registry_lock() as agents:
-        rec = agents.get(name)
-        if rec is None:
-            lib.die(f"agent {name!r} vanished from registry mid-run")
+def _run_turn(
+    name: str, msg: lib.Message, authority: _RunnerAuthority,
+) -> None:
+    rec = authority.load(name)
     if rec.harness == "codex":
-        _run_codex_turn(name, rec, msg)
+        _run_codex_turn(name, rec, msg, authority)
     elif rec.harness == "agy":
-        _run_agy_turn(name, rec, msg)
+        _run_agy_turn(name, rec, msg, authority)
     elif rec.harness == "muse":
-        _run_muse_turn(name, rec, msg)
+        _run_muse_turn(name, rec, msg, authority)
     else:
         _append(
             name,
@@ -780,7 +872,7 @@ def _run_turn(name: str, msg: lib.Message) -> None:
             f"harness={rec.harness}===\n>>> {msg.text}",
         )
         _append(name, f"===TURN-DONE {msg.seq} rc=unsupported_harness {lib.now_iso()}===")
-        _set_status(name, "error", mark_turn=True)
+        _set_status(name, "error", authority, mark_turn=True)
 
 
 @contextlib.contextmanager
@@ -794,7 +886,13 @@ def _intake_lock(name: str) -> Iterator[None]:
         os.close(fd)
 
 
-def _quarantine(name: str, path: Path, reason: str) -> None:
+def _quarantine(
+    name: str,
+    path: Path,
+    reason: str,
+    authority: _RunnerAuthority,
+) -> None:
+    authority.load(name)
     destination = lib.failed_dir(name) / path.name
     if destination.exists():
         destination = destination.with_name(f"{path.stem}-{time.time_ns()}.json")
@@ -804,25 +902,38 @@ def _quarantine(name: str, path: Path, reason: str) -> None:
     os.replace(path, destination)
     lib._sync_directory(destination.parent)
     lib._sync_directory(path.parent)
-    _set_status(name, "error")
+    _set_status(name, "error", authority)
     lib.write_event("turn_quarantined", name, rc="possibly_submitted", preview=reason)
 
 
-def _recover_inflight(name: str) -> None:
+def _recover_inflight(name: str, authority: _RunnerAuthority) -> None:
     for path in sorted(lib.inflight_dir(name).glob("*.json")):
-        _quarantine(name, path, "runner exited after claiming this turn; inspect its transcript before retrying")
+        _quarantine(
+            name, path,
+            "runner exited after claiming this turn; inspect its transcript before retrying",
+            authority,
+        )
 
 
-def _consume(name: str, rec: lib.AgentRecord, msg_path: Path) -> None:
+def _consume(
+    name: str,
+    rec: lib.AgentRecord,
+    msg_path: Path,
+    authority: _RunnerAuthority,
+) -> None:
     with _intake_lock(name):
-        _recover_inflight(name)
+        rec = authority.load(name)
+        _recover_inflight(name, authority)
         if not msg_path.exists():
             return
         if lib.automation_is_paused(rec) or lib.migration_pause_path(name).exists():
             return
         destination = lib.processed_dir(name) / msg_path.name
         if destination.exists():
-            _quarantine(name, msg_path, "this turn sequence already has a completed request")
+            _quarantine(
+                name, msg_path,
+                "this turn sequence already has a completed request", authority,
+            )
             return
         claimed = lib.inflight_dir(name) / msg_path.name
         with msg_path.open("rb") as stream:
@@ -833,9 +944,11 @@ def _consume(name: str, rec: lib.AgentRecord, msg_path: Path) -> None:
         try:
             msg = lib.Message.from_path(claimed)
         except (OSError, ValueError, TypeError, KeyError) as exc:
-            _quarantine(name, claimed, f"invalid turn request: {exc}")
+            _quarantine(
+                name, claimed, f"invalid turn request: {exc}", authority,
+            )
             return
-        _run_turn(name, msg)
+        _run_turn(name, msg, authority)
         for output in (lib.transcript_path(name), lib.last_message_path(name)):
             if output.exists():
                 with output.open("rb") as stream:
@@ -847,30 +960,45 @@ def _consume(name: str, rec: lib.AgentRecord, msg_path: Path) -> None:
 
 def main() -> int:
     """Run ordered queued turns until a stop marker or termination signal arrives."""
-    if len(sys.argv) != 2:
-        lib.die("usage: agent_runner.py <name>")
+    if len(sys.argv) not in (2, 4):
+        lib.die("usage: agent_runner.py <name> [control-generation launch-fingerprint]")
     name = sys.argv[1]
+    if len(sys.argv) == 4:
+        control_generation = sys.argv[2]
+        launch_fingerprint = sys.argv[3]
+        if (
+            re.fullmatch(r"[a-z0-9-]{1,80}", control_generation) is None
+            or re.fullmatch(r"[0-9a-f]{64}", launch_fingerprint) is None
+        ):
+            lib.die("runner control generation or launch fingerprint is invalid")
+        authority = _RunnerAuthority(control_generation, launch_fingerprint)
+    else:
+        authority = _RunnerAuthority(None, None)
     stage_token = os.environ.get("SUBAGENTS_MIGRATION_STAGE")
     signal.signal(signal.SIGTERM, _handle_sigterm)
+    rec = authority.load(name)
     lib.ensure_agent_dirs(name)
     if stage_token is None:
-        old = lib.read_registry().get(name)
-        if old is not None and old.runner_pid is not None:
-            if (lib.runner_liveness(old) is not lib.ProcessLiveness.DEAD
-                    and old.runner_pid != os.getpid()):
+        if rec.runner_pid is not None:
+            if (lib.runner_liveness(rec) is not lib.ProcessLiveness.DEAD
+                    and rec.runner_pid != os.getpid()):
                 lib.die(f"worker {name!r} already has a live or unverified runner")
-            lib.terminate_active_harness(old)
-    _record_runner_pid(name, stage_token)
-    rec = lib.read_registry().get(name)
-    if rec is None:
-        lib.die(f"worker {name!r} disappeared while publishing its runner identity")
+            lib.terminate_active_harness(rec)
+    _record_runner_pid(name, authority, stage_token)
+    rec = authority.load(name)
     if stage_token is not None:
         while not _STOP_REQUESTED:
             if lib.stop_path(name).exists():
                 _exit_reason(name, "stop marker while awaiting staged activation")
                 return 0
             if lib.staged_runner_activate_path(name, stage_token).exists():
-                lib.acknowledge_staged_runner_activation(name, stage_token)
+                lib.acknowledge_staged_runner_activation(
+                    name,
+                    stage_token,
+                    lib.capture_process_identity(os.getpid()),
+                    authority.control_generation,
+                    authority.launch_fingerprint,
+                )
                 stage_token = None
                 break
             if not lib.staged_runner_path(name, stage_token).exists():
@@ -879,16 +1007,10 @@ def main() -> int:
             time.sleep(0.05)
     _append(name, f"===RUNNER UP {name} pid={os.getpid()} {lib.now_iso()}===")
     with _intake_lock(name):
-        _recover_inflight(name)
+        _recover_inflight(name, authority)
 
     while not _STOP_REQUESTED:
-        # A pre-token runtime may be adopted by the unified registry after it
-        # starts. Refresh only until that one-way generation binding appears.
-        if rec.owner_token is None:
-            current = lib.read_registry().get(name)
-            if current is None:
-                lib.die(f"worker {name!r} disappeared from the registry")
-            rec = current
+        rec = authority.load(name)
         if lib.stop_path(name).exists():
             break
         if stage_token is None and lib.migration_pause_path(name).exists():
@@ -904,7 +1026,7 @@ def main() -> int:
         if pending is None:
             time.sleep(0.5)
             continue
-        _consume(name, rec, pending)
+        _consume(name, rec, pending, authority)
 
     _append(name, f"===RUNNER DOWN {name} {lib.now_iso()}===")
     _exit_reason(name, "stop marker or SIGTERM after active runner loop")

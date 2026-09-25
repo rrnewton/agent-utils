@@ -283,7 +283,7 @@ def test_old_partial_allocation_is_recovered_only_for_the_original_unclaimed_she
 
 def test_stop_preserves_a_sibling_pane_added_during_output_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
-    manager.start("worker", cwd=str(tmp_path))
+    started = manager.start("worker", cwd=str(tmp_path))
     original_read = fake.read
     inserted = False
 
@@ -300,6 +300,7 @@ def test_stop_preserves_a_sibling_pane_added_during_output_capture(tmp_path: Pat
     result = manager.stop("worker")
     assert result["pane_closed"] is True and result["tab_closed"] is False
     assert fake.presentations == [Pane("w1:human", "w1:t1", "w1")]
+    assert manager.stop("worker", expected_token=str(started["token"])) == result
 
 
 def make_managed_dead(
@@ -331,6 +332,39 @@ def test_managed_dead_stop_requires_token_then_closes_exact_pane_and_archives(
     assert fake.presentations == []
     assert json.loads((archive / "agent.json").read_text())["lifecycle"] == "stopped"
     assert json.loads((archive / "output.json").read_text())["pane_id"] == pane
+    assert manager.stop("worker", expected_token=token) == result
+
+
+def test_terminal_receipt_outcome_must_match_the_record_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    _pane, token = make_managed_dead(manager, _fake, tmp_path)
+    stopped = manager.stop("worker", expected_token=token)
+    record_path = Path(str(stopped["archive"])) / "agent.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["terminal"]["outcome"] = "owned-pane-closed"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError, match="disagrees"):
+        manager.stop("worker", expected_token=token)
+
+
+def test_muse_terminal_outcome_mutation_cannot_change_retry_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    stopped = manager.stop("worker", expected_token=token)
+    assert stopped["managed_dead"] is True
+    assert stopped["runtime_preserved"] is True
+    record_path = Path(str(stopped["archive"])) / "agent.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["terminal"]["outcome"] = "custom-runtime-absent"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError, match="disagrees"):
+        manager.stop("worker", expected_token=token)
 
 
 def _make_owned_muse_dead(
@@ -342,6 +376,16 @@ def _make_owned_muse_dead(
     # Herdr may retain the last harness label after the process has exited.
     assert fake.infos[pane].agent == "muse"
     return pane, str(started["token"])
+
+
+def save_v3_stopped_prefix(manager: ManagedAgents, name: str) -> None:
+    """Write the exact stopped-without-terminal prefix emitted before schema v4."""
+    path = manager.registry / name / "agent.json"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored.pop("terminal") is None
+    stored["schema"] = "agentctl-session/v3"
+    stored["lifecycle"] = "stopped"
+    path.write_text(json.dumps(stored), encoding="utf-8")
 
 
 def test_owned_dead_muse_requires_token_and_archives_exact_stale_label_pane(
@@ -365,6 +409,7 @@ def test_owned_dead_muse_requires_token_and_archives_exact_stale_label_pane(
     stored = json.loads(record_path.read_text(encoding="utf-8"))
     goal = cast(dict[str, object], stored.pop("goal"))
     native = cast(dict[str, object] | None, stored.pop("native_session"))
+    stored.pop("terminal")
     stored.update({
         "schema": "agentctl-session/v2",
         "session_agent": None if native is None else native["agent"],
@@ -481,7 +526,7 @@ def test_owned_dead_muse_retries_stopped_before_archive_without_touching_pane(
         manager.stop("worker", expected_token=token)
     active = manager.registry / "worker"
     assert json.loads((active / "agent.json").read_text())["lifecycle"] == "stopped"
-    assert (active / "managed-dead-retirement.json").is_file()
+    assert (active / "terminal-retirement.json").is_file()
 
     if replace_terminal:
         fake.presentations[0] = replace(
@@ -524,11 +569,9 @@ def test_ordinary_muse_stop_retries_stopped_before_archive_without_retirement_re
     # This is the ordinary teardown prefix: its pane was already closed, then
     # lifecycle=stopped was committed, but archive rename did not happen.
     fake.presentations.clear()
-    record = manager.get("worker")
-    record.lifecycle = "stopped"
-    manager._save(record)
+    save_v3_stopped_prefix(manager, "worker")
     active = manager.registry / "worker"
-    assert not (active / "managed-dead-retirement.json").exists()
+    assert not (active / "terminal-retirement.json").exists()
 
     result = manager.stop("worker", expected_token=token)
 
@@ -536,6 +579,7 @@ def test_ordinary_muse_stop_retries_stopped_before_archive_without_retirement_re
     assert not active.exists()
     assert Path(str(result["archive"])).is_dir()
     assert fake.closed == []
+    assert manager.stop("worker", expected_token=token) == result
 
 
 @pytest.mark.parametrize("replacement_terminal", [False, True])
@@ -546,9 +590,7 @@ def test_stopped_muse_without_retirement_receipt_never_closes_surviving_pane(
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
-    record = manager.get("worker")
-    record.lifecycle = "stopped"
-    manager._save(record)
+    save_v3_stopped_prefix(manager, "worker")
     if replacement_terminal:
         fake.presentations[0] = replace(
             fake.presentations[0], terminal_id="replacement-terminal",
@@ -572,9 +614,7 @@ def test_ordinary_stopped_muse_never_closes_pane_created_after_absence_proof(
         fake.presentations[0], terminal_id="replacement-after-absence",
     )
     fake.presentations.clear()
-    record = manager.get("worker")
-    record.lifecycle = "stopped"
-    manager._save(record)
+    save_v3_stopped_prefix(manager, "worker")
     original_panes = fake.panes
     injected = False
 
@@ -596,7 +636,76 @@ def test_ordinary_stopped_muse_never_closes_pane_created_after_absence_proof(
     assert fake.closed == []
 
 
-@pytest.mark.parametrize("swap_after", ["agent.json", "managed-dead-retirement.json"])
+def test_ordinary_stopped_muse_requires_exact_explicit_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    fake.presentations.clear()
+    save_v3_stopped_prefix(manager, "worker")
+
+    with pytest.raises(AgentDeliveryError, match="requires --expected-token"):
+        manager.stop("worker")
+    with pytest.raises(AgentDeliveryError, match="was replaced"):
+        manager.stop("worker", expected_token="f" * len(token))
+
+    assert (manager.registry / "worker/agent.json").is_file()
+    assert not (manager.registry / "archive").exists()
+    assert fake.closed == []
+
+
+def test_archive_destination_rejects_untrusted_token_path_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    record.token = "../escape"
+
+    with pytest.raises(AgentDeliveryError, match="token has an invalid shape"):
+        manager._archive_destination(record)
+
+    assert not (manager.registry / "archive").exists()
+
+
+@pytest.mark.parametrize("mutation", ["directory", "record"])
+def test_ordinary_stopped_muse_publication_refuses_generation_mutation(
+    mutation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    fake.presentations.clear()
+    save_v3_stopped_prefix(manager, "worker")
+    active = manager.registry / "worker"
+    displaced = manager.registry / ".worker-displaced"
+    real_rename = subagents_module._rename_directory_noreplace_at
+
+    def mutate_then_publish(
+        source_parent: int, source_name: str,
+        destination_parent: int, destination_name: str,
+    ) -> None:
+        if mutation == "directory":
+            active.rename(displaced)
+            active.mkdir(mode=0o700)
+            (active / "agent.json").write_bytes((displaced / "agent.json").read_bytes())
+            (active / "agent.json").chmod(0o600)
+        else:
+            changed = json.loads((active / "agent.json").read_text())
+            changed["error"] = "replacement record"
+            agent._atomic_json(str(active / "agent.json"), changed)
+        real_rename(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(
+        subagents_module, "_rename_directory_noreplace_at", mutate_then_publish,
+    )
+    with pytest.raises(AgentDeliveryError, match="changed|published directory"):
+        manager.stop("worker", expected_token=token)
+
+    assert fake.closed == []
+    assert not (manager.registry / "archive" / f"worker-{token}").is_symlink()
+
+
+@pytest.mark.parametrize("swap_after", ["agent.json", "terminal-retirement.json"])
 def test_owned_dead_muse_archive_receipt_refuses_directory_replacement_between_reads(
     swap_after: str,
     tmp_path: Path,
@@ -608,7 +717,7 @@ def test_owned_dead_muse_archive_receipt_refuses_directory_replacement_between_r
     destination = Path(str(first["archive"]))
     saved = {
         name: (destination / name).read_bytes()
-        for name in ("agent.json", "managed-dead-retirement.json")
+        for name in ("agent.json", "terminal-retirement.json")
     }
     retained = list(fake.presentations)
     original = manager._pinned_artifact_bytes

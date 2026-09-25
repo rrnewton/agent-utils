@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 import stat
@@ -513,6 +514,51 @@ def test_busy_for_more_than_thirty_seconds_still_delivers_with_turn_sized_budget
     )
     assert clock["now"] > 30
     assert result.delivered == (result.message_id,)
+
+
+def test_busy_readiness_wait_holds_no_queue_or_target_lock(tmp_path: Path) -> None:
+    fake = FakeAgentHerdr(["working"])
+    sleeping = threading.Event()
+    release = threading.Event()
+    clock = {"now": 0.0}
+    outcome: list[str] = []
+
+    def sleep(_seconds: float) -> None:
+        sleeping.set()
+        assert release.wait(5)
+        clock["now"] = 2.0
+
+    def invoke() -> None:
+        try:
+            send(
+                client(fake), target(), str(tmp_path), "after current turn",
+                ready_timeout=1, sleep=sleep,
+                monotonic=lambda: clock["now"],
+            )
+        except AgentPending:
+            outcome.append("pending")
+
+    thread = threading.Thread(target=invoke, daemon=True)
+    thread.start()
+    assert sleeping.wait(5)
+
+    delivery = agent_api._open_private_lock(
+        str(tmp_path / ".delivery.lock"), "test delivery lock",
+    )
+    target_lock = agent_api._open_private_lock(
+        agent_api._target_lock_path("w1:p1"), "test target lock",
+    )
+    try:
+        fcntl.flock(delivery, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(target_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(target_lock)
+        os.close(delivery)
+        release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert outcome == ["pending"]
+    assert fake.runs == []
 
 
 def test_done_is_submit_safe(tmp_path: object) -> None:

@@ -20,6 +20,10 @@ class HerdrUnavailable(AgentCtlError):
     exit_code = EXIT_UNAVAILABLE
 
 
+class RuntimeIdentityMismatch(HerdrUnavailable):
+    """A live runtime observation proves it is not the recorded generation."""
+
+
 class AgentDeliveryError(AgentCtlError):
     """Input could not be delivered under the required identity and state."""
     exit_code = EXIT_BUSY

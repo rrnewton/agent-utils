@@ -1945,7 +1945,7 @@ impl HerdrClient {
         }
         let state = self.pane_process_state(pane_id, cancelled)?;
         if state.shell_pid != expected.pid {
-            return Err(AdapterError::unavailable(format!(
+            return Err(AdapterError::identity_mismatch(format!(
                 "recorded pane shell generation changed for pane {pane_id}"
             )));
         }
@@ -1955,7 +1955,7 @@ impl HerdrClient {
             ))
         })?;
         if observed.identity != *expected || observed.process_group_id != state.shell_pid {
-            return Err(AdapterError::unavailable(format!(
+            return Err(AdapterError::identity_mismatch(format!(
                 "recorded pane shell generation changed for pane {pane_id}"
             )));
         }

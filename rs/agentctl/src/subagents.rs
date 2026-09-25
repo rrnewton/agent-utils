@@ -29,6 +29,7 @@ use crate::client::{
     muse_verified_process_prompt_transcript_count, AgentPaneInfo, CustomLaunchObservation,
     CustomProcessIdentity, HerdrClient, Pane, PaneMove, PaneShellProof,
 };
+use crate::error::AdapterErrorKind;
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
@@ -37,13 +38,18 @@ const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_QUEUE_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const HEALTH_SCHEMA: &str = "agentctl-health/v1";
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-const SESSION_STORAGE_SCHEMA: &str = "agentctl-session/v3";
+const SESSION_STORAGE_SCHEMA: &str = "agentctl-session/v4";
+const LEGACY_SESSION_STORAGE_SCHEMA_V3: &str = "agentctl-session/v3";
 const LEGACY_SESSION_STORAGE_SCHEMA: &str = "agentctl-session/v2";
 const LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v2";
 const LEGACY_LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v1";
 const GOAL_STATE_SCHEMA: &str = "agentctl-goal/v1";
 const GOAL_TRANSACTION_SCHEMA: &str = "agentctl-goal-transaction/v1";
 const GOAL_TRANSACTION_FILE: &str = "goal-transaction.json";
+const TERMINAL_STATE_SCHEMA: &str = "agentctl-terminal-state/v1";
+const TERMINAL_RETIREMENT_SCHEMA: &str = "agentctl-terminal-retirement/v2";
+const LEGACY_TERMINAL_RETIREMENT_SCHEMA: &str = "agentctl-terminal-retirement/v1";
+const TERMINAL_RETIREMENT_FILE: &str = "terminal-retirement.json";
 const MANAGED_DEAD_RETIREMENT_SCHEMA: &str = "agentctl-managed-dead-retirement/v1";
 const MANAGED_DEAD_RETIREMENT_FILE: &str = "managed-dead-retirement.json";
 const NATIVE_SESSION_SCHEMA: &str = "agentctl-native-session/v1";
@@ -152,11 +158,11 @@ where
     let (after_write, after_rename) = hooks;
     if !matches!(
         name,
-        "agent.json" | "output.json" | MANAGED_DEAD_RETIREMENT_FILE
+        "agent.json" | "output.json" | TERMINAL_RETIREMENT_FILE
     ) {
         return Err(fail("unsupported pinned registry artifact name").into());
     }
-    let limit = if matches!(name, "agent.json" | MANAGED_DEAD_RETIREMENT_FILE) {
+    let limit = if name == "agent.json" {
         MAX_AGENT_RECORD_BYTES
     } else {
         MAX_SNAPSHOT_BYTES
@@ -481,6 +487,18 @@ fn name(value: &str) -> Result<&str> {
     Ok(value)
 }
 
+fn token(value: &str) -> Result<&str> {
+    if value.is_empty()
+        || value.len() > 80
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(fail("token has an invalid shape"));
+    }
+    Ok(value)
+}
+
 /// Harness arguments for Codex/Claude/Muse presets, leaving permission policy untouched.
 pub fn harness_arguments(
     harness: &str,
@@ -699,7 +717,7 @@ pub trait ManagedApi: AgentApi {
         if self.pane_shell_identity(pane)? == *expected {
             Ok(())
         } else {
-            Err(crate::error::AdapterError::unavailable(format!(
+            Err(crate::error::AdapterError::identity_mismatch(format!(
                 "recorded pane shell generation changed for pane {pane}"
             )))
         }
@@ -1160,6 +1178,52 @@ struct LaunchSpec {
     permission_mode: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalState {
+    schema: String,
+    outcome: String,
+    evidence: Value,
+}
+
+impl TerminalState {
+    fn new(outcome: &str, evidence: Value) -> Result<Self> {
+        let terminal = Self {
+            schema: TERMINAL_STATE_SCHEMA.to_owned(),
+            outcome: outcome.to_owned(),
+            evidence,
+        };
+        terminal.validate()?;
+        Ok(terminal)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema != TERMINAL_STATE_SCHEMA
+            || !matches!(
+                self.outcome.as_str(),
+                "managed-dead-preserved"
+                    | "managed-dead-closed"
+                    | "custom-runtime-absent"
+                    | "owned-pane-closed"
+                    | "owned-runtime-absent"
+                    | "foreign-unregistered"
+                    | "turn-runner-stopped"
+            )
+            || !self.evidence.is_object()
+        {
+            return Err(fail("unsupported terminal state"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TerminalRetirement {
+    terminal: TerminalState,
+    legacy_receipt: bool,
+    legacy_managed_dead_artifact: Option<InstalledArtifact>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct AgentRecord {
     name: String,
@@ -1184,6 +1248,7 @@ struct AgentRecord {
     custom_process_identity: Option<CustomProcessIdentity>,
     foreign_shell_identity: Option<CustomProcessIdentity>,
     runner_identity: Option<CustomProcessIdentity>,
+    terminal: Option<TerminalState>,
     legacy_runner_pid: Option<u64>,
     legacy_runner_started_at: Option<String>,
     legacy_goal_delivery: Option<String>,
@@ -1469,6 +1534,7 @@ impl AgentRecord {
         {
             return Err(fail("incomplete native session identity"));
         }
+        self.validate_terminal_state(true)?;
         self.validate_loaded(Path::new("<in-memory>"), &self.name)?;
         let launch = &self.launch;
         if self.runner_identity.is_none()
@@ -1512,6 +1578,7 @@ impl AgentRecord {
             "custom_process_identity": self.custom_process_identity,
             "foreign_shell_identity": self.foreign_shell_identity,
             "runner_identity": self.runner_identity,
+            "terminal": self.terminal,
             "extensions": self.extra,
         }))
     }
@@ -1521,11 +1588,35 @@ impl AgentRecord {
             .as_object()
             .cloned()
             .ok_or_else(|| fail(format!("invalid agent record: {}", path.display())))?;
-        let legacy_goal_pointer = match document.get("schema") {
+        let (legacy_goal_pointer, terminal, current_storage) = match document.get("schema") {
             Some(Value::String(schema))
-                if schema == SESSION_STORAGE_SCHEMA || schema == LEGACY_SESSION_STORAGE_SCHEMA =>
+                if schema == SESSION_STORAGE_SCHEMA
+                    || schema == LEGACY_SESSION_STORAGE_SCHEMA_V3
+                    || schema == LEGACY_SESSION_STORAGE_SCHEMA =>
             {
-                const CURRENT_FIELDS: [&str; 19] = [
+                const CURRENT_FIELDS: [&str; 20] = [
+                    "schema",
+                    "name",
+                    "token",
+                    "created_at",
+                    "lifecycle",
+                    "launch",
+                    "workspace_id",
+                    "tab_id",
+                    "pane_id",
+                    "native_session",
+                    "startup_warning",
+                    "effective_reasoning_effort",
+                    "error",
+                    "goal",
+                    "paused",
+                    "pane_reported_by_agentctl",
+                    "custom_process_identity",
+                    "foreign_shell_identity",
+                    "runner_identity",
+                    "terminal",
+                ];
+                const V3_FIELDS: [&str; 19] = [
                     "schema",
                     "name",
                     "token",
@@ -1574,8 +1665,11 @@ impl AgentRecord {
                     "runner_identity",
                 ];
                 let current = schema == SESSION_STORAGE_SCHEMA;
+                let modern = current || schema == LEGACY_SESSION_STORAGE_SCHEMA_V3;
                 let fields: &[&str] = if current {
                     &CURRENT_FIELDS
+                } else if modern {
+                    &V3_FIELDS
                 } else {
                     &LEGACY_FIELDS
                 };
@@ -1588,7 +1682,30 @@ impl AgentRecord {
                         path.display()
                     )));
                 }
-                if current {
+                let terminal = if current {
+                    let value = document.remove("terminal").expect("checked terminal field");
+                    if value.is_null() {
+                        None
+                    } else {
+                        let terminal: TerminalState =
+                            serde_json::from_value(value).map_err(|error| {
+                                fail(format!(
+                                    "invalid agent record terminal state {}: {error}",
+                                    path.display()
+                                ))
+                            })?;
+                        terminal.validate().map_err(|_| {
+                            fail(format!(
+                                "invalid agent record terminal state: {}",
+                                path.display()
+                            ))
+                        })?;
+                        Some(terminal)
+                    }
+                } else {
+                    None
+                };
+                if modern {
                     let goal = document
                         .get("goal")
                         .and_then(Value::as_object)
@@ -1779,6 +1896,7 @@ impl AgentRecord {
                                 | "launch_permission_mode"
                                 | "runner_pid"
                                 | "runner_started_at"
+                                | "terminal"
                         )
                     {
                         return Err(fail(format!(
@@ -1789,7 +1907,7 @@ impl AgentRecord {
                     }
                     document.insert(key, value);
                 }
-                if !current {
+                if !modern {
                     let observed = document
                         .get("session_value")
                         .cloned()
@@ -1822,7 +1940,7 @@ impl AgentRecord {
                     document.insert("goal_session_id".to_owned(), value);
                     document.insert("session_source".to_owned(), source);
                 }
-                !current
+                (!modern, terminal, current)
             }
             Some(Value::Number(schema)) if schema.as_u64() == Some(1) => {
                 if !document.contains_key("arguments") {
@@ -1873,7 +1991,7 @@ impl AgentRecord {
                 document.insert("session_value".to_owned(), value.clone());
                 document.insert("goal_session_id".to_owned(), value);
                 document.insert("session_source".to_owned(), source);
-                true
+                (true, None, false)
             }
             _ => {
                 return Err(fail(format!(
@@ -1935,11 +2053,12 @@ impl AgentRecord {
         }
         let legacy: LegacyAgentRecord = serde_json::from_value(Value::Object(document))
             .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
-        if legacy
-            .extra
-            .keys()
-            .any(|key| matches!(key.as_str(), "launch" | "native_session" | "extensions"))
-        {
+        if legacy.extra.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "launch" | "native_session" | "terminal" | "extensions"
+            )
+        }) {
             return Err(fail(format!(
                 "legacy agent record contains a reserved current-schema field: {}",
                 path.display()
@@ -1969,6 +2088,7 @@ impl AgentRecord {
             custom_process_identity: legacy.custom_process_identity,
             foreign_shell_identity: legacy.foreign_shell_identity,
             runner_identity: legacy.runner_identity,
+            terminal,
             legacy_runner_pid: None,
             legacy_runner_started_at: None,
             legacy_goal_delivery: legacy.goal_delivery,
@@ -1993,8 +2113,26 @@ impl AgentRecord {
             record.legacy_runner_started_at = legacy.runner_started_at;
         }
         record.validate_loaded(path, agent_name)?;
+        record.validate_terminal_state(current_storage)?;
         record.validate_runtime_shape(&record.launch)?;
         Ok(record)
+    }
+
+    fn validate_terminal_state(&self, require_current_terminal: bool) -> Result<()> {
+        if let Some(terminal) = &self.terminal {
+            terminal.validate()?;
+        }
+        if self.lifecycle != "stopped" && self.terminal.is_some() {
+            return Err(fail(
+                "active agent record must not contain a terminal state",
+            ));
+        }
+        if require_current_terminal && ((self.lifecycle == "stopped") != self.terminal.is_some()) {
+            return Err(fail(
+                "current agent record requires terminal state exactly when stopped",
+            ));
+        }
+        Ok(())
     }
 
     fn validate_runtime_shape(&self, launch: &LaunchSpec) -> Result<()> {
@@ -2507,11 +2645,12 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                                         )
                                     {
                                         let detail = error.to_string();
-                                        let state = if detail.contains("changed") {
-                                            AdoptedRuntimeState::IdentityMismatch
-                                        } else {
-                                            AdoptedRuntimeState::Unknown
-                                        };
+                                        let state =
+                                            if error.kind() == AdapterErrorKind::IdentityMismatch {
+                                                AdoptedRuntimeState::IdentityMismatch
+                                            } else {
+                                                AdoptedRuntimeState::Unknown
+                                            };
                                         observed(
                                             state,
                                             if state == AdoptedRuntimeState::IdentityMismatch {
@@ -4137,6 +4276,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_process_identity: None,
             foreign_shell_identity: None,
             runner_identity: None,
+            terminal: None,
             legacy_runner_pid: None,
             legacy_runner_started_at: None,
             legacy_goal_delivery: None,
@@ -4196,7 +4336,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "agent {agent_name:?} was replaced before start recovery"
             )));
         }
-        if record.lifecycle != "launch_failed"
+        if !matches!(record.lifecycle.as_str(), "starting" | "launch_failed")
             || record.launch.adapter != "herdr-pane"
             || record.launch.harness != "muse"
             || record.launch.mode != "interactive"
@@ -4210,7 +4350,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             || record.session_value.is_some()
         {
             return Err(fail(
-                "start recovery requires a launch_failed Muse interactive Herdr record with complete launch intent and pane ownership",
+                "start recovery requires a starting or launch_failed Muse interactive Herdr record with complete launch intent and pane ownership",
             ));
         }
         let pane_id = record.pane_id.clone().expect("checked pane identity");
@@ -4528,6 +4668,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_process_identity: None,
             foreign_shell_identity: Some(shell_identity.clone()),
             runner_identity: None,
+            terminal: None,
             legacy_runner_pid: None,
             legacy_runner_started_at: None,
             legacy_goal_delivery: None,
@@ -6535,6 +6676,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn archive_destination(&self, record: &AgentRecord) -> Result<(PathBuf, PathBuf)> {
+        name(&record.name)?;
+        token(&record.token)?;
         let archive = self.registry.join("archive");
         agent::create_private_directory(&archive, "agent archive", false, false)?;
         let destination = archive.join(format!("{}-{}", record.name, record.token));
@@ -6813,6 +6956,71 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .file
             .sync_all()
             .map_err(|error| fail(format!("cannot sync restored agent directory: {error}")))
+    }
+
+    fn pinned_artifact_identity(
+        pinned: &PinnedAgentDirectory,
+        name: &str,
+        expected_content: &[u8],
+        label: &str,
+    ) -> Result<InstalledArtifact> {
+        let file = Self::open_pinned_file(pinned, name, libc::O_RDONLY)?;
+        let before = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot inspect {label}: {error}")))?;
+        let uid = unsafe { libc::getuid() };
+        let mut content = vec![0_u8; expected_content.len().saturating_add(1)];
+        let length = file
+            .read_at(&mut content, 0)
+            .map_err(|error| fail(format!("cannot reread {label}: {error}")))?;
+        let after = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot reinspect {label}: {error}")))?;
+        if !before.is_file()
+            || before.uid() != uid
+            || before.permissions().mode() & 0o077 != 0
+            || before.nlink() != 1
+            || before.len() != expected_content.len() as u64
+            || length != expected_content.len()
+            || &content[..length] != expected_content
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.mode() != before.mode()
+            || after.uid() != before.uid()
+            || after.nlink() != before.nlink()
+            || after.len() != before.len()
+            || after.mtime() != before.mtime()
+            || after.mtime_nsec() != before.mtime_nsec()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
+        {
+            return Err(fail(format!(
+                "{label} changed while binding its generation"
+            )));
+        }
+        Ok(InstalledArtifact {
+            device: before.dev(),
+            inode: before.ino(),
+            size: before.len(),
+            digest: Sha256::digest(expected_content).into(),
+        })
+    }
+
+    fn unlink_pinned_file_generation(
+        pinned: &PinnedAgentDirectory,
+        name: &str,
+        expected: InstalledArtifact,
+        label: &str,
+    ) -> Result<()> {
+        let content =
+            Self::pinned_artifact_bytes(pinned, name, MAX_AGENT_RECORD_BYTES, label, true)?;
+        let current = Self::pinned_artifact_identity(pinned, name, &content, label)?;
+        if current != expected {
+            return Err(fail(format!(
+                "refusing to remove replaced {label}; replacement was preserved"
+            )));
+        }
+        Self::unlink_pinned_file(pinned, name)
     }
 
     fn restore_output_snapshot(
@@ -7181,7 +7389,30 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )
     }
 
-    fn managed_dead_retirement_value(record: &AgentRecord, record_bytes: &[u8]) -> Value {
+    fn terminal_retirement_value(record_bytes: &[u8]) -> Result<Value> {
+        Ok(json!({
+            "schema": TERMINAL_RETIREMENT_SCHEMA,
+            "record_sha256": format!("{:x}", Sha256::digest(record_bytes)),
+        }))
+    }
+
+    #[cfg(test)]
+    fn legacy_terminal_retirement_value(
+        record_bytes: &[u8],
+        outcome: &str,
+        evidence: Value,
+    ) -> Result<Value> {
+        let terminal = TerminalState::new(outcome, evidence)?;
+        Ok(json!({
+            "schema": LEGACY_TERMINAL_RETIREMENT_SCHEMA,
+            "record_sha256": format!("{:x}", Sha256::digest(record_bytes)),
+            "outcome": terminal.outcome,
+            "evidence": terminal.evidence,
+        }))
+    }
+
+    #[cfg(test)]
+    fn legacy_managed_dead_retirement_value(record: &AgentRecord, record_bytes: &[u8]) -> Value {
         json!({
             "schema": MANAGED_DEAD_RETIREMENT_SCHEMA,
             "name": record.name,
@@ -7192,79 +7423,390 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         })
     }
 
-    fn managed_dead_retirement_exists(&self, record: &AgentRecord) -> Result<bool> {
-        let pinned = self.pinned_agent_directory(&record.name)?;
-        let Some(file) =
-            Self::open_optional_pinned_file(&pinned, MANAGED_DEAD_RETIREMENT_FILE, libc::O_RDONLY)?
-        else {
-            Self::verify_pinned_agent_directory(&pinned)?;
+    fn retirement_artifact_exists(
+        pinned: &PinnedAgentDirectory,
+        artifact: &str,
+        purpose: &str,
+    ) -> Result<bool> {
+        let Some(file) = Self::open_optional_pinned_file(pinned, artifact, libc::O_RDONLY)? else {
             return Ok(false);
         };
-        let metadata = file.metadata().map_err(|error| {
-            fail(format!(
-                "cannot inspect managed-dead retirement receipt: {error}"
-            ))
-        })?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| fail(format!("cannot inspect {purpose}: {error}")))?;
         let uid = unsafe { libc::getuid() };
         if !metadata.is_file()
             || metadata.uid() != uid
             || metadata.permissions().mode() & 0o077 != 0
             || metadata.nlink() != 1
         {
-            return Err(fail("unsafe managed-dead retirement receipt"));
+            return Err(fail(format!("unsafe {purpose}")));
         }
-        Self::verify_pinned_agent_directory(&pinned)?;
         Ok(true)
     }
 
-    fn read_managed_dead_retirement(
+    fn terminal_retirement_exists(&self, record: &AgentRecord) -> Result<bool> {
+        let pinned = self.pinned_agent_directory(&record.name)?;
+        let present = Self::retirement_artifact_exists(
+            &pinned,
+            TERMINAL_RETIREMENT_FILE,
+            "terminal retirement receipt",
+        )? || Self::retirement_artifact_exists(
+            &pinned,
+            MANAGED_DEAD_RETIREMENT_FILE,
+            "legacy managed-dead retirement receipt",
+        )?;
+        Self::verify_pinned_agent_directory(&pinned)?;
+        Ok(present)
+    }
+
+    fn read_terminal_retirement(
         &self,
         pinned: &PinnedAgentDirectory,
         record: &AgentRecord,
         record_bytes: &[u8],
-    ) -> Result<Value> {
+    ) -> Result<Option<TerminalRetirement>> {
+        let has_terminal = Self::retirement_artifact_exists(
+            pinned,
+            TERMINAL_RETIREMENT_FILE,
+            "terminal retirement receipt",
+        )?;
+        let has_managed_dead = Self::retirement_artifact_exists(
+            pinned,
+            MANAGED_DEAD_RETIREMENT_FILE,
+            "legacy managed-dead retirement receipt",
+        )?;
+        if has_terminal && has_managed_dead {
+            return Err(fail("multiple terminal retirement receipts"));
+        }
+        if has_terminal {
+            let bytes = Self::pinned_artifact_bytes(
+                pinned,
+                TERMINAL_RETIREMENT_FILE,
+                MAX_SNAPSHOT_BYTES,
+                "terminal retirement receipt",
+                true,
+            )?;
+            let document = agent::decode_json_strict(&bytes).map_err(|error| {
+                fail(format!(
+                    "cannot decode terminal retirement receipt: {error}"
+                ))
+            })?;
+            let object = document
+                .as_object()
+                .ok_or_else(|| fail("terminal retirement receipt has invalid shape"))?;
+            let digest = format!("{:x}", Sha256::digest(record_bytes));
+            match object.get("schema").and_then(Value::as_str) {
+                Some(TERMINAL_RETIREMENT_SCHEMA) => {
+                    let exact_fields = ["schema", "record_sha256"];
+                    if object.len() != exact_fields.len()
+                        || !exact_fields.iter().all(|field| object.contains_key(*field))
+                        || object.get("record_sha256").and_then(Value::as_str)
+                            != Some(digest.as_str())
+                    {
+                        return Err(fail(
+                            "terminal retirement receipt disagrees with its stopped record",
+                        ));
+                    }
+                    let terminal = record.terminal.clone().ok_or_else(|| {
+                        fail("current terminal retirement receipt has no terminal record state")
+                    })?;
+                    terminal.validate()?;
+                    return Ok(Some(TerminalRetirement {
+                        terminal,
+                        legacy_receipt: false,
+                        legacy_managed_dead_artifact: None,
+                    }));
+                }
+                Some(LEGACY_TERMINAL_RETIREMENT_SCHEMA) => {
+                    let exact_fields = ["schema", "record_sha256", "outcome", "evidence"];
+                    let digest_matches = object.get("record_sha256").and_then(Value::as_str)
+                        == Some(digest.as_str());
+                    if object.len() != exact_fields.len()
+                        || !exact_fields.iter().all(|field| object.contains_key(*field))
+                    {
+                        return Err(fail(
+                            "legacy terminal retirement receipt disagrees with its stopped record",
+                        ));
+                    }
+                    let terminal = TerminalState::new(
+                        object
+                            .get("outcome")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                fail("legacy terminal retirement receipt has no outcome")
+                            })?,
+                        object.get("evidence").cloned().ok_or_else(|| {
+                            fail("legacy terminal retirement receipt has no evidence")
+                        })?,
+                    )?;
+                    if record
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|current| current != &terminal)
+                    {
+                        return Err(fail(
+                            "legacy terminal retirement outcome disagrees with canonical terminal state",
+                        ));
+                    }
+                    if !digest_matches && record.terminal.as_ref() != Some(&terminal) {
+                        return Err(fail(
+                            "legacy terminal retirement receipt disagrees with its stopped record",
+                        ));
+                    }
+                    return Ok(Some(TerminalRetirement {
+                        terminal,
+                        legacy_receipt: true,
+                        legacy_managed_dead_artifact: None,
+                    }));
+                }
+                _ => {
+                    return Err(fail(
+                        "terminal retirement receipt disagrees with its stopped record",
+                    ))
+                }
+            }
+        }
+        if !has_managed_dead {
+            return Ok(None);
+        }
         let bytes = Self::pinned_artifact_bytes(
             pinned,
             MANAGED_DEAD_RETIREMENT_FILE,
             MAX_AGENT_RECORD_BYTES,
-            "managed-dead retirement receipt",
+            "legacy managed-dead retirement receipt",
             true,
         )?;
         let document = agent::decode_json_strict(&bytes).map_err(|error| {
             fail(format!(
-                "cannot decode managed-dead retirement receipt: {error}"
+                "cannot decode legacy managed-dead retirement receipt: {error}"
             ))
         })?;
-        let expected = Self::managed_dead_retirement_value(record, record_bytes);
-        if document != expected {
+        let object = document
+            .as_object()
+            .ok_or_else(|| fail("legacy managed-dead retirement receipt has invalid shape"))?;
+        let exact_fields = [
+            "schema",
+            "name",
+            "token",
+            "record_sha256",
+            "pane_closed",
+            "runtime_preserved",
+        ];
+        let digest = format!("{:x}", Sha256::digest(record_bytes));
+        let digest_matches =
+            object.get("record_sha256").and_then(Value::as_str) == Some(digest.as_str());
+        if object.len() != exact_fields.len()
+            || !exact_fields.iter().all(|field| object.contains_key(*field))
+            || object.get("schema").and_then(Value::as_str) != Some(MANAGED_DEAD_RETIREMENT_SCHEMA)
+            || object.get("name").and_then(Value::as_str) != Some(record.name.as_str())
+            || object.get("token").and_then(Value::as_str) != Some(record.token.as_str())
+            || object.get("pane_closed") != Some(&Value::Bool(false))
+            || object.get("runtime_preserved") != Some(&Value::Bool(true))
+        {
             return Err(fail(
-                "managed-dead retirement receipt disagrees with its stopped record",
+                "legacy managed-dead retirement receipt disagrees with its stopped record",
             ));
         }
-        Ok(expected)
+        let terminal = TerminalState::new("managed-dead-preserved", json!({}))?;
+        if record
+            .terminal
+            .as_ref()
+            .is_some_and(|current| current != &terminal)
+        {
+            return Err(fail(
+                "legacy managed-dead retirement outcome disagrees with canonical terminal state",
+            ));
+        }
+        if !digest_matches && record.terminal.as_ref() != Some(&terminal) {
+            return Err(fail(
+                "legacy managed-dead retirement receipt disagrees with its stopped record",
+            ));
+        }
+        let artifact = Self::pinned_artifact_identity(
+            pinned,
+            MANAGED_DEAD_RETIREMENT_FILE,
+            &bytes,
+            "legacy managed-dead retirement receipt",
+        )?;
+        Ok(Some(TerminalRetirement {
+            terminal,
+            legacy_receipt: true,
+            legacy_managed_dead_artifact: Some(artifact),
+        }))
     }
 
-    fn managed_dead_result(name: &str, destination: &Path) -> Value {
-        json!({
-            "name": name,
-            "archive": destination,
-            "pane_closed": false,
-            "tab_closed": false,
-            "managed_dead": true,
-            "runtime_preserved": true,
-            "continuation": "The dead custom runtime was archived; its shell pane was preserved because Herdr does not provide a terminal-generation-conditional close.",
-        })
+    fn terminal_retirement_result(
+        &self,
+        record: &AgentRecord,
+        destination: &Path,
+    ) -> Result<Value> {
+        let terminal = record
+            .terminal
+            .as_ref()
+            .ok_or_else(|| fail("stopped agent record has no terminal state"))?;
+        terminal.validate()?;
+        let outcome = terminal.outcome.as_str();
+        let evidence = terminal
+            .evidence
+            .as_object()
+            .ok_or_else(|| fail("terminal state has invalid evidence"))?;
+        if outcome == "turn-runner-stopped" {
+            if record.launch.adapter != "turn-runner"
+                || evidence.len() != 1
+                || !evidence.get("killed_window").is_some_and(Value::is_boolean)
+            {
+                return Err(fail("terminal receipt has inconsistent runtime outcome"));
+            }
+            let expected_runtime_home = self.directory(&record.name)?.join("runtime");
+            let expected_inner_archive = destination
+                .join("runtime/state/_archive")
+                .join(format!("{}-{}", record.name, record.token));
+            if record.launch.runtime_home.as_deref() != expected_runtime_home.to_str() {
+                return Err(fail(
+                    "terminal receipt runtime archive is not the exact derived path",
+                ));
+            }
+            return Ok(json!({
+                "name": record.name,
+                "archive": destination,
+                "runtime": {
+                    "record": Value::Null,
+                    "result": {
+                        "name": record.name,
+                        "killed_window": evidence.get("killed_window").cloned().unwrap_or(Value::Bool(false)),
+                        "archived_to": expected_inner_archive,
+                        "state_path": Value::Null,
+                        "was_registered": true,
+                        "forced": false,
+                        "unverified_presentation": Value::Null,
+                    },
+                },
+            }));
+        }
+        if outcome == "foreign-unregistered" {
+            if record.launch.adapter != "herdr-foreign"
+                || record.launch.mode != "interactive"
+                || record.launch.backend != "herdr"
+                || record.launch.runtime_ownership != "foreign"
+                || !evidence.is_empty()
+            {
+                return Err(fail("terminal receipt has inconsistent foreign outcome"));
+            }
+            return Ok(json!({
+                "name": record.name,
+                "archive": destination,
+                "pane_closed": false,
+                "tab_closed": false,
+                "runtime_preserved": true,
+            }));
+        }
+        if matches!(
+            outcome,
+            "managed-dead-closed" | "owned-pane-closed" | "owned-runtime-absent"
+        ) {
+            let compatible_adapter = if outcome == "managed-dead-closed" {
+                record.launch.adapter == "herdr"
+            } else {
+                matches!(record.launch.adapter.as_str(), "herdr" | "herdr-pane")
+            };
+            if !compatible_adapter
+                || record.launch.mode != "interactive"
+                || record.launch.backend != "herdr"
+                || record.launch.runtime_ownership != "owned"
+            {
+                return Err(fail("terminal receipt has inconsistent owned outcome"));
+            }
+            if matches!(outcome, "managed-dead-closed" | "owned-pane-closed") {
+                if evidence.len() != 1
+                    || !evidence.contains_key("tab_closed")
+                    || evidence
+                        .get("tab_closed")
+                        .is_some_and(|value| !value.is_null() && !value.is_boolean())
+                {
+                    return Err(fail("terminal receipt has invalid pane-close evidence"));
+                }
+                let mut result = json!({
+                    "name": record.name,
+                    "archive": destination,
+                    "pane_closed": true,
+                    "tab_closed": evidence.get("tab_closed").cloned().unwrap_or(Value::Null),
+                });
+                if outcome == "managed-dead-closed" {
+                    result["managed_dead"] = Value::Bool(true);
+                    result["runtime_preserved"] = Value::Bool(false);
+                    result["continuation"] = Value::Null;
+                }
+                return Ok(result);
+            }
+            if !evidence.is_empty() {
+                return Err(fail("terminal receipt has invalid absent-runtime evidence"));
+            }
+            return Ok(json!({
+                "name": record.name,
+                "archive": destination,
+                "pane_closed": false,
+                "tab_closed": false,
+            }));
+        }
+        if record.launch.adapter != "herdr-pane"
+            || record.launch.harness != "muse"
+            || record.launch.mode != "interactive"
+            || record.launch.backend != "herdr"
+            || record.launch.runtime_ownership != "owned"
+            || record.custom_process_identity.is_none()
+            || record.workspace_id.is_none()
+            || record.tab_id.is_none()
+            || record.pane_id.is_none()
+            || !evidence.is_empty()
+        {
+            return Err(fail("terminal receipt has inconsistent custom outcome"));
+        }
+        match outcome {
+            "managed-dead-preserved" => Ok(json!({
+                "name": record.name,
+                "archive": destination,
+                "pane_closed": false,
+                "tab_closed": false,
+                "managed_dead": true,
+                "runtime_preserved": true,
+                "continuation": "The dead custom runtime was archived; its shell pane was preserved because Herdr does not provide a terminal-generation-conditional close.",
+            })),
+            "custom-runtime-absent" => Ok(json!({
+                "name": record.name,
+                "archive": destination,
+                "pane_closed": false,
+                "tab_closed": Value::Null,
+                "ordinary_stop_recovered": true,
+                "runtime_preserved": false,
+            })),
+            _ => Err(fail("terminal receipt has unsupported custom outcome")),
+        }
     }
 
-    fn managed_dead_archive_receipt(
+    fn install_terminal_retirement(pinned: &PinnedAgentDirectory, receipt: &Value) -> Result<()> {
+        let mut bytes = serde_json::to_vec_pretty(receipt)
+            .map_err(|error| fail(format!("cannot serialize terminal receipt: {error}")))?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_AGENT_RECORD_BYTES {
+            return Err(fail(format!(
+                "terminal retirement receipt exceeds {MAX_AGENT_RECORD_BYTES} bytes"
+            )));
+        }
+        atomic_replace_bytes(pinned, TERMINAL_RETIREMENT_FILE, &bytes)
+            .map(|_| ())
+            .map_err(|error| *error.error)
+    }
+
+    fn terminal_archive_receipt(
         &self,
         agent_name: &str,
         expected_token: Option<&str>,
     ) -> Result<Option<Value>> {
-        self.managed_dead_archive_receipt_with(agent_name, expected_token, || {}, || {})
+        self.terminal_archive_receipt_with(agent_name, expected_token, || {}, || {})
     }
 
-    fn managed_dead_archive_receipt_with<AfterRecord, AfterReceipt>(
+    fn terminal_archive_receipt_with<AfterRecord, AfterReceipt>(
         &self,
         agent_name: &str,
         expected_token: Option<&str>,
@@ -7278,12 +7820,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let Some(expected_token) = expected_token else {
             return Ok(None);
         };
+        name(agent_name)?;
+        token(expected_token)?;
         match fs::symlink_metadata(self.directory(agent_name)?) {
             Ok(_) => return Ok(None),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(fail(format!(
-                    "cannot inspect active managed-dead record: {error}"
+                    "cannot inspect active terminal record: {error}"
                 )))
             }
         }
@@ -7293,17 +7837,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .join(format!("{agent_name}-{expected_token}"));
         match fs::symlink_metadata(&destination) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(fail(format!(
-                    "cannot inspect managed-dead archive: {error}"
-                )))
-            }
+            Err(error) => return Err(fail(format!("cannot inspect terminal archive: {error}"))),
             Ok(_) => {}
         }
         let pinned = Self::pinned_agent_directory_at(
             agent_name,
             destination.clone(),
-            "managed-dead agent archive",
+            "terminal agent archive",
         )?;
         let record_path = destination.join("agent.json");
         let record_bytes = Self::pinned_artifact_bytes(
@@ -7315,58 +7855,106 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )?;
         let record = AgentRecord::from_storage_value(
             agent::decode_json_strict(&record_bytes).map_err(|error| {
-                fail(format!(
-                    "cannot decode managed-dead archived record: {error}"
-                ))
+                fail(format!("cannot decode terminal archived record: {error}"))
             })?,
             &record_path,
             agent_name,
         )?;
-        if record.token != expected_token
-            || record.lifecycle != "stopped"
-            || record.launch.adapter != "herdr-pane"
-            || record.launch.harness != "muse"
-            || record.launch.mode != "interactive"
-            || record.launch.backend != "herdr"
-            || record.launch.runtime_ownership != "owned"
-            || record.custom_process_identity.is_none()
-            || record.workspace_id.is_none()
-            || record.tab_id.is_none()
-            || record.pane_id.is_none()
-        {
+        if record.token != expected_token || record.lifecycle != "stopped" {
             return Err(fail(
-                "managed-dead archive is not an exact preserved-runtime receipt",
+                "terminal archive does not contain a stopped generation",
             ));
         }
         after_record_read();
-        self.read_managed_dead_retirement(&pinned, &record, &record_bytes)?;
+        let Some(receipt) = self.read_terminal_retirement(&pinned, &record, &record_bytes)? else {
+            return Ok(None);
+        };
         after_receipt_read();
         Self::verify_pinned_agent_directory(&pinned)?;
-        Ok(Some(Self::managed_dead_result(agent_name, &destination)))
+        let mut terminal_record = record;
+        if let Some(current) = terminal_record.terminal.as_ref() {
+            if current != &receipt.terminal {
+                return Err(fail(
+                    "terminal archive receipt disagrees with canonical terminal state",
+                ));
+            }
+        } else {
+            terminal_record.terminal = Some(receipt.terminal);
+        }
+        Ok(Some(self.terminal_retirement_result(
+            &terminal_record,
+            &destination,
+        )?))
     }
 
-    fn complete_preserved_managed_dead_publication(
+    fn complete_terminal_publication(
         &self,
         pinned: &PinnedAgentDirectory,
         expected_token: &str,
     ) -> Result<Value> {
         let snapshot = self.managed_record_snapshot(pinned, expected_token)?;
-        let final_record = snapshot.record;
-        if final_record.lifecycle != "stopped"
-            || final_record.launch.adapter != "herdr-pane"
-            || final_record.launch.mode != "interactive"
-            || final_record.launch.backend != "herdr"
-        {
+        let mut final_record = snapshot.record;
+        if final_record.lifecycle != "stopped" {
             return Err(fail(
-                "preserved managed-dead publication requires an exact stopped herdr-pane record",
+                "terminal publication requires an exact stopped record",
             ));
         }
-        self.read_managed_dead_retirement(pinned, &final_record, &snapshot.content)?;
+        let stored_retirement =
+            self.read_terminal_retirement(pinned, &final_record, &snapshot.content)?;
+        let receipt_missing = stored_retirement.is_none();
+        let retirement = match stored_retirement {
+            Some(retirement) => retirement,
+            None => TerminalRetirement {
+                terminal: final_record.terminal.clone().ok_or_else(|| {
+                    fail("terminal publication has neither receipt nor canonical terminal state")
+                })?,
+                legacy_receipt: false,
+                legacy_managed_dead_artifact: None,
+            },
+        };
+        let needs_record_upgrade = final_record.terminal.is_none();
+        if let Some(current) = final_record.terminal.as_ref() {
+            if current != &retirement.terminal {
+                return Err(fail(
+                    "terminal publication receipt disagrees with canonical terminal state",
+                ));
+            }
+        } else {
+            final_record.terminal = Some(retirement.terminal);
+        }
         let (_archive, destination) = self.archive_destination(&final_record)?;
-        self.publish_pinned_directory(pinned, &destination, &snapshot.content)?;
+        let result = self.terminal_retirement_result(&final_record, &destination)?;
+        let final_bytes = if needs_record_upgrade || retirement.legacy_receipt || receipt_missing {
+            self.migrate_legacy_goal_messages(&final_record)?;
+            let mut bytes = serde_json::to_vec_pretty(&final_record.storage_value()?)
+                .map_err(|error| fail(format!("cannot serialize agent record: {error}")))?;
+            bytes.push(b'\n');
+            if bytes.len() > MAX_AGENT_RECORD_BYTES {
+                return Err(fail(format!(
+                    "refusing stopped agent record larger than {MAX_AGENT_RECORD_BYTES} bytes"
+                )));
+            }
+            if bytes != snapshot.content {
+                atomic_replace_bytes(pinned, "agent.json", &bytes).map_err(|error| *error.error)?;
+            }
+            if let Some(artifact) = retirement.legacy_managed_dead_artifact {
+                Self::unlink_pinned_file_generation(
+                    pinned,
+                    MANAGED_DEAD_RETIREMENT_FILE,
+                    artifact,
+                    "legacy managed-dead retirement receipt",
+                )?;
+            }
+            let receipt = Self::terminal_retirement_value(&bytes)?;
+            Self::install_terminal_retirement(pinned, &receipt)?;
+            bytes
+        } else {
+            snapshot.content
+        };
+        self.publish_pinned_directory(pinned, &destination, &final_bytes)?;
         Ok(self
-            .managed_dead_archive_receipt(&final_record.name, Some(expected_token))?
-            .unwrap_or_else(|| Self::managed_dead_result(&final_record.name, &destination)))
+            .terminal_archive_receipt(&final_record.name, Some(expected_token))?
+            .unwrap_or(result))
     }
 
     fn complete_ordinary_stopped_custom_publication(
@@ -7382,7 +7970,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         })?;
         let pinned = self.pinned_agent_directory(&record.name)?;
         let snapshot = self.managed_record_snapshot(&pinned, expected_token)?;
-        let current = snapshot.record;
+        let current = snapshot.record.clone();
         if current.lifecycle != "stopped"
             || current.launch.adapter != "herdr-pane"
             || current.launch.harness != "muse"
@@ -7395,31 +7983,45 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "ordinary stopped custom publication has inconsistent state",
             ));
         }
-        let Some(pane_id) = current.pane_id.as_deref() else {
-            return Err(fail(
-                "ordinary stopped custom publication has no pane identity",
-            ));
-        };
-        if self
-            .client
-            .panes()?
-            .iter()
-            .any(|pane| pane.pane_id == pane_id)
-        {
-            return Err(fail(
-                "stopped custom runtime still has a pane but no managed-dead retirement receipt; pane was preserved",
-            ));
+        let mut final_record = current;
+        if final_record.terminal.is_none() {
+            let Some(pane_id) = final_record.pane_id.as_deref() else {
+                return Err(fail(
+                    "ordinary stopped custom publication has no pane identity",
+                ));
+            };
+            if self
+                .client
+                .panes()?
+                .iter()
+                .any(|pane| pane.pane_id == pane_id)
+            {
+                return Err(fail(
+                    "stopped custom runtime still has a pane but no managed-dead retirement receipt; pane was preserved",
+                ));
+            }
+            final_record.terminal = Some(TerminalState::new("custom-runtime-absent", json!({}))?);
         }
-        let (_archive, destination) = self.archive_destination(&current)?;
-        self.publish_pinned_directory(&pinned, &destination, &snapshot.content)?;
-        Ok(json!({
-            "name": current.name,
-            "archive": destination,
-            "pane_closed": false,
-            "tab_closed": Value::Null,
-            "ordinary_stop_recovered": true,
-            "runtime_preserved": false,
-        }))
+        let verified = self.managed_record_snapshot(&pinned, expected_token)?;
+        if !verified.same_generation(&snapshot) {
+            return Err(fail(format!(
+                "refusing to recover stopped custom agent {:?}: registry record changed",
+                final_record.name
+            )));
+        }
+        let (_archive, destination) = self.archive_destination(&final_record)?;
+        let result = self.terminal_retirement_result(&final_record, &destination)?;
+        self.migrate_legacy_goal_messages(&final_record)?;
+        let mut final_bytes = serde_json::to_vec_pretty(&final_record.storage_value()?)
+            .map_err(|error| fail(format!("cannot serialize agent record: {error}")))?;
+        final_bytes.push(b'\n');
+        let receipt = Self::terminal_retirement_value(&final_bytes)?;
+        atomic_replace_bytes(&pinned, "agent.json", &final_bytes).map_err(|error| *error.error)?;
+        Self::install_terminal_retirement(&pinned, &receipt)?;
+        self.publish_pinned_directory(&pinned, &destination, &final_bytes)?;
+        Ok(self
+            .terminal_archive_receipt(&final_record.name, Some(expected_token))?
+            .unwrap_or(result))
     }
 
     fn retire_managed_dead_locked_with<AfterWrite, AfterInstall>(
@@ -7450,7 +8052,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let record = &initial.record;
         if record.lifecycle == "stopped" && record.launch.adapter == "herdr-pane" {
-            return self.complete_preserved_managed_dead_publication(pinned, expected_token);
+            return self.complete_terminal_publication(pinned, expected_token);
         }
         if !matches!(record.launch.adapter.as_str(), "herdr" | "herdr-pane")
             || record.lifecycle != "running"
@@ -7494,10 +8096,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut final_record = final_snapshot.record;
         final_record.lifecycle = "stopped".to_owned();
         self.migrate_legacy_goal_messages(&final_record)?;
-        let mut stopped_bytes = serde_json::to_vec_pretty(&final_record.storage_value()?)
+        let close_pane = final_record.launch.adapter == "herdr";
+        let mut preflight_record = final_record.clone();
+        preflight_record.terminal = Some(if close_pane {
+            TerminalState::new("managed-dead-closed", json!({"tab_closed": false}))?
+        } else {
+            TerminalState::new("managed-dead-preserved", json!({}))?
+        });
+        let preflight_bytes = serde_json::to_vec_pretty(&preflight_record.storage_value()?)
             .map_err(|error| fail(format!("cannot serialize agent record: {error}")))?;
-        stopped_bytes.push(b'\n');
-        if stopped_bytes.len() > MAX_AGENT_RECORD_BYTES {
+        if preflight_bytes.len().saturating_add(1) > MAX_AGENT_RECORD_BYTES {
             return Err(fail(format!(
                 "refusing stopped agent record larger than {MAX_AGENT_RECORD_BYTES} bytes"
             )));
@@ -7586,19 +8194,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .pane_id
             .as_deref()
             .expect("proved pane identity");
-        let close_pane = final_record.launch.adapter == "herdr";
         if close_pane {
             self.client.close_pane(pane_id)?;
-        } else {
-            let receipt = Self::managed_dead_retirement_value(&final_record, &stopped_bytes);
-            let mut receipt_bytes = serde_json::to_vec_pretty(&receipt)
-                .map_err(|error| fail(format!("cannot serialize retirement receipt: {error}")))?;
-            receipt_bytes.push(b'\n');
-            atomic_replace_bytes(pinned, MANAGED_DEAD_RETIREMENT_FILE, &receipt_bytes)
-                .map_err(|error| *error.error)?;
         }
-        atomic_replace_bytes(pinned, "agent.json", &stopped_bytes).map_err(|error| *error.error)?;
-        self.publish_pinned_directory(pinned, &destination, &stopped_bytes)?;
         let tab_closed = if close_pane {
             self.client.panes().ok().map(|panes| {
                 panes
@@ -7608,19 +8206,31 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         } else {
             Some(false)
         };
-        if close_pane {
-            Ok(json!({
-                "name": record.name,
-                "archive": destination,
-                "pane_closed": true,
-                "tab_closed": tab_closed,
-                "managed_dead": true,
-                "runtime_preserved": false,
-                "continuation": Value::Null,
-            }))
+        let outcome = if close_pane {
+            "managed-dead-closed"
         } else {
-            Ok(Self::managed_dead_result(&record.name, &destination))
+            "managed-dead-preserved"
+        };
+        let evidence = if close_pane {
+            json!({"tab_closed": tab_closed})
+        } else {
+            json!({})
+        };
+        final_record.terminal = Some(TerminalState::new(outcome, evidence)?);
+        let result = self.terminal_retirement_result(&final_record, &destination)?;
+        let mut stopped_bytes = serde_json::to_vec_pretty(&final_record.storage_value()?)
+            .map_err(|error| fail(format!("cannot serialize agent record: {error}")))?;
+        stopped_bytes.push(b'\n');
+        if stopped_bytes.len() > MAX_AGENT_RECORD_BYTES {
+            return Err(fail(format!(
+                "refusing stopped agent record larger than {MAX_AGENT_RECORD_BYTES} bytes"
+            )));
         }
+        let receipt = Self::terminal_retirement_value(&stopped_bytes)?;
+        atomic_replace_bytes(pinned, "agent.json", &stopped_bytes).map_err(|error| *error.error)?;
+        Self::install_terminal_retirement(pinned, &receipt)?;
+        self.publish_pinned_directory(pinned, &destination, &stopped_bytes)?;
+        Ok(result)
     }
 
     /// Close an owned pane, or only unregister a foreign runtime, then archive state.
@@ -7633,14 +8243,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock(agent_name)?;
         if !options.recover_legacy_adoption && options.expected_record_sha256.is_none() {
             if let Some(receipt) =
-                self.managed_dead_archive_receipt(agent_name, options.expected_token.as_deref())?
+                self.terminal_archive_receipt(agent_name, options.expected_token.as_deref())?
             {
                 return Ok(receipt);
             }
         }
         let mut record = self.load(agent_name)?;
         self.reconcile_goal_transaction(&record)?;
-        record.supported()?;
         if options
             .expected_token
             .as_deref()
@@ -7659,6 +8268,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         record = confirmed_record;
+        if self.read_relocation_journal(&record)?.is_some() {
+            return Err(fail(
+                "unfinished relocation must be reconciled with agentctl relocate before stop",
+            ));
+        }
         if options.recover_legacy_adoption {
             let pane_id = record
                 .pane_id
@@ -7673,25 +8287,40 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "--expected-record-sha256 requires --recover-legacy-adoption",
             ));
         }
-        if record.launch.adapter == "herdr-pane" && record.lifecycle == "stopped" {
-            if self.managed_dead_retirement_exists(&record)? {
-                let pane_id = record
-                    .pane_id
-                    .as_deref()
-                    .ok_or_else(|| fail("managed-dead stopped record has no pane identity"))?;
-                let _pane_lock = self.pane_lock(pane_id)?;
+        if record.lifecycle == "stopped" {
+            if self.terminal_retirement_exists(&record)? {
+                let expected_token = options.expected_token.as_deref().ok_or_else(|| {
+                    fail(format!(
+                        "recovering stopped custom agent {:?} requires --expected-token",
+                        record.name
+                    ))
+                })?;
                 let pinned = self.pinned_agent_directory(agent_name)?;
-                return self.retire_managed_dead_locked(
+                return self.complete_terminal_publication(&pinned, expected_token);
+            }
+            if record.terminal.is_some() {
+                let expected_token = options.expected_token.as_deref().ok_or_else(|| {
+                    fail(format!(
+                        "recovering stopped agent {:?} requires --expected-token",
+                        record.name
+                    ))
+                })?;
+                let pinned = self.pinned_agent_directory(agent_name)?;
+                return self.complete_terminal_publication(&pinned, expected_token);
+            }
+            if record.launch.adapter == "turn-runner" {
+                return Err(fail(
+                    "stopped turn-runner has no terminal retirement receipt; retry with the Python runtime authority",
+                ));
+            }
+            if record.launch.adapter == "herdr-pane" {
+                return self.complete_ordinary_stopped_custom_publication(
                     &record,
-                    &pinned,
                     options.expected_token.as_deref(),
                 );
             }
-            return self.complete_ordinary_stopped_custom_publication(
-                &record,
-                options.expected_token.as_deref(),
-            );
         }
+        record.supported()?;
         if record.launch.adapter == "herdr-foreign" {
             let (live, info, presentation) = self.inspect_foreign(agent_name, &record)?;
             let text = self.bounded_terminal_text(&info.pane_id)?;
@@ -7721,7 +8350,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     "refusing to unregister adopted agent {agent_name:?}: runtime identity changed during output capture"
                 )));
             }
-            let (archive, destination) = self.archive_destination(&record)?;
+            let (_archive, destination) = self.archive_destination(&record)?;
             self.snapshot(&record, &text)?;
             let (persisted_live, persisted_info, persisted_presentation) = self
                 .inspect_foreign(agent_name, &record)
@@ -7748,18 +8377,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 )));
             }
             record.lifecycle = "stopped".to_owned();
+            record.terminal = Some(TerminalState::new("foreign-unregistered", json!({}))?);
+            let result = self.terminal_retirement_result(&record, &destination)?;
             self.save(&record)?;
-            fs::rename(self.directory(agent_name)?, &destination)
-                .map_err(|error| fail(error.to_string()))?;
-            agent::sync_directory(&archive)?;
-            agent::sync_directory(&self.registry)?;
-            return Ok(json!({
-                "name": agent_name,
-                "archive": destination,
-                "pane_closed": false,
-                "tab_closed": false,
-                "runtime_preserved": true,
-            }));
+            let pinned = self.pinned_agent_directory(agent_name)?;
+            let snapshot = self.managed_record_snapshot(&pinned, &record.token)?;
+            let receipt = Self::terminal_retirement_value(&snapshot.content)?;
+            Self::install_terminal_retirement(&pinned, &receipt)?;
+            self.publish_pinned_directory(&pinned, &destination, &snapshot.content)?;
+            return Ok(result);
         }
         let panes = self.client.panes()?;
         if matches!(record.launch.adapter.as_str(), "herdr" | "herdr-pane")
@@ -7822,7 +8448,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 self.save(&record)?;
             }
         }
-        let (archive, destination) = self.archive_destination(&record)?;
+        let (_archive, destination) = self.archive_destination(&record)?;
         if !owned.is_empty() {
             if owned.len() != 1
                 || Some(&owned[0].pane_id) != record.pane_id.as_ref()
@@ -7850,11 +8476,6 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             self.client.close_pane(pane_id)?;
         }
         record.lifecycle = "stopped".to_owned();
-        self.save(&record)?;
-        fs::rename(self.directory(agent_name)?, &destination)
-            .map_err(|error| fail(error.to_string()))?;
-        agent::sync_directory(&archive)?;
-        agent::sync_directory(&self.registry)?;
         let tab_closed = if owned.is_empty() {
             Some(false)
         } else {
@@ -7864,9 +8485,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     .all(|pane| Some(&pane.tab_id) != record.tab_id.as_ref())
             })
         };
-        Ok(
-            json!({"name":agent_name,"archive":destination,"pane_closed":!owned.is_empty(),"tab_closed":tab_closed}),
-        )
+        let (outcome, evidence) = if owned.is_empty() {
+            ("owned-runtime-absent", json!({}))
+        } else {
+            ("owned-pane-closed", json!({"tab_closed": tab_closed}))
+        };
+        record.terminal = Some(TerminalState::new(outcome, evidence)?);
+        let result = self.terminal_retirement_result(&record, &destination)?;
+        self.save(&record)?;
+        let pinned = self.pinned_agent_directory(agent_name)?;
+        let snapshot = self.managed_record_snapshot(&pinned, &record.token)?;
+        let receipt = Self::terminal_retirement_value(&snapshot.content)?;
+        Self::install_terminal_retirement(&pinned, &receipt)?;
+        self.publish_pinned_directory(&pinned, &destination, &snapshot.content)?;
+        Ok(result)
     }
 }
 
@@ -7875,7 +8507,7 @@ mod tests {
     use super::*;
     use crate::error::{AdapterError, Result as AdapterResult};
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
     use std::sync::{Arc, Barrier};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -7956,6 +8588,7 @@ mod tests {
                     custom_at_idle_shell: AtomicBool::new(true),
                     claude_background: AtomicBool::new(false),
                     foreign_shell_identity: Mutex::new(Fake::foreign_shell_identity()),
+                    shell_identity_error: AtomicU8::new(0),
                     foreign_shell_path: Mutex::new(PathBuf::from("/bin/bash")),
                     replacement_shell_on_read: Mutex::new(None),
                     change_foreign_shell_after_save: AtomicBool::new(false),
@@ -7964,6 +8597,7 @@ mod tests {
                     add_null_shell_identity_on_read: AtomicBool::new(false),
                     replace_record_directory_on_read: AtomicBool::new(false),
                     replace_after_empty_panes: AtomicBool::new(false),
+                    mutate_registry_after_empty_panes: AtomicU8::new(0),
                     fail_read: AtomicBool::new(false),
                     fail_shell_proof: AtomicBool::new(false),
                     shell_proof_mutation: AtomicU64::new(0),
@@ -8111,6 +8745,7 @@ mod tests {
         custom_at_idle_shell: AtomicBool,
         claude_background: AtomicBool,
         foreign_shell_identity: Mutex<CustomProcessIdentity>,
+        shell_identity_error: AtomicU8,
         foreign_shell_path: Mutex<PathBuf>,
         replacement_shell_on_read: Mutex<Option<PaneShellProof>>,
         change_foreign_shell_after_save: AtomicBool,
@@ -8119,6 +8754,7 @@ mod tests {
         add_null_shell_identity_on_read: AtomicBool,
         replace_record_directory_on_read: AtomicBool,
         replace_after_empty_panes: AtomicBool,
+        mutate_registry_after_empty_panes: AtomicU8,
         fail_read: AtomicBool,
         fail_shell_proof: AtomicBool,
         shell_proof_mutation: AtomicU64,
@@ -8177,6 +8813,31 @@ mod tests {
                 let mut replacement = Fake::pane("owned");
                 replacement.terminal_id = Some("replacement-after-absence".to_owned());
                 self.panes.lock().unwrap().push(replacement);
+            }
+            match self
+                .mutate_registry_after_empty_panes
+                .swap(0, Ordering::Relaxed)
+            {
+                1 => {
+                    let active = self.root.join("registry/worker");
+                    let displaced = self.root.join("registry/.worker-displaced");
+                    fs::rename(&active, &displaced).unwrap();
+                    fs::create_dir(&active).unwrap();
+                    fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();
+                    fs::copy(displaced.join("agent.json"), active.join("agent.json")).unwrap();
+                    fs::set_permissions(
+                        active.join("agent.json"),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                }
+                2 => {
+                    let path = self.root.join("registry/worker/agent.json");
+                    let mut document = agent::read_private_json(&path).unwrap();
+                    document["error"] = json!("replacement record");
+                    agent::atomic_json(&path, &document).unwrap();
+                }
+                _ => {}
             }
             Ok(snapshot)
         }
@@ -8625,6 +9286,19 @@ mod tests {
                 && self.custom_at_idle_shell.load(Ordering::Relaxed))
         }
         fn pane_shell_identity(&self, _: &str) -> AdapterResult<CustomProcessIdentity> {
+            match self.shell_identity_error.load(Ordering::Relaxed) {
+                1 => {
+                    return Err(AdapterError::unavailable(
+                        "transport protocol changed unexpectedly",
+                    ));
+                }
+                2 => {
+                    return Err(AdapterError::identity_mismatch(
+                        "recorded shell belongs to another generation",
+                    ));
+                }
+                _ => {}
+            }
             let mut identity = self.foreign_shell_identity.lock().unwrap().clone();
             if self.change_foreign_shell_after_save.load(Ordering::Relaxed)
                 && self.root.join("registry/foreign/agent.json").exists()
@@ -8793,6 +9467,43 @@ mod tests {
                 .join("registry/worker/relocation.json")
                 .exists());
         }
+    }
+
+    #[test]
+    fn stop_refuses_runtime_moved_by_unfinished_relocation() {
+        let fixture = Fixture::new();
+        let started = fixture.start(None);
+        fixture
+            .client
+            .fail_after_move
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture
+            .manager()
+            .relocate("worker", Some("destination"), None, true)
+            .unwrap_err();
+        assert!(error.to_string().contains("lost pane move response"));
+        let moved = fixture.client.panes.lock().unwrap().clone();
+        assert_eq!(moved[0].pane_id, "destination:moved");
+
+        let error = fixture
+            .manager()
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unfinished relocation"));
+        assert_eq!(*fixture.client.panes.lock().unwrap(), moved);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert!(fixture
+            .root
+            .join("registry/worker/relocation.json")
+            .is_file());
+        assert!(!fixture.root.join("registry/archive").exists());
     }
 
     #[test]
@@ -9037,6 +9748,25 @@ mod tests {
     }
 
     #[test]
+    fn adopted_shell_health_uses_typed_identity_failure() {
+        for (failure, expected_health, expected_reason) in [
+            (1, "unknown", "runtime-probe-failed"),
+            (2, "unhealthy", "runtime-identity-mismatch"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.adopt();
+            fixture
+                .client
+                .shell_identity_error
+                .store(failure, Ordering::Relaxed);
+            let health = fixture.manager().health(&["foreign".to_owned()]);
+            assert_eq!(health["sessions"][0]["health"], expected_health);
+            assert_eq!(health["sessions"][0]["runtime_state"], "unknown");
+            assert_eq!(health["sessions"][0]["reason_code"], expected_reason);
+        }
+    }
+
+    #[test]
     fn health_does_not_call_transient_agent_detector_failure_dead() {
         let fixture = Fixture::new();
         fixture.start(None);
@@ -9270,6 +10000,53 @@ mod tests {
         assert_eq!(recovered["custom_process_identity"]["pid"], 4242);
         assert_eq!(recovered["pane_reported_by_agentctl"], false);
         assert!(fixture.client.runs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn starting_muse_after_launch_before_identity_callback_is_recoverable() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    harness_args: vec!["--literal".to_owned()],
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut record = manager.load("worker").unwrap();
+        record.lifecycle = "starting".to_owned();
+        record.custom_process_identity = None;
+        record.pane_reported_by_agentctl = false;
+        record.session_agent = None;
+        record.session_value = None;
+        record.session_source = None;
+        record.error = None;
+        manager.save(&record).unwrap();
+        fixture
+            .client
+            .custom_reported
+            .store(false, Ordering::Relaxed);
+        fixture.client.started.store(false, Ordering::Relaxed);
+
+        let recovered = manager
+            .recover_start(
+                "worker",
+                started["token"].as_str().unwrap(),
+                Fake::custom_identity().pid,
+            )
+            .unwrap();
+
+        assert_eq!(recovered["lifecycle"], "running");
+        assert_eq!(recovered["custom_process_identity"]["pid"], 4242);
+        assert!(manager.load("worker").unwrap().error.is_none());
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert!(path.is_file());
     }
 
     #[test]
@@ -9938,7 +10715,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v3_has_one_tagged_launch_and_goal_authority() {
+    fn agent_record_v4_has_one_tagged_launch_goal_and_terminal_authority() {
         let fixture = Fixture::new();
         let started = fixture
             .manager()
@@ -9957,6 +10734,7 @@ mod tests {
         assert_eq!(stored["schema"], SESSION_STORAGE_SCHEMA);
         assert_eq!(stored["launch"]["schema"], LAUNCH_SPEC_SCHEMA);
         assert_eq!(stored["goal"]["schema"], GOAL_STATE_SCHEMA);
+        assert!(stored["terminal"].is_null());
         assert_eq!(
             stored["native_session"],
             json!({
@@ -10011,7 +10789,101 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v3_reads_profiled_claude_launch_without_flat_harness_field() {
+    fn agent_record_v4_requires_terminal_state_exactly_when_stopped() {
+        for case in [
+            "stopped-null",
+            "active-terminal",
+            "missing-terminal",
+            "wrong-terminal-schema",
+            "wrong-terminal-outcome",
+            "non-object-evidence",
+            "extra-terminal-field",
+        ] {
+            let fixture = Fixture::new();
+            fixture.start(None);
+            let path = fixture.root.join("registry/worker/agent.json");
+            let mut stored = agent::read_private_json(&path).unwrap();
+            let valid = json!({
+                "schema": TERMINAL_STATE_SCHEMA,
+                "outcome": "owned-runtime-absent",
+                "evidence": {},
+            });
+            match case {
+                "stopped-null" => stored["lifecycle"] = json!("stopped"),
+                "active-terminal" => stored["terminal"] = valid,
+                "missing-terminal" => {
+                    stored.as_object_mut().unwrap().remove("terminal");
+                }
+                "wrong-terminal-schema" => {
+                    stored["lifecycle"] = json!("stopped");
+                    stored["terminal"] = valid;
+                    stored["terminal"]["schema"] = json!("agentctl-terminal-state/v0");
+                }
+                "wrong-terminal-outcome" => {
+                    stored["lifecycle"] = json!("stopped");
+                    stored["terminal"] = valid;
+                    stored["terminal"]["outcome"] = json!("success-ish");
+                }
+                "non-object-evidence" => {
+                    stored["lifecycle"] = json!("stopped");
+                    stored["terminal"] = valid;
+                    stored["terminal"]["evidence"] = json!([]);
+                }
+                "extra-terminal-field" => {
+                    stored["lifecycle"] = json!("stopped");
+                    stored["terminal"] = valid;
+                    stored["terminal"]["duplicate_authority"] = json!(true);
+                }
+                _ => unreachable!(),
+            }
+            agent::atomic_json(&path, &stored).unwrap();
+            let error = fixture.manager().load("worker").unwrap_err();
+            assert!(
+                error.to_string().contains("terminal")
+                    || error.to_string().contains("agentctl-session/v4 fields"),
+                "case {case}: {error}"
+            );
+        }
+
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let mut stopped = fixture.manager().load("worker").unwrap();
+        stopped.lifecycle = "stopped".to_owned();
+        assert!(stopped
+            .storage_value()
+            .unwrap_err()
+            .to_string()
+            .contains("requires terminal state"));
+        stopped.lifecycle = "running".to_owned();
+        stopped.terminal = Some(TerminalState::new("owned-runtime-absent", json!({})).unwrap());
+        assert!(stopped
+            .storage_value()
+            .unwrap_err()
+            .to_string()
+            .contains("must not contain"));
+    }
+
+    #[test]
+    fn stopped_v3_decodes_only_at_the_legacy_edge() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut legacy = downgrade_current_record_to_v3(agent::read_private_json(&path).unwrap());
+        legacy["lifecycle"] = json!("stopped");
+        agent::atomic_json(&path, &legacy).unwrap();
+
+        let loaded = fixture.manager().load("worker").unwrap();
+        assert_eq!(loaded.lifecycle, "stopped");
+        assert!(loaded.terminal.is_none());
+        assert!(loaded
+            .storage_value()
+            .unwrap_err()
+            .to_string()
+            .contains("requires terminal state"));
+    }
+
+    #[test]
+    fn agent_record_v4_reads_profiled_claude_launch_without_flat_harness_field() {
         let fixture = Fixture::new();
         fixture.start(None);
         let path = fixture.root.join("registry/worker/agent.json");
@@ -10036,7 +10908,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v3_rejects_duplicate_nested_launch_keys() {
+    fn agent_record_v4_rejects_duplicate_nested_launch_keys() {
         let fixture = Fixture::new();
         fixture.start(None);
         let path = fixture.root.join("registry/worker/agent.json");
@@ -10057,7 +10929,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v3_writer_refuses_incomplete_native_session() {
+    fn agent_record_v4_writer_refuses_incomplete_native_session() {
         let fixture = Fixture::new();
         fixture.start(None);
         let mut record = fixture.manager().load("worker").unwrap();
@@ -10072,7 +10944,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v3_refuses_native_session_for_another_harness() {
+    fn agent_record_v4_refuses_native_session_for_another_harness() {
         let fixture = Fixture::new();
         fixture.start(None);
         let path = fixture.root.join("registry/worker/agent.json");
@@ -10093,6 +10965,7 @@ mod tests {
         let object = stored
             .as_object_mut()
             .expect("stored agent record is an object");
+        object.remove("terminal");
         let goal = object
             .remove("goal")
             .and_then(|value| value.as_object().cloned())
@@ -10138,8 +11011,17 @@ mod tests {
         stored
     }
 
+    fn downgrade_current_record_to_v3(mut stored: Value) -> Value {
+        let object = stored
+            .as_object_mut()
+            .expect("stored agent record is an object");
+        object.insert("schema".to_owned(), json!(LEGACY_SESSION_STORAGE_SCHEMA_V3));
+        object.remove("terminal");
+        stored
+    }
+
     #[test]
-    fn agent_record_v3_migrates_v2_goal_and_native_session_without_duplicates() {
+    fn agent_record_v4_migrates_v2_goal_and_native_session_without_duplicates() {
         let fixture = Fixture::new();
         fixture.start(None);
         let manager = fixture.manager();
@@ -10204,7 +11086,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v3_migrates_legacy_goal_artifact_before_dropping_map() {
+    fn agent_record_v4_migrates_legacy_goal_artifact_before_dropping_map() {
         let fixture = Fixture::new();
         fixture.start(None);
         let manager = fixture.manager();
@@ -10501,7 +11383,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v3_refuses_to_discard_missing_legacy_goal_artifact() {
+    fn agent_record_v4_refuses_to_discard_missing_legacy_goal_artifact() {
         let fixture = Fixture::new();
         fixture.start(None);
         let manager = fixture.manager();
@@ -10567,7 +11449,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v3_migrates_legacy_launch_spec_at_write_boundary() {
+    fn agent_record_v4_migrates_legacy_launch_spec_at_write_boundary() {
         let fixture = Fixture::new();
         fixture.start(None);
         let manager = fixture.manager();
@@ -10602,6 +11484,7 @@ mod tests {
             "launch_permission_mode",
             "launch",
             "native_session",
+            "terminal",
             "extensions",
             "goal_delivery",
             "goal_messages",
@@ -10668,7 +11551,7 @@ mod tests {
 
     #[test]
     fn agent_record_v1_rejects_reserved_current_schema_fields() {
-        for field in ["launch", "native_session", "extensions"] {
+        for field in ["launch", "native_session", "terminal", "extensions"] {
             let fixture = Fixture::new();
             fixture.start(None);
             let path = fixture.root.join("registry/worker/agent.json");
@@ -10825,7 +11708,7 @@ mod tests {
             record.error.as_deref(),
             Some("launch failed with caller-supplied environment; details omitted from status")
         );
-        assert!(!record.public_value().to_string().contains(secret));
+        assert!(!record.storage_value().unwrap().to_string().contains(secret));
     }
 
     #[test]
@@ -10979,6 +11862,16 @@ mod tests {
                 .count(),
             1
         );
+        let retried = manager
+            .stop_with_options(
+                "foreign",
+                StopOptions {
+                    expected_token: Some(adopted["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(retried, stopped);
     }
 
     #[test]
@@ -11423,7 +12316,7 @@ mod tests {
             .stop_with_options(
                 "foreign",
                 StopOptions {
-                    expected_token: Some(token),
+                    expected_token: Some(token.clone()),
                     recover_legacy_adoption: true,
                     expected_record_sha256: Some(digest),
                 },
@@ -13460,17 +14353,20 @@ mod tests {
                 .unwrap();
             fixture.client.custom_alive.store(false, Ordering::Relaxed);
             let active = fixture.root.join("registry/worker");
-            let mut stopped = manager.load("worker").unwrap();
-            stopped.lifecycle = "stopped".to_owned();
-            agent::atomic_json(
-                &active.join("agent.json"),
-                &stopped.storage_value().unwrap(),
-            )
-            .unwrap();
+            let mut stopped = downgrade_current_record_to_v3(
+                agent::read_private_json(&active.join("agent.json")).unwrap(),
+            );
+            stopped["lifecycle"] = json!("stopped");
+            agent::atomic_json(&active.join("agent.json"), &stopped).unwrap();
             let stopped_bytes = fs::read(active.join("agent.json")).unwrap();
             agent::atomic_json(
-                &active.join(MANAGED_DEAD_RETIREMENT_FILE),
-                &ManagedAgents::<Fake>::managed_dead_retirement_value(&stopped, &stopped_bytes),
+                &active.join(TERMINAL_RETIREMENT_FILE),
+                &ManagedAgents::<Fake>::legacy_terminal_retirement_value(
+                    &stopped_bytes,
+                    "managed-dead-preserved",
+                    json!({}),
+                )
+                .unwrap(),
             )
             .unwrap();
             if replace_terminal {
@@ -13494,6 +14390,21 @@ mod tests {
             assert_eq!(*fixture.client.panes.lock().unwrap(), retained);
             assert!(fixture.client.closed.lock().unwrap().is_empty());
             assert!(!active.exists());
+            let archive = PathBuf::from(result["archive"].as_str().unwrap());
+            let archived = agent::read_private_json(&archive.join("agent.json")).unwrap();
+            assert_eq!(archived["schema"], SESSION_STORAGE_SCHEMA);
+            assert_eq!(
+                archived["terminal"],
+                json!({
+                    "schema": TERMINAL_STATE_SCHEMA,
+                    "outcome": "managed-dead-preserved",
+                    "evidence": {},
+                })
+            );
+            let receipt =
+                agent::read_private_json(&archive.join(TERMINAL_RETIREMENT_FILE)).unwrap();
+            assert_eq!(receipt["schema"], TERMINAL_RETIREMENT_SCHEMA);
+            assert_eq!(receipt.as_object().unwrap().len(), 2);
         }
     }
 
@@ -13535,6 +14446,290 @@ mod tests {
     }
 
     #[test]
+    fn archived_v3_terminal_v1_receipt_decodes_without_rewrite() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let token = started["token"].as_str().unwrap().to_owned();
+        let active = fixture.root.join("registry/worker");
+        let mut legacy = downgrade_current_record_to_v3(
+            agent::read_private_json(&active.join("agent.json")).unwrap(),
+        );
+        legacy["lifecycle"] = json!("stopped");
+        agent::atomic_json(&active.join("agent.json"), &legacy).unwrap();
+        let record_bytes = fs::read(active.join("agent.json")).unwrap();
+        let receipt = ManagedAgents::<Fake>::legacy_terminal_retirement_value(
+            &record_bytes,
+            "managed-dead-preserved",
+            json!({}),
+        )
+        .unwrap();
+        agent::atomic_json(&active.join(TERMINAL_RETIREMENT_FILE), &receipt).unwrap();
+        let receipt_bytes = fs::read(active.join(TERMINAL_RETIREMENT_FILE)).unwrap();
+        let archive_root = fixture.root.join("registry/archive");
+        agent::create_private_directory(&archive_root, "agent archive", false, false).unwrap();
+        let archive = archive_root.join(format!("worker-{token}"));
+        fs::rename(&active, &archive).unwrap();
+
+        let result = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result["runtime_preserved"], true);
+        assert_eq!(fs::read(archive.join("agent.json")).unwrap(), record_bytes);
+        assert_eq!(
+            fs::read(archive.join(TERMINAL_RETIREMENT_FILE)).unwrap(),
+            receipt_bytes
+        );
+    }
+
+    #[test]
+    fn active_v3_terminal_v1_reconciles_after_record_first_interruption() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let token = started["token"].as_str().unwrap().to_owned();
+        let active = fixture.root.join("registry/worker");
+        let mut legacy = downgrade_current_record_to_v3(
+            agent::read_private_json(&active.join("agent.json")).unwrap(),
+        );
+        legacy["lifecycle"] = json!("stopped");
+        agent::atomic_json(&active.join("agent.json"), &legacy).unwrap();
+        let legacy_bytes = fs::read(active.join("agent.json")).unwrap();
+        let receipt = ManagedAgents::<Fake>::legacy_terminal_retirement_value(
+            &legacy_bytes,
+            "managed-dead-preserved",
+            json!({}),
+        )
+        .unwrap();
+        agent::atomic_json(&active.join(TERMINAL_RETIREMENT_FILE), &receipt).unwrap();
+        let mut current = manager.load("worker").unwrap();
+        current.terminal = Some(TerminalState::new("managed-dead-preserved", json!({})).unwrap());
+        manager.save(&current).unwrap();
+
+        let first = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token.clone()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        let retry = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(retry, first);
+        let archive = PathBuf::from(first["archive"].as_str().unwrap());
+        let current_receipt =
+            agent::read_private_json(&archive.join(TERMINAL_RETIREMENT_FILE)).unwrap();
+        assert_eq!(current_receipt["schema"], TERMINAL_RETIREMENT_SCHEMA);
+        assert_eq!(current_receipt.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn archived_v2_managed_dead_v1_receipt_decodes_without_rewrite() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let token = started["token"].as_str().unwrap().to_owned();
+        let active = fixture.root.join("registry/worker");
+        let mut legacy = downgrade_current_record_to_v2(
+            agent::read_private_json(&active.join("agent.json")).unwrap(),
+        );
+        legacy["lifecycle"] = json!("stopped");
+        agent::atomic_json(&active.join("agent.json"), &legacy).unwrap();
+        let record_bytes = fs::read(active.join("agent.json")).unwrap();
+        let record = manager.load("worker").unwrap();
+        let receipt =
+            ManagedAgents::<Fake>::legacy_managed_dead_retirement_value(&record, &record_bytes);
+        agent::atomic_json(&active.join(MANAGED_DEAD_RETIREMENT_FILE), &receipt).unwrap();
+        let receipt_bytes = fs::read(active.join(MANAGED_DEAD_RETIREMENT_FILE)).unwrap();
+        let archive_root = fixture.root.join("registry/archive");
+        agent::create_private_directory(&archive_root, "agent archive", false, false).unwrap();
+        let archive = archive_root.join(format!("worker-{token}"));
+        fs::rename(&active, &archive).unwrap();
+
+        let result = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result["runtime_preserved"], true);
+        assert_eq!(fs::read(archive.join("agent.json")).unwrap(), record_bytes);
+        assert_eq!(
+            fs::read(archive.join(MANAGED_DEAD_RETIREMENT_FILE)).unwrap(),
+            receipt_bytes
+        );
+    }
+
+    #[test]
+    fn active_v2_managed_dead_retirement_reconciles_every_safe_prefix() {
+        for prefix in ["legacy", "v4-with-legacy", "v4-only"] {
+            let fixture = Fixture::new();
+            fixture
+                .client
+                .report_session
+                .store(false, Ordering::Relaxed);
+            let manager = fixture.manager();
+            let started = manager
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        workspace_id: Some("workspace".to_owned()),
+                        harness: "muse".to_owned(),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap();
+            let token = started["token"].as_str().unwrap().to_owned();
+            let active = fixture.root.join("registry/worker");
+            let mut legacy = downgrade_current_record_to_v2(
+                agent::read_private_json(&active.join("agent.json")).unwrap(),
+            );
+            legacy["lifecycle"] = json!("stopped");
+            agent::atomic_json(&active.join("agent.json"), &legacy).unwrap();
+            let legacy_bytes = fs::read(active.join("agent.json")).unwrap();
+            let mut record = manager.load("worker").unwrap();
+            let receipt =
+                ManagedAgents::<Fake>::legacy_managed_dead_retirement_value(&record, &legacy_bytes);
+            agent::atomic_json(&active.join(MANAGED_DEAD_RETIREMENT_FILE), &receipt).unwrap();
+            if prefix != "legacy" {
+                record.terminal =
+                    Some(TerminalState::new("managed-dead-preserved", json!({})).unwrap());
+                manager.save(&record).unwrap();
+            }
+            if prefix == "v4-only" {
+                fs::remove_file(active.join(MANAGED_DEAD_RETIREMENT_FILE)).unwrap();
+            }
+
+            let first = manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(token.clone()),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap();
+            let second = manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(token),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(second, first, "prefix {prefix}");
+            let archive = PathBuf::from(first["archive"].as_str().unwrap());
+            assert!(archive.join(TERMINAL_RETIREMENT_FILE).is_file());
+            assert!(!archive.join(MANAGED_DEAD_RETIREMENT_FILE).exists());
+            assert_eq!(
+                agent::read_private_json(&archive.join("agent.json")).unwrap()["schema"],
+                SESSION_STORAGE_SCHEMA
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_managed_dead_cleanup_preserves_a_replacement_inode() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let pinned = manager.pinned_agent_directory("worker").unwrap();
+        let path = fixture
+            .root
+            .join("registry/worker")
+            .join(MANAGED_DEAD_RETIREMENT_FILE);
+        let original = b"{\"legacy\":true}\n";
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let identity = ManagedAgents::<Fake>::pinned_artifact_identity(
+            &pinned,
+            MANAGED_DEAD_RETIREMENT_FILE,
+            original,
+            "legacy managed-dead retirement receipt",
+        )
+        .unwrap();
+        agent::atomic_json(&path, &json!({"replacement": true})).unwrap();
+        let replacement = fs::read(&path).unwrap();
+
+        let error = ManagedAgents::<Fake>::unlink_pinned_file_generation(
+            &pinned,
+            MANAGED_DEAD_RETIREMENT_FILE,
+            identity,
+            "legacy managed-dead retirement receipt",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("replacement was preserved"));
+        assert_eq!(fs::read(path).unwrap(), replacement);
+    }
+
+    #[test]
     fn ordinary_muse_stop_retries_stopped_before_archive_without_retirement_receipt() {
         let fixture = Fixture::new();
         let manager = fixture.manager();
@@ -13551,17 +14746,18 @@ mod tests {
             .unwrap();
         let token = started["token"].as_str().unwrap().to_owned();
         fixture.client.panes.lock().unwrap().clear();
-        let mut record = manager.load("worker").unwrap();
-        record.lifecycle = "stopped".to_owned();
-        manager.save(&record).unwrap();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut record = downgrade_current_record_to_v3(agent::read_private_json(&path).unwrap());
+        record["lifecycle"] = json!("stopped");
+        agent::atomic_json(&path, &record).unwrap();
         let active = fixture.root.join("registry/worker");
-        assert!(!active.join(MANAGED_DEAD_RETIREMENT_FILE).exists());
+        assert!(!active.join(TERMINAL_RETIREMENT_FILE).exists());
 
         let result = manager
             .stop_with_options(
                 "worker",
                 StopOptions {
-                    expected_token: Some(token),
+                    expected_token: Some(token.clone()),
                     ..StopOptions::default()
                 },
             )
@@ -13571,6 +14767,18 @@ mod tests {
         assert!(!active.exists());
         assert!(Path::new(result["archive"].as_str().unwrap()).is_dir());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(
+            manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(token),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap(),
+            result
+        );
     }
 
     #[test]
@@ -13590,9 +14798,10 @@ mod tests {
             .unwrap();
         let token = started["token"].as_str().unwrap().to_owned();
         fixture.client.panes.lock().unwrap().clear();
-        let mut record = manager.load("worker").unwrap();
-        record.lifecycle = "stopped".to_owned();
-        manager.save(&record).unwrap();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut record = downgrade_current_record_to_v3(agent::read_private_json(&path).unwrap());
+        record["lifecycle"] = json!("stopped");
+        agent::atomic_json(&path, &record).unwrap();
         fixture
             .client
             .replace_after_empty_panes
@@ -13602,7 +14811,7 @@ mod tests {
             .stop_with_options(
                 "worker",
                 StopOptions {
-                    expected_token: Some(token),
+                    expected_token: Some(token.clone()),
                     ..StopOptions::default()
                 },
             )
@@ -13617,6 +14826,190 @@ mod tests {
             Some("replacement-after-absence")
         );
         assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_stopped_muse_requires_exact_explicit_token() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let token = started["token"].as_str().unwrap().to_owned();
+        fixture.client.panes.lock().unwrap().clear();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut record = downgrade_current_record_to_v3(agent::read_private_json(&path).unwrap());
+        record["lifecycle"] = json!("stopped");
+        agent::atomic_json(&path, &record).unwrap();
+
+        let missing = manager.stop("worker").unwrap_err();
+        assert!(missing.to_string().contains("requires --expected-token"));
+        let wrong = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some("f".repeat(token.len())),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(wrong.to_string().contains("was replaced"));
+        assert!(fixture.root.join("registry/worker/agent.json").is_file());
+        assert!(!fixture.root.join("registry/archive").exists());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_destination_rejects_untrusted_token_path_component() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let mut record = manager.load("worker").unwrap();
+        record.token = "../escape".to_owned();
+
+        let error = manager.archive_destination(&record).unwrap_err();
+
+        assert!(error.to_string().contains("token has an invalid shape"));
+        assert!(!fixture.root.join("registry/archive").exists());
+    }
+
+    #[test]
+    fn rust_reconciles_python_style_stopped_turn_runner_receipt() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = fixture.start(None);
+        let token = started["token"].as_str().unwrap().to_owned();
+        let mut record = manager.load("worker").unwrap();
+        record.lifecycle = "stopped".to_owned();
+        record.launch.adapter = "turn-runner".to_owned();
+        record.launch.mode = "headless".to_owned();
+        record.launch.runtime_home = Some(
+            fixture
+                .root
+                .join("registry/worker/runtime")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        record.terminal = Some(
+            TerminalState::new("turn-runner-stopped", json!({"killed_window": false})).unwrap(),
+        );
+        manager.save(&record).unwrap();
+        let active = fixture.root.join("registry/worker");
+        let destination = fixture
+            .root
+            .join("registry/archive")
+            .join(format!("worker-{token}"));
+        let stopped_bytes = fs::read(active.join("agent.json")).unwrap();
+        let receipt = ManagedAgents::<Fake>::terminal_retirement_value(&stopped_bytes).unwrap();
+        agent::atomic_json(&active.join(TERMINAL_RETIREMENT_FILE), &receipt).unwrap();
+        assert_eq!(receipt.as_object().unwrap().len(), 2);
+
+        let result = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result["archive"], destination.to_string_lossy().as_ref());
+        assert!(Path::new(result["archive"].as_str().unwrap()).is_dir());
+        assert!(!active.exists());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rust_reconciles_current_stopped_turn_runner_without_terminal_receipt() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = fixture.start(None);
+        let mut record = manager.load("worker").unwrap();
+        record.lifecycle = "stopped".to_owned();
+        record.launch.adapter = "turn-runner".to_owned();
+        record.launch.mode = "headless".to_owned();
+        record.launch.runtime_home = Some(
+            fixture
+                .root
+                .join("registry/worker/runtime")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        record.terminal = Some(
+            TerminalState::new("turn-runner-stopped", json!({"killed_window": false})).unwrap(),
+        );
+        manager.save(&record).unwrap();
+
+        let result = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result["runtime"]["result"]["killed_window"], false);
+        assert!(!fixture.root.join("registry/worker").exists());
+        assert!(Path::new(result["archive"].as_str().unwrap()).is_dir());
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_stopped_muse_publication_refuses_generation_mutation() {
+        for mutation in [1_u8, 2_u8] {
+            let fixture = Fixture::new();
+            let manager = fixture.manager();
+            let started = manager
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        workspace_id: Some("workspace".to_owned()),
+                        harness: "muse".to_owned(),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap();
+            let token = started["token"].as_str().unwrap().to_owned();
+            fixture.client.panes.lock().unwrap().clear();
+            let path = fixture.root.join("registry/worker/agent.json");
+            let mut record =
+                downgrade_current_record_to_v3(agent::read_private_json(&path).unwrap());
+            record["lifecycle"] = json!("stopped");
+            agent::atomic_json(&path, &record).unwrap();
+            fixture
+                .client
+                .mutate_registry_after_empty_panes
+                .store(mutation, Ordering::Relaxed);
+
+            let error = manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(token),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("changed")
+                    || error.to_string().contains("published directory"),
+                "unexpected mutation result: {error}"
+            );
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -13637,9 +15030,11 @@ mod tests {
                 .unwrap();
             fixture.client.custom_alive.store(false, Ordering::Relaxed);
             let token = started["token"].as_str().unwrap().to_owned();
-            let mut record = manager.load("worker").unwrap();
-            record.lifecycle = "stopped".to_owned();
-            manager.save(&record).unwrap();
+            let path = fixture.root.join("registry/worker/agent.json");
+            let mut record =
+                downgrade_current_record_to_v3(agent::read_private_json(&path).unwrap());
+            record["lifecycle"] = json!("stopped");
+            agent::atomic_json(&path, &record).unwrap();
             if replacement_terminal {
                 fixture.client.panes.lock().unwrap()[0].terminal_id =
                     Some("replacement-terminal".to_owned());
@@ -13706,7 +15101,7 @@ mod tests {
                 true,
             )
             .unwrap();
-            for name in ["agent.json", MANAGED_DEAD_RETIREMENT_FILE] {
+            for name in ["agent.json", TERMINAL_RETIREMENT_FILE] {
                 fs::copy(destination.join(name), replacement.join(name)).unwrap();
             }
             let replace = || {
@@ -13716,9 +15111,9 @@ mod tests {
             let retained = fixture.client.panes.lock().unwrap().clone();
 
             let result = if swap_after_receipt {
-                manager.managed_dead_archive_receipt_with("worker", Some(&token), || {}, replace)
+                manager.terminal_archive_receipt_with("worker", Some(&token), || {}, replace)
             } else {
-                manager.managed_dead_archive_receipt_with("worker", Some(&token), replace, || {})
+                manager.terminal_archive_receipt_with("worker", Some(&token), replace, || {})
             };
 
             assert!(
@@ -13876,7 +15271,7 @@ mod tests {
     #[test]
     fn stop_preserves_a_human_pane_created_after_the_membership_check() {
         let fixture = Fixture::new();
-        fixture.start(None);
+        let started = fixture.start(None);
         fixture
             .client
             .add_sibling_on_read
@@ -13886,6 +15281,82 @@ mod tests {
         assert_eq!(result["tab_closed"], false);
         assert_eq!(*fixture.client.panes.lock().unwrap(), [Fake::pane("human")]);
         assert_eq!(*fixture.client.closed.lock().unwrap(), ["owned"]);
+        let retried = fixture
+            .manager()
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(retried, result);
+    }
+
+    #[test]
+    fn confirmed_missing_pane_stop_is_idempotent() {
+        let fixture = Fixture::new();
+        let started = fixture.start(None);
+        fixture.client.panes.lock().unwrap().clear();
+        let manager = fixture.manager();
+
+        let first = manager.stop("worker").unwrap();
+        let second = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(first["pane_closed"], false);
+        assert_eq!(second, first);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn current_terminal_state_survives_receipt_install_crash_without_reclassification() {
+        let fixture = Fixture::new();
+        let started = fixture.start(None);
+        let token = started["token"].as_str().unwrap().to_owned();
+        let manager = fixture.manager();
+        fixture.client.panes.lock().unwrap().clear();
+        let mut record = manager.load("worker").unwrap();
+        record.lifecycle = "stopped".to_owned();
+        record.terminal =
+            Some(TerminalState::new("managed-dead-closed", json!({"tab_closed": true})).unwrap());
+        manager.save(&record).unwrap();
+        assert!(!fixture
+            .root
+            .join("registry/worker")
+            .join(TERMINAL_RETIREMENT_FILE)
+            .exists());
+
+        let first_observed = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token.clone()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        let retried = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(first_observed["managed_dead"], true);
+        assert_eq!(first_observed["pane_closed"], true);
+        assert_eq!(retried, first_observed);
     }
 
     #[test]
@@ -13900,7 +15371,7 @@ mod tests {
             .stop_with_options(
                 "worker",
                 StopOptions {
-                    expected_token: Some(token),
+                    expected_token: Some(token.clone()),
                     ..StopOptions::default()
                 },
             )
@@ -13911,11 +15382,213 @@ mod tests {
         assert_eq!(stopped["tab_closed"], true);
         assert_eq!(*fixture.client.closed.lock().unwrap(), [pane]);
         let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        let archived_record = agent::read_private_json(&archive.join("agent.json")).unwrap();
+        assert_eq!(archived_record["lifecycle"], "stopped");
+        assert_eq!(archived_record["schema"], SESSION_STORAGE_SCHEMA);
         assert_eq!(
-            agent::read_private_json(&archive.join("agent.json")).unwrap()["lifecycle"],
-            "stopped"
+            archived_record["terminal"],
+            json!({
+                "schema": TERMINAL_STATE_SCHEMA,
+                "outcome": "managed-dead-closed",
+                "evidence": {"tab_closed": true},
+            })
         );
+        let terminal_receipt =
+            agent::read_private_json(&archive.join(TERMINAL_RETIREMENT_FILE)).unwrap();
+        assert_eq!(terminal_receipt["schema"], TERMINAL_RETIREMENT_SCHEMA);
+        assert_eq!(terminal_receipt.as_object().unwrap().len(), 2);
         assert!(archive.join("output.json").is_file());
+        let retried = fixture
+            .manager()
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(retried, stopped);
+    }
+
+    #[test]
+    fn terminal_receipt_outcome_must_match_canonical_state_even_for_same_adapter() {
+        let fixture = Fixture::new();
+        let (_pane, token) = fixture.make_managed_dead();
+        let manager = fixture.manager();
+        let stopped = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token.clone()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        let receipt_path = archive.join(TERMINAL_RETIREMENT_FILE);
+        let record_bytes = fs::read(archive.join("agent.json")).unwrap();
+        let receipt = ManagedAgents::<Fake>::legacy_terminal_retirement_value(
+            &record_bytes,
+            "owned-pane-closed",
+            json!({"tab_closed": true}),
+        )
+        .unwrap();
+        agent::atomic_json(&receipt_path, &receipt).unwrap();
+
+        let error = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("disagrees with canonical terminal state"));
+    }
+
+    #[test]
+    fn ordinary_close_terminal_cannot_be_relabelled_managed_dead() {
+        let fixture = Fixture::new();
+        let started = fixture.start(None);
+        let token = started["token"].as_str().unwrap().to_owned();
+        let manager = fixture.manager();
+        let stopped = manager.stop("worker").unwrap();
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        let record_bytes = fs::read(archive.join("agent.json")).unwrap();
+        let forged = ManagedAgents::<Fake>::legacy_terminal_retirement_value(
+            &record_bytes,
+            "managed-dead-closed",
+            json!({"tab_closed": true}),
+        )
+        .unwrap();
+        agent::atomic_json(&archive.join(TERMINAL_RETIREMENT_FILE), &forged).unwrap();
+
+        let error = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("disagrees with canonical terminal state"));
+    }
+
+    #[test]
+    fn muse_terminal_receipt_cannot_change_preserved_to_absent() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        fixture.client.custom_alive.store(false, Ordering::Relaxed);
+        let token = started["token"].as_str().unwrap().to_owned();
+        let stopped = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token.clone()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        let record_bytes = fs::read(archive.join("agent.json")).unwrap();
+        let forged = ManagedAgents::<Fake>::legacy_terminal_retirement_value(
+            &record_bytes,
+            "custom-runtime-absent",
+            json!({}),
+        )
+        .unwrap();
+        agent::atomic_json(&archive.join(TERMINAL_RETIREMENT_FILE), &forged).unwrap();
+
+        let error = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("disagrees with canonical terminal state"));
+    }
+
+    #[test]
+    fn muse_terminal_receipt_cannot_change_absent_to_preserved() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let started = manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let token = started["token"].as_str().unwrap().to_owned();
+        fixture.client.panes.lock().unwrap().clear();
+        let active = fixture.root.join("registry/worker");
+        let mut legacy = downgrade_current_record_to_v3(
+            agent::read_private_json(&active.join("agent.json")).unwrap(),
+        );
+        legacy["lifecycle"] = json!("stopped");
+        agent::atomic_json(&active.join("agent.json"), &legacy).unwrap();
+        let stopped = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token.clone()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        let archive = PathBuf::from(stopped["archive"].as_str().unwrap());
+        let record_bytes = fs::read(archive.join("agent.json")).unwrap();
+        let forged = ManagedAgents::<Fake>::legacy_terminal_retirement_value(
+            &record_bytes,
+            "managed-dead-preserved",
+            json!({}),
+        )
+        .unwrap();
+        agent::atomic_json(&archive.join(TERMINAL_RETIREMENT_FILE), &forged).unwrap();
+
+        let error = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(token),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("disagrees with canonical terminal state"));
     }
 
     #[test]

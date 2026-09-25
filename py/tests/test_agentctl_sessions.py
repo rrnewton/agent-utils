@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import fcntl
+import errno
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -14,9 +17,12 @@ from typing import cast
 import pytest
 
 from agentctl import cli, mcp, worker_rpc
-from agentctl.client import CustomProcessIdentity, HerdrClient, Pane
+from agentctl.client import (
+    CustomProcessIdentity, HerdrClient, Pane, _bounded_control_command,
+)
 from agentctl.errors import AgentDeliveryError
 from agentctl.foreign import lib as worker_lib
+from agentctl.launch_contract import RuntimeControl, RuntimeLaunchContract
 from agentctl.profiles import validate_muse_headless_arguments
 from agentctl.sessions import Sessions, WorkerRpcError
 from agentctl.subagents import AgentRecord, LaunchSpec
@@ -56,7 +62,7 @@ def runtime_receipt(record: AgentRecord, **values: object) -> dict[str, object]:
     """Build the worker projection from the outer launch authority."""
     result: dict[str, object] = {
         "name": record.name,
-        "owner_token": record.token,
+        "control": RuntimeControl.outer_session(record.token).to_document(),
         "harness": record.launch.harness,
         "cwd": record.launch.cwd,
         "model": record.launch.model,
@@ -65,9 +71,23 @@ def runtime_receipt(record: AgentRecord, **values: object) -> dict[str, object]:
         "tmux_target": "workers:worker",
         "harness_args": record.arguments,
         "codex_bypass_permissions": record.launch.permission_mode == "bypass",
+        "launch": launch_contract(record).to_document(),
     }
     result.update(values)
     return result
+
+
+def launch_contract(record: AgentRecord) -> RuntimeLaunchContract:
+    return RuntimeLaunchContract.create(
+        cwd=record.launch.cwd,
+        harness=record.launch.harness,
+        model=record.launch.model,
+        backend=record.launch.backend,
+        mode=record.launch.mode,
+        harness_args=record.arguments,
+        permission_mode=record.launch.permission_mode or "native",
+        runtime_home=record.launch.runtime_home or "",
+    )
 
 
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, FakeManagedClient, list[str]]:
@@ -78,6 +98,23 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, Fa
 
     def worker(record: AgentRecord, action: str, **options: object) -> dict[str, object]:
         calls.append(action)
+        if action == "stop":
+            assert record.launch.runtime_home is not None
+            return {
+                "record": None,
+                "result": {
+                    "name": record.name,
+                    "killed_window": False,
+                    "archived_to": str(
+                        Path(record.launch.runtime_home)
+                        / "state/_archive" / f"{record.name}-{record.token}"
+                    ),
+                    "state_path": None,
+                    "was_registered": True,
+                    "forced": False,
+                    "unverified_presentation": None,
+                },
+            }
         # Starting the detached runner is asynchronous: its first legitimate
         # response can precede publication of the child PID/starttime.
         identity: dict[str, object] = {} if action == "start" else {
@@ -423,7 +460,7 @@ def test_mcp_routes_into_the_cli_registry_and_honors_its_pause(tmp_path: Path, m
     assert fake.submitted == ["--literal prompt"]
 
 
-def test_headless_herdr_attach_checks_pane_ownership_and_focuses_its_tab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_headless_herdr_attach_focuses_the_runtime_owned_tab_not_a_tui_pane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions, fake, _ = setup(tmp_path, monkeypatch)
     sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
     fake.presentations.append(Pane("w1:headless", "workers:worker", "w1"))
@@ -528,6 +565,120 @@ def test_lost_migration_receipt_reconciles_from_inner_runtime_authority(
     }
 
 
+@pytest.mark.parametrize("reconciliation", ["status", "migrate"])
+def test_worker_receipt_cannot_duplicate_another_native_session(
+    reconciliation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("first", cwd=str(tmp_path), mode="headless")
+    second_dir = sessions.registry / "second"
+    second_dir.mkdir(mode=0o700)
+    second = AgentRecord(
+        "second", "second-generation",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "herdr",
+            None, None, None, ("codex",), (), str(second_dir / "runtime"),
+            "owned", None, permission_mode="native",
+        ),
+        2.0, lifecycle="starting",
+    )
+    sessions._save(second)
+    before = (second_dir / "agent.json").read_bytes()
+    response = {
+        "record": runtime_receipt(
+            second, session_id="native-thread", runner_pid=4242,
+            runner_started_at="9001", runner_identity=RUNNER_IDENTITY_JSON,
+        ),
+        "result": {"agents": [{
+            "name": "second", "status": "idle", "pending": 0,
+            "runner_pid": 4242, "runner_started_at": "9001",
+            "runner_identity": RUNNER_IDENTITY_JSON, "runner_alive": True,
+        }]},
+    }
+
+    if reconciliation == "status":
+        with pytest.raises(AgentDeliveryError, match="already registered"):
+            sessions._sync_worker_record(second, response, promote_running=True)
+    else:
+        monkeypatch.setattr(sessions, "_worker", lambda *_args, **_kwargs: response)
+        with pytest.raises(AgentDeliveryError, match="already registered"):
+            sessions.runtime_operation("second", "migrate", backend="tmux")
+
+    assert (second_dir / "agent.json").read_bytes() == before
+    assert sessions.get("first").session_value == "native-thread"
+    assert sessions.get("second").session_value is None
+
+
+def test_concurrent_worker_receipts_allow_one_native_session_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = tmp_path / "registry"
+    first = Sessions(registry=registry)
+    second = Sessions(registry=registry)
+    records: list[AgentRecord] = []
+    for index, sessions in enumerate((first, second), start=1):
+        name = f"worker-{index}"
+        directory = registry / name
+        directory.mkdir(parents=True, mode=0o700)
+        record = AgentRecord(
+            name, f"generation-{index}",
+            LaunchSpec(
+                "codex", str(tmp_path), "turn-runner", "headless", "herdr",
+                None, None, None, ("codex",), (), str(directory / "runtime"),
+                "owned", None, permission_mode="native",
+            ),
+            float(index), lifecycle="starting",
+        )
+        sessions._save(record)
+        records.append(record)
+
+    rendezvous = threading.Barrier(2)
+    original_save = Sessions._save
+
+    def synchronize_candidate_save(self: Sessions, record: AgentRecord) -> None:
+        if record.session_value == "shared-native-session":
+            try:
+                rendezvous.wait(timeout=0.2)
+            except threading.BrokenBarrierError:
+                pass
+        original_save(self, record)
+
+    monkeypatch.setattr(Sessions, "_save", synchronize_candidate_save)
+    outcomes: list[bool] = []
+    outcome_lock = threading.Lock()
+
+    def reconcile(sessions: Sessions, record: AgentRecord) -> None:
+        response = {
+            "record": runtime_receipt(
+                record, session_id="shared-native-session",
+                runner_pid=4242, runner_started_at="9001",
+                runner_identity=RUNNER_IDENTITY_JSON,
+            ),
+        }
+        try:
+            sessions._sync_worker_record(record, response, promote_running=True)
+        except AgentDeliveryError:
+            success = False
+        else:
+            success = True
+        with outcome_lock:
+            outcomes.append(success)
+
+    threads = [
+        threading.Thread(target=reconcile, args=(sessions, record))
+        for sessions, record in zip((first, second), records, strict=True)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+
+    assert sorted(outcomes) == [False, True]
+    claims = [first.get(record.name).session_value for record in records]
+    assert claims.count("shared-native-session") == 1
+
+
 def test_tui_migration_receipt_replaces_runner_cache_and_drives_attach(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -576,23 +727,40 @@ def test_tui_migration_receipt_replaces_runner_cache_and_drives_attach(
     assert focused == ["w1:tui-tab"]
 
 
-def test_nested_stop_receipt_paths_follow_the_canonical_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_nested_stop_receipt_path_is_derived_from_canonical_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions, _, _ = setup(tmp_path, monkeypatch)
-    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    started = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    token = str(started["token"])
 
     def worker(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
         assert action == "stop" and record.launch.runtime_home
-        archived = Path(record.launch.runtime_home) / "state/_archive/worker"
+        archived = Path(record.launch.runtime_home) / f"state/_archive/worker-{token}"
         archived.mkdir(parents=True)
-        (archived / "turn.log").write_text("completed turn")
-        return {"result": {"archived_to": str(archived), "state_path": str(archived / "turn.log")}}
+        return {
+            "record": None,
+            "result": {
+                "name": "worker", "killed_window": False,
+                "archived_to": str(archived), "state_path": None,
+                "was_registered": True, "forced": False,
+                "unverified_presentation": None,
+            },
+        }
 
     monkeypatch.setattr(sessions, "_worker", worker)
     result = sessions.stop("worker")
     nested = cast(dict[str, object], cast(dict[str, object], result["runtime"])["result"])
     assert Path(str(nested["archived_to"])).is_dir()
-    assert Path(str(nested["state_path"])).read_text() == "completed turn"
+    assert nested["state_path"] is None
     assert Path(str(nested["archived_to"])).is_relative_to(Path(str(result["archive"])))
+    receipt = json.loads(
+        (Path(str(result["archive"])) / "terminal-retirement.json").read_text()
+    )
+    assert set(receipt) == {"schema", "record_sha256"}
+    stopped = json.loads(
+        (Path(str(result["archive"])) / "agent.json").read_text()
+    )
+    assert stopped["terminal"]["outcome"] == "turn-runner-stopped"
+    assert stopped["terminal"]["evidence"] == {"killed_window": False}
 
 
 @pytest.mark.parametrize("liveness", [False, None, "absent"])
@@ -711,27 +879,34 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
     outer = sessions.start_session(
         "worker", cwd=str(tmp_path), mode="headless", backend="tmux",
     )
+    assert sessions.get("worker").launch.runtime_home is not None
+    monkeypatch.setattr(
+        worker_lib, "BASE", Path(cast(str, sessions.get("worker").launch.runtime_home)),
+    )
     inner = worker_lib.AgentRecord(
         name="worker", harness="codex", backend="tmux",
         tmux_target="workers:worker", cwd=str(tmp_path), model=None,
         session_id="native-thread", status="idle", runner_pid=4242,
         runner_started_at="9001", runner_identity=RUNNER_IDENTITY, next_seq=0,
         created_at="2026-09-24T00:00:00+00:00", last_turn_at=None,
-        owner_token=cast(str, outer["token"]),
+        control=RuntimeControl.outer_session(cast(str, outer["token"])),
+        owner_launch=launch_contract(sessions.get("worker")),
     )
     monkeypatch.setattr(worker_lib, "read_registry", lambda: {"worker": inner})
     monkeypatch.setattr(
-        worker_lib, "verify_owner_permission",
-        lambda name, owner_token, permission_mode: (
-            inner if (name, owner_token, permission_mode) == (
-                "worker", outer["token"], "native",
+        worker_lib, "verify_owner_launch",
+        lambda name, owner_token, owner_launch: (
+            inner if (name, owner_token, owner_launch) == (
+                "worker", outer["token"],
+                launch_contract(sessions.get("worker")),
             ) else pytest.fail("unexpected permission verification")
         ),
     )
     monkeypatch.setattr(
         worker_lib, "reconcile_automation_pause",
-        lambda name, owner_token, paused: (
-            None if (name, owner_token, paused) == ("worker", outer["token"], False)
+        lambda record, paused: (
+            None if (record.name, record.owner_token, paused)
+            == ("worker", outer["token"], False)
             else pytest.fail("unexpected pause reconciliation")
         ),
     )
@@ -758,10 +933,10 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
         return worker_rpc.dispatch({
             "schema": "agentctl-worker-rpc/v2",
             "action": action,
-                "name": record.name,
-                "owner_token": record.token,
-                "desired_paused": record.paused,
-                "permission_mode": record.launch.permission_mode,
+            "name": record.name,
+            "owner_token": record.token,
+            "desired_paused": record.paused,
+            "owner_launch": launch_contract(record).to_document(),
         })
 
     monkeypatch.setattr(sessions, "_worker", dispatch)
@@ -861,7 +1036,7 @@ def test_worker_rpc_preserves_typed_remote_error(
         "error": {"code": "unknown_agent", "message": "runner is not alive"},
     }
     monkeypatch.setattr(
-        subprocess, "run",
+        "agentctl.sessions._bounded_control_command",
         lambda *args, **kwargs: CompletedProcess(args[0], 1, json.dumps(response), ""),
     )
     with pytest.raises(WorkerRpcError) as raised:
@@ -869,6 +1044,169 @@ def test_worker_rpc_preserves_typed_remote_error(
     assert raised.value.kind == "runtime-error"
     assert raised.value.remote_code == "unknown_agent"
     assert str(raised.value) == "runner is not alive"
+
+
+def test_worker_start_rpc_contains_one_nested_launch_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    record = AgentRecord(
+        "worker", "generation",
+        LaunchSpec(
+            "muse", str(tmp_path), "turn-runner", "headless", "tmux",
+            "watermelon", None, "watermelon-profile",
+            ("muse", "--reasoning-effort", "xhigh"), (),
+            str(tmp_path / "runtime"), "owned", None,
+            permission_mode="native",
+        ),
+        1.0,
+    )
+    captured: dict[str, object] = {}
+
+    def control(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+        captured.update(kwargs)
+        response = {
+            "schema": "agentctl-worker-rpc/v2", "action": "start",
+            "owner_token": record.token, "ok": True,
+            "payload": {"record": runtime_receipt(record), "result": {}},
+        }
+        return CompletedProcess(command, 0, json.dumps(response), "")
+
+    monkeypatch.setattr("agentctl.sessions._bounded_control_command", control)
+    sessions._worker(record, "start", brief="first task")
+    request = json.loads(cast(str, captured["input_text"]))
+    assert set(request) == {
+        "schema", "action", "name", "owner_token", "desired_paused",
+        "owner_launch", "brief",
+    }
+    assert request["owner_launch"] == launch_contract(record).to_document()
+    assert request["brief"] == "first task"
+    assert captured["stdout_limit"] == 8 << 20
+    assert captured["stderr_limit"] == 64 << 10
+    assert captured["strict_utf8"] is True
+
+
+def test_worker_control_preserves_invalid_utf8_as_a_protocol_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(UnicodeDecodeError):
+        _bounded_control_command(
+            [sys.executable, "-c", "import os; os.write(1, b'{\\\"x\\\":\\\"\\xff\\\"}')"],
+            strict_utf8=True,
+        )
+
+    sessions = Sessions(registry=tmp_path / "registry")
+    record = AgentRecord(
+        "worker", "generation",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "herdr",
+            None, None, None, ("codex",), (), str(tmp_path / "runtime"),
+            "owned", None, permission_mode="native",
+        ),
+        1.0,
+    )
+    monkeypatch.setattr(
+        "agentctl.sessions._bounded_control_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+        ),
+    )
+    with pytest.raises(WorkerRpcError) as raised:
+        sessions._worker(record, "status")
+    assert raised.value.kind == "invalid-receipt"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        '{"schema":"agentctl-worker-rpc/v2","schema":"duplicate"}\n',
+        "[" * 70 + "0" + "]" * 70,
+    ],
+)
+def test_committed_start_with_ambiguous_worker_receipt_stays_reconcilable(
+    stdout: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    monkeypatch.setattr(
+        "agentctl.sessions._bounded_control_command",
+        lambda command, **_kwargs: CompletedProcess(command, 0, stdout, ""),
+    )
+    with pytest.raises(WorkerRpcError) as raised:
+        sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    assert raised.value.kind == "invalid-receipt"
+    saved = sessions.get("worker")
+    assert saved.lifecycle == "starting"
+    assert saved.launch.adapter == "turn-runner"
+
+
+def test_committed_start_with_oversized_worker_output_stays_reconcilable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    monkeypatch.setattr(
+        "agentctl.sessions._bounded_control_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.EFBIG, "worker stdout exceeds bound")
+        ),
+    )
+    with pytest.raises(WorkerRpcError) as raised:
+        sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    assert raised.value.kind == "invalid-receipt"
+    assert sessions.get("worker").lifecycle == "starting"
+
+
+def test_oversized_worker_request_refuses_before_spawning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    record = AgentRecord(
+        "worker", "generation",
+        LaunchSpec(
+            "muse", str(tmp_path), "turn-runner", "headless", "tmux",
+            None, None, None, ("muse", "x" * (1 << 20)), (),
+            str(tmp_path / "runtime"), "owned", None,
+            permission_mode="native",
+        ),
+        1.0,
+    )
+    called = False
+
+    def control(*_args: object, **_kwargs: object) -> CompletedProcess[str]:
+        nonlocal called
+        called = True
+        return CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr("agentctl.sessions._bounded_control_command", control)
+    with pytest.raises(WorkerRpcError, match="request exceeds") as raised:
+        sessions._worker(record, "status")
+    assert raised.value.kind == "request-too-large"
+    assert not called
+
+
+@pytest.mark.parametrize("channel", ["stdout", "stderr"])
+def test_non_start_worker_operation_bounds_all_diagnostic_channels(
+    channel: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    record = AgentRecord(
+        "worker", "generation",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "herdr",
+            None, None, None, ("codex",), (), str(tmp_path / "runtime"),
+            "owned", None, permission_mode="native",
+        ),
+        1.0,
+    )
+
+    def oversized(_command: object, **options: object) -> CompletedProcess[str]:
+        assert options["stdout_limit"] == 8 << 20
+        assert options["stderr_limit"] == 64 << 10
+        raise OSError(errno.EFBIG, f"worker {channel} exceeds bound")
+
+    monkeypatch.setattr("agentctl.sessions._bounded_control_command", oversized)
+    with pytest.raises(WorkerRpcError, match="bounded diagnostic") as raised:
+        sessions._worker(record, "status")
+    assert raised.value.kind == "invalid-receipt"
 
 
 def test_worker_rpc_rejects_a_receipt_for_another_owner_generation(
@@ -890,10 +1228,48 @@ def test_worker_rpc_rejects_a_receipt_for_another_owner_generation(
         "payload": {"record": None, "result": {}},
     }
     monkeypatch.setattr(
-        subprocess, "run",
+        "agentctl.sessions._bounded_control_command",
         lambda *args, **kwargs: CompletedProcess(args[0], 0, json.dumps(response), ""),
     )
     with pytest.raises(WorkerRpcError, match="invalid typed envelope") as raised:
+        sessions._worker(record, "status")
+    assert raised.value.kind == "invalid-receipt"
+
+
+@pytest.mark.parametrize(
+    "returncode,envelope",
+    [
+        (0, {"ok": True, "payload": {}, "error": {"code": "x", "message": "x"}}),
+        (0, {"ok": True, "payload": {}, "extra": True}),
+        (1, {"ok": False, "error": {"code": "x", "message": "x"}, "payload": {}}),
+        (1, {"ok": False, "error": {"code": "x", "message": "x", "extra": True}}),
+    ],
+)
+def test_worker_rpc_rejects_contradictory_or_extended_envelopes(
+    returncode: int, envelope: dict[str, object], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    record = AgentRecord(
+        "worker", "generation",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "herdr",
+            None, None, None, ("codex",), (), str(tmp_path / "runtime"),
+            "owned", None, permission_mode="native",
+        ),
+        1.0,
+    )
+    document = {
+        "schema": "agentctl-worker-rpc/v2", "action": "status",
+        "owner_token": record.token, **envelope,
+    }
+    monkeypatch.setattr(
+        "agentctl.sessions._bounded_control_command",
+        lambda command, **_kwargs: CompletedProcess(
+            command, returncode, json.dumps(document), "",
+        ),
+    )
+    with pytest.raises(WorkerRpcError) as raised:
         sessions._worker(record, "status")
     assert raised.value.kind == "invalid-receipt"
 
@@ -928,7 +1304,9 @@ def test_worker_receipt_validation_is_atomic_before_outer_state_mutation(
     elif mutation == "runner":
         runtime["runner_started_at"] = "replacement"
     else:
-        runtime["codex_bypass_permissions"] = True
+        runtime["launch"] = replace(
+            launch_contract(record), permission_mode="bypass",
+        ).to_document()
     before = record.to_document()
 
     with pytest.raises(AgentDeliveryError, match="invalid|contradictory|disagrees"):
@@ -1051,11 +1429,17 @@ def test_lost_stop_receipt_reconciles_inner_and_outer_generation(
     worker_lib.ensure_agent_dirs("worker")
     with worker_lib.registry_lock() as agents:
         agents["worker"] = worker_lib.AgentRecord(
-            name="worker", harness="agy", backend="tmux",
-            tmux_target="subagents:worker", cwd=str(tmp_path), model=None,
+            name="worker", harness=outer.launch.harness,
+            backend=outer.launch.backend,
+            tmux_target="subagents:worker", cwd=str(tmp_path),
+            model=outer.launch.model,
             session_id=None, status="idle", runner_pid=None,
             runner_started_at=None, next_seq=0, created_at=worker_lib.now_iso(),
-            last_turn_at=None, owner_token=str(started["token"]),
+            last_turn_at=None, mode="headless",
+            codex_bypass_permissions=False,
+            harness_args=tuple(outer.arguments),
+            control=RuntimeControl.outer_session(str(started["token"])),
+            owner_launch=launch_contract(outer),
         )
     monkeypatch.setattr(worker_lib, "window_exists", lambda _rec: False)
     attempts = 0
@@ -1068,6 +1452,7 @@ def test_lost_stop_receipt_reconciles_inner_and_outer_generation(
             "schema": "agentctl-worker-rpc/v2", "action": "stop",
             "name": record.name, "owner_token": record.token,
             "desired_paused": record.paused,
+            "owner_launch": launch_contract(record).to_document(),
         })
         if attempts == 1:
             raise WorkerRpcError("timeout", "committed stop receipt was lost")
@@ -1119,6 +1504,84 @@ def test_lost_outer_stop_receipt_reconciles_exact_archived_generation(
     assert json.loads((destination / "agent.json").read_text())["lifecycle"] == "stopped"
 
 
+def test_stopped_turn_runner_receipt_completes_publication_without_second_rpc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, calls = setup(tmp_path, monkeypatch)
+    started = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    token = str(started["token"])
+    publish = sessions._publish_pinned_directory
+
+    def fail_before_publish(*_args: object, **_kwargs: object) -> None:
+        raise AgentDeliveryError("injected pre-publication failure")
+
+    monkeypatch.setattr(sessions, "_publish_pinned_directory", fail_before_publish)
+    with pytest.raises(AgentDeliveryError, match="pre-publication"):
+        sessions.stop("worker", expected_token=token)
+    active = sessions.registry / "worker"
+    assert json.loads((active / "agent.json").read_text())["lifecycle"] == "stopped"
+    assert (active / "terminal-retirement.json").is_file()
+    assert calls.count("stop") == 1
+
+    def no_second_rpc(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("terminal receipt recovery re-ran the worker stop")
+
+    monkeypatch.setattr(sessions, "_publish_pinned_directory", publish)
+    monkeypatch.setattr(sessions, "_worker", no_second_rpc)
+    recovered = sessions.stop("worker", expected_token=token)
+
+    assert Path(str(recovered["archive"])).is_dir()
+    assert not active.exists()
+    assert calls.count("stop") == 1
+
+
+def test_active_legacy_turn_runner_receipt_migrates_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    started = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    token = str(started["token"])
+    active = sessions.registry / "worker"
+    stored = json.loads((active / "agent.json").read_text(encoding="utf-8"))
+    assert stored.pop("terminal") is None
+    stored["schema"] = "agentctl-session/v3"
+    stored["lifecycle"] = "stopped"
+    (active / "agent.json").write_text(json.dumps(stored), encoding="utf-8")
+    destination = sessions.registry / "archive" / f"worker-{token}"
+    runtime_archive = destination / "runtime/state/_archive" / f"worker-{token}"
+    runtime = {
+        "record": None,
+        "result": {
+            "name": "worker", "killed_window": False,
+            "archived_to": str(runtime_archive), "state_path": None,
+            "was_registered": True, "forced": False,
+            "unverified_presentation": None,
+        },
+    }
+    legacy = {
+        "schema": "agentctl-session-stop/v1",
+        "name": "worker", "token": token,
+        "record_sha256": hashlib.sha256((active / "agent.json").read_bytes()).hexdigest(),
+        "result": {"name": "worker", "archive": str(destination), "runtime": runtime},
+    }
+    (active / "stop-result.json").write_text(
+        json.dumps(legacy), encoding="utf-8",
+    )
+    (active / "stop-result.json").chmod(0o600)
+
+    monkeypatch.setattr(
+        sessions, "_worker",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy terminal receipt re-ran the worker stop")
+        ),
+    )
+    result = sessions.stop("worker", expected_token=token)
+
+    assert result["archive"] == str(destination)
+    assert (destination / "terminal-retirement.json").is_file()
+    assert not active.exists()
+
+
 def test_outer_stop_reconciliation_requires_exact_token_and_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1133,11 +1596,35 @@ def test_outer_stop_reconciliation_requires_exact_token_and_receipt(
     with pytest.raises(AgentDeliveryError, match="inspect archived agent generation"):
         sessions.stop("worker", expected_token="b" * 32)
 
-    receipt = json.loads((destination / "stop-result.json").read_text())
-    receipt["token"] = "c" * 32
-    (destination / "stop-result.json").write_text(json.dumps(receipt), encoding="utf-8")
-    with pytest.raises(AgentDeliveryError, match="does not match"):
+    receipt = json.loads((destination / "terminal-retirement.json").read_text())
+    receipt["record_sha256"] = "c" * 64
+    (destination / "terminal-retirement.json").write_text(
+        json.dumps(receipt), encoding="utf-8",
+    )
+    with pytest.raises(AgentDeliveryError, match="disagrees"):
         sessions.stop("worker", expected_token=token)
+
+
+def test_python_sessions_reconciles_managed_dead_retirement_after_lost_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    started = sessions.start_session(
+        "worker", cwd=str(tmp_path), harness="muse", mode="interactive",
+        workspace_id="w1",
+    )
+    fake.custom_running = False
+    token = str(started["token"])
+
+    first = sessions.stop("worker", expected_token=token)
+    retained = list(fake.presentations)
+    second = sessions.stop("worker", expected_token=token)
+
+    assert second == first
+    assert second["managed_dead"] is True
+    assert second["runtime_preserved"] is True
+    assert fake.presentations == retained
+    assert fake.closed == []
 
 
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -1.0, 31_536_001.0])

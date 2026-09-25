@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from agentctl.errors import HerdrUnavailable
+from agentctl.errors import HerdrUnavailable, RuntimeIdentityMismatch
 from agentctl.jsonx import as_mapping, as_sequence, get_int, get_str, opt_str
 
 __all__ = [
@@ -476,6 +476,10 @@ def _bounded_control_command(
     *,
     environ: Mapping[str, str] | None = None,
     timeout: float = CONTROL_TIMEOUT_SECONDS,
+    input_text: str | None = None,
+    stdout_limit: int = _CONTROL_STDOUT_BYTES,
+    stderr_limit: int = _CONTROL_STDERR_BYTES,
+    strict_utf8: bool = False,
 ) -> "subprocess.CompletedProcess[str]":
     """Capture one control command and kill its whole process group on timeout.
 
@@ -485,36 +489,74 @@ def _bounded_control_command(
     could leave an unbounded helper behind or block forever waiting for its inherited pipe ends.
     """
     argv = list(command)
-    process = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=None if environ is None else dict(environ),
-        start_new_session=True,
+    process = (
+        subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=None if environ is None else dict(environ),
+            start_new_session=True,
+        )
+        if input_text is None else
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=None if environ is None else dict(environ),
+            start_new_session=True,
+        )
     )
     assert process.stdout is not None and process.stderr is not None
     stdout_content = bytearray()
     stderr_content = bytearray()
     streams = {
         process.stdout.fileno(): (
-            process.stdout, stdout_content, _CONTROL_STDOUT_BYTES, "stdout",
+            process.stdout, stdout_content, stdout_limit, "stdout",
         ),
         process.stderr.fileno(): (
-            process.stderr, stderr_content, _CONTROL_STDERR_BYTES, "stderr",
+            process.stderr, stderr_content, stderr_limit, "stderr",
         ),
     }
+    input_content = b"" if input_text is None else input_text.encode("utf-8")
+    input_offset = 0
+    input_descriptor: int | None = None
     poller = select.poll()
     for descriptor in streams:
         os.set_blocking(descriptor, False)
         poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+    if process.stdin is not None:
+        input_descriptor = process.stdin.fileno()
+        os.set_blocking(input_descriptor, False)
+        poller.register(
+            input_descriptor,
+            select.POLLOUT | select.POLLHUP | select.POLLERR,
+        )
     deadline = time.monotonic() + timeout
     try:
-        while streams:
+        while streams or input_descriptor is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(argv, timeout)
             events = poller.poll(max(1, min(10, int(remaining * 1000))))
             for descriptor, _event in events:
+                if descriptor == input_descriptor:
+                    assert process.stdin is not None
+                    try:
+                        if input_offset < len(input_content):
+                            input_offset += os.write(
+                                descriptor,
+                                input_content[input_offset: input_offset + (64 << 10)],
+                            )
+                        if input_offset == len(input_content):
+                            poller.unregister(descriptor)
+                            process.stdin.close()
+                            input_descriptor = None
+                    except BrokenPipeError:
+                        poller.unregister(descriptor)
+                        process.stdin.close()
+                        input_descriptor = None
+                    continue
                 stream = streams.get(descriptor)
                 if stream is None:
                     continue
@@ -554,15 +596,16 @@ def _bounded_control_command(
             pass
         finally:
             process.kill()
-            for pipe in (process.stdout, process.stderr):
-                pipe.close()
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None and not pipe.closed:
+                    pipe.close()
             process.wait()
         raise
     return subprocess.CompletedProcess(
         argv,
         returncode,
-        stdout_content.decode("utf-8", errors="replace"),
-        stderr_content.decode("utf-8", errors="replace"),
+        stdout_content.decode("utf-8", errors="strict" if strict_utf8 else "replace"),
+        stderr_content.decode("utf-8", errors="strict" if strict_utf8 else "replace"),
     )
 
 
@@ -1344,7 +1387,7 @@ class HerdrClient:
         """
         info = self.process_info(pane_id, timeout=timeout)
         if info.shell_pid != expected.pid:
-            raise HerdrUnavailable(
+            raise RuntimeIdentityMismatch(
                 f"recorded pane shell generation changed for pane {pane_id}"
             )
         observed = self._process_identity(info.shell_pid)
@@ -1353,7 +1396,7 @@ class HerdrClient:
                 f"cannot verify recorded pane shell generation for pane {pane_id}"
             )
         if observed[0] != expected:
-            raise HerdrUnavailable(
+            raise RuntimeIdentityMismatch(
                 f"recorded pane shell generation changed for pane {pane_id}"
             )
 

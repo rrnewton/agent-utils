@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import errno
 import os
 import subprocess
 import sys
@@ -12,24 +13,44 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import cast
 
 from agentctl import agent
 from agentctl.client import HerdrClient, _bounded_control_command
 from agentctl.client import CustomProcessIdentity
 from agentctl.errors import AgentDeliveryError, HerdrRunError
+from agentctl.launch_contract import (
+    OUTER_SESSION_CONTROL,
+    RuntimeControl,
+    RuntimeLaunchContract,
+)
 from agentctl.jsonx import as_mapping
 from agentctl.profiles import (
     reasoning_arguments,
     validate_muse_headless_arguments,
     validate_structured_harness_argument_conflicts,
 )
-from agentctl.subagents import AgentRecord, LaunchSpec, ManagedAgents, _name
+from agentctl.subagents import (
+    AgentRecord,
+    LaunchSpec,
+    ManagedAgents,
+    TerminalState,
+    _MAX_TERMINAL_RETIREMENT_BYTES,
+    _PinnedAgentDirectory,
+    _TERMINAL_RETIREMENT_FILE,
+    _name,
+)
 
 _WORKER_RPC_SCHEMA = "agentctl-worker-rpc/v2"
 _RUNNER_LIVENESS_SCHEMA = "agentctl-runner-liveness/v1"
+# Decode-only compatibility for terminal receipts written before the shared
+# retirement protocol became the sole current writer.
 _STOP_RESULT_SCHEMA = "agentctl-session-stop/v1"
 _STOP_RESULT_FILE = "stop-result.json"
 _MAX_STOP_RESULT_BYTES = 1 << 20
+_MAX_WORKER_REQUEST_BYTES = 1 << 20
+_MAX_WORKER_RESPONSE_BYTES = 8 << 20
+_MAX_WORKER_STDERR_BYTES = 64 << 10
 
 
 def _headless_permission_mode(harness: str) -> str:
@@ -43,6 +64,20 @@ def _headless_permission_mode(harness: str) -> str:
             "(native permissions) or 1 (bypass approvals and sandbox)"
         )
     return "bypass" if raw == "1" else "native"
+
+
+def _runtime_launch_contract(record: AgentRecord) -> RuntimeLaunchContract:
+    """Project the canonical outer LaunchSpec into the worker boundary schema."""
+    return RuntimeLaunchContract.create(
+        cwd=record.launch.cwd,
+        harness=record.launch.harness,
+        model=record.launch.model,
+        backend=record.launch.backend,
+        mode=record.launch.mode,
+        harness_args=record.arguments,
+        permission_mode=record.launch.permission_mode or "native",
+        runtime_home=record.launch.runtime_home or "",
+    )
 
 
 def _runner_identity(value: object) -> CustomProcessIdentity | None:
@@ -88,31 +123,29 @@ class WorkerRuntimeEvidence:
         cls, record: AgentRecord, response: dict[str, object],
     ) -> WorkerRuntimeEvidence:
         runtime = as_mapping(response.get("record"), "runtime record")
-        if runtime.get("owner_token") != record.token:
+        try:
+            control = RuntimeControl.from_document(runtime.get("control"))
+        except ValueError as exc:
+            raise AgentDeliveryError(
+                f"worker runtime returned invalid control authority: {exc}"
+            ) from exc
+        if control.kind != OUTER_SESSION_CONTROL or control.generation != record.token:
             raise AgentDeliveryError(
                 "worker runtime belongs to another session generation"
             )
-        immutable = {
-            "name": record.name,
-            "harness": record.launch.harness,
-            "cwd": record.launch.cwd,
-            "model": record.launch.model,
-        }
-        runtime_args = runtime.get("harness_args")
-        if (any(runtime.get(key) != value for key, value in immutable.items())
-                or not isinstance(runtime_args, (list, tuple))
-                or list(runtime_args) != record.arguments
-                or any(not isinstance(value, str) for value in runtime_args)):
+        expected_launch = _runtime_launch_contract(record)
+        try:
+            observed_launch = RuntimeLaunchContract.from_document(
+                runtime.get("launch")
+            )
+        except ValueError as exc:
+            raise AgentDeliveryError(
+                f"worker runtime returned an invalid owner launch: {exc}"
+            ) from exc
+        if runtime.get("name") != record.name or observed_launch != expected_launch:
             raise AgentDeliveryError(
                 "worker runtime launch receipt disagrees with canonical launch intent"
             )
-        if record.launch.permission_mode is not None:
-            bypass = runtime.get("codex_bypass_permissions")
-            if (not isinstance(bypass, bool)
-                    or bypass != (record.launch.permission_mode == "bypass")):
-                raise AgentDeliveryError(
-                    "worker runtime permission policy disagrees with canonical launch intent"
-                )
         backend = runtime.get("backend")
         mode = runtime.get("mode")
         target = runtime.get("tmux_target")
@@ -175,6 +208,7 @@ class Sessions(ManagedAgents):
             raise AgentDeliveryError("turn-runner session has no runtime directory")
         environment = dict(os.environ)
         environment["HERDR_SUBAGENTS_HOME"] = record.launch.runtime_home
+        owner_launch = _runtime_launch_contract(record)
         command = [sys.executable, str(Path(__file__).with_name("worker_rpc.py"))]
         # The adapter process may be interrupted after committing a request. Keep
         # its canonical record and report uncertainty rather than retrying it.
@@ -188,42 +222,57 @@ class Sessions(ManagedAgents):
                 raise AgentDeliveryError(
                     "turn-runner start options must derive from the canonical launch specification"
                 )
-            options = {
-                "cwd": record.launch.cwd,
-                "harness": record.launch.harness,
-                "model": record.launch.model,
-                "backend": record.launch.backend,
-                "brief": brief,
-                "harness_args": record.arguments,
-            }
+            options = {"brief": brief}
         timeout = 900.0 if action == "migrate" else 90.0
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise WorkerRpcError("deadline", f"runtime {action} probe deadline expired")
             timeout = min(timeout, remaining)
+        request = json.dumps({
+            "schema": _WORKER_RPC_SCHEMA,
+            "action": action,
+            "name": record.name,
+            "owner_token": record.token,
+            "desired_paused": record.paused,
+            "owner_launch": owner_launch.to_document(),
+            **options,
+        }, separators=(",", ":"))
+        if len(request.encode("utf-8")) > _MAX_WORKER_REQUEST_BYTES:
+            raise WorkerRpcError("request-too-large", "runtime request exceeds its byte limit")
         try:
-            completed = subprocess.run(command,
-                input=json.dumps({
-                    "schema": _WORKER_RPC_SCHEMA,
-                    "action": action,
-                    "name": record.name,
-                    "owner_token": record.token,
-                    "desired_paused": record.paused,
-                    "permission_mode": record.launch.permission_mode,
-                    **options,
-                }),
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                env=environment, timeout=timeout)
+            completed = _bounded_control_command(
+                command,
+                input_text=request,
+                environ=environment,
+                timeout=timeout,
+                stdout_limit=_MAX_WORKER_RESPONSE_BYTES,
+                stderr_limit=_MAX_WORKER_STDERR_BYTES,
+                strict_utf8=True,
+            )
         except subprocess.TimeoutExpired as exc:
             raise WorkerRpcError(
                 "timeout", f"runtime {action} timed out; inspect session state before retrying",
             ) from exc
+        except UnicodeError as exc:
+            raise WorkerRpcError(
+                "invalid-receipt", f"runtime {action} returned non-UTF-8 diagnostics",
+            ) from exc
         except OSError as exc:
+            if exc.errno == errno.EFBIG:
+                raise WorkerRpcError(
+                    "invalid-receipt",
+                    f"runtime {action} exceeded its bounded diagnostic channel",
+                ) from exc
             raise WorkerRpcError("transport", f"runtime {action} transport failed: {exc}") from exc
         try:
-            envelope = as_mapping(json.loads(completed.stdout), "runtime response")
-        except (ValueError, TypeError) as exc:
+            envelope = as_mapping(
+                agent._decode_json_bytes(
+                    completed.stdout.encode("utf-8"), "runtime response", "<worker stdout>",
+                ),
+                "runtime response",
+            )
+        except (AgentDeliveryError, ValueError, TypeError) as exc:
             raise WorkerRpcError(
                 "invalid-receipt",
                 f"runtime {action} returned no valid receipt: {completed.stderr.strip()}",
@@ -237,7 +286,13 @@ class Sessions(ManagedAgents):
             )
         if completed.returncode:
             try:
+                if set(envelope) != {
+                    "schema", "action", "owner_token", "ok", "error",
+                }:
+                    raise TypeError("invalid typed runtime error fields")
                 error = as_mapping(envelope.get("error"), "runtime error")
+                if set(error) != {"code", "message"}:
+                    raise TypeError("invalid typed runtime error payload")
                 code = error.get("code")
                 message = error.get("message")
                 if (envelope.get("ok") is not False or not isinstance(code, str) or not code
@@ -251,6 +306,12 @@ class Sessions(ManagedAgents):
         if envelope.get("ok") is not True:
             raise WorkerRpcError(
                 "invalid-receipt", f"runtime {action} returned failure with exit status zero",
+            )
+        if set(envelope) != {
+            "schema", "action", "owner_token", "ok", "payload",
+        }:
+            raise WorkerRpcError(
+                "invalid-receipt", f"runtime {action} returned invalid success fields",
             )
         try:
             return as_mapping(envelope.get("payload"), "runtime payload")
@@ -390,24 +451,50 @@ class Sessions(ManagedAgents):
 
     def _sync_worker_record(
         self, record: AgentRecord, response: dict[str, object], *, save: bool = True,
+        promote_running: bool = False,
     ) -> WorkerRuntimeEvidence:
         evidence = WorkerRuntimeEvidence.parse(record, response)
-        # Publish only compatibility caches derived from the typed inner
-        # authority. LaunchSpec remains immutable startup intent.
-        record.session_value = evidence.session_id
-        record.session_agent = (
-            record.launch.harness if evidence.session_id is not None else None
-        )
-        record.session_source = (
-            "observed" if evidence.session_id is not None else None
-        )
-        record.pane_id = evidence.pane_id
-        if evidence.mode == "tui":
-            record.set_runner_identity(None)
-        elif evidence.runner_identity is not None:
-            record.set_runner_identity(evidence.runner_identity)
-        if save:
-            self._save(record)
+
+        def apply(target: AgentRecord) -> None:
+            # Publish only compatibility caches derived from the typed inner
+            # authority. LaunchSpec remains immutable startup intent.
+            target.session_value = evidence.session_id
+            target.session_agent = (
+                target.launch.harness if evidence.session_id is not None else None
+            )
+            target.session_source = (
+                "observed" if evidence.session_id is not None else None
+            )
+            target.pane_id = evidence.pane_id
+            if evidence.mode == "tui":
+                target.set_runner_identity(None)
+            elif evidence.runner_identity is not None:
+                target.set_runner_identity(evidence.runner_identity)
+            if promote_running:
+                target.lifecycle = "running"
+                target.error = None
+
+        if not save:
+            apply(record)
+            return evidence
+        with self._identity_transaction():
+            current = self._load_expected(record.name, record.token)
+            if current.to_storage_document() != record.to_storage_document():
+                raise AgentDeliveryError(
+                    "session record changed before worker evidence commit"
+                )
+            if evidence.session_id is not None:
+                owner = self._identity_owner(
+                    record.launch.harness, evidence.session_id,
+                    exclude=record.name,
+                )
+                if owner is not None:
+                    raise AgentDeliveryError(
+                        f"native session is already registered as {owner.name!r}"
+                    )
+            apply(current)
+            self._save(current)
+            apply(record)
         return evidence
 
     @staticmethod
@@ -506,13 +593,14 @@ class Sessions(ManagedAgents):
                         or live_runtime_observation or current_tui)
                         and record.launch.runtime_ownership == "owned"
                         and record.launch.runtime_home == expected_runtime_home):
-                    self._sync_worker_record(record, response, save=False)
-                    if (record.lifecycle == "starting"
+                    self._sync_worker_record(
+                        record, response,
+                        promote_running=(
+                            record.lifecycle == "starting"
                             and observation is not None
-                            and observation[1] is True):
-                        record.lifecycle = "running"
-                        record.error = None
-                    self._save(record)
+                            and observation[1] is True
+                        ),
+                    )
                     if evidence.mode == "headless":
                         liveness, liveness_error = self._runner_liveness(
                             record, response,
@@ -575,7 +663,7 @@ class Sessions(ManagedAgents):
             if row.get("runner_alive") is False or row.get("window_alive") is False:
                 return "unhealthy", "runtime-not-live", "worker TUI is not live"
             if row.get("runner_alive") is True and row.get("window_alive") is True:
-                return "healthy", "ok", "token-bound worker TUI is live"
+                return "healthy", "ok", "worker TUI presentation is live"
             return "unknown", "runtime-liveness-unconfirmed", (
                 "worker TUI status did not confirm process and pane liveness"
             )
@@ -689,6 +777,34 @@ class Sessions(ManagedAgents):
                         "session adapter changed before token-bound stop"
                     )
                 current = current_snapshot.record
+                if current.lifecycle == "stopped":
+                    receipt = self._read_terminal_retirement(
+                        pinned, current, current_snapshot.content,
+                    )
+                    if receipt is None:
+                        receipt = self._read_legacy_terminal_receipt(
+                            pinned, current, current_snapshot.content, destination,
+                        )
+                        if receipt is not None:
+                            current.terminal = receipt
+                            current._legacy_terminal_authority = False
+                            migrated_bytes = agent._json_text(
+                                current.to_storage_document()
+                            ).encode("utf-8")
+                            self._atomic_snapshot_bytes(
+                                pinned, migrated_bytes, name="agent.json",
+                            )
+                            self._atomic_snapshot_bytes(
+                                pinned,
+                                agent._json_text(
+                                    self._terminal_retirement_document(migrated_bytes)
+                                ).encode("utf-8"),
+                                name=_TERMINAL_RETIREMENT_FILE,
+                            )
+                    if receipt is not None:
+                        return self._complete_terminal_publication(
+                            current, pinned=pinned, expected_token=current.token,
+                        )
                 current.lifecycle = "stopping"
                 current.error = None
                 self._atomic_snapshot_bytes(
@@ -709,43 +825,53 @@ class Sessions(ManagedAgents):
                         name="agent.json",
                     )
                     raise
+                runtime = _relocate_receipt_paths(
+                    result, self._directory(name), destination,
+                )
+                evidence = self._turn_runner_retirement_evidence(
+                    current, destination, runtime,
+                )
                 current.lifecycle = "stopped"
                 current.error = None
+                current.terminal = TerminalState.create(
+                    "turn-runner-stopped", evidence,
+                )
+                current._legacy_terminal_authority = False
                 stopped_bytes = agent._json_text(
                     current.to_storage_document()
                 ).encode("utf-8")
                 self._atomic_snapshot_bytes(
                     pinned, stopped_bytes, name="agent.json",
                 )
-                response: dict[str, object] = {
-                    "name": name,
-                    "archive": str(destination),
-                    "runtime": _relocate_receipt_paths(
-                        result, self._directory(name), destination,
-                    ),
-                }
-                receipt: dict[str, object] = {
-                    "schema": _STOP_RESULT_SCHEMA,
-                    "name": name,
-                    "token": current.token,
-                    "record_sha256": hashlib.sha256(stopped_bytes).hexdigest(),
-                    "result": response,
-                }
+                receipt = self._terminal_retirement_document(stopped_bytes)
                 receipt_bytes = agent._json_text(receipt).encode("utf-8")
-                if len(receipt_bytes) > _MAX_STOP_RESULT_BYTES:
+                if len(receipt_bytes) > _MAX_TERMINAL_RETIREMENT_BYTES:
                     raise AgentDeliveryError(
-                        f"stop result exceeds {_MAX_STOP_RESULT_BYTES} bytes"
+                        "terminal retirement receipt exceeds "
+                        f"{_MAX_TERMINAL_RETIREMENT_BYTES} bytes"
                     )
                 self._atomic_snapshot_bytes(
-                    pinned, receipt_bytes, name=_STOP_RESULT_FILE,
+                    pinned, receipt_bytes, name=_TERMINAL_RETIREMENT_FILE,
                 )
                 self._publish_pinned_directory(
                     pinned, destination, expected_record=stopped_bytes,
                 )
-                return response
+                return self._terminal_retirement_result(
+                    current, destination,
+                    cast(TerminalState, current.terminal),
+                )
 
     def _completed_stop(self, name: str, expected_token: str) -> dict[str, object]:
-        """Read the exact terminal receipt for one already-published generation."""
+        """Read a current terminal receipt, or a decode-only legacy receipt."""
+        current = self._terminal_archive_receipt(name, expected_token)
+        if current is not None:
+            return current
+        return self._legacy_completed_stop(name, expected_token)
+
+    def _legacy_completed_stop(
+        self, name: str, expected_token: str,
+    ) -> dict[str, object]:
+        """Decode one pre-shared-protocol turn-runner stop receipt."""
         _name(name)
         if not expected_token or any(
             character not in "0123456789abcdefghijklmnopqrstuvwxyz-"
@@ -766,13 +892,29 @@ class Sessions(ManagedAgents):
                 raise AgentDeliveryError(
                     "archived stop receipt does not match the requested runtime generation"
                 )
-            record_bytes = agent._json_text(
-                record.to_storage_document()
-            ).encode("utf-8")
-            receipt_bytes = self._pinned_artifact_bytes(
-                pinned, name=_STOP_RESULT_FILE, limit=_MAX_STOP_RESULT_BYTES,
-                purpose="session stop result",
+            receipt = self._read_legacy_terminal_receipt(
+                pinned, record, snapshot.content, destination,
             )
+            if receipt is None:
+                raise AgentDeliveryError(
+                    "archived stop receipt does not match the requested runtime generation"
+                )
+            self._verify_pinned_agent_directory(pinned)
+        return self._terminal_retirement_result(record, destination, receipt)
+
+    def _read_legacy_terminal_receipt(
+        self, pinned: _PinnedAgentDirectory, record: AgentRecord, record_bytes: bytes,
+        destination: Path,
+    ) -> TerminalState | None:
+        """Decode a pre-shared-protocol stop result into the canonical outcome."""
+        if not self._retirement_artifact_exists(
+            pinned, _STOP_RESULT_FILE, purpose="legacy session stop result",
+        ):
+            return None
+        receipt_bytes = self._pinned_artifact_bytes(
+            pinned, name=_STOP_RESULT_FILE, limit=_MAX_STOP_RESULT_BYTES,
+            purpose="legacy session stop result",
+        )
         try:
             value = json.loads(
                 receipt_bytes.decode("utf-8"),
@@ -789,15 +931,25 @@ class Sessions(ManagedAgents):
         }:
             raise AgentDeliveryError("session stop result has an invalid shape")
         if (value.get("schema") != _STOP_RESULT_SCHEMA
-                or value.get("name") != name or value.get("token") != expected_token
+                or value.get("name") != record.name
+                or value.get("token") != record.token
                 or value.get("record_sha256") != hashlib.sha256(record_bytes).hexdigest()):
             raise AgentDeliveryError(
                 "session stop result does not match the archived generation"
             )
         result = as_mapping(value.get("result"), "session stop result payload")
-        if result.get("name") != name or result.get("archive") != str(destination):
+        if result.get("name") != record.name or result.get("archive") != str(destination):
             raise AgentDeliveryError("session stop result payload is inconsistent")
-        return dict(result)
+        runtime = result.get("runtime")
+        evidence = self._turn_runner_retirement_evidence(
+            record, destination, runtime,
+        )
+        terminal = TerminalState.create(
+            "turn-runner-stopped", evidence,
+        )
+        # Reuse the current strict result validator before migration/publication.
+        self._terminal_retirement_result(record, destination, terminal)
+        return terminal
 
     def pause(self, name: str, *, paused: bool = True) -> dict[str, object]:
         """Hand off input after in-flight work; preserve the running conversation."""

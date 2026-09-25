@@ -17,7 +17,8 @@ from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
-from agentctl.sessions import Sessions
+from agentctl.launch_contract import RuntimeControl
+from agentctl.sessions import Sessions, _runtime_launch_contract
 from agentctl.subagents import AgentRecord, LaunchSpec
 import agentctl.codex_goal as native_goal
 from .test_herdr_subagents import FakeManagedClient
@@ -139,6 +140,9 @@ def test_stop_unregisters_foreign_agent_without_closing_or_mutating_runtime(
     assert saved["token"] == original["token"]
     assert (archive / "output.json").is_file()
     assert list((archive / "queue/processed").iterdir())
+    assert sessions.stop(
+        "foreign", expected_token=str(original["token"]),
+    ) == stopped
 
 
 def test_stop_unregisters_confirmed_dead_foreign_agent_without_closing_shell(
@@ -1299,8 +1303,10 @@ def test_headless_start_stops_runtime_if_session_is_claimed_by_adopted_agent(
             "mode": "headless", "backend": "tmux",
             "harness_args": record.arguments,
             "codex_bypass_permissions": False,
-            "tmux_target": "workers:headless", "presentation_pane": None,
-            "session_id": "native-session", "owner_token": record.token,
+                "control": RuntimeControl.outer_session(record.token).to_document(),
+                "launch": _runtime_launch_contract(record).to_document(),
+                "tmux_target": "workers:headless", "presentation_pane": None,
+                "session_id": "native-session",
         }, "result": {}}
 
     monkeypatch.setattr(sessions, "_worker", worker)

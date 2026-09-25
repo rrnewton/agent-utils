@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -44,7 +44,12 @@ from agentctl.client import (
     muse_startup_metadata,
     muse_trust_prompt,
 )
-from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable
+from agentctl.errors import (
+    AgentDeliveryError,
+    HerdrRunError,
+    HerdrUnavailable,
+    RuntimeIdentityMismatch,
+)
 from agentctl.profiles import (
     reasoning_arguments,
     validate_structured_harness_argument_conflicts,
@@ -59,17 +64,23 @@ _MAX_U64 = (1 << 64) - 1
 _MAX_PROCESS_ID = (1 << 31) - 1
 _MAX_AGENT_RECORD_BYTES = 1 << 20
 _MAX_SNAPSHOT_BYTES = 16 << 20
+_MAX_TERMINAL_RETIREMENT_BYTES = _MAX_AGENT_RECORD_BYTES
 _MAX_QUEUE_ARTIFACT_BYTES = 16 << 20
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _HEALTH_SCHEMA = "agentctl-health/v1"
 _HEALTH_PROBE_SECONDS = 60.0
-_SESSION_STORAGE_SCHEMA = "agentctl-session/v3"
+_SESSION_STORAGE_SCHEMA = "agentctl-session/v4"
+_PREVIOUS_SESSION_STORAGE_SCHEMA = "agentctl-session/v3"
 _LEGACY_SESSION_STORAGE_SCHEMA = "agentctl-session/v2"
 _LAUNCH_SPEC_SCHEMA = "agentctl-launch/v2"
 _LEGACY_LAUNCH_SPEC_SCHEMA = "agentctl-launch/v1"
 _GOAL_STATE_SCHEMA = "agentctl-goal/v1"
 _GOAL_TRANSACTION_SCHEMA = "agentctl-goal-transaction/v1"
 _GOAL_TRANSACTION_FILE = "goal-transaction.json"
+_TERMINAL_STATE_SCHEMA = "agentctl-terminal-state/v1"
+_TERMINAL_RETIREMENT_SCHEMA = "agentctl-terminal-retirement/v2"
+_LEGACY_TERMINAL_RETIREMENT_SCHEMA = "agentctl-terminal-retirement/v1"
+_TERMINAL_RETIREMENT_FILE = "terminal-retirement.json"
 _MANAGED_DEAD_RETIREMENT_SCHEMA = "agentctl-managed-dead-retirement/v1"
 _MANAGED_DEAD_RETIREMENT_FILE = "managed-dead-retirement.json"
 _NATIVE_SESSION_SCHEMA = "agentctl-native-session/v1"
@@ -82,6 +93,13 @@ _SESSION_COMPATIBILITY_FIELDS = frozenset({
     "launch_permission_mode", "runner_pid", "runner_started_at",
     "session_agent", "session_value", "session_source", "goal_delivery",
     "goal_session_id", "goal_command", "goal_messages", "goal_message_id",
+    "terminal",
+})
+
+_TERMINAL_OUTCOMES = frozenset({
+    "managed-dead-preserved", "custom-runtime-absent", "turn-runner-stopped",
+    "managed-dead-closed", "owned-pane-closed", "owned-runtime-absent",
+    "foreign-unregistered",
 })
 
 
@@ -92,6 +110,13 @@ def _fsync_pinned_directory(descriptor: int, label: str) -> None:
     """Durably order one already-pinned directory; ``label`` is diagnostic only."""
     del label
     os.fsync(descriptor)
+
+
+def _token(value: str, field_name: str = "token") -> str:
+    """Validate one generation token before it becomes a path component."""
+    if re.fullmatch(r"[a-z0-9-]{1,80}", value) is None:
+        raise AgentDeliveryError(f"{field_name} has an invalid shape")
+    return value
 
 
 def _snapshot_json_bytes(document: dict[str, object]) -> bytes:
@@ -233,6 +258,43 @@ class LaunchSpec:
         return document
 
 
+@dataclass(frozen=True)
+class TerminalState:
+    """Canonical result of the one terminal transition for a generation."""
+
+    outcome: str
+    evidence: dict[str, object]
+
+    @classmethod
+    def create(
+        cls, outcome: str, evidence: dict[str, object] | None = None,
+    ) -> "TerminalState":
+        if outcome not in _TERMINAL_OUTCOMES:
+            raise AgentDeliveryError("unsupported terminal retirement outcome")
+        return cls(outcome=outcome, evidence=dict(evidence or {}))
+
+    @classmethod
+    def from_document(cls, value: object) -> "TerminalState":
+        if (not isinstance(value, dict)
+                or set(value) != {"schema", "outcome", "evidence"}
+                or value.get("schema") != _TERMINAL_STATE_SCHEMA
+                or not isinstance(value.get("evidence"), dict)):
+            raise AgentDeliveryError("invalid terminal state")
+        outcome = value.get("outcome")
+        if not isinstance(outcome, str):
+            raise AgentDeliveryError("invalid terminal state outcome")
+        return cls.create(
+            outcome, cast(dict[str, object], value["evidence"]),
+        )
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "schema": _TERMINAL_STATE_SCHEMA,
+            "outcome": self.outcome,
+            "evidence": dict(self.evidence),
+        }
+
+
 @dataclass
 class AgentRecord:
     """Canonical session state with one immutable launch-intent authority."""
@@ -258,11 +320,13 @@ class AgentRecord:
     custom_process_identity: CustomProcessIdentity | None = None
     foreign_shell_identity: CustomProcessIdentity | None = None
     runner_identity: CustomProcessIdentity | None = None
+    terminal: TerminalState | None = None
     _legacy_runner_pid: int | None = field(default=None, repr=False)
     _legacy_runner_started_at: str | None = field(default=None, repr=False)
     _legacy_goal_delivery: str | None = field(default=None, repr=False)
     _legacy_goal_messages: dict[str, str] = field(default_factory=dict, repr=False)
     _legacy_goal_pointer: bool = field(default=False, repr=False)
+    _legacy_terminal_authority: bool = field(default=False, repr=False)
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
     @property
@@ -314,7 +378,11 @@ class AgentRecord:
         document.pop("_legacy_goal_delivery")
         document.pop("_legacy_goal_messages")
         document.pop("_legacy_goal_pointer")
+        document.pop("_legacy_terminal_authority")
         document.pop("launch")
+        document.pop("terminal")
+        if self.terminal is not None:
+            document["terminal"] = self.terminal.to_document()
         launch = self.launch
         executable = launch.executable
         document.update({
@@ -372,6 +440,14 @@ class AgentRecord:
                     and self.session_agent != launch.harness)):
             raise AgentDeliveryError("incomplete native session identity")
         self._validate_runtime_shape(launch)
+        if self.lifecycle == "stopped" and self.terminal is None:
+            raise AgentDeliveryError(
+                "current stopped agent record has no canonical terminal state"
+            )
+        if self.lifecycle != "stopped" and self.terminal is not None:
+            raise AgentDeliveryError(
+                "nonterminal agent record cannot contain terminal state"
+            )
         native_session: dict[str, object] | None = None
         if self.session_value is not None:
             native_session = {
@@ -412,6 +488,9 @@ class AgentRecord:
             ),
             "runner_identity": (
                 asdict(self.runner_identity) if self.runner_identity is not None else None
+            ),
+            "terminal": (
+                None if self.terminal is None else self.terminal.to_document()
             ),
             "extensions": dict(self._unknown),
         }
@@ -620,6 +699,30 @@ class AgentRecord:
         fields["_legacy_goal_delivery"] = document.get("goal_delivery")
         fields["_legacy_goal_messages"] = cast(dict[str, str], goals)
         fields["_legacy_goal_pointer"] = legacy_goal_pointer
+        raw_terminal = document.get("terminal")
+        terminal = (
+            None if raw_terminal is None else TerminalState.from_document(raw_terminal)
+        )
+        lifecycle = cast(str, document["lifecycle"])
+        if terminal is not None and lifecycle != "stopped":
+            raise AgentDeliveryError(
+                f"nonterminal agent record contains terminal state: {path}"
+            )
+        if source_schema == _SESSION_STORAGE_SCHEMA and (
+            (lifecycle == "stopped") != (terminal is not None)
+        ):
+            raise AgentDeliveryError(
+                f"current agent record has inconsistent terminal state: {path}"
+            )
+        fields["terminal"] = terminal
+        fields["_legacy_terminal_authority"] = (
+            source_schema in {
+                1, _PREVIOUS_SESSION_STORAGE_SCHEMA,
+                _LEGACY_SESSION_STORAGE_SCHEMA,
+            }
+            and lifecycle == "stopped"
+            and terminal is None
+        )
         if document.get("adapter", "herdr") not in ("herdr", "herdr-pane", "herdr-foreign", "turn-runner"):
             raise AgentDeliveryError(f"unsupported runtime adapter in {path}")
         if document.get("mode", "interactive") not in ("interactive", "headless"):
@@ -743,7 +846,11 @@ class AgentRecord:
     ) -> dict[str, object]:
         """Translate current/v2 storage or one supported flat row at the decode edge."""
         storage_schema = document.get("schema")
-        if storage_schema in (_SESSION_STORAGE_SCHEMA, _LEGACY_SESSION_STORAGE_SCHEMA):
+        if storage_schema in (
+            _SESSION_STORAGE_SCHEMA,
+            _PREVIOUS_SESSION_STORAGE_SCHEMA,
+            _LEGACY_SESSION_STORAGE_SCHEMA,
+        ):
             common_fields = {
                 "schema", "name", "token", "created_at", "lifecycle", "launch",
                 "workspace_id", "tab_id", "pane_id",
@@ -753,6 +860,8 @@ class AgentRecord:
                 "extensions",
             }
             if storage_schema == _SESSION_STORAGE_SCHEMA:
+                top_fields = common_fields | {"native_session", "goal", "terminal"}
+            elif storage_schema == _PREVIOUS_SESSION_STORAGE_SCHEMA:
                 top_fields = common_fields | {"native_session", "goal"}
             else:
                 top_fields = common_fields | {
@@ -810,7 +919,9 @@ class AgentRecord:
                 key: value for key, value in document.items()
                 if key not in {"schema", "launch", "extensions", "native_session"}
             }
-            if storage_schema == _SESSION_STORAGE_SCHEMA:
+            if storage_schema in (
+                _SESSION_STORAGE_SCHEMA, _PREVIOUS_SESSION_STORAGE_SCHEMA,
+            ):
                 goal_value = document.get("goal")
                 if (not isinstance(goal_value, dict)
                         or set(goal_value) != {
@@ -851,6 +962,8 @@ class AgentRecord:
                     raise AgentDeliveryError(
                         f"invalid agent record native session: {path}"
                     )
+                if storage_schema == _PREVIOUS_SESSION_STORAGE_SCHEMA:
+                    normalized["terminal"] = None
             else:
                 observed = normalized.get("session_value")
                 asserted = normalized.get("goal_session_id")
@@ -893,7 +1006,9 @@ class AgentRecord:
 
         if document.get("schema") != 1 or isinstance(document.get("schema"), bool):
             raise AgentDeliveryError(f"invalid agent record schema: {path}")
-        if any(key in document for key in ("launch", "native_session", "extensions")):
+        if any(key in document for key in (
+            "launch", "native_session", "extensions", "terminal",
+        )):
             raise AgentDeliveryError(
                 f"legacy agent record contains a reserved current-schema field: {path}"
             )
@@ -1152,6 +1267,7 @@ class _WorkspaceClient:
         self, client: HerdrClient, record: AgentRecord, *,
         queue: str | None = None, check_prompt: bool = True,
         deadline: float | None = None,
+        submission_guard: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         self.client, self.record = client, record
         self.goal_objective: str | None = None
@@ -1160,6 +1276,7 @@ class _WorkspaceClient:
         # harness, exact text, prior submitted-turn count, prior active UI.
         self.custom_submission: tuple[str, str, int, bool] | None = None
         self.deadline = deadline
+        self.submission_guard = submission_guard
         self.adopted_evidence_observation: AdoptedRuntimeEvidence | None = None
 
     def _timeout(self, purpose: str) -> float:
@@ -1249,18 +1366,15 @@ class _WorkspaceClient:
                 )
             else:
                 self.client.verify_pane_shell_identity(pane_id, shell_identity)
-        except HerdrRunError as exc:
-            detail = str(exc)
-            state = (
-                AdoptedRuntimeState.IDENTITY_MISMATCH
-                if "changed" in detail else AdoptedRuntimeState.UNKNOWN
-            )
+        except RuntimeIdentityMismatch as exc:
             return observed(
-                state,
-                "runtime-identity-mismatch"
-                if state is AdoptedRuntimeState.IDENTITY_MISMATCH
-                else "runtime-probe-failed",
-                detail, info, presentation,
+                AdoptedRuntimeState.IDENTITY_MISMATCH,
+                "runtime-identity-mismatch", str(exc), info, presentation,
+            )
+        except HerdrRunError as exc:
+            return observed(
+                AdoptedRuntimeState.UNKNOWN,
+                "runtime-probe-failed", str(exc), info, presentation,
             )
         if info.agent == self.record.launch.harness:
             if (self.record.session_source == "observed"
@@ -1470,6 +1584,16 @@ class _WorkspaceClient:
         return self.client.workspace_label(workspace_id)
 
     def prompt_agent(self, pane_id: str, command: str) -> None:
+        guard = (
+            nullcontext()
+            if self.submission_guard is None
+            else self.submission_guard()
+        )
+        with guard:
+            self._prompt_agent_under_guard(pane_id, command)
+
+    def _prompt_agent_under_guard(self, pane_id: str, command: str) -> None:
+        """Cross the injection boundary while the registry generation is pinned."""
         self.goal_objective = None
         if self.queue is not None and command.startswith("/goal "):
             inflight = Path(self.queue) / "inflight"
@@ -1736,6 +1860,50 @@ class ManagedAgents:
             yield
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _delivery_identity(record: AgentRecord) -> tuple[object, ...]:
+        """Return the immutable generation and runtime route used for submission."""
+        return (
+            record.token,
+            record.launch,
+            record.workspace_id,
+            record.tab_id,
+            record.pane_id,
+            record.session_agent,
+            record.session_value,
+            record.session_source,
+            record.custom_process_identity,
+            record.foreign_shell_identity,
+            record.runner_identity,
+        )
+
+    @contextmanager
+    def _submission_guard(self, expected: AgentRecord) -> Iterator[None]:
+        """Pin one live generation only across its irreversible prompt injection."""
+        with self._lock(expected.name):
+            current = self._load_expected(expected.name, expected.token)
+            if current.lifecycle != "running":
+                raise AgentDeliveryError(
+                    f"agent {expected.name!r} is no longer running"
+                )
+            if self._delivery_identity(current) != self._delivery_identity(expected):
+                raise AgentDeliveryError(
+                    f"agent {expected.name!r} runtime identity changed before submission"
+                )
+            yield
+
+    def _delivery_client(self, record: AgentRecord) -> HerdrClient:
+        """Build the queue client whose injection boundary revalidates the record."""
+        return cast(
+            HerdrClient,
+            _WorkspaceClient(
+                self.client,
+                record,
+                queue=self._queue(record.name),
+                submission_guard=lambda: self._submission_guard(record),
+            ),
+        )
 
     @contextmanager
     def _try_lock(self, name: str, deadline: float) -> Iterator[bool]:
@@ -2269,6 +2437,26 @@ class ManagedAgents:
     def _queue(self, name: str) -> str:
         return str(self._directory(name) / "queue")
 
+    def _refuse_inflight_delivery(self, record: AgentRecord) -> None:
+        """Keep teardown from overtaking an injection already at its barrier."""
+        root = self._queue(record.name)
+        if not os.path.lexists(root):
+            return
+        agent._validate_existing_queue(root)
+        agent._validate_existing_binding(root, record.target())
+        inflight = Path(root) / "inflight"
+        if not inflight.is_dir():
+            raise AgentDeliveryError("delivery queue is incomplete")
+        identifiers = sorted(
+            path.name[:-5] for path in inflight.iterdir()
+            if path.name.endswith(".json")
+        )
+        if identifiers:
+            raise AgentDeliveryError(
+                "refusing stop while prompt submission is in flight: "
+                + ", ".join(identifiers)
+            )
+
     def get(self, name: str) -> AgentRecord:
         """Read durable metadata without requiring Herdr to be reachable."""
         return self._load(name)
@@ -2540,7 +2728,8 @@ class ManagedAgents:
         """Recover or reconcile one exactly identified live Muse process."""
         with self._lock(name):
             record = self._load_expected(name, expected_token)
-            if (record.lifecycle != "launch_failed" or record.launch.adapter != "herdr-pane"
+            if (record.lifecycle not in {"starting", "launch_failed"}
+                    or record.launch.adapter != "herdr-pane"
                     or record.launch.harness != "muse" or record.launch.mode != "interactive"
                     or record.launch.backend != "herdr" or record.launch.runtime_ownership != "owned"
                     or record.pane_id is None
@@ -2548,7 +2737,7 @@ class ManagedAgents:
                     or not record.launch.argv
                     or record.session_agent is not None or record.session_value is not None):
                 raise AgentDeliveryError(
-                    "start recovery requires a launch_failed Muse interactive Herdr "
+                    "start recovery requires a starting or launch_failed Muse interactive Herdr "
                     "record with complete launch intent and pane ownership"
                 )
             launch_device = (
@@ -3355,26 +3544,57 @@ class ManagedAgents:
                 if _NAME.fullmatch(path.name) and path.name != "archive"]
 
     def send(self, name: str, text: str, *, message_id: str | None = None, expected_token: str | None = None, **options: object) -> agent.QueueResult:
-        """Serialize against stop, then use the existing durable submission transport."""
+        """Enqueue under the lifecycle lock, then wait without holding it."""
+        if "require_existing" in options:
+            raise AgentDeliveryError("require_existing is managed internally")
+        max_artifact_bytes = options.get("max_artifact_bytes")
+        if max_artifact_bytes is not None and not isinstance(max_artifact_bytes, int):
+            raise AgentDeliveryError("max_artifact_bytes must be a positive integer or None")
+        atomic_policy = options.get("atomic_policy")
         with self._lock(name):
             record = self._load_expected(name, expected_token)
             self._reconcile_goal_transaction(record)
             self._require_automation(record)
             if record.goal_messages:
                 self._save(record)
-            client = cast(HerdrClient, _WorkspaceClient(self.client, record, queue=self._queue(name)))
-            return agent.send(client, record.target(), self._queue(name), text, message_id=message_id, **options)
+            identifier = agent.enqueue_bound(
+                self._queue(name), record.target(), text,
+                message_id=message_id,
+                max_artifact_bytes=cast(int | None, max_artifact_bytes),
+                atomic_policy=cast(agent.AtomicWritePolicy | None, atomic_policy),
+            )
+            client = self._delivery_client(record)
+        drained = agent.drain(
+            client, record.target(), self._queue(name),
+            require_existing=True, **options,
+        )
+        return agent.finish_identified_delivery(
+            self._queue(name), identifier, drained,
+            max_artifact_bytes=cast(int | None, max_artifact_bytes),
+        )
 
     def drain(self, name: str, **options: object) -> agent.QueueResult:
-        """Retry only messages that the shared queue knows were never submitted."""
+        """Retry pending messages without retaining the lifecycle lock while busy."""
+        if "require_existing" in options:
+            raise AgentDeliveryError("require_existing is managed internally")
+        max_artifact_bytes = options.get("max_artifact_bytes")
+        if max_artifact_bytes is not None and not isinstance(max_artifact_bytes, int):
+            raise AgentDeliveryError("max_artifact_bytes must be a positive integer or None")
         with self._lock(name):
             record = self._load(name)
             self._reconcile_goal_transaction(record)
             self._require_automation(record)
             if record.goal_messages:
                 self._save(record)
-            client = cast(HerdrClient, _WorkspaceClient(self.client, record, queue=self._queue(name)))
-            return agent.drain(client, record.target(), self._queue(name), **options)  # type: ignore[arg-type]
+            agent._bind_queue(
+                self._queue(name), record.target(),
+                max_artifact_bytes=cast(int | None, max_artifact_bytes),
+            )
+            client = self._delivery_client(record)
+        return agent.drain(
+            client, record.target(), self._queue(name),
+            require_existing=True, **options,
+        )  # type: ignore[arg-type]
 
     def reconcile_delivery(
         self, name: str, message_id: str, expected_sha256: str,
@@ -3646,6 +3866,8 @@ class ManagedAgents:
             ) from exc
 
     def _archive_destination(self, record: AgentRecord) -> tuple[Path, Path]:
+        _name(record.name)
+        _token(record.token)
         archive = self.registry / "archive"
         try:
             archive.mkdir(mode=0o700, exist_ok=True)
@@ -3715,11 +3937,15 @@ class ManagedAgents:
     ) -> _InstalledArtifact:
         """Replace one private snapshot with exact bytes and durable directory metadata."""
         if name not in {
-            "agent.json", "output.json", "stop-result.json",
-            _MANAGED_DEAD_RETIREMENT_FILE,
+            "agent.json", "output.json", _TERMINAL_RETIREMENT_FILE,
         }:
             raise AgentDeliveryError("unsupported pinned registry artifact name")
-        limit = _MAX_AGENT_RECORD_BYTES if name == "agent.json" else _MAX_SNAPSHOT_BYTES
+        if name == "agent.json":
+            limit = _MAX_AGENT_RECORD_BYTES
+        elif name == _TERMINAL_RETIREMENT_FILE:
+            limit = _MAX_TERMINAL_RETIREMENT_BYTES
+        else:
+            limit = _MAX_SNAPSHOT_BYTES
         if len(content) > limit:
             raise AgentDeliveryError(
                 f"refusing {name} larger than {limit} bytes"
@@ -4524,9 +4750,20 @@ class ManagedAgents:
                 )
 
     @staticmethod
-    def _managed_dead_retirement_document(
+    def _terminal_retirement_document(
+        record_bytes: bytes,
+    ) -> dict[str, object]:
+        """Commit publication of a record that already owns its terminal result."""
+        return {
+            "schema": _TERMINAL_RETIREMENT_SCHEMA,
+            "record_sha256": hashlib.sha256(record_bytes).hexdigest(),
+        }
+
+    @staticmethod
+    def _legacy_managed_dead_retirement_document(
         record: AgentRecord, record_bytes: bytes,
     ) -> dict[str, object]:
+        """Decode-only shape written by pre-terminal-receipt checkpoints."""
         return {
             "schema": _MANAGED_DEAD_RETIREMENT_SCHEMA,
             "name": record.name,
@@ -4536,95 +4773,304 @@ class ManagedAgents:
             "runtime_preserved": True,
         }
 
-    def _managed_dead_retirement_exists(self, record: AgentRecord) -> bool:
-        """Distinguish a preserved-runtime stop prefix from an ordinary stop."""
-        with self._pinned_agent_directory(record.name) as pinned:
-            try:
-                metadata = os.stat(
-                    _MANAGED_DEAD_RETIREMENT_FILE,
-                    dir_fd=pinned.descriptor,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                self._verify_pinned_agent_directory(pinned)
-                return False
-            except OSError as exc:
-                raise AgentDeliveryError(
-                    f"cannot inspect managed-dead retirement receipt: {exc}"
-                ) from exc
-            if (not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_uid != os.getuid()
-                    or stat.S_IMODE(metadata.st_mode) & 0o077
-                    or metadata.st_nlink != 1):
-                raise AgentDeliveryError("unsafe managed-dead retirement receipt")
-            self._verify_pinned_agent_directory(pinned)
-            return True
+    @staticmethod
+    def _retirement_artifact_exists(
+        pinned: _PinnedAgentDirectory, name: str, *, purpose: str,
+    ) -> bool:
+        try:
+            metadata = os.stat(
+                name, dir_fd=pinned.descriptor, follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot inspect {purpose}: {exc}") from exc
+        if (not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+                or metadata.st_nlink != 1):
+            raise AgentDeliveryError(f"unsafe {purpose}")
+        return True
 
-    def _read_managed_dead_retirement(
+    def _terminal_retirement_exists(self, record: AgentRecord) -> bool:
+        """Detect a durable current receipt, or its decode-only predecessor."""
+        with self._pinned_agent_directory(record.name) as pinned:
+            present = self._retirement_artifact_exists(
+                pinned, _TERMINAL_RETIREMENT_FILE,
+                purpose="terminal retirement receipt",
+            ) or self._retirement_artifact_exists(
+                pinned, _MANAGED_DEAD_RETIREMENT_FILE,
+                purpose="legacy managed-dead retirement receipt",
+            )
+            self._verify_pinned_agent_directory(pinned)
+            return present
+
+    def _read_terminal_retirement(
         self, pinned: _PinnedAgentDirectory, record: AgentRecord,
         record_bytes: bytes,
-    ) -> dict[str, object]:
+    ) -> TerminalState | None:
+        if self._retirement_artifact_exists(
+            pinned, _TERMINAL_RETIREMENT_FILE,
+            purpose="terminal retirement receipt",
+        ):
+            path = pinned.path / _TERMINAL_RETIREMENT_FILE
+            content = self._pinned_artifact_bytes(
+                pinned, name=_TERMINAL_RETIREMENT_FILE,
+                limit=_MAX_TERMINAL_RETIREMENT_BYTES,
+                purpose="terminal retirement receipt",
+            )
+            document = agent._decode_json_bytes(
+                content, "terminal retirement receipt", path,
+            )
+            if not isinstance(document, dict):
+                raise AgentDeliveryError(
+                    "terminal retirement receipt disagrees with its stopped record"
+                )
+            digest = hashlib.sha256(record_bytes).hexdigest()
+            if document.get("schema") == _TERMINAL_RETIREMENT_SCHEMA:
+                if (set(document) != {"schema", "record_sha256"}
+                        or document.get("record_sha256") != digest
+                        or record.terminal is None):
+                    raise AgentDeliveryError(
+                        "terminal retirement receipt disagrees with its stopped record"
+                    )
+                return record.terminal
+            if document.get("schema") == _LEGACY_TERMINAL_RETIREMENT_SCHEMA:
+                if (set(document) != {
+                        "schema", "record_sha256", "outcome", "evidence",
+                    }
+                        or document.get("record_sha256") != digest
+                        or not isinstance(document.get("outcome"), str)
+                        or not isinstance(document.get("evidence"), dict)):
+                    raise AgentDeliveryError(
+                        "legacy terminal receipt disagrees with its stopped record"
+                    )
+                terminal = TerminalState.create(
+                    cast(str, document["outcome"]),
+                    cast(dict[str, object], document["evidence"]),
+                )
+                if record.terminal is not None and record.terminal != terminal:
+                    raise AgentDeliveryError(
+                        "legacy terminal receipt conflicts with canonical terminal state"
+                    )
+                return terminal
+            raise AgentDeliveryError(
+                "terminal retirement receipt has an unsupported schema"
+            )
+        if not self._retirement_artifact_exists(
+            pinned, _MANAGED_DEAD_RETIREMENT_FILE,
+            purpose="legacy managed-dead retirement receipt",
+        ):
+            return None
         path = pinned.path / _MANAGED_DEAD_RETIREMENT_FILE
         content = self._pinned_artifact_bytes(
             pinned, name=_MANAGED_DEAD_RETIREMENT_FILE,
             limit=_MAX_AGENT_RECORD_BYTES,
-            purpose="managed-dead retirement receipt",
+            purpose="legacy managed-dead retirement receipt",
         )
         document = agent._decode_json_bytes(
-            content, "managed-dead retirement receipt", path,
+            content, "legacy managed-dead retirement receipt", path,
         )
-        expected = self._managed_dead_retirement_document(record, record_bytes)
+        expected = self._legacy_managed_dead_retirement_document(record, record_bytes)
         if document != expected:
             raise AgentDeliveryError(
-                "managed-dead retirement receipt disagrees with its stopped record"
+                "legacy managed-dead retirement receipt disagrees with its stopped record"
             )
-        return expected
+        terminal = TerminalState.create("managed-dead-preserved")
+        if record.terminal is not None and record.terminal != terminal:
+            raise AgentDeliveryError(
+                "legacy managed-dead receipt conflicts with canonical terminal state"
+            )
+        return terminal
 
-    def _managed_dead_archive_receipt(
-        self, name: str, expected_token: str | None,
+    def _terminal_retirement_result(
+        self, record: AgentRecord, destination: Path, terminal: TerminalState,
+    ) -> dict[str, object]:
+        if record.terminal is not None and record.terminal != terminal:
+            raise AgentDeliveryError(
+                "terminal publication state disagrees with its stopped record"
+            )
+        outcome = terminal.outcome
+        evidence = terminal.evidence
+        if outcome == "turn-runner-stopped":
+            if (record.launch.adapter != "turn-runner"
+                    or set(evidence) != {"killed_window"}
+                    or not isinstance(evidence.get("killed_window"), bool)):
+                raise AgentDeliveryError("terminal receipt has inconsistent runtime outcome")
+            expected_runtime_home = self._directory(record.name) / "runtime"
+            expected_inner_archive = (
+                destination / "runtime/state/_archive"
+                / f"{record.name}-{record.token}"
+            )
+            if record.launch.runtime_home != str(expected_runtime_home):
+                raise AgentDeliveryError(
+                    "terminal receipt runtime archive is not the exact derived path"
+                )
+            runtime = {
+                "record": None,
+                "result": {
+                    "name": record.name,
+                    "killed_window": evidence["killed_window"],
+                    "archived_to": str(expected_inner_archive),
+                    "state_path": None,
+                    "was_registered": True,
+                    "forced": False,
+                    "unverified_presentation": None,
+                },
+            }
+            return {
+                "name": record.name, "archive": str(destination),
+                "runtime": runtime,
+            }
+        if outcome == "foreign-unregistered":
+            if (record.launch.adapter != "herdr-foreign"
+                    or record.launch.mode != "interactive"
+                    or record.launch.backend != "herdr"
+                    or record.launch.runtime_ownership != "foreign"
+                    or evidence):
+                raise AgentDeliveryError("terminal receipt has inconsistent foreign outcome")
+            return {
+                "name": record.name, "archive": str(destination),
+                "pane_closed": False, "tab_closed": False,
+                "runtime_preserved": True,
+            }
+        if outcome in {
+            "managed-dead-closed", "owned-pane-closed", "owned-runtime-absent",
+        }:
+            compatible_adapter = (
+                record.launch.adapter == "herdr"
+                if outcome == "managed-dead-closed"
+                else record.launch.adapter in {"herdr", "herdr-pane"}
+            )
+            if (not compatible_adapter
+                    or record.launch.mode != "interactive"
+                    or record.launch.backend != "herdr"
+                    or record.launch.runtime_ownership != "owned"):
+                raise AgentDeliveryError("terminal receipt has inconsistent owned outcome")
+            if outcome in {"managed-dead-closed", "owned-pane-closed"}:
+                if (set(evidence) != {"tab_closed"}
+                        or (evidence["tab_closed"] is not None
+                            and not isinstance(evidence["tab_closed"], bool))):
+                    raise AgentDeliveryError("terminal receipt has invalid pane-close evidence")
+                result = {
+                    "name": record.name, "archive": str(destination),
+                    "pane_closed": True, "tab_closed": evidence["tab_closed"],
+                }
+                if outcome == "managed-dead-closed":
+                    result.update({
+                        "managed_dead": True,
+                        "runtime_preserved": False,
+                        "continuation": None,
+                    })
+                return result
+            if evidence:
+                raise AgentDeliveryError("terminal receipt has invalid absent-runtime evidence")
+            return {
+                "name": record.name, "archive": str(destination),
+                "pane_closed": False, "tab_closed": False,
+            }
+        if (record.launch.adapter != "herdr-pane"
+                or record.launch.harness != "muse"
+                or record.launch.mode != "interactive"
+                or record.launch.backend != "herdr"
+                or record.launch.runtime_ownership != "owned"
+                or record.custom_process_identity is None
+                or not record.workspace_id or not record.tab_id or not record.pane_id
+                or evidence):
+            raise AgentDeliveryError("terminal receipt has inconsistent custom outcome")
+        if outcome == "managed-dead-preserved":
+            return {
+                "name": record.name,
+                "archive": str(destination),
+                "pane_closed": False,
+                "tab_closed": False,
+                "managed_dead": True,
+                "runtime_preserved": True,
+                "continuation": (
+                    "The dead custom runtime was archived; its shell pane was preserved "
+                    "because Herdr does not provide a terminal-generation-conditional close."
+                ),
+            }
+        if outcome == "custom-runtime-absent":
+            return {
+                "name": record.name,
+                "archive": str(destination),
+                "pane_closed": False,
+                "tab_closed": None,
+                "ordinary_stop_recovered": True,
+                "runtime_preserved": False,
+            }
+        raise AgentDeliveryError("terminal receipt has unsupported outcome")
+
+    def _turn_runner_retirement_evidence(
+        self, record: AgentRecord, destination: Path, runtime: object,
+    ) -> dict[str, object]:
+        """Validate a worker stop reply and retain only its irreducible outcome."""
+        if (not isinstance(runtime, dict)
+                or set(runtime) != {"result", "record"}
+                or runtime.get("record") is not None
+                or not isinstance(runtime.get("result"), dict)):
+            raise AgentDeliveryError("terminal receipt has invalid runtime evidence")
+        result = cast(dict[str, object], runtime["result"])
+        if (set(result) != {
+                "name", "killed_window", "archived_to", "state_path",
+                "was_registered", "forced", "unverified_presentation",
+            }
+                or result.get("name") != record.name
+                or any(not isinstance(result.get(field), bool) for field in (
+                    "killed_window", "was_registered", "forced",
+                ))
+                or not isinstance(result.get("archived_to"), str)
+                or (result.get("state_path") is not None
+                    and not isinstance(result.get("state_path"), str))
+                or result.get("was_registered") is not True
+                or result.get("forced") is not False
+                or result.get("unverified_presentation") is not None
+                or result.get("state_path") is not None):
+            raise AgentDeliveryError("terminal receipt has invalid runtime stop result")
+        expected_inner_archive = (
+            destination / "runtime/state/_archive" / f"{record.name}-{record.token}"
+        )
+        if result.get("archived_to") != str(expected_inner_archive):
+            raise AgentDeliveryError(
+                "terminal receipt runtime archive is not the exact derived path"
+            )
+        return {"killed_window": cast(bool, result["killed_window"])}
+
+    def _terminal_archive_receipt(
+        self, name: str, expected_token: str | None, *,
+        after_record_read: Callable[[], None] = lambda: None,
+        after_receipt_read: Callable[[], None] = lambda: None,
     ) -> dict[str, object] | None:
         if expected_token is None or os.path.lexists(self._directory(name)):
             return None
+        _name(name)
+        _token(expected_token, "expected token")
         destination = self.registry / "archive" / f"{name}-{expected_token}"
         if not os.path.lexists(destination):
             return None
         with self._pinned_agent_directory(
-            name, path=destination, label="managed-dead agent archive",
+            name, path=destination, label="terminal agent archive",
         ) as pinned:
             snapshot = self._managed_record_snapshot(
                 pinned, expected_token=expected_token,
             )
             record = snapshot.record
-            if (record.lifecycle != "stopped"
-                    or record.launch.adapter != "herdr-pane"
-                    or record.launch.harness != "muse"
-                    or record.launch.mode != "interactive"
-                    or record.launch.backend != "herdr"
-                    or record.launch.runtime_ownership != "owned"
-                    or record.custom_process_identity is None
-                    or not record.workspace_id or not record.tab_id
-                    or not record.pane_id):
+            if record.lifecycle != "stopped":
                 raise AgentDeliveryError(
-                    "managed-dead archive is not an exact preserved-runtime receipt"
+                    "terminal archive does not contain a stopped generation"
                 )
-            self._read_managed_dead_retirement(
+            after_record_read()
+            receipt = self._read_terminal_retirement(
                 pinned, record, snapshot.content,
             )
+            if receipt is None:
+                return None
+            after_receipt_read()
             self._verify_pinned_agent_directory(pinned)
-        return {
-            "name": name,
-            "archive": str(destination),
-            "pane_closed": False,
-            "tab_closed": False,
-            "managed_dead": True,
-            "runtime_preserved": True,
-            "continuation": (
-                "The dead custom runtime was archived; its shell pane was preserved "
-                "because Herdr does not provide a terminal-generation-conditional close."
-            ),
-        }
+        return self._terminal_retirement_result(record, destination, receipt)
 
-    def _complete_preserved_managed_dead_publication(
+    def _complete_terminal_publication(
         self, record: AgentRecord, *, pinned: _PinnedAgentDirectory,
         expected_token: str,
     ) -> dict[str, object]:
@@ -4632,28 +5078,26 @@ class ManagedAgents:
             pinned, expected_token=expected_token,
         )
         final = snapshot.record
-        if (final.lifecycle != "stopped"
-                or final.launch.adapter != "herdr-pane"
-                or final.launch.mode != "interactive"
-                or final.launch.backend != "herdr"):
+        if final.lifecycle != "stopped":
             raise AgentDeliveryError(
-                "preserved managed-dead publication requires an exact stopped herdr-pane record"
+                "terminal publication requires an exact stopped record"
             )
-        self._read_managed_dead_retirement(pinned, final, snapshot.content)
+        receipt = self._read_terminal_retirement(pinned, final, snapshot.content)
+        if receipt is None:
+            raise AgentDeliveryError(
+                "terminal publication has no matching retirement receipt"
+            )
         _archive, destination = self._archive_destination(final)
+        # Validate outcome/record coherence before making the publication
+        # visible.  This is also the one result derivation path used after a
+        # lost response.
+        self._terminal_retirement_result(final, destination, receipt)
         self._publish_pinned_directory(
             pinned, destination, expected_record=snapshot.content,
         )
-        return self._managed_dead_archive_receipt(
+        return self._terminal_archive_receipt(
             final.name, expected_token,
-        ) or {
-            "name": final.name,
-            "archive": str(destination),
-            "pane_closed": False,
-            "tab_closed": False,
-            "managed_dead": True,
-            "runtime_preserved": True,
-        }
+        ) or self._terminal_retirement_result(final, destination, receipt)
 
     def _complete_ordinary_stopped_custom_publication(
         self, record: AgentRecord, *, expected_token: str | None,
@@ -4689,17 +5133,27 @@ class ManagedAgents:
                     "managed-dead retirement receipt; pane was preserved"
                 )
             _archive, destination = self._archive_destination(current)
-            self._publish_pinned_directory(
-                pinned, destination, expected_record=snapshot.content,
+            current.terminal = TerminalState.create("custom-runtime-absent")
+            current._legacy_terminal_authority = False
+            stopped_bytes = agent._json_text(
+                current.to_storage_document()
+            ).encode("utf-8")
+            self._atomic_snapshot_bytes(
+                pinned, stopped_bytes, name="agent.json",
             )
-        return {
-            "name": current.name,
-            "archive": str(destination),
-            "pane_closed": False,
-            "tab_closed": None,
-            "ordinary_stop_recovered": True,
-            "runtime_preserved": False,
-        }
+            receipt = self._terminal_retirement_document(stopped_bytes)
+            self._atomic_snapshot_bytes(
+                pinned, _snapshot_json_bytes(receipt),
+                name=_TERMINAL_RETIREMENT_FILE,
+            )
+            self._publish_pinned_directory(
+                pinned, destination, expected_record=stopped_bytes,
+            )
+        return self._terminal_archive_receipt(
+            current.name, expected_token,
+        ) or self._terminal_retirement_result(
+            current, destination, cast(TerminalState, current.terminal),
+        )
 
     def _retire_managed_dead_locked(
         self, record: AgentRecord, *, pinned: _PinnedAgentDirectory,
@@ -4720,7 +5174,7 @@ class ManagedAgents:
         record = initial.record
         if (record.lifecycle == "stopped"
                 and record.launch.adapter == "herdr-pane"):
-            return self._complete_preserved_managed_dead_publication(
+            return self._complete_terminal_publication(
                 record, pinned=pinned, expected_token=expected_token,
             )
         if (record.launch.adapter not in ("herdr", "herdr-pane")
@@ -4763,9 +5217,16 @@ class ManagedAgents:
                 "runtime identity changed before close"
             )
         final.lifecycle = "stopped"
+        close_pane = final.launch.adapter == "herdr"
+        final.terminal = TerminalState.create(
+            "managed-dead-closed" if close_pane else "managed-dead-preserved",
+            {"tab_closed": False} if close_pane else {},
+        )
         self._migrate_legacy_goal_messages(final)
-        stopped_bytes = agent._json_text(final.to_storage_document()).encode("utf-8")
-        if len(stopped_bytes) > _MAX_AGENT_RECORD_BYTES:
+        bounded_stopped_bytes = agent._json_text(
+            final.to_storage_document()
+        ).encode("utf-8")
+        if len(bounded_stopped_bytes) > _MAX_AGENT_RECORD_BYTES:
             raise AgentDeliveryError(
                 f"refusing stopped agent record larger than {_MAX_AGENT_RECORD_BYTES} bytes"
             )
@@ -4838,42 +5299,33 @@ class ManagedAgents:
                 ) from rollback
             raise
         assert final.pane_id is not None
-        close_pane = final.launch.adapter == "herdr"
         if close_pane:
             self.client.close_pane(final.pane_id)
-        else:
-            retirement_bytes = _snapshot_json_bytes(
-                self._managed_dead_retirement_document(final, stopped_bytes)
-            )
-            self._atomic_snapshot_bytes(
-                pinned, retirement_bytes, name=_MANAGED_DEAD_RETIREMENT_FILE,
-            )
-        self._atomic_snapshot_bytes(pinned, stopped_bytes, name="agent.json")
-        self._publish_pinned_directory(
-            pinned, destination, expected_record=stopped_bytes,
-        )
-        if close_pane:
             try:
                 tab_closed: bool | None = not any(
                     pane.tab_id == final.tab_id for pane in self.client.panes()
                 )
             except HerdrRunError:
                 tab_closed = None
+            final.terminal = TerminalState.create(
+                "managed-dead-closed", {"tab_closed": tab_closed},
+            )
         else:
-            tab_closed = False
-        return {
-            "name": record.name,
-            "archive": str(destination),
-            "pane_closed": close_pane,
-            "tab_closed": tab_closed,
-            "managed_dead": True,
-            "runtime_preserved": not close_pane,
-            "continuation": (
-                None if close_pane else
-                "The dead custom runtime was archived; its shell pane was preserved "
-                "because Herdr does not provide a terminal-generation-conditional close."
-            ),
-        }
+            final.terminal = TerminalState.create("managed-dead-preserved")
+        final._legacy_terminal_authority = False
+        stopped_bytes = agent._json_text(final.to_storage_document()).encode("utf-8")
+        self._atomic_snapshot_bytes(pinned, stopped_bytes, name="agent.json")
+        retirement = self._terminal_retirement_document(stopped_bytes)
+        self._atomic_snapshot_bytes(
+            pinned, _snapshot_json_bytes(retirement),
+            name=_TERMINAL_RETIREMENT_FILE,
+        )
+        self._publish_pinned_directory(
+            pinned, destination, expected_record=stopped_bytes,
+        )
+        return self._terminal_retirement_result(
+            final, destination, cast(TerminalState, final.terminal),
+        )
 
     def goal(self, name: str, text: str | None = None, *, goal_command: Sequence[str] | None = None, **options: object) -> dict[str, object]:
         """Read native goal state when bound, or submit a goal to the visible conversation.
@@ -4887,6 +5339,12 @@ class ManagedAgents:
             return self._goal_result(record, goal_command)
         if not text.strip() or "\n" in text or "\r" in text:
             raise AgentDeliveryError("goal must be a nonempty single line")
+        if "require_existing" in options:
+            raise AgentDeliveryError("require_existing is managed internally")
+        max_artifact_bytes = options.get("max_artifact_bytes")
+        if max_artifact_bytes is not None and not isinstance(max_artifact_bytes, int):
+            raise AgentDeliveryError("max_artifact_bytes must be a positive integer or None")
+        atomic_policy = options.get("atomic_policy")
         with self._lock(name):
             record = self._load(name)
             self._reconcile_goal_transaction(record)
@@ -4897,23 +5355,23 @@ class ManagedAgents:
             record.goal_message_id = identifier
             self._save(record)
             prompt = _goal_prompt(record.launch.harness, text)
-            agent.enqueue_goal(
-                self._queue(name), prompt, message_id=identifier,
+            agent.enqueue_bound(
+                self._queue(name), record.target(), prompt,
+                message_id=identifier, kind="goal",
                 max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
+                atomic_policy=cast(agent.AtomicWritePolicy | None, atomic_policy),
             )
             self._remove_goal_transaction(record)
-            client = cast(
-                HerdrClient,
-                _WorkspaceClient(self.client, record, queue=self._queue(name)),
-            )
-            drained = agent.drain(
-                client, record.target(), self._queue(name), **options,
-            )
-            agent.finish_identified_delivery(
-                self._queue(name), identifier, drained,
-                max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
-            )
-            return self._goal_result(record, goal_command)
+            client = self._delivery_client(record)
+        drained = agent.drain(
+            client, record.target(), self._queue(name),
+            require_existing=True, **options,
+        )
+        agent.finish_identified_delivery(
+            self._queue(name), identifier, drained,
+            max_artifact_bytes=_MAX_QUEUE_ARTIFACT_BYTES,
+        )
+        return self._goal_result(record, goal_command)
 
     def stop(
         self, name: str, *, expected_token: str | None = None,
@@ -4943,7 +5401,7 @@ class ManagedAgents:
         with self._lock(name):
             if (expected_token_explicit and not recover_legacy_adoption
                     and expected_record_sha256 is None):
-                receipt = self._managed_dead_archive_receipt(name, expected_token)
+                receipt = self._terminal_archive_receipt(name, expected_token)
                 if receipt is not None:
                     return receipt
             record = self._load_expected(name, expected_token)
@@ -4952,6 +5410,13 @@ class ManagedAgents:
             if confirmed_record.to_document() != record.to_document():
                 raise AgentDeliveryError(f"agent {name!r} record changed before stop")
             record = confirmed_record
+            relocation = self._read_relocation_journal(record)
+            if relocation is not None:
+                raise AgentDeliveryError(
+                    "unfinished relocation must be reconciled with agentctl relocate "
+                    "before stop"
+                )
+            self._refuse_inflight_delivery(record)
             if recover_legacy_adoption:
                 return self._recover_legacy_adoption(
                     record, expected_token=expected_token,
@@ -4962,13 +5427,17 @@ class ManagedAgents:
                 raise AgentDeliveryError(
                     "--expected-record-sha256 requires --recover-legacy-adoption"
                 )
+            if record.lifecycle == "stopped" and self._terminal_retirement_exists(record):
+                if not expected_token_explicit or expected_token is None:
+                    raise AgentDeliveryError(
+                        f"recovering stopped agent {record.name!r} requires --expected-token"
+                    )
+                with self._pinned_agent_directory(record.name) as pinned:
+                    return self._complete_terminal_publication(
+                        record, pinned=pinned, expected_token=expected_token,
+                    )
             if (record.launch.adapter == "herdr-pane"
                     and record.lifecycle == "stopped"):
-                if self._managed_dead_retirement_exists(record):
-                    return self._retire_managed_dead(
-                        record, expected_token=expected_token,
-                        expected_token_explicit=expected_token_explicit,
-                    )
                 return self._complete_ordinary_stopped_custom_publication(
                     record, expected_token=expected_token,
                     expected_token_explicit=expected_token_explicit,
@@ -5013,7 +5482,7 @@ class ManagedAgents:
                         f"refusing to unregister adopted agent {name!r}: "
                         "runtime identity changed during output capture"
                     )
-                archive, destination = self._archive_destination(record)
+                _archive, destination = self._archive_destination(record)
                 agent._atomic_json(str(self._directory(name) / "output.json"),
                                    {"text": output, "captured_at": time.time(),
                                     "pane_id": record.pane_id})
@@ -5030,13 +5499,25 @@ class ManagedAgents:
                         "runtime identity changed before archival"
                     )
                 record.lifecycle = "stopped"
+                record.terminal = TerminalState.create("foreign-unregistered")
+                record._legacy_terminal_authority = False
                 self._save(record)
-                os.rename(self._directory(name), destination)
-                agent._fsync_dir(str(archive))
-                agent._fsync_dir(str(self.registry))
-                return {"name": name, "archive": str(destination),
-                        "pane_closed": False, "tab_closed": False,
-                        "runtime_preserved": True}
+                with self._pinned_agent_directory(name) as pinned:
+                    snapshot = self._managed_record_snapshot(
+                        pinned, expected_token=record.token,
+                    )
+                    receipt = self._terminal_retirement_document(snapshot.content)
+                    self._atomic_snapshot_bytes(
+                        pinned, _snapshot_json_bytes(receipt),
+                        name=_TERMINAL_RETIREMENT_FILE,
+                    )
+                    self._publish_pinned_directory(
+                        pinned, destination, expected_record=snapshot.content,
+                    )
+                return self._terminal_retirement_result(
+                    snapshot.record, destination,
+                    cast(TerminalState, snapshot.record.terminal),
+                )
             panes = self.client.panes()
             if (record.launch.adapter in ("herdr", "herdr-pane")
                     and record.lifecycle in ("running", "stopping")
@@ -5075,7 +5556,7 @@ class ManagedAgents:
             if owned:
                 if len(owned) != 1 or owned[0].pane_id != record.pane_id or owned[0].workspace_id != record.workspace_id:
                     raise AgentDeliveryError("refusing to close a tab whose pane ownership changed")
-            archive, destination = self._archive_destination(record)
+            _archive, destination = self._archive_destination(record)
             if owned:
                 if (record.launch.adapter == "herdr-pane" or record.lifecycle == "running"
                         or self.client.pane_info(owned[0].pane_id).agent is not None):
@@ -5101,12 +5582,28 @@ class ManagedAgents:
                     tab_closed = not any(pane.tab_id == record.tab_id for pane in self.client.panes())
                 except HerdrRunError:
                     tab_closed = None
+            outcome = "owned-pane-closed" if owned else "owned-runtime-absent"
+            evidence = {"tab_closed": tab_closed} if owned else {}
             record.lifecycle = "stopped"
+            record.terminal = TerminalState.create(outcome, evidence)
+            record._legacy_terminal_authority = False
             self._save(record)
-            os.rename(self._directory(name), destination)
-            agent._fsync_dir(str(archive))
-            agent._fsync_dir(str(self.registry))
-            return {"name": name, "archive": str(destination), "pane_closed": bool(owned), "tab_closed": tab_closed}
+            with self._pinned_agent_directory(name) as pinned:
+                snapshot = self._managed_record_snapshot(
+                    pinned, expected_token=record.token,
+                )
+                receipt = self._terminal_retirement_document(snapshot.content)
+                self._atomic_snapshot_bytes(
+                    pinned, _snapshot_json_bytes(receipt),
+                    name=_TERMINAL_RETIREMENT_FILE,
+                )
+                self._publish_pinned_directory(
+                    pinned, destination, expected_record=snapshot.content,
+                )
+            return self._terminal_retirement_result(
+                snapshot.record, destination,
+                cast(TerminalState, snapshot.record.terminal),
+            )
 
     def _read_relocation_journal(
         self, record: AgentRecord,

@@ -23,9 +23,20 @@ if __package__ in (None, ""):
 from agentctl.foreign import lib
 
 
-def _down_one(name: str, grace: float, force: bool) -> int:
+def _down_one(
+    name: str,
+    grace: float,
+    force: bool,
+    recover_v2_generation: str | None,
+) -> int:
     try:
-        res = lib.bring_down_agent(name, grace=grace, archive=True, force=force)
+        res = (
+            lib.retire_legacy_undetermined_runtime(
+                name, recover_v2_generation, grace=grace,
+            )
+            if recover_v2_generation is not None
+            else lib.bring_down_agent(name, grace=grace, archive=True, force=force)
+        )
     except lib.AgentOperationError as exc:
         lib.die(exc.message)
     if not res.was_registered:
@@ -55,11 +66,23 @@ def main() -> int:
         action="store_true",
         help="retire NAME without probing or closing its presentation backend; archives state loudly",
     )
+    ap.add_argument(
+        "--recover-v2-generation",
+        default=None,
+        metavar="TOKEN",
+        help=(
+            "retire an ambiguous V2 headless row only after matching its exact "
+            "generation and boot-bound runner; preserves the presentation"
+        ),
+    )
     args = ap.parse_args()
 
     if args.all_dead:
-        if args.force:
-            lib.die("--force requires an agent NAME; --all-dead remains conservative")
+        if args.force or args.recover_v2_generation is not None:
+            lib.die(
+                "--force and --recover-v2-generation require an agent NAME; "
+                "--all-dead remains conservative"
+            )
         notes = lib.gc()
         if notes:
             for note in notes:
@@ -70,8 +93,12 @@ def main() -> int:
 
     if args.name is None:
         lib.die("give an agent NAME, or use --all-dead")
+    if args.force and args.recover_v2_generation is not None:
+        lib.die("--force and --recover-v2-generation are mutually exclusive")
     lib.validate_name(args.name)
-    return _down_one(args.name, args.grace, args.force)
+    return _down_one(
+        args.name, args.grace, args.force, args.recover_v2_generation,
+    )
 
 
 if __name__ == "__main__":

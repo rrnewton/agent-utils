@@ -857,6 +857,24 @@ registry. An independent worker-compatibility registry retains its own command
 and environment until those workers are stopped and started through the unified
 interface. Creating a new registry does not adopt an agent by matching its name;
 use `agentctl adopt` with the explicit live identity assertions above.
+
+One transitional worker-registry format (`agentctl-runtime/v2`) recorded a
+generation without recording whether the unified session manager or the
+standalone compatibility command owned it. Agentctl therefore will not adopt or
+mutate a headless v2 row. Retire that exact generation through the compatibility
+command instead:
+
+```console
+herdr-subagents down NAME --recover-v2-generation GENERATION
+```
+
+This operation requires the row's complete boot-bound runner identity, stops
+only that exact process generation, preserves its presentation, and writes a
+generation-bound deterministic archive receipt. A wrong generation, an
+unverifiable process, or colliding live/archive state fails without signaling or
+rewriting anything. Start a new unified session only after this retirement is
+complete.
+
 Low-level compatibility arguments remain discoverable with each entry point's
 `--help`.
 

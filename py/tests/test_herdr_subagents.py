@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -17,8 +18,11 @@ from agentctl.client import (
 )
 from agentctl.errors import (
     AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable,
+    RuntimeIdentityMismatch,
 )
-from agentctl.subagents import ManagedAgents, environment_entries, harness_arguments
+from agentctl.subagents import (
+    ManagedAgents, TerminalState, environment_entries, harness_arguments,
+)
 import agentctl.legacy_cli as cli
 import agentctl.cli as unified_cli
 import agentctl.codex_goal as native_goal
@@ -231,7 +235,7 @@ class FakeManagedClient:
     ) -> None:
         assert pane_id in self.infos
         if expected != self.foreign_shell_identity:
-            raise HerdrUnavailable("recorded pane shell generation changed")
+            raise RuntimeIdentityMismatch("recorded pane shell generation changed")
 
     def pane_is_same_idle_shell(
         self, pane_id: str, expected: CustomProcessIdentity,
@@ -409,6 +413,30 @@ def test_relocate_recovers_move_before_registry_commit(
     assert not (manager.registry / "worker/relocation.json").exists()
 
 
+def test_stop_refuses_runtime_moved_by_unfinished_relocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start(
+        "worker", cwd=str(tmp_path), harness="muse", workspace_id="w1",
+    )
+    monkeypatch.setattr(fake, "workspace_label", lambda workspace: f"label-{workspace}")
+    fake.fail_after_move = True
+
+    with pytest.raises(HerdrUnavailable):
+        manager.relocate("worker", workspace_id="w2", new_tab=True)
+    moved = list(fake.presentations)
+    assert moved[0].pane_id == "w2:moved"
+
+    with pytest.raises(AgentDeliveryError, match="unfinished relocation"):
+        manager.stop("worker", expected_token=str(started["token"]))
+
+    assert fake.presentations == moved
+    assert fake.closed == []
+    assert (manager.registry / "worker/relocation.json").is_file()
+    assert not (manager.registry / "archive").exists()
+
+
 def test_relocate_reconciles_after_routing_commit_before_journal_removal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -549,6 +577,48 @@ def test_health_transport_failure_is_unknown_not_proof_of_death(
     session = cast(list[dict[str, object]], result["sessions"])[0]
     assert session["health"] == "unknown"
     assert session["reason_code"] == "runtime-probe-failed"
+
+
+@pytest.mark.parametrize(
+    "error,expected_health,expected_reason",
+    [
+        (
+            HerdrUnavailable("transport protocol changed unexpectedly"),
+            "unknown", "runtime-probe-failed",
+        ),
+        (
+            RuntimeIdentityMismatch("recorded shell belongs to another generation"),
+            "unhealthy", "runtime-identity-mismatch",
+        ),
+    ],
+)
+def test_adopted_shell_health_uses_typed_identity_failure(
+    error: HerdrUnavailable, expected_health: str, expected_reason: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    fake.workspace = "w1"
+    fake.presentations.append(Pane("w1:p1", "w1:t1", "w1"))
+    fake.infos["w1:p1"] = AgentPaneInfo(
+        "w1:p1", "w1", str(tmp_path), "codex", "idle", "codex", "thread",
+    )
+    adopted = manager.adopt(
+        "foreign", pane_id="w1:p1", expected_workspace="subagents",
+        expected_cwd=str(tmp_path), harness="codex",
+    )
+    assert adopted["runtime_ownership"] == "foreign"
+
+    def fail_identity(
+        _pane: str, _expected: CustomProcessIdentity,
+    ) -> None:
+        raise error
+
+    monkeypatch.setattr(fake, "verify_pane_shell_identity", fail_identity)
+    health = manager.health(["foreign"], checked_at=123.0)
+    row = cast(list[dict[str, object]], health["sessions"])[0]
+    assert row["health"] == expected_health
+    assert row["runtime_state"] == "unknown"
+    assert row["reason_code"] == expected_reason
 
 
 def test_health_does_not_call_transient_agent_detector_failure_dead(
@@ -955,6 +1025,36 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
     assert fake.submitted == []
 
 
+def test_starting_muse_after_launch_before_identity_callback_is_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start(
+        "worker", cwd=str(tmp_path), harness="muse", harness_args=("--literal",),
+    )
+    record = replace(
+        manager.get("worker"), lifecycle="starting",
+        custom_process_identity=None, pane_reported_by_agentctl=False,
+        session_agent=None, session_value=None,
+        error=None,
+    )
+    manager._save(record)
+    fake.infos["w1:p1"] = replace(
+        fake.infos["w1:p1"], agent=None, status="unknown",
+        session_agent=None, session_value=None,
+    )
+
+    recovered = manager.recover_start(
+        "worker", expected_token=str(started["token"]),
+        expected_pid=fake.custom_identity.pid,
+    )
+
+    assert recovered["lifecycle"] == "running"
+    assert recovered["custom_process_identity"]["pid"] == fake.custom_identity.pid
+    assert manager.get("worker").error is None
+    assert fake.submitted == []
+
+
 def test_custom_process_identity_outweighs_a_missing_native_agent_label(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1109,6 +1209,66 @@ def test_busy_delivery_stays_pending_and_can_drain(tmp_path: Path, monkeypatch: 
     assert fake.submitted == ["next turn"]
 
 
+def test_busy_drain_does_not_hold_the_lifecycle_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="working")
+    with pytest.raises(AgentPending):
+        manager.send("worker", "next turn", ready_timeout=0)
+
+    sleeping = threading.Event()
+    release = threading.Event()
+    clock = {"now": 0.0}
+    outcome: list[str] = []
+
+    def sleep(_seconds: float) -> None:
+        sleeping.set()
+        assert release.wait(5)
+        clock["now"] = 2.0
+
+    def invoke() -> None:
+        result = manager.drain(
+            "worker", ready_timeout=1, sleep=sleep,
+            monotonic=lambda: clock["now"],
+        )
+        outcome.append(result.outcome)
+
+    thread = threading.Thread(target=invoke, daemon=True)
+    thread.start()
+    assert sleeping.wait(5)
+    observation, _status = manager.status_health_snapshot(
+        "worker", deadline=time.monotonic() + 1,
+    )
+    assert observation["reason_code"] != "lifecycle-lock-contended"
+    assert observation["health"] == "healthy"
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert outcome == ["pending"]
+
+
+def test_stop_refuses_an_inflight_prompt_before_runtime_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    identifier = agent.enqueue_bound(
+        manager._queue("worker"), record.target(), "crossed barrier",
+        message_id="inflight-stop",
+    )
+    inbox = manager.registry / "worker" / "queue" / "inbox" / f"{identifier}.json"
+    inflight = manager.registry / "worker" / "queue" / "inflight" / f"{identifier}.json"
+    agent._transition(str(inbox), str(inflight))
+
+    with pytest.raises(AgentDeliveryError, match="submission is in flight"):
+        manager.stop("worker", expected_token=record.token)
+    assert fake.closed == []
+    assert (manager.registry / "worker" / "agent.json").is_file()
+
+
 def test_lost_native_status_event_reconciles_without_reinjecting_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1173,10 +1333,12 @@ def test_stop_preserves_queue_and_output_and_allows_name_reuse(tmp_path: Path, m
 
 def test_confirmed_missing_pane_can_be_archived(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
-    manager.start("worker", cwd=str(tmp_path))
+    started = manager.start("worker", cwd=str(tmp_path))
     fake.presentations.clear()
-    assert manager.stop("worker")["tab_closed"] is False
+    stopped = manager.stop("worker")
+    assert stopped["tab_closed"] is False
     assert fake.closed == []
+    assert manager.stop("worker", expected_token=str(started["token"])) == stopped
 
 
 def test_goal_is_native_submission_with_honest_requested_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1685,7 +1847,7 @@ def test_agent_record_v3_has_one_tagged_launch_and_goal_authority(
     )
     path = manager.registry / "worker" / "agent.json"
     stored = json.loads(path.read_text(encoding="utf-8"))
-    assert stored["schema"] == "agentctl-session/v3"
+    assert stored["schema"] == "agentctl-session/v4"
     assert stored["launch"]["schema"] == "agentctl-launch/v2"
     assert stored["launch"]["permission_mode"] is None
     assert stored["launch"]["argv"] == [
@@ -1699,6 +1861,7 @@ def test_agent_record_v3_has_one_tagged_launch_and_goal_authority(
         "schema": "agentctl-native-session/v1", "agent": "codex",
         "value": "session-1", "source": "observed",
     }
+    assert stored["terminal"] is None
     for duplicate in (
         "harness", "cwd", "adapter", "mode", "backend", "model", "resume",
         "arguments", "launch_argv", "launch_executable", "runtime_home",
@@ -1708,6 +1871,36 @@ def test_agent_record_v3_has_one_tagged_launch_and_goal_authority(
     ):
         assert duplicate not in stored
     assert manager.get("worker").arguments == started["arguments"]
+
+
+def test_agent_record_v4_requires_exact_terminal_union(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "worker" / "agent.json"
+    active = json.loads(path.read_text(encoding="utf-8"))
+
+    stopped_without_terminal = dict(active, lifecycle="stopped", terminal=None)
+    path.write_text(json.dumps(stopped_without_terminal), encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="inconsistent terminal state"):
+        manager.get("worker")
+
+    active["terminal"] = TerminalState.create(
+        "owned-runtime-absent"
+    ).to_document()
+    path.write_text(json.dumps(active), encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="nonterminal"):
+        manager.get("worker")
+
+    legacy = dict(stopped_without_terminal)
+    legacy.pop("terminal")
+    legacy["schema"] = "agentctl-session/v3"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    decoded = manager.get("worker")
+    assert decoded.lifecycle == "stopped"
+    assert decoded.terminal is None
+    assert decoded._legacy_terminal_authority is True
 
 
 def test_agent_record_v3_reads_profiled_claude_launch_without_flat_harness_field(
@@ -1779,6 +1972,7 @@ def test_agent_record_v3_writer_refuses_incomplete_native_session(
 def _downgrade_current_record_to_v2(stored: dict[str, object]) -> dict[str, object]:
     goal = cast(dict[str, object], stored.pop("goal"))
     native = cast(dict[str, object] | None, stored.pop("native_session"))
+    stored.pop("terminal")
     stored["schema"] = "agentctl-session/v2"
     stored.update({
         "session_agent": None if native is None else native["agent"],
@@ -1831,7 +2025,7 @@ def test_agent_record_v3_migrates_v2_goal_and_native_session_without_duplicates(
     assert manager.get("worker").goal == "legacy objective"
     manager.pause("worker")
     migrated = json.loads(path.read_text(encoding="utf-8"))
-    assert migrated["schema"] == "agentctl-session/v3"
+    assert migrated["schema"] == "agentctl-session/v4"
     assert migrated["goal"] == {
         "schema": "agentctl-goal/v1",
         "objective": "legacy objective",
@@ -1905,7 +2099,7 @@ def test_agent_record_v3_migrates_legacy_goal_artifact_before_dropping_map(
     manager.pause("worker")
 
     migrated = json.loads(path.read_text(encoding="utf-8"))
-    assert migrated["schema"] == "agentctl-session/v3"
+    assert migrated["schema"] == "agentctl-session/v4"
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert artifact["kind"] == "goal"
     assert "goal_messages" not in migrated
@@ -1945,7 +2139,7 @@ def test_legacy_goal_pointer_without_duplicate_map_is_exactly_recovered(
     manager.pause("worker")
 
     migrated = json.loads(path.read_text(encoding="utf-8"))
-    assert migrated["schema"] == "agentctl-session/v3"
+    assert migrated["schema"] == "agentctl-session/v4"
     assert json.loads(artifact_path.read_text(encoding="utf-8"))["kind"] == "goal"
 
 
@@ -2127,7 +2321,7 @@ def test_send_migrates_legacy_goal_authority_before_queue_delivery(
     def observe_send(*_args: object, **_kwargs: object) -> agent.QueueResult:
         migrated = json.loads(record_path.read_text(encoding="utf-8"))
         tagged = json.loads(artifact_path.read_text(encoding="utf-8"))
-        assert migrated["schema"] == "agentctl-session/v3"
+        assert migrated["schema"] == "agentctl-session/v4"
         assert "goal_messages" not in migrated
         assert tagged["kind"] == "goal"
         return agent.QueueResult("ordinary", (), (), ())
@@ -2199,7 +2393,7 @@ def test_agent_record_v1_migrates_once_and_refuses_conflicting_argument_authorit
     )
     manager.pause("worker")
     migrated = json.loads(path.read_text(encoding="utf-8"))
-    assert migrated["schema"] == "agentctl-session/v3"
+    assert migrated["schema"] == "agentctl-session/v4"
     assert migrated["launch"]["argv"] == [
         "codex", "--no-alt-screen", "--literal",
     ]

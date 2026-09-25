@@ -91,14 +91,33 @@ struct Document {
     schema: String,
     profiles: UniqueMap<RawProfile>,
     #[serde(default)]
-    default_workspace: Option<RawWorkspaceSelector>,
+    default_workspace: FieldPresence<RawWorkspaceSelector>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawWorkspaceSelector {
-    id: Option<String>,
-    label: Option<String>,
+    #[serde(default)]
+    id: FieldPresence<String>,
+    #[serde(default)]
+    label: FieldPresence<String>,
+}
+
+enum FieldPresence<T> {
+    Missing,
+    Present(T),
+}
+
+impl<T> Default for FieldPresence<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for FieldPresence<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::Present)
+    }
 }
 
 #[derive(Deserialize)]
@@ -697,18 +716,20 @@ pub(crate) fn load_project_config(
         ))
     })?;
     if !matches!(document.schema.as_str(), LEGACY_SCHEMA | SCHEMA)
-        || (document.schema == LEGACY_SCHEMA && document.default_workspace.is_some())
-        || (document.schema == SCHEMA && document.default_workspace.is_none())
+        || (document.schema == LEGACY_SCHEMA
+            && matches!(&document.default_workspace, FieldPresence::Present(_)))
+        || (document.schema == SCHEMA
+            && matches!(&document.default_workspace, FieldPresence::Missing))
     {
         return Err(fail(format!(
             "profile config must use schema {LEGACY_SCHEMA:?} or {SCHEMA:?} with exactly its documented fields"
         )));
     }
     let default_workspace = match document.default_workspace {
-        Some(raw) => {
+        FieldPresence::Present(raw) => {
             let (kind, value) = match (raw.id, raw.label) {
-                (Some(value), None) => ("id", value),
-                (None, Some(value)) => ("label", value),
+                (FieldPresence::Present(value), FieldPresence::Missing) => ("id", value),
+                (FieldPresence::Missing, FieldPresence::Present(value)) => ("label", value),
                 _ => {
                     return Err(fail(
                         "default_workspace must contain exactly one of id or label",
@@ -725,7 +746,7 @@ pub(crate) fn load_project_config(
                 value,
             })
         }
-        None => None,
+        FieldPresence::Missing => None,
     };
     let profiles = document
         .profiles
@@ -765,5 +786,40 @@ pub(crate) fn reasoning_arguments(
         _ => Err(fail(format!(
             "reasoning effort is not supported for harness {harness:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_selector_preserves_presence_and_rejects_null_values() {
+        for document in [
+            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":null}"#,
+            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":{"id":"w","label":null}}"#,
+            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":{"id":null}}"#,
+            r#"{"schema":"agentctl-profiles/v1","profiles":{},"default_workspace":null}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Document>(document).is_err(),
+                "{document}"
+            );
+        }
+
+        let missing: Document =
+            serde_json::from_str(r#"{"schema":"agentctl-profiles/v2","profiles":{}}"#).unwrap();
+        assert!(matches!(missing.default_workspace, FieldPresence::Missing));
+        let exact: Document = serde_json::from_str(
+            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":{"label":"dev-hermit-014"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            exact.default_workspace,
+            FieldPresence::Present(RawWorkspaceSelector {
+                id: FieldPresence::Missing,
+                label: FieldPresence::Present(value),
+            }) if value == "dev-hermit-014"
+        ));
     }
 }
