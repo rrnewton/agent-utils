@@ -4917,12 +4917,23 @@ class ManagedAgents:
                     "--expected-record-sha256 requires --recover-legacy-adoption"
                 )
             if (record.launch.adapter == "herdr-pane"
-                    and record.lifecycle == "stopped"
-                    and self._managed_dead_retirement_exists(record)):
-                return self._retire_managed_dead(
-                    record, expected_token=expected_token,
-                    expected_token_explicit=expected_token_explicit,
-                )
+                    and record.lifecycle == "stopped"):
+                if self._managed_dead_retirement_exists(record):
+                    return self._retire_managed_dead(
+                        record, expected_token=expected_token,
+                        expected_token_explicit=expected_token_explicit,
+                    )
+                # An ordinary stop writes lifecycle=stopped only after closing
+                # its pane.  A surviving route with no preservation receipt is
+                # ambiguous (deleted/tampered receipt or replacement terminal),
+                # so never fall through to the pane-closing path.
+                if record.pane_id is None or any(
+                    pane.pane_id == record.pane_id for pane in self.client.panes()
+                ):
+                    raise AgentDeliveryError(
+                        "stopped custom runtime still has a pane but no "
+                        "managed-dead retirement receipt; pane was preserved"
+                    )
             if record.launch.adapter == "herdr-foreign":
                 # This registry owns only delivery state.  Revalidate and retain
                 # one final snapshot, but never close, rename, signal, or

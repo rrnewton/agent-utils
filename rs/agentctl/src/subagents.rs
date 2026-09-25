@@ -7620,21 +7620,34 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "--expected-record-sha256 requires --recover-legacy-adoption",
             ));
         }
-        if record.launch.adapter == "herdr-pane"
-            && record.lifecycle == "stopped"
-            && self.managed_dead_retirement_exists(&record)?
-        {
+        if record.launch.adapter == "herdr-pane" && record.lifecycle == "stopped" {
+            if self.managed_dead_retirement_exists(&record)? {
+                let pane_id = record
+                    .pane_id
+                    .as_deref()
+                    .ok_or_else(|| fail("managed-dead stopped record has no pane identity"))?;
+                let _pane_lock = self.pane_lock(pane_id)?;
+                let pinned = self.pinned_agent_directory(agent_name)?;
+                return self.retire_managed_dead_locked(
+                    &record,
+                    &pinned,
+                    options.expected_token.as_deref(),
+                );
+            }
             let pane_id = record
                 .pane_id
                 .as_deref()
-                .ok_or_else(|| fail("managed-dead stopped record has no pane identity"))?;
-            let _pane_lock = self.pane_lock(pane_id)?;
-            let pinned = self.pinned_agent_directory(agent_name)?;
-            return self.retire_managed_dead_locked(
-                &record,
-                &pinned,
-                options.expected_token.as_deref(),
-            );
+                .ok_or_else(|| fail("stopped custom runtime has no recorded pane identity"))?;
+            if self
+                .client
+                .panes()?
+                .iter()
+                .any(|pane| pane.pane_id == pane_id)
+            {
+                return Err(fail(
+                    "stopped custom runtime still has a pane but no managed-dead retirement receipt; pane was preserved",
+                ));
+            }
         }
         if record.launch.adapter == "herdr-foreign" {
             let (live, info, presentation) = self.inspect_foreign(agent_name, &record)?;
@@ -13503,6 +13516,52 @@ mod tests {
         assert!(!active.exists());
         assert!(Path::new(result["archive"].as_str().unwrap()).is_dir());
         assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stopped_muse_without_retirement_receipt_never_closes_surviving_pane() {
+        for replacement_terminal in [false, true] {
+            let fixture = Fixture::new();
+            let manager = fixture.manager();
+            let started = manager
+                .start(
+                    "worker",
+                    &fixture.root,
+                    StartOptions {
+                        workspace_id: Some("workspace".to_owned()),
+                        harness: "muse".to_owned(),
+                        ..StartOptions::default()
+                    },
+                )
+                .unwrap();
+            fixture.client.custom_alive.store(false, Ordering::Relaxed);
+            let token = started["token"].as_str().unwrap().to_owned();
+            let mut record = manager.load("worker").unwrap();
+            record.lifecycle = "stopped".to_owned();
+            manager.save(&record).unwrap();
+            if replacement_terminal {
+                fixture.client.panes.lock().unwrap()[0].terminal_id =
+                    Some("replacement-terminal".to_owned());
+            }
+            let retained = fixture.client.panes.lock().unwrap().clone();
+
+            let error = manager
+                .stop_with_options(
+                    "worker",
+                    StopOptions {
+                        expected_token: Some(token),
+                        ..StopOptions::default()
+                    },
+                )
+                .unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("no managed-dead retirement receipt"));
+            assert_eq!(*fixture.client.panes.lock().unwrap(), retained);
+            assert!(fixture.client.closed.lock().unwrap().is_empty());
+            assert!(fixture.root.join("registry/worker").is_dir());
+        }
     }
 
     #[test]

@@ -538,6 +538,31 @@ def test_ordinary_muse_stop_retries_stopped_before_archive_without_retirement_re
     assert fake.closed == []
 
 
+@pytest.mark.parametrize("replacement_terminal", [False, True])
+def test_stopped_muse_without_retirement_receipt_never_closes_surviving_pane(
+    replacement_terminal: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    record = manager.get("worker")
+    record.lifecycle = "stopped"
+    manager._save(record)
+    if replacement_terminal:
+        fake.presentations[0] = replace(
+            fake.presentations[0], terminal_id="replacement-terminal",
+        )
+    retained = list(fake.presentations)
+
+    with pytest.raises(AgentDeliveryError, match="no managed-dead retirement receipt"):
+        manager.stop("worker", expected_token=token)
+
+    assert fake.presentations == retained
+    assert fake.closed == []
+    assert (manager.registry / "worker").is_dir()
+
+
 @pytest.mark.parametrize("swap_after", ["agent.json", "managed-dead-retirement.json"])
 def test_owned_dead_muse_archive_receipt_refuses_directory_replacement_between_reads(
     swap_after: str,
