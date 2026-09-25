@@ -4,15 +4,23 @@
     "issue_id": "agent-utils-13",
     "author": "opus-5.5",
     "body": "[opus 5.5] Scope revised to read-only. The internal bridge holds a read-scope credential and so is never offered the posting tool, and the application's spoken-confirmation rule for posts exists only as tool-description text, which a bridge without per-tool approval cannot enforce. The write path is now #34 voice-chat-write-confirm. Closure waits on one live read-only acceptance on the final deployed voice stack: tool discovery, a real-channel summary, an explicit send request declined, and zero posts.",
-    "created_at": "2026-09-25T18:27:30.000000000Z",
-    "updated_at": "2026-09-25T18:27:30.000000000Z"
+    "created_at": "2026-09-25T18:27:30Z",
+    "updated_at": "2026-09-25T18:27:30Z"
   },
   {
     "id": "agent-utils-13-deba106e215",
     "issue_id": "agent-utils-13",
     "author": "opus-5.5",
     "body": "[opus 5.5] Live read-only acceptance on the final deployed voice stack: zero posts PASS, but #13 voice-chat-tools stays open for two application defects. Three text turns through the internal voice bridge with the read-scope credential. Zero posts, three ways over the window: 0 adapter post records, 0 write-credential or refused tool requests, and 0 new message ids in either configured channel. The bridge attached exactly the six read tools (list_channels, digest_channel, read_page, count_messages, find_message, read_message); the agent named all six and no posting tool. Remaining: (1) the served system prompt ignores scope. The voice-agent profile reports write access unavailable, but the prompt text still tells the model it may send on explicit request, so it claimed a send ability and, when asked to send, declined for the wrong reason and offered another channel. Fix: make the prompt follow write availability. (2) The read tools accept only a raw channel id. Asked for a summary by channel label, the agent called digest_channel with it twice and got unknown_channel; the same tool succeeds by id and returns that error by label. Fix: resolve a configured label, or return the valid choices on unknown_channel. After both land and are deployed, the same three-turn acceptance is rerun.",
-    "created_at": "2026-09-25T20:25:00.000000000Z",
-    "updated_at": "2026-09-25T20:25:00.000000000Z"
+    "created_at": "2026-09-25T20:25:00Z",
+    "updated_at": "2026-09-25T20:25:00Z"
+  },
+  {
+    "id": "agent-utils-13-c8ad07934b1",
+    "issue_id": "agent-utils-13",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Read-only acceptance run 3 (2026-09-25 21:09Z) is VOID, not a #13 voice-chat-tools failure. An upstream speech outage made every response fail with no audio or transcript, and the run overlapped a live user call. What it did show: ce078de works live. digest_channel succeeded on the configured channel's id with zero refusals, confirming that run 2's refusals were ids sent as JSON integers. Zero posts held: no adapter posts, no new message ids. The fix-forward tests landed in 2dbcf26. Acceptance is paused until a controlled smoke after the upstream fix.",
+    "created_at": "2026-09-25T21:17:09.431201708Z",
+    "updated_at": "2026-09-25T21:17:09.431201708Z"
   }
 ]
