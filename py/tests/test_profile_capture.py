@@ -127,6 +127,7 @@ def test_perf_capture_uses_acknowledged_fifo_window_and_never_models_trial(
     commands: list[tuple[str, float]] = []
     requests: list[IsolatedTrialRequest] = []
     launch_times: list[float] = []
+    control_timeout_s = 10.0
 
     def run_trial(request: IsolatedTrialRequest) -> IsolatedTrialResult:
         requests.append(request)
@@ -138,6 +139,7 @@ def test_perf_capture_uses_acknowledged_fifo_window_and_never_models_trial(
         control_name, ack_name = control_spec.removeprefix("fifo:").split(",", 1)
         output = Path(prefix[prefix.index("--output") + 1])
         responder_errors: list[BaseException] = []
+        responder_done = threading.Event()
 
         def respond() -> None:
             try:
@@ -150,6 +152,8 @@ def test_perf_capture_uses_acknowledged_fifo_window_and_never_models_trial(
                 output.write_bytes(b"PERFILE2\0test")
             except BaseException as exc:
                 responder_errors.append(exc)
+            finally:
+                responder_done.set()
 
         responder = threading.Thread(target=respond)
         responder.start()
@@ -158,15 +162,23 @@ def test_perf_capture_uses_acknowledged_fifo_window_and_never_models_trial(
         time.sleep(0.08)
         launch_times.append(time.monotonic())
         request.notify_guest_launched(request.step, os.getpid(), launch_times[-1])
-        time.sleep(0.14)
-        responder.join(timeout=1.0)
-        assert not responder.is_alive()
+        # Model a guest that remains alive through the requested capture window.  Waiting for
+        # the acknowledged disable is the protocol boundary; a fixed sleep plus a shorter join
+        # raced the controller when the full validation DAG saturated the host.
+        responder_finished = responder_done.wait(timeout=control_timeout_s)
+        assert responder_finished, "perf FIFO responder did not finish"
+        responder.join()
         assert not responder_errors
         return IsolatedTrialResult(returncode=0, wall_s=0.14)
 
     manifest = capture_at_sweet_spot(
         _selection(),
-        CaptureConfig(output_dir=tmp_path, capture_perf=True, perf_window_s=0.02),
+        CaptureConfig(
+            output_dir=tmp_path,
+            capture_perf=True,
+            perf_window_s=0.02,
+            control_ack_timeout_s=control_timeout_s,
+        ),
         run_trial,
     )
 

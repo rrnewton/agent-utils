@@ -20,6 +20,7 @@ import pytest
 
 from dagrun import __version__
 import dagrun.cli as cli
+from dagrun.attribution import LOG_DIR_ENV
 from dagrun.cli import (
     CGROUP_SETUP_ENVIRONMENT_ERROR,
     PROG,
@@ -39,6 +40,7 @@ from dagrun.profile_capture import (
     IsolatedTrialResult,
     ProfileCaptureError,
 )
+from dagrun.scheduler import BudgetUnit
 from dagrun.sweep import CpuTopology
 
 _DEMO = '{"steps": [{"group": "g", "job": "j", "cmd": "true", "deps": []}]}'
@@ -478,6 +480,12 @@ def test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree(
     pid_marker = tmp_path / "descendant.pid"
     cgroup_marker = tmp_path / "descendant.cgroup"
     coordinator_cgroup_marker = tmp_path / "coordinator.cgroup"
+    evidence_dir = tmp_path / "evidence"
+    # The budget starts before a second Python runner has imported and established its nested
+    # cgroups. Three seconds raced that setup under whole-repository load and could tear the run
+    # down before the worker wrote the very markers this test needs to inspect. Ten seconds is
+    # still a tight timeout smoke, while leaving startup outside the condition under test.
+    outer_timeout_s = 10
     inner = tmp_path / "inner.json"
     inner.write_text(
         json.dumps(
@@ -521,7 +529,7 @@ def test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree(
                             ]
                         ),
                         "delegated_children": True,
-                        "timeout": 3,
+                        "timeout": outer_timeout_s,
                         "cpu_timeout": 60,
                         # Keep the smoke's own envelope small enough to nest below the canonical
                         # validation shard; inherited admission clamps the modeling floor.
@@ -546,7 +554,14 @@ def test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree(
             "-q",
         ],
         cwd=Path(__file__).parents[1],
-        env={**os.environ, **inherited_runner_authority_env},
+        env={
+            **os.environ,
+            **inherited_runner_authority_env,
+            # Assert the durable timeout event, not a console line emitted later in teardown.
+            # Under load the process snapshot can be visible even when that terminal rendering
+            # loses its race with nested shutdown; the journal record is flushed before reaping.
+            LOG_DIR_ENV: str(evidence_dir),
+        },
         capture_output=True,
         text=True,
         timeout=30,
@@ -559,13 +574,34 @@ def test_delegated_nested_run_keeps_descendants_in_outer_owned_subtree(
     ):
         pytest.skip(f"cgroup delegation unavailable: {output}")
     assert result.returncode == 1, output
-    assert "TIMEOUT" in output
+    journal = evidence_dir / "journal.jsonl"
+    assert journal.exists(), output
+    records = [
+        json.loads(line)
+        for line in journal.read_text().splitlines()
+        if line.strip()
+    ]
+    breaches = [
+        record
+        for record in records
+        if record.get("event") == "step_timeout"
+        and record.get("step") == "outer.delegating"
+    ]
+    assert len(breaches) == 1, f"expected one outer wall-timeout record, got {breaches}\n{output}"
+    breach = breaches[0]
+    assert breach["unit"] == BudgetUnit.WALL_SECONDS.value
+    assert breach["limit_s"] == str(outer_timeout_s)
+    assert float(breach["measured_s"]) >= outer_timeout_s
+    assert float(breach["measured_s"]) == float(breach["wall_elapsed_s"])
+    assert cgroup_marker.exists(), output
     cgroup_path = cgroup_marker.read_text()
     assert "step-outer.delegating/nested-run-" in cgroup_path
     assert "/step-inner.worker" in cgroup_path
+    assert coordinator_cgroup_marker.exists(), output
     coordinator_cgroup_path = coordinator_cgroup_marker.read_text()
     assert "step-outer.delegating/nested-run-" in coordinator_cgroup_path
     assert coordinator_cgroup_path.rstrip().endswith("/supervisor")
+    assert pid_marker.exists(), output
     pid = int(pid_marker.read_text().strip())
     deadline = time.monotonic() + 5
     while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:

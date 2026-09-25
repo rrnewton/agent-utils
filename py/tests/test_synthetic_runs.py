@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import shlex
 import tempfile
 from pathlib import Path
 
@@ -113,32 +114,64 @@ def test_chain_is_serial() -> None:
     assert r.ok and r.wall_s >= 0.2  # 5 * 0.05 forced serial by deps (loose)
 
 
-def test_intra_step_parallelism_runs_concurrently() -> None:
-    # Compare like-for-like runner and teardown overhead instead of imposing an absolute wall-time
-    # ceiling: ownership sweeps and host load are independent of the inner sleepers themselves.
-    parallel = run_dag_limited(
-        DagConfig(steps=(sleeper("g", "fan", 0.1, inner=4),)),
-        max_steps=1,
-        max_cpus=4,
-        verbosity=0,
+def test_intra_step_parallelism_runs_concurrently(tmp_path: Path) -> None:
+    # Each worker announces itself and then waits for a release file. The parent releases them
+    # only after ALL four announcements exist, so success proves that the workers were live at
+    # the same time without comparing wall clocks (which include variable host/procfs overhead).
+    probe = tmp_path / "parallel-probe"
+    probe.mkdir()
+    command = (
+        f"probe={shlex.quote(str(probe))}; "
+        'n="${INNER:-1}"; i=0; '
+        'while [ "$i" -lt "$n" ]; do '
+        '( worker="$i"; : > "$probe/ready.$worker"; '
+        'while [ ! -e "$probe/release" ]; do sleep 0.01; done; '
+        ': > "$probe/done.$worker" ) & '
+        'i=$((i+1)); '
+        'done; '
+        'attempt=0; '
+        'while [ "$attempt" -lt 500 ]; do '
+        'all_ready=1; i=0; '
+        'while [ "$i" -lt "$n" ]; do '
+        '[ -e "$probe/ready.$i" ] || all_ready=0; '
+        'i=$((i+1)); '
+        'done; '
+        '[ "$all_ready" -eq 1 ] && break; '
+        'sleep 0.01; attempt=$((attempt+1)); '
+        'done; '
+        '[ "$attempt" -lt 500 ] || exit 42; '
+        ': > "$probe/release"; wait'
     )
-    serial = run_dag_limited(
-        DagConfig(
-            steps=(
-                Step(
-                    "g",
-                    "serial",
-                    "g.serial",
-                    "sleep 0.1; sleep 0.1; sleep 0.1; sleep 0.1",
-                ),
-            )
-        ),
-        max_steps=1,
-        max_cpus=4,
-        verbosity=0,
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "fan",
+                "g.fan",
+                command,
+                env={"INNER": "4"},
+                timeout=10,
+                hint=ResourceHint(preferred_inner_jobs=4),
+                jobs_flag="",
+            ),
+        )
     )
-    assert parallel.ok and serial.ok
-    assert parallel.wall_s + 0.15 < serial.wall_s
+
+    result = run_dag_limited(cfg, max_steps=1, max_cpus=4, verbosity=0)
+
+    assert result.ok
+    assert sorted(path.name for path in probe.glob("ready.*")) == [
+        "ready.0",
+        "ready.1",
+        "ready.2",
+        "ready.3",
+    ]
+    assert sorted(path.name for path in probe.glob("done.*")) == [
+        "done.0",
+        "done.1",
+        "done.2",
+        "done.3",
+    ]
 
 
 def test_dep_failure_skips_dependents() -> None:
