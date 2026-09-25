@@ -1,6 +1,6 @@
 ---
 title: 'thread-view-phone-overflow: keep a long thread title from widening the phone layout'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -9,7 +9,8 @@ labels:
 - ui
 - regression
 created_at: 2026-09-25T19:23:43.223208716+00:00
-updated_at: 2026-09-25T19:23:43.223208716+00:00
+updated_at: 2026-09-25T19:41:51.552485000+00:00
+closed_at: 2026-09-25T19:41:51.552485000+00:00
 ---
 
 # Description
