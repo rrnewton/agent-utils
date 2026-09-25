@@ -21367,6 +21367,110 @@ def test_abort_create_refuses_and_preserves_untracked_source_from_failed_hook(
     ).returncode == 0
 
 
+_POPULATE_SUBMODULES_THEN_FAIL = (
+    "git -c protocol.file.allow=always submodule update --init --recursive && exit 9"
+)
+_LEAVE_EMPTY_SUBMODULE_ADMINISTRATION_THEN_FAIL = python_hook(
+    "import pathlib, subprocess; "
+    "git_dir = pathlib.Path(subprocess.check_output("
+    "['git', 'rev-parse', '--absolute-git-dir'], text=True).strip()); "
+    "(git_dir / 'modules' / 'component').mkdir(parents=True); "
+    "raise SystemExit(9)"
+)
+
+
+@pytest.mark.parametrize(
+    "hook",
+    (_POPULATE_SUBMODULES_THEN_FAIL, _LEAVE_EMPTY_SUBMODULE_ADMINISTRATION_THEN_FAIL),
+    ids=("populated", "empty-administration"),
+)
+def test_abort_create_removes_clean_checkout_with_submodule_administration(
+    tmp_path: Path, hook: str
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(project, post_provision_hooks=[hook])
+    before = submodule_peer_snapshot(repository, repository)
+    refused = create(project)
+    assert refused.returncode == 3
+    tree = checkout(project)
+    journal = create_journal_path(project)
+    assert journal.is_file()
+    private_git_dir = Path(
+        git(tree, "rev-parse", "--absolute-git-dir").stdout.strip()
+    )
+    assert (private_git_dir / "modules" / "component").is_dir()
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not tree.exists()
+    assert not private_git_dir.exists()
+    assert not journal.exists()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 1
+    assert submodule_peer_snapshot(repository, repository) == before
+
+
+def test_abort_create_refuses_and_preserves_untracked_source_in_a_submodule(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project, post_provision_hooks=[_POPULATE_SUBMODULES_THEN_FAIL]
+    )
+    refused = create(project)
+    assert refused.returncode == 3
+    tree = checkout(project)
+    journal = create_journal_path(project)
+    source = tree / "component" / "leaf" / "important-source.txt"
+    source.write_text("preserve me\n", encoding="utf-8")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 3
+    assert "source state is dirty" in aborted.stderr
+    assert source.read_text(encoding="utf-8") == "preserve me\n"
+    assert tree.is_dir()
+    assert journal.is_file()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 0
+
+
 def test_disk_ladder_warns_refuses_allows_override_and_keeps_emergency_hard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

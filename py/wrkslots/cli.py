@@ -18074,7 +18074,11 @@ def _abort_create(
                 )
             for cache in caches:
                 _remove_cache_directory(config, cache)
-            vcs.remove_worktree(repository, destination)
+            # A failed submodule hook leaves worktree-private submodule
+            # administration, which plain `git worktree remove` refuses. The
+            # status check above already includes untracked, ignored, and
+            # submodule changes, so --force removes only that administration.
+            vcs.remove_worktree(repository, destination, force=True)
             _fsync_directory(slot_path.parent)
     for item, repository, _destination, expected_head, _present, _checkout, _caches in preflight:
         vcs.delete_branch_at(repository, item.branch, expected_head)
