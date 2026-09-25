@@ -156,17 +156,20 @@ and Python derives that path from the slot type's root, so such a create proves 
 attempt left no slot directory. A create of the same slot name under the other slot type proves only
 that its own root was clear, and it leaves the marker open. The path check is stricter than that
 proof: a nested re-create that plans fewer checkouts than the aborted attempt leaves the marker
-open, although the refused slot directory held all of them, because a row records neither its slot
-directory nor its layout. That is a false blocker and never a false clearance. The proof does not
-extend to branches or caches outside the slot path that an older writer may have left. Some of these
-blockers are permanent, because no event that current writers append can close them and phase 1 has
-no operator acknowledgment event: a marker whose journal does not identify its storage; a create
-marker bound to the legacy singleton journal, because current creates complete only at their scoped
-path; an aborted import-existing followed by a create rather than a re-import of the same checkouts,
-because the completion's operation differs; and a create or import marker still open when the slot
-is archived, because archive evidence clears only finish attempts. The enumeration of
-`py/wrkslots/cli.py` below supports the row-present cases for histories written by that code. Line
-numbers are at `aa68c18`, "wrkslots: check task scopes before create recovery provisions".
+open, although the refused slot directory held all of them. So does a re-import through the same
+journal that records fewer checkouts than an aborted import, although Python publishes an import
+only when the slot directory holds exactly the row's checkouts. Replay compares checkout paths
+rather than deriving each slot directory from the checkout names, so these are false blockers and
+never false clearances. The proof does not extend to branches or caches outside the slot path that
+an older writer may have left. Some of these blockers are permanent, because no event that current
+writers append can close them and phase 1 has no operator acknowledgment event: a marker whose
+journal does not identify its storage; a create marker bound to the legacy singleton journal,
+because current creates complete only at their scoped path; an aborted import-existing followed by a
+create rather than a re-import of the same checkouts, because the completion's operation differs;
+and a create or import marker still open when the slot is archived, because archive evidence clears
+only finish attempts. The enumeration of `py/wrkslots/cli.py` below supports the row-present cases
+for histories written by that code. Line numbers are at `aa68c18`, "wrkslots: check task scopes
+before create recovery provisions".
 
 - `_clear_journal` (5472) is the only writer of `operation-completed` (5483). Every
   `_write_event_file` and `writer.append` call passes a literal kind. The other occurrences, at 5558
@@ -202,8 +205,9 @@ called from `_recover_ownerless_validation` at 26597, 26685, and 26753) does the
 ownerless validation. Those operations therefore keep the archived-removal rule above.
 For a pre-event-log finish journal, recovery can import snapshots that are already at any side of
 the archive/ACTIVE publication boundary. Once those snapshots prove physical removal, the observer
-retains a synthetic legacy-journal cleanup marker until the following `operation-completed`; this
-keeps the interrupted operation visible without leaving a false recovery blocker after completion.
+retains a synthetic legacy-journal cleanup marker until an `operation-completed` at that journal's
+path; this keeps the interrupted operation visible without leaving a false recovery blocker after
+completion. A completion at another journal path, such as a later scoped finish, leaves it pending.
 
 Python `clean-caches --only SLOT` limits cache-directory traversal and scoped-journal checkout/Git
 inspection to the named slot. It reads each complete bounded unselected scoped journal and verifies
