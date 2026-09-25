@@ -15651,6 +15651,14 @@ def _expand_cache_globs(
     symlink, and an unreadable directory contributes nothing. Every directory
     is listed at most once for all patterns together, and each listing is
     debited from ``budget`` together with the time this walk has taken.
+
+    The order matches ``Path.glob`` only for a pattern without ``**``, or with
+    one ``**`` directly before the final component and only literal
+    components before it. For other shapes the same paths may come in a
+    different order, so a caller that stops at the first unsafe path may name
+    a different one than ``Path.glob`` would. The time bound is cooperative:
+    it is checked between listings, so a listing that blocks is not
+    interrupted.
     """
 
     started = time.monotonic()
@@ -15668,8 +15676,10 @@ def _expand_cache_globs_walk(
     started: float,
 ) -> tuple[tuple[str, tuple[Path, ...]], ...]:
     parts = tuple(_glob_pattern_parts(pattern) for pattern in cache_globs)
-    # Ordered by (the sequence in which Path.glob reaches the directory that
+    # Ordered by (the sequence in which this walk reaches the directory that
     # yields the path, the entry's position in that directory's listing).
+    # That is Path.glob's order only for the shapes the docstring names: a
+    # wildcard before '**' makes Path.glob finish each match's subtree first.
     matches: tuple[list[tuple[tuple[int, int], Path]], ...] = tuple([] for _ in parts)
 
     def closure(positions: set[tuple[int, int]]) -> set[tuple[int, int]]:

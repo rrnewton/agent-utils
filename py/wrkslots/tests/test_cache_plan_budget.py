@@ -68,6 +68,7 @@ def _expand(root: Path, pattern: str) -> list[Path]:
         "ignored/*/target",
         "ignored/link/target",
         "ignored/**/*/target",
+        "ignored/*/**/target",
         "ignored/**/b/**/target-debug",
         "ignored/**/**/target",
         "a/b?/d",
@@ -83,10 +84,14 @@ def test_expansion_yields_what_path_glob_yields(tmp_path: Path, pattern: str) ->
     assert sorted(found) == sorted(expected)
     assert len(found) == len(set(found))
     parts = pattern.split("/")
-    if "**" not in parts or (parts.count("**") == 1 and parts[-2] == "**"):
-        # Patterns without '**', or with one '**' directly before the final
-        # component, are also yielded in Path.glob's order, so the first
-        # refusal a checkout reports is unchanged.
+    if "**" not in parts or (
+        parts.count("**") == 1
+        and parts[-2] == "**"
+        and not any(magic in "".join(parts[:-2]) for magic in "*?[")
+    ):
+        # Only these shapes are also yielded in Path.glob's order, so the first
+        # refusal a checkout reports is unchanged. Other shapes, such as
+        # 'ignored/*/**/target', may name a different first unsafe path.
         assert found == expected
 
 
@@ -100,6 +105,23 @@ def test_trailing_recursive_wildcard_yields_directories_without_following_links(
         for directory, _names, _files in os.walk(root / "ignored", followlinks=False)
     ]
     assert sorted(_expand(root, "ignored/**")) == sorted(expected)
+
+
+def test_unreadable_directory_contributes_nothing(tmp_path: Path) -> None:
+    root = _tree(tmp_path)
+    closed = root / "ignored/a"
+    closed.chmod(0)
+    try:
+        if os.access(closed, os.R_OK):
+            pytest.skip("directory permissions are not enforced for this user")
+        for pattern in LIVE_SHAPED:
+            expected = list(root.glob(pattern))
+            assert _expand(root, pattern) == expected
+        assert not any(
+            closed in path.parents for path in _expand(root, "ignored/**/target")
+        )
+    finally:
+        closed.chmod(0o755)
 
 
 @contextlib.contextmanager
