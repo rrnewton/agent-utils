@@ -18,7 +18,7 @@ from agentctl.client import (
 )
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 from agentctl.sessions import Sessions
-from agentctl.subagents import AgentRecord
+from agentctl.subagents import AgentRecord, LaunchSpec
 import agentctl.codex_goal as native_goal
 from .test_herdr_subagents import FakeManagedClient
 
@@ -1220,10 +1220,15 @@ def test_adopt_refuses_same_harness_session_held_by_headless_record(
     sessions._prepare()
     (sessions.registry / "headless").mkdir(mode=0o700)
     sessions._save(AgentRecord(
-        "headless", "headless-token", "codex", str(tmp_path), 1.0,
-        lifecycle="running", session_value="native-session",
-        adapter="turn-runner", mode="headless", backend="tmux",
-        runtime_home=str(tmp_path / "runtime"),
+        "headless", "headless-token",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "tmux",
+            None, None, None, ("codex",), (), str(tmp_path / "runtime"),
+            "owned", None,
+        ),
+        1.0,
+        lifecycle="running", session_agent="codex",
+        session_value="native-session", session_source="observed",
     ))
     with pytest.raises(AgentDeliveryError, match="already registered as 'headless'"):
         adopt(sessions, pane, tmp_path)
@@ -1288,9 +1293,15 @@ def test_headless_start_stops_runtime_if_session_is_claimed_by_adopted_agent(
         record: AgentRecord, action: str, **_options: object,
     ) -> dict[str, object]:
         actions.append(action)
-        return {"record": {"mode": "headless", "backend": "tmux",
-                           "session_id": "native-session", "owner_token": record.token},
-                "result": {}}
+        return {"record": {
+            "name": record.name, "harness": record.launch.harness,
+            "cwd": record.launch.cwd, "model": record.launch.model,
+            "mode": "headless", "backend": "tmux",
+            "harness_args": record.arguments,
+            "codex_bypass_permissions": False,
+            "tmux_target": "workers:headless", "presentation_pane": None,
+            "session_id": "native-session", "owner_token": record.token,
+        }, "result": {}}
 
     monkeypatch.setattr(sessions, "_worker", worker)
     with pytest.raises(AgentDeliveryError, match="already registered as 'foreign'"):

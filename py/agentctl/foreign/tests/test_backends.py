@@ -54,6 +54,24 @@ def test_backend_selection_prefers_call_then_environment_then_config(
     assert lib.selected_backend() == "tmux"
 
 
+@pytest.mark.parametrize("limit", [0, 1, 2, 3, 12])
+def test_last_message_preview_marks_bounded_diagnostic_truncation(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch, limit: int,
+) -> None:
+    lib.ensure_agent_dirs("worker")
+    monkeypatch.setattr(lib, "MAX_QUEUE_MESSAGE_BYTES", 4)
+    path = lib.last_message_path("worker")
+    path.write_bytes(b"xxxxx")
+
+    preview = lib.last_message_preview("worker", limit=limit)
+
+    assert len(preview) <= limit
+    if limit <= 3:
+        assert preview == "..."[:limit]
+    else:
+        assert preview.endswith("...")
+
+
 def test_mode_selection_prefers_call_then_environment_then_project(
     fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -109,6 +127,11 @@ def test_legacy_registry_writer_cannot_enable_bypass_on_a_native_worker(
     rec = _tui_record("native-worker", fake_backend_state)
     rec.mode = lib.HEADLESS_MODE
     rec.presentation_pane = None
+    rec.backend = "tmux"
+    rec.tmux_target = f"subagents:{rec.name}"
+    rec.runner_identity = lib.capture_process_identity(os.getpid())
+    rec.runner_pid = rec.runner_identity.pid
+    rec.runner_started_at = str(rec.runner_identity.starttime_ticks)
     rec.codex_bypass_permissions = False
     with lib.registry_lock() as agents:
         agents[rec.name] = rec
@@ -264,6 +287,7 @@ def test_tmux_record_operations_ignore_changed_default_session(
     rec.mode = lib.HEADLESS_MODE
     rec.backend = "tmux"
     rec.tmux_target = "original:worker"
+    rec.runner_pid = 123
     monkeypatch.setattr(lib, "TMUX_SESSION", "unrelated")
     windows = {"original": {"worker"}, "unrelated": {"worker"}}
     calls: list[tuple[str, ...]] = []
@@ -371,8 +395,8 @@ def _tui_record(name: str, cwd: Path) -> lib.AgentRecord:
         model="model-a",
         session_id=None,
         status="idle",
-        runner_pid=os.getpid(),
-        runner_started_at=lib.pid_start_time(os.getpid()),
+        runner_pid=None,
+        runner_started_at=None,
         next_seq=0,
         created_at="2020-01-01T00:00:00+00:00",
         last_turn_at=None,
@@ -967,6 +991,9 @@ def test_current_runtime_record_has_one_tagged_process_identity_authority(
     record.backend = "tmux"
     record.tmux_target = "subagents:runtime-schema"
     record.presentation_pane = None
+    record.runner_identity = lib.capture_process_identity(os.getpid())
+    record.runner_pid = record.runner_identity.pid
+    record.runner_started_at = str(record.runner_identity.starttime_ticks)
     document = record.to_dict()
 
     assert document["schema"] == lib.RUNTIME_RECORD_SCHEMA
@@ -993,6 +1020,9 @@ def test_current_runtime_record_rejects_wrong_types_and_crossed_dimensions(
     record.backend = "tmux"
     record.tmux_target = "subagents:runtime-invalid"
     record.presentation_pane = None
+    record.runner_identity = lib.capture_process_identity(os.getpid())
+    record.runner_pid = record.runner_identity.pid
+    record.runner_started_at = str(record.runner_identity.starttime_ticks)
     document = record.to_dict()
     document[field] = value
 
@@ -1103,6 +1133,7 @@ def test_migration_preserves_session_and_updates_presentation(
             status="idle",
             runner_pid=os.getpid(),
             runner_started_at=lib.pid_start_time(os.getpid()),
+            runner_identity=lib.capture_process_identity(os.getpid()),
             next_seq=1,
             created_at=lib.now_iso(),
             last_turn_at=lib.now_iso(),
@@ -1156,6 +1187,7 @@ def test_migration_destination_runner_dies_keeps_tmx_source_intact(
             status="idle",
             runner_pid=old_pid,
             runner_started_at=old_start,
+            runner_identity=lib.capture_process_identity(old_pid),
             next_seq=1,
             created_at=lib.now_iso(),
             last_turn_at=lib.now_iso(),
@@ -1195,6 +1227,7 @@ def test_activation_timeout_restores_source_registry_after_commit(
         agents[name] = lib.AgentRecord(name=name, harness="codex", backend="tmux",
             tmux_target=f"subagents:{name}", cwd=str(cwd), model=None, session_id="session-kept",
             status="idle", runner_pid=old_pid, runner_started_at=old_start, next_seq=1,
+            runner_identity=lib.capture_process_identity(old_pid),
             created_at=lib.now_iso(), last_turn_at=lib.now_iso())
     destination = _runner_identity(999_998, 9003)
     killed: list[str] = []
@@ -1250,6 +1283,7 @@ def test_legacy_tmux_source_without_pause_ack_stops_only_after_idle_check(
             status="idle",
             runner_pid=old_pid,
             runner_started_at=old_start,
+            runner_identity=lib.capture_process_identity(old_pid),
             next_seq=1,
             created_at=lib.now_iso(),
             last_turn_at=lib.now_iso(),
@@ -1312,6 +1346,7 @@ def test_legacy_tmux_destination_failure_restores_tmux_runner(
             status="idle",
             runner_pid=old_pid,
             runner_started_at=old_start,
+            runner_identity=lib.capture_process_identity(old_pid),
             next_seq=1,
             created_at=lib.now_iso(),
             last_turn_at=lib.now_iso(),

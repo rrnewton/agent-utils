@@ -32,9 +32,11 @@ deliberately detection-first: it does not restart a harness or replay input.
 - New records identify an owner-selected profile, non-secret environment
   variable names, and whether the runtime is owned or foreign. Secret values
   are never written to the record.
-- Headless health stores the runner PID and Linux start time and accepts a dead
-  result only from a typed `runner_alive: false` receipt bound to that exact
-  saved generation. Transport, decoding, and runtime errors remain `unknown`
+- Headless health stores one boot-, image-, PID-, and Linux-start-time-bound
+  runner identity and derives the older PID/start fields only for public
+  compatibility output. It accepts a dead result only from a typed
+  `runner_alive: false` receipt bound to that exact saved generation.
+  Transport, decoding, and runtime errors remain `unknown`
   regardless of diagnostic wording. Exact positive liveness additionally
   requires a readable matching start time and non-zombie state; procfs
   ambiguity is typed `null` and maps to `unknown`. When asynchronous start first
@@ -45,8 +47,12 @@ deliberately detection-first: it does not restart a harness or replay input.
   persist only the resolved workspace ID and one normalized launch
   specification; they do not copy profile policy or workspace labels into a
   second authority.
-- `relocate` moves one verified one-pane tab through a token-bound intent
-  journal. Recovery finds the same terminal generation at either the old or
+- `relocate` is a fail-closed, token-bound one-pane move state machine. It
+  requires Herdr to atomically compare the saved terminal ID while executing
+  `pane move`; Herdr 0.8.0 lacks that precondition and therefore this client
+  refuses before moving a production pane. Once that Herdr prerequisite is
+  available, relocation records the exact old route and intended destination
+  in its journal before moving. Recovery finds the same terminal generation at either the old or
   destination route, revalidates the live harness, commits only the derived
   route to the existing session record, and removes the journal. Goal and queue
   state remain name-scoped and are not copied.
@@ -57,6 +63,33 @@ deliberately detection-first: it does not restart a harness or replay input.
   delivery stays quarantined for explicit reconciliation.
 
 ## Canonical fleet snapshot boundary
+
+The state model has one writable owner for each fact:
+
+- `.agentctl/profiles.json` owns reusable project launch policy. The session's
+  nested `LaunchSpec` owns the resolved immutable launch intent; flat v1 fields
+  are emitted only as a derived compatibility view and are never stored by a
+  current writer.
+- `runner_identity`, `custom_process_identity`, and `foreign_shell_identity`
+  are mutually adapter-specific complete process identities. PID/start fields
+  exist only at the legacy decode and public-output boundaries.
+- The nested native-session object owns the observed/asserted conversation
+  identity. The nested goal object points to one `kind: goal` queue artifact;
+  that artifact's phase, text, and ID determine delivery state.
+- The session record owns workspace/tab/pane routing. A relocation journal is
+  a temporary transaction intent, not another current route; it is deleted
+  only after the record, queue binding, and live terminal agree.
+- The outer session record owns desired launch/lifecycle state. A headless
+  worker's separate runtime row owns only observed runtime state and accepts
+  commands from the exact outer generation token. Typed receipts may refresh
+  derived route/process observations but cannot rewrite launch intent.
+- `health.json` and archived `output.json` are derived observations. Neither is
+  consulted as lifecycle, route, launch, or goal authority.
+
+Session-v1/v2 fields and the old headless presentation/permission files are
+decode-only migration inputs. Any successful current write emits only the
+tagged session-v3/runtime-v2 form and removes superseded sidecars after the
+canonical publication succeeds.
 
 `agentctl`'s versioned session record is the authority for launch intent,
 runtime identity, route, goal, and queue state. A project integration that maps
@@ -81,7 +114,19 @@ The bounded migration is:
 
 External task-system lookup belongs in a project-private plugin because it is
 deployment-specific. The normalized session and health snapshot stay in the
-open-source core.
+open-source core. A current private producer may read schema-2 or schema-3
+legacy bindings during migration, but those binding rows are inputs to the
+project mapping only: pane IDs, tokens, launch commands, goals, and lifecycle
+must come from the bounded agentctl snapshot. The 2026-09-25 incident was stale
+project data naming retired `wP` panes while the live fleet was in `wM`/`wK`;
+it was not an incompatibility between the producer's schema-2/schema-3 reader.
+
+Until agentctl exposes one atomic multi-session snapshot, a private integration
+can take a generation-consistent bounded observation with `list`, native-goal
+reads for the selected exact tokens, then a second `list`; it publishes only if
+the two name/token sets are identical. This is a bounded compatibility bridge,
+not a second writable session registry. Once the atomic snapshot exists, the
+plugin should delete that retry loop and consume the single core receipt.
 
 ## Launch-intent gaps
 
@@ -106,7 +151,9 @@ are not yet a general restart specification:
 
 ## Python/Rust port status at this base
 
-This checkout is based on `b899ff9871d6dde7840f9a6f08e466f999e32c4d`.
+This branch was rebased onto agent-utils
+`3819a76dfefb7a3395090c4924f9ba52b1bdffa6`; later rebases must update this
+provenance before publication.
 It is not an all-Rust port:
 
 - Python installs `agentctl = agentctl.cli:main` and

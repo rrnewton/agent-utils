@@ -19,7 +19,7 @@ from agentctl.errors import AgentDeliveryError
 from agentctl.foreign import lib as worker_lib
 from agentctl.profiles import validate_muse_headless_arguments
 from agentctl.sessions import Sessions, WorkerRpcError
-from agentctl.subagents import AgentRecord
+from agentctl.subagents import AgentRecord, LaunchSpec
 from .test_herdr_subagents import FakeManagedClient
 
 
@@ -39,6 +39,35 @@ RUNNER_IDENTITY_JSON = {
     "executable_device": RUNNER_IDENTITY.executable_device,
     "executable_inode": RUNNER_IDENTITY.executable_inode,
 }
+MIGRATED_RUNNER_IDENTITY = replace(
+    RUNNER_IDENTITY, pid=4343, starttime_ticks=9101, executable_inode=5,
+)
+MIGRATED_RUNNER_IDENTITY_JSON = {
+    "version": MIGRATED_RUNNER_IDENTITY.version,
+    "boot_id": MIGRATED_RUNNER_IDENTITY.boot_id,
+    "pid": MIGRATED_RUNNER_IDENTITY.pid,
+    "starttime_ticks": MIGRATED_RUNNER_IDENTITY.starttime_ticks,
+    "executable_device": MIGRATED_RUNNER_IDENTITY.executable_device,
+    "executable_inode": MIGRATED_RUNNER_IDENTITY.executable_inode,
+}
+
+
+def runtime_receipt(record: AgentRecord, **values: object) -> dict[str, object]:
+    """Build the worker projection from the outer launch authority."""
+    result: dict[str, object] = {
+        "name": record.name,
+        "owner_token": record.token,
+        "harness": record.launch.harness,
+        "cwd": record.launch.cwd,
+        "model": record.launch.model,
+        "mode": "headless",
+        "backend": record.launch.backend,
+        "tmux_target": "workers:worker",
+        "harness_args": record.arguments,
+        "codex_bypass_permissions": record.launch.permission_mode == "bypass",
+    }
+    result.update(values)
+    return result
 
 
 def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, FakeManagedClient, list[str]]:
@@ -62,10 +91,9 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Sessions, Fa
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             finally:
                 os.close(descriptor)
-        return {"record": {"name": record.name, "owner_token": record.token,
-                "mode": "headless", "backend": record.backend,
+        return {"record": {**runtime_receipt(record),
                 "session_id": "native-thread", "tmux_target": "workers:worker",
-                "presentation_pane": "w1:headless", **identity},
+                "presentation_pane": None, **identity},
             "result": {"agents": [{"name": record.name, "status": "idle", "pending": 0,
                 **identity, "runner_alive": True if identity else None}]}}
 
@@ -290,13 +318,17 @@ def test_cli_headless_muse_profile_reaches_worker_with_exact_structured_argument
         _sessions: Sessions, record: AgentRecord, action: str, **options: object,
     ) -> dict[str, object]:
         if action == "start":
-            captured.append(dict(options))
+            captured.append({
+                "harness": record.launch.harness,
+                "model": record.launch.model,
+                "harness_args": record.arguments,
+                **options,
+            })
         return {
-            "record": {
-                "mode": "headless", "backend": record.backend,
-                "session_id": "native-thread", "tmux_target": "workers:worker",
-                "presentation_pane": "w1:headless",
-                "owner_token": record.token,
+                "record": {
+                    **runtime_receipt(record),
+                    "session_id": "native-thread", "tmux_target": "workers:worker",
+                    "presentation_pane": None,
             },
             "result": {
                 "agents": [{
@@ -400,9 +432,9 @@ def test_headless_herdr_attach_checks_pane_ownership_and_focuses_its_tab(tmp_pat
     assert sessions.attach("worker")["focused"] == "tab"
     assert focused == ["workers:worker"]
     fake.presentations[0] = Pane("w1:headless", "different-tab", "w1")
-    with pytest.raises(AgentDeliveryError, match="no longer belongs"):
-        sessions.attach("worker")
-    assert focused == ["workers:worker"]
+    # The headless runtime owns the tab target; no TUI pane id is authoritative.
+    assert sessions.attach("worker")["focused"] == "tab"
+    assert focused == ["workers:worker", "workers:worker"]
 
 
 @pytest.mark.parametrize("inside", [True, False])
@@ -439,13 +471,118 @@ def test_tmux_attach_uses_exact_window_identity_and_releases_lifecycle_lock(insi
     assert commands[1] == ["tmux", "select-window" if inside else "attach-session", "-t", "@123"]
 
 
+def test_lost_migration_receipt_reconciles_from_inner_runtime_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    migrated = False
+
+    def worker(
+        record: AgentRecord, action: str, **_: object,
+    ) -> dict[str, object]:
+        nonlocal migrated
+        if action == "migrate":
+            migrated = True
+            raise WorkerRpcError("timeout", "migration receipt was lost")
+        assert action == "status"
+        identity = (
+            MIGRATED_RUNNER_IDENTITY_JSON if migrated else RUNNER_IDENTITY_JSON
+        )
+        return {
+            "record": runtime_receipt(
+                record,
+                backend="tmux" if migrated else "herdr",
+                tmux_target="workers:migrated" if migrated else "workers:worker",
+                session_id="native-thread",
+                presentation_pane=None,
+                runner_pid=identity["pid"],
+                runner_started_at=str(identity["starttime_ticks"]),
+                runner_identity=identity,
+            ),
+            "result": {"agents": [{
+                "name": record.name,
+                "status": "idle",
+                "pending": 0,
+                "runner_alive": True,
+                "runner_identity": identity,
+            }]},
+        }
+
+    monkeypatch.setattr(sessions, "_worker", worker)
+    with pytest.raises(WorkerRpcError, match="receipt was lost"):
+        sessions.runtime_operation("worker", "migrate", backend="tmux")
+
+    status = sessions.status("worker")
+    saved = sessions.get("worker")
+    assert saved.launch.backend == "herdr"
+    assert saved.runner_identity == MIGRATED_RUNNER_IDENTITY
+    assert status["runtime_evidence"] == {
+        "schema": "agentctl-worker-runtime-evidence/v1",
+        "backend": "tmux",
+        "mode": "headless",
+        "target": "workers:migrated",
+        "session_id": "native-thread",
+        "pane_id": None,
+        "runner_identity": MIGRATED_RUNNER_IDENTITY_JSON,
+    }
+
+
+def test_tui_migration_receipt_replaces_runner_cache_and_drives_attach(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    fake.presentations.append(Pane("w1:tui-pane", "w1:tui-tab", "w1"))
+    focused: list[str] = []
+    monkeypatch.setattr(fake, "focus_tab", focused.append, raising=False)
+
+    def worker(
+        record: AgentRecord, action: str, **_: object,
+    ) -> dict[str, object]:
+        assert action == "status"
+        return {
+            "record": runtime_receipt(
+                record,
+                backend="herdr",
+                mode="tui",
+                tmux_target="w1:tui-tab",
+                session_id="native-thread",
+                presentation_pane="w1:tui-pane",
+            ),
+            "result": {"agents": [{
+                "name": record.name,
+                "backend": "herdr",
+                "mode": "tui",
+                "presentation_pane": "w1:tui-pane",
+                "status": "idle",
+                "pending": 0,
+                "runner_alive": True,
+                "window_alive": True,
+            }]},
+        }
+
+    monkeypatch.setattr(sessions, "_worker", worker)
+    health = sessions.health(["worker"], checked_at=123.0)
+    row = cast(list[dict[str, object]], health["sessions"])[0]
+    assert row["health"] == "healthy"
+    status = sessions.status("worker")
+    assert "migrate" not in cast(list[str], status["capabilities"])
+    saved = sessions.get("worker")
+    assert saved.launch.mode == "headless"
+    assert saved.runner_identity is None
+    assert saved.pane_id == "w1:tui-pane"
+    assert sessions.attach("worker")["backend"] == "herdr"
+    assert focused == ["w1:tui-tab"]
+
+
 def test_nested_stop_receipt_paths_follow_the_canonical_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions, _, _ = setup(tmp_path, monkeypatch)
     sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
 
     def worker(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
-        assert action == "stop" and record.runtime_home
-        archived = Path(record.runtime_home) / "state/_archive/worker"
+        assert action == "stop" and record.launch.runtime_home
+        archived = Path(record.launch.runtime_home) / "state/_archive/worker"
         archived.mkdir(parents=True)
         (archived / "turn.log").write_text("completed turn")
         return {"result": {"archived_to": str(archived), "state_path": str(archived / "turn.log")}}
@@ -468,9 +605,9 @@ def test_saved_idle_state_cannot_make_a_dead_or_unverifiable_runner_ready(livene
         row: dict[str, object] = {"name": record.name, "status": "idle", "pending": 0}
         if liveness != "absent":
             row["runner_alive"] = liveness
-        return {"result": {"agents": [row]}, "record": {
-            "session_id": "native-thread", "owner_token": record.token,
-        }}
+        return {"result": {"agents": [row]}, "record": runtime_receipt(
+            record, session_id="native-thread",
+        )}
 
     monkeypatch.setattr(sessions, "_worker", status)
     with pytest.raises(AgentDeliveryError, match="not alive|cannot confirm"):
@@ -493,7 +630,7 @@ def test_live_idle_runner_remains_ready_when_only_its_presentation_is_lost(tmp_p
             os.close(descriptor)
         return {"result": {"agents": [{"name": record.name, "status": "idle", "pending": 0,
             "runner_alive": True, "window_alive": False, "presentation_degraded": True}]},
-            "record": {"session_id": "native-thread", "owner_token": record.token}}
+            "record": runtime_receipt(record, session_id="native-thread")}
 
     monkeypatch.setattr(sessions, "_worker", status)
     assert sessions.wait("worker", timeout=0)["token"] == original["token"]
@@ -529,8 +666,7 @@ def test_headless_health_requires_identity_bound_typed_liveness(
     sessions, _, _ = setup(tmp_path, monkeypatch)
     sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
     saved = replace(
-        sessions.get("worker"), runner_pid=4242, runner_started_at="9001",
-        runner_identity=RUNNER_IDENTITY,
+        sessions.get("worker"), runner_identity=RUNNER_IDENTITY,
     )
     sessions._save(saved)
 
@@ -541,9 +677,9 @@ def test_headless_health_requires_identity_bound_typed_liveness(
             "runner_identity": RUNNER_IDENTITY_JSON,
         }
         return {
-            "record": {
-                **identity, "session_id": "native-thread", "owner_token": record.token,
-            },
+            "record": runtime_receipt(
+                record, **identity, session_id="native-thread",
+            ),
             "result": {"agents": [{
                 **identity, "status": "dead", "pending": 0,
                 "runner_alive": alive,
@@ -572,7 +708,9 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
     expected_health: str, expected_reason: str,
 ) -> None:
     sessions, _fake, _calls = setup(tmp_path, monkeypatch)
-    outer = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    outer = sessions.start_session(
+        "worker", cwd=str(tmp_path), mode="headless", backend="tmux",
+    )
     inner = worker_lib.AgentRecord(
         name="worker", harness="codex", backend="tmux",
         tmux_target="workers:worker", cwd=str(tmp_path), model=None,
@@ -582,6 +720,14 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
         owner_token=cast(str, outer["token"]),
     )
     monkeypatch.setattr(worker_lib, "read_registry", lambda: {"worker": inner})
+    monkeypatch.setattr(
+        worker_lib, "verify_owner_permission",
+        lambda name, owner_token, permission_mode: (
+            inner if (name, owner_token, permission_mode) == (
+                "worker", outer["token"], "native",
+            ) else pytest.fail("unexpected permission verification")
+        ),
+    )
     monkeypatch.setattr(
         worker_lib, "reconcile_automation_pause",
         lambda name, owner_token, paused: (
@@ -612,9 +758,10 @@ def test_worker_rpc_process_liveness_reaches_health_as_typed_evidence(
         return worker_rpc.dispatch({
             "schema": "agentctl-worker-rpc/v2",
             "action": action,
-            "name": record.name,
-            "owner_token": record.token,
-            "desired_paused": record.paused,
+                "name": record.name,
+                "owner_token": record.token,
+                "desired_paused": record.paused,
+                "permission_mode": record.launch.permission_mode,
         })
 
     monkeypatch.setattr(sessions, "_worker", dispatch)
@@ -633,22 +780,27 @@ def test_headless_dead_receipt_for_another_runner_is_unknown(
 ) -> None:
     sessions, _, _ = setup(tmp_path, monkeypatch)
     sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
+    saved_identity = replace(RUNNER_IDENTITY, pid=4242, starttime_ticks=9001)
     saved = replace(
-        sessions.get("worker"), runner_pid=4242, runner_started_at="9001",
+        sessions.get("worker"), runner_identity=saved_identity,
     )
     sessions._save(saved)
+    record_path = sessions.registry / "worker" / "agent.json"
+    before = record_path.read_bytes()
 
     def status(record: AgentRecord, action: str, **_: object) -> dict[str, object]:
         assert action == "status"
+        replacement = {**RUNNER_IDENTITY_JSON, "starttime_ticks": 9002}
         return {
-            "record": {
-                "name": record.name, "runner_pid": 4242,
-                "runner_started_at": "9002", "session_id": "native-thread",
-                "owner_token": record.token,
-            },
+            "record": runtime_receipt(
+                record, runner_pid=4242, runner_started_at="9002",
+                runner_identity=replacement,
+                session_id="native-thread",
+            ),
             "result": {"agents": [{
                 "name": record.name, "runner_pid": 4242,
-                "runner_started_at": "9002", "runner_alive": False,
+                "runner_started_at": "9002", "runner_identity": replacement,
+                "runner_alive": False,
             }]},
         }
 
@@ -658,6 +810,7 @@ def test_headless_dead_receipt_for_another_runner_is_unknown(
     assert row["health"] == "unknown"
     assert row["runtime_state"] == "unknown"
     assert row["reason_code"] == "runtime-liveness-unconfirmed"
+    assert record_path.read_bytes() == before
 
 
 def test_headless_boolean_pid_cannot_match_saved_runner_one(
@@ -667,8 +820,7 @@ def test_headless_boolean_pid_cannot_match_saved_runner_one(
     sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
     saved_identity = replace(RUNNER_IDENTITY, pid=1)
     saved = replace(
-        sessions.get("worker"), runner_pid=1, runner_started_at="9001",
-        runner_identity=saved_identity,
+        sessions.get("worker"), runner_identity=saved_identity,
     )
     sessions._save(saved)
 
@@ -678,7 +830,7 @@ def test_headless_boolean_pid_cannot_match_saved_runner_one(
             "name": record.name, "runner_pid": True, "runner_started_at": "9001",
         }
         return {
-            "record": {**identity, "owner_token": record.token},
+            "record": runtime_receipt(record, **identity),
             "result": {"agents": [{**identity, "runner_alive": False}]},
         }
 
@@ -695,8 +847,13 @@ def test_worker_rpc_preserves_typed_remote_error(
 ) -> None:
     sessions = Sessions(registry=tmp_path / "registry")
     record = AgentRecord(
-        "worker", "generation", "codex", str(tmp_path), 1.0,
-        adapter="turn-runner", mode="headless", runtime_home=str(tmp_path / "runtime"),
+        "worker", "generation",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "herdr",
+            None, None, None, ("codex",), (), str(tmp_path / "runtime"),
+            "owned", None,
+        ),
+        1.0,
     )
     response = {
         "schema": "agentctl-worker-rpc/v2", "action": "status",
@@ -719,8 +876,13 @@ def test_worker_rpc_rejects_a_receipt_for_another_owner_generation(
 ) -> None:
     sessions = Sessions(registry=tmp_path / "registry")
     record = AgentRecord(
-        "worker", "generation", "codex", str(tmp_path), 1.0,
-        adapter="turn-runner", mode="headless", runtime_home=str(tmp_path / "runtime"),
+        "worker", "generation",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "herdr",
+            None, None, None, ("codex",), (), str(tmp_path / "runtime"),
+            "owned", None,
+        ),
+        1.0,
     )
     response = {
         "schema": "agentctl-worker-rpc/v2", "action": "status",
@@ -734,6 +896,69 @@ def test_worker_rpc_rejects_a_receipt_for_another_owner_generation(
     with pytest.raises(WorkerRpcError, match="invalid typed envelope") as raised:
         sessions._worker(record, "status")
     assert raised.value.kind == "invalid-receipt"
+
+
+@pytest.mark.parametrize("mutation", ["session", "runner", "permission"])
+def test_worker_receipt_validation_is_atomic_before_outer_state_mutation(
+    tmp_path: Path, mutation: str,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    record = AgentRecord(
+        "worker", "generation",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "herdr",
+            None, None, None, ("codex",), (), str(tmp_path / "runtime"),
+            "owned", None, permission_mode="native",
+        ),
+        1.0,
+        session_value="prior-session",
+        pane_id="prior-pane",
+        runner_identity=RUNNER_IDENTITY,
+    )
+    runtime = runtime_receipt(
+        record,
+        session_id="replacement-session",
+        presentation_pane=None,
+        runner_pid=RUNNER_IDENTITY.pid,
+        runner_started_at=str(RUNNER_IDENTITY.starttime_ticks),
+        runner_identity=RUNNER_IDENTITY_JSON,
+    )
+    if mutation == "session":
+        runtime["session_id"] = 7
+    elif mutation == "runner":
+        runtime["runner_started_at"] = "replacement"
+    else:
+        runtime["codex_bypass_permissions"] = True
+    before = record.to_document()
+
+    with pytest.raises(AgentDeliveryError, match="invalid|contradictory|disagrees"):
+        sessions._sync_worker_record(record, {"record": runtime})
+
+    assert record.to_document() == before
+
+
+def test_incomplete_worker_receipt_cannot_erase_saved_runner_identity(
+    tmp_path: Path,
+) -> None:
+    sessions = Sessions(registry=tmp_path / "registry")
+    record = AgentRecord(
+        "worker", "generation",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "herdr",
+            None, None, None, ("codex",), (), str(tmp_path / "runtime"),
+            "owned", None,
+        ),
+        1.0,
+        runner_identity=RUNNER_IDENTITY,
+    )
+
+    sessions._sync_worker_record(record, {
+        "record": runtime_receipt(record, session_id=None, presentation_pane=None),
+    }, save=False)
+
+    assert record.runner_identity == RUNNER_IDENTITY
+    assert record.runner_pid == RUNNER_IDENTITY.pid
+    assert record.runner_started_at == str(RUNNER_IDENTITY.starttime_ticks)
 
 
 def test_lost_start_receipt_is_reconciled_without_a_second_launch(
@@ -761,10 +986,9 @@ def test_lost_start_receipt_is_reconciled_without_a_second_launch(
             "runner_identity": RUNNER_IDENTITY_JSON,
         }
         return {
-            "record": {
-                **identity, "owner_token": record.token, "mode": "headless",
-                "backend": record.backend, "session_id": "native-thread",
-            },
+            "record": runtime_receipt(
+                record, **identity, session_id="native-thread",
+            ),
             "result": {"agents": [{**identity, "runner_alive": True}]},
         }
 
@@ -800,7 +1024,7 @@ def test_lost_pause_receipt_leaves_durable_intent_for_reconciliation(
             "runner_identity": RUNNER_IDENTITY_JSON,
         }
         return {
-            "record": {**identity, "owner_token": record.token},
+            "record": runtime_receipt(record, **identity),
             "result": {"agents": [{**identity, "runner_alive": True}]},
         }
 
@@ -815,8 +1039,8 @@ def test_lost_stop_receipt_reconciles_inner_and_outer_generation(
     sessions, _fake, _calls = setup(tmp_path, monkeypatch)
     started = sessions.start_session("worker", cwd=str(tmp_path), mode="headless")
     outer = sessions.get("worker")
-    assert outer.runtime_home is not None
-    runtime = Path(outer.runtime_home)
+    assert outer.launch.runtime_home is not None
+    runtime = Path(outer.launch.runtime_home)
     monkeypatch.setattr(worker_lib, "BASE", runtime)
     monkeypatch.setattr(worker_lib, "STATE", runtime / "state")
     monkeypatch.setattr(worker_lib, "ARCHIVE", runtime / "state/_archive")

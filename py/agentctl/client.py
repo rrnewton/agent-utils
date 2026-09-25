@@ -126,6 +126,18 @@ def muse_verified_process_idle_composer(screen: str) -> bool:
     return regions is not None and regions[1].strip() in ("❯", "›")
 
 
+def muse_verified_process_composer(screen: str) -> bool:
+    """Recognize Muse's current editor after exact live-process verification.
+
+    Unlike :func:`muse_verified_process_idle_composer`, this accepts a composer
+    containing buffered input.  It says nothing about whether that input is the
+    caller's prompt; delivery must compare the entire editor before pressing
+    Enter.
+    """
+    regions = _muse_composer_regions(screen, require_header=False)
+    return regions is not None and _muse_editor_segments(regions[1]) is not None
+
+
 def _muse_composer_regions(
     screen: str, *, require_header: bool = True,
 ) -> tuple[str, str] | None:
@@ -157,22 +169,67 @@ def _muse_composer_regions(
     return "\n".join(lines[:top]), "\n".join(lines[top + 1:bottom])
 
 
+def _muse_editor_segments(editor: str) -> tuple[str, ...] | None:
+    """Return normalized editor lines after one leading Muse prompt marker."""
+    lines = [" ".join(line.split()) for line in editor.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return None
+    first = lines[0]
+    marker = next(
+        (candidate for candidate in ("❯", "›")
+         if first == candidate or first.startswith(candidate + " ")),
+        None,
+    )
+    if marker is None:
+        return None
+    initial = first[len(marker):].strip()
+    return tuple(([initial] if initial else []) + lines[1:])
+
+
+def _muse_editor_matches(editor: str, text: str, *, exact: bool) -> bool:
+    """Match a logical prompt against one conservatively rendered Muse editor.
+
+    A terminal may soft-wrap ``deterministic-scheduling`` immediately after
+    the hyphen, rendering ``deterministic-`` and ``scheduling`` on successive
+    physical lines.  At each such physical boundary we consider both the
+    ordinary whitespace-normalized rendering and the no-space soft-wrap form,
+    but retain only candidates that are exact prefixes of *this* requested
+    prompt.  We never globally remove whitespace around hyphens.
+    """
+    wanted = " ".join(text.split())
+    segments = _muse_editor_segments(editor)
+    if not wanted or segments is None:
+        return False
+    prefixes = {""}
+    previous = ""
+    for index, segment in enumerate(segments):
+        separators = ("",) if index == 0 else ((" ", "") if previous.endswith("-") else (" ",))
+        next_prefixes: set[str] = set()
+        for prefix in prefixes:
+            for separator in separators:
+                rendered = prefix + separator + segment
+                if not exact and (
+                    rendered == wanted or rendered.startswith(wanted + " ")
+                ):
+                    return True
+                if wanted.startswith(rendered):
+                    next_prefixes.add(rendered)
+        if not next_prefixes:
+            return False
+        prefixes = next_prefixes
+        previous = segment
+    return wanted in prefixes
+
+
 def _muse_prompt_in_composer(
     screen: str, text: str, *, require_header: bool, exact: bool,
 ) -> bool:
-    """Compare one normalized terminal rendering within a verified composer."""
+    """Compare one terminal rendering within a verified composer."""
     regions = _muse_composer_regions(screen, require_header=require_header)
     if regions is None:
         return False
-    wanted = " ".join(text.split())
-    rendered = " ".join(regions[1].split())
-    if not wanted:
-        return False
-    candidates = tuple(f"{marker} {wanted}" for marker in ("❯", "›"))
-    return rendered in candidates if exact else any(
-        rendered == candidate or rendered.startswith(candidate + " ")
-        for candidate in candidates
-    )
+    return _muse_editor_matches(regions[1], text, exact=exact)
 
 
 def muse_prompt_in_composer(screen: str, text: str) -> bool:
@@ -205,23 +262,31 @@ def muse_verified_process_prompt_is_exact_composer(screen: str, text: str) -> bo
 
 def _muse_prompt_transcript_count(transcript: str, text: str) -> int:
     """Count complete marker-delimited user turns, never prompt prefixes."""
-    wanted = " ".join(text.split())
-    rendered = " ".join(transcript.split())
-    if not wanted:
+    if not " ".join(text.split()):
         return 0
+    lines = transcript.splitlines()
     count = 0
-    for marker in ("❯", "›"):
-        needle = f"{marker} {wanted}"
-        start = 0
-        while (found := rendered.find(needle, start)) >= 0:
-            before = rendered[:found]
-            after = rendered[found + len(needle):]
-            if (not before or before.endswith(" ")) and (
-                not after or any(after.startswith(f" {next_marker} ")
-                                 for next_marker in ("◆", "❯", "›"))
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not any(
+            stripped == marker or stripped.startswith(marker + " ")
+            for marker in ("❯", "›")
+        ):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines):
+            next_line = lines[end].strip()
+            if any(
+                next_line == marker or next_line.startswith(marker + " ")
+                for marker in ("◆", "❯", "›")
             ):
-                count += 1
-            start = found + len(marker)
+                break
+            end += 1
+        if _muse_editor_matches("\n".join(lines[index:end]), text, exact=True):
+            count += 1
+        index = end
     return count
 
 
@@ -272,6 +337,64 @@ def claude_active_screen(screen: str) -> bool:
     return "esc to interrupt" in after or (
         waiting and count is not None and int(count.group(1)) >= 2
     )
+
+
+def _claude_composer_regions(screen: str) -> tuple[str, str] | None:
+    """Split Claude's ruled composer and require its explicit staged-input hint."""
+    lines = screen.splitlines()
+    dividers = [
+        index for index, line in enumerate(lines)
+        if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+    ]
+    if len(dividers) < 2:
+        return None
+    top, bottom = dividers[-2:]
+    editor = lines[top + 1:bottom]
+    hint = "ctrl+x ctrl+s to send now"
+    if not any(hint in " ".join(line.split()).lower() for line in editor):
+        return None
+    content = [line for line in editor if hint not in " ".join(line.split()).lower()]
+    if _muse_editor_segments("\n".join(content)) is None:
+        return None
+    return "\n".join(lines[:top]), "\n".join(content)
+
+
+def claude_staged_composer(screen: str) -> bool:
+    """Recognize a nonempty Claude composer whose UI says it is not submitted."""
+    regions = _claude_composer_regions(screen)
+    return regions is not None and bool(_muse_editor_segments(regions[1]))
+
+
+def claude_prompt_is_exact_composer(screen: str, text: str) -> bool:
+    """Require the complete staged Claude editor to equal one requested prompt."""
+    regions = _claude_composer_regions(screen)
+    return regions is not None and _muse_editor_matches(regions[1], text, exact=True)
+
+
+def claude_prompt_transcript_count(screen: str, text: str) -> int:
+    """Count exact submitted Claude user turns above the current composer."""
+    regions = _claude_composer_regions(screen)
+    transcript = regions[0] if regions is not None else screen
+    lines = transcript.splitlines()
+    count = 0
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not (stripped == "❯" or stripped.startswith("❯ ")):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines):
+            following = lines[end].strip()
+            if (following.startswith(("❯", "●", "✻", "✽", "⏺", "◆"))
+                    or (len(following) >= 3
+                        and set(following) <= {"─", "━", "═"})):
+                break
+            end += 1
+        if _muse_editor_matches("\n".join(lines[index:end]), text, exact=True):
+            count += 1
+        index = end
+    return count
 
 
 def _get_process_id(mapping: dict[str, object], key: str, what: str) -> int:
@@ -756,13 +879,16 @@ class HerdrClient:
             raise HerdrUnavailable(f"tab create: invalid allocation identity: {exc}") from exc
 
     def move_pane_to_new_tab(
-        self, pane_id: str, *, workspace_id: str, label: str,
+        self, pane_id: str, *, expected_terminal_id: str,
+        workspace_id: str, label: str,
         timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> PaneMove:
-        """Move one pane without restarting its terminal or foreground process."""
+        """Conditionally move one exact terminal generation into a new tab."""
         result = self._call(
             [
-                "pane", "move", pane_id, "--workspace", workspace_id,
+                "pane", "move", pane_id,
+                "--expect-terminal-id", expected_terminal_id,
+                "--workspace", workspace_id,
                 "--new-tab", "--label", label, "--no-focus",
             ],
             f"pane move {pane_id}", timeout=timeout,
@@ -780,6 +906,7 @@ class HerdrClient:
                 get_str(pane, "terminal_id", "pane move pane"),
             )
             if (parsed.workspace_id != workspace_id
+                    or parsed.terminal_id != expected_terminal_id
                     or get_str(created, "workspace_id", "pane move created_tab") != workspace_id
                     or get_str(created, "tab_id", "pane move created_tab") != parsed.tab_id
                     or get_int(created, "pane_count", "pane move created_tab") != 1
@@ -1552,7 +1679,7 @@ class HerdrClient:
         purpose = f"wait for pane {pane_id} status {status}"
         completed = self._invoke(
             ["agent", "wait", pane_id, "--until", status, "--timeout", str(timeout_ms)],
-            timeout=max(CONTROL_TIMEOUT_SECONDS, timeout_ms / 1000.0 + 5.0),
+            timeout=max(0.001, timeout_ms / 1000.0),
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "").strip() or f"exit {completed.returncode}"
@@ -1684,9 +1811,14 @@ class HerdrClient:
         """Insert literal text without synthesizing a submission keystroke."""
         self._call_ok(["pane", "send-text", pane_id, text], f"pane send-text {pane_id}")
 
-    def send_keys(self, pane_id: str, keys: str) -> None:
+    def send_keys(
+        self, pane_id: str, keys: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
         """Send named key presses (for example ``ctrl+u``) to a pane."""
-        self._call_ok(["pane", "send-keys", pane_id, keys], f"pane send-keys {pane_id}")
+        self._call_ok(
+            ["pane", "send-keys", pane_id, keys],
+            f"pane send-keys {pane_id}", timeout=timeout,
+        )
 
     def close_pane(self, pane_id: str) -> None:
         """Close one exact pane, preserving any other panes added to its tab."""

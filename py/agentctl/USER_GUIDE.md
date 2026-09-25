@@ -337,6 +337,9 @@ agentctl relocate reviewer --workspace-label project --new-tab
 Relocation supports a one-pane source tab. It records the exact session token,
 terminal identity, old route, and intended workspace before asking Herdr to
 move the pane; a retry reconciles an interrupted move by terminal identity.
+The Herdr command must support the atomic `--expect-terminal-id` precondition;
+with an older Herdr release, the command retains its recovery journal but does
+not move the live pane.
 The session's launch specification, goal, and queue stay in the same registry
 generation. Ambiguous labels, multi-pane source tabs, changed processes, and
 changed terminals are refused.
@@ -533,7 +536,12 @@ proves completion of the task.
 
 `status` preserves the saved record fields, including `lifecycle`, and adds a
 separate `runtime_state`, `health`, reason, and detection timestamps. A saved
-`lifecycle: "running"` whose pane has returned to a shell is reported as
+Muse editor containing unsubmitted text is reported as `agent_status: staged`,
+not `working`; drain may press Enter only when that complete buffered text is
+the exact queued message. A real submitted turn or background task remains
+`working`.
+
+A saved `lifecycle: "running"` whose pane has returned to a shell is reported as
 `runtime_state: "dead"`, `health: "unhealthy"`, and exits 1. `list` applies the
 same rule to every entry and exits 1 if any entry is non-healthy. Automation
 that needs only the aggregate health document can use `health` directly.

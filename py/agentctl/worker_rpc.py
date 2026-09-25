@@ -52,6 +52,12 @@ def dispatch(request: dict[str, object]) -> dict[str, object]:
     paused = request.get("desired_paused")
     if not isinstance(paused, bool):
         raise ValueError("desired_paused must be a boolean")
+    permission_mode = _optional_text(request, "permission_mode")
+    if permission_mode not in (None, "native", "bypass"):
+        raise ValueError("permission_mode must be native or bypass")
+    bypass_permissions = (
+        None if permission_mode is None else permission_mode == "bypass"
+    )
     result: object
     if action == "start":
         cwd = get_str(request, "cwd", "start")
@@ -66,51 +72,66 @@ def dispatch(request: dict[str, object]) -> dict[str, object]:
                 brief=_optional_text(request, "brief"), backend=backend,
                 mode="headless", harness_args=harness_args,
                 owner_token=owner_token,
+                bypass_permissions=bypass_permissions,
             )
         else:
-            existing = lib.bind_owner_token(name, owner_token)
-            if (
-                existing.cwd != str(Path(cwd).expanduser().resolve())
-                or existing.harness != harness
-                or existing.model != model
-                or existing.backend != backend
-                or existing.mode != lib.HEADLESS_MODE
-                or existing.harness_args != tuple(harness_args)
-            ):
-                raise lib.AgentOperationError(
-                    "owner_launch_mismatch",
-                    f"runtime {name!r} exists for this token with a different launch specification",
-                )
+            existing = lib.bind_owner_launch(
+                name, owner_token, cwd=cwd, harness=harness, model=model,
+                backend=backend, harness_args=tuple(harness_args),
+                bypass_permissions=bypass_permissions,
+            )
             result = lib.status_snapshot(name, run_gc=False)
-    elif action == "status":
-        lib.reconcile_automation_pause(name, owner_token, paused)
-        result = lib.status_snapshot(name, run_gc=False)
-    elif action == "send":
-        lib.reconcile_automation_pause(name, owner_token, paused)
-        result = lib.send_message_to_agent(name, get_str(request, "text", "send"),
-            model=_optional_text(request, "model"))
-    elif action == "read":
-        lib.reconcile_automation_pause(name, owner_token, paused)
-        result = lib.read_agent_output(name, mode=get_str(request, "mode", "read"),
-            since_turn=_optional_int(request, "since_turn"), tail=_optional_int(request, "tail"))
-    elif action == "stop":
-        result = lib.stop_owned_agent(name, owner_token)
-    elif action == "reset":
-        lib.reconcile_automation_pause(name, owner_token, paused)
-        result = lib.reset_agent_context(name)
-    elif action == "migrate":
-        lib.reconcile_automation_pause(name, owner_token, paused)
-        mode = _optional_text(request, "mode")
-        result = lib.migrate_agent(name, to_backend=get_str(request, "backend", "migrate"),
-            to_mode="tui" if mode == "interactive" else mode)
-    elif action == "repair":
-        lib.reconcile_automation_pause(name, owner_token, paused)
-        result = lib.recreate_window(name)
-    elif action in ("pause", "resume"):
-        lib.reconcile_automation_pause(name, owner_token, paused)
-        result = {"paused": paused}
     else:
-        raise ValueError(f"unsupported runtime operation: {action}")
+        # A committed stop removes the live inner registry row before its
+        # response can reach the outer process.  On retry, the immutable
+        # token-bound stop receipt is the authority; requiring a live row first
+        # would make the committed transaction unrecoverable.
+        if action != "stop":
+            lib.verify_owner_permission(name, owner_token, permission_mode)
+        else:
+            try:
+                lib.verify_owner_permission(name, owner_token, permission_mode)
+            except lib.AgentOperationError as exc:
+                if exc.code != "unknown_agent":
+                    raise
+        if action == "status":
+            lib.reconcile_automation_pause(name, owner_token, paused)
+            result = lib.status_snapshot(name, run_gc=False)
+        elif action == "send":
+            lib.reconcile_automation_pause(name, owner_token, paused)
+            result = lib.send_message_to_agent(
+                name, get_str(request, "text", "send"),
+                model=_optional_text(request, "model"),
+            )
+        elif action == "read":
+            lib.reconcile_automation_pause(name, owner_token, paused)
+            result = lib.read_agent_output(
+                name,
+                mode=get_str(request, "mode", "read"),
+                since_turn=_optional_int(request, "since_turn"),
+                tail=_optional_int(request, "tail"),
+            )
+        elif action == "stop":
+            result = lib.stop_owned_agent(name, owner_token)
+        elif action == "reset":
+            lib.reconcile_automation_pause(name, owner_token, paused)
+            result = lib.reset_agent_context(name)
+        elif action == "migrate":
+            lib.reconcile_automation_pause(name, owner_token, paused)
+            mode = _optional_text(request, "mode")
+            result = lib.migrate_agent(
+                name,
+                to_backend=get_str(request, "backend", "migrate"),
+                to_mode="tui" if mode == "interactive" else mode,
+            )
+        elif action == "repair":
+            lib.reconcile_automation_pause(name, owner_token, paused)
+            result = lib.recreate_window(name)
+        elif action in ("pause", "resume"):
+            lib.reconcile_automation_pause(name, owner_token, paused)
+            result = {"paused": paused}
+        else:
+            raise ValueError(f"unsupported runtime operation: {action}")
     value: object = asdict(result) if is_dataclass(result) and not isinstance(result, type) else result
     record = lib.read_registry().get(name)
     if record is not None and record.owner_token != owner_token:

@@ -166,7 +166,8 @@ def test_enqueue_artifact_limit_counts_serialized_bytes_before_temporary_write(
     monkeypatch.setattr("agentctl.agent.time.time", lambda: 123.0)
     text = "\x00😀\"\\" * 100
     expected = (json.dumps({
-        "id": "bounded", "text": text, "queued_at": 123.0, "delivery_attempts": 0,
+        "id": "bounded", "kind": "message", "text": text,
+        "queued_at": 123.0, "delivery_attempts": 0,
     }, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
     def unexpected_temporary(*args: object, **kwargs: object) -> None:
@@ -636,11 +637,12 @@ def test_send_inspects_terminal_artifact_when_another_drain_consumed_its_id(
         message_id: str | None,
         serialize: bool,
         max_artifact_bytes: int | None = None,
+        kind: str = "message",
     ) -> str:
         del message_id, serialize
         identifier = original_enqueue(
             root, text, message_id="cross-drained", serialize=True,
-            max_artifact_bytes=max_artifact_bytes,
+            max_artifact_bytes=max_artifact_bytes, kind=kind,
         )
         source = tmp_path / "inbox/cross-drained.json"
         document = json.loads(source.read_text())
@@ -890,6 +892,28 @@ def test_status_validates_processed_directory_too(tmp_path: Path) -> None:
         status(client(FakeAgentHerdr()), target(), str(tmp_path))
 
     assert stat.S_IMODE(processed.stat().st_mode) == 0o755
+
+
+def test_message_state_distinguishes_absence_from_root_inspection_failure(
+    tmp_path: Path,
+) -> None:
+    regular = tmp_path / "not-a-directory"
+    regular.write_text("occupied", encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="cannot inspect queue directory"):
+        agent_api.message_state(str(regular / "queue"), "message-1")
+    assert agent_api.message_state(str(tmp_path / "absent"), "message-1") is None
+
+
+def test_message_state_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    agent_api._prepare(str(tmp_path))
+    artifact = tmp_path / "inbox" / "message-1.json"
+    artifact.write_text(
+        '{"id":"message-1","id":"forged","text":"task"}\n',
+        encoding="utf-8",
+    )
+    artifact.chmod(0o600)
+    with pytest.raises(AgentDeliveryError, match="duplicate JSON object key"):
+        agent_api.message_state(str(tmp_path), "message-1")
 
 
 def test_status_read_only_validates_existing_binding(tmp_path: Path) -> None:

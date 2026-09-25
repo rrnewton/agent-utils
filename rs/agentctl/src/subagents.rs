@@ -20,23 +20,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
+use crate::agent::{self, AgentApi, AgentError, AgentRuntime, DrainOptions, QueueResult, Target};
 use crate::client::{
-    claude_active_screen, muse_idle_composer, muse_startup_metadata, muse_trust_prompt,
-    muse_verified_process_idle_composer, muse_verified_process_prompt_in_composer,
-    muse_verified_process_prompt_is_exact_composer, muse_verified_process_prompt_transcript_count,
-    AgentPaneInfo, CustomLaunchObservation, CustomProcessIdentity, HerdrClient, Pane, PaneMove,
-    PaneShellProof,
+    claude_active_screen, claude_prompt_is_exact_composer, claude_prompt_transcript_count,
+    claude_staged_composer, muse_idle_composer, muse_startup_metadata, muse_trust_prompt,
+    muse_verified_process_composer, muse_verified_process_idle_composer,
+    muse_verified_process_prompt_in_composer, muse_verified_process_prompt_is_exact_composer,
+    muse_verified_process_prompt_transcript_count, AgentPaneInfo, CustomLaunchObservation,
+    CustomProcessIdentity, HerdrClient, Pane, PaneMove, PaneShellProof,
 };
 
 const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
 const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 const MAX_AGENT_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_QUEUE_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const HEALTH_SCHEMA: &str = "agentctl-health/v1";
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-const SESSION_STORAGE_SCHEMA: &str = "agentctl-session/v2";
-const LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v1";
+const SESSION_STORAGE_SCHEMA: &str = "agentctl-session/v3";
+const LEGACY_SESSION_STORAGE_SCHEMA: &str = "agentctl-session/v2";
+const LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v2";
+const LEGACY_LAUNCH_SPEC_SCHEMA: &str = "agentctl-launch/v1";
+const GOAL_STATE_SCHEMA: &str = "agentctl-goal/v1";
+const NATIVE_SESSION_SCHEMA: &str = "agentctl-native-session/v1";
 const RELOCATION_SCHEMA: &str = "agentctl-relocation/v1";
 
 fn rename_directory_noreplace_at(
@@ -591,6 +597,7 @@ pub trait ManagedApi: AgentApi {
     fn move_pane_to_new_tab(
         &self,
         pane: &str,
+        expected_terminal: &str,
         workspace: &str,
         label: &str,
     ) -> crate::error::Result<PaneMove>;
@@ -883,10 +890,11 @@ impl ManagedApi for HerdrClient {
     fn move_pane_to_new_tab(
         &self,
         pane: &str,
+        expected_terminal: &str,
         workspace: &str,
         label: &str,
     ) -> crate::error::Result<PaneMove> {
-        HerdrClient::move_pane_to_new_tab(self, pane, workspace, label)
+        HerdrClient::move_pane_to_new_tab(self, pane, expected_terminal, workspace, label)
     }
     fn close_pane(&self, pane: &str) -> crate::error::Result<()> {
         HerdrClient::close_pane(self, pane)
@@ -1030,7 +1038,7 @@ impl ManagedApi for HerdrClient {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct AgentRecord {
+struct LegacyAgentRecord {
     #[serde(default = "herdr_adapter")]
     adapter: String,
     #[serde(default = "interactive_mode")]
@@ -1060,6 +1068,8 @@ struct AgentRecord {
     #[serde(default)]
     launch_environment_names: Vec<String>,
     #[serde(default)]
+    launch_permission_mode: Option<String>,
+    #[serde(default)]
     runtime_ownership: Option<String>,
     #[serde(default)]
     runner_pid: Option<u64>,
@@ -1081,6 +1091,8 @@ struct AgentRecord {
     pane_id: Option<String>,
     session_agent: Option<String>,
     session_value: Option<String>,
+    #[serde(default)]
+    session_source: Option<String>,
     model: Option<String>,
     resume: Option<String>,
     #[serde(default)]
@@ -1122,6 +1134,39 @@ struct LaunchSpec {
     runtime_home: Option<String>,
     runtime_ownership: String,
     executable: Option<LaunchExecutable>,
+    #[serde(default)]
+    permission_mode: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AgentRecord {
+    name: String,
+    token: String,
+    launch: LaunchSpec,
+    created_at: f64,
+    lifecycle: String,
+    workspace_id: Option<String>,
+    tab_id: Option<String>,
+    pane_id: Option<String>,
+    session_agent: Option<String>,
+    session_value: Option<String>,
+    session_source: Option<String>,
+    startup_warning: Option<String>,
+    effective_reasoning_effort: Option<String>,
+    error: Option<String>,
+    goal: Option<String>,
+    goal_command: Option<Vec<String>>,
+    goal_message_id: Option<String>,
+    paused: bool,
+    pane_reported_by_agentctl: bool,
+    custom_process_identity: Option<CustomProcessIdentity>,
+    foreign_shell_identity: Option<CustomProcessIdentity>,
+    runner_identity: Option<CustomProcessIdentity>,
+    legacy_runner_pid: Option<u64>,
+    legacy_runner_started_at: Option<String>,
+    legacy_goal_delivery: Option<String>,
+    legacy_goal_messages: BTreeMap<String, String>,
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1237,7 +1282,7 @@ fn interactive_mode() -> String {
     "interactive".to_owned()
 }
 
-impl AgentRecord {
+impl LegacyAgentRecord {
     fn launch_spec(&self) -> Result<LaunchSpec> {
         let runtime_ownership = self.runtime_ownership.clone().unwrap_or_else(|| {
             if self.adapter == "herdr-foreign" {
@@ -1278,32 +1323,138 @@ impl AgentRecord {
             runtime_home: self.runtime_home.clone(),
             runtime_ownership,
             executable,
+            permission_mode: self.launch_permission_mode.clone(),
         })
     }
+}
 
+impl AgentRecord {
     fn arguments(&self) -> &[String] {
-        self.launch_argv.get(1..).unwrap_or(&[])
+        self.launch.argv.get(1..).unwrap_or(&[])
+    }
+
+    fn capabilities(&self) -> Vec<&'static str> {
+        if self.launch.adapter == "turn-runner" {
+            return vec!["status"];
+        }
+        let mut capabilities = vec![
+            "send",
+            "status",
+            "read",
+            "wait",
+            "stop",
+            "attach",
+            "pause",
+            "resume",
+            "terminal-snapshot",
+            "drain",
+            "goal",
+            "bind-session",
+            "relocate",
+        ];
+        if self.launch.adapter == "herdr-pane" && self.launch.harness == "muse" {
+            capabilities.push("reconcile-delivery");
+        }
+        capabilities
     }
 
     fn public_value(&self) -> Value {
-        let mut value = json!(self);
+        let executable = self.launch.executable.as_ref();
+        let runner_pid = self
+            .runner_identity
+            .as_ref()
+            .map_or(self.legacy_runner_pid, |identity| Some(identity.pid));
+        let runner_started_at = self.runner_identity.as_ref().map_or_else(
+            || self.legacy_runner_started_at.clone(),
+            |identity| Some(identity.starttime_ticks.to_string()),
+        );
+        let mut value = json!({
+            "schema": 1,
+            "name": self.name,
+            "token": self.token,
+            "harness": self.launch.harness,
+            "cwd": self.launch.cwd,
+            "created_at": self.created_at,
+            "lifecycle": self.lifecycle,
+            "workspace_id": self.workspace_id,
+            "tab_id": self.tab_id,
+            "pane_id": self.pane_id,
+            "session_agent": self.session_agent,
+            "session_value": self.session_value,
+            "model": self.launch.model,
+            "resume": self.launch.resume,
+            "startup_warning": self.startup_warning,
+            "effective_reasoning_effort": self.effective_reasoning_effort,
+            "error": self.error,
+            "goal": self.goal,
+            "goal_delivery": self.legacy_goal_delivery,
+            "goal_session_id": self.session_value,
+            "goal_command": self.goal_command,
+            "goal_messages": {},
+            "goal_message_id": self.goal_message_id,
+            "adapter": self.launch.adapter,
+            "mode": self.launch.mode,
+            "backend": self.launch.backend,
+            "paused": self.paused,
+            "runtime_home": self.launch.runtime_home,
+            "pane_reported_by_agentctl": self.pane_reported_by_agentctl,
+            "custom_process_identity": self.custom_process_identity,
+            "foreign_shell_identity": self.foreign_shell_identity,
+            "launch_profile": self.launch.profile,
+            "launch_executable": executable.map(|value| &value.path),
+            "launch_executable_device": executable.map(|value| value.device),
+            "launch_executable_inode": executable.map(|value| value.inode),
+            "launch_argv": self.launch.argv,
+            "launch_environment_names": self.launch.environment_names,
+            "runtime_ownership": self.launch.runtime_ownership,
+            "runner_pid": runner_pid,
+            "runner_started_at": runner_started_at,
+            "runner_identity": self.runner_identity,
+        });
         value["arguments"] = json!(self.arguments());
+        let object = value
+            .as_object_mut()
+            .expect("public session projection is an object");
+        object.insert(
+            "launch_permission_mode".to_owned(),
+            json!(self.launch.permission_mode),
+        );
+        object.insert("session_source".to_owned(), json!(self.session_source));
+        for (key, extension) in &self.extra {
+            assert!(!object.contains_key(key), "validated extension collision");
+            object.insert(key.clone(), extension.clone());
+        }
         value
     }
 
     fn storage_value(&self) -> Result<Value> {
-        self.validate_loaded(Path::new("<in-memory>"), &self.name)?;
-        let launch = self.launch_spec()?;
-        if let Some(program) = launch.argv.first() {
-            let expected = launch
-                .executable
+        if (self.session_value.is_some() != self.session_agent.is_some())
+            || (self.session_value.is_some() != self.session_source.is_some())
+            || self
+                .session_agent
                 .as_ref()
-                .map_or(launch.harness.as_str(), |identity| identity.path.as_str());
-            if program != expected {
-                return Err(fail("launch argv disagrees with its executable authority"));
-            }
+                .is_some_and(|agent| agent != &self.launch.harness)
+        {
+            return Err(fail("incomplete native session identity"));
         }
-        self.validate_runtime_shape(&launch)?;
+        self.validate_loaded(Path::new("<in-memory>"), &self.name)?;
+        let launch = &self.launch;
+        if self.runner_identity.is_none()
+            && (self.legacy_runner_pid.is_some() || self.legacy_runner_started_at.is_some())
+        {
+            return Err(fail(
+                "cannot migrate a PID/start-only runner without boot-bound identity",
+            ));
+        }
+        self.validate_runtime_shape(launch)?;
+        let native_session = self.session_value.as_ref().map(|value| {
+            json!({
+                "schema": NATIVE_SESSION_SCHEMA,
+                "agent": self.session_agent.as_deref().unwrap_or(&launch.harness),
+                "value": value,
+                "source": self.session_source.as_deref().unwrap_or("observed"),
+            })
+        });
         Ok(json!({
             "schema": SESSION_STORAGE_SCHEMA,
             "name": self.name,
@@ -1314,17 +1465,16 @@ impl AgentRecord {
             "workspace_id": self.workspace_id,
             "tab_id": self.tab_id,
             "pane_id": self.pane_id,
-            "session_agent": self.session_agent,
-            "session_value": self.session_value,
+            "native_session": native_session,
             "startup_warning": self.startup_warning,
             "effective_reasoning_effort": self.effective_reasoning_effort,
             "error": self.error,
-            "goal": self.goal,
-            "goal_delivery": self.goal_delivery,
-            "goal_session_id": self.goal_session_id,
-            "goal_command": self.goal_command,
-            "goal_messages": self.goal_messages,
-            "goal_message_id": self.goal_message_id,
+            "goal": {
+                "schema": GOAL_STATE_SCHEMA,
+                "objective": self.goal,
+                "message_id": self.goal_message_id,
+                "native_command": self.goal_command,
+            },
             "paused": self.paused,
             "pane_reported_by_agentctl": self.pane_reported_by_agentctl,
             "custom_process_identity": self.custom_process_identity,
@@ -1340,8 +1490,31 @@ impl AgentRecord {
             .cloned()
             .ok_or_else(|| fail(format!("invalid agent record: {}", path.display())))?;
         match document.get("schema") {
-            Some(Value::String(schema)) if schema == SESSION_STORAGE_SCHEMA => {
-                const TOP_FIELDS: [&str; 25] = [
+            Some(Value::String(schema))
+                if schema == SESSION_STORAGE_SCHEMA || schema == LEGACY_SESSION_STORAGE_SCHEMA =>
+            {
+                const CURRENT_FIELDS: [&str; 19] = [
+                    "schema",
+                    "name",
+                    "token",
+                    "created_at",
+                    "lifecycle",
+                    "launch",
+                    "workspace_id",
+                    "tab_id",
+                    "pane_id",
+                    "native_session",
+                    "startup_warning",
+                    "effective_reasoning_effort",
+                    "error",
+                    "goal",
+                    "paused",
+                    "pane_reported_by_agentctl",
+                    "custom_process_identity",
+                    "foreign_shell_identity",
+                    "runner_identity",
+                ];
+                const LEGACY_FIELDS: [&str; 25] = [
                     "schema",
                     "name",
                     "token",
@@ -1368,38 +1541,133 @@ impl AgentRecord {
                     "foreign_shell_identity",
                     "runner_identity",
                 ];
-                if document.len() != TOP_FIELDS.len() + 1
-                    || !TOP_FIELDS.iter().all(|field| document.contains_key(*field))
+                let current = schema == SESSION_STORAGE_SCHEMA;
+                let fields: &[&str] = if current {
+                    &CURRENT_FIELDS
+                } else {
+                    &LEGACY_FIELDS
+                };
+                if document.len() != fields.len() + 1
+                    || !fields.iter().all(|field| document.contains_key(*field))
                     || !document.contains_key("extensions")
                 {
                     return Err(fail(format!(
-                        "invalid agent record v2 fields: {}",
+                        "invalid agent record {schema} fields: {}",
                         path.display()
                     )));
                 }
-                let launch: LaunchSpec = serde_json::from_value(
-                    document.remove("launch").expect("checked launch field"),
-                )
-                .map_err(|error| {
+                if current {
+                    let goal = document
+                        .get("goal")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .ok_or_else(|| {
+                            fail(format!(
+                                "invalid agent record goal state: {}",
+                                path.display()
+                            ))
+                        })?;
+                    const GOAL_FIELDS: [&str; 4] =
+                        ["schema", "objective", "message_id", "native_command"];
+                    if goal.len() != GOAL_FIELDS.len()
+                        || !GOAL_FIELDS.iter().all(|field| goal.contains_key(*field))
+                        || goal.get("schema").and_then(Value::as_str) != Some(GOAL_STATE_SCHEMA)
+                    {
+                        return Err(fail(format!(
+                            "invalid agent record goal state: {}",
+                            path.display()
+                        )));
+                    }
+                    document.insert(
+                        "goal".to_owned(),
+                        goal.get("objective").cloned().unwrap_or(Value::Null),
+                    );
+                    document.insert("goal_delivery".to_owned(), Value::Null);
+                    document.insert(
+                        "goal_command".to_owned(),
+                        goal.get("native_command").cloned().unwrap_or(Value::Null),
+                    );
+                    document.insert("goal_messages".to_owned(), json!({}));
+                    document.insert(
+                        "goal_message_id".to_owned(),
+                        goal.get("message_id").cloned().unwrap_or(Value::Null),
+                    );
+                    let native = document.remove("native_session");
+                    match native {
+                        Some(Value::Null) => {
+                            document.insert("session_agent".to_owned(), Value::Null);
+                            document.insert("session_value".to_owned(), Value::Null);
+                            document.insert("session_source".to_owned(), Value::Null);
+                            document.insert("goal_session_id".to_owned(), Value::Null);
+                        }
+                        Some(Value::Object(native)) => {
+                            const SESSION_FIELDS: [&str; 4] =
+                                ["schema", "agent", "value", "source"];
+                            if native.len() != SESSION_FIELDS.len()
+                                || !SESSION_FIELDS
+                                    .iter()
+                                    .all(|field| native.contains_key(*field))
+                                || native.get("schema").and_then(Value::as_str)
+                                    != Some(NATIVE_SESSION_SCHEMA)
+                            {
+                                return Err(fail(format!(
+                                    "invalid agent record native session: {}",
+                                    path.display()
+                                )));
+                            }
+                            document.insert(
+                                "session_agent".to_owned(),
+                                native.get("agent").cloned().unwrap_or(Value::Null),
+                            );
+                            document.insert(
+                                "session_value".to_owned(),
+                                native.get("value").cloned().unwrap_or(Value::Null),
+                            );
+                            document.insert(
+                                "session_source".to_owned(),
+                                native.get("source").cloned().unwrap_or(Value::Null),
+                            );
+                            document.insert(
+                                "goal_session_id".to_owned(),
+                                native.get("value").cloned().unwrap_or(Value::Null),
+                            );
+                        }
+                        _ => {
+                            return Err(fail(format!(
+                                "invalid agent record native session: {}",
+                                path.display()
+                            )))
+                        }
+                    }
+                }
+                let launch_value = document.remove("launch").expect("checked launch field");
+                let launch_fields = launch_value.as_object().ok_or_else(|| {
                     fail(format!(
-                        "invalid agent record launch specification {}: {error}",
+                        "invalid agent record launch specification: {}",
                         path.display()
                     ))
                 })?;
-                if launch.schema != LAUNCH_SPEC_SCHEMA {
+                let launch_field_count = launch_fields.len();
+                let has_permission_mode = launch_fields.contains_key("permission_mode");
+                let mut launch: LaunchSpec =
+                    serde_json::from_value(launch_value).map_err(|error| {
+                        fail(format!(
+                            "invalid agent record launch specification {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                let valid_launch_shape = match launch.schema.as_str() {
+                    LAUNCH_SPEC_SCHEMA => launch_field_count == 15 && has_permission_mode,
+                    LEGACY_LAUNCH_SPEC_SCHEMA => launch_field_count == 14 && !has_permission_mode,
+                    _ => false,
+                };
+                if !valid_launch_shape {
                     return Err(fail(format!(
                         "invalid agent record launch schema: {}",
                         path.display()
                     )));
                 }
-                let launch_object =
-                    serde_json::to_value(&launch).expect("LaunchSpec serialization is infallible");
-                if launch_object.as_object().map_or(0, serde_json::Map::len) != 14 {
-                    return Err(fail(format!(
-                        "invalid agent record launch fields: {}",
-                        path.display()
-                    )));
-                }
+                launch.schema = LAUNCH_SPEC_SCHEMA.to_owned();
                 let extensions = document
                     .remove("extensions")
                     .and_then(|value| value.as_object().cloned())
@@ -1409,7 +1677,7 @@ impl AgentRecord {
                             path.display()
                         ))
                     })?;
-                const LAUNCH_FIELDS: [&str; 14] = [
+                const LAUNCH_FIELDS: [&str; 15] = [
                     "schema",
                     "harness",
                     "cwd",
@@ -1424,6 +1692,7 @@ impl AgentRecord {
                     "runtime_home",
                     "runtime_ownership",
                     "executable",
+                    "permission_mode",
                 ];
                 document.insert("schema".to_owned(), json!(1));
                 document.insert("harness".to_owned(), json!(launch.harness));
@@ -1457,8 +1726,14 @@ impl AgentRecord {
                 document.insert("launch_executable".to_owned(), path_value);
                 document.insert("launch_executable_device".to_owned(), device);
                 document.insert("launch_executable_inode".to_owned(), inode);
+                document.insert(
+                    "launch_permission_mode".to_owned(),
+                    json!(launch.permission_mode),
+                );
                 for (key, value) in extensions {
-                    if document.contains_key(&key)
+                    if key == "extensions"
+                        || fields.contains(&key.as_str())
+                        || document.contains_key(&key)
                         || LAUNCH_FIELDS.contains(&key.as_str())
                         || matches!(
                             key.as_str(),
@@ -1469,6 +1744,7 @@ impl AgentRecord {
                                 | "launch_executable"
                                 | "launch_executable_device"
                                 | "launch_executable_inode"
+                                | "launch_permission_mode"
                                 | "runner_pid"
                                 | "runner_started_at"
                         )
@@ -1480,6 +1756,39 @@ impl AgentRecord {
                         )));
                     }
                     document.insert(key, value);
+                }
+                if !current {
+                    let observed = document
+                        .get("session_value")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let asserted = document
+                        .get("goal_session_id")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if !observed.is_null() && !asserted.is_null() && observed != asserted {
+                        return Err(fail(format!(
+                            "contradictory native session identities in {}",
+                            path.display()
+                        )));
+                    }
+                    let (value, source) = if !observed.is_null() {
+                        (observed, json!("observed"))
+                    } else if !asserted.is_null() {
+                        (asserted, json!("asserted"))
+                    } else {
+                        (Value::Null, Value::Null)
+                    };
+                    if !value.is_null() && document.get("session_agent").is_none_or(Value::is_null)
+                    {
+                        document.insert(
+                            "session_agent".to_owned(),
+                            document.get("harness").cloned().unwrap_or(Value::Null),
+                        );
+                    }
+                    document.insert("session_value".to_owned(), value.clone());
+                    document.insert("goal_session_id".to_owned(), value);
+                    document.insert("session_source".to_owned(), source);
                 }
             }
             Some(Value::Number(schema)) if schema.as_u64() == Some(1) => {
@@ -1501,6 +1810,36 @@ impl AgentRecord {
                     };
                     document.insert("runtime_ownership".to_owned(), json!(ownership));
                 }
+                let observed = document
+                    .get("session_value")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let asserted = document
+                    .get("goal_session_id")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if !observed.is_null() && !asserted.is_null() && observed != asserted {
+                    return Err(fail(format!(
+                        "contradictory native session identities in {}",
+                        path.display()
+                    )));
+                }
+                let (value, source) = if !observed.is_null() {
+                    (observed, json!("observed"))
+                } else if !asserted.is_null() {
+                    (asserted, json!("asserted"))
+                } else {
+                    (Value::Null, Value::Null)
+                };
+                if !value.is_null() && document.get("session_agent").is_none_or(Value::is_null) {
+                    document.insert(
+                        "session_agent".to_owned(),
+                        document.get("harness").cloned().unwrap_or(Value::Null),
+                    );
+                }
+                document.insert("session_value".to_owned(), value.clone());
+                document.insert("goal_session_id".to_owned(), value);
+                document.insert("session_source".to_owned(), source);
             }
             _ => {
                 return Err(fail(format!(
@@ -1560,14 +1899,66 @@ impl AgentRecord {
                 path.display()
             )));
         }
-        let mut record: AgentRecord = serde_json::from_value(Value::Object(document))
+        let legacy: LegacyAgentRecord = serde_json::from_value(Value::Object(document))
             .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
+        if legacy
+            .extra
+            .keys()
+            .any(|key| matches!(key.as_str(), "launch" | "native_session" | "extensions"))
+        {
+            return Err(fail(format!(
+                "legacy agent record contains a reserved current-schema field: {}",
+                path.display()
+            )));
+        }
+        let launch = legacy.launch_spec()?;
+        let mut record = AgentRecord {
+            name: legacy.name,
+            token: legacy.token,
+            launch,
+            created_at: legacy.created_at,
+            lifecycle: legacy.lifecycle,
+            workspace_id: legacy.workspace_id,
+            tab_id: legacy.tab_id,
+            pane_id: legacy.pane_id,
+            session_agent: legacy.session_agent,
+            session_value: legacy.session_value,
+            session_source: legacy.session_source,
+            startup_warning: legacy.startup_warning,
+            effective_reasoning_effort: legacy.effective_reasoning_effort,
+            error: legacy.error,
+            goal: legacy.goal,
+            goal_command: legacy.goal_command,
+            goal_message_id: legacy.goal_message_id,
+            paused: legacy.paused,
+            pane_reported_by_agentctl: legacy.pane_reported_by_agentctl,
+            custom_process_identity: legacy.custom_process_identity,
+            foreign_shell_identity: legacy.foreign_shell_identity,
+            runner_identity: legacy.runner_identity,
+            legacy_runner_pid: None,
+            legacy_runner_started_at: None,
+            legacy_goal_delivery: legacy.goal_delivery,
+            legacy_goal_messages: legacy.goal_messages,
+            extra: legacy.extra,
+        };
         if let Some(identity) = record.runner_identity.as_ref() {
-            record.runner_pid = Some(identity.pid);
-            record.runner_started_at = Some(identity.starttime_ticks.to_string());
+            if legacy.runner_pid.is_some_and(|pid| pid != identity.pid)
+                || legacy
+                    .runner_started_at
+                    .as_ref()
+                    .is_some_and(|started| started != &identity.starttime_ticks.to_string())
+            {
+                return Err(fail(format!(
+                    "contradictory runner identity in {}",
+                    path.display()
+                )));
+            }
+        } else {
+            record.legacy_runner_pid = legacy.runner_pid;
+            record.legacy_runner_started_at = legacy.runner_started_at;
         }
         record.validate_loaded(path, agent_name)?;
-        record.validate_runtime_shape(&record.launch_spec()?)?;
+        record.validate_runtime_shape(&record.launch)?;
         Ok(record)
     }
 
@@ -1576,6 +1967,52 @@ impl AgentRecord {
             self.lifecycle.as_str(),
             "starting" | "running" | "stopping" | "stopped" | "launch_failed" | "adopt_failed"
         );
+        let expected_program = launch
+            .executable
+            .as_ref()
+            .map_or(launch.harness.as_str(), |identity| identity.path.as_str());
+        let option_valid = |value: Option<&str>| {
+            value.is_none_or(|value| !value.is_empty() && !value.contains('\0'))
+        };
+        let mut launch_shape = Path::new(&launch.cwd).is_absolute()
+            && option_valid(launch.model.as_deref())
+            && option_valid(launch.resume.as_deref())
+            && option_valid(launch.profile.as_deref())
+            && launch
+                .argv
+                .iter()
+                .all(|value| !value.is_empty() && !value.contains('\0'))
+            && launch.environment_names.iter().all(|value| {
+                value
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+            && if launch.adapter == "herdr-foreign" {
+                launch.argv.is_empty()
+            } else {
+                launch
+                    .argv
+                    .first()
+                    .is_some_and(|value| value == expected_program)
+            };
+        // Interactive adapters launch the harness directly, so their
+        // structured model/resume arguments must be present in argv.  The
+        // Python turn-runner protocol carries those fields separately and
+        // reserves argv for its harness-specific extra arguments.
+        if matches!(launch.adapter.as_str(), "herdr" | "herdr-pane") {
+            let structured = harness_arguments(
+                &launch.harness,
+                launch.model.as_deref(),
+                launch.resume.as_deref(),
+                &[],
+            )?;
+            launch_shape = launch_shape
+                && launch.argv.get(1..1 + structured.len()) == Some(structured.as_slice());
+        }
         let valid = if launch.adapter == "turn-runner" {
             launch.mode == "headless"
                 && matches!(launch.backend.as_str(), "herdr" | "tmux")
@@ -1586,6 +2023,12 @@ impl AgentRecord {
                     .is_some_and(|home| Path::new(home).is_absolute())
                 && self.custom_process_identity.is_none()
                 && self.foreign_shell_identity.is_none()
+                && matches!(
+                    launch.permission_mode.as_deref(),
+                    None | Some("native") | Some("bypass")
+                )
+                && (launch.permission_mode.as_deref() != Some("bypass")
+                    || launch.harness == "codex")
         } else {
             let base = matches!(
                 launch.adapter.as_str(),
@@ -1594,8 +2037,9 @@ impl AgentRecord {
                 && launch.backend == "herdr"
                 && launch.runtime_home.is_none()
                 && self.runner_identity.is_none()
-                && self.runner_pid.is_none()
-                && self.runner_started_at.is_none();
+                && self.legacy_runner_pid.is_none()
+                && self.legacy_runner_started_at.is_none()
+                && launch.permission_mode.is_none();
             base && match launch.adapter.as_str() {
                 "herdr" => {
                     launch.runtime_ownership == "owned"
@@ -1613,7 +2057,7 @@ impl AgentRecord {
                 _ => false,
             }
         };
-        if !valid_lifecycle || !valid {
+        if !valid_lifecycle || !launch_shape || !valid {
             return Err(fail(
                 "adapter, mode, backend, ownership, and runtime identity are inconsistent",
             ));
@@ -1622,26 +2066,46 @@ impl AgentRecord {
     }
 
     fn validate_loaded(&self, path: &Path, agent_name: &str) -> Result<()> {
+        if self
+            .session_agent
+            .as_ref()
+            .is_some_and(|agent| agent != &self.launch.harness)
+        {
+            return Err(fail(format!(
+                "native session harness mismatch in {}",
+                path.display()
+            )));
+        }
         if self.name != agent_name
-            || self.schema != 1
             || self.token.is_empty()
             || self.token.len() > 80
             || !self
                 .token
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            || self.harness.is_empty()
-            || self.cwd.is_empty()
+            || self.launch.harness.is_empty()
+            || self.launch.cwd.is_empty()
             || self.lifecycle.is_empty()
             || !self.created_at.is_finite()
             || self
                 .goal_message_id
                 .as_deref()
                 .is_some_and(|value| !message_id(value))
+            || (self.goal_message_id.is_some() && self.goal.is_none())
+            || !matches!(
+                self.legacy_goal_delivery.as_deref(),
+                None | Some("pending") | Some("possibly_submitted") | Some("delivered")
+            )
             || self
-                .goal_messages
+                .legacy_goal_messages
                 .iter()
                 .any(|(key, value)| !message_id(key) || value.is_empty())
+            || !matches!(
+                self.session_source.as_deref(),
+                None | Some("observed") | Some("asserted")
+            )
+            || (self.session_value.is_some() != self.session_source.is_some())
+            || (self.session_value.is_some() != self.session_agent.is_some())
             || self.goal_command.as_ref().is_some_and(|command| {
                 command.is_empty()
                     || command
@@ -1664,8 +2128,8 @@ impl AgentRecord {
                 .custom_process_identity
                 .as_ref()
                 .is_some_and(|identity| {
-                    self.adapter != "herdr-pane"
-                        || self.harness != "muse"
+                    self.launch.adapter != "herdr-pane"
+                        || self.launch.harness != "muse"
                         || self.pane_id.as_deref().is_none_or(str::is_empty)
                         || !identity.valid()
                 })
@@ -1673,37 +2137,33 @@ impl AgentRecord {
                 .foreign_shell_identity
                 .as_ref()
                 .is_some_and(|identity| {
-                    self.adapter != "herdr-foreign"
+                    self.launch.adapter != "herdr-foreign"
                         || self.pane_id.as_deref().is_none_or(str::is_empty)
                         || !identity.valid()
                 })
+            || !matches!(self.launch.runtime_ownership.as_str(), "owned" | "foreign")
             || self
-                .runtime_ownership
-                .as_deref()
-                .is_some_and(|ownership| !matches!(ownership, "owned" | "foreign"))
-            || self
-                .runner_pid
+                .legacy_runner_pid
                 .is_some_and(|pid| pid == 0 || pid > i32::MAX as u64)
-            || self.runner_started_at.as_deref().is_some_and(|started_at| {
-                started_at.is_empty()
-                    || !started_at.bytes().all(|byte| byte.is_ascii_digit())
-                    || started_at.bytes().all(|byte| byte == b'0')
-            })
-            || self.runner_pid.is_some() != self.runner_started_at.is_some()
-            || self.runner_identity.as_ref().is_some_and(|identity| {
-                !identity.valid()
-                    || self.runner_pid != Some(identity.pid)
-                    || self
-                        .runner_started_at
-                        .as_deref()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        != Some(identity.starttime_ticks)
-            })
             || self
-                .launch_argv
+                .legacy_runner_started_at
+                .as_deref()
+                .is_some_and(|started_at| {
+                    started_at.is_empty()
+                        || !started_at.bytes().all(|byte| byte.is_ascii_digit())
+                        || started_at.bytes().all(|byte| byte == b'0')
+                })
+            || self.legacy_runner_pid.is_some() != self.legacy_runner_started_at.is_some()
+            || self
+                .runner_identity
+                .as_ref()
+                .is_some_and(|identity| !identity.valid())
+            || self
+                .launch
+                .argv
                 .iter()
                 .any(|value| value.is_empty() || value.contains('\0'))
-            || self.launch_environment_names.iter().any(|value| {
+            || self.launch.environment_names.iter().any(|value| {
                 value.is_empty()
                     || !value
                         .bytes()
@@ -1713,16 +2173,11 @@ impl AgentRecord {
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             })
-            || self.launch_executable_device.is_some() != self.launch_executable_inode.is_some()
-            || self.launch_executable.is_some() != self.launch_executable_device.is_some()
-            || self
-                .launch_executable_device
-                .is_some_and(|value| value == 0)
-            || self.launch_executable_inode.is_some_and(|value| value == 0)
-            || self.launch_executable.as_ref().is_some_and(|executable| {
-                !Path::new(executable).is_absolute()
-                    || self.launch_argv.first() != Some(executable)
-                    || self.launch_executable_device.is_none()
+            || self.launch.executable.as_ref().is_some_and(|executable| {
+                !Path::new(&executable.path).is_absolute()
+                    || self.launch.argv.first() != Some(&executable.path)
+                    || executable.device == 0
+                    || executable.inode == 0
             })
         {
             return Err(fail(format!("invalid agent record: {}", path.display())));
@@ -1732,12 +2187,12 @@ impl AgentRecord {
 
     fn supported(&self) -> Result<()> {
         if !matches!(
-            self.adapter.as_str(),
+            self.launch.adapter.as_str(),
             "herdr" | "herdr-pane" | "herdr-foreign"
-        ) || self.mode != "interactive"
-            || self.backend != "herdr"
+        ) || self.launch.mode != "interactive"
+            || self.launch.backend != "herdr"
         {
-            return Err(fail(format!("agent {:?} uses adapter {:?}, mode {:?}, backend {:?}; use the agentctl with the worker extension implementation for this runtime", self.name, self.adapter, self.mode, self.backend)));
+            return Err(fail(format!("agent {:?} uses adapter {:?}, mode {:?}, backend {:?}; use the agentctl with the worker extension implementation for this runtime", self.name, self.launch.adapter, self.launch.mode, self.launch.backend)));
         }
         Ok(())
     }
@@ -1757,12 +2212,17 @@ impl AgentRecord {
                 self.name
             )));
         }
+        let observed_session = self.session_source.as_deref() == Some("observed");
         Ok(Target {
             pane_id: self.pane_id.clone(),
-            session_agent: self.session_agent.clone(),
-            session_value: self.session_value.clone(),
-            expected_agent: Some(self.harness.clone()),
-            expected_cwd: Some(PathBuf::from(&self.cwd)),
+            session_agent: observed_session
+                .then(|| self.session_agent.clone())
+                .flatten(),
+            session_value: observed_session
+                .then(|| self.session_value.clone())
+                .flatten(),
+            expected_agent: Some(self.launch.harness.clone()),
+            expected_cwd: Some(PathBuf::from(&self.launch.cwd)),
             expected_workspace: None,
         })
     }
@@ -1775,11 +2235,22 @@ fn goal_replacement_selected(screen: &str, objective: &str) -> bool {
         && screen.contains("2. Cancel Keep the current goal") && screen.contains("Press enter to confirm or esc to go back")
 }
 
+fn goal_prompt(harness: &str, objective: &str) -> String {
+    if harness == "codex" {
+        format!("/goal {objective}")
+    } else {
+        format!(
+            "Your ongoing goal: {objective}\nWork toward this goal and report completion or blockers."
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CustomPaneSubmission {
-    staged_screen: String,
+    harness: String,
     text: String,
     prior_transcript_count: usize,
+    prior_active: bool,
 }
 
 struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
@@ -1789,6 +2260,346 @@ struct WorkspaceClient<'a, A: ManagedApi + ?Sized> {
     custom_submission: Mutex<Option<CustomPaneSubmission>>,
     queue: Option<&'a Path>,
     check_prompt: bool,
+    adopted_evidence: Mutex<Option<AdoptedRuntimeEvidence>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdoptedRuntimeState {
+    LiveExact,
+    IdleShellExact,
+    Missing,
+    Ambiguous,
+    IdentityMismatch,
+    Unknown,
+}
+
+impl AdoptedRuntimeState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveExact => "live-exact",
+            Self::IdleShellExact => "idle-shell-exact",
+            Self::Missing => "missing",
+            Self::Ambiguous => "ambiguous",
+            Self::IdentityMismatch => "identity-mismatch",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdoptedRuntimeEvidence {
+    state: AdoptedRuntimeState,
+    reason_code: String,
+    reason: String,
+    info: Option<AgentPaneInfo>,
+    presentation: Option<Pane>,
+}
+
+impl AdoptedRuntimeEvidence {
+    fn public_value(&self) -> Value {
+        json!({
+            "state": self.state.as_str(),
+            "reason_code": self.reason_code,
+            "reason": self.reason,
+        })
+    }
+
+    fn require_live(&self) -> crate::error::Result<AgentPaneInfo> {
+        if self.state == AdoptedRuntimeState::LiveExact {
+            if let Some(info) = &self.info {
+                return Ok(info.clone());
+            }
+        }
+        Err(crate::error::AdapterError::unavailable(&self.reason))
+    }
+}
+
+struct OperationDeadlineRuntime<'a> {
+    inner: &'a dyn agent::AgentRuntime,
+    deadline: Duration,
+}
+
+impl agent::AgentRuntime for OperationDeadlineRuntime<'_> {
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner
+            .sleep(duration.min(self.deadline.saturating_sub(self.inner.monotonic())));
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled() || self.inner.monotonic() >= self.deadline
+    }
+
+    fn delivery_wait_chunk(&self) -> Option<Duration> {
+        Some(
+            self.inner
+                .delivery_wait_chunk()
+                .unwrap_or(Duration::from_secs(1))
+                .min(self.deadline.saturating_sub(self.inner.monotonic())),
+        )
+    }
+}
+
+impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
+    fn adopted_evidence_with_runtime(
+        &self,
+        runtime: &dyn agent::AgentRuntime,
+        refresh: bool,
+    ) -> AdoptedRuntimeEvidence {
+        if !refresh {
+            if let Some(cached) = self
+                .adopted_evidence
+                .lock()
+                .expect("adopted evidence lock poisoned")
+                .clone()
+            {
+                return cached;
+            }
+        }
+        let observed =
+            |state, code: &str, reason: String, info, presentation| AdoptedRuntimeEvidence {
+                state,
+                reason_code: code.to_owned(),
+                reason,
+                info,
+                presentation,
+            };
+        let evidence = if self.record.launch.adapter != "herdr-foreign" {
+            observed(
+                AdoptedRuntimeState::IdentityMismatch,
+                "adopted-adapter-required",
+                "adopted-runtime evidence requires herdr-foreign".to_owned(),
+                None,
+                None,
+            )
+        } else if self.record.pane_id.is_none() || self.record.foreign_shell_identity.is_none() {
+            observed(
+                AdoptedRuntimeState::Unknown,
+                "runtime-probe-failed",
+                format!(
+                    "legacy record has no identity-bound pane shell for adopted agent {:?}",
+                    self.record.name
+                ),
+                None,
+                None,
+            )
+        } else {
+            let pane_id = self.record.pane_id.as_deref().expect("checked pane");
+            let shell = self
+                .record
+                .foreign_shell_identity
+                .as_ref()
+                .expect("checked shell identity");
+            match self.client.panes_with_runtime(runtime) {
+                Err(error) => observed(
+                    AdoptedRuntimeState::Unknown,
+                    "runtime-probe-failed",
+                    error.to_string(),
+                    None,
+                    None,
+                ),
+                Ok(panes) => {
+                    let matching = panes
+                        .into_iter()
+                        .filter(|pane| pane.pane_id == pane_id)
+                        .collect::<Vec<_>>();
+                    if matching.is_empty() {
+                        observed(
+                            AdoptedRuntimeState::Missing,
+                            "pane-missing",
+                            "expected one recorded pane, found 0".to_owned(),
+                            None,
+                            None,
+                        )
+                    } else if matching.len() != 1 {
+                        observed(
+                            AdoptedRuntimeState::Ambiguous,
+                            "pane-identity-ambiguous",
+                            format!("expected one recorded pane, found {}", matching.len()),
+                            None,
+                            None,
+                        )
+                    } else {
+                        let presentation = matching[0].clone();
+                        if Some(&presentation.workspace_id) != self.record.workspace_id.as_ref() {
+                            observed(
+                                AdoptedRuntimeState::IdentityMismatch,
+                                "runtime-identity-mismatch",
+                                format!("adopted pane {pane_id:?} workspace identity changed"),
+                                None,
+                                Some(presentation),
+                            )
+                        } else {
+                            match self.client.pane_info_with_runtime(pane_id, runtime) {
+                                Err(error) => observed(
+                                    AdoptedRuntimeState::Unknown,
+                                    "runtime-probe-failed",
+                                    error.to_string(),
+                                    None,
+                                    Some(presentation),
+                                ),
+                                Ok(info) => {
+                                    let cwd_matches = info.cwd == self.record.launch.cwd
+                                        || fs::canonicalize(&info.cwd).ok().is_some_and(|cwd| {
+                                            Some(cwd)
+                                                == fs::canonicalize(&self.record.launch.cwd).ok()
+                                        });
+                                    if info.pane_id != pane_id
+                                        || Some(&info.workspace_id)
+                                            != self.record.workspace_id.as_ref()
+                                        || !cwd_matches
+                                    {
+                                        observed(
+                                            AdoptedRuntimeState::IdentityMismatch,
+                                            "runtime-identity-mismatch",
+                                            format!(
+                                                "recorded pane, workspace, or cwd changed for {pane_id:?}"
+                                            ),
+                                            Some(info),
+                                            Some(presentation),
+                                        )
+                                    } else if let Err(error) =
+                                        self.client.verify_pane_shell_identity_with_runtime(
+                                            pane_id, shell, runtime,
+                                        )
+                                    {
+                                        let detail = error.to_string();
+                                        let state = if detail.contains("changed") {
+                                            AdoptedRuntimeState::IdentityMismatch
+                                        } else {
+                                            AdoptedRuntimeState::Unknown
+                                        };
+                                        observed(
+                                            state,
+                                            if state == AdoptedRuntimeState::IdentityMismatch {
+                                                "runtime-identity-mismatch"
+                                            } else {
+                                                "runtime-probe-failed"
+                                            },
+                                            detail,
+                                            Some(info),
+                                            Some(presentation),
+                                        )
+                                    } else if info.agent.as_deref()
+                                        == Some(self.record.launch.harness.as_str())
+                                    {
+                                        if self.record.session_source.as_deref() == Some("observed")
+                                            && (self.record.session_agent.as_ref().is_some_and(
+                                                |expected| {
+                                                    info.session_agent.as_ref() != Some(expected)
+                                                },
+                                            ) || self
+                                                .record
+                                                .session_value
+                                                .as_ref()
+                                                .is_some_and(|expected| {
+                                                    info.session_value.as_ref() != Some(expected)
+                                                }))
+                                        {
+                                            observed(
+                                                AdoptedRuntimeState::IdentityMismatch,
+                                                "runtime-identity-mismatch",
+                                                format!(
+                                                    "adopted pane {pane_id:?} is not exactly one live pane with the recorded native session identity"
+                                                ),
+                                                Some(info),
+                                                Some(presentation),
+                                            )
+                                        } else {
+                                            observed(
+                                                AdoptedRuntimeState::LiveExact,
+                                                "ok",
+                                                "adopted harness and shell generation are live and exact"
+                                                    .to_owned(),
+                                                Some(info),
+                                                Some(presentation),
+                                            )
+                                        }
+                                    } else if info.agent.is_some() {
+                                        observed(
+                                            AdoptedRuntimeState::IdentityMismatch,
+                                            "expected-harness-missing",
+                                            format!(
+                                                "pane {pane_id:?} reports agent {:?}, expected {:?}",
+                                                info.agent, self.record.launch.harness
+                                            ),
+                                            Some(info),
+                                            Some(presentation),
+                                        )
+                                    } else if info.session_agent.is_some()
+                                        || info.session_value.is_some()
+                                    {
+                                        observed(
+                                            AdoptedRuntimeState::IdentityMismatch,
+                                            "runtime-identity-mismatch",
+                                            format!(
+                                                "absent agent has native session identity in pane {pane_id:?}"
+                                            ),
+                                            Some(info),
+                                            Some(presentation),
+                                        )
+                                    } else {
+                                        match self.client.pane_is_same_idle_shell_with_runtime(
+                                            pane_id, shell, runtime,
+                                        ) {
+                                            Ok(true)
+                                                if Some(&presentation.tab_id)
+                                                    != self.record.tab_id.as_ref() =>
+                                            {
+                                                observed(
+                                                    AdoptedRuntimeState::IdentityMismatch,
+                                                    "runtime-identity-mismatch",
+                                                    format!(
+                                                        "recorded tab changed while the agent was absent ({:?})",
+                                                        self.record.name
+                                                    ),
+                                                    Some(info),
+                                                    Some(presentation),
+                                                )
+                                            }
+                                            Ok(true) => observed(
+                                                AdoptedRuntimeState::IdleShellExact,
+                                                "expected-harness-missing",
+                                                format!(
+                                                    "adopted pane {pane_id:?} returned to its exact recorded idle shell"
+                                                ),
+                                                Some(info),
+                                                Some(presentation),
+                                            ),
+                                            Ok(false) => observed(
+                                                AdoptedRuntimeState::Unknown,
+                                                "agent-report-missing",
+                                                format!(
+                                                    "pane {pane_id:?} is not at the recorded identity-bound idle shell process group"
+                                                ),
+                                                Some(info),
+                                                Some(presentation),
+                                            ),
+                                            Err(error) => observed(
+                                                AdoptedRuntimeState::Unknown,
+                                                "runtime-probe-failed",
+                                                error.to_string(),
+                                                Some(info),
+                                                Some(presentation),
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        *self
+            .adopted_evidence
+            .lock()
+            .expect("adopted evidence lock poisoned") = Some(evidence.clone());
+        evidence
+    }
 }
 
 impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
@@ -1830,6 +2641,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         &self,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<Vec<Pane>> {
+        if self.record.launch.adapter == "herdr-foreign" {
+            let evidence = self.adopted_evidence_with_runtime(runtime, false);
+            return Ok(evidence.presentation.into_iter().collect());
+        }
         Ok(self
             .client
             .panes_with_runtime(runtime)?
@@ -1843,7 +2658,14 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         pane_id: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<AgentPaneInfo> {
-        if self.record.adapter == "herdr"
+        if self.record.launch.adapter == "herdr-foreign"
+            && Some(pane_id) == self.record.pane_id.as_deref()
+        {
+            return self
+                .adopted_evidence_with_runtime(runtime, false)
+                .require_live();
+        }
+        if self.record.launch.adapter == "herdr"
             && Some(
                 self.client
                     .agent_pane_with_runtime(&self.record.name, runtime)?,
@@ -1862,19 +2684,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             )));
         }
         if Some(pane_id) == self.record.pane_id.as_deref() {
-            if self.record.adapter == "herdr-foreign" {
-                let identity = self.record.foreign_shell_identity.as_ref().ok_or_else(|| {
-                    crate::error::AdapterError::unavailable(format!(
-                        "adopted agent {:?} has no identity-bound pane shell",
-                        self.record.name
-                    ))
-                })?;
-                self.client
-                    .verify_pane_shell_identity_with_runtime(pane_id, identity, runtime)?;
-            }
-            if self.record.goal_session_id.is_some()
+            if self.record.session_source.as_deref() == Some("observed")
+                && self.record.session_value.is_some()
                 && info.session_value.is_some()
-                && info.session_value != self.record.goal_session_id
+                && info.session_value != self.record.session_value
             {
                 return Err(crate::error::AdapterError::unavailable(format!(
                     "agent {:?} native session identity changed",
@@ -1896,7 +2709,9 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         {
                             return Err(crate::error::AdapterError::unavailable("Claude workspace trust prompt requires human attention; no input was submitted"));
                         }
-                        if claude_active_screen(&screen) {
+                        if claude_staged_composer(&screen) {
+                            info.status = "staged".to_owned();
+                        } else if claude_active_screen(&screen) {
                             info.status = "working".to_owned();
                         }
                     }
@@ -1904,11 +2719,11 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                     Err(_) => {}
                 }
             }
-            if self.record.adapter == "herdr-pane" {
+            if self.record.launch.adapter == "herdr-pane" {
                 let reported_status = info.status.clone();
                 self.client.verify_custom_harness_with_runtime(
                     pane_id,
-                    &self.record.harness,
+                    &self.record.launch.harness,
                     self.record.custom_process_identity.as_ref(),
                     runtime,
                 )?;
@@ -1922,12 +2737,16 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 }
                 // The exact custom-process proof is authoritative even when
                 // Herdr's advisory agent label has not been published yet.
-                info.agent = Some(self.record.harness.clone());
+                info.agent = Some(self.record.launch.harness.clone());
                 info.status = if muse_idle_composer(&screen)
                     || (matches!(reported_status.as_str(), "idle" | "done")
                         && muse_verified_process_idle_composer(&screen))
                 {
                     "idle".to_owned()
+                } else if matches!(reported_status.as_str(), "idle" | "done")
+                    && muse_verified_process_composer(&screen)
+                {
+                    "staged".to_owned()
                 } else {
                     "working".to_owned()
                 };
@@ -1960,24 +2779,72 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .goal_objective
             .lock()
             .expect("goal operation lock poisoned") = None;
-        if let Some(queue) = self.queue {
-            for (identifier, objective) in &self.record.goal_messages {
-                let path = queue.join("inflight").join(format!("{identifier}.json"));
-                if text == format!("/goal {objective}") && fs::symlink_metadata(&path).is_ok() {
-                    let document = agent::read_private_json(&path).map_err(|error| {
-                        crate::error::AdapterError::unavailable(error.to_string())
-                    })?;
-                    if document["text"].as_str() == Some(text) {
-                        *self
-                            .goal_objective
-                            .lock()
-                            .expect("goal operation lock poisoned") = Some(objective.clone());
-                        break;
-                    }
+        if let (Some(queue), Some(objective)) = (self.queue, text.strip_prefix("/goal ")) {
+            let inflight = queue.join("inflight");
+            let mut entries = fs::read_dir(&inflight)
+                .map_err(|error| crate::error::AdapterError::unavailable(error.to_string()))?
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|error| crate::error::AdapterError::unavailable(error.to_string()))?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let document = agent::read_private_json(&entry.path())
+                    .map_err(|error| crate::error::AdapterError::unavailable(error.to_string()))?;
+                if document["kind"].as_str() == Some("goal")
+                    && document["text"].as_str() == Some(text)
+                {
+                    *self
+                        .goal_objective
+                        .lock()
+                        .expect("goal operation lock poisoned") = Some(objective.to_owned());
+                    break;
                 }
             }
         }
-        if self.record.adapter != "herdr-pane" {
+        if self.record.launch.adapter != "herdr-pane" {
+            if self.record.launch.harness == "claude" {
+                let before =
+                    self.client
+                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                let prior_transcript_count = claude_prompt_transcript_count(&before, text);
+                let prior_active = claude_active_screen(&before);
+                if !claude_prompt_is_exact_composer(&before, text) {
+                    if claude_staged_composer(&before) {
+                        return Err(crate::error::AdapterError::unavailable(
+                            "Claude editor contains different buffered input; no input was sent",
+                        ));
+                    }
+                    self.client.run_with_runtime(pane_id, text, runtime)?;
+                }
+                let staged =
+                    self.client
+                        .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                if !claude_prompt_is_exact_composer(&staged, text) {
+                    // Preserve Herdr's native transition contract when the
+                    // screen does not prove a staged Claude editor. It never
+                    // authorizes a second input operation.
+                    return Ok(());
+                }
+                if self.pane_info_with_runtime(pane_id, runtime)?.status != "staged" {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Claude staged prompt changed before its submit chord",
+                    ));
+                }
+                self.client
+                    .send_keys_with_runtime(pane_id, "ctrl+x ctrl+s", runtime)?;
+                *self
+                    .custom_submission
+                    .lock()
+                    .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
+                    harness: "claude".to_owned(),
+                    text: text.to_owned(),
+                    prior_transcript_count,
+                    prior_active,
+                });
+                return Ok(());
+            }
             return self.client.run_with_runtime(pane_id, text, runtime);
         }
         if text.contains(['\0', '\u{1b}']) {
@@ -1986,50 +2853,84 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             ));
         }
         let info = self.pane_info_with_runtime(pane_id, runtime)?;
-        if info.status != "idle" {
+        if !matches!(info.status.as_str(), "idle" | "staged") {
             return Err(crate::error::AdapterError::unavailable(format!(
-                "custom pane {pane_id} is not at a verified idle Muse composer"
+                "custom pane {pane_id} is not at a verified idle or staged Muse composer"
             )));
         }
         let before =
             self.client
                 .read_with_runtime(pane_id, "recent-unwrapped", Some(200), runtime)?;
-        self.client.send_text_with_runtime(
-            pane_id,
-            &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
-            runtime,
-        )?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let staged = loop {
-            if runtime.cancelled() {
+        if !muse_verified_process_composer(&before) {
+            return Err(crate::error::AdapterError::unavailable(
+                "current Muse editor could not be verified before delivery; no input was sent",
+            ));
+        }
+        if muse_verified_process_prompt_is_exact_composer(&before, text) {
+            // The exact requested input is already staged. Re-prove it below
+            // rather than injecting a duplicate paste.
+        } else {
+            if !muse_verified_process_idle_composer(&before) {
                 return Err(crate::error::AdapterError::unavailable(
-                    "Herdr control operation was cancelled",
+                    "Muse editor contains different buffered input; no input or Enter was sent",
                 ));
             }
-            self.client.verify_custom_harness_with_runtime(
+            self.client.send_text_with_runtime(
                 pane_id,
-                &self.record.harness,
-                self.record.custom_process_identity.as_ref(),
+                &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
                 runtime,
             )?;
-            let screen =
-                self.client
-                    .read_with_runtime(pane_id, "recent-unwrapped", Some(200), runtime)?;
-            if screen != before && muse_verified_process_prompt_is_exact_composer(&screen, text) {
-                break screen;
-            }
-            if Instant::now() >= deadline {
-                return Err(crate::error::AdapterError::unavailable(
-                    "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent",
-                ));
-            }
-            std::thread::sleep(
-                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
-            );
-        };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let _staged = loop {
+                if runtime.cancelled() {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "Herdr control operation was cancelled",
+                    ));
+                }
+                self.client.verify_custom_harness_with_runtime(
+                    pane_id,
+                    &self.record.launch.harness,
+                    self.record.custom_process_identity.as_ref(),
+                    runtime,
+                )?;
+                let screen = self.client.read_with_runtime(
+                    pane_id,
+                    "recent-unwrapped",
+                    Some(200),
+                    runtime,
+                )?;
+                if screen != before && muse_verified_process_prompt_is_exact_composer(&screen, text)
+                {
+                    break screen;
+                }
+                if Instant::now() >= deadline {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent",
+                    ));
+                }
+                std::thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            };
+        }
         self.client.verify_custom_harness_with_runtime(
             pane_id,
-            &self.record.harness,
+            &self.record.launch.harness,
+            self.record.custom_process_identity.as_ref(),
+            runtime,
+        )?;
+        let confirmed =
+            self.client
+                .read_with_runtime(pane_id, "recent-unwrapped", Some(200), runtime)?;
+        if !muse_verified_process_prompt_is_exact_composer(&confirmed, text) {
+            return Err(crate::error::AdapterError::unavailable(
+                "Muse editor changed before submission; Enter was not sent",
+            ));
+        }
+        self.client.verify_custom_harness_with_runtime(
+            pane_id,
+            &self.record.launch.harness,
             self.record.custom_process_identity.as_ref(),
             runtime,
         )?;
@@ -2039,9 +2940,10 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .custom_submission
             .lock()
             .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
-            prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
-            staged_screen: staged,
+            harness: "muse".to_owned(),
+            prior_transcript_count: muse_verified_process_prompt_transcript_count(&confirmed, text),
             text: text.to_owned(),
+            prior_active: false,
         });
         Ok(())
     }
@@ -2053,40 +2955,75 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         timeout_ms: u64,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
-        if self.record.adapter == "herdr-pane" && status == "working" {
-            let submission = self
-                .custom_submission
-                .lock()
-                .expect("custom submission lock poisoned")
-                .clone()
-                .ok_or_else(|| {
-                    crate::error::AdapterError::unavailable(
-                        "custom pane harness has no pending submission receipt",
-                    )
-                })?;
-            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let deadline = runtime
+            .monotonic()
+            .saturating_add(Duration::from_millis(timeout_ms));
+        let bounded = OperationDeadlineRuntime {
+            inner: runtime,
+            deadline,
+        };
+        let submission = self
+            .custom_submission
+            .lock()
+            .expect("custom submission lock poisoned")
+            .clone();
+        if let ("working", Some(submission)) = (status, submission) {
+            let retry_after = runtime.monotonic().saturating_add(
+                Duration::from_millis(250).min(Duration::from_millis(timeout_ms / 2)),
+            );
+            let mut retried_enter = false;
             loop {
                 if runtime.cancelled() {
                     return Err(crate::error::AdapterError::unavailable(
                         "Herdr control operation was cancelled",
                     ));
                 }
-                self.client.verify_custom_harness_with_runtime(
-                    pane_id,
-                    &self.record.harness,
-                    self.record.custom_process_identity.as_ref(),
-                    runtime,
-                )?;
-                let screen = self.client.read_with_runtime(
-                    pane_id,
-                    "recent-unwrapped",
-                    Some(200),
-                    runtime,
-                )?;
-                if screen != submission.staged_screen
-                    && muse_verified_process_prompt_transcript_count(&screen, &submission.text)
-                        > submission.prior_transcript_count
-                    && !muse_verified_process_prompt_in_composer(&screen, &submission.text)
+                if bounded.monotonic() >= deadline {
+                    return Err(crate::error::AdapterError::unavailable(
+                        "agent did not show a verified post-submission screen transition",
+                    ));
+                }
+                let (screen, transcript_count, in_composer) = if submission.harness == "muse" {
+                    self.client.verify_custom_harness_with_runtime(
+                        pane_id,
+                        &self.record.launch.harness,
+                        self.record.custom_process_identity.as_ref(),
+                        &bounded,
+                    )?;
+                    let screen = self.client.read_with_runtime(
+                        pane_id,
+                        "recent-unwrapped",
+                        Some(200),
+                        &bounded,
+                    )?;
+                    let count =
+                        muse_verified_process_prompt_transcript_count(&screen, &submission.text);
+                    let retained =
+                        muse_verified_process_prompt_in_composer(&screen, &submission.text);
+                    (screen, count, retained)
+                } else {
+                    self.pane_info_with_runtime(pane_id, &bounded)?;
+                    let screen = self.client.read_with_runtime(
+                        pane_id,
+                        "recent-unwrapped",
+                        Some(5000),
+                        &bounded,
+                    )?;
+                    let count = claude_prompt_transcript_count(&screen, &submission.text);
+                    let retained = claude_prompt_is_exact_composer(&screen, &submission.text);
+                    (screen, count, retained)
+                };
+                if transcript_count > submission.prior_transcript_count && !in_composer {
+                    *self
+                        .custom_submission
+                        .lock()
+                        .expect("custom submission lock poisoned") = None;
+                    return Ok(());
+                }
+                if submission.harness == "claude"
+                    && !submission.prior_active
+                    && !in_composer
+                    && claude_active_screen(&screen)
                 {
                     *self
                         .custom_submission
@@ -2094,15 +3031,23 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                         .expect("custom submission lock poisoned") = None;
                     return Ok(());
                 }
-                if Instant::now() >= deadline {
-                    return Err(crate::error::AdapterError::unavailable(
-                        "Muse did not show a verified post-Enter screen transition",
-                    ));
+                if submission.harness == "muse"
+                    && !retried_enter
+                    && bounded.monotonic() >= retry_after
+                    && transcript_count == submission.prior_transcript_count
+                    && muse_verified_process_prompt_is_exact_composer(&screen, &submission.text)
+                {
+                    self.client.verify_custom_harness_with_runtime(
+                        pane_id,
+                        &self.record.launch.harness,
+                        self.record.custom_process_identity.as_ref(),
+                        &bounded,
+                    )?;
+                    self.client
+                        .send_keys_with_runtime(pane_id, "Enter", &bounded)?;
+                    retried_enter = true;
                 }
-                std::thread::sleep(
-                    Duration::from_millis(50)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
+                bounded.sleep(Duration::from_millis(50));
             }
         }
         let objective = self
@@ -2111,12 +3056,12 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .expect("goal operation lock poisoned")
             .clone()
             .filter(|_| status == "working");
-        let start = Instant::now();
+        let start = bounded.monotonic();
         let initial_error = match self.client.wait_agent_status_with_runtime(
             pane_id,
             status,
             timeout_ms.min(1000),
-            runtime,
+            &bounded,
         ) {
             Ok(()) => return Ok(()),
             Err(error) => error,
@@ -2124,28 +3069,31 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         // Herdr's wait subscription may be installed after the transition it
         // is waiting for. Reconcile the event failure against the exact owned
         // pane, without ever running the prompt operation a second time.
-        if self.pane_info_with_runtime(pane_id, runtime)?.status == status {
+        if self.pane_info_with_runtime(pane_id, &bounded)?.status == status {
             return Ok(());
         }
         if let Some(objective) = objective {
             let screen = self
                 .client
-                .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+                .read_with_runtime(pane_id, "visible", Some(200), &bounded)?;
             if goal_replacement_selected(&screen, &objective) {
                 self.client
-                    .send_keys_with_runtime(pane_id, "Enter", runtime)?;
+                    .send_keys_with_runtime(pane_id, "Enter", &bounded)?;
             }
         }
-        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match self.client.wait_agent_status_with_runtime(
-            pane_id,
-            status,
-            timeout_ms.saturating_sub(elapsed).max(1),
-            runtime,
-        ) {
+        let elapsed = u64::try_from(bounded.monotonic().saturating_sub(start).as_millis())
+            .unwrap_or(u64::MAX);
+        let remaining = timeout_ms.saturating_sub(elapsed);
+        if remaining == 0 || bounded.cancelled() {
+            return Err(initial_error);
+        }
+        match self
+            .client
+            .wait_agent_status_with_runtime(pane_id, status, remaining, &bounded)
+        {
             Ok(()) => Ok(()),
             Err(final_error) => {
-                if self.pane_info_with_runtime(pane_id, runtime)?.status == status {
+                if self.pane_info_with_runtime(pane_id, &bounded)?.status == status {
                     Ok(())
                 } else {
                     Err(crate::error::AdapterError::unavailable(format!(
@@ -2674,7 +3622,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let path = pinned.path.join("agent.json");
         let content = self.record_bytes(pinned)?;
-        let document: Value = serde_json::from_slice(&content).map_err(|error| {
+        let document: Value = agent::decode_json_strict(&content).map_err(|error| {
             fail(format!(
                 "cannot inspect legacy agent record {}: {error}",
                 path.display()
@@ -2714,7 +3662,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<ManagedRecordSnapshot> {
         let path = pinned.path.join("agent.json");
         let content = self.record_bytes(pinned)?;
-        let document: Value = serde_json::from_slice(&content)
+        let document: Value = agent::decode_json_strict(&content)
             .map_err(|error| fail(format!("invalid agent record {}: {error}", path.display())))?;
         let record = AgentRecord::from_storage_value(document, &path, &pinned.name)?;
         if record.token != expected_token {
@@ -2732,10 +3680,65 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn save(&self, record: &AgentRecord) -> Result<()> {
-        agent::atomic_json(
-            &self.directory(&record.name)?.join("agent.json"),
-            &record.storage_value()?,
-        )
+        let document = record.storage_value()?;
+        let encoded = serde_json::to_vec_pretty(&document)
+            .map_err(|error| fail(format!("cannot encode agent record: {error}")))?;
+        if encoded.len().saturating_add(1) > MAX_AGENT_RECORD_BYTES {
+            return Err(fail(format!(
+                "agent record exceeds {MAX_AGENT_RECORD_BYTES} bytes"
+            )));
+        }
+        self.migrate_legacy_goal_messages(record)?;
+        agent::atomic_json(&self.directory(&record.name)?.join("agent.json"), &document)
+    }
+
+    fn migrate_legacy_goal_messages(&self, record: &AgentRecord) -> Result<()> {
+        if record.legacy_goal_messages.is_empty() {
+            return Ok(());
+        }
+        let queue = self.queue(&record.name)?;
+        if fs::symlink_metadata(&queue).is_err() {
+            return Err(fail("legacy goal migration requires its durable queue"));
+        }
+        let lock_path = queue.join(".delivery.lock");
+        let lock = agent::open_private_lock(&lock_path, "queue delivery lock")?;
+        lock.try_lock_exclusive().map_err(|error| {
+            fail(format!(
+                "legacy goal migration is busy with queue delivery; retry: {error}"
+            ))
+        })?;
+        for (identifier, objective) in &record.legacy_goal_messages {
+            let Some(state) = agent::message_state(&queue, identifier)? else {
+                return Err(fail(format!(
+                    "legacy goal artifact {identifier:?} is missing; refusing to discard its confirmation authority"
+                )));
+            };
+            let folder = match state {
+                agent::QueueMessageState::Pending => "inbox",
+                agent::QueueMessageState::Inflight => "inflight",
+                agent::QueueMessageState::Processed => "processed",
+                agent::QueueMessageState::Failed => "failed",
+            };
+            let path = queue.join(folder).join(format!("{identifier}.json"));
+            let mut document = agent::read_private_json(&path)?;
+            let expected_text = goal_prompt(&record.launch.harness, objective);
+            let valid = document.get("id").and_then(Value::as_str) == Some(identifier)
+                && document.get("text").and_then(Value::as_str) == Some(expected_text.as_str())
+                && matches!(
+                    document.get("kind").and_then(Value::as_str),
+                    None | Some("goal")
+                );
+            if !valid {
+                return Err(fail(format!(
+                    "legacy goal artifact {identifier:?} disagrees with its session record"
+                )));
+            }
+            if document.get("kind").is_none() {
+                document["kind"] = json!("goal");
+                agent::atomic_json(&path, &document)?;
+            }
+        }
+        Ok(())
     }
 
     fn queue(&self, agent_name: &str) -> Result<PathBuf> {
@@ -2764,9 +3767,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 continue;
             }
             let other = self.load(&existing_name)?;
-            if other.session_agent.as_deref().unwrap_or(&other.harness) == session_agent
-                && (other.session_value.as_deref() == Some(session_value)
-                    || other.goal_session_id.as_deref() == Some(session_value))
+            if other
+                .session_agent
+                .as_deref()
+                .unwrap_or(&other.launch.harness)
+                == session_agent
+                && other.session_value.as_deref() == Some(session_value)
             {
                 return Ok(Some(other));
             }
@@ -2854,57 +3860,58 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
         let mut record = AgentRecord {
-            adapter: if options.harness == "muse" {
-                "herdr-pane".to_owned()
-            } else {
-                herdr_adapter()
+            launch: LaunchSpec {
+                schema: LAUNCH_SPEC_SCHEMA.to_owned(),
+                harness: options.harness.clone(),
+                cwd: cwd.display().to_string(),
+                adapter: if options.harness == "muse" {
+                    "herdr-pane".to_owned()
+                } else {
+                    herdr_adapter()
+                },
+                mode: interactive_mode(),
+                backend: herdr_adapter(),
+                model: options.model.clone(),
+                resume: options.resume.clone(),
+                profile: options.launch_profile.clone(),
+                argv: std::iter::once(options.harness.clone())
+                    .chain(arguments.iter().cloned())
+                    .collect(),
+                environment_names: options
+                    .environment
+                    .iter()
+                    .filter_map(|entry| entry.split_once('=').map(|(name, _)| name.to_owned()))
+                    .collect(),
+                runtime_home: None,
+                runtime_ownership: "owned".to_owned(),
+                executable: None,
+                permission_mode: None,
             },
-            mode: interactive_mode(),
-            backend: herdr_adapter(),
             paused: false,
-            runtime_home: None,
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
             foreign_shell_identity: None,
-            launch_profile: options.launch_profile.clone(),
-            launch_executable: None,
-            launch_executable_device: None,
-            launch_executable_inode: None,
-            launch_argv: std::iter::once(options.harness.clone())
-                .chain(arguments.iter().cloned())
-                .collect(),
-            launch_environment_names: options
-                .environment
-                .iter()
-                .filter_map(|entry| entry.split_once('=').map(|(name, _)| name.to_owned()))
-                .collect(),
-            runtime_ownership: Some("owned".to_owned()),
-            runner_pid: None,
-            runner_started_at: None,
             runner_identity: None,
+            legacy_runner_pid: None,
+            legacy_runner_started_at: None,
+            legacy_goal_delivery: None,
+            legacy_goal_messages: BTreeMap::new(),
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
-            harness: options.harness.clone(),
-            cwd: cwd.display().to_string(),
             created_at: now.as_secs_f64(),
-            schema: 1,
             lifecycle: "starting".to_owned(),
             workspace_id: None,
             tab_id: None,
             pane_id: None,
             session_agent: None,
             session_value: None,
-            model: options.model.clone(),
-            resume: options.resume.clone(),
+            session_source: None,
             startup_warning: None,
             effective_reasoning_effort: None,
             error: None,
             goal: None,
-            goal_delivery: None,
-            goal_session_id: None,
             goal_command: None,
-            goal_messages: BTreeMap::new(),
             goal_message_id: None,
         };
         self.save(&record)?;
@@ -2944,15 +3951,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         if record.lifecycle != "launch_failed"
-            || record.adapter != "herdr-pane"
-            || record.harness != "muse"
-            || record.mode != "interactive"
-            || record.backend != "herdr"
-            || record.runtime_ownership.as_deref() != Some("owned")
+            || record.launch.adapter != "herdr-pane"
+            || record.launch.harness != "muse"
+            || record.launch.mode != "interactive"
+            || record.launch.backend != "herdr"
+            || record.launch.runtime_ownership != "owned"
             || record.pane_id.is_none()
             || record.tab_id.is_none()
             || record.workspace_id.is_none()
-            || record.launch_argv.is_empty()
+            || record.launch.argv.is_empty()
             || record.session_agent.is_some()
             || record.session_value.is_some()
         {
@@ -2978,21 +3985,26 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let info = self.client.pane_info(&pane_id)?;
         let cwd_matches = fs::canonicalize(&info.cwd)
             .ok()
-            .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+            .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.launch.cwd).ok());
         if info.pane_id != pane_id
             || Some(&info.workspace_id) != record.workspace_id.as_ref()
             || !cwd_matches
             || info
                 .agent
                 .as_deref()
-                .is_some_and(|agent| agent != record.harness)
+                .is_some_and(|agent| agent != record.launch.harness)
         {
             return Err(fail(
                 "refusing start recovery: live pane identity or agent report changed",
             ));
         }
-        let mut launch_device = record.launch_executable_device;
-        let mut launch_inode = record.launch_executable_inode;
+        let (mut launch_device, mut launch_inode) = record
+            .launch
+            .executable
+            .as_ref()
+            .map_or((None, None), |value| {
+                (Some(value.device), Some(value.inode))
+            });
         if let Some(persisted) = record.custom_process_identity.as_ref() {
             let recorded_image = (persisted.executable_device, persisted.executable_inode);
             if launch_device
@@ -3014,7 +4026,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         })?;
         let identity = self.client.recover_pane_agent(
             &pane_id,
-            &record.launch_argv,
+            &record.launch.argv,
             launch_device,
             launch_inode,
             expected_pid,
@@ -3037,7 +4049,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     "start recovery found the exact Muse process but no verified idle composer",
                 ));
             }
-            let harness = record.harness.clone();
+            let harness = record.launch.harness.clone();
             let mut commit = || -> crate::error::Result<()> {
                 // Custom process identity is the durable authority. Herdr's
                 // native agent label remains advisory and need not be
@@ -3185,10 +4197,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
             let other = self.load(&existing_name)?;
             let same_session = info.session_value.is_some()
-                && other.session_agent.as_deref().unwrap_or(&other.harness)
+                && other
+                    .session_agent
+                    .as_deref()
+                    .unwrap_or(&other.launch.harness)
                     == info.session_agent.as_deref().unwrap_or("")
-                && (other.session_value == info.session_value
-                    || other.goal_session_id == info.session_value);
+                && other.session_value == info.session_value;
             if other.pane_id.as_ref() == Some(&info.pane_id) || same_session {
                 return Err(fail(format!(
                     "pane {:?} is already registered as {:?}",
@@ -3246,47 +4260,48 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
         let mut record = AgentRecord {
-            adapter: "herdr-foreign".to_owned(),
-            mode: interactive_mode(),
-            backend: herdr_adapter(),
+            launch: LaunchSpec {
+                schema: LAUNCH_SPEC_SCHEMA.to_owned(),
+                harness: options.harness,
+                cwd: cwd.display().to_string(),
+                adapter: "herdr-foreign".to_owned(),
+                mode: interactive_mode(),
+                backend: herdr_adapter(),
+                model: None,
+                resume: None,
+                profile: None,
+                argv: Vec::new(),
+                environment_names: Vec::new(),
+                runtime_home: None,
+                runtime_ownership: "foreign".to_owned(),
+                executable: None,
+                permission_mode: None,
+            },
             paused: false,
-            runtime_home: None,
             pane_reported_by_agentctl: false,
             custom_process_identity: None,
             foreign_shell_identity: Some(shell_identity.clone()),
-            launch_profile: None,
-            launch_executable: None,
-            launch_executable_device: None,
-            launch_executable_inode: None,
-            launch_argv: Vec::new(),
-            launch_environment_names: Vec::new(),
-            runtime_ownership: Some("foreign".to_owned()),
-            runner_pid: None,
-            runner_started_at: None,
             runner_identity: None,
+            legacy_runner_pid: None,
+            legacy_runner_started_at: None,
+            legacy_goal_delivery: None,
+            legacy_goal_messages: BTreeMap::new(),
             extra: BTreeMap::new(),
             name: agent_name.to_owned(),
             token: format!("{}-{}", now.as_nanos(), std::process::id()),
-            harness: options.harness,
-            cwd: cwd.display().to_string(),
             created_at: now.as_secs_f64(),
-            schema: 1,
             lifecycle: "running".to_owned(),
             workspace_id: Some(info.workspace_id),
             tab_id: Some(presentation.tab_id.clone()),
             pane_id: Some(info.pane_id),
-            session_agent: info.session_agent,
-            session_value: info.session_value,
-            model: None,
-            resume: None,
+            session_agent: info.session_agent.clone(),
+            session_value: info.session_value.clone(),
+            session_source: info.session_value.as_ref().map(|_| "observed".to_owned()),
             startup_warning: None,
             effective_reasoning_effort: None,
             error: None,
             goal: None,
-            goal_delivery: None,
-            goal_session_id: None,
             goal_command: None,
-            goal_messages: BTreeMap::new(),
             goal_message_id: None,
         };
         self.save(&record)?;
@@ -3352,9 +4367,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     fn launch(&self, record: &mut AgentRecord, options: &StartOptions) -> Result<()> {
         self.create_presentation(record, options)?;
         let pane_id = record.pane_id.clone().expect("new tab has pane");
-        if record.adapter == "herdr-pane" {
+        if record.launch.adapter == "herdr-pane" {
             let agent_name = record.name.clone();
-            let harness = record.harness.clone();
+            let harness = record.launch.harness.clone();
             let arguments = record.arguments().to_vec();
             self.client.start_pane_agent(
                 &agent_name,
@@ -3370,10 +4385,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                             inode,
                             argv,
                         } => {
-                            record.launch_executable = Some(executable.display().to_string());
-                            record.launch_executable_device = Some(device);
-                            record.launch_executable_inode = Some(inode);
-                            record.launch_argv = argv;
+                            record.launch.executable = Some(LaunchExecutable {
+                                path: executable.display().to_string(),
+                                device,
+                                inode,
+                            });
+                            record.launch.argv = argv;
                         }
                         CustomLaunchObservation::Process(identity) => {
                             record.custom_process_identity = Some(identity);
@@ -3394,7 +4411,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         } else {
             self.client.start_agent(
                 &record.name,
-                &record.harness,
+                &record.launch.harness,
                 &pane_id,
                 record.arguments(),
                 options.startup_timeout,
@@ -3408,11 +4425,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: true,
+                adopted_evidence: Mutex::new(None),
             },
             &record.target()?,
         )?;
         record.session_agent = info.session_agent;
         record.session_value = info.session_value;
+        record.session_source = record.session_value.as_ref().map(|_| "observed".to_owned());
         let owner = match (&record.session_agent, &record.session_value) {
             (Some(session_agent), Some(session_value)) => {
                 self.identity_owner(session_agent, session_value, Some(&record.name))?
@@ -3425,6 +4444,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 Ok(()) => {
                     record.session_agent = None;
                     record.session_value = None;
+                    record.session_source = None;
                     return Err(fail(format!(
                         "native session is already registered as {:?}; closed the conflicting new pane",
                         owner.name
@@ -3433,6 +4453,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 Err(error) => {
                     record.session_agent = None;
                     record.session_value = None;
+                    record.session_source = None;
                     return Err(fail(format!(
                         "native session is already registered as {:?}; could not close the conflicting new pane: {error}",
                         owner.name
@@ -3444,6 +4465,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             if let Err(error) = agent::resolve_target(self.client, &record.target()?) {
                 record.session_agent = None;
                 record.session_value = None;
+                record.session_source = None;
                 return Err(fail(format!(
                     "started native session is not globally unique; the failed owned pane remains available for stop: {error}"
                 )));
@@ -3458,6 +4480,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             Err(error) => {
                 record.session_agent = None;
                 record.session_value = None;
+                record.session_source = None;
                 return Err(error);
             }
         };
@@ -3466,6 +4489,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         {
             record.session_agent = None;
             record.session_value = None;
+            record.session_source = None;
             return Err(fail(
                 "started agent native session changed during identity commit",
             ));
@@ -3525,7 +4549,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 let (tab, pane) = self.client.create_tab_with_pane(
                     &workspace,
                     &record.name,
-                    &record.cwd,
+                    &record.launch.cwd,
                     &options.environment,
                 )?;
                 record.tab_id = Some(tab);
@@ -3537,9 +4561,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 if !may_create_shared_default {
                     return Err(fail(format!("workspace label {label:?} does not exist")));
                 }
-                let (workspace, tab, pane) =
-                    self.client
-                        .create_workspace(label, &record.cwd, &options.environment)?;
+                let (workspace, tab, pane) = self.client.create_workspace(
+                    label,
+                    &record.launch.cwd,
+                    &options.environment,
+                )?;
                 record.workspace_id = Some(workspace);
                 record.tab_id = Some(tab.clone());
                 record.pane_id = Some(pane);
@@ -3559,6 +4585,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: false,
+                adopted_evidence: Mutex::new(None),
             },
             &record.target()?,
         )
@@ -3569,83 +4596,32 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent_name: &str,
         record: &AgentRecord,
     ) -> Result<(bool, AgentPaneInfo, Pane)> {
-        let pane_id = record
-            .pane_id
-            .as_deref()
-            .ok_or_else(|| fail("adopted agent record has no pane identity"))?;
-        let mut presentations: Vec<Pane> = self
-            .client
-            .panes()?
-            .into_iter()
-            .filter(|pane| pane.pane_id == pane_id)
-            .collect();
-        if presentations.len() != 1 {
+        let client = WorkspaceClient {
+            client: self.client,
+            record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: None,
+            check_prompt: false,
+            adopted_evidence: Mutex::new(None),
+        };
+        let evidence = client.adopted_evidence_with_runtime(&agent::SystemRuntime::default(), true);
+        if !matches!(
+            evidence.state,
+            AdoptedRuntimeState::LiveExact | AdoptedRuntimeState::IdleShellExact
+        ) {
             return Err(fail(format!(
-                "refusing to unregister adopted agent {agent_name:?}: expected one recorded pane, found {}",
-                presentations.len()
+                "refusing to unregister adopted agent {agent_name:?}: {}",
+                evidence.reason
             )));
         }
-        let presentation = presentations.pop().expect("one presentation was checked");
-        if record.workspace_id.as_deref() != Some(presentation.workspace_id.as_str()) {
-            return Err(fail(format!(
-                "refusing to unregister adopted agent {agent_name:?}: recorded presentation workspace changed"
-            )));
-        }
-        let info = self.client.pane_info(&presentation.pane_id)?;
-        let cwd_matches = info.cwd == record.cwd
-            || fs::canonicalize(&info.cwd)
-                .ok()
-                .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
-        if info.pane_id != presentation.pane_id
-            || Some(&info.workspace_id) != record.workspace_id.as_ref()
-            || !cwd_matches
-        {
-            return Err(fail(format!(
-                "refusing to unregister adopted agent {agent_name:?}: recorded pane, workspace, or cwd changed"
-            )));
-        }
-        let shell_identity = record.foreign_shell_identity.as_ref().ok_or_else(|| {
-            fail(format!(
-                "refusing to unregister adopted agent {agent_name:?}: legacy record has no identity-bound pane shell"
-            ))
-        })?;
-        self.client
-            .verify_pane_shell_identity(&info.pane_id, shell_identity)
-            .map_err(|_| {
-                fail(format!(
-                    "refusing to unregister adopted agent {agent_name:?}: recorded pane shell generation changed"
-                ))
-            })?;
-        if info.agent.is_none() {
-            // A live agent is pinned by its harness and, when one was
-            // reported, native session. A returned shell has no such process
-            // identity, so its recorded tab remains part of the fallback
-            // proof. This still lets an operator unregister a fully
-            // revalidated live agent after moving its pane between tabs in the
-            // same workspace.
-            if record.tab_id.as_deref() != Some(presentation.tab_id.as_str()) {
-                return Err(fail(format!(
-                    "refusing to unregister adopted agent {agent_name:?}: recorded tab changed while the agent was absent"
-                )));
-            }
-            if info.session_agent.is_some() || info.session_value.is_some() {
-                return Err(fail(format!(
-                    "refusing pane {}: absent agent has native session identity",
-                    info.pane_id
-                )));
-            }
-            if !self
-                .client
-                .pane_is_same_idle_shell(&info.pane_id, shell_identity)?
-            {
-                return Err(fail(format!(
-                    "refusing pane {}: absent agent is not at the recorded identity-bound idle shell process group",
-                    info.pane_id
-                )));
-            }
-            return Ok((false, info, presentation));
-        }
-        Ok((true, self.checked(record)?, presentation))
+        Ok((
+            evidence.state == AdoptedRuntimeState::LiveExact,
+            evidence.info.expect("accepted evidence has pane info"),
+            evidence
+                .presentation
+                .expect("accepted evidence has presentation"),
+        ))
     }
 
     /// Report live state or an explicit probe error without reaping durable records.
@@ -3674,6 +4650,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: false,
+                adopted_evidence: Mutex::new(None),
             },
             &record.target()?,
             runtime,
@@ -3691,6 +4668,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<Value> {
         let agent_name = &record.name;
         let mut result = record.public_value();
+        result["capabilities"] = json!(record.capabilities());
         result["queue"] = json!(self.queue(agent_name)?);
         result["output"] = json!(self.directory(agent_name)?.join("output.json"));
         result["goal_source"] = if record.goal.is_some() {
@@ -3698,8 +4676,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         } else {
             Value::Null
         };
-        result["goal_delivery"] = json!(self.goal_delivery(record));
-        if record.adapter == "turn-runner" {
+        result["goal_delivery"] = json!(self.goal_delivery(record)?);
+        if record.launch.adapter == "turn-runner" {
             result["agent_status"] = json!("unknown");
             result["probe_error"] = json!(
                 "turn-runner liveness requires the worker extension; this edition made no death claim"
@@ -3714,11 +4692,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_submission: Mutex::new(None),
             queue: None,
             check_prompt: false,
+            adopted_evidence: Mutex::new(None),
         };
         let probe = record.target().and_then(|target| {
-            agent::resolve_target_with_runtime(&client, &target, runtime).and_then(|_| {
-                agent::status_with_runtime(&client, &target, &self.queue(agent_name)?, runtime)
-            })
+            agent::status_with_runtime(&client, &target, &self.queue(agent_name)?, runtime)
         });
         match probe {
             Ok(status) => {
@@ -3733,6 +4710,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 result["probe_error"] = json!(error.to_string());
             }
         }
+        if record.launch.adapter == "herdr-foreign" {
+            let cached = {
+                client
+                    .adopted_evidence
+                    .lock()
+                    .expect("adopted evidence lock poisoned")
+                    .clone()
+            };
+            let evidence =
+                cached.unwrap_or_else(|| client.adopted_evidence_with_runtime(runtime, false));
+            result["runtime_evidence"] = evidence.public_value();
+        }
         Ok(result)
     }
 
@@ -3742,7 +4731,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         status: &Value,
         runtime: &dyn agent::AgentRuntime,
     ) -> (String, String, String) {
-        if record.adapter == "turn-runner" {
+        if record.launch.adapter == "turn-runner" {
             return (
                 "unknown".to_owned(),
                 "runtime-observer-unavailable".to_owned(),
@@ -3759,6 +4748,39 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     record.lifecycle
                 ),
             );
+        }
+        if record.launch.adapter == "herdr-foreign" {
+            let evidence = status.get("runtime_evidence");
+            let state = evidence
+                .and_then(|value| value.get("state"))
+                .and_then(Value::as_str);
+            let code = evidence
+                .and_then(|value| value.get("reason_code"))
+                .and_then(Value::as_str)
+                .unwrap_or("runtime-probe-failed");
+            let detail = evidence
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("adopted-runtime probe produced no typed evidence");
+            return match state {
+                Some("live-exact") if status["probe_error"].is_null() => {
+                    ("healthy".to_owned(), "ok".to_owned(), detail.to_owned())
+                }
+                Some("live-exact") => (
+                    "unknown".to_owned(),
+                    "runtime-probe-failed".to_owned(),
+                    status["probe_error"].as_str().unwrap_or(detail).to_owned(),
+                ),
+                Some("unknown") => ("unknown".to_owned(), code.to_owned(), detail.to_owned()),
+                Some("idle-shell-exact" | "missing" | "ambiguous" | "identity-mismatch") => {
+                    ("unhealthy".to_owned(), code.to_owned(), detail.to_owned())
+                }
+                _ => (
+                    "unknown".to_owned(),
+                    "runtime-probe-failed".to_owned(),
+                    "adopted-runtime probe produced malformed typed evidence".to_owned(),
+                ),
+            };
         }
         let Some(reason) = status.get("probe_error").and_then(Value::as_str) else {
             return (
@@ -3819,7 +4841,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         });
         let cwd_matches = fs::canonicalize(&info.cwd)
             .ok()
-            .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+            .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.launch.cwd).ok());
         if Some(&presentation.workspace_id) != record.workspace_id.as_ref()
             || Some(&presentation.tab_id) != record.tab_id.as_ref()
             || info.pane_id != pane_id
@@ -3834,13 +4856,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 reason,
             );
         }
-        if record.adapter == "herdr-pane" {
+        if record.launch.adapter == "herdr-pane" {
             if record.custom_process_identity.is_some()
                 && self
                     .client
                     .verify_custom_harness_with_runtime(
                         pane_id,
-                        &record.harness,
+                        &record.launch.harness,
                         record.custom_process_identity.as_ref(),
                         runtime,
                     )
@@ -3875,7 +4897,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     "expected-harness-missing".to_owned(),
                     format!(
                         "pane '{pane_id}' has no live exact '{}' process and is at a stable idle shell (reported agent {reported}); status probe: {reason}",
-                        record.harness
+                        record.launch.harness
                     ),
                 );
             }
@@ -3885,22 +4907,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 reason,
             );
         }
-        if info.agent.as_deref() != Some(record.harness.as_str()) {
+        if info.agent.as_deref() != Some(record.launch.harness.as_str()) {
             if info.agent.is_none() {
-                let shell_fallback = if record.adapter == "herdr-foreign" {
-                    match record.foreign_shell_identity.as_ref() {
-                        Some(identity) => self
-                            .client
-                            .pane_is_same_idle_shell_with_runtime(pane_id, identity, runtime)
-                            .ok(),
-                        None => None,
-                    }
-                } else {
-                    self.client
-                        .pane_idle_shell_identity_with_runtime(pane_id, runtime)
-                        .ok()
-                        .map(|proof| proof.is_some())
-                };
+                let shell_fallback = self
+                    .client
+                    .pane_idle_shell_identity_with_runtime(pane_id, runtime)
+                    .ok()
+                    .map(|proof| proof.is_some());
                 if shell_fallback != Some(true) {
                     return (
                         "unknown".to_owned(),
@@ -3918,7 +4931,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "expected-harness-missing".to_owned(),
                 format!(
                     "pane '{pane_id}' reports agent {reported}, expected '{}'; status probe: {reason}",
-                    record.harness
+                    record.launch.harness
                 ),
             );
         }
@@ -3939,7 +4952,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<Value> {
         let path = self.directory(&record.name)?.join("health.json");
         let previous = if path.exists() {
-            agent::read_private_json(&path)
+            agent::read_private_json_bounded(&path, 64 << 10)
                 .ok()
                 .filter(|value| value["schema"] == HEALTH_SCHEMA)
                 .unwrap_or_else(|| json!({}))
@@ -4336,6 +5349,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
         record.input_allowed()?;
+        if !record.legacy_goal_messages.is_empty() {
+            self.save(&record)?;
+        }
         let queue = self.queue(&record.name)?;
         let client = WorkspaceClient {
             client: self.client,
@@ -4344,6 +5360,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
+            adopted_evidence: Mutex::new(None),
         };
         agent::send_identified_with_runtime(
             &client,
@@ -4388,6 +5405,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         message_id: Option<&str>,
     ) -> Result<QueueResult> {
         record.input_allowed()?;
+        if !record.legacy_goal_messages.is_empty() {
+            self.save(record)?;
+        }
         let queue = self.queue(&record.name)?;
         let client = WorkspaceClient {
             client: self.client,
@@ -4396,6 +5416,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
+            adopted_evidence: Mutex::new(None),
         };
         match message_id {
             Some(identifier) => agent::send_identified(
@@ -4462,6 +5483,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         candidate.tab_id = Some(pane.tab_id.clone());
         candidate.pane_id = Some(pane.pane_id.clone());
         self.checked(&candidate)?;
+        agent::relocate_existing_binding(
+            &self.queue(&record.name)?,
+            &record.target()?,
+            &candidate.target()?,
+        )?;
         self.save(&candidate)?;
         let persisted = self.load(&record.name)?;
         if persisted.token != record.token
@@ -4472,6 +5498,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             return Err(fail("relocation routing commit did not persist"));
         }
         self.checked(&persisted)?;
+        agent::validate_existing_binding(&self.queue(&record.name)?, &persisted.target()?)?;
         let current = self
             .client
             .panes()?
@@ -4522,8 +5549,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
         if record.lifecycle != "running"
-            || record.mode != "interactive"
-            || record.backend != "herdr"
+            || record.launch.mode != "interactive"
+            || record.launch.backend != "herdr"
             || record.workspace_id.is_none()
             || record.tab_id.is_none()
             || record.pane_id.is_none()
@@ -4626,9 +5653,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 return Err(fail("source pane routing changed before relocation"));
             }
             pane = fresh[0].clone();
-            let moved =
-                self.client
-                    .move_pane_to_new_tab(&pane.pane_id, &target_workspace, &record.name)?;
+            let moved = self.client.move_pane_to_new_tab(
+                &pane.pane_id,
+                &journal.terminal_id,
+                &target_workspace,
+                &record.name,
+            )?;
             if (
                 moved.previous_pane_id,
                 moved.previous_tab_id,
@@ -4665,6 +5695,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
         record.input_allowed()?;
+        if !record.legacy_goal_messages.is_empty() {
+            self.save(&record)?;
+        }
         agent::drain(
             &WorkspaceClient {
                 client: self.client,
@@ -4673,6 +5706,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: Some(&self.queue(agent_name)?),
                 check_prompt: true,
+                adopted_evidence: Mutex::new(None),
             },
             &record.target()?,
             &self.queue(agent_name)?,
@@ -4690,7 +5724,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
         record.supported()?;
-        if record.adapter != "herdr-pane" || record.harness != "muse" {
+        if record.launch.adapter != "herdr-pane" || record.launch.harness != "muse" {
             return Err(fail(
                 "delivery reconciliation currently requires an owned interactive Muse pane",
             ));
@@ -4703,6 +5737,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
+            adopted_evidence: Mutex::new(None),
         };
         let target = record.target()?;
         if fs::symlink_metadata(queue.join("target.json")).is_err() {
@@ -4731,6 +5766,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _lock = self.lock_with_runtime(agent_name, runtime)?;
         let record = self.load(agent_name)?;
         record.input_allowed()?;
+        if !record.legacy_goal_messages.is_empty() {
+            self.save(&record)?;
+        }
         let queue = self.queue(&record.name)?;
         agent::drain_with_runtime(
             &WorkspaceClient {
@@ -4740,6 +5778,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: Some(&queue),
                 check_prompt: true,
+                adopted_evidence: Mutex::new(None),
             },
             &record.target()?,
             &queue,
@@ -4787,6 +5826,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 custom_submission: Mutex::new(None),
                 queue: None,
                 check_prompt: false,
+                adopted_evidence: Mutex::new(None),
             },
             &target,
             runtime,
@@ -4816,7 +5856,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 )));
             }
             let info = self.checked(&record)?;
-            if matches!(info.status.as_str(), "idle" | "done") {
+            if matches!(info.status.as_str(), "idle" | "done" | "staged") {
                 return self.status_record(&record);
             }
             if !matches!(info.status.as_str(), "working" | "starting" | "unknown") {
@@ -4862,19 +5902,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let _identity_lock = self.identity_lock()?;
         let mut record = self.load(agent_name)?;
         let info = self.checked(&record)?;
-        for existing in [
-            &record.goal_session_id,
-            &record.session_value,
-            &info.session_value,
-        ]
-        .into_iter()
-        .flatten()
+        for existing in [&record.session_value, &info.session_value]
+            .into_iter()
+            .flatten()
         {
             if existing != session_id {
                 return Err(fail("refusing to replace an already bound native session"));
             }
         }
-        if let Some(owner) = self.identity_owner(&record.harness, session_id, Some(agent_name))? {
+        if let Some(owner) =
+            self.identity_owner(&record.launch.harness, session_id, Some(agent_name))?
+        {
             return Err(fail(format!(
                 "native session is already registered as {:?}",
                 owner.name
@@ -4883,7 +5921,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut reported = Vec::new();
         for pane in self.client.panes()? {
             let live = self.client.pane_info(&pane.pane_id)?;
-            if live.session_agent.as_deref() == Some(&record.harness)
+            if live.session_agent.as_deref() == Some(&record.launch.harness)
                 && live.session_value.as_deref() == Some(session_id)
             {
                 reported.push(pane.pane_id);
@@ -4898,7 +5936,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         // Session metadata is optional in Herdr. This is an explicit caller
         // assertion anchored to the independently verified live name and pane.
-        record.goal_session_id = Some(session_id.to_owned());
+        record.session_agent = Some(record.launch.harness.clone());
+        record.session_value = Some(session_id.to_owned());
+        record.session_source = Some(
+            if info.session_agent.as_deref() == Some(&record.launch.harness)
+                && info.session_value.as_deref() == Some(session_id)
+            {
+                "observed"
+            } else {
+                "asserted"
+            }
+            .to_owned(),
+        );
         if let Some(command) = goal_command {
             record.goal_command = Some(command.to_vec());
         }
@@ -4906,39 +5955,67 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(json!({"name":agent_name,"session_id":session_id,"source":"explicit"}))
     }
 
-    fn goal_delivery(&self, record: &AgentRecord) -> Option<String> {
-        if let (Some(identifier), Ok(queue)) = (&record.goal_message_id, self.queue(&record.name)) {
-            for (folder, outcome) in [
-                ("processed", "delivered"),
-                ("failed", "possibly_submitted"),
-                ("inflight", "possibly_submitted"),
-                ("inbox", "pending"),
-            ] {
-                if fs::symlink_metadata(queue.join(folder).join(format!("{identifier}.json")))
-                    .is_ok()
-                {
-                    return Some(outcome.to_owned());
-                }
+    fn goal_delivery(&self, record: &AgentRecord) -> Result<Option<String>> {
+        if let Some(identifier) = &record.goal_message_id {
+            let queue = self.queue(&record.name)?;
+            let state = agent::message_state(&queue, identifier)?.ok_or_else(|| {
+                fail(format!(
+                    "goal message {identifier:?} has no durable queue artifact"
+                ))
+            })?;
+            let folder = match state {
+                agent::QueueMessageState::Pending => "inbox",
+                agent::QueueMessageState::Inflight => "inflight",
+                agent::QueueMessageState::Processed => "processed",
+                agent::QueueMessageState::Failed => "failed",
+            };
+            let path = queue.join(folder).join(format!("{identifier}.json"));
+            let document = agent::read_private_json_bounded(&path, MAX_QUEUE_ARTIFACT_BYTES)?;
+            let objective = record.goal.as_deref().ok_or_else(|| {
+                fail(format!(
+                    "goal message {identifier:?} has no session objective"
+                ))
+            })?;
+            let legacy_match = record
+                .legacy_goal_messages
+                .get(identifier)
+                .is_some_and(|legacy| legacy == objective);
+            let expected_text = goal_prompt(&record.launch.harness, objective);
+            let kind_matches = document.get("kind").and_then(Value::as_str) == Some("goal")
+                || (document.get("kind").is_none() && legacy_match);
+            if document.get("id").and_then(Value::as_str) != Some(identifier)
+                || document.get("text").and_then(Value::as_str) != Some(expected_text.as_str())
+                || !kind_matches
+            {
+                return Err(fail(format!(
+                    "goal message {identifier:?} disagrees with its session record"
+                )));
             }
+            return Ok(Some(
+                match state {
+                    agent::QueueMessageState::Processed => "delivered",
+                    agent::QueueMessageState::Failed | agent::QueueMessageState::Inflight => {
+                        "possibly_submitted"
+                    }
+                    agent::QueueMessageState::Pending => "pending",
+                }
+                .to_owned(),
+            ));
         }
-        record.goal_delivery.clone()
+        // Decode-edge compatibility for rows written before session/v3.
+        Ok(record.legacy_goal_delivery.clone())
     }
 
-    fn goal_result(&self, record: &AgentRecord, command: Option<&[String]>) -> Value {
-        let mut result = json!({"name":record.name,"goal":record.goal,"delivery":self.goal_delivery(record),"source":"requested","native_status":"unverified"});
-        if record.harness != "codex" {
-            return result;
+    fn goal_result(&self, record: &AgentRecord, command: Option<&[String]>) -> Result<Value> {
+        let mut result = json!({"name":record.name,"goal":record.goal,"delivery":self.goal_delivery(record)?,"source":"requested","native_status":"unverified"});
+        if record.launch.harness != "codex" {
+            return Ok(result);
         }
-        let Some(session) = record
-            .goal_session_id
-            .as_deref()
-            .or(record.session_value.as_deref())
-            .filter(|s| !s.is_empty())
-        else {
+        let Some(session) = record.session_value.as_deref().filter(|s| !s.is_empty()) else {
             result["native_error"] = json!(
                 "native session unknown; bind-session with the session id reported by this agent"
             );
-            return result;
+            return Ok(result);
         };
         let default = [
             "codex".to_owned(),
@@ -4961,7 +6038,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
             Err(error) => result["native_error"] = json!(error),
         }
-        result
+        Ok(result)
     }
 
     /// Inspect a native Codex goal when bound, or submit a visible goal and wake its harness.
@@ -4975,7 +6052,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let Some(text) = text else {
             let record = self.load(agent_name)?;
             self.checked(&record)?;
-            return Ok(self.goal_result(&record, goal_command));
+            return self.goal_result(&record, goal_command);
         };
         if text.trim().is_empty() || text.contains(['\n', '\r']) {
             return Err(fail("goal must be a nonempty single line"));
@@ -4984,24 +6061,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut record = self.load(agent_name)?;
         record.input_allowed()?;
         record.goal = Some(text.to_owned());
-        record.goal_delivery = Some("pending".to_owned());
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?
             .as_nanos();
         let identifier = format!("{timestamp:020}-{}", std::process::id());
         record.goal_message_id = Some(identifier.clone());
-        if record.harness == "codex" {
-            record
-                .goal_messages
-                .insert(identifier.clone(), text.to_owned());
-        }
         self.save(&record)?;
-        let prompt = if record.harness == "codex" {
-            format!("/goal {text}")
-        } else {
-            format!("Your ongoing goal: {text}\nWork toward this goal and report completion or blockers.")
-        };
+        let prompt = goal_prompt(&record.launch.harness, text);
         let queue = self.queue(agent_name)?;
         let client = WorkspaceClient {
             client: self.client,
@@ -5010,8 +6077,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             custom_submission: Mutex::new(None),
             queue: Some(&queue),
             check_prompt: true,
+            adopted_evidence: Mutex::new(None),
         };
-        let outcome = agent::send_identified(
+        let outcome = agent::send_goal_identified(
             &client,
             &record.target()?,
             &queue,
@@ -5020,26 +6088,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             options,
         );
         match outcome {
-            Ok(delivered) => {
-                record.goal_delivery = Some(delivered.outcome.as_str().to_owned());
-                self.save(&record)?;
-                Ok(self.goal_result(&record, goal_command))
-            }
-            Err(error) => {
-                record.goal_delivery = Some(
-                    error
-                        .outcome()
-                        .map_or("failed", |outcome| outcome.as_str())
-                        .to_owned(),
-                );
-                self.save(&record)?;
-                Err(error)
-            }
+            Ok(_) => self.goal_result(&record, goal_command),
+            Err(error) => Err(error),
         }
     }
 
     fn checked_or_launch_failed(&self, record: &AgentRecord, pane: &str) -> Result<()> {
-        if record.adapter != "herdr-pane" {
+        if record.launch.adapter != "herdr-pane" {
             if record.lifecycle != "launch_failed" || self.client.pane_info(pane)?.agent.is_some() {
                 self.checked(record)?;
             }
@@ -5049,10 +6104,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             && record.custom_process_identity.is_some()
         {
             let info = self.client.pane_info(pane)?;
-            let cwd_matches = info.cwd == record.cwd
+            let cwd_matches = info.cwd == record.launch.cwd
                 || fs::canonicalize(&info.cwd)
                     .ok()
-                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.launch.cwd).ok());
             if info.pane_id == pane
                 && Some(&info.workspace_id) == record.workspace_id.as_ref()
                 && cwd_matches
@@ -5060,7 +6115,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                     .client
                     .verify_custom_harness(
                         pane,
-                        &record.harness,
+                        &record.launch.harness,
                         record.custom_process_identity.as_ref(),
                     )
                     .is_ok()
@@ -5070,14 +6125,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         if record.lifecycle == "launch_failed" && record.pane_reported_by_agentctl {
             let info = self.client.pane_info(pane)?;
-            let cwd_matches = info.cwd == record.cwd
+            let cwd_matches = info.cwd == record.launch.cwd
                 || fs::canonicalize(&info.cwd)
                     .ok()
-                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.launch.cwd).ok());
             if info.pane_id == pane
                 && Some(&info.workspace_id) == record.workspace_id.as_ref()
                 && cwd_matches
-                && info.agent.as_deref() == Some(&record.harness)
+                && info.agent.as_deref() == Some(&record.launch.harness)
                 && self.client.pane_is_idle_shell(pane)?
             {
                 return Ok(());
@@ -5143,10 +6198,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         let info = self.client.pane_info(pane_id)?;
-        let cwd_matches = info.cwd == record.cwd
+        let cwd_matches = info.cwd == record.launch.cwd
             || fs::canonicalize(&info.cwd)
                 .ok()
-                .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+                .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.launch.cwd).ok());
         if info.pane_id != pane_id || info.workspace_id != workspace_id || !cwd_matches {
             return Err(fail(format!(
                 "refusing to {operation} {:?}: recorded pane, workspace, or cwd changed",
@@ -5791,10 +6846,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         let record = &initial.record;
-        if record.adapter != "herdr-foreign"
+        if record.launch.adapter != "herdr-foreign"
             || record.lifecycle != "running"
-            || record.mode != "interactive"
-            || record.backend != "herdr"
+            || record.launch.mode != "interactive"
+            || record.launch.backend != "herdr"
             || record.foreign_shell_identity.is_some()
         {
             return Err(fail(
@@ -5913,10 +6968,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             )));
         }
         let record = &initial.record;
-        if record.adapter != "herdr"
+        if record.launch.adapter != "herdr"
             || record.lifecycle != "running"
-            || record.mode != "interactive"
-            || record.backend != "herdr"
+            || record.launch.mode != "interactive"
+            || record.launch.backend != "herdr"
         {
             return Err(fail(
                 "managed-dead retirement requires a running herdr record in interactive/herdr mode",
@@ -6105,7 +7160,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "--expected-record-sha256 requires --recover-legacy-adoption",
             ));
         }
-        if record.adapter == "herdr-foreign" {
+        if record.launch.adapter == "herdr-foreign" {
             let (live, info, presentation) = self.inspect_foreign(agent_name, &record)?;
             let text = self.bounded_terminal_text(&info.pane_id)?;
             // Output capture is another control round trip. Refuse archival if
@@ -6175,7 +7230,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }));
         }
         let panes = self.client.panes()?;
-        if record.adapter == "herdr"
+        if record.launch.adapter == "herdr"
             && matches!(record.lifecycle.as_str(), "running" | "stopping")
             && record.pane_id.is_some()
         {
@@ -6214,10 +7269,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             let info = self.client.pane_info(&owned[0].pane_id)?;
             if info.agent.is_none()
                 && Some(&info.workspace_id) == record.workspace_id.as_ref()
-                && (info.cwd == record.cwd
+                && (info.cwd == record.launch.cwd
                     || fs::canonicalize(&info.cwd)
                         .ok()
-                        .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok()))
+                        .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.launch.cwd).ok()))
             {
                 record.pane_id = Some(owned[0].pane_id.clone());
                 self.save(&record)?;
@@ -6231,7 +7286,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             {
                 return Err(fail("refusing to close a tab whose pane ownership changed"));
             }
-            if record.adapter == "herdr-pane"
+            if record.launch.adapter == "herdr-pane"
                 || record.lifecycle == "running"
                 || self.client.pane_info(&owned[0].pane_id)?.agent.is_some()
             {
@@ -6343,8 +7398,14 @@ mod tests {
                     wait_fails: AtomicBool::new(false),
                     working_after_run: AtomicBool::new(false),
                     custom_screen: Mutex::new(None),
+                    screen_after_run: Mutex::new(None),
+                    screen_after_enter: Mutex::new(None),
+                    ignore_first_enter: AtomicBool::new(false),
+                    sent_texts: Mutex::new(Vec::new()),
+                    sent_keys: Mutex::new(Vec::new()),
                     current_owned_pane: Mutex::new("owned".to_owned()),
                     move_count: AtomicU64::new(0),
+                    replace_terminal_before_move: AtomicBool::new(false),
                     fail_after_move: AtomicBool::new(false),
                     wrong_move_response: AtomicBool::new(false),
                     ambiguous_workspace: AtomicBool::new(false),
@@ -6491,8 +7552,14 @@ mod tests {
         wait_fails: AtomicBool,
         working_after_run: AtomicBool,
         custom_screen: Mutex<Option<String>>,
+        screen_after_run: Mutex<Option<String>>,
+        screen_after_enter: Mutex<Option<String>>,
+        ignore_first_enter: AtomicBool,
+        sent_texts: Mutex<Vec<String>>,
+        sent_keys: Mutex<Vec<String>>,
         current_owned_pane: Mutex<String>,
         move_count: AtomicU64,
+        replace_terminal_before_move: AtomicBool,
         fail_after_move: AtomicBool,
         wrong_move_response: AtomicBool,
         ambiguous_workspace: AtomicBool,
@@ -6645,6 +7712,9 @@ mod tests {
         }
         fn run(&self, _: &str, text: &str) -> AdapterResult<()> {
             self.runs.lock().unwrap().push(text.to_owned());
+            if let Some(screen) = self.screen_after_run.lock().unwrap().take() {
+                *self.custom_screen.lock().unwrap() = Some(screen);
+            }
             if self.working_after_run.load(Ordering::Relaxed) {
                 self.custom_native_working.store(true, Ordering::Relaxed);
             }
@@ -6796,16 +7866,32 @@ mod tests {
         fn move_pane_to_new_tab(
             &self,
             pane: &str,
+            expected_terminal: &str,
             workspace: &str,
             _: &str,
         ) -> AdapterResult<PaneMove> {
-            self.move_count.fetch_add(1, Ordering::Relaxed);
             let mut panes = self.panes.lock().unwrap();
+            if self
+                .replace_terminal_before_move
+                .swap(false, Ordering::Relaxed)
+            {
+                panes
+                    .iter_mut()
+                    .find(|item| item.pane_id == pane)
+                    .expect("replacement pane")
+                    .terminal_id = Some("replacement-terminal".to_owned());
+            }
             let old = panes
                 .iter()
                 .find(|item| item.pane_id == pane)
                 .cloned()
                 .ok_or_else(|| AdapterError::unavailable("missing pane"))?;
+            if old.terminal_id.as_deref() != Some(expected_terminal) {
+                return Err(AdapterError::unavailable(
+                    "conditional terminal identity changed",
+                ));
+            }
+            self.move_count.fetch_add(1, Ordering::Relaxed);
             let moved = Pane {
                 pane_id: format!("{workspace}:moved"),
                 tab_id: format!("{workspace}:tab"),
@@ -7016,7 +8102,21 @@ mod tests {
         fn report_agent_session(&self, _: &str, _: &str, _: &str, _: &str) -> AdapterResult<()> {
             Ok(())
         }
-        fn send_keys(&self, _: &str, _: &str) -> AdapterResult<()> {
+        fn send_text(&self, _: &str, text: &str) -> AdapterResult<()> {
+            self.sent_texts.lock().unwrap().push(text.to_owned());
+            Ok(())
+        }
+        fn send_keys(&self, _: &str, key: &str) -> AdapterResult<()> {
+            self.sent_keys.lock().unwrap().push(key.to_owned());
+            if matches!(key, "Enter" | "ctrl+x ctrl+s") {
+                if self.ignore_first_enter.swap(false, Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if let Some(screen) = self.screen_after_enter.lock().unwrap().take() {
+                    *self.custom_screen.lock().unwrap() = Some(screen);
+                }
+                self.custom_native_working.store(true, Ordering::Relaxed);
+            }
             Ok(())
         }
         fn close_tab(&self, _: &str) -> AdapterResult<()> {
@@ -7039,7 +8139,15 @@ mod tests {
     #[test]
     fn relocation_preserves_generation_and_pending_queue() {
         let fixture = Fixture::new();
+        fixture
+            .client
+            .report_session
+            .store(false, Ordering::Relaxed);
         let started = fixture.start(None);
+        fixture
+            .manager()
+            .send("worker", "before relocation", DrainOptions::default())
+            .unwrap();
         let queue = fixture.root.join("registry/worker/queue");
         let identifier = agent::enqueue(&queue, "retained prompt", Some("queued")).unwrap();
         let artifact = queue.join("inbox").join(format!("{identifier}.json"));
@@ -7056,6 +8164,17 @@ mod tests {
         assert_eq!(persisted.pane_id.as_deref(), Some("destination:moved"));
         assert_eq!(persisted.token, started["token"]);
         assert_eq!(fs::read(&artifact).unwrap(), before);
+        fixture
+            .manager()
+            .send("worker", "after relocation", DrainOptions::default())
+            .unwrap();
+        assert_eq!(fixture.client.runs.lock().unwrap()[0], "before relocation");
+        let mut after = fixture.client.runs.lock().unwrap()[1..].to_vec();
+        after.sort();
+        assert_eq!(after, ["after relocation", "retained prompt"]);
+        let binding = agent::read_private_json(&queue.join("target.json")).unwrap();
+        assert_eq!(binding["kind"], "pane");
+        assert_eq!(binding["pane_id"], "destination:moved");
         assert!(!fixture
             .root
             .join("registry/worker/relocation.json")
@@ -7191,6 +8310,34 @@ mod tests {
     }
 
     #[test]
+    fn relocation_conditional_move_refuses_terminal_replacement_in_final_gap() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        fixture
+            .client
+            .replace_terminal_before_move
+            .store(true, Ordering::Relaxed);
+
+        let error = fixture
+            .manager()
+            .relocate("worker", Some("destination"), None, true)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("conditional terminal identity changed"));
+        assert_eq!(fixture.client.move_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            fixture.manager().load("worker").unwrap().pane_id.as_deref(),
+            Some("owned")
+        );
+        assert!(fixture
+            .root
+            .join("registry/worker/relocation.json")
+            .is_file());
+    }
+
+    #[test]
     fn health_isolates_dead_and_malformed_records_and_persists_detection() {
         let fixture = Fixture::new();
         fixture.start(None);
@@ -7226,10 +8373,51 @@ mod tests {
             .contains("reports agent None, expected 'codex'"));
         assert_eq!(stale["health"], "unknown");
         assert_eq!(stale["recorded"], false);
+        let (rows, list_healthy) = fixture.manager().list_with_health();
+        let stale_row = rows
+            .iter()
+            .find(|row| row["name"] == "stale")
+            .expect("malformed row remains visible");
+        assert!(!list_healthy);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(stale_row["health"], "unknown");
+        assert!(stale_row["probe_error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid agent record"));
+        assert!(fixture.manager().status_with_health("stale").is_err());
         let durable =
             agent::read_private_json(&fixture.root.join("registry/worker/health.json")).unwrap();
         assert_eq!(durable["schema"], HEALTH_SCHEMA);
         assert_eq!(durable["last_unhealthy_reason"], dead["reason"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn list_quarantines_fifo_agent_record_without_blocking_other_rows() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let blocked = fixture.root.join("registry/blocked");
+        fs::create_dir(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        let fifo = blocked.join("agent.json");
+        let fifo_name = CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: fifo_name is a live NUL-terminated path and mkfifo does not
+        // retain the pointer after returning.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        let (rows, healthy) = fixture.manager().list_with_health();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!healthy);
+        assert_eq!(rows.len(), 2);
+        let blocked = rows
+            .iter()
+            .find(|row| row["name"] == "blocked")
+            .expect("FIFO row remains visible");
+        assert_eq!(blocked["health"], "unknown");
+        assert_eq!(blocked["health_reason_code"], "registry-or-health-error");
     }
 
     #[test]
@@ -7448,8 +8636,7 @@ mod tests {
         record["lifecycle"] = json!("launch_failed");
         record["custom_process_identity"] = Value::Null;
         record["pane_reported_by_agentctl"] = json!(false);
-        record["session_agent"] = Value::Null;
-        record["session_value"] = Value::Null;
+        record["native_session"] = Value::Null;
         record["error"] = json!("transient process-info response");
         agent::atomic_json(&path, &record).unwrap();
         fixture
@@ -7540,8 +8727,7 @@ mod tests {
         record["lifecycle"] = json!("launch_failed");
         record["custom_process_identity"] = Value::Null;
         record["pane_reported_by_agentctl"] = json!(false);
-        record["session_agent"] = Value::Null;
-        record["session_value"] = Value::Null;
+        record["native_session"] = Value::Null;
         record["error"] = json!("transient process-info response");
         agent::atomic_json(&path, &record).unwrap();
         fixture
@@ -7588,6 +8774,7 @@ mod tests {
         let mut record = manager.load("worker").unwrap();
         record.session_agent = None;
         record.session_value = None;
+        record.session_source = None;
         manager.save(&record).unwrap();
         fixture
             .client
@@ -7627,11 +8814,236 @@ mod tests {
         );
         assert_eq!(manager.status("worker").unwrap()["agent_status"], "idle");
 
+        *fixture.client.custom_screen.lock().unwrap() = Some(
+            "old transcript after the version header scrolled away\n\
+             ────────────────\n❯ queued owner prompt\n────────────────\n\
+             kiki · xhigh · /work · YOLO\n"
+                .to_owned(),
+        );
+        assert_eq!(manager.status("worker").unwrap()["agent_status"], "staged");
+
         fixture
             .client
             .custom_native_working
             .store(true, Ordering::Relaxed);
         assert_eq!(manager.status("worker").unwrap()["agent_status"], "working");
+    }
+
+    #[test]
+    fn muse_submits_matching_prebuffered_prompt_once_without_reinjection() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        let prompt =
+            "Use deterministic-scheduling-review and preserve the exact staged owner prompt";
+        *fixture.client.custom_screen.lock().unwrap() = Some(format!(
+            "old transcript\n{divider}\n❯ Use deterministic-\n  scheduling-review and preserve the exact staged owner prompt\n{divider}\nkiki · xhigh · /work · YOLO\n"
+        ));
+        *fixture.client.screen_after_enter.lock().unwrap() = Some(format!(
+            "❯ Use deterministic-\n  scheduling-review and preserve the exact staged owner prompt\n◆ Working\n{divider}\n❯\n{divider}\nkiki · xhigh · /work · YOLO\n"
+        ));
+
+        assert_eq!(manager.status("worker").unwrap()["agent_status"], "staged");
+        let result = manager
+            .send("worker", prompt, DrainOptions::default())
+            .unwrap();
+
+        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+        assert!(fixture.client.sent_texts.lock().unwrap().is_empty());
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn claude_staged_prompt_uses_exact_submit_chord_once() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .claude_background
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "claude".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        let prompt = "inspect the exact state and continue safely";
+        *fixture.client.custom_screen.lock().unwrap() =
+            Some(format!("{divider}\n❯\n{divider}\nauto mode on\n"));
+        *fixture.client.screen_after_run.lock().unwrap() = Some(format!(
+            "{divider}\n❯ {prompt}\n  ctrl+x ctrl+s to send now\n\
+             {divider}\n⏵⏵ auto mode on · esc to interrupt\n"
+        ));
+        *fixture.client.screen_after_enter.lock().unwrap() = Some(format!(
+            "❯ {prompt}\n● Thinking\n{divider}\n❯\n{divider}\n\
+             ⏵⏵ auto mode on · esc to interrupt\n"
+        ));
+
+        let result = manager
+            .send("worker", prompt, DrainOptions::default())
+            .unwrap();
+
+        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+        assert_eq!(*fixture.client.runs.lock().unwrap(), [prompt]);
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["ctrl+x ctrl+s"]);
+    }
+
+    #[test]
+    fn claude_new_active_ui_confirms_submission_when_long_turn_left_history() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .claude_background
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "claude".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        let prompt = "review the exact long prompt whose rendered turn left bounded history";
+        *fixture.client.custom_screen.lock().unwrap() =
+            Some(format!("{divider}\n❯\n{divider}\nauto mode on\n"));
+        *fixture.client.screen_after_run.lock().unwrap() = Some(format!(
+            "{divider}\n❯ {prompt}\n  ctrl+x ctrl+s to send now\n\
+             {divider}\nauto mode on\n"
+        ));
+        *fixture.client.screen_after_enter.lock().unwrap() = Some(format!(
+            "● Inspecting repository\n{divider}\n❯\n{divider}\n\
+             ⏵⏵ auto mode on · esc to interrupt\n"
+        ));
+
+        let result = manager
+            .send("worker", prompt, DrainOptions::default())
+            .unwrap();
+
+        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+        assert_eq!(*fixture.client.sent_keys.lock().unwrap(), ["ctrl+x ctrl+s"]);
+    }
+
+    #[test]
+    fn claude_different_staged_prompt_is_not_overwritten_or_submitted() {
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .claude_background
+            .store(true, Ordering::Relaxed);
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "claude".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        *fixture.client.custom_screen.lock().unwrap() = Some(format!(
+            "{divider}\n❯ existing owner prompt\n  ctrl+x ctrl+s to send now\n\
+             {divider}\nauto mode on\n"
+        ));
+
+        assert_eq!(manager.status("worker").unwrap()["agent_status"], "staged");
+        let error = manager
+            .send("worker", "different queued prompt", DrainOptions::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("different buffered input"));
+        assert!(fixture.client.runs.lock().unwrap().is_empty());
+        assert!(fixture.client.sent_keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn muse_retries_enter_once_only_while_exact_prompt_remains_staged() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        let divider = "────────────────────────────────────────";
+        let prompt = "continue the exact queued task after the first Enter was ignored";
+        *fixture.client.custom_screen.lock().unwrap() = Some(format!(
+            "old transcript\n{divider}\n❯ {prompt}\n{divider}\nkiki · xhigh · /work · YOLO\n"
+        ));
+        *fixture.client.screen_after_enter.lock().unwrap() = Some(format!(
+            "❯ {prompt}\n◆ Thinking\n{divider}\n❯\n{divider}\nkiki · xhigh · /work · YOLO\n"
+        ));
+        fixture
+            .client
+            .ignore_first_enter
+            .store(true, Ordering::Relaxed);
+
+        let result = manager
+            .send("worker", prompt, DrainOptions::default())
+            .unwrap();
+
+        assert_eq!(result.outcome, agent::QueueOutcome::Delivered);
+        assert!(fixture.client.sent_texts.lock().unwrap().is_empty());
+        assert_eq!(
+            *fixture.client.sent_keys.lock().unwrap(),
+            ["Enter", "Enter"]
+        );
+    }
+
+    #[test]
+    fn muse_refuses_different_prebuffered_prompt_without_terminal_input() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        *fixture.client.custom_screen.lock().unwrap() = Some(
+            "old transcript\n────────────────\n❯ human draft that must be preserved\n────────────────\nkiki · xhigh · /work · YOLO\n"
+                .to_owned(),
+        );
+
+        assert_eq!(manager.status("worker").unwrap()["agent_status"], "staged");
+        let error = manager
+            .send(
+                "worker",
+                "queued automation prompt",
+                DrainOptions::default(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("different buffered input"));
+        assert!(fixture.client.sent_texts.lock().unwrap().is_empty());
+        assert!(fixture.client.sent_keys.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -7961,7 +9373,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v2_has_one_tagged_launch_authority() {
+    fn agent_record_v3_has_one_tagged_launch_and_goal_authority() {
         let fixture = Fixture::new();
         let started = fixture
             .manager()
@@ -7979,6 +9391,16 @@ mod tests {
         let stored = agent::read_private_json(&path).unwrap();
         assert_eq!(stored["schema"], SESSION_STORAGE_SCHEMA);
         assert_eq!(stored["launch"]["schema"], LAUNCH_SPEC_SCHEMA);
+        assert_eq!(stored["goal"]["schema"], GOAL_STATE_SCHEMA);
+        assert_eq!(
+            stored["native_session"],
+            json!({
+                "schema": NATIVE_SESSION_SCHEMA,
+                "agent": "codex",
+                "value": "thread",
+                "source": "observed",
+            })
+        );
         assert_eq!(
             stored["launch"]["argv"],
             json!([
@@ -8004,6 +9426,13 @@ mod tests {
             "runtime_ownership",
             "runner_pid",
             "runner_started_at",
+            "session_agent",
+            "session_value",
+            "goal_delivery",
+            "goal_session_id",
+            "goal_command",
+            "goal_messages",
+            "goal_message_id",
         ] {
             assert!(
                 stored.get(duplicate).is_none(),
@@ -8017,7 +9446,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_record_v2_reads_profiled_claude_launch_without_flat_harness_field() {
+    fn agent_record_v3_reads_profiled_claude_launch_without_flat_harness_field() {
         let fixture = Fixture::new();
         fixture.start(None);
         let path = fixture.root.join("registry/worker/agent.json");
@@ -8026,6 +9455,7 @@ mod tests {
         stored["launch"]["argv"] = json!(["claude", "--model", "opus"]);
         stored["launch"]["model"] = json!("opus");
         stored["launch"]["profile"] = json!("claude-opus-55");
+        stored["native_session"]["agent"] = json!("claude");
         agent::atomic_json(&path, &stored).unwrap();
         let stored = agent::read_private_json(&path).unwrap();
         assert!(stored.get("harness").is_none());
@@ -8036,8 +9466,329 @@ mod tests {
             json!(["claude", "--model", "opus"])
         );
         let loaded = fixture.manager().load("worker").unwrap();
-        assert_eq!(loaded.harness, "claude");
-        assert_eq!(loaded.launch_profile.as_deref(), Some("claude-opus-55"));
+        assert_eq!(loaded.launch.harness, "claude");
+        assert_eq!(loaded.launch.profile.as_deref(), Some("claude-opus-55"));
+    }
+
+    #[test]
+    fn agent_record_v3_rejects_duplicate_nested_launch_keys() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let path = fixture.root.join("registry/worker/agent.json");
+        let encoded = fs::read_to_string(&path).unwrap();
+        let needle = "\"harness\": \"codex\"";
+        assert_eq!(encoded.matches(needle).count(), 1);
+        fs::write(
+            &path,
+            encoded.replacen(needle, "\"harness\": \"codex\", \"harness\": \"muse\"", 1),
+        )
+        .unwrap();
+
+        let error = fixture.manager().load("worker").unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate JSON object key"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn agent_record_v3_writer_refuses_incomplete_native_session() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let mut record = fixture.manager().load("worker").unwrap();
+        record.session_value = None;
+        record.session_source = None;
+
+        let error = record.storage_value().unwrap_err();
+        assert!(
+            error.to_string().contains("incomplete native session"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn agent_record_v3_refuses_native_session_for_another_harness() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut stored = agent::read_private_json(&path).unwrap();
+        stored["native_session"]["agent"] = json!("claude");
+        agent::atomic_json(&path, &stored).unwrap();
+
+        let error = fixture.manager().load("worker").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native session harness mismatch"),
+            "{error}"
+        );
+    }
+
+    fn downgrade_current_record_to_v2(mut stored: Value) -> Value {
+        let object = stored
+            .as_object_mut()
+            .expect("stored agent record is an object");
+        let goal = object
+            .remove("goal")
+            .and_then(|value| value.as_object().cloned())
+            .expect("current goal state");
+        let native = object.remove("native_session");
+        object.insert("schema".to_owned(), json!(LEGACY_SESSION_STORAGE_SCHEMA));
+        match native {
+            Some(Value::Object(native)) => {
+                object.insert(
+                    "session_agent".to_owned(),
+                    native.get("agent").cloned().unwrap_or(Value::Null),
+                );
+                object.insert(
+                    "session_value".to_owned(),
+                    native.get("value").cloned().unwrap_or(Value::Null),
+                );
+                object.insert(
+                    "goal_session_id".to_owned(),
+                    native.get("value").cloned().unwrap_or(Value::Null),
+                );
+            }
+            Some(Value::Null) | None => {
+                object.insert("session_agent".to_owned(), Value::Null);
+                object.insert("session_value".to_owned(), Value::Null);
+                object.insert("goal_session_id".to_owned(), Value::Null);
+            }
+            Some(_) => panic!("current native session is an object or null"),
+        }
+        object.insert(
+            "goal".to_owned(),
+            goal.get("objective").cloned().unwrap_or(Value::Null),
+        );
+        object.insert("goal_delivery".to_owned(), Value::Null);
+        object.insert(
+            "goal_command".to_owned(),
+            goal.get("native_command").cloned().unwrap_or(Value::Null),
+        );
+        object.insert("goal_messages".to_owned(), json!({}));
+        object.insert(
+            "goal_message_id".to_owned(),
+            goal.get("message_id").cloned().unwrap_or(Value::Null),
+        );
+        stored
+    }
+
+    #[test]
+    fn agent_record_v3_migrates_v2_goal_and_native_session_without_duplicates() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let path = fixture.root.join("registry/worker/agent.json");
+        agent::enqueue(
+            &fixture.root.join("registry/worker/queue"),
+            "ordinary message",
+            Some("ordinary"),
+        )
+        .unwrap();
+        let mut legacy = downgrade_current_record_to_v2(agent::read_private_json(&path).unwrap());
+        legacy["goal"] = json!("legacy objective");
+        legacy["goal_delivery"] = json!("delivered");
+        legacy["goal_command"] = json!(["codex", "app-server", "proxy"]);
+        agent::atomic_json(&path, &legacy).unwrap();
+
+        assert_eq!(
+            manager.load("worker").unwrap().goal.as_deref(),
+            Some("legacy objective")
+        );
+        manager.pause("worker", true).unwrap();
+        let migrated = agent::read_private_json(&path).unwrap();
+        assert_eq!(migrated["schema"], SESSION_STORAGE_SCHEMA);
+        assert_eq!(
+            migrated["goal"],
+            json!({
+                "schema": GOAL_STATE_SCHEMA,
+                "objective": "legacy objective",
+                "message_id": null,
+                "native_command": ["codex", "app-server", "proxy"],
+            })
+        );
+        assert_eq!(migrated["native_session"]["value"], "thread");
+        for duplicate in [
+            "session_agent",
+            "session_value",
+            "goal_delivery",
+            "goal_session_id",
+            "goal_command",
+            "goal_messages",
+            "goal_message_id",
+        ] {
+            assert!(migrated.get(duplicate).is_none(), "duplicate {duplicate}");
+        }
+    }
+
+    #[test]
+    fn agent_record_v2_refuses_conflicting_native_session_authorities() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut legacy = downgrade_current_record_to_v2(agent::read_private_json(&path).unwrap());
+        legacy["goal_session_id"] = json!("different-session");
+        agent::atomic_json(&path, &legacy).unwrap();
+
+        assert!(fixture
+            .manager()
+            .load("worker")
+            .unwrap_err()
+            .to_string()
+            .contains("contradictory native session"));
+    }
+
+    #[test]
+    fn agent_record_v3_migrates_legacy_goal_artifact_before_dropping_map() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let queue = fixture.root.join("registry/worker/queue");
+        let identifier =
+            agent::enqueue(&queue, "/goal legacy objective", Some("legacy-goal")).unwrap();
+        let artifact_path = queue.join("inbox").join(format!("{identifier}.json"));
+        let mut legacy_artifact = agent::read_private_json(&artifact_path).unwrap();
+        legacy_artifact.as_object_mut().unwrap().remove("kind");
+        agent::atomic_json(&artifact_path, &legacy_artifact).unwrap();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut legacy = downgrade_current_record_to_v2(agent::read_private_json(&path).unwrap());
+        legacy["goal"] = json!("legacy objective");
+        legacy["goal_message_id"] = json!(identifier);
+        legacy["goal_messages"] = json!({identifier.clone(): "legacy objective"});
+        agent::atomic_json(&path, &legacy).unwrap();
+
+        manager.pause("worker", true).unwrap();
+
+        let migrated = agent::read_private_json(&path).unwrap();
+        assert_eq!(migrated["schema"], SESSION_STORAGE_SCHEMA);
+        let artifact = agent::read_private_json(&artifact_path).unwrap();
+        assert_eq!(artifact["kind"], "goal");
+        assert!(migrated.get("goal_messages").is_none());
+    }
+
+    #[test]
+    fn send_migrates_legacy_goal_authority_before_queue_delivery() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let queue = fixture.root.join("registry/worker/queue");
+        let identifier =
+            agent::enqueue(&queue, "/goal legacy objective", Some("legacy-goal")).unwrap();
+        let artifact_path = queue.join("inbox").join(format!("{identifier}.json"));
+        let mut legacy_artifact = agent::read_private_json(&artifact_path).unwrap();
+        legacy_artifact.as_object_mut().unwrap().remove("kind");
+        agent::atomic_json(&artifact_path, &legacy_artifact).unwrap();
+        let record_path = fixture.root.join("registry/worker/agent.json");
+        let mut legacy =
+            downgrade_current_record_to_v2(agent::read_private_json(&record_path).unwrap());
+        legacy["goal"] = json!("legacy objective");
+        legacy["goal_message_id"] = json!(identifier.clone());
+        legacy["goal_messages"] = json!({identifier.clone(): "legacy objective"});
+        agent::atomic_json(&record_path, &legacy).unwrap();
+
+        manager
+            .send("worker", "ordinary message", DrainOptions::default())
+            .unwrap();
+
+        let migrated = agent::read_private_json(&record_path).unwrap();
+        assert_eq!(migrated["schema"], SESSION_STORAGE_SCHEMA);
+        assert!(migrated.get("goal_messages").is_none());
+        let processed = queue.join("processed").join(format!("{identifier}.json"));
+        assert_eq!(
+            agent::read_private_json(&processed).unwrap()["kind"],
+            "goal"
+        );
+        let runs = fixture.client.runs.lock().unwrap().clone();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.contains(&"ordinary message".to_owned()));
+        assert!(runs.contains(&"/goal legacy objective".to_owned()));
+    }
+
+    #[test]
+    fn agent_record_v3_refuses_to_discard_missing_legacy_goal_artifact() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let path = fixture.root.join("registry/worker/agent.json");
+        agent::enqueue(
+            &fixture.root.join("registry/worker/queue"),
+            "ordinary message",
+            Some("ordinary"),
+        )
+        .unwrap();
+        let mut legacy = downgrade_current_record_to_v2(agent::read_private_json(&path).unwrap());
+        legacy["goal"] = json!("missing objective");
+        legacy["goal_message_id"] = json!("missing-goal");
+        legacy["goal_messages"] = json!({"missing-goal": "missing objective"});
+        agent::atomic_json(&path, &legacy).unwrap();
+        let encoded = fs::read(&path).unwrap();
+
+        let error = manager.pause("worker", true).unwrap_err();
+        assert!(error.to_string().contains("refusing to discard"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), encoded);
+    }
+
+    #[test]
+    fn goal_delivery_requires_the_exact_tagged_queue_artifact() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let queue = fixture.root.join("registry/worker/queue");
+        let identifier = agent::enqueue(&queue, "/goal finish task", Some("goal-1")).unwrap();
+        let artifact_path = queue.join("inbox").join(format!("{identifier}.json"));
+        let mut artifact = agent::read_private_json(&artifact_path).unwrap();
+        artifact["kind"] = json!("goal");
+        agent::atomic_json(&artifact_path, &artifact).unwrap();
+        let mut record = manager.load("worker").unwrap();
+        record.goal = Some("finish task".to_owned());
+        record.goal_message_id = Some(identifier.clone());
+        manager.save(&record).unwrap();
+        assert_eq!(
+            manager.goal_delivery(&record).unwrap().as_deref(),
+            Some("pending")
+        );
+
+        artifact["kind"] = json!("message");
+        agent::atomic_json(&artifact_path, &artifact).unwrap();
+        let error = manager.goal_delivery(&record).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("disagrees with its session record"),
+            "{error}"
+        );
+
+        artifact["kind"] = json!("goal");
+        artifact["text"] = json!("/goal forged task");
+        agent::atomic_json(&artifact_path, &artifact).unwrap();
+        let error = manager.goal_delivery(&record).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("disagrees with its session record"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn agent_record_v3_migrates_legacy_launch_spec_at_write_boundary() {
+        let fixture = Fixture::new();
+        fixture.start(None);
+        let manager = fixture.manager();
+        let path = fixture.root.join("registry/worker/agent.json");
+        let mut stored = agent::read_private_json(&path).unwrap();
+        stored["launch"]["schema"] = json!(LEGACY_LAUNCH_SPEC_SCHEMA);
+        stored["launch"]
+            .as_object_mut()
+            .unwrap()
+            .remove("permission_mode");
+        agent::atomic_json(&path, &stored).unwrap();
+
+        assert_eq!(manager.load("worker").unwrap().launch.permission_mode, None);
+        manager.pause("worker", true).unwrap();
+        let migrated = agent::read_private_json(&path).unwrap();
+        assert_eq!(migrated["launch"]["schema"], LAUNCH_SPEC_SCHEMA);
+        assert!(migrated["launch"]["permission_mode"].is_null());
     }
 
     #[test]
@@ -8051,6 +9802,14 @@ mod tests {
             "arguments",
             "runner_pid",
             "runner_started_at",
+            "permission_mode",
+            "launch_permission_mode",
+            "launch",
+            "native_session",
+            "extensions",
+            "goal_delivery",
+            "goal_messages",
+            "goal_session_id",
         ] {
             let fixture = Fixture::new();
             fixture.start(None);
@@ -8059,7 +9818,14 @@ mod tests {
             document["extensions"][collision] = match collision {
                 "runner_pid" => json!(123),
                 "runner_started_at" => json!("456"),
-                "launch_profile" | "profile" | "adapter" => json!("replacement"),
+                "launch_profile"
+                | "profile"
+                | "adapter"
+                | "permission_mode"
+                | "launch_permission_mode"
+                | "goal_delivery"
+                | "goal_session_id" => json!("replacement"),
+                "launch" | "native_session" | "extensions" | "goal_messages" => json!({}),
                 _ => json!(["replacement"]),
             };
             agent::atomic_json(&path, &document).unwrap();
@@ -8083,7 +9849,7 @@ mod tests {
         legacy["arguments"] = json!(["--no-alt-screen", "--literal"]);
         agent::atomic_json(&path, &legacy).unwrap();
         assert_eq!(
-            manager.load("worker").unwrap().launch_argv,
+            manager.load("worker").unwrap().launch.argv,
             ["codex", "--no-alt-screen", "--literal"]
         );
         manager.pause("worker", true).unwrap();
@@ -8102,6 +9868,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("contradictory launch arguments"));
+    }
+
+    #[test]
+    fn agent_record_v1_rejects_reserved_current_schema_fields() {
+        for field in ["launch", "native_session", "extensions"] {
+            let fixture = Fixture::new();
+            fixture.start(None);
+            let path = fixture.root.join("registry/worker/agent.json");
+            let mut legacy = fixture.manager().load("worker").unwrap().public_value();
+            legacy[field] = json!({});
+            agent::atomic_json(&path, &legacy).unwrap();
+            let error = fixture.manager().load("worker").unwrap_err();
+            assert!(
+                error.to_string().contains("reserved current-schema field"),
+                "{field}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -8246,7 +10029,7 @@ mod tests {
             record.error.as_deref(),
             Some("launch failed with caller-supplied environment; details omitted from status")
         );
-        assert!(!serde_json::to_string(&record).unwrap().contains(secret));
+        assert!(!record.public_value().to_string().contains(secret));
     }
 
     #[test]
@@ -8289,6 +10072,24 @@ mod tests {
         assert_eq!(
             adopted["foreign_shell_identity"],
             json!(Fake::foreign_shell_identity())
+        );
+        assert_eq!(
+            adopted["capabilities"],
+            json!([
+                "send",
+                "status",
+                "read",
+                "wait",
+                "stop",
+                "attach",
+                "pause",
+                "resume",
+                "terminal-snapshot",
+                "drain",
+                "goal",
+                "bind-session",
+                "relocate"
+            ])
         );
         assert_eq!(manager.list().unwrap().len(), 1);
         manager
@@ -10233,8 +12034,6 @@ mod tests {
         document["launch"]["mode"] = json!("headless");
         document["launch"]["backend"] = json!("tmux");
         document["launch"]["runtime_home"] = json!(fixture.root.join("runtime"));
-        document["session_agent"] = Value::Null;
-        document["session_value"] = json!("thread");
         document["pane_id"] = json!("headless-pane");
         agent::atomic_json(&path, &document).unwrap();
         *fixture.client.panes.lock().unwrap() = vec![Fake::pane("foreign")];
@@ -10439,7 +12238,7 @@ mod tests {
             .manager()
             .load("second")
             .unwrap()
-            .goal_session_id
+            .session_value
             .is_none());
     }
 
@@ -10463,7 +12262,7 @@ mod tests {
             .manager()
             .load("foreign")
             .unwrap()
-            .goal_session_id
+            .session_value
             .is_none());
     }
 
@@ -10501,8 +12300,8 @@ mod tests {
         outcomes.sort_unstable();
         assert_eq!(outcomes, [false, true]);
         let claims = [
-            manager.load("foreign").unwrap().goal_session_id,
-            manager.load("second").unwrap().goal_session_id,
+            manager.load("foreign").unwrap().session_value,
+            manager.load("second").unwrap().session_value,
         ];
         assert_eq!(
             claims

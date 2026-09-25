@@ -124,16 +124,20 @@ def _session_storage_shape(root: Path) -> tuple[set[str], set[str], str, str]:
 
 
 def _legacy_session_document(document: object) -> dict[str, object]:
-    """Downgrade one v2 fixture to the last supported flat v1 shape."""
-    if not isinstance(document, dict) or document.get("schema") != "agentctl-session/v2":
+    """Downgrade one v3 fixture to the last supported flat v1 shape."""
+    if not isinstance(document, dict) or document.get("schema") != "agentctl-session/v3":
         raise AssertionError(f"expected current session storage, got {document!r}")
     launch = document.get("launch")
+    goal = document.get("goal")
+    native = document.get("native_session")
     extensions = document.get("extensions")
-    if not isinstance(launch, dict) or not isinstance(extensions, dict):
+    if (not isinstance(launch, dict) or not isinstance(goal, dict)
+            or (native is not None and not isinstance(native, dict))
+            or not isinstance(extensions, dict)):
         raise AssertionError(f"invalid current session storage: {document!r}")
     legacy = {
         str(key): value for key, value in document.items()
-        if key not in {"schema", "launch", "extensions"}
+        if key not in {"schema", "launch", "goal", "native_session", "extensions"}
     }
     executable = launch.get("executable")
     if executable is None:
@@ -161,6 +165,14 @@ def _legacy_session_document(document: object) -> dict[str, object]:
         "launch_executable": executable.get("path"),
         "launch_executable_device": executable.get("device"),
         "launch_executable_inode": executable.get("inode"),
+        "session_agent": None if native is None else native.get("agent"),
+        "session_value": None if native is None else native.get("value"),
+        "goal": goal.get("objective"),
+        "goal_delivery": None,
+        "goal_session_id": None if native is None else native.get("value"),
+        "goal_command": goal.get("native_command"),
+        "goal_messages": {},
+        "goal_message_id": goal.get("message_id"),
     })
     legacy.update({str(key): value for key, value in extensions.items()})
     return legacy
@@ -263,11 +275,14 @@ def _lifecycle(harness: Harness, report: Report) -> None:
         report.require(
             f"primary/{kind}/storage-schema",
             shapes[0] == shapes[1]
-            and shapes[0][2:] == ("agentctl-session/v2", "agentctl-launch/v1")
+            and shapes[0][2:] == ("agentctl-session/v3", "agentctl-launch/v2")
             and not {
                 "harness", "cwd", "adapter", "mode", "backend", "model", "resume",
                 "arguments", "launch_argv", "launch_executable", "runtime_home",
                 "runtime_ownership", "runner_pid", "runner_started_at",
+                "session_agent", "session_value", "goal_delivery",
+                "goal_session_id", "goal_command", "goal_messages",
+                "goal_message_id",
             } & shapes[0][0],
             f"edition storage schemas diverged or retained duplicate authorities: {shapes!r}",
         )
@@ -764,13 +779,14 @@ def _profiles(harness: Harness, report: Report) -> None:
     configure(permanent)
     outcomes = harness.invoke(permanent, (
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
-        "--profile", "watermelon", "--startup-timeout", "0.5", *_COMMON,
+        "--profile", "watermelon", "--startup-timeout", "0.15", *_COMMON,
     ))
     report.require(
         "primary/profile/watermelon/permanent-process-info-retried",
         all(
             outcome.returncode == 75
             and "last process probe" in outcome.stderr
+            and "injected process-info failure" in outcome.stderr
             for outcome in outcomes
         )
         and all(process_info_retried(root)
@@ -1404,6 +1420,26 @@ def _relocation(harness: Harness, report: Report) -> None:
             for root in (lost.python_root, lost.rust_root)
         ),
         "lost move response was repeated or not reconciled",
+    )
+
+    replaced = harness.case(
+        "primary-relocation-terminal-replacement",
+        {"replace_terminal_before_move": True},
+    )
+    if not _start(harness, report, replaced, "primary/relocation/replaced/start"):
+        return
+    _pair(harness, report, replaced, "primary/relocation/replaced/refusal", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ), 69)
+    report.require(
+        "primary/relocation/replaced/no-side-effect",
+        all(
+            _state(root).get("workspace_id", "w1") == "w1"
+            and _state(root).get("pane_id", "w1:p1") == "w1:p1"
+            and (root / "registry/worker/relocation.json").is_file()
+            for root in (replaced.python_root, replaced.rust_root)
+        ),
+        "conditional move changed routing after terminal replacement",
     )
 
     multi = harness.case("primary-relocation-multi-pane")

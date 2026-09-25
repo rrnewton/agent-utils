@@ -147,12 +147,44 @@ fn canonical_boot_uuid(value: &str) -> bool {
 }
 
 fn bounded_file(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
-    let value = fs::read(path).map_err(|error| {
-        AdapterError::unavailable(format!("cannot read {label} {}: {error}", path.display()))
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            AdapterError::unavailable(format!("cannot read {label} {}: {error}", path.display()))
+        })?;
+    let before = file.metadata().map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot inspect {label} {}: {error}",
+            path.display()
+        ))
     })?;
-    if value.is_empty() || value.len() > limit {
+    if !before.file_type().is_file() || before.len() > limit as u64 {
         return Err(AdapterError::unavailable(format!(
             "{label} {} has an invalid length",
+            path.display()
+        )));
+    }
+    let mut value = Vec::with_capacity(before.len().min(limit as u64) as usize);
+    file.by_ref()
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut value)
+        .map_err(|error| {
+            AdapterError::unavailable(format!("cannot read {label} {}: {error}", path.display()))
+        })?;
+    let after = file.metadata().map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot reinspect {label} {}: {error}",
+            path.display()
+        ))
+    })?;
+    if value.is_empty()
+        || value.len() > limit
+        || (before.dev(), before.ino(), before.len()) != (after.dev(), after.ino(), after.len())
+    {
+        return Err(AdapterError::unavailable(format!(
+            "{label} {} has an invalid or changing length",
             path.display()
         )));
     }
@@ -658,30 +690,9 @@ pub(crate) fn muse_verified_process_idle_composer(screen: &str) -> bool {
         .is_some_and(|(_, composer)| matches!(composer.trim(), "❯" | "›"))
 }
 
-fn muse_marked_prompt_count(screen: &str, text: &str) -> usize {
-    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let rendered = screen.split_whitespace().collect::<Vec<_>>().join(" ");
-    if wanted.is_empty() {
-        return 0;
-    }
-    ["❯", "›"]
-        .iter()
-        .map(|marker| {
-            let needle = format!("{marker} {wanted}");
-            rendered
-                .match_indices(&needle)
-                .filter(|(start, _)| {
-                    let before = &rendered[..*start];
-                    let after = &rendered[*start + needle.len()..];
-                    (before.is_empty() || before.ends_with(' '))
-                        && (after.is_empty()
-                            || ["◆", "❯", "›"]
-                                .iter()
-                                .any(|next| after.starts_with(&format!(" {next} "))))
-                })
-                .count()
-        })
-        .sum()
+pub(crate) fn muse_verified_process_composer(screen: &str) -> bool {
+    muse_composer_regions(screen, false)
+        .is_some_and(|(_, composer)| muse_editor_segments(&composer).is_some())
 }
 
 fn muse_composer_regions(screen: &str, require_header: bool) -> Option<(String, String)> {
@@ -735,15 +746,96 @@ fn muse_prompt_in_composer_context(
     require_header: bool,
     exact: bool,
 ) -> bool {
+    muse_composer_regions(screen, require_header)
+        .is_some_and(|(_, composer)| muse_editor_matches(&composer, text, exact))
+}
+
+fn muse_editor_segments(editor: &str) -> Option<Vec<String>> {
+    let mut lines = editor
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let first = lines.first_mut()?;
+    let marker = ["❯", "›"]
+        .iter()
+        .find(|marker| first.as_str() == **marker || first.starts_with(&format!("{marker} ")))?;
+    *first = first[marker.len()..].trim().to_owned();
+    if first.is_empty() {
+        lines.remove(0);
+    }
+    Some(lines)
+}
+
+fn muse_editor_matches(editor: &str, text: &str, exact: bool) -> bool {
     let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    muse_composer_regions(screen, require_header).is_some_and(|(_, composer)| {
-        let rendered = composer.split_whitespace().collect::<Vec<_>>().join(" ");
-        !wanted.is_empty()
-            && ["❯", "›"].iter().any(|marker| {
-                let candidate = format!("{marker} {wanted}");
-                rendered == candidate || (!exact && rendered.starts_with(&format!("{candidate} ")))
-            })
-    })
+    let Some(segments) = muse_editor_segments(editor) else {
+        return false;
+    };
+    if wanted.is_empty() {
+        return false;
+    }
+    let mut prefixes = HashSet::from([String::new()]);
+    let mut previous = "";
+    for (index, segment) in segments.iter().enumerate() {
+        let separators: &[&str] = if index == 0 {
+            &[""]
+        } else if previous.ends_with('-') {
+            &[" ", ""]
+        } else {
+            &[" "]
+        };
+        let mut next = HashSet::new();
+        for prefix in &prefixes {
+            for separator in separators {
+                let rendered = format!("{prefix}{separator}{segment}");
+                if !exact && (rendered == wanted || rendered.starts_with(&format!("{wanted} "))) {
+                    return true;
+                }
+                if wanted.starts_with(&rendered) {
+                    next.insert(rendered);
+                }
+            }
+        }
+        if next.is_empty() {
+            return false;
+        }
+        prefixes = next;
+        previous = segment;
+    }
+    prefixes.contains(&wanted)
+}
+
+fn muse_marked_prompt_count(screen: &str, text: &str) -> usize {
+    let lines = screen.lines().collect::<Vec<_>>();
+    let mut count = 0;
+    let mut index = 0;
+    while index < lines.len() {
+        let stripped = lines[index].trim();
+        if !["❯", "›"]
+            .iter()
+            .any(|marker| stripped == *marker || stripped.starts_with(&format!("{marker} ")))
+        {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < lines.len() {
+            let next = lines[end].trim();
+            if ["◆", "❯", "›"]
+                .iter()
+                .any(|marker| next == *marker || next.starts_with(&format!("{marker} ")))
+            {
+                break;
+            }
+            end += 1;
+        }
+        if muse_editor_matches(&lines[index..end].join("\n"), text, true) {
+            count += 1;
+        }
+        index = end;
+    }
+    count
 }
 
 #[cfg(test)]
@@ -827,6 +919,95 @@ pub(crate) fn claude_active_screen(screen: &str) -> bool {
     });
     after.contains("esc to interrupt") || (waiting && agent_count)
 }
+
+fn claude_composer_regions(screen: &str) -> Option<(String, String)> {
+    let lines = screen.lines().collect::<Vec<_>>();
+    let dividers = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            (trimmed.chars().count() >= 3
+                && trimmed
+                    .chars()
+                    .all(|value| matches!(value, '─' | '━' | '═')))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let bottom = *dividers.last()?;
+    let top = *dividers.get(dividers.len().checked_sub(2)?)?;
+    let hint = "ctrl+x ctrl+s to send now";
+    let editor = &lines[top + 1..bottom];
+    if !editor.iter().any(|line| {
+        line.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+            .contains(hint)
+    }) {
+        return None;
+    }
+    let content = editor
+        .iter()
+        .filter(|line| {
+            !line
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+                .contains(hint)
+        })
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    muse_editor_segments(&content)?;
+    Some((lines[..top].join("\n"), content))
+}
+
+pub(crate) fn claude_staged_composer(screen: &str) -> bool {
+    claude_composer_regions(screen)
+        .is_some_and(|(_, composer)| muse_editor_segments(&composer).is_some_and(|v| !v.is_empty()))
+}
+
+pub(crate) fn claude_prompt_is_exact_composer(screen: &str, text: &str) -> bool {
+    claude_composer_regions(screen)
+        .is_some_and(|(_, composer)| muse_editor_matches(&composer, text, true))
+}
+
+pub(crate) fn claude_prompt_transcript_count(screen: &str, text: &str) -> usize {
+    let transcript = claude_composer_regions(screen)
+        .map_or_else(|| screen.to_owned(), |(transcript, _)| transcript);
+    let lines = transcript.lines().collect::<Vec<_>>();
+    let mut count = 0;
+    let mut index = 0;
+    while index < lines.len() {
+        let stripped = lines[index].trim();
+        if stripped != "❯" && !stripped.starts_with("❯ ") {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < lines.len() {
+            let following = lines[end].trim();
+            let marker = ["❯", "●", "✻", "✽", "⏺", "◆"]
+                .iter()
+                .any(|marker| following.starts_with(marker));
+            let divider = following.chars().count() >= 3
+                && following
+                    .chars()
+                    .all(|value| matches!(value, '─' | '━' | '═'));
+            if marker || divider {
+                break;
+            }
+            end += 1;
+        }
+        if muse_editor_matches(&lines[index..end].join("\n"), text, true) {
+            count += 1;
+        }
+        index = end;
+    }
+    count
+}
 #[derive(Debug)]
 pub(crate) struct BoundedOutput {
     pub status: ExitStatus,
@@ -858,13 +1039,47 @@ fn bounded_output_with_cancellation_and_shutdown(
     cancelled: &dyn Fn() -> bool,
     shutdown: &mut dyn FnMut(&mut ProcessPluginChild, Duration) -> io::Result<ExitStatus>,
 ) -> io::Result<BoundedOutput> {
-    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+    let deadline = control_deadline(timeout)?;
+    let captured = CapturedProcess::spawn(command)?;
+    finish_bounded_output(captured, timeout, deadline, cancelled, shutdown)
+}
+
+fn control_deadline(timeout: Duration) -> io::Result<Instant> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "control command timeout is too large",
         )
-    })?;
-    let mut captured = CapturedProcess::spawn(command)?;
+    })
+}
+
+#[cfg(test)]
+fn bounded_output_after_spawn_hook_for_test(
+    command: Command,
+    timeout: Duration,
+    after_spawn: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<BoundedOutput> {
+    // Establish fixture readiness without giving the code under test a fresh deadline: this is
+    // the same absolute deadline production creates before spawning the command.
+    let deadline = control_deadline(timeout)?;
+    let captured = CapturedProcess::spawn(command)?;
+    after_spawn()?;
+    finish_bounded_output(
+        captured,
+        timeout,
+        deadline,
+        &|| false,
+        &mut ProcessPluginChild::shutdown,
+    )
+}
+
+fn finish_bounded_output(
+    mut captured: CapturedProcess,
+    timeout: Duration,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    shutdown: &mut dyn FnMut(&mut ProcessPluginChild, Duration) -> io::Result<ExitStatus>,
+) -> io::Result<BoundedOutput> {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut stdout_eof = false;
@@ -1224,6 +1439,7 @@ impl HerdrClient {
     pub fn move_pane_to_new_tab(
         &self,
         pane_id: &str,
+        expected_terminal_id: &str,
         workspace_id: &str,
         label: &str,
     ) -> Result<PaneMove> {
@@ -1232,6 +1448,8 @@ impl HerdrClient {
                 "pane",
                 "move",
                 pane_id,
+                "--expect-terminal-id",
+                expected_terminal_id,
                 "--workspace",
                 workspace_id,
                 "--new-tab",
@@ -1256,6 +1474,7 @@ impl HerdrClient {
             terminal_id: Some(required_string(pane, "terminal_id", "pane move pane")?),
         };
         if pane.workspace_id != workspace_id
+            || pane.terminal_id.as_deref() != Some(expected_terminal_id)
             || required_string(created, "workspace_id", "pane move created_tab")? != workspace_id
             || required_string(created, "tab_id", "pane move created_tab")? != pane.tab_id
             || created.get("pane_count").and_then(Value::as_u64) != Some(1)
@@ -2151,8 +2370,7 @@ impl HerdrClient {
                 "--timeout".to_owned(),
                 timeout_ms.to_string(),
             ],
-            CONTROL_TIMEOUT
-                .max(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(5))),
+            Duration::from_millis(timeout_ms.max(1)),
             cancelled,
         )?;
         if completed.status != 0 {
@@ -2781,6 +2999,36 @@ mod tests {
     }
 
     #[test]
+    fn exact_muse_composer_matches_only_requested_hyphen_soft_wraps() {
+        let divider = "────────────────────────────────────────";
+        let footer = "kiki · xhigh · /work/project · YOLO\n";
+        let prompt =
+            "Use deterministic-scheduling-review and keep this buffered prompt byte-for-byte";
+        let wrapped = format!(
+            "old transcript\n{divider}\n❯ Use deterministic-\n  scheduling-review and keep this buffered prompt byte-for-byte\n{divider}\n{footer}"
+        );
+        assert!(muse_verified_process_composer(&wrapped));
+        assert!(muse_verified_process_prompt_is_exact_composer(
+            &wrapped, prompt
+        ));
+        assert!(!muse_verified_process_prompt_is_exact_composer(
+            &wrapped,
+            &prompt.replace("byte-for-byte", "byte for byte")
+        ));
+        let accepted = format!(
+            "❯ Use deterministic-\n  scheduling-review and keep this buffered prompt byte-for-byte\n◆ Working\n{divider}\n❯\n{divider}\n{footer}"
+        );
+        assert_eq!(
+            muse_verified_process_prompt_transcript_count(&accepted, prompt),
+            1
+        );
+        let weakened = wrapped.replace("deterministic-\n", "deterministic -\n");
+        assert!(!muse_verified_process_prompt_is_exact_composer(
+            &weakened, prompt
+        ));
+    }
+
+    #[test]
     fn current_muse_footer_identifies_only_an_empty_composer() {
         let prefix = "Muse Code at Meta (https://fb.workplace.com/groups/27315719428107177)\n\
                       Using AI Gateway (Meta Model API upstream)\n\n  Muse Code 1.4.0\n\n";
@@ -2818,6 +3066,35 @@ mod tests {
         assert!(!claude_active_screen(
             &screen.replace("← 2 agents", "← 1 agent")
         ));
+        let staged_while_active = format!(
+            "● Background command still running\n✽ Considering… (20m 51s)\n\
+             {divider}\n❯ queued follow-up prompt\n  ctrl+x ctrl+s to send now\n\
+             {divider}\n⏵⏵ auto mode on · esc to interrupt · ← 2 agents\n"
+        );
+        assert!(claude_active_screen(&staged_while_active));
+    }
+
+    #[test]
+    fn claude_staged_prompt_is_distinct_from_a_submitted_turn() {
+        let divider = "─".repeat(40);
+        let prompt = "review the deterministic- scheduling contract";
+        let staged = format!(
+            "● Background command still running\n{divider}\n\
+             ❯ review the deterministic-\n  scheduling contract\n\
+               ctrl+x ctrl+s to send now\n{divider}\n\
+             ⏵⏵ auto mode on · esc to interrupt · ← 2 agents\n"
+        );
+        assert!(claude_staged_composer(&staged));
+        assert!(claude_prompt_is_exact_composer(&staged, prompt));
+        assert_eq!(claude_prompt_transcript_count(&staged, prompt), 0);
+
+        let submitted = format!(
+            "❯ {prompt}\n● Working on the request\n{divider}\n❯\n{divider}\n\
+             ⏵⏵ auto mode on · esc to interrupt\n"
+        );
+        assert!(!claude_staged_composer(&submitted));
+        assert!(!claude_prompt_is_exact_composer(&submitted, prompt));
+        assert_eq!(claude_prompt_transcript_count(&submitted, prompt), 1);
     }
 
     #[cfg(target_os = "linux")]
@@ -2934,19 +3211,6 @@ mod tests {
                 .trim()
                 .parse()
                 .expect("fixture child pid is numeric")
-        }
-
-        fn wait_for_pid(path: &Path, timeout: Duration) -> Option<libc::pid_t> {
-            let deadline = Instant::now() + timeout;
-            loop {
-                if let Ok(value) = fs::read_to_string(path) {
-                    return Some(value.trim().parse().expect("fixture child pid is numeric"));
-                }
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
         }
 
         fn group_pid(&self) -> libc::pid_t {
@@ -3779,31 +4043,43 @@ mod tests {
     #[test]
     fn control_timeout_includes_pipes_inherited_after_the_parent_exits() {
         let mut unrelated = ChildGuard(Command::new("/bin/sleep").arg("30").spawn().unwrap());
-        // The timeout remains explicit, but its clock starts at spawn, so a loaded host can fire
-        // it before the shell forks the escaped holder. Such an attempt never exercised inherited
-        // pipes; retry it with a longer budget. The separate EINTR test exercises the short
-        // 150ms deadline.
-        for timeout in [1, 3, 10].map(Duration::from_secs) {
-            let escaped = RecordedChild::new("setsid-holder");
-            let started = Instant::now();
-            let result = bounded_output(escaped.escaped_pipe_command(), timeout);
-            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
-            assert!(started.elapsed() < timeout + Duration::from_secs(4));
-            // Once forked, the holder is outside the killed group and publishes itself.
-            let Some(pid) =
-                RecordedChild::wait_for_pid(&escaped.escaped_pid_file, Duration::from_secs(5))
-            else {
-                continue;
-            };
-            // The setsid child escaped the supervised group and really was retaining both capture
-            // pipes, so returning promptly did not depend on receiving EOF from reader threads.
-            assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
-            // The pinned private group must not be confused with any unrelated numeric identity.
-            assert!(unrelated.0.try_wait().unwrap().is_none());
-            escaped.terminate_escaped();
-            return;
-        }
-        panic!("the escaped pipe holder was never started before any timeout");
+        let escaped = RecordedChild::new("setsid-holder");
+        let escaped_pid_file = escaped.escaped_pid_file.clone();
+        let mut fixture_ready = || {
+            let readiness_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if fs::read_to_string(&escaped_pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                if Instant::now() >= readiness_deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "fixture did not publish the escaped pipe-holder PID",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let started = Instant::now();
+        // The readiness hook makes the escaped-pipe premise deterministic under scheduler load.
+        // The absolute timeout is still created before spawn, and the hook cannot reset it.
+        let result = bounded_output_after_spawn_hook_for_test(
+            escaped.escaped_pipe_command(),
+            Duration::from_secs(1),
+            &mut fixture_ready,
+        );
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The setsid child escaped the supervised group and really was retaining both capture
+        // pipes, so returning promptly did not depend on receiving EOF from reader threads.
+        assert_eq!(unsafe { libc::kill(escaped.escaped_pid(), 0) }, 0);
+        // The pinned private group must not be confused with any unrelated numeric identity.
+        assert!(unrelated.0.try_wait().unwrap().is_none());
+        escaped.terminate_escaped();
     }
 
     #[cfg(target_os = "linux")]

@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 
 from agentctl.client import AgentPaneInfo, HerdrClient
 from agentctl.errors import (
@@ -32,8 +33,8 @@ from agentctl.errors import (
 )
 
 __all__ = [
-    "Target", "QueueResult", "resolve_target", "enqueue", "drain", "send",
-    "reconcile_delivery", "status", "read",
+    "Target", "QueueResult", "resolve_target", "enqueue", "drain", "send", "send_goal",
+    "message_state", "reconcile_delivery", "status", "read",
     "QUEUE_ERROR_MAX_BYTES", "QUEUE_UPDATE_MAX_BYTES", "QUEUE_ERROR_SIDECAR_MAX_BYTES",
     "queue_artifact_reservation_bytes",
 ]
@@ -140,6 +141,7 @@ _U64_MAX = (1 << 64) - 1
 # Bound diagnostic text before JSON escaping. ASCII control characters can require
 # six serialized bytes per UTF-8 byte, which the reservation envelopes include.
 QUEUE_ERROR_MAX_BYTES = 2000
+_MESSAGE_STATE_MAX_BYTES = 16 << 20
 _LONGEST_JSON_FLOAT = -1.7976931348623157e308
 
 
@@ -219,7 +221,7 @@ def queue_artifact_reservation_bytes(text: str, *, message_id: str) -> int:
     if not text or _MESSAGE_ID.fullmatch(message_id) is None:
         raise AgentDeliveryError("reservation needs nonempty text and a valid message id")
     initial: dict[str, object] = {
-        "id": message_id, "text": text,
+        "id": message_id, "kind": "message", "text": text,
         "queued_at": _LONGEST_JSON_FLOAT, "delivery_attempts": 0,
     }
     return len(_json_text(initial).encode("utf-8")) + QUEUE_UPDATE_MAX_BYTES
@@ -386,9 +388,9 @@ def _read_queue_json(
             raise AgentDeliveryError(f"{purpose} is not private: {path}")
         # Preserve the generic queue's historical unlimited mode. Chat and
         # other bounded callers take the strict helper above.
-        with os.fdopen(descriptor, encoding="utf-8") as handle:
+        with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
-            return json.load(handle, parse_constant=_reject_json_constant)
+            return _decode_json_bytes(handle.read(), purpose, path)
     except AgentDeliveryError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
@@ -406,6 +408,11 @@ def _read_bounded_queue_json(
         path, purpose, require_private=require_private,
         max_artifact_bytes=max_artifact_bytes,
     )
+    return _decode_json_bytes(encoded, purpose, path), len(encoded)
+
+
+def _decode_json_bytes(encoded: bytes, purpose: str, path: str | Path) -> object:
+    """Decode one JSON document without accepting duplicate object keys."""
     try:
         decoded = json.loads(
             encoded.decode("utf-8"),
@@ -413,7 +420,7 @@ def _read_bounded_queue_json(
             parse_constant=_reject_json_constant,
         )
         _validate_json_depth(decoded)
-        return decoded, len(encoded)
+        return decoded
     except AgentDeliveryError:
         raise
     except (UnicodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
@@ -1182,7 +1189,8 @@ def enqueue(
     """
     with atomic_write_policy(atomic_policy):
         return _enqueue(
-            root, text, message_id=message_id, serialize=True, max_artifact_bytes=max_artifact_bytes,
+            root, text, message_id=message_id, serialize=True,
+            max_artifact_bytes=max_artifact_bytes, kind="message",
         )
 
 
@@ -1193,10 +1201,13 @@ def _enqueue(
     message_id: str | None,
     serialize: bool,
     max_artifact_bytes: int | None = None,
+    kind: str = "message",
 ) -> str:
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
     if not text:
         raise AgentDeliveryError("message must not be empty")
+    if kind not in ("message", "goal"):
+        raise AgentDeliveryError("queue message kind must be 'message' or 'goal'")
     inbox, inflight, processed, failed = _prepare(root)
     identifier = f"{time.time_ns():020d}-{os.getpid()}" if message_id is None else message_id
     if _MESSAGE_ID.fullmatch(identifier) is None:
@@ -1219,6 +1230,7 @@ def _enqueue(
                 path,
                 {
                     "id": identifier,
+                    "kind": kind,
                     "text": text,
                     "queued_at": time.time(),
                     "delivery_attempts": 0,
@@ -1338,6 +1350,42 @@ def _validate_existing_binding(root: str, target: Target) -> None:
         raise AgentDeliveryError(
             f"queue {root} is bound to {actual!r}, refusing different target {expected!r}"
         )
+
+
+def _relocate_existing_binding(root: str, old: Target, new: Target) -> None:
+    """Atomically move one existing pane-bound queue to an exact new route.
+
+    A missing binding remains missing, and a stable session binding is already
+    route-independent.  Any third binding is another authority and is refused.
+    The caller's durable relocation journal makes a completed rewrite
+    crash-reconcilable before the outer route is committed.
+    """
+
+    if not os.path.lexists(root):
+        return
+    _validate_private_directory(root, "queue directory")
+    lock_path = os.path.join(root, ".binding.lock")
+    binding_path = os.path.join(root, "target.json")
+    descriptor = _open_private_lock(lock_path, "queue binding lock")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if not os.path.lexists(binding_path):
+            return
+        actual = _read_queue_json(
+            binding_path, "queue target binding", require_private=True,
+        )
+        old_expected = _binding(old)
+        new_expected = _binding(new)
+        if actual == new_expected:
+            return
+        if actual != old_expected:
+            raise AgentDeliveryError(
+                f"queue {root} is bound to {actual!r}, refusing relocation from "
+                f"{old_expected!r} to {new_expected!r}"
+            )
+        _atomic_json(binding_path, new_expected)
+    finally:
+        os.close(descriptor)
 
 
 def _validate_existing_queue(root: str) -> None:
@@ -1469,13 +1517,13 @@ def _wait_ready(
             raise AgentDeliveryError(
                 f"target moved from locked pane {locked_pane_id!r} to {info.pane_id!r}"
             )
-        if info.status in ("idle", "done"):
+        if info.status in ("idle", "done", "staged"):
             return info
         if info.status == "blocked":
             raise AgentDeliveryError(f"pane {info.pane_id} is blocked; resolve its visible prompt")
         if monotonic() >= deadline:
             raise AgentDeliveryError(
-                f"pane {info.pane_id} did not become idle/done within {timeout:g}s; last status={info.status}"
+                f"pane {info.pane_id} did not become idle/done/staged within {timeout:g}s; last status={info.status}"
             )
         sleep(min(0.25, max(0.0, deadline - monotonic())))
 
@@ -1499,7 +1547,8 @@ def _deliver_one(
         client.wait_agent_status(info.pane_id, "working", max(1, int(working_timeout * 1000)))
     except HerdrUnavailable as exc:
         raise _PossiblySubmitted(
-            f"pane {info.pane_id} did not confirm idle/done -> working submission: {exc}"
+            f"pane {info.pane_id} did not confirm ready -> working submission; "
+            f"outcome is unknown: {exc}"
         ) from exc
 
 
@@ -1693,7 +1742,65 @@ def send(
         raise AgentDeliveryError("atomic_policy must be an AtomicWritePolicy or None")
     with atomic_write_policy(atomic_policy):
         return _send(client, target, root, text, message_id=message_id,
-                     atomic_policy=_ACTIVE_ATOMIC_POLICY.get(), **kwargs)
+                     atomic_policy=_ACTIVE_ATOMIC_POLICY.get(), kind="message", **kwargs)
+
+
+def send_goal(
+    client: HerdrClient, target: Target, root: str, text: str, *,
+    message_id: str, **kwargs: object,
+) -> QueueResult:
+    """Durably send one goal-tagged prompt through the same queue state machine."""
+    atomic_policy = kwargs.pop("atomic_policy", None)
+    if atomic_policy is not None and not isinstance(atomic_policy, AtomicWritePolicy):
+        raise AgentDeliveryError("atomic_policy must be an AtomicWritePolicy or None")
+    with atomic_write_policy(atomic_policy):
+        return _send(
+            client, target, root, text, message_id=message_id,
+            atomic_policy=_ACTIVE_ATOMIC_POLICY.get(), kind="goal", **kwargs,
+        )
+
+
+def message_state(root: str, message_id: str) -> str | None:
+    """Locate one exact message in the validated queue without guessing."""
+    if _MESSAGE_ID.fullmatch(message_id) is None:
+        raise AgentDeliveryError("message id has an invalid shape")
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AgentDeliveryError(
+            f"cannot inspect queue directory {root}: {exc}"
+        ) from exc
+    _validate_existing_queue(root)
+    filename = f"{message_id}.json"
+    observed: str | None = None
+    for state, directory in zip(
+        ("pending", "inflight", "processed", "failed"), _dirs(root), strict=True,
+    ):
+        path = os.path.join(directory, filename)
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AgentDeliveryError(f"cannot inspect queue message {path}: {exc}") from exc
+        document = _read_queue_json(
+            path,
+            "queued message",
+            require_private=True,
+            max_artifact_bytes=_MESSAGE_STATE_MAX_BYTES,
+        )
+        if not isinstance(document, dict) or document.get("id") != message_id:
+            raise AgentDeliveryError(
+                f"queue artifact {path} contains a different message id"
+            )
+        if observed is not None:
+            raise AgentDeliveryError(
+                f"message id {message_id!r} exists in multiple queue phases"
+            )
+        observed = state
+    return observed
 
 
 def reconcile_delivery(
@@ -1797,7 +1904,7 @@ def _remove_optional_delivery_sidecar(path: str, parent: str) -> None:
 
 def _send(
     client: HerdrClient, target: Target, root: str, text: str, *, message_id: str | None,
-    atomic_policy: AtomicWritePolicy | None, **kwargs: object,
+    atomic_policy: AtomicWritePolicy | None, kind: str, **kwargs: object,
 ) -> QueueResult:
 
     max_artifact_bytes = kwargs.pop("max_artifact_bytes", None)
@@ -1812,7 +1919,7 @@ def _send(
     # it. Serialize that check with delivery, so the same ID cannot be recreated.
     identifier = _enqueue(
         root, text, message_id=message_id, serialize=message_id is not None,
-        max_artifact_bytes=max_artifact_bytes,
+        max_artifact_bytes=max_artifact_bytes, kind=kind,
     )
     result = drain(client, target, root, max_artifact_bytes=max_artifact_bytes,
                    atomic_policy=atomic_policy, **kwargs)  # type: ignore[arg-type]

@@ -17,6 +17,9 @@ from pathlib import Path
 import agentctl.client as client_module
 from agentctl.client import (
     claude_active_screen,
+    claude_prompt_is_exact_composer,
+    claude_prompt_transcript_count,
+    claude_staged_composer,
     CustomProcessIdentity,
     HerdrClient,
     ProcessInfo,
@@ -26,6 +29,7 @@ from agentctl.client import (
     muse_prompt_is_exact_composer,
     muse_prompt_transcript_count,
     muse_startup_metadata,
+    muse_verified_process_composer,
     muse_verified_process_idle_composer,
     muse_verified_process_prompt_in_composer,
     muse_verified_process_prompt_is_exact_composer,
@@ -221,11 +225,48 @@ def test_claude_active_screen_requires_current_activity_controls() -> None:
     ))
     assert not claude_active_screen(screen.replace("Waiting", "Waited"))
     assert not claude_active_screen(screen.replace("← 2 agents", "← 1 agent"))
+    staged_while_active = (
+        "● Background command still running\n"
+        "✽ Considering… (20m 51s)\n"
+        f"{divider}\n"
+        "❯ queued follow-up prompt\n"
+        "  ctrl+x ctrl+s to send now\n"
+        f"{divider}\n"
+        "⏵⏵ auto mode on · esc to interrupt · ← 2 agents\n"
+    )
+    assert claude_active_screen(staged_while_active)
     assert not claude_active_screen(
         screen.replace("❯", "old transcript\n❯", 1).replace(
             "✻ Waiting for 1 background agent to finish\n", "", 1,
         )
     )
+
+
+def test_claude_staged_prompt_is_distinct_from_a_submitted_turn() -> None:
+    divider = "─" * 40
+    prompt = "review the deterministic- scheduling contract"
+    staged = (
+        "● Background command still running\n"
+        f"{divider}\n"
+        "❯ review the deterministic-\n"
+        "  scheduling contract\n"
+        "  ctrl+x ctrl+s to send now\n"
+        f"{divider}\n"
+        "⏵⏵ auto mode on · esc to interrupt · ← 2 agents\n"
+    )
+    assert claude_staged_composer(staged)
+    assert claude_prompt_is_exact_composer(staged, prompt)
+    assert claude_prompt_transcript_count(staged, prompt) == 0
+
+    submitted = (
+        f"❯ {prompt}\n"
+        "● Working on the request\n"
+        f"{divider}\n❯\n{divider}\n"
+        "⏵⏵ auto mode on · esc to interrupt\n"
+    )
+    assert not claude_staged_composer(submitted)
+    assert not claude_prompt_is_exact_composer(submitted, prompt)
+    assert claude_prompt_transcript_count(submitted, prompt) == 1
 
 
 def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
@@ -332,6 +373,7 @@ def test_headerless_muse_composer_requires_verified_process_context() -> None:
         "kiki · xhigh · /work/project · YOLO\n"
     )
     assert not muse_idle_composer(screen)
+    assert muse_verified_process_composer(screen)
     assert muse_verified_process_idle_composer(screen)
     prompt = "require the full deterministic-scheduling-review skill"
     staged = screen.replace("❯\n", f"❯ {prompt}\n")
@@ -343,6 +385,39 @@ def test_headerless_muse_composer_requires_verified_process_context() -> None:
         f"❯ {prompt}\n◆ Working\n",
     )
     assert muse_verified_process_prompt_transcript_count(accepted, prompt) == 1
+
+
+def test_exact_muse_composer_matches_only_requested_hyphen_soft_wraps() -> None:
+    divider = "─" * 40
+    footer = "kiki · xhigh · /work/project · YOLO\n"
+    prompt = (
+        "Use deterministic-scheduling-review and keep this buffered prompt "
+        "byte-for-byte"
+    )
+    wrapped = (
+        "old transcript\n"
+        f"{divider}\n"
+        "❯ Use deterministic-\n"
+        "  scheduling-review and keep this buffered prompt byte-for-byte\n"
+        f"{divider}\n{footer}"
+    )
+    assert muse_verified_process_composer(wrapped)
+    assert muse_verified_process_prompt_is_exact_composer(wrapped, prompt)
+    assert not muse_verified_process_prompt_is_exact_composer(
+        wrapped, prompt.replace("byte-for-byte", "byte for byte"),
+    )
+    accepted = (
+        "❯ Use deterministic-\n"
+        "  scheduling-review and keep this buffered prompt byte-for-byte\n"
+        "◆ Working\n"
+        f"{divider}\n❯\n{divider}\n{footer}"
+    )
+    assert muse_verified_process_prompt_transcript_count(accepted, prompt) == 1
+
+    # Only a physical boundary immediately after the same hyphen may omit the
+    # normalization space.  This does not globally erase spaces around '-'.
+    weakened = wrapped.replace("deterministic-\n", "deterministic -\n")
+    assert not muse_verified_process_prompt_is_exact_composer(weakened, prompt)
 
 
 def test_custom_muse_launch_never_accepts_a_trust_prompt() -> None:

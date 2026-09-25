@@ -812,7 +812,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
     let client =
         HerdrClient::with_executable("direct", &args.herdr_bin).map_err(AgentError::from)?;
     let manager = ManagedAgents::new(&client, &args.registry)?;
-    let mut result = match command {
+    let result = match command {
         Commands::Start(value) => {
             let (_, project_config) = crate::profiles::load_project_config(&value.cwd, true)?;
             let launch_profile = value.profile.clone();
@@ -967,14 +967,12 @@ fn run(args: Cli) -> Result<i32, Failure> {
         }
         Commands::List => {
             let (rows, healthy) = manager.list_with_health();
-            let mut result = json!(rows);
-            add_capabilities(&mut result);
+            let result = json!(rows);
             write_json(&result).map_err(Failure::Output)?;
             return Ok(if healthy { 0 } else { 1 });
         }
         Commands::Status(value) => {
-            let (mut result, healthy) = manager.status_with_health(&value.name)?;
-            add_capabilities(&mut result);
+            let (result, healthy) = manager.status_with_health(&value.name)?;
             write_json(&result).map_err(Failure::Output)?;
             return Ok(if healthy { 0 } else { 1 });
         }
@@ -1082,7 +1080,6 @@ fn run(args: Cli) -> Result<i32, Failure> {
             unreachable!()
         }
     };
-    add_capabilities(&mut result);
     write_json(&result).map_err(Failure::Output)?;
     Ok(0)
 }
@@ -1217,43 +1214,6 @@ fn capabilities_document(
             "plugins": plugins
         }
     })
-}
-
-fn add_capabilities(value: &mut serde_json::Value) {
-    if let Some(values) = value.as_array_mut() {
-        for value in values {
-            add_capabilities(value);
-        }
-    } else if value.get("adapter").is_some() && value.get("name").is_some() {
-        value["capabilities"] = if matches!(
-            value["adapter"].as_str(),
-            Some("herdr" | "herdr-pane" | "herdr-foreign")
-        ) && value["mode"] == "interactive"
-            && value["backend"] == "herdr"
-        {
-            let mut capabilities = vec![
-                "send",
-                "status",
-                "read",
-                "wait",
-                "stop",
-                "attach",
-                "pause",
-                "resume",
-                "terminal-snapshot",
-                "drain",
-                "goal",
-                "bind-session",
-                "relocate",
-            ];
-            if value["adapter"] == "herdr-pane" && value["harness"] == "muse" {
-                capabilities.push("reconcile-delivery");
-            }
-            json!(capabilities)
-        } else {
-            json!(["status"])
-        };
-    }
 }
 
 #[cfg(test)]
@@ -1621,35 +1581,6 @@ mod tests {
                 .as_array()
                 .expect("missing capability list")
                 .contains(&json!("rust-provider"))
-        );
-    }
-
-    #[test]
-    fn adopted_interactive_records_advertise_the_full_named_interface() {
-        let mut record = json!({
-            "name": "foreign",
-            "adapter": "herdr-foreign",
-            "mode": "interactive",
-            "backend": "herdr",
-        });
-        add_capabilities(&mut record);
-        assert_eq!(
-            record["capabilities"],
-            json!([
-                "send",
-                "status",
-                "read",
-                "wait",
-                "stop",
-                "attach",
-                "pause",
-                "resume",
-                "terminal-snapshot",
-                "drain",
-                "goal",
-                "bind-session",
-                "relocate"
-            ])
         );
     }
 }

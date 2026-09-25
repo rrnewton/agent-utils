@@ -1010,9 +1010,13 @@ def test_harness_group_teardown_signals_only_pinned_generations_after_final_proo
         lib, "_pidfd_signal", lambda descriptor, signum: events.append(("pidfd", signum)),
     )
 
+    real_close = os.close
+
     def close(descriptor: int) -> None:
         nonlocal closed
-        assert descriptor in (77, 78)
+        if descriptor not in (77, 78):
+            real_close(descriptor)
+            return
         if descriptor == 77:
             closed = True
         events.append(("close", descriptor))
@@ -1163,6 +1167,140 @@ def test_owner_generation_binds_once_and_rejects_stale_runtime_operations(
             "name": rec.name, "owner_token": second, "desired_paused": False,
         })
     assert not called
+
+
+def test_owner_permission_policy_is_part_of_the_generation_binding(
+    fake_runner_state: Path,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "permission-bound")
+    token = rec.owner_token
+    assert token is not None
+    native = lib.verify_owner_permission(rec.name, token, "native")
+    assert native.codex_bypass_permissions is False
+
+    before = lib.REGISTRY.read_bytes()
+    with pytest.raises(lib.AgentOperationError, match="different permission") as raised:
+        lib.verify_owner_permission(rec.name, token, "bypass")
+    assert raised.value.code == "owner_launch_mismatch"
+    assert lib.REGISTRY.read_bytes() == before
+
+
+def test_existing_worker_start_refuses_permission_policy_drift(
+    fake_runner_state: Path,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "permission-start")
+    with lib.registry_lock() as agents:
+        agents[rec.name].harness = "codex"
+        agents[rec.name].model = None
+        agents[rec.name].harness_args = ()
+    token = lib.read_registry()[rec.name].owner_token
+    assert token is not None
+
+    with pytest.raises(lib.AgentOperationError, match="different launch") as raised:
+        worker_rpc.dispatch({
+            "schema": "agentctl-worker-rpc/v2",
+            "action": "start",
+            "name": rec.name,
+            "owner_token": token,
+            "desired_paused": False,
+            "permission_mode": "bypass",
+            "cwd": rec.cwd,
+            "harness": "codex",
+            "model": None,
+            "backend": rec.backend,
+            "harness_args": [],
+            "brief": None,
+        })
+    assert raised.value.code == "owner_launch_mismatch"
+    assert lib.read_registry()[rec.name].codex_bypass_permissions is False
+
+
+def test_legacy_pid_start_identity_is_never_upgraded_from_current_process(
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "legacy-identity")
+    legacy = rec.to_public_dict()
+    legacy.pop("owner_token")
+    legacy.pop("runner_identity")
+    legacy["runner_pid"] = os.getpid()
+    legacy["runner_started_at"] = lib.pid_start_time(os.getpid())
+    raw = json.dumps([legacy], sort_keys=True).encode()
+    lib.REGISTRY.write_bytes(raw)
+    calls = 0
+
+    def forbidden_capture(_pid: int) -> CustomProcessIdentity:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("legacy identity must not sample the current PID occupant")
+
+    monkeypatch.setattr(lib, "capture_process_identity", forbidden_capture)
+    loaded = lib.read_registry()[rec.name]
+    assert loaded.runner_identity is None
+    assert lib.runner_liveness(loaded) is lib.ProcessLiveness.UNKNOWN
+    assert calls == 0
+    with pytest.raises(lib.AgentOperationError, match="explicit recovery") as raised:
+        lib.bind_owner_token(rec.name, "a" * 32)
+    assert raised.value.code == "runner_identity_incomplete"
+    assert lib.REGISTRY.read_bytes() == raw
+
+
+def test_binding_one_legacy_row_preserves_unrelated_untrusted_row(
+    fake_runner_state: Path,
+) -> None:
+    first = _install_agy_agent(fake_runner_state, "first")
+    second = replace(first, name="second", tmux_target="subagents:second")
+    rows = []
+    for record in (first, second):
+        legacy = record.to_public_dict()
+        legacy.pop("owner_token")
+        legacy.pop("runner_identity")
+        if record.name == "second":
+            legacy["runner_pid"] = os.getpid()
+            legacy["runner_started_at"] = lib.pid_start_time(os.getpid())
+        rows.append(legacy)
+    lib.REGISTRY.write_text(json.dumps(rows, sort_keys=True), encoding="utf-8")
+    sidecar = lib._permission_policy_path("second")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar_bytes = b'{"legacy":"must remain untouched"}\n'
+    sidecar.write_bytes(sidecar_bytes)
+
+    bound = lib.bind_owner_token("first", "a" * 32)
+
+    assert bound.owner_token == "a" * 32
+    stored = json.loads(lib.REGISTRY.read_text(encoding="utf-8"))
+    second_stored = next(row for row in stored if row["name"] == "second")
+    assert "owner_token" not in second_stored
+    assert "schema" not in second_stored
+    assert "runner_identity" not in second_stored
+    assert sidecar.read_bytes() == sidecar_bytes
+
+
+def test_worker_start_launch_mismatch_does_not_claim_or_rewrite_legacy_row(
+    fake_runner_state: Path,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "mismatch")
+    legacy = rec.to_public_dict()
+    legacy.pop("owner_token")
+    legacy.pop("runner_identity")
+    raw = (json.dumps([legacy], sort_keys=True) + "\n").encode()
+    lib.REGISTRY.write_bytes(raw)
+
+    with pytest.raises(lib.AgentOperationError) as raised:
+        worker_rpc.dispatch({
+            "schema": "agentctl-worker-rpc/v2",
+            "action": "start",
+            "name": rec.name,
+            "owner_token": "a" * 32,
+            "desired_paused": False,
+            "cwd": rec.cwd,
+            "harness": "codex",
+            "model": rec.model,
+            "backend": rec.backend,
+            "harness_args": [],
+            "brief": None,
+        })
+    assert raised.value.code == "owner_launch_mismatch"
+    assert lib.REGISTRY.read_bytes() == raw
 
 
 def test_pause_markers_are_scoped_to_the_owner_generation(

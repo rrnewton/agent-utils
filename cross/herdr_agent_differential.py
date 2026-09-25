@@ -201,8 +201,17 @@ elif args[:2] == ["tab", "create"]:
         "terminal_id":terminal_id,
     }})
 elif args[:2] == ["pane", "move"]:
-    if args[2] != pane_id or "--new-tab" not in args or "--no-focus" not in args:
+    if (args[2] != pane_id or "--new-tab" not in args or "--no-focus" not in args
+            or "--expect-terminal-id" not in args):
         print("invalid pane move", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    expected_terminal = args[args.index("--expect-terminal-id") + 1]
+    if state.pop("replace_terminal_before_move", False):
+        terminal_id = "replacement-terminal"
+        state["terminal_id"] = terminal_id
+    if expected_terminal != terminal_id:
+        print("conditional terminal identity changed", file=sys.stderr)
         save()
         raise SystemExit(1)
     target = args[args.index("--workspace") + 1]

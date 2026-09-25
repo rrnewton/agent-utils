@@ -127,6 +127,8 @@ MIGRATION_READY_TIMEOUT_S: float = float(os.environ.get("SUBAGENTS_MIGRATION_REA
 STARTUP_GRACE_S: int = 20
 MAX_RUNTIME_REGISTRY_BYTES: int = 8 << 20
 MAX_STOP_RECEIPT_BYTES: int = 64 << 10
+MAX_IDENTITY_RECORD_BYTES: int = 64 << 10
+MAX_QUEUE_MESSAGE_BYTES: int = 8 << 20
 MAX_PROC_ENTRIES: int = 1 << 20
 MAX_HARNESS_GROUP_MEMBERS: int = 4096
 MAX_HARNESS_FREEZE_ROUNDS: int = 64
@@ -486,7 +488,6 @@ class AgentRecord:
     # above are accepted only while loading legacy rows and are not emitted
     # when this field is present.
     runner_identity: Optional[CustomProcessIdentity] = None
-
     @staticmethod
     def from_dict(d: dict[str, object]) -> "AgentRecord":
         """Load a strict current row or normalize one supported untagged row."""
@@ -565,17 +566,6 @@ class AgentRecord:
                 die("registry row has contradictory runner identity")
             legacy_pid = runner_identity.pid
             legacy_started = str(runner_identity.starttime_ticks)
-        elif legacy_pid is not None and legacy_started is not None:
-            # Upgrade a live legacy PID/start row while the original process
-            # generation is still available.  Failure to capture the boot and
-            # executable identity deliberately leaves the row legacy: callers
-            # may prove that generation dead, but may not control it as live.
-            try:
-                observed = capture_process_identity(legacy_pid)
-            except AgentOperationError:
-                observed = None
-            if observed is not None and str(observed.starttime_ticks) == legacy_started:
-                runner_identity = observed
         owner_token = d.get("owner_token")
         if owner_token is not None and (
             not isinstance(owner_token, str)
@@ -638,15 +628,7 @@ class AgentRecord:
         else:
             durable_identity = self.runner_identity
         if durable_identity is None and self.runner_pid is not None and self.mode == HEADLESS_MODE:
-            try:
-                observed = capture_process_identity(self.runner_pid)
-            except AgentOperationError:
-                observed = None
-            if (observed is not None and self.runner_started_at is not None
-                    and str(observed.starttime_ticks) == self.runner_started_at):
-                durable_identity = observed
-                self.runner_identity = observed
-            elif runner_liveness(self) is ProcessLiveness.UNKNOWN:
+            if runner_liveness(self) is ProcessLiveness.UNKNOWN:
                 raise AgentOperationError(
                     "runner_identity_unknown",
                     "refusing to persist a live or unverified runner without boot-bound identity",
@@ -844,7 +826,9 @@ def _load_presentation_identity(row: dict[str, object]) -> Optional[Presentation
     if not path.exists():
         return None
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(_read_bounded_private_text(
+            path, MAX_IDENTITY_RECORD_BYTES, "presentation identity",
+        ))
     except json.JSONDecodeError as exc:
         die(f"presentation identity {path} is corrupt ({exc}); inspect it before sending work")
     if not isinstance(raw, dict):
@@ -880,7 +864,9 @@ def _load_codex_permission_policy(row: dict[str, object]) -> bool:
         path = _permission_policy_path(str(row["name"]))
         if path.exists():
             try:
-                saved = json.loads(path.read_text())
+                saved = json.loads(_read_bounded_private_text(
+                    path, MAX_IDENTITY_RECORD_BYTES, "worker permissions",
+                ))
             except (OSError, json.JSONDecodeError) as exc:
                 raise AgentOperationError("invalid_permission_policy", f"cannot read worker permissions {path}: {exc}") from exc
             if not isinstance(saved, dict):
@@ -905,12 +891,19 @@ def _clear_legacy_sidecars(name: str) -> None:
 def _read_bounded_private_text(path: Path, limit: int, label: str) -> str:
     """Read one regular private control file without an unbounded allocation."""
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except FileNotFoundError:
+        # Absence is meaningful to optional control-record readers; do not
+        # collapse it into an unreadable or ambiguous record.
+        raise
     except OSError as exc:
         raise AgentOperationError("control_record_unavailable", f"cannot open {label}: {exc}") from exc
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_size < 0
+                or metadata.st_size > limit):
             raise AgentOperationError(
                 "control_record_invalid", f"{label} is not a regular file within {limit} bytes",
             )
@@ -926,6 +919,13 @@ def _read_bounded_private_text(path: Path, limit: int, label: str) -> str:
             raise AgentOperationError(
                 "control_record_invalid", f"{label} exceeds {limit} bytes",
             )
+        confirmed = os.fstat(descriptor)
+        if (confirmed.st_dev, confirmed.st_ino, confirmed.st_size) != (
+            metadata.st_dev, metadata.st_ino, metadata.st_size,
+        ):
+            raise AgentOperationError(
+                "control_record_invalid", f"{label} changed while it was read",
+            )
         return b"".join(chunks).decode("utf-8")
     except UnicodeError as exc:
         raise AgentOperationError("control_record_invalid", f"{label} is not UTF-8") from exc
@@ -933,9 +933,19 @@ def _read_bounded_private_text(path: Path, limit: int, label: str) -> str:
         os.close(descriptor)
 
 
-def _load_unlocked() -> tuple[dict[str, AgentRecord], bool]:
+class _RegistryRows(dict[str, AgentRecord]):
+    """Canonical rows plus legacy serialization state kept at the I/O boundary."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.legacy_documents: dict[str, dict[str, object]] = {}
+        self.original_records: dict[str, AgentRecord] = {}
+        self.force_current: set[str] = set()
+
+
+def _load_unlocked() -> tuple[_RegistryRows, bool]:
     if not REGISTRY.exists():
-        return {}, False
+        return _RegistryRows(), False
     try:
         raw = json.loads(_read_bounded_private_text(
             REGISTRY, MAX_RUNTIME_REGISTRY_BYTES, "runtime registry",
@@ -944,41 +954,69 @@ def _load_unlocked() -> tuple[dict[str, AgentRecord], bool]:
         die(f"registry.json is corrupt ({exc}); inspect {REGISTRY} by hand")
     if not isinstance(raw, list):
         die(f"registry.json must be a JSON array, found {type(raw).__name__}")
-    out: dict[str, AgentRecord] = {}
+    out = _RegistryRows()
     migration_needed = False
     for row in raw:
         if not isinstance(row, dict):
             die("registry.json rows must be JSON objects")
         rec = AgentRecord.from_dict(row)
         out[rec.name] = rec
+        if row.get("schema") != RUNTIME_RECORD_SCHEMA:
+            out.legacy_documents[rec.name] = dict(row)
+            out.original_records[rec.name] = dataclasses.replace(rec)
         # An old MCP writer can serialize a row without TUI-only fields. The
         # durable presentation identity rehydrates them above; record that the
         # registry itself needs repair so the next read makes the canonical row
         # whole again instead of leaving a live TUI stranded on disk.
-        if rec.owner_token is not None and (
+        migrate = rec.owner_token is not None and (
             row.get("schema") != RUNTIME_RECORD_SCHEMA
             or (rec.mode == TUI_MODE and any(
-                row.get(field) != rec.to_dict()[field]
+                row.get(field) != getattr(rec, field)
                 for field in ("backend", "mode", "presentation_pane")
             ))
-        ):
+        )
+        # A PID/start-only row cannot be upgraded: those values are boot-local
+        # and do not prove the current process image.  Keep its exact legacy
+        # document until an explicit recovery supplies boot/image authority.
+        if (migrate and rec.mode == HEADLESS_MODE
+                and rec.runner_pid is not None and rec.runner_identity is None):
+            migrate = False
+        if migrate:
+            out.force_current.add(rec.name)
             migration_needed = True
     return out, migration_needed
 
 
 def _save_unlocked(agents: dict[str, AgentRecord]) -> None:
-    for rec in agents.values():
+    payload: list[dict[str, object]] = []
+    emitted_current: set[str] = set()
+    legacy_documents = (
+        agents.legacy_documents if isinstance(agents, _RegistryRows) else {}
+    )
+    original_records = (
+        agents.original_records if isinstance(agents, _RegistryRows) else {}
+    )
+    force_current = agents.force_current if isinstance(agents, _RegistryRows) else set()
+    for name in sorted(agents):
+        rec = agents[name]
+        if (name in legacy_documents and name not in force_current
+                and original_records.get(name) == rec):
+            payload.append(dict(legacy_documents[name]))
+            continue
+        # Only the row actually changed by the current transaction receives a
+        # local owner generation.  Unrelated legacy rows above stay untouched.
         if rec.owner_token is None:
             rec.owner_token = secrets.token_hex(16)
-    payload = [agents[name].to_dict() for name in sorted(agents)]
+        payload.append(rec.to_dict())
+        emitted_current.add(name)
     tmp = REGISTRY.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
     os.replace(tmp, REGISTRY)
     # These were compatibility mirrors for writers predating the tagged row.
     # Delete them only after the canonical registry replacement succeeds.
-    for rec in agents.values():
-        presentation_identity_path(rec.name).unlink(missing_ok=True)
-        _permission_policy_path(rec.name).unlink(missing_ok=True)
+    for name in emitted_current:
+        presentation_identity_path(name).unlink(missing_ok=True)
+        _permission_policy_path(name).unlink(missing_ok=True)
 
 
 @contextlib.contextmanager
@@ -1027,21 +1065,96 @@ def read_registry() -> dict[str, AgentRecord]:
         os.close(fd)
 
 
+def _validate_owner_token(owner_token: str) -> None:
+    if re.fullmatch(r"[a-z0-9-]{1,80}", owner_token) is None:
+        raise AgentOperationError("invalid_owner_token", "owner token has an invalid shape")
+
+
+def _bind_owner_record(rec: AgentRecord, owner_token: str) -> None:
+    """Bind one already validated row without sampling missing identity."""
+    if rec.owner_token is None:
+        if (rec.mode == HEADLESS_MODE and rec.runner_pid is not None
+                and rec.runner_identity is None):
+            raise AgentOperationError(
+                "runner_identity_incomplete",
+                f"runtime {rec.name!r} has only a legacy PID/start identity; "
+                "explicit recovery is required before it can be adopted",
+            )
+        rec.owner_token = owner_token
+    elif rec.owner_token != owner_token:
+        raise AgentOperationError(
+            "owner_token_mismatch",
+            f"runtime {rec.name!r} belongs to another session generation",
+        )
+
+
 def bind_owner_token(name: str, owner_token: str) -> AgentRecord:
     """Bind or verify the canonical session generation for one runtime row."""
     valid_name = require_valid_name(name)
-    if re.fullmatch(r"[a-z0-9-]{1,80}", owner_token) is None:
-        raise AgentOperationError("invalid_owner_token", "owner token has an invalid shape")
+    _validate_owner_token(owner_token)
     with registry_lock() as agents:
         rec = agents.get(valid_name)
         if rec is None:
             raise AgentOperationError("unknown_agent", f"unknown agent {valid_name!r}")
-        if rec.owner_token is None:
-            rec.owner_token = owner_token
-        elif rec.owner_token != owner_token:
+        _bind_owner_record(rec, owner_token)
+        return dataclasses.replace(rec)
+
+
+def bind_owner_launch(
+    name: str, owner_token: str, *, cwd: str, harness: str,
+    model: str | None, backend: str, harness_args: tuple[str, ...],
+    bypass_permissions: bool | None = None,
+) -> AgentRecord:
+    """Compare the full existing launch and bind its owner in one transaction."""
+    valid_name = require_valid_name(name)
+    _validate_owner_token(owner_token)
+    resolved_cwd = str(Path(cwd).expanduser().resolve())
+    with registry_lock() as agents:
+        rec = agents.get(valid_name)
+        if rec is None:
+            raise AgentOperationError("unknown_agent", f"unknown agent {valid_name!r}")
+        if (
+            rec.cwd != resolved_cwd
+            or rec.harness != harness
+            or rec.model != model
+            or rec.backend != backend
+            or rec.mode != HEADLESS_MODE
+            or rec.harness_args != harness_args
+            or (
+                bypass_permissions is not None
+                and rec.codex_bypass_permissions != bypass_permissions
+            )
+        ):
             raise AgentOperationError(
-                "owner_token_mismatch",
-                f"runtime {valid_name!r} belongs to another session generation",
+                "owner_launch_mismatch",
+                f"runtime {valid_name!r} exists with a different launch specification",
+            )
+        _bind_owner_record(rec, owner_token)
+        return dataclasses.replace(rec)
+
+
+def verify_owner_permission(
+    name: str, owner_token: str, permission_mode: str | None,
+) -> AgentRecord:
+    """Verify one outer generation's immutable permission policy."""
+    if permission_mode not in (None, "native", "bypass"):
+        raise AgentOperationError(
+            "invalid_permission_policy", "permission mode must be native or bypass",
+        )
+    valid_name = require_valid_name(name)
+    _validate_owner_token(owner_token)
+    with registry_lock() as agents:
+        rec = agents.get(valid_name)
+        if rec is None:
+            raise AgentOperationError("unknown_agent", f"unknown agent {valid_name!r}")
+        _bind_owner_record(rec, owner_token)
+        if (
+            permission_mode is not None
+            and rec.codex_bypass_permissions != (permission_mode == "bypass")
+        ):
+            raise AgentOperationError(
+                "owner_launch_mismatch",
+                f"runtime {valid_name!r} has a different permission policy",
             )
         return dataclasses.replace(rec)
 
@@ -1165,10 +1278,12 @@ def terminate_active_harness(rec: AgentRecord) -> bool:
     """Kill only the detached harness group pinned to this worker generation."""
     path = agent_dir(rec.name) / "active-harness.json"
     try:
-        value = json.loads(path.read_text())
+        value = json.loads(_read_bounded_private_text(
+            path, MAX_IDENTITY_RECORD_BYTES, "active harness identity",
+        ))
     except FileNotFoundError:
         return False
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, AgentOperationError) as exc:
         raise AgentOperationError("harness_identity_unknown", f"cannot read active harness identity: {exc}") from exc
     if not isinstance(value, dict) or value.get("schema") != "agentctl-active-harness/v2":
         raise AgentOperationError("harness_identity_unknown", "malformed active harness identity")
@@ -1286,8 +1401,11 @@ def acknowledge_migration_pause(name: str, identity: RunnerIdentity) -> None:
 def pause_acknowledged(name: str, old: RunnerIdentity) -> bool:
     """Check that the pause acknowledgement belongs to the expected source process."""
     try:
-        raw = cast(dict[str, object], json.loads(migration_pause_ack_path(name).read_text()))
-    except (OSError, json.JSONDecodeError):
+        raw = cast(dict[str, object], json.loads(_read_bounded_private_text(
+            migration_pause_ack_path(name), MAX_IDENTITY_RECORD_BYTES,
+            "migration pause acknowledgement",
+        )))
+    except (OSError, json.JSONDecodeError, AgentOperationError):
         return False
     return (
         raw.get("schema") == "agentctl-migration-pause-ack/v2"
@@ -1308,7 +1426,10 @@ def write_staged_runner(name: str, token: str, identity: RunnerIdentity) -> None
 def read_staged_runner(name: str, token: str) -> Optional[RunnerIdentity]:
     """Read a replacement-runner identity, returning None when no valid record exists."""
     try:
-        raw = json.loads(staged_runner_path(name, token).read_text())
+        raw = json.loads(_read_bounded_private_text(
+            staged_runner_path(name, token), MAX_IDENTITY_RECORD_BYTES,
+            "staged runner identity",
+        ))
         if (not isinstance(raw, dict)
                 or raw.get("schema") != "agentctl-staged-runner/v2"
                 or raw.get("token") != token
@@ -1367,10 +1488,16 @@ def last_message_preview(name: str, limit: int = 240) -> str:
     p = last_message_path(name)
     if not p.exists():
         return ""
-    text = " ".join(p.read_text(errors="replace").split())
+    try:
+        text = " ".join(_read_bounded_private_text(
+            p, MAX_QUEUE_MESSAGE_BYTES, "last completed message",
+        ).split())
+    except AgentOperationError as exc:
+        text = f"[{exc.code}: {exc.message}]"
     if len(text) <= limit:
         return text
-    return text[: max(0, limit - 3)] + "..."
+    marker = "..."
+    return marker[:limit] if limit <= len(marker) else text[:limit - len(marker)] + marker
 
 
 def write_event(
@@ -1426,7 +1553,9 @@ class Message:
     @staticmethod
     def from_path(path: Path) -> "Message":
         """Read a queued turn, accepting records that omit optional model and effort overrides."""
-        d = json.loads(path.read_text())
+        d = json.loads(_read_bounded_private_text(
+            path, MAX_QUEUE_MESSAGE_BYTES, "queued turn",
+        ))
         return Message(
             seq=int(d["seq"]),
             text=str(d["text"]),
@@ -1485,7 +1614,14 @@ def pending_count(name: str) -> int:
 
 def _record_tui_delivery_failure(path: Path, exc: AgentOperationError) -> int:
     """Persist a failed attempt before retrying or quarantining a TUI message."""
-    raw = json.loads(path.read_text())
+    try:
+        raw = json.loads(_read_bounded_private_text(
+            path, MAX_QUEUE_MESSAGE_BYTES, "TUI inbox message",
+        ))
+    except json.JSONDecodeError as error:
+        raise AgentOperationError(
+            "tui_inbox_corrupt", f"TUI inbox message {path} is invalid JSON: {error}",
+        ) from error
     attempts = raw.get("tui_delivery_attempts", 0)
     if not isinstance(attempts, int) or attempts < 0:
         raise AgentOperationError(
@@ -3080,6 +3216,7 @@ def bring_up_agent(
     purpose: str = "development",
     harness_args: Sequence[str] = (),
     owner_token: Optional[str] = None,
+    bypass_permissions: Optional[bool] = None,
 ) -> UpResult:
     """Validate policy and launch a named worker, optionally enqueueing its first task."""
     harness = require_supported_harness(harness)
@@ -3093,7 +3230,18 @@ def bring_up_agent(
             "unsupported_harness_arguments",
             "headless harness arguments currently apply only to Muse",
         )
-    bypass_permissions = _configured_codex_bypass_permissions()
+    if bypass_permissions is None:
+        bypass_permissions = (
+            _configured_codex_bypass_permissions() if harness == "codex" else False
+        )
+    if not isinstance(bypass_permissions, bool):
+        raise AgentOperationError(
+            "invalid_permission_policy", "bypass_permissions must be a boolean",
+        )
+    if bypass_permissions and harness != "codex":
+        raise AgentOperationError(
+            "invalid_permission_policy", "permission bypass applies only to Codex",
+        )
     backend = selected_backend(backend)
     mode = selected_mode(harness, mode, backend=backend)
     if mode == TUI_MODE and backend != "herdr":

@@ -82,7 +82,9 @@ while keeping their terminals available for direct inspection.
 
    To preserve a running agent while moving its one-pane tab to another Herdr
    workspace, use `agentctl relocate reviewer --workspace-label project
-   --new-tab`. Interrupted moves are reconciled by stable terminal and process
+   --new-tab`. This requires Herdr's atomic `--expect-terminal-id` move
+   precondition; older Herdr releases refuse rather than risk moving a replaced
+   terminal. Interrupted moves are reconciled by stable terminal and process
    identity; the queue and goal remain attached to the same session generation.
 
 5. Finish with `agentctl stop reviewer`. This stops a runtime created by

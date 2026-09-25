@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from agentctl import agent
@@ -23,13 +23,26 @@ from agentctl.profiles import (
     validate_muse_headless_arguments,
     validate_structured_harness_argument_conflicts,
 )
-from agentctl.subagents import AgentRecord, ManagedAgents, _name
+from agentctl.subagents import AgentRecord, LaunchSpec, ManagedAgents, _name
 
 _WORKER_RPC_SCHEMA = "agentctl-worker-rpc/v2"
 _RUNNER_LIVENESS_SCHEMA = "agentctl-runner-liveness/v1"
 _STOP_RESULT_SCHEMA = "agentctl-session-stop/v1"
 _STOP_RESULT_FILE = "stop-result.json"
 _MAX_STOP_RESULT_BYTES = 1 << 20
+
+
+def _headless_permission_mode(harness: str) -> str:
+    """Resolve the one explicit permission mode stored with a new headless launch."""
+    if harness != "codex":
+        return "native"
+    raw = os.environ.get("SUBAGENTS_CODEX_BYPASS_PERMISSIONS", "0")
+    if raw not in ("0", "1"):
+        raise AgentDeliveryError(
+            "SUBAGENTS_CODEX_BYPASS_PERMISSIONS must be exactly 0 "
+            "(native permissions) or 1 (bypass approvals and sandbox)"
+        )
+    return "bypass" if raw == "1" else "native"
 
 
 def _runner_identity(value: object) -> CustomProcessIdentity | None:
@@ -59,6 +72,96 @@ class WorkerRpcError(AgentDeliveryError):
         self.remote_code = remote_code
 
 
+@dataclass(frozen=True)
+class WorkerRuntimeEvidence:
+    """One token-bound observation from the canonical inner runtime registry."""
+
+    backend: str
+    mode: str
+    target: str
+    session_id: str | None
+    pane_id: str | None
+    runner_identity: CustomProcessIdentity | None
+
+    @classmethod
+    def parse(
+        cls, record: AgentRecord, response: dict[str, object],
+    ) -> WorkerRuntimeEvidence:
+        runtime = as_mapping(response.get("record"), "runtime record")
+        if runtime.get("owner_token") != record.token:
+            raise AgentDeliveryError(
+                "worker runtime belongs to another session generation"
+            )
+        immutable = {
+            "name": record.name,
+            "harness": record.launch.harness,
+            "cwd": record.launch.cwd,
+            "model": record.launch.model,
+        }
+        runtime_args = runtime.get("harness_args")
+        if (any(runtime.get(key) != value for key, value in immutable.items())
+                or not isinstance(runtime_args, (list, tuple))
+                or list(runtime_args) != record.arguments
+                or any(not isinstance(value, str) for value in runtime_args)):
+            raise AgentDeliveryError(
+                "worker runtime launch receipt disagrees with canonical launch intent"
+            )
+        if record.launch.permission_mode is not None:
+            bypass = runtime.get("codex_bypass_permissions")
+            if (not isinstance(bypass, bool)
+                    or bypass != (record.launch.permission_mode == "bypass")):
+                raise AgentDeliveryError(
+                    "worker runtime permission policy disagrees with canonical launch intent"
+                )
+        backend = runtime.get("backend")
+        mode = runtime.get("mode")
+        target = runtime.get("tmux_target")
+        session = runtime.get("session_id")
+        pane = runtime.get("presentation_pane")
+        if backend not in ("herdr", "tmux") or mode not in ("headless", "tui"):
+            raise AgentDeliveryError("worker returned an invalid runtime route")
+        if not isinstance(target, str) or not target:
+            raise AgentDeliveryError("worker returned an invalid presentation target")
+        if session is not None and (not isinstance(session, str) or not session):
+            raise AgentDeliveryError("worker returned an invalid native session identity")
+        if pane is not None and (not isinstance(pane, str) or not pane):
+            raise AgentDeliveryError("worker returned an invalid presentation pane")
+        runner_pid = runtime.get("runner_pid")
+        runner_started_at = runtime.get("runner_started_at")
+        identity = _runner_identity(runtime.get("runner_identity"))
+        if identity is not None:
+            if (runner_pid not in (None, identity.pid)
+                    or runner_started_at not in (
+                        None, str(identity.starttime_ticks),
+                    )):
+                raise AgentDeliveryError(
+                    "worker returned contradictory runner identity fields"
+                )
+        elif runner_pid is not None or runner_started_at is not None:
+            raise AgentDeliveryError("worker returned an invalid runner identity")
+        if mode == "tui":
+            if (backend != "herdr" or record.launch.harness != "codex"
+                    or pane is None or identity is not None):
+                raise AgentDeliveryError("worker returned an inconsistent TUI route")
+        elif pane is not None:
+            raise AgentDeliveryError("headless worker returned a TUI presentation pane")
+        return cls(backend, mode, target, session, pane, identity)
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "schema": "agentctl-worker-runtime-evidence/v1",
+            "backend": self.backend,
+            "mode": self.mode,
+            "target": self.target,
+            "session_id": self.session_id,
+            "pane_id": self.pane_id,
+            "runner_identity": (
+                asdict(self.runner_identity)
+                if self.runner_identity is not None else None
+            ),
+        }
+
+
 class Sessions(ManagedAgents):
     """Route all public operations through one generation-locked session record."""
 
@@ -68,10 +171,10 @@ class Sessions(ManagedAgents):
     def _worker(
         self, record: AgentRecord, action: str, **options: object,
     ) -> dict[str, object]:
-        if record.runtime_home is None:
+        if record.launch.runtime_home is None:
             raise AgentDeliveryError("turn-runner session has no runtime directory")
         environment = dict(os.environ)
-        environment["HERDR_SUBAGENTS_HOME"] = record.runtime_home
+        environment["HERDR_SUBAGENTS_HOME"] = record.launch.runtime_home
         command = [sys.executable, str(Path(__file__).with_name("worker_rpc.py"))]
         # The adapter process may be interrupted after committing a request. Keep
         # its canonical record and report uncertainty rather than retrying it.
@@ -79,6 +182,20 @@ class Sessions(ManagedAgents):
         if raw_deadline is not None and not isinstance(raw_deadline, float):
             raise WorkerRpcError("deadline", "runtime probe deadline is invalid")
         deadline = raw_deadline
+        if action == "start":
+            brief = options.pop("brief", None)
+            if options:
+                raise AgentDeliveryError(
+                    "turn-runner start options must derive from the canonical launch specification"
+                )
+            options = {
+                "cwd": record.launch.cwd,
+                "harness": record.launch.harness,
+                "model": record.launch.model,
+                "backend": record.launch.backend,
+                "brief": brief,
+                "harness_args": record.arguments,
+            }
         timeout = 900.0 if action == "migrate" else 90.0
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -93,6 +210,7 @@ class Sessions(ManagedAgents):
                     "name": record.name,
                     "owner_token": record.token,
                     "desired_paused": record.paused,
+                    "permission_mode": record.launch.permission_mode,
                     **options,
                 }),
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -142,15 +260,18 @@ class Sessions(ManagedAgents):
             ) from exc
 
     @staticmethod
-    def _capabilities(record: AgentRecord) -> list[str]:
+    def _capabilities(
+        record: AgentRecord, runtime: WorkerRuntimeEvidence | None = None,
+    ) -> list[str]:
         result = ["send", "status", "read", "wait", "stop", "attach", "pause", "resume"]
-        if record.mode == "headless":
+        mode = runtime.mode if runtime is not None else record.launch.mode
+        if mode == "headless":
             result.extend(("final-answer", "reset", "migrate", "repair"))
         else:
             result.append("terminal-snapshot")
-        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if record.launch.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             result.extend(("drain", "goal", "bind-session", "relocate"))
-        if record.adapter == "herdr-pane" and record.harness == "muse":
+        if record.launch.adapter == "herdr-pane" and record.launch.harness == "muse":
             result.append("reconcile-delivery")
         return result
 
@@ -216,20 +337,25 @@ class Sessions(ManagedAgents):
                 if os.path.lexists(directory):
                     raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
                 directory.mkdir(mode=0o700)
-                record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(), model=model,
-                    adapter="turn-runner", mode=mode, backend=backend,
-                    runtime_home=str(directory / "runtime"), launch_profile=launch_profile,
-                    launch_argv=[harness, *arguments], launch_environment_names=[],
-                    runtime_ownership="owned")
+                record = AgentRecord(
+                    name, uuid.uuid4().hex,
+                    LaunchSpec(
+                        harness=harness, cwd=root, adapter="turn-runner",
+                        mode=mode, backend=backend, model=model, resume=None,
+                        profile=launch_profile, argv=(harness, *arguments),
+                        environment_names=(), runtime_home=str(directory / "runtime"),
+                        runtime_ownership="owned", executable=None,
+                        permission_mode=_headless_permission_mode(harness),
+                    ),
+                    time.time(),
+                )
                 self._save(record)
                 try:
-                    response = self._worker(record, "start", cwd=root, harness=harness,
-                                            model=model, backend=backend, brief=brief,
-                                            harness_args=list(arguments))
+                    response = self._worker(record, "start", brief=brief)
                     self._sync_worker_record(record, response, save=False)
                     if record.session_value is not None:
                         owner = self._identity_owner(
-                            record.session_agent or record.harness,
+                            record.session_agent or record.launch.harness,
                             record.session_value, exclude=name,
                         )
                         if owner is not None:
@@ -240,6 +366,7 @@ class Sessions(ManagedAgents):
                             else:
                                 detail = "; stopped the conflicting new runtime"
                             record.session_agent = record.session_value = None
+                            record.session_source = None
                             raise AgentDeliveryError(
                                 f"native session is already registered as {owner.name!r}{detail}"
                             )
@@ -263,69 +390,53 @@ class Sessions(ManagedAgents):
 
     def _sync_worker_record(
         self, record: AgentRecord, response: dict[str, object], *, save: bool = True,
-    ) -> None:
-        value = response.get("record")
-        if isinstance(value, dict):
-            runtime = as_mapping(value, "runtime record")
-            if runtime.get("owner_token") != record.token:
-                raise AgentDeliveryError(
-                    "worker runtime belongs to another session generation"
-                )
-            record.mode = "interactive" if runtime.get("mode") == "tui" else "headless"
-            record.backend = str(runtime.get("backend", record.backend))
-            session = runtime.get("session_id")
-            record.session_value = session if isinstance(session, str) else None
-            pane = runtime.get("presentation_pane")
-            record.pane_id = pane if isinstance(pane, str) else None
-            runner_pid = runtime.get("runner_pid")
-            runner_started_at = runtime.get("runner_started_at")
-            identity = _runner_identity(runtime.get("runner_identity"))
-            if identity is not None:
-                runner_pid = identity.pid
-                runner_started_at = str(identity.starttime_ticks)
-            if (runtime.get("name") == record.name
-                    and isinstance(runner_pid, int) and not isinstance(runner_pid, bool)
-                    and 1 <= runner_pid <= 2_147_483_647
-                    and isinstance(runner_started_at, str)
-                    and runner_started_at.isascii() and runner_started_at.isdigit()
-                    and any(character != "0" for character in runner_started_at)):
-                record.runner_pid = runner_pid
-                record.runner_started_at = runner_started_at
-                record.runner_identity = identity
-            elif runner_pid is not None or runner_started_at is not None:
-                raise AgentDeliveryError("worker returned an invalid runner identity")
+    ) -> WorkerRuntimeEvidence:
+        evidence = WorkerRuntimeEvidence.parse(record, response)
+        # Publish only compatibility caches derived from the typed inner
+        # authority. LaunchSpec remains immutable startup intent.
+        record.session_value = evidence.session_id
+        record.session_agent = (
+            record.launch.harness if evidence.session_id is not None else None
+        )
+        record.session_source = (
+            "observed" if evidence.session_id is not None else None
+        )
+        record.pane_id = evidence.pane_id
+        if evidence.mode == "tui":
+            record.set_runner_identity(None)
+        elif evidence.runner_identity is not None:
+            record.set_runner_identity(evidence.runner_identity)
         if save:
             self._save(record)
+        return evidence
 
     @staticmethod
     def _runner_observation(
         record: AgentRecord, response: dict[str, object],
+        evidence: WorkerRuntimeEvidence | None = None,
     ) -> tuple[tuple[CustomProcessIdentity, bool | None] | None, str | None]:
         """Parse one internally consistent worker identity and liveness observation."""
         try:
-            runtime_record = as_mapping(response.get("record"), "worker runtime record")
+            evidence = evidence or WorkerRuntimeEvidence.parse(record, response)
+            if evidence.mode != "headless" or evidence.runner_identity is None:
+                raise TypeError("worker runtime has no headless runner identity")
             result = as_mapping(response.get("result"), "worker status result")
             agents = result.get("agents")
             if (not isinstance(agents, list) or len(agents) != 1
                     or not isinstance(agents[0], dict)):
                 raise TypeError("worker status result must contain exactly one agent")
             row = as_mapping(agents[0], "worker status row")
-            parsed: list[CustomProcessIdentity] = []
-            for value in (runtime_record, row):
-                if value.get("name") != record.name:
-                    raise TypeError("worker status identity has a different name")
-                identity = _runner_identity(value.get("runner_identity"))
-                if identity is None:
-                    raise TypeError("worker status identity is invalid")
-                parsed.append(identity)
-            if parsed[0] != parsed[1]:
+            if row.get("name") != record.name:
+                raise TypeError("worker status identity has a different name")
+            row_identity = _runner_identity(row.get("runner_identity"))
+            if row_identity is None or evidence.runner_identity != row_identity:
                 raise TypeError("worker status identities disagree")
             runner_alive = row.get("runner_alive")
             if runner_alive is not None and not isinstance(runner_alive, bool):
                 raise TypeError("worker status row has invalid runner_alive evidence")
         except TypeError as exc:
             return None, str(exc)
-        return (parsed[0], runner_alive), None
+        return (evidence.runner_identity, runner_alive), None
 
     @classmethod
     def _runner_liveness(
@@ -361,36 +472,54 @@ class Sessions(ManagedAgents):
     def _status_record(
         self, record: AgentRecord, *, deadline: float | None = None,
     ) -> dict[str, object]:
-        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if record.launch.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             result = super()._status_record(record, deadline=deadline)
         else:
             result = record.to_document()
+            evidence: WorkerRuntimeEvidence | None = None
             try:
                 response = self._worker(record, "status", _deadline=deadline)
-                self._sync_worker_record(record, response, save=False)
-                observation, observation_error = self._runner_observation(record, response)
+                # Parse first, but do not let an untrusted/dead replacement
+                # receipt overwrite the saved generation before liveness is
+                # compared with that generation.
+                evidence = WorkerRuntimeEvidence.parse(record, response)
+                observation, observation_error = self._runner_observation(
+                    record, response, evidence,
+                )
+                liveness, liveness_error = self._runner_liveness(record, response)
                 expected_runtime_home = str(self._directory(record.name) / "runtime")
-                if (record.lifecycle in ("starting", "running")
-                        and record.runtime_ownership == "owned"
-                        and record.runtime_home == expected_runtime_home
-                        and observation is not None and observation[1] is True):
-                    record.runner_identity = observation[0]
-                    record.runner_pid = observation[0].pid
-                    record.runner_started_at = str(observation[0].starttime_ticks)
-                    record.lifecycle = "running"
-                    record.error = None
-                self._save(record)
+                first_runner_observation = (
+                    record.lifecycle in ("starting", "running")
+                    and record.runner_identity is None
+                    and observation is not None
+                )
+                live_runtime_observation = (
+                    record.lifecycle == "running"
+                    and observation is not None
+                    and observation[1] is True
+                )
+                current_tui = (
+                    record.lifecycle == "running"
+                    and evidence.mode == "tui"
+                )
+                if ((first_runner_observation
+                        or live_runtime_observation or current_tui)
+                        and record.launch.runtime_ownership == "owned"
+                        and record.launch.runtime_home == expected_runtime_home):
+                    self._sync_worker_record(record, response, save=False)
+                    if (record.lifecycle == "starting"
+                            and observation is not None
+                            and observation[1] is True):
+                        record.lifecycle = "running"
+                        record.error = None
+                    self._save(record)
+                    if evidence.mode == "headless":
+                        liveness, liveness_error = self._runner_liveness(
+                            record, response,
+                        )
                 result = record.to_document()
                 result["runtime"] = response.get("result")
-                runtime_record = response.get("record")
-                if isinstance(runtime_record, dict):
-                    live_session = runtime_record.get("session_id")
-                    if isinstance(live_session, str):
-                        result["session_value"] = live_session
-                    live_pane = runtime_record.get("presentation_pane")
-                    if isinstance(live_pane, str):
-                        result["pane_id"] = live_pane
-                liveness, liveness_error = self._runner_liveness(record, response)
+                result["runtime_evidence"] = evidence.to_document()
                 if liveness_error is None and observation_error is not None:
                     liveness_error = observation_error
                 result["runtime_liveness"] = liveness
@@ -410,14 +539,16 @@ class Sessions(ManagedAgents):
                     probe_error_kind="untyped", probe_error_code=None,
                     runtime_liveness=None, runtime_liveness_error=None,
                 )
-        result["capabilities"] = self._capabilities(record)
+        result["capabilities"] = self._capabilities(
+            record, evidence if record.launch.adapter == "turn-runner" else None,
+        )
         return result
 
     def _classify_health(
         self, record: AgentRecord, status: dict[str, object], *,
         deadline: float | None = None,
     ) -> tuple[str, str, str]:
-        if record.adapter != "turn-runner":
+        if record.launch.adapter != "turn-runner":
             return super()._classify_health(record, status, deadline=deadline)
         if record.lifecycle != "running":
             return (
@@ -429,6 +560,25 @@ class Sessions(ManagedAgents):
         if probe_error is not None:
             kind = status.get("probe_error_kind")
             return "unknown", "runtime-probe-failed", f"{kind or 'untyped'}: {probe_error}"
+        route = status.get("runtime_evidence")
+        if isinstance(route, dict) and route.get("mode") == "tui":
+            runtime = status.get("runtime")
+            agents = runtime.get("agents") if isinstance(runtime, dict) else None
+            row = agents[0] if isinstance(agents, list) and len(agents) == 1 else None
+            if (not isinstance(row, dict) or row.get("name") != record.name
+                    or row.get("backend") != route.get("backend")
+                    or row.get("mode") != "tui"
+                    or row.get("presentation_pane") != route.get("pane_id")):
+                return "unknown", "runtime-evidence-inconsistent", (
+                    "worker TUI status disagrees with its token-bound route"
+                )
+            if row.get("runner_alive") is False or row.get("window_alive") is False:
+                return "unhealthy", "runtime-not-live", "worker TUI is not live"
+            if row.get("runner_alive") is True and row.get("window_alive") is True:
+                return "healthy", "ok", "token-bound worker TUI is live"
+            return "unknown", "runtime-liveness-unconfirmed", (
+                "worker TUI status did not confirm process and pane liveness"
+            )
         evidence = status.get("runtime_liveness")
         if (isinstance(evidence, dict)
                 and evidence.get("schema") == _RUNNER_LIVENESS_SCHEMA
@@ -454,7 +604,7 @@ class Sessions(ManagedAgents):
                      model: str | None = None, **options: object) -> dict[str, object]:
         """Submit to the selected adapter without reusing another generation's name."""
         record = self._load(name)
-        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if record.launch.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             if model is not None:
                 raise AgentDeliveryError("per-turn model overrides require a headless session")
             return asdict(super().send(name, text, message_id=message_id, expected_token=record.token, **options))
@@ -476,7 +626,7 @@ class Sessions(ManagedAgents):
             raise AgentDeliveryError("--output since_turn requires since-turn")
         with self._lock(name):
             record = self._load(name)
-            if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+            if record.launch.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
                 if output not in ("tail", "all") or since_turn is not None:
                     raise AgentDeliveryError("interactive terminals expose snapshots, not final-answer boundaries")
                 self._checked(record)
@@ -508,7 +658,7 @@ class Sessions(ManagedAgents):
                     record = self._load_expected(name, expected_token)
                 else:
                     return self._completed_stop(name, expected_token)
-        if record.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if record.launch.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             return self._stop(
                 name, expected_token=record.token,
                 recover_legacy_adoption=recover_legacy_adoption,
@@ -534,7 +684,7 @@ class Sessions(ManagedAgents):
                 current_snapshot = self._managed_record_snapshot(
                     pinned, expected_token=current.token,
                 )
-                if current_snapshot.record.adapter != "turn-runner":
+                if current_snapshot.record.launch.adapter != "turn-runner":
                     raise AgentDeliveryError(
                         "session adapter changed before token-bound stop"
                     )
@@ -612,7 +762,7 @@ class Sessions(ManagedAgents):
                 pinned, expected_token=expected_token,
             )
             record = snapshot.record
-            if record.lifecycle != "stopped" or record.adapter != "turn-runner":
+            if record.lifecycle != "stopped" or record.launch.adapter != "turn-runner":
                 raise AgentDeliveryError(
                     "archived stop receipt does not match the requested runtime generation"
                 )
@@ -653,7 +803,7 @@ class Sessions(ManagedAgents):
         """Hand off input after in-flight work; preserve the running conversation."""
         with self._lock(name):
             record = self._load(name)
-            if record.adapter == "turn-runner":
+            if record.launch.adapter == "turn-runner":
                 # The outer generation owns desired state. Persist intent first;
                 # a lost RPC response is reconciled by the next worker call.
                 record.paused = paused
@@ -669,7 +819,7 @@ class Sessions(ManagedAgents):
         """Run a headless capability under the same canonical lifecycle lock."""
         with self._lock(name):
             record = self._load(name)
-            if record.adapter != "turn-runner":
+            if record.launch.adapter != "turn-runner":
                 raise AgentDeliveryError(f"{action} requires a persistent turn-runner session")
             self._require_automation(record)
             result = self._worker(record, action, **options)
@@ -681,7 +831,7 @@ class Sessions(ManagedAgents):
         if not math.isfinite(timeout) or not 0 <= timeout <= 31_536_000:
             raise AgentDeliveryError("wait timeout must be finite and between 0 and 31536000 seconds")
         initial = self._load(name)
-        if initial.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if initial.launch.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             return super().wait(name, timeout=timeout, expected_token=initial.token, **options)  # type: ignore[arg-type]
         deadline = time.monotonic() + timeout
         while True:
@@ -710,22 +860,31 @@ class Sessions(ManagedAgents):
     def attach(self, name: str, *, expected_token: str | None = None) -> dict[str, object]:
         """Focus a verified Herdr tab or attach the current terminal to an exact tmux window."""
         initial = self._load_expected(name, expected_token)
-        if initial.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
+        if initial.launch.adapter in ("herdr", "herdr-pane", "herdr-foreign"):
             return super().attach(name, expected_token=initial.token)
         attach_command: list[str] | None = None
         with self._lock(name):
             record = self._load_expected(name, initial.token)
             response = self._worker(record, "status")
-            runtime = as_mapping(response["record"], "worker identity")
-            target = str(runtime.get("tmux_target", ""))
-            if record.backend == "herdr":
-                pane = runtime.get("presentation_pane")
-                if not isinstance(pane, str) or not pane:
-                    raise AgentDeliveryError("worker has no confirmed Herdr pane; use repair")
-                panes = [entry for entry in self.client.panes() if entry.pane_id == pane]
-                if len(panes) != 1 or panes[0].tab_id != target:
-                    raise AgentDeliveryError("worker presentation pane no longer belongs to its recorded tab; use repair")
-                self.client.focus_tab(panes[0].tab_id)
+            runtime = self._sync_worker_record(record, response)
+            target = runtime.target
+            if runtime.backend == "herdr":
+                if runtime.mode == "tui":
+                    pane = runtime.pane_id
+                    if pane is None:
+                        raise AgentDeliveryError(
+                            "worker has no confirmed Herdr pane; use repair"
+                        )
+                    panes = [
+                        entry for entry in self.client.panes()
+                        if entry.pane_id == pane
+                    ]
+                    if len(panes) != 1 or panes[0].tab_id != target:
+                        raise AgentDeliveryError(
+                            "worker presentation pane no longer belongs to its "
+                            "recorded tab; use repair"
+                        )
+                self.client.focus_tab(target)
                 focused = "tab"
             else:
                 if not target or ":" not in target:
@@ -747,7 +906,7 @@ class Sessions(ManagedAgents):
                         raise AgentDeliveryError("tmux attach requires an interactive terminal; inspect with agentctl read")
                     attach_command = ["tmux", "attach-session", "-t", window_id]
                 focused = "window"
-            result: dict[str, object] = {"name": name, "backend": record.backend,
+            result: dict[str, object] = {"name": name, "backend": runtime.backend,
                 "target": target, "focused": focused, "paused": record.paused}
         # User attachment can last indefinitely. It must not monopolize lifecycle
         # ownership and prevent another controller from stopping or messaging it.
