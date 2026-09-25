@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import select
+import signal
+import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -355,6 +359,179 @@ def test_a_failed_interrupt_report_does_not_replace_the_original_exception(
     with pytest.raises(RuntimeError, match="runner fault"):
         runner.run_commands(_shard(marker, 60), logs)
     assert marker.read_text() == "terminated"
+
+
+# A real runner process, signalled on its own the way `kill -INT <runner>` or a deadline does, so
+# nothing reaches the shards unless the runner forwards it.
+_RUNNER_PROCESS = """
+import importlib.util, pathlib, signal, sys
+signal.signal(signal.SIGINT, signal.default_int_handler)  # even if started with SIGINT ignored
+spec = importlib.util.spec_from_file_location("run_lifecycle_shards", sys.argv[1])
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+commands = ((sys.executable, "-c", *sys.argv[3:]),)
+sys.exit(runner.run_commands(commands, pathlib.Path(sys.argv[2]), label="ordinary lifecycle"))
+"""
+
+# A shard whose test left a process running.  "leaky" tears down on SIGINT but forgets the
+# grandchild; "stubborn" ignores SIGINT and SIGTERM.  The grandchild ignores SIGINT, and SIGTERM too
+# when "stubborn", so only a signal to the whole process group can stop it.
+_SHARD_WITH_A_GRANDCHILD = """
+import os, pathlib, signal, subprocess, sys, time
+state, shard_mode, grandchild_mode, grandchild = pathlib.Path(sys.argv[1]), *sys.argv[2:5]
+def tear_down_but_forget_the_grandchild(*_):
+    (state / "shard-interrupted").write_text("")
+    sys.exit(130)
+if shard_mode == "stubborn":
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+else:
+    signal.signal(signal.SIGINT, tear_down_but_forget_the_grandchild)
+subprocess.Popen([sys.executable, "-c", grandchild, str(state), grandchild_mode])
+while not (state / "grandchild.pid").exists():
+    time.sleep(0.01)
+(state / "shard.tmp").write_text(str(os.getpid()))
+(state / "shard.tmp").rename(state / "shard.pid")
+print("shard started", flush=True)
+time.sleep(120)
+"""
+
+_GRANDCHILD = """
+import os, pathlib, signal, sys, time
+state = pathlib.Path(sys.argv[1])
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+if sys.argv[2] == "stubborn":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+(state / "grandchild.tmp").write_text(str(os.getpid()))
+(state / "grandchild.tmp").rename(state / "grandchild.pid")
+time.sleep(120)
+"""
+
+
+class _RealRunner:
+    def __init__(self, tmp_path: Path, shard_mode: str, grandchild_mode: str) -> None:
+        self.state = tmp_path / "state"
+        self.state.mkdir()
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        self.process = subprocess.Popen(
+            [
+                sys.executable, "-c", _RUNNER_PROCESS, str(RUNNER_PATH), str(logs),
+                _SHARD_WITH_A_GRANDCHILD, str(self.state), shard_mode, grandchild_mode, _GRANDCHILD,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.pidfds: dict[str, int] = {}
+        deadline = time.monotonic() + 30
+        while not (self.state / "shard.pid").exists():
+            assert self.process.poll() is None, self.process.communicate()[0]
+            assert time.monotonic() < deadline, "the shard never started"
+            time.sleep(0.02)
+        for name in ("shard", "grandchild"):
+            self.pidfds[name] = os.pidfd_open(int((self.state / f"{name}.pid").read_text()))
+
+    def signal(self, signum: int) -> None:
+        os.kill(self.process.pid, signum)
+
+    def finish(self) -> tuple[int, str]:
+        output, _ = self.process.communicate(timeout=60)
+        return self.process.returncode, output.decode()
+
+    def exited(self, name: str) -> bool:
+        poller = select.poll()
+        poller.register(self.pidfds[name], select.POLLIN)
+        return bool(poller.poll(0))
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+            self.process.wait()
+        for pidfd in self.pidfds.values():
+            try:
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.close(pidfd)
+
+
+@pytest.fixture
+def real_runner(tmp_path: Path) -> Iterator[Callable[[str, str], _RealRunner]]:
+    started: list[_RealRunner] = []
+
+    def start(shard_mode: str, grandchild_mode: str) -> _RealRunner:
+        started.append(_RealRunner(tmp_path, shard_mode, grandchild_mode))
+        return started[-1]
+
+    yield start
+    for runner_process in started:
+        runner_process.close()
+
+
+def test_runner_only_interrupt_reaches_the_shard_and_kills_the_grandchild_it_left(
+    real_runner: Callable[[str, str], _RealRunner],
+) -> None:
+    run = real_runner("leaky", "stubborn")
+
+    started = time.monotonic()
+    run.signal(signal.SIGINT)
+    returncode, output = run.finish()
+
+    assert returncode == -signal.SIGINT
+    assert (run.state / "shard-interrupted").exists(), "the SIGINT was not forwarded to the shard"
+    assert "=== ordinary lifecycle shard 1/1 INTERRUPTED rc=130 ===" in output
+    # The runner returned only after the grandchild, which ignores SIGINT and SIGTERM, was gone.
+    assert run.exited("shard") and run.exited("grandchild")
+    # The grace ended with the shard; SIGTERM then waited its bound, and SIGKILL finished the group.
+    assert time.monotonic() - started < runner._INTERRUPT_GRACE_SECONDS / 3
+
+
+def test_repeated_interrupts_escalate_to_sigkill_and_leave_no_process_behind(
+    real_runner: Callable[[str, str], _RealRunner],
+) -> None:
+    run = real_runner("stubborn", "stubborn")
+
+    started = time.monotonic()
+    for _ in range(12):  # Past the grace and the SIGTERM wait, and into the SIGKILL step.
+        if run.process.poll() is not None:
+            break
+        run.signal(signal.SIGINT)
+        time.sleep(0.25)
+    returncode, output = run.finish()
+
+    assert returncode == -signal.SIGINT
+    assert run.exited("shard") and run.exited("grandchild")
+    assert f"INTERRUPTED rc={-signal.SIGKILL} ===" in output
+    # Each further interrupt skipped a step instead of waiting it out, or escaping it.
+    assert time.monotonic() - started < runner._TERMINATE_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("signum", "shard_mode", "grandchild_mode", "shard_rc"),
+    (
+        (signal.SIGHUP, "leaky", "killable", -signal.SIGTERM),
+        (signal.SIGTERM, "stubborn", "stubborn", -signal.SIGKILL),
+    ),
+)
+def test_a_stop_signal_to_the_runner_stops_every_shard_group_without_a_grace(
+    real_runner: Callable[[str, str], _RealRunner], signum: int, shard_mode: str, grandchild_mode: str,
+    shard_rc: int,
+) -> None:
+    run = real_runner(shard_mode, grandchild_mode)
+
+    started = time.monotonic()
+    run.signal(signum)
+    returncode, output = run.finish()
+    elapsed = time.monotonic() - started
+
+    assert returncode == 128 + signum
+    assert f"INTERRUPTED rc={shard_rc} ===" in output
+    assert run.exited("shard") and run.exited("grandchild")
+    assert not (run.state / "shard-interrupted").exists()
+    if shard_rc == -signal.SIGTERM:
+        assert elapsed < runner._TERMINATE_SECONDS  # SIGTERM sufficed; no SIGKILL wait
+    else:
+        assert runner._TERMINATE_SECONDS <= elapsed < runner._INTERRUPT_GRACE_SECONDS / 3
 
 
 def test_main_runs_ordinary_partition_with_the_unresolved_interpreter(

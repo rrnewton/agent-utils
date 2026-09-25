@@ -12,11 +12,12 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 
@@ -40,11 +41,33 @@ _ORDINARY_DURATION_HINTS: Mapping[str, float] = {
 _ORDINARY_DEFAULT_DURATION = 2.1
 # After Ctrl-C, how long shards get to finish their own teardown.  An ordinary shard's teardown is
 # what stops the host processes its tests started: nothing else will, because unlike a mapped shard
-# it has no PID namespace to collapse.  This assumes the SIGINT reached the shards too, as Ctrl-C
-# at a terminal does; a SIGINT sent to the runner alone leaves them running until the grace ends
-# and SIGTERM stops them without teardown, the same end state as without a grace.  A second
-# Ctrl-C during the grace skips the rest of it.
+# it has no PID namespace to collapse.  Each shard runs in its own session, so Ctrl-C at a terminal
+# reaches only the runner, which forwards exactly one SIGINT to every shard's process group, as the
+# terminal used to; a SIGINT sent to the runner alone now reaches the shards too.  Another Ctrl-C
+# skips to the next step: the rest of the grace, then the SIGTERM wait.
 _INTERRUPT_GRACE_SECONDS = 30.0
+# How long each shard's process group gets after SIGTERM, then after SIGKILL.  Signalling the group,
+# not only the leader, reaches what a shard's tests started and left behind, and reaches a mapped
+# shard's namespace, whose `unshare --fork` leader ignores SIGTERM.  A process that starts its own
+# session (as production hooks do) has left the group and is its test's teardown to stop.
+_TERMINATE_SECONDS = 5.0
+_KILL_SECONDS = 5.0
+# Besides Ctrl-C, the signals that stop the runner and must not orphan shards, which no longer share
+# its process group: a SIGTERM (a deadline, or a TERM sent to the caller's process group) and a
+# terminal hangup.
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+
+class _StopSignal(BaseException):
+    """The runner received one of ``_STOP_SIGNALS``."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"received signal {signum}")
+        self.signum = signum
+
+
+def _raise_stop_signal(signum: int, _frame: object) -> None:
+    raise _StopSignal(signum)
 
 
 def partition_nodeids(
@@ -236,6 +259,7 @@ def run_commands(
     processes: list[subprocess.Popen[bytes]] = []
     logs: list[Path] = []
     started = time.monotonic()
+    previous = {signum: signal.signal(signum, _raise_stop_signal) for signum in _STOP_SIGNALS}
     try:
         for index, command in enumerate(commands):
             log = log_directory / f"shard-{index}.log"
@@ -248,6 +272,7 @@ def run_commands(
                         stdin=subprocess.DEVNULL,
                         stdout=output,
                         stderr=subprocess.STDOUT,
+                        start_new_session=True,
                     )
                 )
         elapsed: list[float | None] = [None] * len(processes)
@@ -258,8 +283,8 @@ def run_commands(
             time.sleep(0.2)
         returncodes = [process.wait() for process in processes]
     except BaseException as exc:
-        grace = _INTERRUPT_GRACE_SECONDS if isinstance(exc, KeyboardInterrupt) else 0.0
-        _stop_shards(processes, grace)
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        _stop_shards(processes, _INTERRUPT_GRACE_SECONDS if interrupted else 0.0, interrupted)
         try:
             for index, process in enumerate(processes):
                 _report_shard(
@@ -269,7 +294,12 @@ def run_commands(
                 )
         except Exception:
             pass  # A failed report (a closed pipe) must not replace the original exception.
+        if isinstance(exc, _StopSignal):
+            raise SystemExit(128 + exc.signum) from exc
         raise
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
     for index, (returncode, log) in enumerate(zip(returncodes, logs, strict=True)):
         _report_shard(
             f"=== {label} shard {index + 1}/{len(commands)} rc={returncode} "
@@ -279,24 +309,70 @@ def run_commands(
     return 0 if all(returncode == 0 for returncode in returncodes) else 1
 
 
-def _stop_shards(processes: Sequence[subprocess.Popen[bytes]], grace: float) -> None:
-    """Let shards exit on their own for ``grace`` seconds, then terminate, then kill."""
+def _stop_shards(
+    processes: Sequence[subprocess.Popen[bytes]], grace: float, forward_interrupt: bool
+) -> None:
+    """Stop every shard's process group: grace, then SIGTERM, then SIGKILL, each bounded.
 
-    deadline = time.monotonic() + grace
+    A further Ctrl-C or stop signal moves on to the next step; during the SIGKILL step it only
+    repeats the SIGKILL, so no number of interrupts can leave a group unsignalled.
+    """
+
     try:
-        while time.monotonic() < deadline and any(p.poll() is None for p in processes):
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        pass  # A second Ctrl-C means stop now, not abandon the shards.
-    for process in processes:
-        if process.poll() is None:
-            process.terminate()
+        if forward_interrupt:
+            _signal_groups(processes, signal.SIGINT)
+        _wait_until(lambda: all(p.poll() is not None for p in processes), grace)
+    except (KeyboardInterrupt, _StopSignal):
+        pass  # Stop now, not abandon the shards.
+    try:
+        _signal_groups(processes, signal.SIGTERM)
+        if _wait_until(lambda: _groups_ended(processes), _TERMINATE_SECONDS):
+            return
+    except (KeyboardInterrupt, _StopSignal):
+        pass
+    deadline = time.monotonic() + _KILL_SECONDS
+    while True:
+        try:
+            _signal_groups(processes, signal.SIGKILL)
+            if not _wait_until(lambda: _groups_ended(processes), deadline - time.monotonic()):
+                survivors = [str(p.pid) for p in processes if not _groups_ended([p])]
+                print(f"shard process groups still present after SIGKILL: {', '.join(survivors)}")
+            return
+        except (KeyboardInterrupt, _StopSignal):
+            continue  # Repeating SIGKILL is harmless, and the deadline does not move.
+
+
+def _signal_groups(processes: Sequence[subprocess.Popen[bytes]], signum: int) -> None:
+    # Each shard leads its own session, so its PID names its process group.  The group outlives
+    # the reaped leader while any member remains, and the kernel does not reuse that PID meanwhile.
     for process in processes:
         try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+            os.killpg(process.pid, signum)
+        except (ProcessLookupError, PermissionError):
+            pass  # The group is empty, or holds nothing this user may signal.
+
+
+def _groups_ended(processes: Sequence[subprocess.Popen[bytes]]) -> bool:
+    for process in processes:
+        if process.poll() is None:
+            return False
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass  # A member exists that this user may not signal.
+        return False
+    return True
+
+
+def _wait_until(done: Callable[[], bool], seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while not done():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
 
 
 def _report_shard(header: str, log: Path) -> None:
