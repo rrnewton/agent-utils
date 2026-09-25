@@ -1,12 +1,13 @@
 ---
 title: 'claude-linux-reply-bullet: accept Claude Code''s Linux reply bullet in chat reply capture'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 depends_on:
   agent-utils-10: discovered-from
 created_at: 2026-09-25T05:11:14.829091266+00:00
-updated_at: 2026-09-25T05:11:14.829091266+00:00
+updated_at: 2026-09-25T06:44:20.682855349+00:00
+closed_at: 2026-09-25T06:44:20.682855238+00:00
 ---
 
 # Description
