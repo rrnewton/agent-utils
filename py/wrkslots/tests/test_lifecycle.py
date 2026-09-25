@@ -40,11 +40,33 @@ sys.path.insert(0, str(PY_ROOT))
 from wrkslots import cli as wrkslots  # noqa: E402
 
 
+SYSTEM_GIT = Path("/usr/bin/git")
+
+
 @pytest.fixture(autouse=True)
-def select_fixture_machine(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make the suite's synthetic config shard an intentional override."""
+def select_fixture_machine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Make the suite's machine and system Git choices intentional."""
 
     monkeypatch.setenv("WRKSLOTS_MACHINE", "testhost")
+    # Optional host wrappers may detach telemetry after their foreground Git
+    # exits. Such a child correctly counts as live checkout use, but makes a
+    # fixture race its own instrumentation. Prefer the system executable for
+    # both helper calls and the product subprocesses they launch. Only Git is
+    # redirected: python3, which compatibility shebangs resolve, and every
+    # other tool keep the inherited PATH order.
+    inherited_path = os.environ.get("PATH", "")
+    inherited_python = shutil.which("python3")
+    system_git_directory = tmp_path_factory.mktemp("system-git")
+    (system_git_directory / "git").symlink_to(SYSTEM_GIT)
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join((str(system_git_directory), inherited_path))
+    )
+    resolved_git = shutil.which("git")
+    assert resolved_git is not None
+    assert Path(resolved_git).resolve() == SYSTEM_GIT.resolve()
+    assert shutil.which("python3") == inherited_python
 
 
 def source_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
