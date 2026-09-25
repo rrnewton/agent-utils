@@ -746,11 +746,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         (REPO_ROOT / "Makefile").read_text(encoding="utf-8").replace("\\\n", " "),
     )
     assert (
-        "python3 ../scripts/run_mapped_lifecycle_shards.py "
+        "python3 ../scripts/run_lifecycle_shards.py --partition mapped "
         '--shards "$${LIFECYCLE_TEST_SHARDS:-4}"'
     ) in makefile
     assert (
-        "python3 -m pytest -q -c pyproject.toml --rootdir=. "
-        "wrkslots/tests/test_lifecycle.py -m ordinary_environment"
+        "python3 ../scripts/run_lifecycle_shards.py --partition ordinary "
+        '--shards "$${ORDINARY_LIFECYCLE_TEST_SHARDS:-4}"'
     ) in makefile
     assert "wrkslots/tests/test_lifecycle.py::" not in makefile

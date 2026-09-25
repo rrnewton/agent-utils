@@ -84,8 +84,11 @@ check-test-suite-selector:
 # while limiting them to the test and its children. Tests marked
 # `ordinary_environment` either manage child PIDs whose signal/reap behaviour must
 # remain host-visible or exercise the initial identity user namespace. Run that
-# partition outside unshare. If unprivileged namespaces are unavailable, run the
-# original single pytest command; availability changes cost, never coverage.
+# partition outside unshare, in duration-balanced parallel shards: its two
+# slowest tests each spend over a minute in the host-wide scan, and serially the
+# partition takes about 15 minutes. If unprivileged namespaces are unavailable,
+# run the original single pytest command; availability changes cost, never
+# coverage.
 # Resolve the real interpreter before unshare: a Python launcher that forks
 # cannot itself serve as the namespace init that reaps adopted children.
 test:
@@ -94,10 +97,10 @@ ifneq ($(TEST_SUITE),rust)
 	if command -v unshare >/dev/null 2>&1 \
 		&& unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then \
 		python3 -m pytest -q --ignore=wrkslots/tests/test_lifecycle.py && \
-		python3 ../scripts/run_mapped_lifecycle_shards.py \
+		python3 ../scripts/run_lifecycle_shards.py --partition mapped \
 			--shards "$${LIFECYCLE_TEST_SHARDS:-4}" && \
-		python3 -m pytest -q -c pyproject.toml --rootdir=. \
-			wrkslots/tests/test_lifecycle.py -m ordinary_environment; \
+		python3 ../scripts/run_lifecycle_shards.py --partition ordinary \
+			--shards "$${ORDINARY_LIFECYCLE_TEST_SHARDS:-4}"; \
 	else \
 		python3 -m pytest -q; \
 	fi
