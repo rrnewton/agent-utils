@@ -5,7 +5,7 @@ steps:
     job: mypy
     desc: strict typing and no-Any policy for cross-language Python inputs
     cmd: >-
-      python3 -m mypy --config-file py/pyproject.toml --strict
+      MYPYPATH=py python3 -m mypy --config-file py/pyproject.toml --strict
       --disallow-any-explicit --disallow-any-decorated
       cross examples/dagrun-scaling-workload.py &&
       python3 scripts/check_no_any.py cross examples/dagrun-scaling-workload.py
