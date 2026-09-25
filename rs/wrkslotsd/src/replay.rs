@@ -8,6 +8,7 @@ use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 
 use crate::canonical::{canonical_json, canonical_sha256};
+use crate::config::is_sha256;
 use crate::schema::{
     exact_keys, exact_keys_optional, parse_timestamp, validate_active_record,
     validate_archive_record, ActiveRecordMeta,
@@ -126,7 +127,22 @@ struct State {
     archived_generations: BTreeMap<String, u64>,
     holds: BTreeMap<String, SlotHold>,
     pending_operations: BTreeMap<String, PendingOperation>,
-    completed_operations: BTreeMap<String, (String, String)>,
+    completed_operations: BTreeMap<String, CompletedOperation>,
+}
+
+/// The last completion recorded at one journal path.
+struct CompletedOperation {
+    slot: String,
+    operation: String,
+    /// Event sequence of the completion, so recovery can bind the journal
+    /// that completed most recently rather than the path that sorts first.
+    sequence: u64,
+}
+
+impl CompletedOperation {
+    fn is(&self, slot: &str, operation: &str) -> bool {
+        self.slot == slot && self.operation == operation
+    }
 }
 
 pub(crate) struct ReplayGuard<'a> {
@@ -795,6 +811,11 @@ const JOURNAL_OPERATIONS: &[&str] = &[
     "recover-absent-agent-row",
 ];
 
+/// Operations whose journal completion is terminal for a recovery attempt.
+/// Finish and the ownerless cleanups also complete journals on rollback or
+/// refusal paths that keep their storage, so they are excluded.
+const TERMINAL_COMPLETION_OPERATIONS: &[&str] = &["create", "import-existing"];
+
 fn active_generation(state: &State, slot: &str) -> Option<u64> {
     state
         .active_records
@@ -910,9 +931,9 @@ fn apply_operation_progress(event: &Event, state: &mut State) -> Result<(), Obse
             "operation-progress-recorded identity differs from its embedded journal",
         ));
     }
-    if let Some(completed_identity) = state.completed_operations.get(&journal_path) {
+    if let Some(completed) = state.completed_operations.get(&journal_path) {
         if (journal_path.starts_with("CREATE.") || journal_path.starts_with("FINISH."))
-            && completed_identity != &(slot.clone(), operation.clone())
+            && !completed.is(&slot, &operation)
         {
             return Err(ObserverError::invalid(
                 "scoped operation journal path was reused for a different identity",
@@ -984,7 +1005,7 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
     let duplicate_completion = state
         .completed_operations
         .get(&journal_path)
-        .is_some_and(|identity| identity == &(slot.clone(), operation.clone()));
+        .is_some_and(|completed| completed.is(&slot, &operation));
     // Python ignores such a completion. Replay refuses it because a history
     // that closes an operation it never opened is not one Python writes.
     if pending_journal.is_none() && !matching_recovery && !duplicate_completion {
@@ -1007,9 +1028,29 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
         }
         None => {}
     }
-    state
-        .completed_operations
-        .insert(journal_path, (slot.clone(), operation));
+    if TERMINAL_COMPLETION_OPERATIONS.contains(&operation.as_str()) {
+        // Every Python path that completes a create or import journal leaves
+        // the slot's storage owned by its ACTIVE row or leaves none, so the
+        // completion also ends a recovery attempt bound to the same journal.
+        // A recovery bound elsewhere, such as the legacy singleton default,
+        // stays pending.
+        let recovery_key = pending_key(PendingOperationKind::Recovery, &slot, &operation);
+        if state
+            .pending_operations
+            .get(&recovery_key)
+            .is_some_and(|pending| pending.journal_path.as_deref() == Some(journal_path.as_str()))
+        {
+            state.pending_operations.remove(&recovery_key);
+        }
+    }
+    state.completed_operations.insert(
+        journal_path,
+        CompletedOperation {
+            slot: slot.clone(),
+            operation,
+            sequence: event.sequence,
+        },
+    );
     clear_archived_removal_markers(state, &slot);
     Ok(())
 }
@@ -1017,7 +1058,8 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
 /// Close lifecycle attempts only after the append-only history proves that the
 /// same generation was archived with removed storage and left ACTIVE. Python's
 /// `operation-completed` means only that a journal was cleared: rollback and
-/// late-refusal paths emit it while deliberately retaining the slot.
+/// late-refusal paths emit it while deliberately retaining the slot. Create and
+/// import completions are the exception handled in `apply_operation_completed`.
 fn clear_archived_removal_markers(state: &mut State, slot: &str) {
     let Some(generation) = state.archived_generations.get(slot).copied() else {
         return;
@@ -1045,9 +1087,11 @@ fn clear_archived_removal_markers(state: &mut State, slot: &str) {
         if pending.kind == PendingOperationKind::Recovery {
             if let Some(journal_path) = pending.journal_path.as_ref() {
                 let journal_identity = ("finish".to_owned(), journal_path.clone());
-                let completed_identity = (pending.slot.clone(), "finish".to_owned());
                 if !existing_journals.contains(&journal_identity)
-                    && state.completed_operations.get(journal_path) != Some(&completed_identity)
+                    && !state
+                        .completed_operations
+                        .get(journal_path)
+                        .is_some_and(|completed| completed.is(&pending.slot, "finish"))
                 {
                     legacy_journals.push(PendingOperation {
                         slot: pending.slot.clone(),
@@ -1243,16 +1287,17 @@ fn apply_recovery_started(event: &Event, state: &mut State) -> Result<(), Observ
         });
     // `operation-completed` is appended before the journal is unlinked, so a
     // crash between the two leaves a completed journal that recovery loads
-    // again. Only a journal absent from the history is the legacy singleton.
+    // again. Bind the most recent such completion: an older one at another
+    // path may since have been reused by a different identity. Only a journal
+    // absent from the history is the legacy singleton.
     let journal_path = pending_journal
         .and_then(|pending| pending.journal_path.clone())
         .or_else(|| {
             state
                 .completed_operations
                 .iter()
-                .find(|(_, (completed_slot, completed_operation))| {
-                    completed_slot == slot && completed_operation == operation
-                })
+                .filter(|(_, completed)| completed.is(slot, operation))
+                .max_by_key(|(_, completed)| completed.sequence)
                 .map(|(path, _)| path.clone())
         })
         .unwrap_or_else(|| format!("ACTIVE.{}.journal", event.machine));
@@ -1298,10 +1343,7 @@ fn apply_retirement_attempted(event: &Event, state: &mut State) -> Result<(), Ob
         ));
     }
     let digest = string(&payload["sha256"], "retirement-attempted payload.sha256")?;
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    if !is_sha256(digest)
         || unsigned(
             &payload["handoff_read_sequence"],
             "retirement-attempted payload.handoff_read_sequence",
@@ -1858,12 +1900,7 @@ fn recovery_identity(
         &evidence["source_record_sha256"],
         &format!("{label}.source_record_sha256"),
     )?;
-    if source_record_sha256.len() != 64
-        || !source_record_sha256
-            .as_bytes()
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
+    if !is_sha256(source_record_sha256) {
         return Err(ObserverError::invalid(format!(
             "{label}.source_record_sha256 is not a lowercase SHA-256 digest"
         )));
@@ -1918,7 +1955,9 @@ fn unsigned(value: &Value, label: &str) -> Result<u64, ObserverError> {
         .ok_or_else(|| ObserverError::invalid(format!("{label} must be a non-negative integer")))
 }
 
-fn validate_name(value: &str, label: &str) -> Result<(), ObserverError> {
+/// The lifecycle authority's name grammar: 1-64 ASCII letters, digits, `.`,
+/// `_`, or `-`, beginning with a letter or digit.
+pub(crate) fn validate_name(value: &str, label: &str) -> Result<(), ObserverError> {
     let bytes = value.as_bytes();
     let first_is_valid = bytes.first().is_some_and(u8::is_ascii_alphanumeric);
     let rest_is_valid = bytes

@@ -5,7 +5,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{is_sha256, load_typed_json, validate_name, Digested};
+use crate::config::{is_sha256, load_typed_json, Digested};
+use crate::replay::validate_name;
 use crate::ObserverError;
 
 /// The observed state of the exact recorded transient scope.
