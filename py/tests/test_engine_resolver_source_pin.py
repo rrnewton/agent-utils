@@ -167,8 +167,7 @@ def test_launcher_builds_then_reuses_verified_workspace_cache(tmp_path: Path) ->
 
     ensured_again = _run_launcher(root, ensure_only=True)
     assert ensured_again.returncode == 0, ensured_again.stderr
-    assert ensured_again.stdout.strip() == str(target)
-    assert "v1" not in ensured_again.stdout
+    assert ensured_again.stdout == f"{target}\n"
 
 
 def test_library_change_rebuilds_unchanged_entrypoint(tmp_path: Path) -> None:
