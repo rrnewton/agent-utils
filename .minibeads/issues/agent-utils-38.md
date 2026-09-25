@@ -1,6 +1,6 @@
 ---
 title: 'read-token-conversation-probe: a read-scope /voice page asks for stored conversations and logs a 403'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - auth
 - ui
 created_at: 2026-09-25T20:07:34.870604057+00:00
-updated_at: 2026-09-25T20:07:34.870604057+00:00
+updated_at: 2026-09-25T20:18:38.669380000+00:00
+closed_at: 2026-09-25T20:18:38.669380000+00:00
 ---
 
 # Description
