@@ -73,6 +73,8 @@ impl SpeechProvider for ElevenLabsSpeech {
             .map_err(shared_error)?;
         Ok(SpeechStream {
             content_type: stream.content_type,
+            preamble: stream.preamble,
+            session: stream.session,
             chunks: stream
                 .chunks
                 .map(|chunk| chunk.map_err(shared_error))

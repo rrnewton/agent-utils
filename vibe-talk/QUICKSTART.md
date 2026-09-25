@@ -177,6 +177,28 @@ scripts/run.sh --tunnel-status   # the cloudflared unit: active, since when, whi
 `--tunnel-status` only reports; it never starts or stops anything. Logs are kept when the
 container stops and are discarded at the next launch, so read them before you relaunch.
 
+For server-audio read-aloud, a completed browser start writes `read-aloud reached audible
+playback` with one opaque `observation` and millisecond fields. `message_preparation` normally
+happens when Read is enabled, before the tap. The on-tap server phases, `request_connection`,
+`request_session_start`, `yield` (waiting for an earlier read to finish or acknowledge an
+interrupt) and `first_audio`, add up to `request_to_first_audio`. `transfer` is the rest of the
+browser's wait for its first media frame, and `browser_playback` runs from that frame to the
+`playing` event. `tap_to_audible` is measured directly. Conversational reads also carry `session`
+(which provider connection, counting from 1), `turn` (the prompt's number on it) and
+`session_reused`, so a reused session is stated, not inferred from a zero. These records contain
+no message text, credentials, provider identity, or deployment address. If the browser never
+reaches `playing`, the earlier `read-aloud audio reached the server` record still shows the server
+phases under the same observation id, and `read-aloud turn ended` shows whether a turn was
+interrupted.
+
+A conversational session is shared by every read and kept for five idle minutes. Enabling Read
+refreshes that and replaces a session the provider has closed. Tapping a different message while
+one is still being generated interrupts it and starts the new one on the same session; the parts
+of one combined row play in order. A session whose provider reports an error, closes, does not
+acknowledge an interrupt within three seconds, or returns no audio within 15 seconds of a prompt
+is replaced, and a read that heard nothing is retried once, so an unanswered read fails after at
+most two such waits rather than hanging.
+
 ```sh
 cd vibe-talk
 podman build -t vibe-talk:v0 -f Containerfile .

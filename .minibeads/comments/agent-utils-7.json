@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-7-cd5a733d47a",
+    "issue_id": "agent-utils-7",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Took over from gpt-5.6-sol. The earlier reuse only covered completed reads: it held the session lock for the whole response body, and cancelling reconnected. Replaced it with one session task that owns the provider socket. Each tap sends an opaque selection id. When a new selection arrives, the task sends {\"type\":\"interrupt\"} (the contract was agreed with the bridge owner), discards every frame up to that turn's turn_complete, and prompts the new read on the SAME socket. Parts of one combined row queue in order instead. Other changes: the lock wait is bounded (25 s); warm_up checks liveness and restarts a 5-minute idle clock; keepalive pings detect a dead path; a missing interrupt ack is bounded at 3 s; queued errors and write-then-read failures retry once on a fresh session; the /speak fallback shares the session; telemetry reports session/turn/session_reused/retried explicitly, and the four server phases now sum to request_to_first_audio. Regression switching_mid_turn_interrupts_and_begins_the_next_read_on_the_same_session consumes one A chunk, switches, and shows B on the single accepted socket as turn 2 with distinct audio and no late A PCM. Still open: exact-head deployment with the bridge interrupt support, and a live proof of both completed and interrupted A→B with tap-to-audible records.",
+    "created_at": "2026-09-25T05:03:43.159731075Z",
+    "updated_at": "2026-09-25T05:03:43.159731075Z"
+  }
+]

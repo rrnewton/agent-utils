@@ -28,7 +28,12 @@
 //! `Authorization` header, and without it the browser cannot stream. So the ticket has to
 //! authenticate on its own. It is 256 bits from the system CSPRNG, it names exactly one message, it
 //! expires in minutes, and the store it lives in is capped. What it grants — hearing one message
-//! the holder could already read — is deliberately the smallest thing that makes the URL work.
+//! the holder could already read, plus appending bounded content-free playback timings for that
+//! same read — is deliberately the smallest thing that makes the URL work. The timing callback
+//! takes no bearer header for exactly the same reason as the audio element: the random ticket is
+//! intentionally its capability too. It answers one 404 for a ticket that was never minted, one
+//! that has expired, and one whose audio has not been played yet, so it reveals nothing the audio
+//! route does not.
 //!
 //! It WILL appear in the page's DOM and in this server's access log, which is the cost of the
 //! approach and the reason for the short life and the narrow scope.
@@ -63,12 +68,45 @@ pub struct Prepared {
     pub said: String,
     /// The pace the reader had chosen when this was minted, if they had chosen one.
     pub speed: Option<f64>,
+    /// Opaque correlation key for content-free server and browser timing records.
+    pub observation: String,
+    /// Message lookup and normalization, ending before provider connection or readiness begins.
+    pub preparation_ms: u64,
+}
+
+/// How the audio request itself spent its time, measured on the server.
+///
+/// The four phases add up to `request_to_first_audio_ms`, so a report can say where the wait went
+/// without subtracting numbers taken from different clocks or different requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServerTiming {
+    /// From the audio request arriving until its first real audio chunk (not a container header).
+    pub request_to_first_audio_ms: u64,
+    /// Transport establishment this request waited for: zero when it reused a live session, and
+    /// includes joining a connection another request (normally preparation) had already begun.
+    pub request_connection_ms: u64,
+    /// Waiting for a new session to announce itself ready; zero when a live session was reused.
+    pub request_session_start_ms: u64,
+    /// Waiting for an earlier read on the same session to finish or acknowledge its interrupt.
+    pub yield_ms: u64,
+    /// The remainder: from the prompt (or, for a provider without sessions, the request) until the
+    /// first audio chunk, including any first attempt that failed and was repeated.
+    pub first_audio_ms: u64,
+    /// Content-free facts about the provider session; `None` for a provider that keeps none.
+    pub session: Option<crate::speech::SessionUse>,
+}
+
+#[derive(Clone, Debug)]
+struct Entry {
+    prepared: Prepared,
+    minted: Instant,
+    server_timing: Option<ServerTiming>,
 }
 
 /// A short-lived table of prepared messages, keyed by an unguessable ticket.
 #[derive(Debug)]
 pub struct SpeechTickets {
-    held: Mutex<HashMap<String, (Prepared, Instant)>>,
+    held: Mutex<HashMap<String, Entry>>,
 }
 
 impl Default for SpeechTickets {
@@ -93,20 +131,27 @@ impl SpeechTickets {
         let ticket = fresh_ticket();
         if let Ok(mut held) = self.held.lock() {
             let now = Instant::now();
-            held.retain(|_, (_, minted)| now.duration_since(*minted) < TICKET_TTL);
+            held.retain(|_, entry| now.duration_since(entry.minted) < TICKET_TTL);
             // Only after expiry has been applied, so a store full of dead tickets evicts those
             // rather than a live one somebody is about to tap.
             while held.len() >= MAX_TICKETS {
                 let Some(oldest) = held
                     .iter()
-                    .min_by_key(|(_, (_, minted))| *minted)
+                    .min_by_key(|(_, entry)| entry.minted)
                     .map(|(key, _)| key.clone())
                 else {
                     break;
                 };
                 held.remove(&oldest);
             }
-            held.insert(ticket.clone(), (prepared, now));
+            held.insert(
+                ticket.clone(),
+                Entry {
+                    prepared,
+                    minted: now,
+                    server_timing: None,
+                },
+            );
         }
         ticket
     }
@@ -118,15 +163,35 @@ impl SpeechTickets {
     #[must_use]
     pub fn claim(&self, ticket: &str) -> Option<Prepared> {
         let mut held = self.held.lock().ok()?;
-        let (prepared, minted) = held.get(ticket)?;
-        if Instant::now().duration_since(*minted) >= TICKET_TTL {
+        let entry = held.get(ticket)?;
+        if Instant::now().duration_since(entry.minted) >= TICKET_TTL {
             held.remove(ticket);
             return None;
         }
         // NOT removed on a successful claim. An `<audio>` element may open the URL more than once
         // — a retry, a re-read, a media session restoring itself — and a single-use ticket turns
         // the second of those into a failure the reader cannot explain or act on.
-        Some(prepared.clone())
+        Some(entry.prepared.clone())
+    }
+
+    /// Attach the provider phases measured by the streaming handler to this observation.
+    pub fn record_server_timing(&self, ticket: &str, timing: ServerTiming) {
+        if let Ok(mut held) = self.held.lock() {
+            if let Some(entry) = held.get_mut(ticket) {
+                entry.server_timing = Some(timing);
+            }
+        }
+    }
+
+    /// Resolve a browser report to its content-free observation and server phases.
+    #[must_use]
+    pub fn observed_timing(&self, ticket: &str) -> Option<(Prepared, ServerTiming)> {
+        let held = self.held.lock().ok()?;
+        let entry = held.get(ticket)?;
+        if Instant::now().duration_since(entry.minted) >= TICKET_TTL {
+            return None;
+        }
+        Some((entry.prepared.clone(), entry.server_timing?))
     }
 
     /// How many tickets are held. For tests and the diagnostics line; not a stable API.
@@ -157,6 +222,15 @@ fn fresh_ticket() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// A correlation id which carries no message, credential, provider, or deployment identity.
+#[must_use]
+pub fn fresh_observation() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 12];
+    getrandom::fill(&mut bytes).expect("the system CSPRNG must be available for timing ids");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,17 +241,21 @@ mod tests {
             message: message.to_owned(),
             said: format!("the text of {message}"),
             speed: None,
+            observation: fresh_observation(),
+            preparation_ms: 1,
         }
     }
 
     #[test]
     fn a_ticket_names_exactly_what_was_minted_under_it() {
         let tickets = SpeechTickets::new();
-        let one = tickets.mint(prepared("1000000000000000001"));
-        let two = tickets.mint(prepared("1000000000000000002"));
+        let one_prepared = prepared("1000000000000000001");
+        let two_prepared = prepared("1000000000000000002");
+        let one = tickets.mint(one_prepared.clone());
+        let two = tickets.mint(two_prepared.clone());
         assert_ne!(one, two, "two mints produced the same ticket");
-        assert_eq!(tickets.claim(&one), Some(prepared("1000000000000000001")));
-        assert_eq!(tickets.claim(&two), Some(prepared("1000000000000000002")));
+        assert_eq!(tickets.claim(&one), Some(one_prepared));
+        assert_eq!(tickets.claim(&two), Some(two_prepared));
     }
 
     #[test]
