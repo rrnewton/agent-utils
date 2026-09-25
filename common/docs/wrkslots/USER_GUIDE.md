@@ -462,6 +462,17 @@ remote before the exact stale Git worktree registration is removed. The archive 
 ACTIVE is changed and explicitly records that uncommitted, untracked, ignored, and HANDOFF contents
 could not be inspected because storage was already absent.
 
+The local branch is separate evidence, not the salvage authority. It may be absent or may directly
+name the recorded commit, an ancestor, a descendant, or a divergent commit. Recovery records that
+exact state, issues no source-repository command targeting the branch for mutation, and requires the
+same state immediately before and after registration reconciliation. Only the recorded slot HEAD is
+given a rescue ref; a distinct local branch tip is left in place without a separate rescue ref. The
+branch witness expires after the registration removal is durably journaled, so the archive tells the
+operator to re-read every local branch rather than asserting its later state. Symbolic branch refs,
+a rescue destination colliding with any recorded local branch, relative local remotes, and local
+remotes whose Git common directory aliases any source repository in the row all refuse before the
+journal or salvage push.
+
 An unregistered agent worktree is recovered without assigning it an owner, task, or handoff. Supply
 the exact path and the Git identities established during inspection:
 

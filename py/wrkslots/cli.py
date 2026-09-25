@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
@@ -320,6 +321,7 @@ _ABSENT_AGENT_JOURNAL_REQUIRED = frozenset(
         "archive_entry",
     }
 )
+_ABSENT_AGENT_JOURNAL_OPTIONAL = frozenset({"branch_witnesses"})
 CONFIG_NAME = ".wrkslots.yml"
 # Configuration keys that may be absent. Absent is a meaning, not a default to
 # be materialised: no `max_active_slots` key means allocation is uncapped.
@@ -344,6 +346,7 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_NULL_GIT_SHA = "0" * 40
 GIB = 1024**3
 HOLD_SCHEMA = 1
 EVENT_SCHEMA = 1
@@ -740,6 +743,16 @@ class AbsentAgentRow:
     slot: str
     generation: int
     record_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _AbsentAgentBranchWitness:
+    """Exact local branch state observed without making that branch source authority."""
+
+    checkout: str
+    branch_ref: str
+    state: str
+    head: str | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -6186,7 +6199,7 @@ def _validate_global_state_for_absent_agent_recovery(
 
     states = _load_all_active(config)
     archives = _load_all_archives(config)
-    item, recorded, _receipts, expected_entry = _absent_agent_journal_inputs(
+    item, recorded, _branches, _receipts, expected_entry = _absent_agent_journal_inputs(
         config, journal
     )
     active = {
@@ -8022,6 +8035,30 @@ def _with_proxy(command: Sequence[str], env: Mapping[str, str]) -> list[str]:
     return [str(Path(wrapper).absolute()), *command] if wrapper is not None else list(command)
 
 
+def _local_remote_url_path(repository: Path, url: str) -> Path | None:
+    """Return a conservative local path for a Git remote URL, if it has one."""
+
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme:
+        if parsed.scheme != "file":
+            return None
+        if parsed.netloc not in {"", "localhost"} or parsed.query or parsed.fragment:
+            raise Refusal(f"ambiguous file remote URL cannot be proven safe: {url!r}")
+        try:
+            raw = urllib.parse.unquote_to_bytes(parsed.path).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise Refusal("file remote URL path is not valid UTF-8") from exc
+        candidate = Path(raw)
+    else:
+        # Git's host:path spelling is a remote transport, not a local path.
+        if re.match(r"^(?:[^/@:]+@)?[^/:]+:", url):
+            return None
+        candidate = Path(url)
+    if not candidate.is_absolute():
+        candidate = repository / candidate
+    return candidate
+
+
 def _github_credential_helper_args(env: Mapping[str, str]) -> tuple[str, ...]:
     """Return an explicit GitHub credential helper without loading global Git config."""
 
@@ -8187,6 +8224,77 @@ class _GitVcs:
         if not SHA_RE.fullmatch(sha):
             raise Refusal(f"{label} did not resolve to one full commit: {ref}")
         return sha
+
+    def local_branch_head(self, repository: Path, branch_ref: str) -> str | None:
+        """Read one stable commit-valued local branch ref without changing it."""
+
+        _validate_full_ref(branch_ref, "local branch ref")
+        if not branch_ref.startswith("refs/heads/"):
+            raise Refusal(f"local branch ref is outside refs/heads: {branch_ref!r}")
+        symbolic = self._run(
+            repository,
+            ["symbolic-ref", "--quiet", branch_ref],
+            check=False,
+        )
+        if symbolic.returncode == 0:
+            raise Refusal(
+                f"local branch ref {branch_ref!r} is symbolic; recovery requires a "
+                "direct branch ref or proven absence"
+            )
+        if symbolic.returncode != 1 or symbolic.stdout or symbolic.stderr:
+            raise Refusal(
+                f"cannot classify whether local branch {branch_ref!r} is symbolic in "
+                f"{repository}"
+            )
+        existence = self._run(
+            repository,
+            ["show-ref", "--exists", branch_ref],
+            check=False,
+        )
+        # `show-ref --exists` has a purpose-built status contract: 0 means the
+        # ref exists, 2 means it is missing, and 1 means another lookup error.
+        # Git writes its fixed "reference does not exist" diagnostic on the
+        # normal status-2 path, so stderr cannot distinguish absence here.
+        if existence.returncode == 2 and not existence.stdout:
+            return None
+        if (
+            existence.returncode != 0
+            or existence.stdout
+            or existence.stderr
+        ):
+            raise Refusal(
+                f"cannot classify local branch existence for {branch_ref!r} in "
+                f"{repository}"
+            )
+
+        def read_ref() -> str:
+            result = self._run(
+                repository,
+                ["show-ref", "--verify", "--hash", "--", branch_ref],
+                check=False,
+            )
+            lines = result.stdout.splitlines()
+            if (
+                result.returncode != 0
+                or result.stderr
+                or len(lines) != 1
+                or SHA_RE.fullmatch(lines[0]) is None
+            ):
+                raise Refusal(
+                    f"cannot read exact local branch state for {branch_ref!r} in "
+                    f"{repository}"
+                )
+            return lines[0]
+
+        first = read_ref()
+        if self.verify_ref(repository, first, "local branch object") != first:
+            raise Refusal(f"local branch {branch_ref!r} does not name one commit")
+        second = read_ref()
+        if second != first:
+            raise Refusal(
+                f"local branch {branch_ref!r} changed while its state was read"
+            )
+        return first
 
     def check_branch_name(self, repository: Path, branch: str) -> None:
         _validate_ref(branch, "branch")
@@ -8620,6 +8728,74 @@ class _GitVcs:
             url=url,
             sha256=hashlib.sha256(url.encode("utf-8")).hexdigest(),
         )
+
+    def assert_remote_distinct_from_repositories(
+        self,
+        repository: Path,
+        authority: _RemoteAuthority,
+        protected_repositories: Sequence[Path],
+    ) -> None:
+        """Refuse a local remote that aliases any source repository in the row."""
+
+        candidate = _local_remote_url_path(repository, authority.url)
+        if candidate is None:
+            return
+        parsed = urllib.parse.urlsplit(authority.url)
+        raw_local_path = (
+            Path(urllib.parse.unquote(parsed.path))
+            if parsed.scheme == "file"
+            else Path(authority.url)
+        )
+        if not raw_local_path.is_absolute():
+            kind = "file remote" if parsed.scheme == "file" else "local remote"
+            raise Refusal(
+                f"relative {kind} {authority.url!r} has no stable meaning in the "
+                "isolated salvage transport; use a distinct absolute remote URL"
+            )
+        try:
+            candidate = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot prove local remote {authority.url!r} is distinct from source "
+                f"repositories: {exc}"
+            ) from exc
+        result = self._run(
+            candidate,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            check=False,
+        )
+        lines = result.stdout.splitlines()
+        if result.returncode != 0 or result.stderr or len(lines) != 1:
+            raise Refusal(
+                f"cannot classify local remote {authority.url!r} as one distinct Git "
+                "repository"
+            )
+        remote_common = Path(lines[0])
+        if not remote_common.is_absolute():
+            remote_common = candidate / remote_common
+        try:
+            remote_common = remote_common.resolve(strict=True)
+            remote_stat = remote_common.stat()
+            protected_common = tuple(
+                self.common_directory(source).resolve(strict=True)
+                for source in protected_repositories
+            )
+            protected_identities = {
+                (common.stat().st_dev, common.stat().st_ino)
+                for common in protected_common
+            }
+        except OSError as exc:
+            raise Refusal(
+                "cannot resolve remote/source Git common directories before salvage"
+            ) from exc
+        if (
+            remote_common in protected_common
+            or (remote_stat.st_dev, remote_stat.st_ino) in protected_identities
+        ):
+            raise Refusal(
+                f"remote {authority.url!r} resolves to a source repository in this "
+                "recovery; refusing before the salvage push so no local ref is mutated"
+            )
 
     def assert_remote_authority(
         self, checkout: Path, remote: str, authority: _RemoteAuthority
@@ -27377,57 +27553,180 @@ def _absent_agent_rescue_ref(record: ActiveRecord, checkout: Checkout) -> str:
     return ref
 
 
-def _absent_agent_checkout_receipts(
+def _absent_agent_branch_witness_to_obj(
+    witness: _AbsentAgentBranchWitness,
+) -> dict[str, object]:
+    return {
+        "checkout": witness.checkout,
+        "branch_ref": witness.branch_ref,
+        "state": witness.state,
+        "head": witness.head,
+    }
+
+
+def _absent_agent_branch_witness_from_obj(
+    value: object, label: str
+) -> _AbsentAgentBranchWitness:
+    raw = _as_mapping(value, label)
+    _exact_keys(raw, {"checkout", "branch_ref", "state", "head"}, set(), label)
+    checkout = _as_str(raw["checkout"], f"{label}.checkout")
+    if not checkout:
+        raise StateError(f"{label}.checkout must not be empty")
+    try:
+        branch_ref = _validate_full_ref(
+            _as_str(raw["branch_ref"], f"{label}.branch_ref"),
+            f"{label}.branch_ref",
+        )
+    except Refusal as exc:
+        raise StateError(f"{label}.branch_ref is invalid") from exc
+    if not branch_ref.startswith("refs/heads/"):
+        raise StateError(f"{label}.branch_ref must name refs/heads")
+    state = _as_str(raw["state"], f"{label}.state")
+    head_raw = raw["head"]
+    if state == "absent":
+        if head_raw is not None:
+            raise StateError(f"{label}.head must be null when the branch is absent")
+        head = None
+    elif state == "present":
+        head = _as_str(head_raw, f"{label}.head")
+        if SHA_RE.fullmatch(head) is None:
+            raise StateError(f"{label}.head must be one full object SHA")
+    else:
+        raise StateError(f"{label}.state must be 'absent' or 'present'")
+    return _AbsentAgentBranchWitness(checkout, branch_ref, state, head)
+
+
+def _absent_agent_branch_witnesses(
     config: Config, record: ActiveRecord, vcs: _GitVcs
-) -> tuple[dict[str, object], ...]:
+) -> tuple[_AbsentAgentBranchWitness, ...]:
+    witnesses: list[_AbsentAgentBranchWitness] = []
     for checkout in record.checkouts:
         _stored, repository = _stored_repository_path(config, checkout.repository)
-        if vcs.remote_url_sha256(repository, checkout.remote) != checkout.remote_url_sha256:
+        branch_ref = f"refs/heads/{checkout.branch}"
+        head = vcs.local_branch_head(repository, branch_ref)
+        witnesses.append(
+            _AbsentAgentBranchWitness(
+                checkout=checkout.name,
+                branch_ref=branch_ref,
+                state="absent" if head is None else "present",
+                head=head,
+            )
+        )
+    return tuple(witnesses)
+
+
+def _assert_absent_agent_branch_witness(
+    repository: Path,
+    checkout: Checkout,
+    witness: _AbsentAgentBranchWitness,
+    vcs: _GitVcs,
+) -> None:
+    expected_ref = f"refs/heads/{checkout.branch}"
+    if witness.checkout != checkout.name or witness.branch_ref != expected_ref:
+        raise StateError(
+            f"branch witness does not match absent checkout {checkout.name}"
+        )
+    observed = vcs.local_branch_head(repository, witness.branch_ref)
+    if observed == witness.head:
+        return
+    expected = witness.head or "absent"
+    actual = observed or "absent"
+    raise Refusal(
+        f"local branch {witness.branch_ref!r} for absent checkout {checkout.name} "
+        f"changed from witnessed state {expected} to {actual}; recovery refuses "
+        "and preserves the ACTIVE row and journal for inspection"
+    )
+
+
+def _assert_absent_agent_registration(
+    checkout: Checkout,
+    witness: _AbsentAgentBranchWitness,
+    registration: tuple[str, str | None],
+) -> None:
+    head, branch = registration
+    expected_head = witness.head if witness.state == "present" else _NULL_GIT_SHA
+    expected_branch = f"refs/heads/{checkout.branch}"
+    if head != expected_head or branch != expected_branch:
+        raise Refusal(
+            f"Git registration changed for absent checkout {checkout.name}: expected "
+            f"HEAD {expected_head} on {expected_branch}, found HEAD {head} on "
+            f"{branch or 'detached'}"
+        )
+
+
+def _assert_absent_agent_rescue_refs_disjoint(
+    record: ActiveRecord,
+    branch_witnesses: Sequence[_AbsentAgentBranchWitness],
+) -> None:
+    local_branches = {witness.branch_ref for witness in branch_witnesses}
+    rescue_refs = {
+        _absent_agent_rescue_ref(record, checkout) for checkout in record.checkouts
+    }
+    collisions = sorted(rescue_refs & local_branches)
+    if collisions:
+        raise Refusal(
+            "planned rescue destination collides with a recorded local branch ref: "
+            + ", ".join(collisions)
+            + "; refusing before any salvage push or ref mutation"
+        )
+
+
+def _absent_agent_checkout_receipts(
+    config: Config,
+    record: ActiveRecord,
+    vcs: _GitVcs,
+    branch_witnesses: Sequence[_AbsentAgentBranchWitness],
+    removed: AbstractSet[str] = frozenset(),
+    *,
+    preserved: AbstractSet[str] = frozenset(),
+) -> tuple[dict[str, object], ...]:
+    if len(branch_witnesses) != len(record.checkouts):
+        raise StateError("absent-agent branch witness count differs from checkout count")
+    _assert_absent_agent_rescue_refs_disjoint(record, branch_witnesses)
+    repositories = tuple(
+        _stored_repository_path(config, checkout.repository)[1]
+        for checkout in record.checkouts
+    )
+    for checkout, witness in zip(record.checkouts, branch_witnesses, strict=True):
+        _stored, repository = _stored_repository_path(config, checkout.repository)
+        authority = vcs.remote_authority(repository, checkout.remote)
+        if authority.sha256 != checkout.remote_url_sha256:
             raise Refusal(
                 f"source repository remote changed for absent checkout {checkout.name}"
             )
-        if vcs.verify_ref(repository, checkout.head, "recorded checkout HEAD") != checkout.head:
+        vcs.assert_remote_distinct_from_repositories(
+            repository, authority, repositories
+        )
+        if checkout.name not in preserved and (
+            vcs.verify_ref(repository, checkout.head, "recorded checkout HEAD")
+            != checkout.head
+        ):
             raise Refusal(f"recorded commit object is unavailable for {checkout.name}")
-        branch_ref = f"refs/heads/{checkout.branch}"
-        try:
-            branch_head = vcs.verify_ref(
-                repository, branch_ref, "recorded checkout local branch"
-            )
-        except Refusal as exc:
-            raise Refusal(
-                f"recorded checkout local branch {checkout.branch!r} is unavailable for "
-                f"{checkout.name}; preserve the ACTIVE row"
-            ) from exc
-        if branch_head != checkout.head:
-            raise Refusal(
-                f"local branch {checkout.branch!r} for absent checkout "
-                f"{checkout.name} moved from recorded HEAD {checkout.head} to "
-                f"{branch_head}; preserve the ACTIVE row and inspect the branch "
-                "before recovery"
-            )
+        if checkout.name not in removed:
+            _assert_absent_agent_branch_witness(repository, checkout, witness, vcs)
         path = _stored_path(config, checkout.path, "agent checkout path").absolute()
         registration = vcs.worktree_registration(repository, path)
-        if registration is not None:
-            head, branch = registration
-            if head != checkout.head:
+        if checkout.name in removed:
+            if registration is not None:
                 raise Refusal(
-                    f"Git registration HEAD for absent checkout {checkout.name} changed "
-                    f"from {checkout.head} to {head}"
+                    f"Git registration reappeared for removed absent checkout {checkout.name}"
                 )
-            expected_branch = f"refs/heads/{checkout.branch}"
-            if branch != expected_branch:
-                raise Refusal(
-                    f"Git registration branch for absent checkout {checkout.name} changed: "
-                    f"expected {expected_branch}, found {branch or 'detached'}"
-                )
-    return _absent_agent_planned_receipts(record)
+        elif registration is not None:
+            _assert_absent_agent_registration(checkout, witness, registration)
+    return _absent_agent_planned_receipts(record, branch_witnesses)
 
 
 def _absent_agent_planned_receipts(
     record: ActiveRecord,
+    branch_witnesses: Sequence[_AbsentAgentBranchWitness],
+    *,
+    include_branch_witness: bool = True,
 ) -> tuple[dict[str, object], ...]:
-    return tuple(
-        {
+    if len(branch_witnesses) != len(record.checkouts):
+        raise StateError("absent-agent branch witness count differs from checkout count")
+    receipts: list[dict[str, object]] = []
+    for checkout, witness in zip(record.checkouts, branch_witnesses, strict=True):
+        receipt: dict[str, object] = {
             "checkout": checkout.name,
             "source_head": checkout.head,
             "salvage_commit": checkout.head,
@@ -27437,7 +27736,51 @@ def _absent_agent_planned_receipts(
             "containing_remote_refs": [],
             "working_tree_contents": "unknown-storage-absent-before-recovery",
         }
-        for checkout in record.checkouts
+        if include_branch_witness:
+            receipt["local_branch"] = _absent_agent_branch_witness_to_obj(witness)
+            receipt["local_branch_rescue"] = (
+                "not-applicable-absent"
+                if witness.head is None
+                else (
+                    "same-commit-as-recorded-head"
+                    if witness.head == checkout.head
+                    else "no-separate-ref-left-untouched"
+                )
+            )
+        receipts.append(receipt)
+    return tuple(receipts)
+
+
+def _absent_agent_branch_validation(receipt: Mapping[str, object]) -> str:
+    checkout = _as_str(receipt.get("checkout"), "absent-agent receipt.checkout")
+    witness = _absent_agent_branch_witness_from_obj(
+        receipt.get("local_branch"), "absent-agent receipt.local_branch"
+    )
+    observed = witness.head or "absent"
+    disposition = _as_str(
+        receipt.get("local_branch_rescue"),
+        "absent-agent receipt.local_branch_rescue",
+    )
+    if disposition == "not-applicable-absent" and witness.head is None:
+        detail = "had no tip to include in the recorded-HEAD rescue ref"
+    elif (
+        disposition == "same-commit-as-recorded-head"
+        and witness.head == receipt.get("source_head")
+    ):
+        detail = "named the same commit as the recorded HEAD rescue ref"
+    elif disposition == "no-separate-ref-left-untouched" and witness.head is not None:
+        detail = (
+            "received no separate rescue ref; the recorded-HEAD rescue ref targets "
+            f"{receipt.get('source_head')}"
+        )
+    else:
+        raise StateError("absent-agent local branch rescue disposition is inconsistent")
+    return (
+        f"checkout {checkout}: recovery issued no source-repository command targeting "
+        f"local branch {witness.branch_ref} for mutation; checks immediately before "
+        f"and after registration reconciliation matched witnessed state {observed}, "
+        f"then that witness expired when the removal marker became durable and asserts "
+        f"no later branch state; {detail}"
     )
 
 
@@ -27447,6 +27790,14 @@ def _absent_agent_archive_entry(
     finished_at: str,
     receipts: Sequence[Mapping[str, object]],
 ) -> dict[str, object]:
+    branch_receipts = ["local_branch" in receipt for receipt in receipts]
+    if any(branch_receipts) and not all(branch_receipts):
+        raise StateError("absent-agent receipts mix legacy and branch-witness shapes")
+    has_branch_witnesses = bool(branch_receipts and branch_receipts[0])
+    distinct_branch_tip = any(
+        receipt.get("local_branch_rescue") == "no-separate-ref-left-untouched"
+        for receipt in receipts
+    )
     return {
         "archive_id": f"{record.machine}:{record.slot}:{record.generation}:{finished_at}",
         "slot": record.slot,
@@ -27465,17 +27816,51 @@ def _absent_agent_archive_entry(
             "registry reconciliation confirmed physical storage externally absent",
             f"source ACTIVE record SHA-256: {item.record_sha256}",
             *(
-                f"checkout {receipt['checkout']}: remote rescue ref "
-                f"{receipt['remote_ref']} read back at {receipt['salvage_commit']}"
+                (
+                    f"checkout {receipt['checkout']}: recorded slot HEAD "
+                    f"{receipt['source_head']} preserved at remote rescue ref "
+                    f"{receipt['remote_ref']} and read back at {receipt['salvage_commit']}"
+                    if has_branch_witnesses
+                    else f"checkout {receipt['checkout']}: remote rescue ref "
+                    f"{receipt['remote_ref']} read back at {receipt['salvage_commit']}"
+                )
                 for receipt in receipts
+            ),
+            *(
+                _absent_agent_branch_validation(receipt)
+                for receipt in receipts
+                if has_branch_witnesses
             ),
         ],
         "limitations": [
             "working-tree contents were absent before recovery; tracked and ordinary "
             "untracked content and HANDOFF could not be inspected or salvaged; ignored "
-            "content could not be inspected and would not have been uploaded"
+            "content could not be inspected and would not have been uploaded",
+            *(
+                [
+                    "local branch witnesses cover only registration reconciliation; "
+                    "no branch state after the durable removal marker is asserted"
+                ]
+                if has_branch_witnesses
+                else []
+            ),
+            *(
+                [
+                    "local branch tips distinct from the recorded slot HEAD were left "
+                    "untouched in source repositories; no separate rescue refs were "
+                    "created to target those exact tips"
+                ]
+                if distinct_branch_tip
+                else []
+            ),
         ],
-        "continuation": "physical storage was already absent; inspect the verified rescue refs",
+        "continuation": (
+            "physical storage was already absent; inspect the verified recorded-HEAD "
+            "rescue refs and re-read every local branch ref because its historical "
+            "witness has expired"
+            if has_branch_witnesses
+            else "physical storage was already absent; inspect the verified rescue refs"
+        ),
         "salvage": [dict(receipt) for receipt in receipts],
         "checkouts": [_checkout_to_obj(checkout) for checkout in record.checkouts],
         **({"layout": record.layout} if record.layout is not None else {}),
@@ -27517,8 +27902,19 @@ def _absent_agent_event_evidence(
 
 def _absent_agent_journal_inputs(
     config: Config, raw: Mapping[str, object]
-) -> tuple[AbsentAgentRow, ActiveRecord, tuple[Mapping[str, object], ...], dict[str, object]]:
-    _exact_keys(raw, _ABSENT_AGENT_JOURNAL_REQUIRED, set(), "absent-agent-row journal")
+) -> tuple[
+    AbsentAgentRow,
+    ActiveRecord,
+    tuple[_AbsentAgentBranchWitness, ...],
+    tuple[Mapping[str, object], ...],
+    dict[str, object],
+]:
+    _exact_keys(
+        raw,
+        _ABSENT_AGENT_JOURNAL_REQUIRED,
+        _ABSENT_AGENT_JOURNAL_OPTIONAL,
+        "absent-agent-row journal",
+    )
     if (
         _as_int(raw["schema"], "absent-agent-row journal.schema") != SCHEMA
         or raw["kind"] != "recover-absent-agent-row"
@@ -27537,6 +27933,42 @@ def _absent_agent_journal_inputs(
         raise StateError(f"unknown absent-agent-row phase {phase!r}")
     record = _record_from_obj(raw["record"], "absent-agent-row journal.record")
     _validate_absent_agent_row(record, item)
+    legacy_branches = "branch_witnesses" not in raw
+    branch_witnesses = (
+        tuple(
+            _AbsentAgentBranchWitness(
+                checkout=checkout.name,
+                branch_ref=f"refs/heads/{checkout.branch}",
+                state="present",
+                head=checkout.head,
+            )
+            for checkout in record.checkouts
+        )
+        if legacy_branches
+        else tuple(
+            _absent_agent_branch_witness_from_obj(
+                value, f"absent-agent-row journal.branch_witnesses[{index}]"
+            )
+            for index, value in enumerate(
+                _as_list(
+                    raw["branch_witnesses"],
+                    "absent-agent-row journal.branch_witnesses",
+                )
+            )
+        )
+    )
+    if len(branch_witnesses) != len(record.checkouts):
+        raise StateError(
+            "absent-agent-row branch witness count differs from checkout count"
+        )
+    for checkout, witness in zip(record.checkouts, branch_witnesses, strict=True):
+        if (
+            witness.checkout != checkout.name
+            or witness.branch_ref != f"refs/heads/{checkout.branch}"
+        ):
+            raise StateError(
+                f"absent-agent-row branch witness differs from checkout {checkout.name}"
+            )
     receipts = tuple(
         _as_mapping(value, f"absent-agent-row journal.preserved[{index}]")
         for index, value in enumerate(_as_list(raw["preserved"], "absent-agent-row journal.preserved"))
@@ -27553,7 +27985,11 @@ def _absent_agent_journal_inputs(
     archive_entry = dict(
         _as_mapping(raw["archive_entry"], "absent-agent-row journal.archive_entry")
     )
-    expected_receipts = _absent_agent_planned_receipts(record)
+    expected_receipts = _absent_agent_planned_receipts(
+        record,
+        branch_witnesses,
+        include_branch_witness=not legacy_branches,
+    )
     finished_at = _as_str(archive_entry.get("finished_at"), "absent-agent archive.finished_at")
     _parse_timestamp(finished_at, "absent-agent archive.finished_at")
     expected_archive = _absent_agent_archive_entry(
@@ -27566,16 +28002,33 @@ def _absent_agent_journal_inputs(
             raise StateError("absent-agent-row preserved receipts are not a durable prefix")
     if tuple(removed) != tuple(checkout.name for checkout in record.checkouts[: len(removed)]):
         raise StateError("absent-agent-row removed registrations are not a durable prefix")
+    if removed and (
+        phase == "prepared" or len(receipts) != len(record.checkouts)
+    ):
+        raise StateError(
+            "absent-agent-row removed registrations precede durable remote preservation"
+        )
     if phase in {"preserved", "registrations-removed"} and len(receipts) != len(
         record.checkouts
     ):
         raise StateError("absent-agent-row journal phase precedes complete remote preservation")
     if phase == "registrations-removed" and len(removed) != len(record.checkouts):
         raise StateError("absent-agent-row journal phase precedes complete registration removal")
-    return item, record, expected_receipts, archive_entry
+    return item, record, branch_witnesses, expected_receipts, archive_entry
 
 
-def _assert_absent_agent_safe(config: Config, record: ActiveRecord) -> tuple[Path, ...]:
+def _assert_absent_agent_safe(
+    config: Config,
+    record: ActiveRecord,
+    branch_witnesses: Sequence[_AbsentAgentBranchWitness] | None = None,
+    removed: AbstractSet[str] = frozenset(),
+    *,
+    preserved: AbstractSet[str] = frozenset(),
+) -> tuple[
+    tuple[Path, ...],
+    tuple[_AbsentAgentBranchWitness, ...],
+    tuple[dict[str, object], ...],
+]:
     _assert_absent_validate_rows_not_held(config, (record,))
     paths = _assert_absent_agent_storage(config, record)
     _assert_handoff_read(
@@ -27584,8 +28037,21 @@ def _assert_absent_agent_safe(config: Config, record: ActiveRecord) -> tuple[Pat
         _slot_directory(config, record.slot, record.slot_type),
     )
     _assert_absent_agent_liveness(config, record, paths)
-    _absent_agent_checkout_receipts(config, record, _GitVcs())
-    return paths
+    vcs = _GitVcs()
+    selected_witnesses = (
+        tuple(branch_witnesses)
+        if branch_witnesses is not None
+        else _absent_agent_branch_witnesses(config, record, vcs)
+    )
+    receipts = _absent_agent_checkout_receipts(
+        config,
+        record,
+        vcs,
+        selected_witnesses,
+        removed,
+        preserved=preserved,
+    )
+    return paths, selected_witnesses, receipts
 
 
 def _recover_absent_agent_row(
@@ -27599,7 +28065,9 @@ def _recover_absent_agent_row(
     if raw.get("host_id") != _host_id():
         raise Refusal("absent-agent-row journal belongs to another host identity")
     _assert_caller_process(coordinator, "coordinator")
-    item, recorded, planned, archive_entry = _absent_agent_journal_inputs(config, raw)
+    item, recorded, branch_witnesses, planned, archive_entry = (
+        _absent_agent_journal_inputs(config, raw)
+    )
     state = _load_active(config)
     current = next((row for row in state.slots if row.slot == item.slot), None)
     archive = _load_archive(config)
@@ -27616,7 +28084,25 @@ def _recover_absent_agent_row(
         return
     if _record_to_obj(current) != _record_to_obj(recorded):
         raise StateError(f"agent row {item.slot} differs from its journal snapshot")
-    _assert_absent_agent_safe(config, current)
+    removed_names = tuple(
+        _as_str(value, f"absent-agent-row journal.removed[{index}]")
+        for index, value in enumerate(
+            _as_list(raw["removed"], "absent-agent-row journal.removed")
+        )
+    )
+    preserved_count = len(
+        _as_list(raw["preserved"], "absent-agent-row journal.preserved")
+    )
+    preserved_names = frozenset(
+        checkout.name for checkout in recorded.checkouts[:preserved_count]
+    )
+    _assert_absent_agent_safe(
+        config,
+        current,
+        branch_witnesses,
+        frozenset(removed_names),
+        preserved=preserved_names,
+    )
     journal = dict(raw)
     preserved = [
         dict(_as_mapping(value, f"preserved[{index}]"))
@@ -27661,25 +28147,40 @@ def _recover_absent_agent_row(
             raise Refusal(f"remote rescue ref for {checkout.name} no longer preserves its HEAD")
     journal["phase"] = "preserved"
     _write_journal(config, journal)
-    removed = [str(value) for value in _as_list(journal["removed"], "removed")]
-    for checkout in recorded.checkouts[len(removed) :]:
+    removed = list(removed_names)
+    for checkout, witness in zip(
+        recorded.checkouts[len(removed) :],
+        branch_witnesses[len(removed) :],
+        strict=True,
+    ):
         _stored, repository = _stored_repository_path(config, checkout.repository)
         checkout_path = _stored_path(config, checkout.path, "agent checkout path").absolute()
+        _assert_absent_agent_branch_witness(repository, checkout, witness, vcs)
         registration = vcs.worktree_registration(repository, checkout_path)
         if registration is not None:
-            head, branch = registration
-            if head != checkout.head or branch != f"refs/heads/{checkout.branch}":
-                raise Refusal(f"Git registration changed for absent checkout {checkout.name}")
+            _assert_absent_agent_registration(checkout, witness, registration)
+            # Remote preservation can take long enough for the missing path to
+            # reappear. Refuse before asking Git to remove the registration so
+            # the ordinary `git worktree remove --force` path does not knowingly
+            # delete newly materialized storage.
+            _assert_absent_agent_storage(config, recorded)
             vcs.remove_worktree(repository, checkout_path, force=True)
         if vcs.worktree_registration(repository, checkout_path) is not None:
             raise Refusal(f"Git still registers absent checkout {checkout.name}")
+        _assert_absent_agent_branch_witness(repository, checkout, witness, vcs)
         removed.append(checkout.name)
         journal["removed"] = removed
         _write_journal(config, journal)
         _interrupt_for_test("after-absent-agent-registration-remove")
     journal["phase"] = "registrations-removed"
     _write_journal(config, journal)
-    _assert_absent_agent_safe(config, current)
+    _assert_absent_agent_safe(
+        config,
+        current,
+        branch_witnesses,
+        frozenset(checkout.name for checkout in recorded.checkouts),
+        preserved=frozenset(checkout.name for checkout in recorded.checkouts),
+    )
     if archived is None:
         archive = _append_archive_once(
             config,
@@ -27733,7 +28234,9 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
             path, raw = _load_journal(config)
             if raw.get("kind") != "recover-absent-agent-row":
                 raise Refusal(f"another interrupted mutation is recorded in {path}")
-            journal_item, _record, _planned, _archive = _absent_agent_journal_inputs(config, raw)
+            journal_item, _record, _branches, _planned, _archive = (
+                _absent_agent_journal_inputs(config, raw)
+            )
             if journal_item != item:
                 raise Refusal("requested agent row differs from the interrupted recovery")
             if not args.apply:
@@ -27767,15 +28270,25 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
                 f"agent row {item.machine}/{item.slot} is neither active nor an exact prior recovery"
             )
         _validate_absent_agent_row(record, item)
-        _assert_absent_agent_safe(config, record)
+        _paths, branch_witnesses, receipts = _assert_absent_agent_safe(
+            config, record
+        )
         if not args.apply:
+            rendered_witnesses = json.dumps(
+                [
+                    _absent_agent_branch_witness_to_obj(witness)
+                    for witness in branch_witnesses
+                ],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             print(
                 f"ROW machine={item.machine} slot={item.slot} generation={item.generation} "
-                "outcome=planned detail=physical-storage-absent"
+                "outcome=planned detail=physical-storage-absent "
+                f"branch_witnesses={rendered_witnesses}"
             )
             return 0
         assert coordinator is not None
-        receipts = _absent_agent_checkout_receipts(config, record, _GitVcs())
         finished_at = _utc_now()
         journal = {
             "schema": SCHEMA,
@@ -27787,6 +28300,10 @@ def _cmd_recover_absent_agent_row(args: argparse.Namespace) -> int:
             "actor": _identity_to_obj(coordinator),
             "input": dataclasses.asdict(item),
             "record": _record_to_obj(record),
+            "branch_witnesses": [
+                _absent_agent_branch_witness_to_obj(witness)
+                for witness in branch_witnesses
+            ],
             "preserved": [],
             "removed": [],
             "archive_entry": _absent_agent_archive_entry(
