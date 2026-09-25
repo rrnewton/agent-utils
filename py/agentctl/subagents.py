@@ -2464,24 +2464,41 @@ class ManagedAgents:
         return str(self._directory(name) / "queue")
 
     def _refuse_inflight_delivery(self, record: AgentRecord) -> None:
-        """Keep teardown from overtaking an injection already at its barrier."""
+        """Keep teardown from overtaking an injection or terminal publication."""
         root = self._queue(record.name)
         if not os.path.lexists(root):
             return
         agent._validate_existing_queue(root)
-        agent._validate_existing_binding(root, record.target())
-        inflight = Path(root) / "inflight"
-        if not inflight.is_dir():
-            raise AgentDeliveryError("delivery queue is incomplete")
-        identifiers = sorted(
-            path.name[:-5] for path in inflight.iterdir()
-            if path.name.endswith(".json")
+        lock = agent._open_private_lock(
+            str(Path(root) / ".delivery.lock"), "queue delivery lock",
         )
-        if identifiers:
-            raise AgentDeliveryError(
-                "refusing stop while prompt submission is in flight: "
-                + ", ".join(identifiers)
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise AgentDeliveryError(
+                    "refusing stop while a delivery transition is active"
+                ) from exc
+            # The drainer holds this lock from the durable inflight barrier
+            # through its processed/failed rename and directory syncs.  The
+            # second validation therefore observes one complete publication,
+            # never the rename-before-fsync prefix.
+            agent._validate_existing_queue(root)
+            agent._validate_existing_binding(root, record.target())
+            inflight = Path(root) / "inflight"
+            if not inflight.is_dir():
+                raise AgentDeliveryError("delivery queue is incomplete")
+            identifiers = sorted(
+                path.name[:-5] for path in inflight.iterdir()
+                if path.name.endswith(".json")
             )
+            if identifiers:
+                raise AgentDeliveryError(
+                    "refusing stop while prompt submission is in flight: "
+                    + ", ".join(identifiers)
+                )
+        finally:
+            os.close(lock)
 
     def get(self, name: str) -> AgentRecord:
         """Read durable metadata without requiring Herdr to be reachable."""

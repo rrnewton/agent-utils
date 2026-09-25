@@ -4225,6 +4225,23 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             Err(error) => return Err(fail(format!("cannot inspect delivery queue: {error}"))),
         }
         agent::validate_existing_queue(&queue)?;
+        let lock_path = queue.join(".delivery.lock");
+        let lock = agent::open_private_lock(&lock_path, "queue delivery lock")?;
+        match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(fail("refusing stop while a delivery transition is active"))
+            }
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot lock queue delivery transition before stop: {error}"
+                )))
+            }
+        }
+        // The drainer holds this lock through the terminal rename and both
+        // directory syncs. Revalidation under it cannot observe the
+        // rename-before-fsync crash prefix.
+        agent::validate_existing_queue(&queue)?;
         agent::validate_existing_binding(&queue, &record.target()?)?;
         let inflight = queue.join("inflight");
         agent::validate_private_directory(&inflight, "queue state directory", false)
@@ -17046,6 +17063,56 @@ mod tests {
         assert!(error.to_string().contains("prompt submission is in flight"));
         assert!(fixture.client.closed.lock().unwrap().is_empty());
         assert!(fixture.root.join("registry/worker").is_dir());
+    }
+
+    #[test]
+    fn stop_refuses_terminal_delivery_rename_before_its_sync_completes() {
+        let fixture = Fixture::new();
+        let started = fixture.start(None);
+        let manager = fixture.manager();
+        let record = manager.load("worker").unwrap();
+        let queue = manager.queue("worker").unwrap();
+        agent::enqueue_bound(
+            &queue,
+            &record.target().unwrap(),
+            "finish the durable transition",
+            Some("processed-before-sync"),
+            agent::QueueMessageKind::Message,
+        )
+        .unwrap();
+        fs::rename(
+            queue.join("inbox/processed-before-sync.json"),
+            queue.join("processed/processed-before-sync.json"),
+        )
+        .unwrap();
+        let delivery_lock =
+            agent::open_private_lock(&queue.join(".delivery.lock"), "test queue lock").unwrap();
+        delivery_lock.lock_exclusive().unwrap();
+
+        let error = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("delivery transition is active"));
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert!(fixture.root.join("registry/worker/agent.json").is_file());
+
+        FileExt::unlock(&delivery_lock).unwrap();
+        let stopped = manager
+            .stop_with_options(
+                "worker",
+                StopOptions {
+                    expected_token: Some(started["token"].as_str().unwrap().to_owned()),
+                    ..StopOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped["pane_closed"], true);
     }
 
     #[test]

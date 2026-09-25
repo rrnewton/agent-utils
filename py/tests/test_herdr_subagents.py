@@ -1449,6 +1449,37 @@ def test_stop_refuses_an_inflight_prompt_before_runtime_teardown(
     assert (manager.registry / "worker" / "agent.json").is_file()
 
 
+def test_stop_refuses_terminal_delivery_rename_before_its_sync_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    queue = manager.registry / "worker/queue"
+    identifier = agent.enqueue_bound(
+        str(queue), record.target(), "finish the durable transition",
+        message_id="processed-before-sync",
+    )
+    agent._transition(
+        str(queue / f"inbox/{identifier}.json"),
+        str(queue / f"processed/{identifier}.json"),
+    )
+    delivery_lock = agent._open_private_lock(
+        str(queue / ".delivery.lock"), "test queue lock",
+    )
+    fcntl.flock(delivery_lock, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(AgentDeliveryError, match="delivery transition is active"):
+            manager.stop("worker", expected_token=str(started["token"]))
+        assert fake.closed == []
+        assert (manager.registry / "worker/agent.json").is_file()
+    finally:
+        os.close(delivery_lock)
+
+    stopped = manager.stop("worker", expected_token=str(started["token"]))
+    assert stopped["pane_closed"] is True
+
+
 def test_failed_receipt_is_durable_before_inflight_teardown_fence_is_removed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1476,7 +1507,7 @@ def test_failed_receipt_is_durable_before_inflight_teardown_fence_is_removed(
 
 
 @pytest.mark.parametrize("terminal_state", ["processed", "failed"])
-def test_terminal_delivery_result_survives_concurrent_stop_archive(
+def test_terminal_delivery_transition_refuses_stop_and_preserves_result(
     terminal_state: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
@@ -1509,8 +1540,10 @@ def test_terminal_delivery_result_survives_concurrent_stop_archive(
     thread.start()
     assert transitioned.wait(5)
     try:
-        stopped = manager.stop("worker", expected_token=str(started["token"]))
-        assert Path(str(stopped["archive"])).is_dir()
+        with pytest.raises(AgentDeliveryError, match="delivery transition is active"):
+            manager.stop("worker", expected_token=str(started["token"]))
+        assert fake.closed == []
+        assert (manager.registry / "worker/agent.json").is_file()
     finally:
         release.set()
     thread.join(5)
@@ -1523,6 +1556,9 @@ def test_terminal_delivery_result_survives_concurrent_stop_archive(
         assert results == []
         assert len(failures) == 1
         assert isinstance(failures[0], AgentPossiblySubmitted)
+
+    stopped = manager.stop("worker", expected_token=str(started["token"]))
+    assert Path(str(stopped["archive"])).is_dir()
     assert not (manager.registry / "worker").exists()
 
 
