@@ -10209,7 +10209,28 @@ def _parse_mountinfo_paths(
     return parsed
 
 
-def _process_mounts_slot(pid_dir: Path, slot_path: Path) -> list[str]:
+def _process_mounts_slot(
+    pid_dir: Path,
+    slot_path: Path,
+    results: dict[tuple[Path, str], tuple[str, ...]] | None = None,
+) -> list[str]:
+    """Report a mount in this process's namespace that references ``slot_path``.
+
+    ``results`` memoizes the answer by ``(slot_path, mount table TEXT)``, which
+    is all the answer depends on.  Every call still reads its own process's table
+    fresh; only the parse and the containment walk are shared.  One live-use
+    scan inspects one table per mount-namespace key, and a process whose
+    ``ns/mnt`` link cannot be read (another user's process) is keyed by its own
+    PID.  On a shared host those fallback keys are nearly all the keys, and
+    almost all of them list the host's own table -- measured 2026-09-25, 3,957
+    keys over about 200 distinct tables.  The mount-only portion of one scan for
+    an unused slot cost 58.2 s of CPU walking every table and 4.6 s walking each
+    distinct table once.
+
+    Only a SUCCESSFUL answer is stored, so a malformed table still refuses once
+    per process and names the process it came from.
+    """
+
     mountinfo_path = pid_dir / "mountinfo"
     try:
         mountinfo = mountinfo_path.read_text(encoding="utf-8", errors="surrogateescape")
@@ -10221,12 +10242,21 @@ def _process_mounts_slot(pid_dir: Path, slot_path: Path) -> list[str]:
         raise Refusal(
             f"process use is indeterminate because {mountinfo_path} is unreadable: {exc}"
         ) from exc
+    key = (slot_path, mountinfo)
+    if results is not None:
+        cached = results.get(key)
+        if cached is not None:
+            return list(cached)
+    uses: tuple[str, ...] = ()
     for candidate, _raw in _parse_mountinfo_paths(
         mountinfo, f"process mount evidence for PID {pid_dir.name}"
     ):
         if _path_is_within(candidate, slot_path):
-            return [f"mount={candidate}"]
-    return []
+            uses = (f"mount={candidate}",)
+            break
+    if results is not None:
+        results[key] = uses
+    return list(uses)
 
 
 def _mount_namespace(pid_dir: Path) -> str | None:
@@ -10802,6 +10832,7 @@ def _observe_slot_use_once(
             invoking_ancestry.add(ancestor)
             ancestor = _read_process_parent(ancestor)
     inspected_mount_namespaces: set[str] = set()
+    mount_results: dict[tuple[Path, str], tuple[str, ...]] = {}
     indeterminate_use: Refusal | None = None
     reported_use: _LiveUseObservation | None = None
     reported_use_recheckable = True
@@ -10860,7 +10891,7 @@ def _observe_slot_use_once(
                 if mount_namespace is None or mount_namespace in inspected_mount_namespaces:
                     uses = []
                 else:
-                    uses = _process_mounts_slot(pid_dir, slot_path)
+                    uses = _process_mounts_slot(pid_dir, slot_path, mount_results)
                     inspected_mount_namespaces.add(mount_namespace)
             else:
                 uses = _process_uses_slot(pid_dir, slot_path)

@@ -288,6 +288,156 @@ def test_mountinfo_parse_cache_never_stores_a_refusal(
     assert cache == {}
 
 
+_SHARED_TABLE = (
+    "24 30 0:22 / /proc rw,nosuid - proc proc rw\n"
+    "25 30 0:5 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
+    "26 30 259:2 / / rw - btrfs /dev/root rw\n"
+)
+
+
+def _fake_mount_process(proc_root: Path, pid: int, namespace: int, table: str) -> Path:
+    pid_dir = proc_root / str(pid)
+    (pid_dir / "ns").mkdir(parents=True)
+    (pid_dir / "ns" / "mnt").symlink_to(f"mnt:[{namespace}]")
+    (pid_dir / "status").write_text(
+        f"Name:\tfake\nUid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n",
+        encoding="ascii",
+    )
+    (pid_dir / "mountinfo").write_text(table, encoding="utf-8")
+    return pid_dir
+
+
+def _counting_parses(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    parsed: list[str] = []
+    original = cli._parse_mountinfo_paths
+
+    def counting(
+        text: str,
+        label: str,
+        cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
+    ) -> tuple[tuple[Path, str], ...]:
+        parsed.append(label)
+        return original(text, label, cache)
+
+    monkeypatch.setattr(cli, "_parse_mountinfo_paths", counting)
+    return parsed
+
+
+def test_mount_use_memo_agrees_with_the_unmemoized_answer(tmp_path: Path) -> None:
+    slot = tmp_path / "slot"
+    mounting = (
+        _SHARED_TABLE
+        + f"27 30 259:2 /x {slot / 'inner'} rw - btrfs /dev/root rw\n"
+    )
+    shared = _fake_mount_process(tmp_path / "proc", 10, 1, _SHARED_TABLE)
+    mounts = _fake_mount_process(tmp_path / "proc", 11, 2, mounting)
+    results: dict[tuple[Path, str], tuple[str, ...]] = {}
+
+    for pid_dir in (shared, mounts, shared, mounts):
+        assert cli._process_mounts_slot(pid_dir, slot, results) == (
+            cli._process_mounts_slot(pid_dir, slot)
+        )
+    assert cli._process_mounts_slot(mounts, slot, results) == [f"mount={slot / 'inner'}"]
+    assert cli._process_mounts_slot(shared, slot, results) == []
+
+
+def test_mount_use_memo_is_keyed_by_slot_as_well_as_table(tmp_path: Path) -> None:
+    """One table answers differently for different slots; the memo must not
+    carry a negative answer for one slot over to another."""
+
+    pid_dir = _fake_mount_process(tmp_path / "proc", 10, 1, _SHARED_TABLE)
+    results: dict[tuple[Path, str], tuple[str, ...]] = {}
+
+    assert cli._process_mounts_slot(pid_dir, tmp_path / "elsewhere", results) == []
+    assert cli._process_mounts_slot(pid_dir, Path("/proc"), results) == ["mount=/proc"]
+    assert cli._process_mounts_slot(pid_dir, tmp_path / "elsewhere", results) == []
+
+
+def test_mount_use_memo_never_stores_a_refusal(tmp_path: Path) -> None:
+    malformed = "this line has no field separator\n"
+    first = _fake_mount_process(tmp_path / "proc", 11, 1, malformed)
+    second = _fake_mount_process(tmp_path / "proc", 22, 2, malformed)
+    results: dict[tuple[Path, str], tuple[str, ...]] = {}
+
+    with pytest.raises(cli.Refusal, match="PID 11"):
+        cli._process_mounts_slot(first, tmp_path / "slot", results)
+    with pytest.raises(cli.Refusal, match="PID 22"):
+        cli._process_mounts_slot(second, tmp_path / "slot", results)
+
+    assert results == {}
+
+
+def test_mount_use_memo_still_reads_every_table(tmp_path: Path) -> None:
+    """A table that changes between processes must be re-answered: the memo
+    shares work between identical TEXT, never between processes."""
+
+    slot = tmp_path / "slot"
+    pid_dir = _fake_mount_process(tmp_path / "proc", 10, 1, _SHARED_TABLE)
+    results: dict[tuple[Path, str], tuple[str, ...]] = {}
+
+    assert cli._process_mounts_slot(pid_dir, slot, results) == []
+    (pid_dir / "mountinfo").write_text(
+        _SHARED_TABLE + f"27 30 259:2 /x {slot} rw - btrfs /dev/root rw\n",
+        encoding="utf-8",
+    )
+    assert cli._process_mounts_slot(pid_dir, slot, results) == [f"mount={slot}"]
+
+
+def _lsof_available() -> bool:
+    return any(
+        candidate.is_file() and os.access(candidate, os.X_OK)
+        for candidate in (Path("/usr/bin/lsof"), Path("/usr/sbin/lsof"))
+    )
+
+
+@pytest.mark.skipif(not _lsof_available(), reason="the mount-only scan follows an lsof pass")
+def test_live_use_scan_walks_each_distinct_mount_table_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the scan's largest cost on a shared host.
+
+    After lsof rules out direct use, the scan reads one mount table per mount
+    namespace.  Thousands of namespaces there list a few identical tables, so
+    the walk must happen once per distinct table.  Remove the memo and this
+    fails with one parse per namespace.
+    """
+
+    slot = tmp_path / "slot"
+    proc_root = tmp_path / "proc"
+    other = _SHARED_TABLE + "28 30 0:40 / /mnt/other rw - tmpfs tmpfs rw\n"
+    for pid in range(100, 160):
+        _fake_mount_process(proc_root, pid, 5000 + pid, _SHARED_TABLE)
+    _fake_mount_process(proc_root, 200, 6000, other)
+    monkeypatch.setattr(cli, "_lsof_slot_use", lambda *_args, **_kwargs: (None, False, 1))
+    parsed = _counting_parses(monkeypatch)
+
+    assert cli._observe_slot_use_once(slot, proc_root=proc_root) is None
+    assert parsed == [
+        "process mount evidence for PID 100",
+        "process mount evidence for PID 200",
+    ]
+
+
+@pytest.mark.skipif(not _lsof_available(), reason="the mount-only scan follows an lsof pass")
+def test_live_use_scan_still_refuses_a_namespace_that_mounts_the_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot = tmp_path / "slot"
+    proc_root = tmp_path / "proc"
+    for pid in range(100, 160):
+        _fake_mount_process(proc_root, pid, 5000 + pid, _SHARED_TABLE)
+    _fake_mount_process(
+        proc_root,
+        200,
+        6000,
+        _SHARED_TABLE + f"27 30 259:2 /x {slot / 'bound'} rw - btrfs /dev/root rw\n",
+    )
+    monkeypatch.setattr(cli, "_lsof_slot_use", lambda *_args, **_kwargs: (None, False, 1))
+
+    with pytest.raises(cli.Refusal, match=f"live process 200 uses slot .*mount={slot / 'bound'}"):
+        cli._observe_slot_use_once(slot, proc_root=proc_root)
+
+
 @pytest.mark.parametrize("row_count", (64, 128, 256))
 def test_batch_liveness_matches_per_subject_results_with_one_invocation(
     tmp_path: Path,
