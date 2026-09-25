@@ -59,6 +59,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/diagnostics", get(api::diagnostics))
         .route("/api/v1/signed-url", get(api::signed_url))
         .route("/api/v1/voice-session", get(api::voice_session))
+        // `#14 voice-agent-prompt`. READ scope: the prompt is public text from this repository and
+        // the tool list is filtered to the caller's own scope, so it discloses nothing the same
+        // credential could not learn from `tools/list`. A private bridge fetches it at session open.
+        .route("/api/v1/voice-agent", get(api::voice_agent))
+        // `#11 voice-connect-latency`. Content-free startup phases, one log line per call. WRITE
+        // scope, the same credential that opened the session.
+        .route("/api/v1/voice-timing", post(api::voice_timing))
         .route("/api/v1/channels/{channel_id}/messages", get(api::messages))
         .route(
             "/api/v1/channels/{channel_id}/messages/{message_id}",
