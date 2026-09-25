@@ -133,31 +133,40 @@ non-removing operations, those attempts remain a rollout blocker; the observer c
 cannot clear or override them.
 
 Create and import-existing are the exception, but only when the completion leaves an ACTIVE row that
-owns the attempt's storage. A create journal records its slot type and every planned and created
-checkout path, and an import journal carries its whole row. Such a completion closes the
-`recovery-started` marker for the same slot and operation when that marker is bound to the completed
-journal path and the ACTIVE row has the attempt's slot type and owns every one of those checkout
-paths. A marker bound to another path stays open, such as the default for a journal that predates
-the event log, and so does one whose journal does not identify its storage. A completion that leaves
-no such row also leaves the marker open. The current abort paths below leave no provisional storage,
-but replay reads histories written by every past writer, and a production history contains a create
-journal completed after `recovery-started` with no row ever published while its provisioned
-worktree, holding commits beyond the recorded start point, remained on disk. Such a slot therefore
-stays `BLOCKED` with `ACTIVE_RECORD_MISSING` and `RECOVERY_PENDING` instead of disappearing from the
-observer. The cost is a blocker for a slot that current code aborted cleanly. After an aborted
-create it ends only when a later create of the same slot at the same journal path publishes a row of
-the same slot type that owns every checkout path the aborted attempt planned or created.
-`_cmd_create` refuses an existing slot path, and Python derives that path from the slot type's root,
-so such a create proves that the aborted attempt left no slot directory. A create of the same slot
-name under the other slot type proves only that its own root was clear, and it leaves the marker
-open. The proof does not extend to branches or caches outside the slot path that an older writer may
-have left. Some of these blockers are permanent, because no event that current writers append can
-close them and phase 1 has no operator acknowledgment event: a create marker bound to the legacy
-singleton journal, because current creates complete only at their scoped path; an aborted
-import-existing followed by a create rather than a re-import of the same checkouts, because the
-completion's operation differs; and a create or import marker still open when the slot is archived,
-because archive evidence clears only finish attempts. The enumeration of `py/wrkslots/cli.py` below
-supports the row-present cases for histories written by that code. Line numbers are at `aa68c18`.
+owns the attempt's storage. A create journal records its slot type and every checkout path it plans,
+and an import journal carries its whole row. Such a completion closes the `recovery-started` marker
+for the same slot and operation when that marker is bound to the completed journal path and the
+ACTIVE row has the attempt's slot type and owns every one of those checkout paths. Each journal a
+recovery binds has its own marker, so a later recovery through another journal leaves an open marker
+in place. Recovering the same journal again adds that attempt's storage to what its marker requires,
+and attempts under different slot types then require storage no row can own. An import that recorded
+no checkouts, which a historical import of a slot whose checkouts are all missing publishes, owns
+nothing and needs only the slot type. A marker bound to another path stays open, such as the default
+for a journal that predates the event log, and so does one whose journal does not identify its
+storage, including a create journal that names no path. A completion that leaves no such row also
+leaves the marker open. The current abort paths below leave no provisional storage, but replay reads
+histories written by every past writer, and a production history contains a create journal completed
+after `recovery-started` with no row ever published while its provisioned worktree, holding commits
+beyond the recorded start point, remained on disk. Such a slot therefore stays `BLOCKED` with
+`ACTIVE_RECORD_MISSING` and `RECOVERY_PENDING` instead of disappearing from the observer. The cost
+is a blocker for a slot that current code aborted cleanly. After an aborted create it ends only when
+a later create of the same slot at the same journal path publishes a row of the same slot type that
+owns every checkout path the aborted attempt planned. `_cmd_create` refuses an existing slot path,
+and Python derives that path from the slot type's root, so such a create proves that the aborted
+attempt left no slot directory. A create of the same slot name under the other slot type proves only
+that its own root was clear, and it leaves the marker open. The path check is stricter than that
+proof: a nested re-create that plans fewer checkouts than the aborted attempt leaves the marker
+open, although the refused slot directory held all of them, because a row records neither its slot
+directory nor its layout. That is a false blocker and never a false clearance. The proof does not
+extend to branches or caches outside the slot path that an older writer may have left. Some of these
+blockers are permanent, because no event that current writers append can close them and phase 1 has
+no operator acknowledgment event: a marker whose journal does not identify its storage; a create
+marker bound to the legacy singleton journal, because current creates complete only at their scoped
+path; an aborted import-existing followed by a create rather than a re-import of the same checkouts,
+because the completion's operation differs; and a create or import marker still open when the slot
+is archived, because archive evidence clears only finish attempts. The enumeration of
+`py/wrkslots/cli.py` below supports the row-present cases for histories written by that code. Line
+numbers are at `aa68c18`, "wrkslots: check task scopes before create recovery provisions".
 
 - `_clear_journal` (5472) is the only writer of `operation-completed` (5483). Every
   `_write_event_file` and `writer.append` call passes a literal kind. The other occurrences, at 5558
