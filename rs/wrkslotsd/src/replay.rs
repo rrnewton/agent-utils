@@ -106,16 +106,20 @@ impl AttemptStorage {
     /// Read the storage an embedded create or import journal describes.
     /// `None` means the journal does not identify it, so no later row can
     /// prove that storage owned. Python treats an absent `slot_type` as
-    /// `agent` in both journal kinds.
+    /// `agent` in both journal kinds. An import places no files, and a
+    /// historical import whose checkouts are all missing records none, so
+    /// only a create must name at least one path.
     fn from_journal(operation: &str, journal: &Map<String, Value>) -> Option<Self> {
-        let (holder, lists): (&Map<String, Value>, &[(&str, &str)]) = match operation {
-            "create" => (journal, &[("planned", "destination"), ("created", "path")]),
-            "import-existing" => (
-                journal.get("record")?.as_object()?,
-                &[("checkouts", "path")],
-            ),
-            _ => return None,
-        };
+        let (holder, lists, may_be_empty): (&Map<String, Value>, &[(&str, &str)], bool) =
+            match operation {
+                "create" => (journal, &[("planned", "destination")], false),
+                "import-existing" => (
+                    journal.get("record")?.as_object()?,
+                    &[("checkouts", "path")],
+                    true,
+                ),
+                _ => return None,
+            };
         let slot_type = match holder.get("slot_type") {
             None => "agent",
             Some(value) => value.as_str()?,
@@ -126,9 +130,19 @@ impl AttemptStorage {
                 paths.insert(item.as_object()?.get(*field)?.as_str()?.to_owned());
             }
         }
-        (!paths.is_empty()).then(|| Self {
+        (may_be_empty || !paths.is_empty()).then(|| Self {
             slot_type: slot_type.to_owned(),
             paths,
+        })
+    }
+
+    /// Storage of two attempts recovered through one journal path. A row must
+    /// own both, and no row owns attempts under different slot types.
+    fn merge(older: Option<Self>, newer: Option<Self>) -> Option<Self> {
+        let (mut older, newer) = (older?, newer?);
+        (older.slot_type == newer.slot_type).then(|| {
+            older.paths.extend(newer.paths);
+            older
         })
     }
 
@@ -882,6 +896,12 @@ fn pending_key(kind: PendingOperationKind, slot: &str, suffix: &str) -> String {
     format!("{kind:?}\0{slot}\0{suffix}")
 }
 
+/// Recovery markers are distinct per bound journal, so a later attempt
+/// recovered through another journal cannot replace an open one.
+fn recovery_suffix(operation: &str, journal_path: &str) -> String {
+    format!("{operation}\0{journal_path}")
+}
+
 fn insert_pending(state: &mut State, suffix: &str, pending: PendingOperation) {
     state
         .pending_operations
@@ -1100,18 +1120,17 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
         // slot type proves only that its own root was clear. An attempt whose
         // storage is unknown, or a recovery bound elsewhere such as the legacy
         // singleton default, stays pending.
-        let recovery_key = pending_key(PendingOperationKind::Recovery, &slot, &operation);
+        let recovery_key = pending_key(
+            PendingOperationKind::Recovery,
+            &slot,
+            &recovery_suffix(&operation, &journal_path),
+        );
         let closed = state.active_records.get(&slot).is_some_and(|row| {
             state
                 .pending_operations
                 .get(&recovery_key)
-                .is_some_and(|pending| {
-                    pending.journal_path.as_deref() == Some(journal_path.as_str())
-                        && pending
-                            .storage
-                            .as_ref()
-                            .is_some_and(|storage| storage.owned_by(&row.meta))
-                })
+                .and_then(|pending| pending.storage.as_ref())
+                .is_some_and(|storage| storage.owned_by(&row.meta))
         });
         if closed {
             state.pending_operations.remove(&recovery_key);
@@ -1381,9 +1400,20 @@ fn apply_recovery_started(event: &Event, state: &mut State) -> Result<(), Observ
                 .map(|(path, completed)| (path.clone(), completed.storage.clone()))
         })
         .unwrap_or_else(|| (format!("ACTIVE.{}.journal", event.machine), None));
+    // Recovering the same journal again adds that attempt's storage to what
+    // the open marker already requires.
+    let suffix = recovery_suffix(operation, &journal_path);
+    let storage = match state.pending_operations.get(&pending_key(
+        PendingOperationKind::Recovery,
+        slot,
+        &suffix,
+    )) {
+        Some(open) => AttemptStorage::merge(open.storage.clone(), storage),
+        None => storage,
+    };
     insert_pending(
         state,
-        operation,
+        &suffix,
         PendingOperation {
             slot: slot.to_owned(),
             generation,
