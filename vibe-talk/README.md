@@ -198,6 +198,14 @@ message as a text turn, collects the agent's 24 kHz PCM response, and returns WA
 server-audio backend is available, the channel bar offers an instant device/agent selector.
 `read_aloud.websocket_url` may name a server-only route to that same agent when the browser-facing
 conversation URL goes through a different ingress.
+
+The page plays a prepared read **as it arrives**. It fetches the audio itself and schedules the
+PCM on a Web Audio context, because an `<audio src>` element buffers a streamed WAV by bytes —
+Chromium reads about 225 KB of samples, 4.7 seconds of 24 kHz speech, before it starts. Tapping
+another message or leaving Read aborts the fetch, and closing that response is what tells the
+server to interrupt the agent. A browser without streamed `fetch` bodies or Web Audio falls back to
+`<audio>`. `make -C vibe-talk read-aloud-browser` times tap to audible in a real Chromium against
+audio streamed at speaking pace, with that `<audio>` fallback as its negative control.
 `GET /api/v1/client-config` reports the selected backend and playback mode. Rust handlers depend on
 `speech::SpeechProvider`; vendor credentials and API details stay in its adapter.
 

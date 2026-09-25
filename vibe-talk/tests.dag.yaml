@@ -129,6 +129,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#7 read-aloud-latency` in the browser engine: a prepared read audible within a second of the
+  # tap while its audio arrives at speaking pace, a switch and a stop closing the response, and
+  # only a read heard to its end archived. The `<audio src>` control must take seconds.
+  - group: check
+    job: read-aloud-browser
+    desc: read-aloud tap to audible in current Chromium, with an <audio> negative control
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/read_aloud_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 16
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

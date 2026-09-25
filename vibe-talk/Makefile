@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check test page pwa-installability offline-cache-browser android-speech-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check scripts-check test page pwa-installability offline-cache-browser read-aloud-browser android-speech-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -87,6 +87,13 @@ pwa-installability:
 # Pass SCREENSHOTS=dir to keep one PNG per step.
 offline-cache-browser:
 	python3 tests/offline_cache_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#7 read-aloud-latency` in a real Chromium: tap to audible against audio streamed at speaking
+# pace, a switch and a stop closing the response, and only a read heard to its end archived. Its
+# negative control is the same tap through `<audio src>`, which must take seconds. Pass
+# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep PNGs.
+read-aloud-browser:
+	python3 tests/read_aloud_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The physical-device run is opt-in, but its signal/language evaluator has offline negative
 # controls. Keep those controls in the ordinary gate so a broken harness cannot silently bless a

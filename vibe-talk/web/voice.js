@@ -7245,6 +7245,7 @@ function stopReading() {
       // A player that will not pause is not a reason to leave the page in a reading state.
     }
   }
+  quietReadAloudContext();
   // The object URL holds the audio alive until it is revoked, and this mode fetches one per
   // message: not revoking is a leak that grows with the length of the backlog. ALL of them on a
   // combined row, including the parts that had not been reached — they were all fetched.
@@ -7321,6 +7322,257 @@ function reportSpeechPlayback(url, timing) {
 }
 
 /**
+ * PLAYING A PREPARED READ AS IT ARRIVES, which an `<audio src>` will not do.
+ *
+ * A media element buffers a streamed WAV by BYTES before it reports anything: Chromium reads about
+ * 225 KB of samples before `loadedmetadata`, whatever their rate. A read arrives at speaking pace —
+ * 24 kHz, 16-bit, mono is 48 KB a second — so the reader sat through 4.7 seconds of silence after
+ * the server already had audio. The other containers a browser streams wait about as long. So the
+ * page fetches the prepared URL itself and schedules each piece of PCM on a Web Audio context as
+ * it lands, which is how the voice conversation already plays its answers.
+ *
+ * It answers to exactly the part of `<audio>` that `readAloud` and `stopReading` use — `play`,
+ * `pause`, and `loadeddata` / `playing` / `ended` / `error` — so every rule about tickets, parts,
+ * stopping and archiving applies to it unchanged. Pausing ABORTS the fetch, because closing the
+ * response is still what tells the server to interrupt the agent.
+ */
+const STREAM_START_LEAD_SECONDS = 0.1;
+/** An underrun doubles the lead, up to this, so a jittery network costs one gap rather than many. */
+const STREAM_MAX_LEAD_SECONDS = 0.8;
+/** A WAV header larger than this is not one this page will wait for. */
+const STREAM_HEADER_LIMIT_BYTES = 64 * 1024;
+
+let readAloudContext = null;
+
+/**
+ * The context read-aloud plays through, resumed. Null where a fetch cannot be streamed into Web
+ * Audio, and the caller then uses `<audio>`. Called from the tap itself as well as from `play`,
+ * because a browser only lets a context start inside a gesture.
+ */
+function readAloudAudioContext() {
+  if (typeof ReadableStream === "undefined" || typeof AbortController !== "function") return null;
+  const Context = window.AudioContext || window.webkitAudioContext;
+  if (!Context) return null;
+  if (readAloudContext === null) {
+    try {
+      readAloudContext = new Context();
+    } catch (_error) {
+      return null;
+    }
+  }
+  if (readAloudContext.state === "suspended" && typeof readAloudContext.resume === "function") {
+    readAloudContext.resume().catch(() => {});
+  }
+  return readAloudContext;
+}
+
+/** Nothing is being read: let the device's audio output go rather than hold it open in silence. */
+function quietReadAloudContext() {
+  if (readAloudContext !== null && readAloudContext.state === "running"
+    && typeof readAloudContext.suspend === "function") {
+    readAloudContext.suspend().catch(() => {});
+  }
+}
+
+function joinBytes(first, second) {
+  if (first.length === 0) return second;
+  const joined = new Uint8Array(first.length + second.length);
+  joined.set(first, 0);
+  joined.set(second, first.length);
+  return joined;
+}
+
+/** The sample format and where the samples begin, once the WAV header is whole; null until then. */
+function wavLayout(bytes) {
+  if (bytes.length < 12) return null;
+  const tag = (at) => String.fromCharCode(bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]);
+  if (tag(0) !== "RIFF" || tag(8) !== "WAVE") throw new Error("the audio is not a WAV stream");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let format = null;
+  let at = 12;
+  while (at + 8 <= bytes.length) {
+    const size = view.getUint32(at + 4, true);
+    if (tag(at) === "data") {
+      if (format === null) throw new Error("the audio names no format before its samples");
+      return { ...format, dataAt: at + 8 };
+    }
+    if (at + 8 + size > bytes.length) return null;
+    if (tag(at) === "fmt ") {
+      format = { channels: view.getUint16(at + 10, true), rate: view.getUint32(at + 12, true) };
+      if (view.getUint16(at + 8, true) !== 1 || view.getUint16(at + 22, true) !== 16 || format.channels < 1) {
+        throw new Error("the audio is not 16-bit PCM");
+      }
+    }
+    at += 8 + size + (size % 2);
+  }
+  return null;
+}
+
+function streamingPlayer(url, context) {
+  const listeners = new Map();
+  const emit = (type) => {
+    for (const fn of listeners.get(type) || []) fn();
+  };
+  const abort = new AbortController();
+  const waiting = []; // decoded before `play`: a later part, fetched while the one before plays
+  const sounding = new Set();
+  let wanted = false;
+  let finished = false;
+  let over = false; // paused, failed or ended: nothing more is heard or announced
+  let loaded = false;
+  let announced = false;
+  let playAt = 0;
+  let lead = STREAM_START_LEAD_SECONDS;
+
+  const silence = () => {
+    over = true;
+    abort.abort();
+    for (const node of sounding) {
+      try {
+        node.stop();
+      } catch (_error) {
+        // Already finished.
+      }
+    }
+    sounding.clear();
+    waiting.length = 0;
+  };
+  const fail = () => {
+    if (over) return;
+    silence();
+    emit("error");
+  };
+  const endIfDone = () => {
+    if (over || !finished || !wanted || waiting.length > 0 || sounding.size > 0) return;
+    over = true;
+    emit("ended");
+  };
+  const schedule = (buffer) => {
+    const node = context.createBufferSource();
+    node.buffer = buffer;
+    node.connect(context.destination);
+    const now = context.currentTime;
+    if (playAt < now + 0.005) {
+      // The first piece, or an underrun: start a lead ahead, and a longer one after a gap.
+      if (announced) lead = Math.min(STREAM_MAX_LEAD_SECONDS, lead * 2);
+      playAt = now + lead;
+    }
+    node.start(playAt);
+    const startsInMs = Math.round((playAt - now + (context.outputLatency || 0)) * 1000);
+    playAt += buffer.duration;
+    sounding.add(node);
+    node.onended = () => {
+      sounding.delete(node);
+      endIfDone();
+    };
+    if (!announced) {
+      announced = true;
+      // `playing` is when the first sample is due at the speaker, not when it was queued.
+      setTimeout(() => {
+        if (!over) emit("playing");
+      }, startsInMs);
+    }
+  };
+  const decode = (bytes, channels, rate) => {
+    const frames = Math.floor(bytes.length / (2 * channels));
+    const buffer = context.createBuffer(channels, frames, rate);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, frames * 2 * channels);
+    for (let channel = 0; channel < channels; channel += 1) {
+      const samples = buffer.getChannelData(channel);
+      for (let frame = 0; frame < frames; frame += 1) {
+        samples[frame] = view.getInt16((frame * channels + channel) * 2, true) / 0x8000;
+      }
+    }
+    return buffer;
+  };
+  const run = async () => {
+    let response;
+    try {
+      response = await fetch(url, { signal: abort.signal, cache: "no-store" });
+    } catch (_error) {
+      fail();
+      return;
+    }
+    if (over) return;
+    if (!response.ok || !response.body || typeof response.body.getReader !== "function") {
+      fail();
+      return;
+    }
+    const reader = response.body.getReader();
+    let head = new Uint8Array(0);
+    let layout = null;
+    let carry = new Uint8Array(0);
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (over) return;
+        if (done) break;
+        let bytes = value;
+        if (layout === null) {
+          head = joinBytes(head, bytes);
+          layout = wavLayout(head);
+          if (layout === null) {
+            if (head.length > STREAM_HEADER_LIMIT_BYTES) throw new Error("no samples in the audio");
+            continue;
+          }
+          bytes = head.subarray(layout.dataAt);
+        }
+        // A chunk boundary can split a sample; the remainder waits for the next chunk.
+        bytes = joinBytes(carry, bytes);
+        const whole = bytes.length - (bytes.length % (2 * layout.channels));
+        carry = bytes.slice(whole);
+        if (whole === 0) continue;
+        const buffer = decode(bytes.subarray(0, whole), layout.channels, layout.rate);
+        if (!loaded) {
+          loaded = true;
+          emit("loadeddata");
+          if (over) return;
+        }
+        if (wanted) schedule(buffer);
+        else waiting.push(buffer);
+      }
+    } catch (_error) {
+      // Includes a response cut off part-way: a read that did not arrive whole did not END, and
+      // must not be archived as heard.
+      fail();
+      return;
+    }
+    if (!loaded) {
+      fail();
+      return;
+    }
+    finished = true;
+    endIfDone();
+  };
+  run();
+  return {
+    url,
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
+    play() {
+      if (!over) {
+        wanted = true;
+        readAloudAudioContext();
+        while (waiting.length > 0) schedule(waiting.shift());
+        endIfDone();
+      }
+      return Promise.resolve();
+    },
+    pause() {
+      if (!over) silence();
+    },
+  };
+}
+
+/** A player for one streamed part: Web Audio as it arrives where the browser can, else `<audio>`. */
+function streamedSpeechPlayer(url) {
+  const context = readAloudAudioContext();
+  return context === null ? new Audio(url) : streamingPlayer(url, context);
+}
+
+/**
  * Read one ROW aloud, and archive everything in it when the audio finishes.
  *
  * Tapping the message that is already playing STOPS it, so the same gesture is its own cancel and
@@ -7377,6 +7629,8 @@ async function readAloud(ids) {
     }
     return;
   }
+  // Still inside the tap, before anything is awaited: the only moment a browser lets audio start.
+  readAloudAudioContext();
   // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
   // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
   // starts playing against a response the server is still writing.
@@ -7438,7 +7692,7 @@ async function readAloud(ids) {
   };
   const addPlayer = (at) => {
     requestBegan[at] = speechTimingNow();
-    const audio = new Audio(sources[at]);
+    const audio = streamed ? streamedSpeechPlayer(sources[at]) : new Audio(sources[at]);
     players[at] = audio;
     audio.addEventListener("loadeddata", () => {
       if (ticket !== readingTicket || loadedAt[at] !== null) return;

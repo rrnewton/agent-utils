@@ -739,26 +739,35 @@ class FakeAudioContext {
     // an observation about playback rather than about a flag the page set on itself.
     this.played = 0;
     this.stopped = 0;
+    this.sources = [];
     page.audio = this;
   }
 
   createBuffer(channels, length, rate) {
-    return { duration: length / rate, getChannelData: () => new Float32Array(length) };
+    // Kept, so a test can read back the samples the page decoded into it.
+    const data = Array.from({ length: channels }, () => new Float32Array(length));
+    return { duration: length / rate, length, sampleRate: rate, getChannelData: (at) => data[at] };
   }
 
   createBufferSource() {
     const context = this;
-    return {
+    const source = {
       buffer: null,
       onended: null,
+      startedAt: null,
+      halted: false,
       connect() {},
-      start() {
+      start(when = 0) {
         context.played += 1;
+        source.startedAt = when;
       },
       stop() {
         context.stopped += 1;
+        source.halted = true;
       },
     };
+    this.sources.push(source);
+    return source;
   }
 
   async resume() {}
@@ -866,7 +875,9 @@ function openStream() {
   const encoder = new TextEncoder();
   const queued = [];
   let waiting = null;
+  let rejecting = null;
   let ended = false;
+  let broken = false;
   const settle = (chunk) => {
     const resolve = waiting;
     waiting = null;
@@ -880,6 +891,24 @@ function openStream() {
         settle({ value, done: false });
       } else {
         queued.push(value);
+      }
+    },
+    /** Deliver raw bytes: an audio body rather than SSE text. */
+    bytes(value) {
+      if (waiting) {
+        settle({ value, done: false });
+      } else {
+        queued.push(value);
+      }
+    },
+    /** The connection broke part-way, as a browser reports a response cut off mid-body. */
+    fail() {
+      ended = true;
+      broken = true;
+      if (waiting) {
+        const reject = rejecting;
+        waiting = null;
+        reject(new TypeError("network error"));
       }
     },
     /** The connection went away. */
@@ -896,11 +925,15 @@ function openStream() {
       if (queued.length > 0) {
         return Promise.resolve({ value: queued.shift(), done: false });
       }
+      if (broken) {
+        return Promise.reject(new TypeError("network error"));
+      }
       if (ended) {
         return Promise.resolve({ value: undefined, done: true });
       }
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
         waiting = resolve;
+        rejecting = reject;
       });
     },
     cancel() {
@@ -1175,6 +1208,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     tracks: [],
     /** Every WebSocket the page has opened, in order. */
     sockets: [],
+    /**
+     * Every prepared read the page STREAMED itself, in order: `{ url, options, controller }`. The
+     * test feeds each body. Empty unless `enableStreamedAudio` gave the page a way to stream.
+     */
+    audioStreams: [],
+    /** The status a streamed ticket answers with. */
+    ticketStatus: 200,
     /** Every ScriptProcessorNode it has built, in order. */
     processors: [],
     /** Every tag name the page has passed to createElement, in order. */
@@ -1651,6 +1691,14 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           expires_in_seconds: 600,
         });
       }
+      // A prepared read the page streams into Web Audio itself, rather than handing to `<audio>`.
+      if (/^\/api\/v1\/speech\/ticket-for-[^/?]+\?/.test(String(path))) {
+        const { controller, body } = openStream();
+        const signal = options && options.signal;
+        if (signal) signal.addEventListener("abort", () => controller.drop());
+        page.audioStreams.push({ url: String(path), options, controller });
+        return { ok: page.ticketStatus < 400, status: page.ticketStatus, body };
+      }
       const speechTiming = /^\/api\/v1\/speech\/([^/]+)\/timing$/.exec(String(path));
       if (speechTiming) {
         page.speechTimingCalls.push({
@@ -1936,6 +1984,22 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     };
     page.deviceSpeech = engine;
     return engine;
+  };
+  /**
+   * What a current browser has and this fixture otherwise leaves out, so that the rest of the suite
+   * keeps exercising the `<audio>` player: a stream to read a response body with, a way to abort
+   * it, and an audio context that can be suspended between reads.
+   */
+  page.enableStreamedAudio = () => {
+    context.ReadableStream = class {};
+    context.AbortController = AbortController;
+    context.window.AudioContext = function () {
+      const audio = new FakeAudioContext(page);
+      audio.state = "running";
+      audio.suspend = async () => { audio.state = "suspended"; };
+      audio.resume = async () => { audio.state = "running"; };
+      return audio;
+    };
   };
   // The page makes its first requests while the script is still running, so a test that needs to
   // hold or fail THOSE — a reload that must draw before the network answers — arranges the fixture
@@ -15972,6 +16036,225 @@ test("stopping a streamed read drops its source, and the next tap is a new selec
     "ticket-for-1000000000000000002",
     "the timing report was not addressed to the bare ticket"
   );
+});
+
+/** A streamed WAV header as the server writes one: 16-bit PCM, length unknown up front. */
+function wavHeader(rate, channels) {
+  const bytes = new Uint8Array(44);
+  const view = new DataView(bytes.buffer);
+  const tag = (at, text) => [...text].forEach((c, i) => { bytes[at + i] = c.charCodeAt(0); });
+  tag(0, "RIFF");
+  view.setUint32(4, 0xffffffff, true);
+  tag(8, "WAVE");
+  tag(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * channels * 2, true);
+  view.setUint16(32, channels * 2, true);
+  view.setUint16(34, 16, true);
+  tag(36, "data");
+  view.setUint32(40, 0xffffffff, true);
+  return bytes;
+}
+
+/** Little-endian 16-bit samples, as they come off the wire. */
+function pcm(...samples) {
+  const bytes = new Uint8Array(samples.length * 2);
+  samples.forEach((sample, at) => new DataView(bytes.buffer).setInt16(at * 2, sample, true));
+  return bytes;
+}
+
+const joined = (...parts) => {
+  const bytes = new Uint8Array(parts.reduce((n, part) => n + part.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    bytes.set(part, at);
+    at += part.length;
+  }
+  return bytes;
+};
+
+test("a prepared read PLAYS AS IT ARRIVES, rather than after the ~225 KB an <audio> buffers first", async () => {
+  // Chromium's media element reads about 225 KB of a streamed WAV before it reports anything, and a
+  // read arrives at speaking pace: 48 KB a second. That was 4.7 seconds of silence after the server
+  // already had audio. So where the browser can, the page reads the body and plays each piece.
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+  const tappedAt = page.clock();
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.players.length, 0, "the read was handed to an <audio>, which waits seconds to start");
+  assert.equal(page.audioStreams.length, 1, "the prepared read was not fetched");
+  const [stream] = page.audioStreams;
+  assert.match(stream.url, /^\/api\/v1\/speech\/ticket-for-1000000000000000001\?selection=tap-[0-9a-f]{16}$/);
+  assert.equal(stream.options.cache, "no-store");
+  const audio = page.audio;
+
+  // A header split across chunks, and a sample split across the next boundary.
+  const header = wavHeader(24000, 1);
+  const samples = pcm(0x4000, -0x8000, 0x2000);
+  stream.controller.bytes(header.subarray(0, 20));
+  await page.settle();
+  assert.equal(audio.sources.length, 0, "half a header was played as sound");
+  page.setClock(tappedAt + 40);
+  stream.controller.bytes(joined(header.subarray(20), samples.subarray(0, 3)));
+  await page.settle();
+  assert.equal(audio.sources.length, 1, "the first samples were held back");
+  assert.deepEqual([...audio.sources[0].buffer.getChannelData(0)], [0.5]);
+  assert.equal(audio.sources[0].startedAt, 0.1, "the first piece was not given its short lead");
+
+  // `playing` is when that lead has run out, not when the piece was queued.
+  page.setClock(tappedAt + 140);
+  assert.equal(page.expireTimers(100), 1, "nothing waited for the first sample to reach the speaker");
+  await page.settle();
+  assert.deepEqual(page.speechTimingCalls.map((call) => call.timing), [{
+    tap_to_play_ms: 0,
+    request_to_loaded_ms: 40,
+    loaded_to_playing_ms: 100,
+    tap_to_audible_ms: 140,
+  }]);
+
+  stream.controller.bytes(samples.subarray(3));
+  await page.settle();
+  assert.equal(audio.sources.length, 2);
+  assert.deepEqual([...audio.sources[1].buffer.getChannelData(0)], [-1, 0.25], "a split sample was garbled");
+  assert.equal(audio.sources[1].startedAt, 0.1 + 1 / 24000, "the next piece did not follow on without a gap");
+
+  stream.controller.drop();
+  await page.settle();
+  audio.sources[0].onended();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [], "archived while its last samples were still to be heard");
+  audio.sources[1].onended();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }]);
+  assert.equal(audio.state, "suspended", "the audio output was held open after the read ended");
+});
+
+test("a SWITCH aborts the first read's response and silences what it had queued, on one context", async () => {
+  // Closing the response is what tells the server to interrupt the agent and begin the next read,
+  // so a streamed read has to abort its fetch as surely as `<audio>` dropped its source.
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", author_id: "1000000000000000011", content: "first" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "second" }),
+  ]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const audio = page.audio;
+  page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), pcm(1, 2, 3)));
+  await page.settle();
+  await rows[1].dispatch("click", {});
+  await page.settle();
+
+  assert.equal(page.audioStreams[0].options.signal.aborted, true, "the first response was left open");
+  assert.equal(audio.sources[0].halted, true, "the first read kept sounding under the second");
+  assert.equal(page.audioStreams.length, 2, "the second row was never requested");
+  const selection = (url) => new URL(url, "http://page").searchParams.get("selection");
+  assert.notEqual(selection(page.audioStreams[1].url), selection(page.audioStreams[0].url));
+
+  page.audioStreams[1].controller.bytes(joined(wavHeader(24000, 1), pcm(4, 5)));
+  await page.settle();
+  assert.equal(page.audio, audio, "every tap built another audio context");
+  assert.equal(audio.sources.length, 2);
+  assert.equal(audio.sources[1].halted, false);
+  assert.deepEqual(page.dismissCalls, [], "the interrupted read was filed away as heard");
+});
+
+test("a streamed read CUT OFF part-way, or refused, says so and archives nothing", async () => {
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", author_id: "1000000000000000011", content: "first" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "second" }),
+  ]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), pcm(1, 2, 3)));
+  await page.settle();
+  // A body that ends without its terminating chunk did not END, whatever was heard of it.
+  page.audioStreams[0].controller.fail();
+  await page.settle();
+  assert.equal(page.audio.sources[0].halted, true);
+  assert.match(page.el("status").textContent, /could not be played/);
+  assert.equal(rowState(page, 0).reading, "false", "the row is stuck looking like it is speaking");
+
+  page.ticketStatus = 410;
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.audio.sources.length, 1, "a refused read played something");
+  assert.match(page.el("status").textContent, /could not be played/);
+  assert.deepEqual(page.dismissCalls, [], "a read nobody heard to the end was archived");
+});
+
+test("a streamed COMBINED row fetches its next part on the first part's audio and plays it after", async () => {
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, splitPost());
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.audioStreams.length, 1, "the second part was requested before the first had audio");
+  const audio = page.audio;
+  page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), pcm(1, 2)));
+  await page.settle();
+  assert.equal(page.audioStreams.length, 2, "the second part was never requested");
+  const selection = (url) => new URL(url, "http://page").searchParams.get("selection");
+  assert.equal(selection(page.audioStreams[1].url), selection(page.audioStreams[0].url));
+
+  page.audioStreams[1].controller.bytes(joined(wavHeader(24000, 1), pcm(3, 4)));
+  await page.settle();
+  assert.equal(audio.sources.length, 1, "both parts played over each other");
+
+  page.audioStreams[0].controller.drop();
+  await page.settle();
+  audio.sources[0].onended();
+  await page.settle();
+  assert.equal(audio.sources.length, 2, "the second part never followed the first");
+  assert.deepEqual([...audio.sources[1].buffer.getChannelData(0)], [3 / 0x8000, 4 / 0x8000]);
+  assert.deepEqual(page.dismissCalls, [], "the row was filed away with half of it unheard");
+
+  page.audioStreams[1].controller.drop();
+  await page.settle();
+  audio.sources[1].onended();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [
+    { messages: ["1000000000000000001", "1000000000000000002"] },
+  ]);
+});
+
+test("leaving Read aborts a streamed read and lets the audio output go, until the next tap", async () => {
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001" })]);
+
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const audio = page.audio;
+  assert.equal(audio.state, "running");
+  await readButton(page).click();
+  await page.settle();
+  assert.equal(page.audioStreams[0].options.signal.aborted, true, "the response outlived the mode");
+  assert.equal(audio.state, "suspended", "the audio output was held open with nothing to read");
+
+  await readButton(page).click();
+  await page.settle();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(audio.state, "running", "the next tap did not wake the audio back up");
+  assert.equal(page.audioStreams.length, 2);
 });
 
 test("...and stopping a combined read part-way releases EVERY audio URL it fetched", async () => {
