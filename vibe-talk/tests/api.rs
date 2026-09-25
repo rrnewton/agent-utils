@@ -1252,6 +1252,65 @@ async fn restored_channel_harness(
 }
 
 #[tokio::test]
+async fn restored_managed_sources_remain_distinct_ordered_app_channels() {
+    let (state, discord, store, elevenlabs) = vibe_talk::testing::state_with_store_and_voice();
+    let first = ChannelId("3333333333333333901".to_owned());
+    let second = ChannelId("3333333333333333902".to_owned());
+    for (channel, label, added_at_ms) in [
+        (&first, "first linked conversation", 10),
+        (&second, "second linked conversation", 20),
+    ] {
+        discord.register_channel(channel);
+        store
+            .add_channel(
+                channel,
+                label,
+                false,
+                Some("https://bridge.example/v1"),
+                added_at_ms,
+            )
+            .await
+            .expect("store managed source");
+    }
+    state
+        .restore_added_channels()
+        .await
+        .expect("restore managed sources");
+    let harness = Harness {
+        router: router(state),
+        discord,
+        elevenlabs: Some(elevenlabs),
+    };
+
+    for uri in ["/api/v1/channels", "/api/v1/client-config"] {
+        let (status, body) = call(&harness, "GET", uri, Some(READ_TOKEN), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if uri.ends_with("client-config") {
+            assert_eq!(body["threading_supported"], false);
+        }
+        let channels = body["channels"].as_array().expect("listed channels");
+        let added: Vec<_> = channels
+            .iter()
+            .filter(|channel| channel["added"] == true)
+            .map(|channel| {
+                (
+                    channel["id"].as_str().expect("channel id"),
+                    channel["label"].as_str().expect("channel label"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                (first.as_str(), "first linked conversation"),
+                (second.as_str(), "second linked conversation"),
+            ],
+            "registered sources were collapsed into a child-thread projection: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_transcript_can_be_written_read_back_and_forgotten() {
     let (harness, _store) = store_harness();
 

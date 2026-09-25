@@ -15831,6 +15831,44 @@ function delayedReply(page) {
   };
 }
 
+test("linked conversation sources stay in the channel picker when thread timelines are off", async () => {
+  const page = newPage();
+  const first = { id: "1110000000000000101", label: "first linked conversation", writable: false,
+    added: true };
+  const second = { id: "1110000000000000102", label: "second linked conversation", writable: false,
+    added: true };
+  page.channels = [first, second];
+  page.threadingSupported = false;
+  // This is the misleading child projection from the reported failure. It must not replace the
+  // two registered sources merely because one source's history contains thread metadata.
+  page.threads = [{ id: "opaque-unrelated-child", title: "unrelated thread", reply_count: 1 }];
+  const reads = [];
+  page.channelPage = async (path) => {
+    reads.push(String(path));
+    const selected = page.channels.find((channel) => String(path).includes(channel.id));
+    return json(200, { channel: selected, messages: [] });
+  };
+
+  await signIn(page);
+  await showDiscord(page, []);
+  assert.deepStrictEqual(
+    optionText(page, "discord-channel"),
+    [first.label, second.label],
+    "an unrelated child thread displaced the registered source choices"
+  );
+  assert.equal(page.el("channel-view-tabs").hidden, true, "disabled child timelines became a menu");
+  assert.equal(page.el("thread-list").hidden, true, "an unrelated child thread became visible");
+  assert.deepStrictEqual(page.timelineCalls, [], "the disabled timeline API was queried");
+  assert.match(reads.at(-1), new RegExp(first.id), "the first source was not read as an app channel");
+
+  page.el("discord-channel").value = second.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  assert.match(reads.at(-1), new RegExp(second.id), "the second source was not independently readable");
+  assert.deepStrictEqual(optionText(page, "discord-channel"), [first.label, second.label]);
+  assert.deepStrictEqual(page.timelineCalls, []);
+});
+
 test("thread views show roots in Main and expose the selector only when threads exist", async () => {
   const page = await threadPage();
   assert.equal(page.el("channel-view-tabs").hidden, false);
