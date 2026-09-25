@@ -32,7 +32,10 @@ disposable SQLite index, and a diagnostic shadow policy evaluator. Its `explain`
 also reject evidence that has aged out, and cannot apply a plan. The disposable index is not an
 authenticated store: a coordinated same-UID rewrite of every bound input and projection can stay
 self-consistent, and this phase does not compare it atomically with the live `EVENTS` directory.
-Rebuild from trusted event/config/evidence inputs before treating its output as current. It has no
+Rebuild from trusted event/config/evidence inputs before treating its output as current. Once an
+index holds policy evidence, a plain `rebuild` without `--config`/`--evidence` is refused rather
+than discarding that evidence high-water mark; to return to a policy-free index, delete the
+disposable index file and rebuild. It has no
 daemon or socket behavior and performs no lease management, cleanup, rescue, deletion, or
 repository mutation. It also has no repository-discovery inventory beyond its supplied event and
 evidence inputs. The reconciliation daemon and lifecycle actions discussed below are roadmap,
@@ -41,7 +44,15 @@ input boundary accepts at most 16 MiB per event and 127 nested JSON containers, 
 strings, exact signed/unsigned 64-bit integers, and finite binary64 floats; Python remains
 authoritative for its broader JSON input domain. Rust also rejects unknown event kinds, malformed
 or generation-mismatched hold transitions, and non-object state evidence even where the current
-Python reader ignores some of those values; the Python writer emits the stricter shape. The CLI renders active and archive revisions as
+Python reader ignores some of those values; the Python writer emits the stricter shape. Replay
+likewise refuses operation progress that reuses a pending journal path for a different slot or
+operation, where the Python reader overwrites the older marker, and an `operation-completed` with no
+pending progress, recovery attempt, or identical earlier completion, which the Python reader
+ignores. Either history fails the whole replay, so no decision is derived from a history in which
+an older operation's blocker could silently disappear. When recovery starts for an operation whose
+journal is no longer pending, the attempt is bound to that operation's completed journal path if
+the history records one: completion is logged before the journal file is unlinked, so an
+interrupted cleanup leaves a completed journal for recovery to load again. The CLI renders active and archive revisions as
 decimal JSON strings so all `u64` values remain exact. First index publication requires a filesystem
 that supports Linux `renameat2(RENAME_NOREPLACE)`. The candidate can diagnose a generation-bound
 task-scope claim, census freshness, heartbeat and minimum-stale boundaries, holds and operation
@@ -72,8 +83,15 @@ incomplete present identities, unbound extra slots, stale or future evidence, ov
 windows, a census beginning before its bound event-tip timestamp beyond configured skew, and
 evidence for another event tip are refused. Heartbeat age is evaluated at the earlier of census
 start and evaluation time, so a future-skewed census cannot make a live heartbeat look old.
-Missing evidence for an active slot
-becomes a digest-bound `UNKNOWN` decision. The SQLite index retains canonical policy inputs and the
+Conversely, a heartbeat later than that instant has a negative age and still counts as within its
+TTL and minimum stale age, so a heartbeat written after the census began cannot drop those
+blockers either; a lead beyond `maximum_future_skew_seconds` additionally records
+`CLOCK_BEFORE_HEARTBEAT`. Heartbeats and the event-tip timestamp are parsed with the same
+CPython `datetime.fromisoformat` grammar that replay accepts, not only RFC 3339; a heartbeat that
+still cannot be aged is `BLOCKED` with `HEARTBEAT_TIMESTAMP_UNSUPPORTED`, and a missing TTL records
+`ACTIVE_HEARTBEAT_TTL_MISSING` without skipping the minimum-stale check. Missing evidence for an
+active slot adds a digest-bound `EVIDENCE_MISSING` reason; the heartbeat and minimum-stale blockers
+are still evaluated because they depend only on the record and the census clock. The SQLite index retains canonical policy inputs and the
 evaluation instant; `explain` and `plan` replay the indexed event chain, compare active/archive/hold
 projections, re-evaluate every decision, reject evidence that is stale at read time, and reject
 incomplete coverage or any changed field. Open progress, reclaim, recovery, and retirement markers

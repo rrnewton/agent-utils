@@ -9,7 +9,8 @@ use serde_json::{Map, Value};
 
 use crate::canonical::{canonical_json, canonical_sha256};
 use crate::schema::{
-    parse_timestamp, validate_active_record, validate_archive_record, ActiveRecordMeta,
+    exact_keys, exact_keys_optional, parse_timestamp, validate_active_record,
+    validate_archive_record, ActiveRecordMeta,
 };
 use crate::ObserverError;
 
@@ -924,14 +925,23 @@ fn apply_operation_progress(event: &Event, state: &mut State) -> Result<(), Obse
         // journal is intentionally reusable across identities as well.
         state.completed_operations.remove(&journal_path);
     }
+    // Python lets progress at a pending path replace another identity's
+    // marker. Replay refuses instead: the overwritten operation may still own
+    // its checkout, so accepting the history could drop a blocker.
     if state.pending_operations.values().any(|pending| {
         pending.kind == PendingOperationKind::Journal
-            && ((pending.journal_path.as_deref() == Some(journal_path.as_str())
-                && (pending.slot != slot
-                    || pending.operation.as_deref() != Some(operation.as_str())))
-                || (pending.slot == slot
-                    && pending.operation.as_deref() == Some(operation.as_str())
-                    && pending.journal_path.as_deref() != Some(journal_path.as_str())))
+            && pending.journal_path.as_deref() == Some(journal_path.as_str())
+            && (pending.slot != slot || pending.operation.as_deref() != Some(operation.as_str()))
+    }) {
+        return Err(ObserverError::invalid(
+            "append-only history reuses a pending journal path for a different operation identity",
+        ));
+    }
+    if state.pending_operations.values().any(|pending| {
+        pending.kind == PendingOperationKind::Journal
+            && pending.slot == slot
+            && pending.operation.as_deref() == Some(operation.as_str())
+            && pending.journal_path.as_deref() != Some(journal_path.as_str())
     }) {
         return Err(ObserverError::invalid(
             "append-only history has the same pending operation under multiple journal paths",
@@ -975,6 +985,8 @@ fn apply_operation_completed(event: &Event, state: &mut State) -> Result<(), Obs
         .completed_operations
         .get(&journal_path)
         .is_some_and(|identity| identity == &(slot.clone(), operation.clone()));
+    // Python ignores such a completion. Replay refuses it because a history
+    // that closes an operation it never opened is not one Python writes.
     if pending_journal.is_none() && !matching_recovery && !duplicate_completion {
         return Err(ObserverError::invalid(
             "operation-completed has no pending progress or recovery attempt",
@@ -1229,8 +1241,20 @@ fn apply_recovery_started(event: &Event, state: &mut State) -> Result<(), Observ
                 .then(|| state.archived_generations.get(slot).copied())
                 .flatten()
         });
+    // `operation-completed` is appended before the journal is unlinked, so a
+    // crash between the two leaves a completed journal that recovery loads
+    // again. Only a journal absent from the history is the legacy singleton.
     let journal_path = pending_journal
         .and_then(|pending| pending.journal_path.clone())
+        .or_else(|| {
+            state
+                .completed_operations
+                .iter()
+                .find(|(_, (completed_slot, completed_operation))| {
+                    completed_slot == slot && completed_operation == operation
+                })
+                .map(|(path, _)| path.clone())
+        })
         .unwrap_or_else(|| format!("ACTIVE.{}.journal", event.machine));
     insert_pending(
         state,
@@ -1864,46 +1888,6 @@ fn continued_revision(
     if recorded_previous != current || recorded_revision != next {
         return Err(ObserverError::invalid(format!(
             "{label} revision does not continue the derived state"
-        )));
-    }
-    Ok(())
-}
-
-fn exact_keys(
-    value: &Map<String, Value>,
-    expected: &[&str],
-    label: &str,
-) -> Result<(), ObserverError> {
-    let actual = value.keys().map(String::as_str).collect::<BTreeSet<_>>();
-    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
-    if actual != expected {
-        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
-        let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
-        return Err(ObserverError::invalid(format!(
-            "{label} has invalid fields: missing {missing:?}; unknown {unknown:?}"
-        )));
-    }
-    Ok(())
-}
-
-fn exact_keys_optional(
-    value: &Map<String, Value>,
-    required: &[&str],
-    optional: &[&str],
-    label: &str,
-) -> Result<(), ObserverError> {
-    let actual = value.keys().map(String::as_str).collect::<BTreeSet<_>>();
-    let required = required.iter().copied().collect::<BTreeSet<_>>();
-    let allowed = required
-        .iter()
-        .copied()
-        .chain(optional.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let missing = required.difference(&actual).copied().collect::<Vec<_>>();
-    let unknown = actual.difference(&allowed).copied().collect::<Vec<_>>();
-    if !missing.is_empty() || !unknown.is_empty() {
-        return Err(ObserverError::invalid(format!(
-            "{label} has invalid fields: missing {missing:?}; unknown {unknown:?}"
         )));
     }
     Ok(())
