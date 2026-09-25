@@ -40,7 +40,7 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 pub const PROMPT_VERSION: u32 = 1;
 
 /// The [`fingerprint`] of [`SYSTEM_PROMPT`] at [`PROMPT_VERSION`].
-pub const PINNED_FINGERPRINT: &str = "fnv1a64:00303f891742df7a";
+pub const PINNED_FINGERPRINT: &str = "fnv1a64:5160141633b115ba";
 
 /// A content fingerprint a consumer can log without logging the prompt.
 ///
@@ -309,6 +309,9 @@ mod tests {
             "Do not read long hashes",
             "Eastern Time",
             "search semantically",
+            "say so briefly and wait",
+            "only when the user explicitly asks you to",
+            "do not ask for it again",
             "untrusted data",
             "only when the human explicitly requests it",
             "exact provider mention token",
