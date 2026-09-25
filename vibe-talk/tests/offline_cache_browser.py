@@ -3,13 +3,20 @@
 
 The fake-DOM suite (tests/js/voice_page.test.mjs) covers every branch of the snapshot. This covers
 what only a browser engine can: real localStorage, a real reload, real fetch failures, the Cache
-Storage and service-worker registries, and layout at 412x915. It serves the checked-out assets
-and a small fake API from one loopback origin, then walks one reader through:
+Storage and service-worker registries, and layout at 412x915 and at a 1280x800 desk. For each of
+those it serves the checked-out assets and a small fake API from one loopback origin, then walks
+one reader through:
 
   sign in, read a channel in Main, Threads and All -> reload with the network held: the saved rows
   are drawn before any answer -> one bounded newest-page read merges a new row without
   duplicating -> switching views makes no request -> a reload with the API unreachable keeps the
-  rows and says so -> signing out removes them from the screen and the device.
+  rows and says so -> a reload whose refresh fails keeps them and says that -> signing out removes
+  them from the screen and the device. Before the reloads, the pill also comes and goes in place,
+  on the channel's own poll, under a reader at the top, in the middle and at the newest line.
+
+While the freshness pill is up — refreshing, offline, failed — it must cover neither the view tabs
+nor the list's header seam or first row, and #scroll-area must be the same box with it as without
+it (`#32 freshness-pill-overlap`).
 
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
@@ -26,7 +33,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
+
+if TYPE_CHECKING:
+    from playwright.sync_api import BrowserType, Route
 
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
@@ -208,6 +219,83 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+# Park the reader (`where`: "top", "middle", "newest", or "" to stay put), then say where they are:
+# the top of the thread root's row within the list, how far the newest line is below the fold, and the
+# scroll offset.
+PLACE_JS = """async (where) => {
+    const area = document.getElementById('scroll-area');
+    const range = area.scrollHeight - area.clientHeight;
+    if (where) area.scrollTop = {top: 0, middle: Math.round(range / 2), newest: area.scrollHeight}[where];
+    await new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
+    const row = document.querySelector('#discord-log > li[data-id="201"]');
+    return {row: row.getBoundingClientRect().top - area.getBoundingClientRect().top,
+            gap: area.scrollHeight - area.clientHeight - area.scrollTop, top: area.scrollTop};
+}"""
+
+# Everything that can be covered, measured at the head of the list, with the view tabs and without
+# them. `problems` is empty when the pill covers none of the tabs, the header seams or the first row,
+# fits on its one line, and sits over the list; `area` is #scroll-area's box and `bare` the same box without the pill.
+# Scrolling to the top is free only because FakeApi answers has_more: False; with more history it
+# would page older rows in and spend a read the "one newest-page read" check counts.
+GEOMETRY_JS = """() => {
+    const area = document.getElementById('scroll-area');
+    area.scrollTop = 0;
+    const shown = (e) => Boolean(e) && !e.hidden && e.getClientRects().length > 0;
+    const box = (e) => e.getBoundingClientRect();
+    const meets = (a, b) => a.top < b.bottom && b.top < a.bottom && a.left < b.right && b.left < a.right;
+    const pill = document.getElementById('channel-freshness');
+    const tabs = document.getElementById('channel-view-tabs');
+    const problems = [];
+    const covering = (layout) => {
+        const p = box(pill), list = box(area);
+        if (shown(tabs) && meets(p, box(tabs))) problems.push(`${layout}: it covers the Main/Threads/All tabs`);
+        const seams = [...document.querySelectorAll('#pane-discord .seam')].filter(shown);
+        if (seams.length === 0) problems.push(`${layout}: there is no header seam to measure against`);
+        seams.forEach((seam) => {
+            if (meets(p, box(seam))) problems.push(`${layout}: it covers the seam "${seam.textContent.trim()}"`);
+        });
+        const first = document.querySelector('#discord-log > li');
+        if (!shown(first)) problems.push(`${layout}: there is no first row to measure against`);
+        else if (meets(p, box(first))) problems.push(`${layout}: it covers the first row`);
+        if (pill.scrollWidth > pill.clientWidth + 1) problems.push(`${layout}: it is cut short: ${pill.textContent}`);
+        if (p.top < list.top || p.left < list.left || p.right > list.right) {
+            problems.push(`${layout}: it is not over the list`);
+        }
+    };
+    if (!shown(pill)) {
+        problems.push('the freshness pill is not shown');
+    } else {
+        covering('with tabs');
+        // A source without threads hides the tabs by this same attribute, and the grid row they
+        // held collapses: the layout the overlap was first seen in.
+        const tabsHidden = tabs.hidden;
+        tabs.hidden = true;
+        covering('without tabs');
+        tabs.hidden = tabsHidden;
+    }
+    const size = () => {
+        const a = box(area);
+        return [a.top, a.left, a.width, a.height, area.clientWidth, area.clientHeight]
+            .map((n) => n.toFixed(2)).join(',');
+    };
+    // The same box with the pill and its room taken away, in the same state, so that a banner
+    // appearing for its own reasons is not mistaken for the pill resizing the list.
+    const measured = size(), pane = document.getElementById('pane-discord');
+    const wasHidden = pill.hidden, reserved = pane.hasAttribute('data-freshness');
+    pill.hidden = true;
+    pane.removeAttribute('data-freshness');
+    const bare = size();
+    pill.hidden = wasHidden;
+    if (reserved) pane.setAttribute('data-freshness', '');
+    return {problems, area: measured, bare, tabs: shown(tabs)};
+}"""
+
+# A phone, the common narrow Android width, and a desk: the desktop regime is `(min-width: 900px) and
+# (pointer: fine)`, so the last is a fine pointer without touch, not a wide phone. Below 360 the
+# pill's longest line is ellipsised, which the "cut short" check would report.
+PROFILES = (("phone", 412, 915, True), ("phone-360", 360, 800, True), ("desktop", 1280, 800, False))
+
+
 def main() -> int:
     args = arguments()
     try:
@@ -217,38 +305,54 @@ def main() -> int:
             "Python Playwright is required: python3 -m pip install --user playwright && "
             "python3 -m playwright install chromium"
         ) from error
+    if args.screenshots:
+        args.screenshots.mkdir(parents=True, exist_ok=True)
 
+    with sync_playwright() as playwright:
+        for label, width, height, mobile in PROFILES:
+            browser_version = walk(playwright.chromium, args, label, width, height, mobile)
+            print(f"{browser_version} {label} at {width}x{height}: snapshot drawn before the network,"
+                  " one newest-page read, local view switches, offline and failed states, the pill"
+                  " clear of the tabs and the header with #scroll-area unmoved, a scrolled reader"
+                  " held in place as it comes and goes, no Cache Storage or"
+                  " service worker, sign-out clears")
+    return 0
+
+
+def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+         mobile: bool) -> str:
+    """One reader, start to finish, against a fresh fake API and a fresh browser profile."""
     api = FakeApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{server.server_port}/voice"
-    if args.screenshots:
-        args.screenshots.mkdir(parents=True, exist_ok=True)
-
+    platform = "Linux; Android 15; Pixel 7" if mobile else "X11; Linux x86_64"
     try:
-        with sync_playwright() as playwright, tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
-            context = playwright.chromium.launch_persistent_context(
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+            context = chromium.launch_persistent_context(
                 profile,
                 headless=True,
                 executable_path=args.browser_executable,
                 user_agent=(
-                    "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"
+                    f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko)"
+                    f" Chrome/151.0.0.0 {'Mobile ' if mobile else ''}Safari/537.36"
                 ),
-                viewport={"width": 412, "height": 915},
-                device_scale_factor=2.625,
-                is_mobile=True,
-                has_touch=True,
+                viewport={"width": width, "height": height},
+                device_scale_factor=2.625 if mobile else 1,
+                is_mobile=mobile,
+                has_touch=mobile,
             )
             page = context.pages[0]
+            # Time flows as normal; `#32`'s in-place step jumps it past the channel's poll.
+            page.clock.install()
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
 
             def shot(name: str) -> None:
                 if args.screenshots:
-                    page.screenshot(path=str(args.screenshots / f"{name}.png"))
+                    page.screenshot(path=str(args.screenshots / f"{label}-{name}.png"))
 
             def rows() -> list[str]:
                 return [str(row) for row in page.eval_on_selector_all(
@@ -268,6 +372,47 @@ def main() -> int:
             def view(name: str) -> None:
                 page.evaluate(f"() => document.getElementById('channel-view-{name}').click()")
 
+            def failing(route: Route) -> None:
+                route.fulfill(status=502, content_type="application/json",
+                              body=json.dumps({"error": "discord_error", "detail": "the provider is down"}))
+
+            def timeline_read(address: str) -> bool:
+                return "/timeline" in address
+
+            def wait_pill(prefix: str, why: str) -> None:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not (pill().startswith(prefix) if prefix else pill() == ""):
+                    page.wait_for_timeout(50)
+                check(pill().startswith(prefix) if prefix else pill() == "", f"{label}, {why}: pill {pill()!r}")
+
+            def poll_channel(fail: bool) -> None:
+                """The channel's own re-read, brought forward on the page clock rather than awaited."""
+                if fail:
+                    page.route(timeline_read, failing)
+                page.clock.fast_forward(60_000)
+                if fail:
+                    wait_pill("Refresh failed", "the in-place refresh did not fail")
+                    page.unroute(timeline_read, failing)
+                else:
+                    wait_pill("", "the in-place refresh did not recover")
+                page.wait_for_timeout(100)
+
+            def place(where: str) -> dict[str, float]:
+                found = page.evaluate(PLACE_JS, where)
+                return {"row": float(found["row"]), "gap": float(found["gap"]), "top": float(found["top"])}
+
+            def geometry(state: str, name: str) -> str:
+                # At the head of the list, where the header is: a pill over row 40 of 90 is the
+                # accepted cost of an overlay, a pill over the header is `#32 freshness-pill-overlap`.
+                found = page.evaluate(GEOMETRY_JS)
+                shot(name)
+                problems = [str(problem) for problem in found["problems"]]
+                check(not problems, f"{label}, {state}: {problems}")
+                check(str(found["area"]) == str(found["bare"]),
+                      f"{label}, {state}: #scroll-area is {found['area']}, {found['bare']} without the pill")
+                check(bool(found["tabs"]), f"{label}, {state}: the view tabs were not on screen to measure")
+                return str(found["area"])
+
             # 1. Sign in and read the channel in Main, Threads and All.
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
@@ -285,6 +430,7 @@ def main() -> int:
             check(sorted(scope.get("views", {})) == ["flat", "main", "threads"],
                   f"the snapshot did not cover each view read: {sorted(scope.get('views', {}))}")
             shot("1-signed-in")
+            baseline = str(page.evaluate(GEOMETRY_JS)["area"])
 
             # 2. Reload with the history read held: the saved rows draw before any answer.
             api.timeline_gate.clear()
@@ -296,16 +442,8 @@ def main() -> int:
             wait_rows(["200", "201"], "the snapshot was not drawn before the network answered")
             text = pill()
             check(text.startswith("Saved ") and "refreshing" in text, f"pill while refreshing: {text!r}")
-            overlap = page.evaluate("""() => {
-                const box = (id) => document.getElementById(id).getBoundingClientRect();
-                const pill = box('channel-freshness'), tabs = box('channel-view-tabs');
-                const list = box('scroll-area');
-                return {covers: pill.top < tabs.bottom, inside: pill.left >= list.left &&
-                  pill.right <= list.right && pill.top >= list.top};
-            }""")
-            check(not overlap["covers"], "the freshness pill covers the Main/Threads/All tabs")
-            check(overlap["inside"], "the freshness pill is not over the list")
-            shot("2-saved-before-network")
+            check(geometry("refreshing", "2-saved-before-network") == baseline,
+                  f"{label}: #scroll-area is not the size it was before the reload")
 
             # 3. One bounded newest page for the view on screen merges without duplicating.
             api.timeline_gate.set()
@@ -318,6 +456,8 @@ def main() -> int:
             while time.monotonic() < deadline and pill():
                 page.wait_for_timeout(50)
             check(pill() == "", f"a refreshed view still says {pill()!r}")
+            check(str(page.evaluate(GEOMETRY_JS)["area"]) == baseline,
+                  f"{label}: #scroll-area changed size when the pill cleared")
             shot("3-merged")
 
             # 4. Switching among views already covered is local.
@@ -330,6 +470,37 @@ def main() -> int:
             check(len(api.reads()) == 1, f"switching views read history again: {api.reads()}")
             shot("4-switched-locally")
 
+            # 4b. The pill arriving and leaving IN PLACE, over a list long enough to scroll. Its room
+            # is made above a reader who has scrolled down, where browser scroll anchoring does not
+            # hold, so the page must: the row being read stays put, and a reader at the newest line
+            # stays there. At the very top the header moves down out from under the pill instead.
+            # Tall rows, so that three of them overflow. The failed read's error banner is kept off
+            # the screen: it is a row ABOVE the list, and moves the reader by its own height as it
+            # comes and goes, which is its behaviour and not the pill's.
+            page.add_style_tag(content="#discord-log > li[data-id] { min-height: 70vh; }"
+                                       " #error-wrap { display: none !important; }")
+            for where in ("middle", "newest", "top"):
+                before = place(where)
+                parked = {"middle": 0 < before["top"] and before["gap"] > 100,
+                          "newest": before["gap"] <= 2, "top": before["top"] == 0}[where]
+                check(parked, f"{label}: could not park the reader at the {where}: {before}")
+                for fail in (True, False):
+                    poll_channel(fail)
+                    after = place("")
+                    state = f"{label}, reader at the {where}: the pill {'appeared' if fail else 'cleared'}"
+                    if where == "middle":
+                        moved = after["row"] - before["row"]
+                        # Under 2px: a refresh makes three position fixes (its loading line
+                        # arriving, the pill's room, the loading line going), each landing on a
+                        # whole pixel. The defect was the pill's whole height, ~32px.
+                        check(abs(moved) < 2, f"{state} and moved the row being read by {moved:.1f}px: {after}")
+                    elif where == "newest":
+                        check(after["gap"] <= 2, f"{state} and left the newest line {after['gap']:.1f}px below")
+                    elif fail:
+                        check(after["top"] == 0, f"{state} and scrolled the header away: {after}")
+                        geometry("in place at the top", "4b-top")
+            shot("4b-in-place")
+
             # 5. The API unreachable: the rows stay, and the pill says they are old.
             page.route("**/api/**", lambda route: route.abort("internetdisconnected"))
             page.reload(wait_until="load")
@@ -339,8 +510,20 @@ def main() -> int:
             while time.monotonic() < deadline and not pill().startswith("Offline"):
                 page.wait_for_timeout(50)
             check(pill().startswith("Offline · showing messages saved "), f"offline pill: {pill()!r}")
-            shot("5-offline")
+            geometry("offline", "5-offline")
             page.unroute("**/api/**")
+
+            # 5b. The API reachable but failing: the rows stay, and the pill says the refresh failed.
+            page.route(timeline_read, failing)
+            page.reload(wait_until="load")
+            page.click("#view-switch")
+            wait_rows(["200", "201", "203"], "the snapshot was not kept after a failed refresh")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not pill().startswith("Refresh failed"):
+                page.wait_for_timeout(50)
+            check(pill().startswith("Refresh failed · showing messages from "), f"failed pill: {pill()!r}")
+            geometry("failed", "5b-failed")
+            page.unroute(timeline_read, failing)
 
             # 6. Nothing private is in Cache Storage, and no service worker holds one.
             cache_names = page.evaluate("() => caches.keys()")
@@ -355,13 +538,12 @@ def main() -> int:
             check(rows() == [], f"signing out left rows on the screen: {rows()}")
             shot("7-signed-out")
 
+            desktop = bool(page.evaluate("() => matchMedia('(min-width: 900px) and (pointer: fine)').matches"))
+            check(desktop != mobile, f"{label}: the page chose the wrong layout regime")
             check(not errors, f"the page threw: {errors}")
             browser_version = context.browser.version if context.browser else "Chromium"
             context.close()
-
-        print(f"{browser_version} at 412x915: snapshot drawn before the network, one newest-page read,"
-              " local view switches, offline state, no Cache Storage or service worker, sign-out clears")
-        return 0
+        return browser_version
     finally:
         api.stopping.set()
         api.timeline_gate.set()

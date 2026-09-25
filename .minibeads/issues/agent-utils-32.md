@@ -1,6 +1,6 @@
 ---
 title: 'freshness-pill-overlap: keep the saved-messages pill off the list header'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
@@ -10,7 +10,8 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T11:28:54.453675745+00:00
-updated_at: 2026-09-25T11:28:54.453675745+00:00
+updated_at: 2026-09-25T11:45:44.943730203+00:00
+closed_at: 2026-09-25T11:45:44.943728972+00:00
 ---
 
 # Description

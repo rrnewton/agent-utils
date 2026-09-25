@@ -4960,6 +4960,31 @@ function renderChannelFreshness() {
   pill.textContent = text;
   pill.setAttribute("data-state", channelFreshness);
   pill.hidden = text === "" || currentView !== "discord" || !el("pull-refresh").hidden;
+  reserveFreshnessRoom(text !== "");
+}
+
+/**
+ * `#32 freshness-pill-overlap`. The pill's height at the head of the channel pane, so that the pill
+ * never covers the list's header. Keyed to there being something to say, not to the pill being
+ * shown: giving way to a pull or to the other view must not shift the list.
+ *
+ * Through `preservingScroll`, because the room is added ABOVE a reader who has scrolled down, and
+ * browser scroll anchoring is suppressed for exactly this change — padding on an ancestor of every
+ * row. Without it a failed refresh pushed the line being read, or the newest line, down by the
+ * pill's height. Not for a reader at the very top: there the first row is the anchor, and holding
+ * it would scroll the header straight back under the pill. That reader is meant to see the header
+ * move down out from under it.
+ */
+function reserveFreshnessRoom(reserve) {
+  const pane = el("pane-discord");
+  if (pane.hasAttribute("data-freshness") === reserve) return;
+  const toggle = () => {
+    if (reserve) pane.setAttribute("data-freshness", "");
+    else pane.removeAttribute("data-freshness");
+  };
+  // The pane is not on screen in the other view; the list that is must not be moved on its behalf.
+  if (currentView === "discord" && el("scroll-area").scrollTop > 0) preservingScroll(toggle);
+  else toggle();
 }
 
 /** The page drew a snapshot for one channel and mode; `/client-config` may describe another. */

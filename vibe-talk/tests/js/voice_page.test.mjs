@@ -620,6 +620,14 @@ class FakeElement {
     return this.attributes.has(name) ? this.attributes.get(name) : null;
   }
 
+  hasAttribute(name) {
+    return this.attributes.has(name);
+  }
+
+  removeAttribute(name) {
+    this.attributes.delete(name);
+  }
+
   /**
    * Append, and DETACH from wherever the child was before.
    *
@@ -17497,6 +17505,35 @@ test("a refresh the SERVER fails is reported as a failure, not as being offline"
   await page.el("view-switch").click();
   await page.el("view-switch").click();
   assert.equal(freshness(page).hidden, true, "two pills stacked in one place");
+});
+
+// `#32 freshness-pill-overlap`. The pill floats over the head of the list, so the pane makes room
+// for it there for exactly as long as it has something to say — and keeps that room while the pill
+// gives way to a pull, because the list jumping mid-gesture is worse than the pill's absence.
+test("the channel pane reserves the freshness pill's room for as long as it has something to say", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "721", content: "on screen" })]);
+  const reserved = () => page.el("pane-discord").hasAttribute("data-freshness");
+  const failing = errorResponse(502, "discord_error", "the provider is down");
+  assert.equal(reserved(), false, "a fresh channel reserved room for a pill it is not showing");
+  page.channelPage = failing;
+  await reReadChannel(page);
+  assert.equal(freshness(page).hidden, false);
+  assert.equal(reserved(), true, "the failed-refresh pill sits over the list's header");
+  page.channelPage = async () =>
+    json(200, { channel: CHANNEL, messages: [message({ id: "721", content: "on screen" })], has_more: false });
+  await reReadChannel(page);
+  assert.equal(freshness(page).hidden, true);
+  assert.equal(reserved(), false, "a recovered channel kept the room for a pill that has gone");
+  page.channelPage = failing;
+  await reReadChannel(page);
+  assert.equal(reserved(), true);
+  page.el("pull-refresh").hidden = false;
+  await page.el("view-switch").click();
+  await page.el("view-switch").click();
+  assert.equal(freshness(page).hidden, true);
+  assert.equal(reserved(), true, "giving way to the pull moved the list under the finger");
 });
 
 test("each scope keeps at most MESSAGE_CACHE_ROWS rows, and a reload walks back from the oldest kept", async () => {

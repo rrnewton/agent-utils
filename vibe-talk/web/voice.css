@@ -77,6 +77,11 @@
      not `rem`: what makes a line hard to read is how many CHARACTERS are on it, and that is the
      unit that says so. Overwritten per reader; see `applyReadingWidth`. */
   --reading-width: 72ch;
+  /* `#32 freshness-pill-overlap`. The saved-messages pill's box, in the tokens its reservation at
+     the head of #pane-discord is computed from, so that the two cannot drift apart. */
+  --freshness-top: 0.4rem;
+  --freshness-pad: 0.25rem;
+  --freshness-line: 1rem;
 }
 
 @media (prefers-color-scheme: light) {
@@ -1511,7 +1516,15 @@ body {
    on this device, or kept after a refresh that failed, say how old they are over the list rather
    than at the head of it, where the reader at the bottom would never see it. Anchored to the top
    of the scroller, not of the pane: pinned to the pane it sat over the Main/Threads/All tabs and
-   hid one. Wraps on a narrow phone rather than running off both edges. */
+   hid one.
+
+   `#32 freshness-pill-overlap`. Over the scroller's top it covered the list's own header instead —
+   the channel summary, the first thing a cold start shows. So while there is a freshness to state,
+   #pane-discord reserves the pill's height at its head (`data-freshness`, below) and the header
+   starts under it. Padding INSIDE the scroller, so #scroll-area keeps its size and nothing else on
+   the screen moves; `renderChannelFreshness` holds a scrolled reader's place while it changes.
+   One line, ellipsised, so that the reservation is exact: a pill that wrapped to two on a narrow
+   phone would outgrow it. */
 #channel-freshness-anchor {
   /* The scroller's own grid cell, at its top: auto-placed, it took the tabs' row. */
   grid-row: 3;
@@ -1524,13 +1537,18 @@ body {
 #channel-freshness {
   position: absolute;
   z-index: 2;
-  top: 0.4rem;
+  top: var(--freshness-top);
   left: 50%;
   transform: translateX(-50%);
+  box-sizing: border-box;
   width: max-content;
   max-width: calc(100% - 2rem);
   margin: 0;
-  padding: 0.25rem 0.75rem;
+  padding: var(--freshness-pad) 0.75rem;
+  line-height: var(--freshness-line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   background: var(--panel);
   color: var(--muted);
   border: 1px solid var(--edge);
@@ -1545,6 +1563,12 @@ body {
 #channel-freshness[data-state="failed"] {
   color: var(--warn);
   border-color: currentColor;
+}
+
+/* The pill's bottom edge, measured from the scroller's top; #scroll-area's own top padding is then
+   the gap between it and the header. The 2px is the pill's border. */
+#pane-discord[data-freshness] {
+  padding-top: calc(var(--freshness-top) + 2 * var(--freshness-pad) + var(--freshness-line) + 2px);
 }
 
 /* Armed reads differently from merely being dragged, because the difference is the whole of what

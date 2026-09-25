@@ -112,10 +112,12 @@ steps:
 
   # `#18 offline-message-cache` in the browser engine: saved rows drawn across a real reload before
   # the network answers, one newest-page read, local view switches, a real fetch failure, sign-out
-  # clearing, empty Cache Storage and no service worker, and the pill clear of the view tabs.
+  # clearing, empty Cache Storage and no service worker. `#32 freshness-pill-overlap`: refreshing,
+  # offline and failed, the pill clear of the view tabs and the list's header, #scroll-area unmoved,
+  # and a scrolled reader held in place as the pill comes and goes.
   - group: check
     job: offline-cache-browser
-    desc: saved-message snapshot in current Chromium at a 412x915 Android viewport
+    desc: saved-message snapshot in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/offline_cache_browser.py
     jobs_flag: ""
@@ -123,7 +125,7 @@ steps:
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
-      est_duration_s: 8
+      est_duration_s: 10
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
