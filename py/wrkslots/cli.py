@@ -4187,6 +4187,14 @@ def _verify_task_scope_invocation(scope: TaskScopeIdentity) -> None:
             f"task scope cgroup {scope.cgroup_path} is not under the systemd user "
             f"manager {manager} whose invocation link is verified"
         )
+    # The manager places a scope only inside slices, so a same-named cgroup made
+    # inside a delegated service subtree cannot borrow the real scope's link.
+    parents = scope.cgroup_path.removeprefix(f"{manager}/").split("/")[:-1]
+    if any(not parent.endswith(".slice") for parent in parents):
+        raise Refusal(
+            f"task scope cgroup {scope.cgroup_path} is not a scope placed by the systemd "
+            f"user manager {manager}: every component between them must be a slice"
+        )
     path = _systemd_invocation_directory() / f"invocation:{scope.unit}"
     flags = os.O_PATH | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -22419,6 +22427,10 @@ def _recover_create(
     if abort_create:
         _abort_create(config, path, slot, slot_type, plan, recorded_created)
         return
+    if task_scope is not None:
+        # Refuse before provisioning or hooks run for an owner whose scope has
+        # ended: hooks that dirty a tree would also make --abort-create refuse.
+        _verify_task_scope_before_publication(task_scope, _CREATE_SCOPE_REMEDY)
     _assert_agent_and_slot_free(config, slot, agent, slot_type)
     slot_path = _slot_directory(config, slot, slot_type)
     if slot_path.exists() and (not slot_path.is_dir() or slot_path.is_symlink()):

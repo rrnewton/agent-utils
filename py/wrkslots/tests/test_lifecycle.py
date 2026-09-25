@@ -154,6 +154,36 @@ def test_task_scope_identity_round_trips_and_legacy_rows_remain_readable(
                 replace(owner, cgroup_path=foreign_cgroup),
             )
 
+    # A same-named cgroup inside a delegated service subtree was not placed by
+    # the manager, so it cannot borrow the link either; nested slices can.
+    manager = wrkslots._systemd_user_manager_cgroup()
+    for delegated_cgroup in (
+        f"{manager}/app.slice/delegated.service/wrkslots-worker.scope",
+        f"{manager}/app.slice/app-x.slice/other.scope/wrkslots-worker.scope",
+        f"{manager}/init.scope/wrkslots-worker.scope",
+    ):
+        with pytest.raises(wrkslots.Refusal, match="every component between them"):
+            wrkslots._task_scope_from_args(
+                argparse.Namespace(
+                    task_scope_unit="wrkslots-worker.scope",
+                    task_scope_invocation_id="a" * 32,
+                ),
+                replace(owner, cgroup_path=delegated_cgroup),
+            )
+    nested_slice_owner = replace(
+        owner,
+        cgroup_path=f"{manager}/app.slice/app-x.slice/wrkslots-worker.scope",
+    )
+    nested_scope = wrkslots._task_scope_from_args(
+        argparse.Namespace(
+            task_scope_unit="wrkslots-worker.scope",
+            task_scope_invocation_id="a" * 32,
+        ),
+        nested_slice_owner,
+    )
+    assert nested_scope is not None
+    assert nested_scope.cgroup_path == nested_slice_owner.cgroup_path
+
     (invocation_directory / "invocation:wrkslots-worker.scope").unlink()
     (invocation_directory / "invocation:wrkslots-worker.scope").symlink_to("b" * 32)
     with pytest.raises(wrkslots.Refusal, match="does not match"):
@@ -7373,6 +7403,42 @@ def test_recover_ownerless_validate_checkout_requires_explicit_authority(
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+def test_recover_ownerless_validate_checkout_refuses_abort_import(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    target = project / "worktrees" / "validate" / "review-checkout"
+    target.parent.mkdir(parents=True)
+    git(repository, "worktree", "add", "--detach", str(target), "origin/main")
+    record = prepare_terminal_validation_record(project, target, field="checkout")
+
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-import",
+        "--ownerless-validate-checkout",
+        target.relative_to(project).as_posix(),
+        "--completed-record",
+        record.relative_to(project).as_posix(),
+        "--repository",
+        repository.relative_to(project).as_posix(),
+    )
+
+    assert refused.returncode == 3
+    assert (
+        "--abort-import applies only to an interrupted import-existing journal"
+        in refused.stderr
+    )
+    assert target.is_dir()
+    assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
+
+
 def test_recover_ownerless_validate_checkout_preserves_clean_terminal_worktree(
     tmp_path: Path,
 ) -> None:
@@ -10475,6 +10541,21 @@ def test_create_and_import_recovery_revalidate_task_scope_at_publication(
         original_verify(scope)
 
     monkeypatch.setattr(wrkslots, "_verify_task_scope_invocation", counted_verify)
+    original_slot_free = wrkslots._assert_agent_and_slot_free
+    provisioning_started: list[str] = []
+
+    def recorded_slot_free(
+        config: wrkslots.Config,
+        slot: str,
+        agent: str,
+        slot_type: str,
+        *,
+        enforce_cap: bool = True,
+    ) -> None:
+        provisioning_started.append(slot)
+        original_slot_free(config, slot, agent, slot_type, enforce_cap=enforce_cap)
+
+    monkeypatch.setattr(wrkslots, "_assert_agent_and_slot_free", recorded_slot_free)
     rc = wrkslots.main(
         [
             "--project-root",
@@ -10487,7 +10568,14 @@ def test_create_and_import_recovery_revalidate_task_scope_at_publication(
     )
     captured = capsys.readouterr()
 
-    assert verification_calls == [expected_scope]
+    # Create recovery checks once before provisioning and hooks, then again
+    # immediately before publication; a failing check stops at the first.
+    if operation == "create" and runtime_link == "stable":
+        assert verification_calls == [expected_scope, expected_scope]
+    else:
+        assert verification_calls == [expected_scope]
+    if operation == "create":
+        assert provisioning_started == ([] if runtime_link != "stable" else ["slot01"])
     if runtime_link == "stable":
         assert rc == 0, captured.err
         assert len(active_slots(project)) == 1
