@@ -1,0 +1,241 @@
+//! `#14 voice-agent-prompt` and `#11 voice-connect-latency`, through the real router.
+//!
+//! The profile is only useful if it agrees with what the MCP endpoint will actually do for the
+//! same credential, so these compare the two directly rather than against a list typed out here.
+//! The timing endpoint is only safe if it refuses anything but phase numbers, so these send it
+//! the things a careless client would.
+
+use std::collections::BTreeSet;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt as _;
+use serde_json::{json, Value};
+use tower::ServiceExt as _;
+use vibe_talk::http::router;
+use vibe_talk::testing::{READ_TOKEN, WRITE_TOKEN};
+use vibe_talk::voice_agent;
+
+async fn send(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    if uri == "/mcp" {
+        builder = builder.header("accept", "application/json, text/event-stream");
+    }
+    let request = match body {
+        Some(json) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(json.to_string()))
+            .expect("request"),
+        None => builder.body(Body::empty()).expect("request"),
+    };
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn app() -> axum::Router {
+    let (state, _discord) = vibe_talk::testing::state();
+    router(state)
+}
+
+async fn listed_tools(router: &axum::Router, token: &str) -> BTreeSet<String> {
+    let (status, body) = send(
+        router,
+        "POST",
+        "/mcp",
+        Some(token),
+        Some(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("name").to_owned())
+        .collect()
+}
+
+fn available(profile: &Value) -> BTreeSet<String> {
+    profile["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter(|tool| tool["available"] == json!(true))
+        .map(|tool| tool["name"].as_str().expect("name").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_profile_agrees_with_tools_list_for_every_scope() {
+    let router = app();
+    for (token, scope, writes) in [(READ_TOKEN, "read", false), (WRITE_TOKEN, "write", true)] {
+        let (status, profile) =
+            send(&router, "GET", "/api/v1/voice-agent", Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{profile}");
+        assert_eq!(profile["scope"], scope);
+        assert_eq!(profile["write_available"], json!(writes));
+        assert_eq!(
+            available(&profile),
+            listed_tools(&router, token).await,
+            "the profile and tools/list disagree for the {scope} token"
+        );
+        assert_eq!(profile["mcp_path"], "/mcp");
+        assert_eq!(profile["mentions"]["source"], "returned_token");
+    }
+}
+
+#[tokio::test]
+async fn a_read_caller_is_told_writing_exists_but_is_not_theirs() {
+    let router = app();
+    let (_, profile) = send(
+        &router,
+        "GET",
+        "/api/v1/voice-agent",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    let writes: Vec<&Value> = profile["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter(|tool| tool["access"] == "write")
+        .collect();
+    assert!(!writes.is_empty(), "no write tool is described at all");
+    for tool in writes {
+        assert_eq!(tool["available"], json!(false), "{tool}");
+        assert_eq!(tool["requires_confirmation"], json!(true), "{tool}");
+    }
+}
+
+#[tokio::test]
+async fn the_profile_carries_the_versioned_prompt_verbatim() {
+    let router = app();
+    let (_, profile) = send(
+        &router,
+        "GET",
+        "/api/v1/voice-agent",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(profile["prompt"]["id"], voice_agent::PROMPT_ID);
+    assert_eq!(
+        profile["prompt"]["version"],
+        json!(voice_agent::PROMPT_VERSION)
+    );
+    assert_eq!(
+        profile["prompt"]["fingerprint"],
+        voice_agent::PINNED_FINGERPRINT
+    );
+    assert_eq!(profile["prompt"]["text"], voice_agent::SYSTEM_PROMPT);
+}
+
+#[tokio::test]
+async fn neither_endpoint_answers_without_a_token() {
+    let router = app();
+    let (status, _) = send(&router, "GET", "/api/v1/voice-agent", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let timing = json!({ "protocol": "vibe-talk-v1", "provider_ready": 10 });
+    let (status, _) = send(&router, "POST", "/api/v1/voice-timing", None, Some(timing)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_startup_record_of_phase_numbers_is_accepted_from_the_write_token() {
+    let router = app();
+    let timing = json!({
+        "protocol": "vibe-talk-v1",
+        "chat": false,
+        "session_acquired": 40,
+        "microphone_ready": 310,
+        "socket_open": 520,
+        "provider_ready": 2480,
+        "greeting_text": 3900,
+        "greeting_audio_received": 3950,
+        "greeting_audible": 4050,
+    });
+    let (status, _) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-timing",
+        Some(READ_TOKEN),
+        Some(timing.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read token wrote to the log"
+    );
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-timing",
+        Some(WRITE_TOKEN),
+        Some(timing),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+#[tokio::test]
+async fn anything_but_phase_numbers_is_refused_rather_than_logged() {
+    let router = app();
+    for (why, timing) in [
+        (
+            "an undocumented field could carry speech",
+            json!({ "protocol": "vibe-talk-v1", "greeting_text_value": "hello" }),
+        ),
+        (
+            "a transcript is not a phase",
+            json!({ "protocol": "vibe-talk-v1", "transcript": "summarize the channel" }),
+        ),
+        (
+            "an unknown protocol is not a measurement",
+            json!({ "protocol": "made-up", "provider_ready": 10 }),
+        ),
+        (
+            "a phase longer than the bound",
+            json!({ "protocol": "vibe-talk-v1", "provider_ready": voice_agent::MAX_PHASE_MS + 1 }),
+        ),
+        (
+            "a phase is milliseconds, not text",
+            json!({ "protocol": "vibe-talk-v1", "provider_ready": "soon" }),
+        ),
+    ] {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v1/voice-timing",
+            Some(WRITE_TOKEN),
+            Some(timing),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+        assert_eq!(body["error"], "invalid_timing", "{why}");
+    }
+}

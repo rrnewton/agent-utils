@@ -652,6 +652,20 @@ class FakeElement {
     this.children = [...kids];
   }
 
+  /** Swap this element for another in place. A live turn's row is rebuilt as its text improves. */
+  replaceWith(node) {
+    const parent = this.parentNode;
+    if (!parent) {
+      return;
+    }
+    if (node.parentNode) {
+      node.parentNode.removeChild(node);
+    }
+    parent.children.splice(parent.children.indexOf(this), 1, node);
+    node.parentNode = parent;
+    this.parentNode = null;
+  }
+
   /** Detach one child. The details sheet a press-and-hold opens is closed by removing it. */
   removeChild(kid) {
     const at = this.children.indexOf(kid);
@@ -1124,6 +1138,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     setFetch(fn) {
       page.mint = fn;
     },
+    /** Every startup timing record the page has POSTed, parsed. */
+    timingPosts: [],
     /** Every constraint object the page has handed getUserMedia, in order. */
     micRequests: [],
     /** Every microphone track it has been given, each counting its own `stop()` calls. */
@@ -1451,6 +1467,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       page.requests.push(`${(options && options.method) || "GET"} ${path}`);
       if (String(path).startsWith("/api/v1/voice-session")) {
         return page.mint(path, options);
+      }
+      if (String(path) === "/api/v1/voice-timing") {
+        page.timingPosts.push(JSON.parse(options.body));
+        return json(204, null);
       }
       if (String(path).startsWith("/api/v1/client-config")) {
         return page.clientConfig(path, options);
@@ -1894,6 +1914,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   if (arrange) arrange(page);
   vm.createContext(context);
   vm.runInContext(script, context, { filename: "voice.js" });
+  // A binary socket frame from the page's own realm, where `instanceof ArrayBuffer` is asked.
+  page.binaryFrame = (bytes) => vm.runInContext(`new ArrayBuffer(${bytes})`, context);
   return page;
 }
 
@@ -11787,6 +11809,174 @@ test("the neutral WebSocket provider carries typed text, PCM, and deduplicated t
     1,
     "a repeated final transcript was rendered twice"
   );
+});
+
+// --- streamed speech: one row per turn (#15 transcript-dedup, #12 live-transcript-latency) -------
+
+/** A live neutral-protocol call, past its greeting. Returns the socket. */
+async function startNeutralCall(page, { greeting = false } = {}) {
+  await signIn(page);
+  page.setFetch(async () =>
+    json(200, {
+      websocket_url: "wss://example.invalid/private-voice",
+      protocol: "vibe-talk-v1",
+      provider: "Internal voice preview",
+      input_sample_rate: 24000,
+      output_sample_rate: 24000,
+    })
+  );
+  await page.el("talk").click();
+  const socket = page.sockets[0];
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting }) });
+  return socket;
+}
+
+const speech = (socket, role, turn, text, final) =>
+  socket.onmessage({
+    data: JSON.stringify(
+      final === undefined
+        ? { type: "transcript", role, turn, text }
+        : { type: "transcript", role, turn, text, final }
+    ),
+  });
+
+const turnDone = (socket, turn) =>
+  socket.onmessage({ data: JSON.stringify({ type: "turn_complete", turn }) });
+
+/** Every turn the page has stored, across conversations, in the order the server received them. */
+const storedTexts = (page) => [...page.storedTurns.values()].flat().map((t) => `${t.speaker}: ${t.text}`);
+
+test("a corrected hypothesis REPLACES the words it corrects, on screen and in the record", async () => {
+  // The two sentences below are real: each was stored as the wrong hypothesis immediately
+  // followed by the corrected one, as one turn, so the record read like a stammer.
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "user", 4, "Can you see any tools that can use and what are they?", false);
+  assert.equal(session_lines(page).length, 1, "a partial hypothesis was not shown while it was spoken");
+  speech(socket, "user", 4, "Can you see any tools that you can use and what are they?", true);
+  speech(socket, "assistant", 4, "Yes, I can see the chat tools.", true);
+  turnDone(socket, 4);
+  // Both final, the way a provider that flushes each hypothesis as finished text sends them.
+  speech(socket, "user", 5, "No, what I'm asking for is to summarize the messages Google Chat.");
+  speech(socket, "user", 5, "No, what I'm asking for is to summarize the messages in Google Chat.");
+  turnDone(socket, 5);
+  await page.settle();
+
+  const rows = session_lines(page).map((li) => li.text());
+  assert.equal(rows.length, 3, `one row per turn and speaker, not ${rows.length}`);
+  assert.match(rows[0], /Can you see any tools that you can use and what are they\?$/);
+  assert.doesNotMatch(rows[0], /tools that can use/, "the stale hypothesis is still on screen");
+  assert.match(rows[2], /summarize the messages in Google Chat\.$/);
+  assert.doesNotMatch(rows[2], /messages Google Chat/);
+  assert.deepStrictEqual(storedTexts(page), [
+    "you: Can you see any tools that you can use and what are they?",
+    "agent: Yes, I can see the chat tools.",
+    "you: No, what I'm asking for is to summarize the messages in Google Chat.",
+  ]);
+});
+
+test("fragments of one turn, and then the whole turn again, become ONE row stored ONCE", async () => {
+  // Also real: a greeting stored three times — two fragments and then their concatenation.
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "assistant", 2, "I can hear you loud and clear. ");
+  speech(socket, "assistant", 2, " How can I help you today? ");
+  speech(socket, "assistant", 2, "I can hear you loud and clear.  How can I help you today? ");
+  turnDone(socket, 2);
+  await page.settle();
+  const rows = session_lines(page).map((li) => li.text());
+  assert.equal(rows.length, 1, `the turn was split over ${rows.length} rows`);
+  assert.match(rows[0], /I can hear you loud and clear\. How can I help you today\?$/);
+  assert.deepStrictEqual(storedTexts(page), [
+    "agent: I can hear you loud and clear. How can I help you today?",
+  ]);
+});
+
+test("partials grow in place; a turn with no final flag at all is still stored once", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "assistant", 1, "The build", false);
+  speech(socket, "assistant", 1, "The build passed", false);
+  assert.equal(storedTexts(page).length, 0, "a partial hypothesis was stored before the turn ended");
+  speech(socket, "assistant", 1, "The build passed at noon.", true);
+  speech(socket, "assistant", 1, "Anything", false);
+  speech(socket, "assistant", 1, "Anything else?", true);
+  turnDone(socket, 1);
+  await page.settle();
+  const rows = session_lines(page).map((li) => li.text());
+  assert.equal(rows.length, 1);
+  assert.match(rows[0], /The build passed at noon\. Anything else\?$/);
+  assert.deepStrictEqual(storedTexts(page), ["agent: The build passed at noon. Anything else?"]);
+});
+
+test("the SAME words in a LATER turn are a new row: repeating yourself is real", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "user", 1, "Yes.");
+  turnDone(socket, 1);
+  speech(socket, "user", 2, "Yes.");
+  turnDone(socket, 2);
+  // A late duplicate of turn 2 changes nothing and stores nothing.
+  speech(socket, "user", 2, "Yes.");
+  await page.settle();
+  assert.equal(session_lines(page).length, 2, "a legitimate repeat was swallowed as a duplicate");
+  assert.deepStrictEqual(storedTexts(page), ["you: Yes.", "you: Yes."]);
+});
+
+test("hanging up mid-turn stores the best text of the turn that was in progress", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  speech(socket, "user", 1, "Summarize the", false);
+  speech(socket, "user", 1, "Summarize the channel", false);
+  await page.settle();
+  assert.equal(storedTexts(page).length, 0, "a partial hypothesis was stored mid-turn");
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.deepStrictEqual(storedTexts(page), ["you: Summarize the channel"]);
+});
+
+test("startup timing is posted ONCE, after the greeting, as phase numbers and nothing said", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page, { greeting: true });
+  speech(socket, "assistant", 0, "Hello, I am listening.", true);
+  socket.onmessage({ data: page.binaryFrame(480) });
+  assert.equal(page.timingPosts.length, 0, "timing was posted before the greeting finished");
+  turnDone(socket, 0);
+  speech(socket, "user", 1, "Thanks.", true);
+  turnDone(socket, 1);
+  await page.el("hang-up").click();
+  await page.settle();
+
+  assert.equal(page.timingPosts.length, 1, `posted ${page.timingPosts.length} times`);
+  const [record] = page.timingPosts;
+  const phases = [
+    "session_acquired",
+    "microphone_ready",
+    "socket_open",
+    "provider_ready",
+    "greeting_text",
+    "greeting_audio_received",
+    "greeting_audible",
+  ];
+  assert.deepStrictEqual(Object.keys(record).sort(), ["chat", "protocol", ...phases].sort());
+  assert.equal(record.protocol, "vibe-talk-v1");
+  assert.equal(record.chat, false);
+  for (const phase of phases) {
+    assert.ok(Number.isInteger(record[phase]) && record[phase] >= 0, `${phase} is ${record[phase]}`);
+  }
+  assert.ok(record.greeting_audible >= record.greeting_audio_received, "heard before it arrived");
+  assert.doesNotMatch(JSON.stringify(record), /listening|Hello|Thanks/, "the record carries speech");
+});
+
+test("a call that ends before its greeting still reports how far it got, once", async () => {
+  const page = newPage();
+  await startNeutralCall(page, { greeting: true });
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.timingPosts.length, 1);
+  assert.ok("provider_ready" in page.timingPosts[0]);
+  assert.ok(!("greeting_audible" in page.timingPosts[0]), "a greeting nobody heard was reported heard");
 });
 
 test("TYPING A MESSAGE SENDS user_message, AND NOTHING ELSE", async () => {
