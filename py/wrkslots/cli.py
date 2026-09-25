@@ -6720,6 +6720,8 @@ def _registry_storage_inconsistencies(
     *,
     tolerate_unavailable_repositories: bool = False,
     additional_repositories: Sequence[Path] = (),
+    vcs: _GitVcs | None = None,
+    verify_row_identity: bool = True,
 ) -> tuple[StorageInconsistency, ...]:
     """Describe storage drift without weakening authoritative state validation.
 
@@ -6764,7 +6766,7 @@ def _registry_storage_inconsistencies(
         slot_type: {record.slot for record in records if record.slot_type == slot_type}
         for slot_type in SLOT_TYPES
     }
-    vcs = _GitVcs()
+    vcs = _GitVcs() if vcs is None else vcs
     listed_by_repository: dict[Path, set[Path]] = {}
     common_by_repository: dict[Path, Path] = {}
     listed_by_common: dict[Path, set[Path]] = {}
@@ -6909,6 +6911,8 @@ def _registry_storage_inconsistencies(
                     machine=record.machine,
                     checkout=checkout.name,
                 )
+                continue
+            if not verify_row_identity:
                 continue
             try:
                 checkout_root, checkout_common, _head = vcs.worktree_identity(path)
@@ -8146,6 +8150,31 @@ def _assert_record_storage_consistent(
         verifier.verify_existing_worktree(repository, path)
 
 
+def _assert_record_registered(
+    config: Config,
+    record: ActiveRecord,
+    vcs: _GitVcs,
+) -> None:
+    """Check a row that a command does not name, without per-checkout Git probes.
+
+    The outcome only decides whether the row is named in an advisory warning,
+    so this reads the slot directory and each repository's worktree list, which
+    a memoizing verifier lists once per repository. It omits the worktree-root,
+    common-directory and HEAD probes, three Git processes per checkout, that
+    kept the mutation locks held for tens of seconds on a large registry.
+    ``wrkslots audit`` still runs those probes for every row.
+    """
+
+    _assert_slot_contents(config, record)
+    for checkout in record.checkouts:
+        path = _stored_path(config, checkout.path, "checkout path")
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        if path.is_symlink() or not path.is_dir():
+            raise Refusal(f"checkout path is missing or not a real directory: {path}")
+        if path.absolute() not in vcs.listed_worktrees(repository):
+            raise Refusal(f"Git does not list {path} as a worktree of {repository}")
+
+
 def _assert_target_record_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
@@ -8314,11 +8343,19 @@ def _assert_registry_storage_consistent(
     # ⚠️ WITH NO TARGET SCOPE THIS STILL RAISES, DELIBERATELY. Ownerless
     # validation recovery supplies an explicit scope because its exact path is
     # checked independently below; a bare recovery command still raises.
+    #
+    # Callers hold the mutation locks here, so the Git work must not grow with
+    # the number of rows the command does not name. One memoizing verifier lists
+    # each repository's worktrees once, and a row outside the scope gets only the
+    # checks that decide whether the warning names it.
     stale: list[str] = []
-    vcs = _GitVcs()
+    vcs = _AuditGitVcs()
     for record in records:
         try:
-            _assert_record_storage_consistent(config, record, vcs=vcs)
+            if scope_to_target and record.slot != target_slot:
+                _assert_record_registered(config, record, vcs)
+            else:
+                _assert_record_storage_consistent(config, record, vcs=vcs)
         except Refusal:
             if not scope_to_target or record.slot == target_slot:
                 raise
@@ -8343,9 +8380,13 @@ def _assert_registry_storage_consistent(
         unexpected.extend(
             f"{slot_type}:{slot}" for slot in sorted(actual_slots - expected_slots[slot_type])
         )
+    # Only registration findings are used, and they depend on the worktree lists
+    # alone, so the per-checkout identity probes are skipped.
     registration_findings = tuple(
         item
-        for item in _registry_storage_inconsistencies(config, states)
+        for item in _registry_storage_inconsistencies(
+            config, states, vcs=vcs, verify_row_identity=False
+        )
         if item.kind == "git-registration-without-row"
     )
     # ⚠️ THE SAME SCOPING THE `stale` LOOP ABOVE ALREADY APPLIES, AND IT WAS
