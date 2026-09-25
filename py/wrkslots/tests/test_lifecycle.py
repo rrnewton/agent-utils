@@ -50,23 +50,61 @@ def select_fixture_machine(
     """Make the suite's machine and system Git choices intentional."""
 
     monkeypatch.setenv("WRKSLOTS_MACHINE", "testhost")
+    _prefer_system_git(monkeypatch, tmp_path_factory, SYSTEM_GIT)
+
+
+def _prefer_system_git(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    system_git: Path,
+) -> None:
+    """Put a Git-only redirect to ``system_git`` first on PATH, when it exists."""
+
     # Optional host wrappers may detach telemetry after their foreground Git
     # exits. Such a child correctly counts as live checkout use, but makes a
     # fixture race its own instrumentation. Prefer the system executable for
     # both helper calls and the product subprocesses they launch. Only Git is
     # redirected: python3, which compatibility shebangs resolve, and every
-    # other tool keep the inherited PATH order.
+    # other tool keep the inherited PATH order. Where there is no system Git,
+    # keep the inherited one rather than fail every test in setup.
+    if not system_git.exists():
+        return
     inherited_path = os.environ.get("PATH", "")
     inherited_python = shutil.which("python3")
     system_git_directory = tmp_path_factory.mktemp("system-git")
-    (system_git_directory / "git").symlink_to(SYSTEM_GIT)
+    (system_git_directory / "git").symlink_to(system_git)
     monkeypatch.setenv(
         "PATH", os.pathsep.join((str(system_git_directory), inherited_path))
     )
     resolved_git = shutil.which("git")
     assert resolved_git is not None
-    assert Path(resolved_git).resolve() == SYSTEM_GIT.resolve()
+    assert Path(resolved_git).resolve() == system_git.resolve()
     assert shutil.which("python3") == inherited_python
+
+
+def test_fixture_git_redirect_keeps_the_inherited_git_without_a_system_git(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    tmp_path: Path,
+) -> None:
+    # A host without /usr/bin/git must still run the suite on whatever Git it
+    # has. A dangling redirect would instead fail every test during setup.
+    inherited_path = os.environ["PATH"]
+    inherited_git = shutil.which("git")
+    _prefer_system_git(monkeypatch, tmp_path_factory, tmp_path / "absent" / "git")
+    assert os.environ["PATH"] == inherited_path
+    assert shutil.which("git") == inherited_git
+
+    # Where the system Git exists, only Git is redirected to it.
+    stand_in = tmp_path / "bin" / "git"
+    stand_in.parent.mkdir()
+    stand_in.write_text("#!/bin/sh\n")
+    stand_in.chmod(0o755)
+    _prefer_system_git(monkeypatch, tmp_path_factory, stand_in)
+    redirected_git = shutil.which("git")
+    assert redirected_git is not None
+    assert Path(redirected_git).resolve() == stand_in.resolve()
+    assert os.environ["PATH"].endswith(os.pathsep + inherited_path)
 
 
 def source_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
