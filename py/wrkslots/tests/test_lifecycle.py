@@ -12,6 +12,7 @@ import fcntl
 import io
 import itertools
 import json
+import mmap
 import os
 import select
 import selectors
@@ -572,8 +573,15 @@ def test_slot_unused(slot_path, _record=None, **_kwargs):
         except OSError:
             continue
         if observed == slot_path or slot_path in observed.parents:
+            try:
+                command = (pid_dir / 'cmdline').read_bytes().replace(b'\\0', b' ').decode(
+                    'utf-8', errors='replace'
+                )
+            except OSError:
+                command = '<unavailable>'
             raise cli.Refusal(
-                f'live process {pid_dir.name} uses slot {slot_path}: cwd={observed}'
+                f'live process {pid_dir.name} uses slot {slot_path}: '
+                f'cwd={observed} command={command}'
             )
 
 def test_census(paths, **_kwargs):
@@ -599,6 +607,10 @@ cli._assert_slot_unused = test_slot_unused
 cli._capture_process_path_census = test_census
 cli._capture_lsof_process_path_census = test_census
 cli._capture_same_uid_process_path_census = test_same_uid_census
+# The excluded census reads a root-owned mode-000 tree through root lsof; like
+# the other root-helper censuses above it falls back to the cwd scan here, and
+# the test_excluded_same_uid_census_* tests call the real one directly.
+cli._capture_excluded_same_uid_process_path_census = test_census
 cli._production_frozen_validation_authority_commit = cli._frozen_validation_authority_commit
 cli._frozen_validation_authority_commit = test_frozen_authority
 cli._OWNERLESS_VALIDATION_EXCLUSION_ROOTS = (Path('/tmp'),)
@@ -15625,7 +15637,9 @@ def test_validate_batch_nested_finish_recovers_after_fence_directory_removed(
         env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-fenced-directory"},
     )
 
-    assert interrupted.returncode == 86, interrupted.stderr
+    assert interrupted.returncode == 86, (
+        f"stdout:\n{interrupted.stdout}\nstderr:\n{interrupted.stderr}"
+    )
     finish_journal = wrkslots._journal_path(config)
     seal_journal = wrkslots._validate_batch_seal_journal_path(config)
     assert finish_journal.is_file()
@@ -21594,6 +21608,38 @@ def test_lsof_warning_must_be_proven_unrelated_to_slot() -> None:
     assert not wrkslots._unrelated_lsof_warnings(unknown, slot)
 
 
+def test_lsof_timeout_is_fail_closed_and_reaps_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    pid_file = tmp_path / "lsof.pid"
+    fake_lsof = tmp_path / "lsof"
+    fake_lsof.write_text(
+        "#!/bin/sh\n"
+        "trap '' TERM\n"
+        "sleep 60 &\n"
+        f"printf '%s %s\\n' \"$$\" \"$!\" > {shlex.quote(str(pid_file))}\n"
+        "wait\n",
+        encoding="utf-8",
+    )
+    fake_lsof.chmod(0o755)
+    monkeypatch.setattr(wrkslots, "_LSOF_CENSUS_SECONDS", 0.2)
+
+    started = time.monotonic()
+    with pytest.raises(wrkslots.Refusal, match="lsof failed: .*exceeded 0.2s"):
+        wrkslots._lsof_slot_use(fake_lsof, slot)
+
+    assert time.monotonic() - started < 3
+    pids = tuple(int(value) for value in pid_file.read_text(encoding="ascii").split())
+    assert len(pids) == 2
+    deadline = time.monotonic() + 2
+    while any((Path("/proc") / str(pid)).exists() for pid in pids):
+        assert time.monotonic() < deadline, "timed-out lsof process group leaked"
+        time.sleep(0.01)
+    assert list(slot.iterdir()) == []
+
+
 def test_changed_create_journal_cannot_redirect_recovery(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     interrupted = create(
@@ -23194,6 +23240,172 @@ def test_abort_create_refuses_source_hidden_inside_submodule(
     ).returncode == 0
 
 
+@pytest.mark.parametrize("moment", ("before-abort", "after-path-fence"))
+@pytest.mark.parametrize("location", ("checkout", "submodule"))
+def test_abort_create_refuses_content_change_hidden_by_git_stat_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    request: pytest.FixtureRequest,
+    location: str,
+    moment: str,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    # Git's stat cache will match the edited file exactly: same size, same
+    # mtime, and a ctime Git is told not to trust.  Only hashing sees it.  The
+    # setting is made while provisioning so it is part of the recorded state.
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component",
+            "git config core.trustctime false",
+            "git -C component config core.trustctime false",
+            "exit 9",
+        ],
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    owner = tree if location == "checkout" else tree / "component"
+    source = owner / ("seed.txt" if location == "checkout" else "component.txt")
+    original = source.read_bytes()
+    replacement = original.swapcase()
+    assert replacement != original and len(replacement) == len(original)
+    old = 1_000_000_000_000_000_000
+    os.utime(source, ns=(old, old))
+    assert git(owner, "status", "--porcelain").stdout == ""
+    # The descriptor follows the file when the path fence renames the slot.
+    descriptor = os.open(source, os.O_RDWR)
+    request.addfinalizer(lambda: os.close(descriptor))
+
+    def edit() -> None:
+        assert os.pwrite(descriptor, replacement, 0) == len(replacement)
+        os.utime(descriptor, ns=(old, old))
+
+    if moment == "before-abort":
+        edit()
+        assert git(owner, "status", "--porcelain").stdout == ""
+    else:
+        # After the preflight proof has passed, so only the final proof can
+        # see it: the removal manifest would record the edited bytes.
+        edited: list[bool] = []
+
+        def interrupt(stage: str) -> None:
+            if stage == "after-create-abort-path-fence":
+                edit()
+                edited.append(True)
+
+        monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    if moment == "after-path-fence":
+        assert edited == [True]
+    assert aborted == 3
+    expected = (
+        "source state is dirty"
+        if location == "checkout"
+        else "submodule component source state is dirty"
+    )
+    assert expected in output.err
+    assert source.read_bytes() == replacement
+    assert create_journal_path(project).is_file()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 0
+
+
+def test_abort_create_refuses_deinitialized_submodule_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    authored_record = tmp_path / "authored-submodule-commit"
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init component"
+            " && git -C component -c user.name='Wrkslots Test'"
+            " -c user.email=wrkslots@example.invalid commit --allow-empty"
+            " -m 'authored only in the submodule repository'"
+            f" && git -C component rev-parse HEAD > {shlex.quote(str(authored_record))}"
+            " && git submodule deinit --force --quiet component",
+            "exit 9",
+        ],
+    )
+    refused = create(project)
+    assert refused.returncode == 3
+    tree = checkout(project)
+    authored = authored_record.read_text(encoding="utf-8").strip()
+    module_repository = Path(
+        git(tree, "rev-parse", "--path-format=absolute", "--git-dir").stdout.strip()
+    ) / "modules" / "component"
+    assert not (tree / "component" / ".git").exists()
+    assert git(tree, "status", "--porcelain").stdout == ""
+    assert git(
+        tree, "--git-dir", str(module_repository), "cat-file", "-t", authored
+    ).stdout.strip() == "commit"
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 3
+    assert (
+        f"submodule repository {module_repository} belongs to no initialized submodule"
+        in output.err
+    )
+    assert git(
+        tree, "--git-dir", str(module_repository), "cat-file", "-t", authored
+    ).stdout.strip() == "commit"
+    assert create_journal_path(project).is_file()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 0
+
+
 @pytest.mark.parametrize(
     ("repository_state", "message"),
     (
@@ -23917,6 +24129,394 @@ def test_abort_create_rollback_never_overwrites_replacement(
 
 
 @pytest.mark.ordinary_environment
+def test_abort_create_branch_delete_refuses_concurrent_authored_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    branch_ref = "refs/heads/codex/task"
+    expected = git(repository, "rev-parse", branch_ref).stdout.strip()
+    authored: str | None = None
+
+    def interrupt(stage: str) -> None:
+        nonlocal authored
+        if stage != "before-create-abort-branch-delete" or authored is not None:
+            return
+        tree = git(repository, "rev-parse", f"{expected}^{{tree}}").stdout.strip()
+        authored = git(
+            repository,
+            "commit-tree",
+            tree,
+            "-p",
+            expected,
+            "-m",
+            "authored branch race",
+        ).stdout.strip()
+        git(repository, "update-ref", branch_ref, authored, expected)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 3
+    assert authored is not None
+    assert "changed before atomic deletion" in output.err
+    assert git(repository, "rev-parse", branch_ref).stdout.strip() == authored
+    assert git(repository, "show", "-s", "--format=%s", authored).stdout.strip() == (
+        "authored branch race"
+    )
+    assert create_journal_path(project).is_file()
+
+
+@pytest.mark.ordinary_environment
+def test_abort_create_branch_delete_preserves_symbolic_ref_referent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    branch_ref = "refs/heads/codex/task"
+    expected = git(repository, "rev-parse", branch_ref).stdout.strip()
+
+    def interrupt(stage: str) -> None:
+        if stage == "before-create-abort-branch-delete":
+            raise RuntimeError("simulated interruption before branch deletion")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    arguments = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-create",
+        "--coordinator-authorized",
+    ]
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        wrkslots.main(arguments)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _stage: None)
+    git(repository, "branch", "victim", expected)
+    git(repository, "reflog", "expire", "--expire=never", "refs/heads/victim")
+    git(repository, "symbolic-ref", branch_ref, "refs/heads/victim")
+
+    resumed = wrkslots.main(arguments)
+
+    output = capsys.readouterr()
+    assert resumed == 3
+    assert (
+        "created branch codex/task became a symbolic ref to refs/heads/victim"
+        in output.err
+    )
+    assert git(repository, "rev-parse", "refs/heads/victim").stdout.strip() == expected
+    assert git(repository, "symbolic-ref", branch_ref).stdout.strip() == (
+        "refs/heads/victim"
+    )
+    assert create_journal_path(project).is_file()
+
+
+@pytest.mark.parametrize("state", ("regular", "symbolic", "moved", "absent"))
+def test_git_delete_branch_at_never_follows_a_symbolic_ref(
+    tmp_path: Path, state: str
+) -> None:
+    repository = tmp_path / "repository"
+    git(tmp_path, "init", "-q", "-b", "main", str(repository))
+    git(
+        repository,
+        "-c",
+        "user.name=Wrkslots Test",
+        "-c",
+        "user.email=wrkslots@example.invalid",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "base",
+    )
+    expected = git(repository, "rev-parse", "HEAD").stdout.strip()
+    moved = git(
+        repository,
+        "commit-tree",
+        f"{expected}^{{tree}}",
+        "-p",
+        expected,
+        "-m",
+        "moved",
+    ).stdout.strip()
+    git(repository, "branch", "victim", expected)
+    if state == "regular":
+        git(repository, "branch", "codex/task", expected)
+    elif state == "symbolic":
+        git(repository, "symbolic-ref", "refs/heads/codex/task", "refs/heads/victim")
+    elif state == "moved":
+        git(repository, "branch", "codex/task", moved)
+    vcs = wrkslots._GitVcs()
+
+    if state in {"regular", "absent"}:
+        vcs.delete_branch_at(repository, "codex/task", expected)
+        assert not vcs.branch_exists(repository, "codex/task")
+    else:
+        message = (
+            "became a symbolic ref to refs/heads/victim"
+            if state == "symbolic"
+            else f"changed before atomic deletion: expected {expected}, found {moved}"
+        )
+        with pytest.raises(wrkslots.Refusal) as refused:
+            vcs.delete_branch_at(repository, "codex/task", expected)
+        assert message in str(refused.value)
+        assert vcs.branch_exists(repository, "codex/task")
+    assert git(repository, "rev-parse", "refs/heads/victim").stdout.strip() == expected
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("mutation", ("none", "late-entry", "replacement"))
+def test_abort_create_binds_configured_cache_before_excluded_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        cache_globs=("cache",),
+        post_provision_hooks=(
+            "mkdir -p cache && printf 'baseline\\n' > cache/data.txt",
+            "exit 9",
+        ),
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    fired = False
+
+    def cleanup_guard() -> None:
+        journal = create_journal_path(project)
+        if not journal.is_file():
+            return
+        raw = json.loads(journal.read_text(encoding="utf-8"))
+        if "abort_exclusion" not in raw:
+            return
+        exclusion = wrkslots._create_abort_exclusion_from_obj(
+            wrkslots._load_config(str(project), None),
+            "slot01",
+            "agent",
+            raw["abort_exclusion"],
+        )
+        if exclusion.guard.exists() or exclusion.guard.is_symlink():
+            wrkslots._root_validation_exclusion_command(
+                Path("/usr/bin/rm"),
+                ("--recursive", "--one-file-system", "--", str(exclusion.guard)),
+                "clean up the configured-cache test guard",
+            )
+
+    request.addfinalizer(cleanup_guard)
+
+    def interrupt(stage: str) -> None:
+        nonlocal fired
+        if stage != "after-create-abort-final-removal-proof" or fired:
+            return
+        fired = True
+        removal = next(tree.parent.glob(".slot01.abort-remove.*"))
+        cache = removal / "cache"
+        if mutation == "late-entry":
+            (cache / "late-authored.txt").write_text(
+                "preserve late cache entry\n", encoding="utf-8"
+            )
+        elif mutation == "replacement":
+            data = cache / "data.txt"
+            data.unlink()
+            data.write_text("preserve replacement\n", encoding="utf-8")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert fired
+    if mutation == "none":
+        assert aborted == 0, output.err
+        assert not tree.exists()
+        assert not create_journal_path(project).exists()
+        return
+    assert aborted == 3
+    expected_refusal = (
+        "removal tree changed after final proof"
+        if mutation == "late-entry"
+        else "create-abort removal entry identity changed"
+    )
+    assert expected_refusal in output.err
+    raw = json.loads(create_journal_path(project).read_text(encoding="utf-8"))
+    exclusion = wrkslots._create_abort_exclusion_from_obj(
+        wrkslots._load_config(str(project), None),
+        "slot01",
+        "agent",
+        raw["abort_exclusion"],
+    )
+    source = exclusion.payloads[0].source
+    if mutation == "late-entry":
+        assert (source / "cache" / "late-authored.txt").read_text(
+            encoding="utf-8"
+        ) == "preserve late cache entry\n"
+    else:
+        assert (source / "cache" / "data.txt").read_text(encoding="utf-8") == (
+            "preserve replacement\n"
+        )
+    assert wrkslots._root_validation_directory_names(exclusion.guard) == []
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("path_kind", ("fenced", "removal"))
+def test_abort_create_never_removes_recreated_empty_slot_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    path_kind: str,
+) -> None:
+    project, _repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    recreated: Path | None = None
+
+    def interrupt(stage: str) -> None:
+        nonlocal recreated
+        if stage != "before-create-abort-final-root-check" or recreated is not None:
+            return
+        if path_kind == "fenced":
+            recreated = tree.with_name(".slot01.abort-create")
+        else:
+            raw = json.loads(
+                create_journal_path(project).read_text(encoding="utf-8")
+            )
+            recreated, _identity = wrkslots._create_abort_removal_target(
+                wrkslots._load_config(str(project), None),
+                "slot01",
+                "agent",
+                raw["abort_removal"],
+            )
+        assert not recreated.exists()
+        recreated.mkdir()
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 3
+    assert recreated is not None
+    assert recreated.is_dir()
+    assert list(recreated.iterdir()) == []
+    assert "path reappeared after excluded removal" in output.err
+    recreated.rmdir()
+    resumed = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+    assert resumed == 0, capsys.readouterr().err
+
+
+@pytest.mark.ordinary_environment
+def test_abort_create_quarantines_nested_slot_root_before_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="nested",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    slot_root = tree.parent
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+
+    aborted = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert aborted == 0, output.err
+    assert not tree.exists()
+    assert not slot_root.exists()
+    assert not create_journal_path(project).exists()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 1
+
+
+@pytest.mark.ordinary_environment
 def test_abort_create_resumes_after_path_fence_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -24046,10 +24646,28 @@ def test_abort_create_resumes_after_removal_fence_interruption(
 
 
 @pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    "crash_stage",
+    (
+        "after-create-abort-exclusion-journal",
+        "after-create-abort-exclusion-seal-before-journal",
+        "after-create-abort-exclusion-seal",
+        "before-create-abort-exclusion-move",
+        "after-create-abort-exclusion-move",
+        "after-create-abort-exclusion-all-moved",
+        "after-create-abort-exclusion-excluded-journal",
+        "after-create-abort-exclusion-removing-journal",
+        "after-create-abort-excluded-entry-check",
+        "after-create-abort-excluded-payload-remove",
+        "after-create-abort-exclusion-all-payloads-remove",
+        "after-create-abort-exclusion-rmdir",
+    ),
+)
 def test_abort_create_resumes_after_exclusion_cleanup_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    crash_stage: str,
 ) -> None:
     project, repository, _remote = make_project(
         tmp_path,
@@ -24061,12 +24679,12 @@ def test_abort_create_resumes_after_exclusion_cleanup_interruption(
     tree = checkout(project)
 
     def interrupt(stage: str) -> None:
-        if stage == "after-create-abort-exclusion-rmdir":
-            raise RuntimeError("simulated post-exclusion cleanup crash")
+        if stage == crash_stage:
+            raise RuntimeError(f"simulated create-abort crash at {stage}")
 
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
-    with pytest.raises(RuntimeError, match="simulated post-exclusion cleanup crash"):
+    with pytest.raises(RuntimeError, match="simulated create-abort crash"):
         wrkslots.main(
             [
                 "--project-root",
@@ -24085,9 +24703,9 @@ def test_abort_create_resumes_after_exclusion_cleanup_interruption(
         "agent",
         raw["abort_exclusion"],
     )
-    assert not exclusion.guard.exists()
-    assert not tree.exists()
-    assert all(not payload.source.exists() for payload in exclusion.payloads)
+    assert create_journal_path(project).is_file()
+    if crash_stage == "after-create-abort-exclusion-rmdir":
+        assert not tree.exists()
 
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _stage: None)
     resumed = wrkslots.main(
@@ -24104,6 +24722,492 @@ def test_abort_create_resumes_after_exclusion_cleanup_interruption(
 
     output = capsys.readouterr()
     assert resumed == 0, output.err
+    assert not exclusion.guard.exists()
+    assert all(not payload.source.exists() for payload in exclusion.payloads)
+    assert not create_journal_path(project).exists()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 1
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize(
+    "failure",
+    ("crash-after-mkdir", "refusal-after-mkdir", "refusal-at-seal", "sealed-unrecorded"),
+)
+def test_abort_create_recovers_from_exclusion_guard_preparation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    config = wrkslots._load_config(str(project), None)
+    root, _root_identity, _alias = wrkslots._trusted_validation_exclusion_root(
+        tree, roots=wrkslots._CREATE_ABORT_EXCLUSION_ROOTS
+    )
+    guard = root / wrkslots._create_abort_exclusion_name(config, "slot01")
+    assert not guard.exists()
+
+    def remove_leftover_guard() -> None:
+        if guard.exists():
+            wrkslots._root_validation_exclusion_command(
+                Path("/usr/bin/rmdir"), ("--", str(guard)), "remove test guard"
+            )
+
+    request.addfinalizer(remove_leftover_guard)
+    real_command = wrkslots._root_validation_exclusion_command
+    fired: list[str] = []
+
+    def interrupt(stage: str) -> None:
+        if (
+            stage != "after-create-abort-exclusion-guard-mkdir"
+            or failure == "refusal-at-seal"
+            or fired
+        ):
+            return
+        fired.append(stage)
+        if failure == "refusal-after-mkdir":
+            raise wrkslots.Refusal("simulated refusal after guard creation")
+        if failure in {"crash-after-mkdir", "sealed-unrecorded"}:
+            raise RuntimeError("simulated crash after guard creation")
+
+    def command(
+        program: Path, arguments: Sequence[str], label: str, **kwargs: bool
+    ) -> bytes:
+        if (
+            failure == "refusal-at-seal"
+            and label == "seal the create-abort exclusion guard"
+            and not fired
+        ):
+            fired.append(label)
+            raise wrkslots.Refusal("simulated seal helper refusal")
+        return real_command(program, arguments, label, **kwargs)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_root_validation_exclusion_command", command)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    arguments = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-create",
+        "--coordinator-authorized",
+    ]
+    if failure in {"crash-after-mkdir", "sealed-unrecorded"}:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            wrkslots.main(arguments)
+        assert guard.is_dir()
+        raw = json.loads(create_journal_path(project).read_text(encoding="utf-8"))
+        assert "abort_exclusion" not in raw
+    else:
+        assert wrkslots.main(arguments) == 3
+        output = capsys.readouterr()
+        assert "simulated" in output.err
+    if failure == "refusal-after-mkdir":
+        # The unrecorded guard was removed and both path fences rolled back.
+        assert not guard.exists()
+        assert tree.is_dir()
+    if failure == "refusal-at-seal":
+        raw = json.loads(create_journal_path(project).read_text(encoding="utf-8"))
+        assert raw["abort_exclusion"]["phase"] == "prepared"
+        assert guard.is_dir()
+        assert not tree.exists()
+    if failure == "sealed-unrecorded":
+        real_command(Path("/usr/bin/chmod"), ("000", "--", str(guard)), "seal test guard")
+    assert fired
+
+    resumed = wrkslots.main(arguments)
+
+    output = capsys.readouterr()
+    if failure == "sealed-unrecorded":
+        assert resumed == 3
+        assert f"unrecorded create-abort exclusion guard exists: {guard}" in output.err
+        assert guard.is_dir()
+        assert create_journal_path(project).is_file()
+        real_command(Path("/usr/bin/chmod"), ("700", "--", str(guard)), "unseal test guard")
+        return
+    assert resumed == 0, output.err
+    assert not guard.exists()
+    assert not tree.exists()
+    assert not create_journal_path(project).exists()
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 1
+
+
+@pytest.mark.ordinary_environment
+def test_root_lsof_sees_process_use_behind_a_sealed_guard(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    lsof = Path("/usr/bin/lsof")
+    guard = tmp_path / "guard"
+    payload = tmp_path / "payload"
+    (payload / "inner").mkdir(parents=True)
+    root_command = wrkslots._root_validation_exclusion_command
+    child = subprocess.Popen(
+        [sys.executable, "-B", "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        cwd=payload / "inner",
+    )
+
+    def cleanup() -> None:
+        assert child.stdin is not None
+        if not child.stdin.closed:
+            child.stdin.close()
+        child.wait(timeout=10)
+        if guard.exists():
+            root_command(
+                Path("/usr/bin/rm"),
+                ("--recursive", "--one-file-system", "--", str(guard)),
+                "remove test guard",
+            )
+
+    request.addfinalizer(cleanup)
+    assert child.stdout is not None
+    assert child.stdout.readline() == b"ready\n"
+    root_command(Path("/usr/bin/mkdir"), ("--mode=0700", "--", str(guard)), "make guard")
+    root_command(
+        Path("/usr/bin/mv"),
+        ("--no-clobber", "--no-target-directory", "--", str(payload), str(guard / "p")),
+        "exclude payload",
+    )
+    root_command(Path("/usr/bin/chmod"), ("000", "--", str(guard)), "seal guard")
+
+    with pytest.raises(wrkslots.Refusal) as unprivileged:
+        wrkslots._lsof_slot_use(lsof, guard)
+    assert "process use is indeterminate" in str(unprivileged.value)
+    evidence, malformed, _returncode = wrkslots._lsof_slot_use(lsof, guard, as_root=True)
+    assert evidence is not None
+    assert evidence.pid == child.pid
+    assert not malformed
+    assert evidence.descriptor_excerpt == '"cwd"'
+
+    assert child.stdin is not None
+    child.stdin.close()
+    child.wait(timeout=10)
+    assert wrkslots._lsof_slot_use(lsof, guard, as_root=True)[0] is None
+
+
+@pytest.mark.ordinary_environment
+def test_abort_create_preserves_write_through_pre_exclusion_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    # Stands in for a process whose cwd was inside the checkout before the
+    # payload moved: it writes after validation and exits before the census.
+    held = os.open(tree, os.O_RDONLY | os.O_DIRECTORY)
+    censuses: list[tuple[Path, bool]] = []
+
+    def census(path: Path, _record: object = None, root_lsof: bool = False) -> None:
+        nonlocal held
+        censuses.append((path, root_lsof))
+        if root_lsof and held >= 0:
+            late = os.open(
+                "late-authored.txt", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=held
+            )
+            os.write(late, b"written after validation\n")
+            os.close(late)
+            os.close(held)
+            held = -1
+
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", census)
+    arguments = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-create",
+        "--coordinator-authorized",
+    ]
+    aborted = wrkslots.main(arguments)
+
+    output = capsys.readouterr()
+    assert held == -1
+    assert [
+        root_lsof
+        for path, root_lsof in censuses
+        if path.name.startswith(".wrkslots-create-abort-")
+    ] == [True]
+    assert aborted == 3, output.out
+    assert "changed after its validation" in output.err
+    assert create_journal_path(project).is_file()
+
+    resumed = wrkslots.main(arguments)
+
+    output = capsys.readouterr()
+    assert resumed == 3
+    assert "source state is dirty" in output.err
+    assert "late-authored.txt" in output.err
+    # Recovery restored every payload to its recorded source below the removal
+    # fence, where the authored file is preserved for inspection.
+    raw = json.loads(create_journal_path(project).read_text(encoding="utf-8"))
+    removal = project / raw["abort_removal"]["path"]
+    assert (removal / "late-authored.txt").read_text(encoding="utf-8") == (
+        "written after validation\n"
+    )
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 0
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("dirtied", ("before-recovery", "before-move"))
+def test_abort_create_preserves_write_through_already_dirty_shared_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dirtied: str,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    assert (tree / "seed.txt").read_bytes() == b"seed\n"
+    # A store to a shared mapping whose page is already dirty takes no page
+    # fault, so it changes the bytes without touching mtime or ctime: only a
+    # comparison of contents can see it.
+    descriptor = os.open(tree / "seed.txt", os.O_RDWR)
+    mapping = mmap.mmap(descriptor, 5, mmap.MAP_SHARED)
+    os.close(descriptor)
+    if dirtied == "before-recovery":
+        mapping[0:1] = b"s"
+
+    def interrupt(stage: str) -> None:
+        if dirtied == "before-move" and stage == "before-create-abort-exclusion-move":
+            mapping[0:1] = b"s"
+
+    written: list[bool] = []
+
+    def census(path: Path, _record: object = None, root_lsof: bool = False) -> None:
+        if root_lsof and not written:
+            mapping[0:4] = b"LOST"
+            mapping.close()
+            written.append(True)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", census)
+    arguments = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--abort-create",
+        "--coordinator-authorized",
+    ]
+    aborted = wrkslots.main(arguments)
+
+    output = capsys.readouterr()
+    assert written == [True]
+    assert aborted == 3, output.out
+    assert "excluded create-abort payload" in output.err
+    assert "changed after its validation" in output.err
+    assert create_journal_path(project).is_file()
+
+    resumed = wrkslots.main(arguments)
+
+    output = capsys.readouterr()
+    assert resumed == 3
+    assert "source state is dirty" in output.err
+    raw = json.loads(create_journal_path(project).read_text(encoding="utf-8"))
+    removal = project / raw["abort_removal"]["path"]
+    assert (removal / "seed.txt").read_bytes() == b"LOST\n"
+    assert git(
+        repository,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/heads/codex/task",
+        check=False,
+    ).returncode == 0
+
+
+def test_create_abort_payload_bounds_cover_real_output_and_scale(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "payload"
+    deep = root / ("d" * 200) / ("e" * 200)
+    deep.mkdir(parents=True)
+    for index in range(40):
+        (deep / f"{'f' * 200}{index}").write_bytes(b"x" * index)
+    (root / "empty").write_bytes(b"")
+    (root / "link").symlink_to("t" * 3000)
+    manifest = wrkslots._capture_abort_removal_tree(root)
+    commands = {
+        "snapshot": ["-printf", wrkslots._CREATE_ABORT_SNAPSHOT_FORMAT],
+        "list": ["-printf", wrkslots._CREATE_ABORT_LISTING_FORMAT],
+        "hash": ["-type", "f", "-exec", "/usr/bin/sha256sum", "-z", "--", "{}", "+"],
+    }
+    # The derived bound, not the fixed floor, must hold the real output.
+    for purpose, arguments in commands.items():
+        produced = subprocess.run(
+            ["/usr/bin/find", str(root), "-xdev", *arguments],
+            capture_output=True,
+            check=True,
+        ).stdout
+        _seconds, output = wrkslots._create_abort_payload_bounds(
+            root, manifest, purpose
+        )
+        assert 0 < len(produced) <= output, purpose
+
+    mebibyte = 1024 * 1024
+    files = tuple(
+        wrkslots._AbortRemovalEntry(
+            name=f"{index:06d}-{'n' * 80}",
+            device=1,
+            inode=index + 2,
+            mode=stat.S_IFREG | 0o644,
+            uid=1,
+            gid=1,
+            size=mebibyte,
+            digest_or_target="0" * 64,
+            children=(),
+        )
+        for index in range(200_000)
+    )
+    large = wrkslots._AbortRemovalEntry(
+        name=manifest.name,
+        device=manifest.device,
+        inode=manifest.inode,
+        mode=manifest.mode,
+        uid=manifest.uid,
+        gid=manifest.gid,
+        size=manifest.size,
+        digest_or_target=manifest.digest_or_target,
+        children=files,
+    )
+    for purpose in ("snapshot", "list", "hash"):
+        seconds, output = wrkslots._create_abort_payload_bounds(root, large, purpose)
+        assert output > 16 * mebibyte, purpose
+        assert seconds > 60, purpose
+    seconds, _output = wrkslots._create_abort_payload_bounds(root, large, "hash")
+    assert seconds == 200_000 * mebibyte / wrkslots._CREATE_ABORT_HASH_BYTES_PER_SECOND
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("recovery_phase", ("rollback", "removing"))
+def test_abort_create_resumes_after_recovery_guard_removal_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recovery_phase: str,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path,
+        worktrees_directory="worktrees/slots",
+        layout="flat",
+        post_provision_hooks=("exit 9",),
+    )
+    assert create(project).returncode == 3
+    tree = checkout(project)
+    initial_stage = (
+        "after-create-abort-exclusion-move"
+        if recovery_phase == "rollback"
+        else "after-create-abort-excluded-payload-remove"
+    )
+
+    def initial_interrupt(stage: str) -> None:
+        if stage == initial_stage:
+            raise RuntimeError("simulated initial exclusion crash")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", initial_interrupt)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args: None)
+    with pytest.raises(RuntimeError, match="simulated initial exclusion crash"):
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--abort-create",
+                "--coordinator-authorized",
+            ]
+        )
+
+    def recovery_interrupt(stage: str) -> None:
+        if stage == "after-create-abort-exclusion-recovery-rmdir":
+            raise RuntimeError("simulated post-recovery-rmdir crash")
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", recovery_interrupt)
+    with pytest.raises(RuntimeError, match="simulated post-recovery-rmdir crash"):
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--abort-create",
+                "--coordinator-authorized",
+            ]
+        )
+
+    raw = json.loads(create_journal_path(project).read_text(encoding="utf-8"))
+    exclusion = wrkslots._create_abort_exclusion_from_obj(
+        wrkslots._load_config(str(project), None),
+        "slot01",
+        "agent",
+        raw["abort_exclusion"],
+    )
+    assert not exclusion.guard.exists()
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _stage: None)
+    resumed = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "recover",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--abort-create",
+            "--coordinator-authorized",
+        ]
+    )
+
+    output = capsys.readouterr()
+    assert resumed == 0, output.err
+    assert not tree.exists()
     assert not create_journal_path(project).exists()
     assert git(
         repository,
@@ -29816,12 +30920,16 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
             if evidence == "mixed":
                 diagnostic += b"/usr/bin/find: '/proc/124/root': Permission denied\n"
             return (1, output, diagnostic)
-        assert "/usr/bin/grep" in command
+        assert "/usr/bin/gawk" in command
         calls.append("maps")
         assert "/proc/123/maps" in command and "/proc/124/maps" in command
         if evidence == "stale-map":
             reused = True
-            return (0, os.fsencode(f"/proc/123/maps:1000-2000 r--p 00000000 00:00 1 {target}\n"), b"")
+            return (
+                0,
+                os.fsencode("/proc/123/maps\0" "1\0" "\0"),
+                b"",
+            )
         return (2, b"", b"/usr/bin/grep: /proc/123/maps: No such file or directory\n")
 
     def mountinfo(
@@ -29905,9 +31013,9 @@ def test_process_census_live_protected_identity_reaches_trusted_readers(
         assert isinstance(authorities, tuple)
         assert tuple(item.path for item in authorities) == (Path("/usr/bin/sudo"), Path(command[5]))
         assert command[:5] == ["/usr/bin/sudo", "-n", "-u", "root", "--"]
-        if command[5] == "/usr/bin/grep":
+        if command[5] == "/usr/bin/gawk":
             assert f"/proc/{pid}/maps" in command
-            return (1, b"", b"")
+            return (0, b"", b"")
         assert command[5] == "/usr/bin/find"
         assert f"/proc/{pid}/root" in command
         output = os.fsencode(f"/proc/{pid}/cwd\0{target}\0") if result == "in-use" else b""
@@ -29940,7 +31048,7 @@ def test_process_census_live_protected_identity_reaches_trusted_readers(
         return
     census = capture()
     assert census.processes == (process,)
-    assert calls == ["sudo", "find", "sudo", "grep", "mount"]
+    assert calls == ["sudo", "find", "sudo", "gawk", "mount"]
     if result == "in-use":
         with pytest.raises(wrkslots.Refusal, match=f"live process {pid}"):
             census.assert_slot_unused(target, None, ignore_current_process=False)
@@ -30253,28 +31361,166 @@ def test_find_link_selection_bounds_large_irrelevant_census_without_truncation(
         wrkslots._run_bounded_read_only_command(command, stdout_limit=512)
 
 
-def test_privileged_grep_census_reports_deleted_mapping(
+def test_privileged_compact_maps_census_reports_deleted_mapping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[123]")
     target = Path("/absent/validate/gone")
     monkeypatch.setattr(wrkslots, "_process_start_ticks", lambda _path: 17)
-    monkeypatch.setattr(
-        wrkslots,
-        "_run_root_owned_command",
-        lambda *_args, **_kwargs: (
+    def compact_maps(
+        program: Path, arguments: Sequence[str], **kwargs: object
+    ) -> tuple[int, bytes, bytes]:
+        assert program == Path("/usr/bin/gawk")
+        assert arguments[:2] == ("--", wrkslots._PATH_MAPS_AWK)
+        assert arguments[2:] == ("/proc/123/maps",)
+        assert kwargs["input_data"] == b"/absent/validate/gone\0"
+        return (
             0,
-            b"/proc/123/maps:7f00-7f10 r--p 00000000 00:00 0 "
-            b"/absent/validate/gone/mapped (deleted)\n",
+            b"/proc/123/maps\0" b"1\0" b"/mapped (deleted)\0",
             b"",
-        ),
-    )
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", compact_maps)
     assert wrkslots._absent_validate_maps_match((process,), {target: "gone"}) == (
         123,
         "gone",
         "map",
         "/absent/validate/gone/mapped",
     )
+
+
+def test_compact_maps_transport_retains_real_scale_complete_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process_count = 4694
+    target = Path("/srv/project/worktrees/slots/selected")
+    processes = tuple(
+        wrkslots._AbsentProcessObservation(pid, pid + 100, "", f"mnt:[{pid}]")
+        for pid in range(1000, 1000 + process_count)
+    )
+    compact = b"".join(
+        f"/proc/{process.pid}/maps\0".encode()
+        + b"1\0/target/release/tool (deleted)\0"
+        for process in processes
+    )
+    legacy = b"".join(
+        f"/proc/{process.pid}/maps:".encode()
+        + b"7f000000-7f001000 r-xp 00000000 00:01 12345 "
+        + os.fsencode(target)
+        + b"/target/release/tool (deleted)\n"
+        for process in processes
+    )
+    assert len(compact) < len(legacy) * 2 // 5
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=30,
+        stdout_limit=len(compact),
+        stderr_limit=1024,
+    )
+    emitted_pids: set[int] = set()
+
+    def emit_complete_compact_census(
+        program: Path, arguments: Sequence[str], **kwargs: object
+    ) -> tuple[int, bytes, bytes]:
+        assert program == Path("/usr/bin/gawk")
+        assert arguments[:2] == ("--", wrkslots._PATH_MAPS_AWK)
+        assert kwargs["input_data"] == os.fsencode(target) + b"\0"
+        batch_pids = {
+            int(Path(argument).parts[2]) for argument in arguments[2:]
+        }
+        assert not emitted_pids & batch_pids
+        emitted_pids.update(batch_pids)
+        chunk = b"".join(
+            f"/proc/{process.pid}/maps\0".encode()
+            + b"1\0/target/release/tool (deleted)\0"
+            for process in processes
+            if process.pid in batch_pids
+        )
+        budget.consume_output(chunk, b"")
+        return 0, chunk, b""
+
+    monkeypatch.setattr(
+        wrkslots, "_run_root_owned_command", emit_complete_compact_census
+    )
+    monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _row: True)
+
+    matches = wrkslots._absent_validate_maps_matches(
+        processes, {target: "selected"}, budget
+    )
+
+    assert len(matches) == process_count
+    assert emitted_pids == {process.pid for process in processes}
+    assert {match[0] for match in matches} == {process.pid for process in processes}
+    assert all(
+        match[1:] == (
+            "selected",
+            "map",
+            str(target / "target/release/tool"),
+        )
+        for match in matches
+    )
+
+
+def test_compact_maps_filter_preserves_each_selected_mapping(
+    tmp_path: Path,
+) -> None:
+    maps = tmp_path / "maps"
+    target = tmp_path / "selected"
+    rows = [
+        f"7f{index:06x}-7f{index + 1:06x} r--p 00000000 00:01 {index + 1} "
+        f"{target}/artifact-{index} (deleted)\n"
+        for index in range(4096)
+    ]
+    rows.append("80000000-80001000 r--p 00000000 00:01 9 /outside/unrelated\n")
+    rows.append(
+        "80001000-80002000 r--p 00000000 00:01 10 "
+        + "x" * len(str(target))
+        + "/prefix-offset-is-not-a-prefix\n"
+    )
+    maps.write_text("".join(rows), encoding="utf-8")
+
+    returncode, stdout, stderr = wrkslots._run_bounded_read_only_command(
+        ["/usr/bin/gawk", "--", wrkslots._PATH_MAPS_AWK, str(maps)],
+        input_data=os.fsencode(target) + b"\0",
+        stdout_limit=512 * 1024,
+    )
+
+    assert returncode == 0
+    assert stderr == b""
+    records = wrkslots._census_nul_records(stdout, 3, "test compact maps")
+    assert len(records) == 4096
+    assert records[0] == [str(maps), "1", "/artifact-0 (deleted)"]
+    assert records[-1] == [str(maps), "1", "/artifact-4095 (deleted)"]
+    legacy_size = sum(
+        len(os.fsencode(str(maps))) + len(row.encode()) + 1 for row in rows[:-1]
+    )
+    assert len(stdout) < legacy_size // 2
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    (
+        (b"/proc/123/maps\0x\0/child\0", "invalid target"),
+        (b"/proc/123/maps\0" b"2\0/child\0", "unknown target"),
+        (b"/proc/123/maps\0" b"1\0-not-a-child\0", "invalid suffix"),
+        (b"/proc/123/maps\0" b"1\0", "truncated record"),
+    ),
+)
+def test_compact_maps_parser_refuses_ambiguous_or_truncated_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    record: bytes,
+    message: str,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "mnt:[123]")
+    target = Path("/selected")
+    monkeypatch.setattr(wrkslots, "_process_generation_is_current", lambda _row: True)
+
+    with pytest.raises(wrkslots.Refusal, match=message):
+        wrkslots._parse_compact_maps_path_matches(
+            record,
+            {123: process},
+            {target: "selected"},
+            census="test",
+        )
 
 
 def test_process_path_census_collects_every_target_once(
@@ -30389,14 +31635,14 @@ def missing_path_census_control(
 
     def run(command: Sequence[str], **_kwargs: object) -> tuple[int, bytes, bytes]:
         nonlocal now
-        program = "find" if "/usr/bin/find" in command else "grep"
+        program = "find" if "/usr/bin/find" in command else "maps"
         calls.append(program)
         if scenario == "input":
             if program == "find":
                 return (0, b"", b"")
             return (2, b"", b"/usr/bin/grep: /proc/123/maps: No such file or directory\n")
-        if program == "grep":
-            return (1, b"", b"")
+        if program == "maps":
+            return (0, b"", b"")
         if scenario == "once" and calls.count("snapshot") > 1:
             return (0, b"", b"")
         diagnostic = b"/usr/bin/find: '/proc/123/fd/399': No such file or directory\n"
@@ -30442,7 +31688,7 @@ def test_missing_path_census_discards_attempt_before_complete_reobservation(
 ) -> None:
     capture, calls = missing_path_census_control(monkeypatch, lane, "once")
     census = capture()
-    assert calls == ["snapshot", "find", "snapshot", "find", "grep", "mount"]
+    assert calls == ["snapshot", "find", "snapshot", "find", "maps", "mount"]
     assert len(census.processes) == 1
     assert census.matches == ()
     assert census.owner_cgroup_complete is (lane == "privileged")
@@ -30471,8 +31717,8 @@ def test_missing_path_census_preserves_shared_attempt_budgets(
     if bound == "time":
         assert calls == ["snapshot", "find"]
     else:
-        # The second real command wrapper exhausts the shared grep pattern input.
-        assert calls == ["snapshot", "find", "grep", "snapshot", "find"]
+        # The second real command wrapper exhausts the shared maps-selection input.
+        assert calls == ["snapshot", "find", "maps", "snapshot", "find"]
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))

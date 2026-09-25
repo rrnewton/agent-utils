@@ -255,17 +255,20 @@ def scripted_lsof(
     pending = iter(responses)
     calls: list[list[str]] = []
 
-    def run(
-        args: list[str], *, text: bool, capture_output: bool, check: bool
-    ) -> subprocess.CompletedProcess[str]:
+    def run(args: list[str], **kwargs: object) -> tuple[int, bytes, bytes]:
         assert args == ["/usr/bin/lsof", "-nP", "-Fpcfn", "+D", str(slot)]
-        assert text is True and capture_output is True and check is False
+        assert kwargs == {
+            "timeout_seconds": cli._LSOF_CENSUS_SECONDS,
+            "stdout_limit": 16 * 1024 * 1024,
+            "stderr_limit": 64 * 1024,
+        }
         calls.append(args)
         if events is not None:
             events.append("lsof")
-        return next(pending)
+        response = next(pending)
+        return response.returncode, response.stdout.encode(), response.stderr.encode()
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(cli, "_run_bounded_read_only_command", run)
     return calls
 
 

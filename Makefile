@@ -94,11 +94,8 @@ ifneq ($(TEST_SUITE),rust)
 	if command -v unshare >/dev/null 2>&1 \
 		&& unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then \
 		python3 -m pytest -q --ignore=wrkslots/tests/test_lifecycle.py && \
-		test_python="$$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" && \
-		unshare --user --map-root-user --pid --fork --mount-proc \
-			"$$test_python" ../scripts/pid_namespace_init.py -- \
-			python3 -m pytest -q -c pyproject.toml --rootdir=. wrkslots/tests/test_lifecycle.py \
-			-m 'not ordinary_environment' && \
+		python3 ../scripts/run_mapped_lifecycle_shards.py \
+			--shards "$${LIFECYCLE_TEST_SHARDS:-4}" && \
 		python3 -m pytest -q -c pyproject.toml --rootdir=. \
 			wrkslots/tests/test_lifecycle.py -m ordinary_environment; \
 	else \

@@ -614,9 +614,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     assert ordinary | mapped == all_tests
     # Exact totals intentionally make every lifecycle-test addition account for
     # its execution partition; changing only collection cannot satisfy this gate.
-    assert len(all_tests) == 1171
-    assert len(ordinary) == 293
-    assert len(mapped) == 878
+    assert len(all_tests) == 1217
+    assert len(ordinary) == 322
+    assert len(mapped) == 895
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
@@ -627,6 +627,16 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_abort_create_exclusion_preserves_post_check_source_replacement",
         "test_abort_create_removes_clean_partially_initialized_submodules",
         "test_abort_create_resumes_after_exclusion_cleanup_interruption",
+        "test_abort_create_branch_delete_refuses_concurrent_authored_move",
+        "test_abort_create_binds_configured_cache_before_excluded_removal",
+        "test_abort_create_never_removes_recreated_empty_slot_root",
+        "test_abort_create_quarantines_nested_slot_root_before_removal",
+        "test_abort_create_resumes_after_recovery_guard_removal_interruption",
+        "test_abort_create_branch_delete_preserves_symbolic_ref_referent",
+        "test_abort_create_recovers_from_exclusion_guard_preparation_failure",
+        "test_abort_create_preserves_write_through_pre_exclusion_descriptor",
+        "test_abort_create_preserves_write_through_already_dirty_shared_mapping",
+        "test_root_lsof_sees_process_use_behind_a_sealed_guard",
         "test_abort_create_resumes_after_path_fence_interruption",
         "test_abort_create_resumes_after_removal_fence_interruption",
         "test_batch_census_isolated_real_file_alias_mapping_and_socket",
@@ -736,12 +746,8 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         (REPO_ROOT / "Makefile").read_text(encoding="utf-8").replace("\\\n", " "),
     )
     assert (
-        'test_python="$$(python3 -c '
-        "'import os, sys; print(os.path.realpath(sys.executable))')\" && "
-        "unshare --user --map-root-user --pid --fork --mount-proc "
-        '"$$test_python" ../scripts/pid_namespace_init.py -- '
-        "python3 -m pytest -q -c pyproject.toml --rootdir=. "
-        "wrkslots/tests/test_lifecycle.py -m 'not ordinary_environment'"
+        "python3 ../scripts/run_mapped_lifecycle_shards.py "
+        '--shards "$${LIFECYCLE_TEST_SHARDS:-4}"'
     ) in makefile
     assert (
         "python3 -m pytest -q -c pyproject.toml --rootdir=. "

@@ -378,6 +378,9 @@ _AT_SYMLINK_FOLLOW = 0x400
 # headroom while retaining the independent 4 MiB per-file and 60 second bounds.
 _MOUNTINFO_CENSUS_BYTES_LIMIT = 256 * 1024 * 1024
 _ABSENT_PROCESS_CENSUS_SECONDS = 60.0
+# lsof recursively walks every process and mount on large shared hosts. Keep
+# that work finite without treating a slow or wedged census as proof of absence.
+_LSOF_CENSUS_SECONDS = 300.0
 _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # Keep this provider command inside the intended 30-second integration envelope:
 # one evidence deadline leaves eight seconds for rollback, Git removal, and
@@ -2434,6 +2437,7 @@ class _CreateAbortExcludedPayload:
     source_alias: Path
     name: str
     identity: tuple[int, int]
+    empty_after_exclusion: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2445,6 +2449,7 @@ class _CreateAbortExclusion:
     guard: Path
     guard_identity: tuple[int, int, int]
     payloads: tuple[_CreateAbortExcludedPayload, ...]
+    phase: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -8363,6 +8368,49 @@ class _GitVcs:
         )
         return result.stdout
 
+    def tracked_content_status(
+        self, checkout: Path, cache_globs: Sequence[str] = ()
+    ) -> str:
+        """Compare every tracked file's contents with HEAD, ignoring stat data.
+
+        ``status`` trusts the index's cached size, mtime and ctime.  A write
+        through an already-dirty shared mapping changes none of them, and an
+        earlier status may already have recorded them, so the change stays
+        invisible.  A private index read from HEAD carries no stat data, which
+        makes Git hash every tracked file before it can call it unchanged.
+        """
+
+        pathspecs = ["."]
+        for pattern in cache_globs:
+            pathspecs.append(f":(exclude,glob){pattern}")
+            pathspecs.append(f":(exclude,glob){pattern}/**")
+        with tempfile.TemporaryDirectory(prefix="wrkslots-content-index-") as raw:
+            overrides = {
+                "GIT_INDEX_FILE": str(Path(raw) / "index"),
+                "GIT_OPTIONAL_LOCKS": "0",
+            }
+            self._run(
+                checkout,
+                ["-c", "core.sparseCheckout=false", "read-tree", "HEAD"],
+                env_overrides=overrides,
+            )
+            return self._run(
+                checkout,
+                [
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.sparseCheckout=false",
+                    "status",
+                    "--porcelain=v2",
+                    "--untracked-files=no",
+                    "--ignore-submodules=all",
+                    "--",
+                    *pathspecs,
+                ],
+                env_overrides=overrides,
+            ).stdout
+
     def uncommitted_handoff_paths(
         self, checkout: Path, cache_globs: Sequence[str] = ()
     ) -> tuple[str, ...]:
@@ -8431,6 +8479,12 @@ class _GitVcs:
         return tuple(dict.fromkeys(paths))
 
     def initialized_submodules(self, checkout: Path) -> tuple[str, ...]:
+        # Avoid Git's shell-script submodule helper when the index and HEAD
+        # contain no gitlinks.  Besides being cheaper, this keeps ordinary
+        # no-submodule operations valid under the caller's intentionally
+        # minimal PATH; the helper itself depends on unrelated host utilities.
+        if not self.submodule_paths(checkout):
+            return ()
         result = self._run(
             checkout,
             [
@@ -8894,15 +8948,45 @@ class _GitVcs:
                 )
 
     def delete_branch_at(self, repository: Path, branch: str, expected_head: str) -> None:
-        if not self.branch_exists(repository, branch):
-            return
-        actual = self.verify_ref(repository, f"refs/heads/{branch}", "created branch")
-        if actual != expected_head:
+        self.check_branch_name(repository, branch)
+        if not SHA_RE.fullmatch(expected_head):
+            raise Refusal(f"cannot delete branch {branch!r} at invalid expected HEAD")
+        ref = f"refs/heads/{branch}"
+        # A symbolic ref at the provisional name is not the branch this slot
+        # created. Plain `update-ref -d` would delete its referent instead.
+        symbolic = self._run(repository, ["symbolic-ref", "-q", ref], check=False)
+        if symbolic.returncode == 0:
             raise Refusal(
-                f"created branch {branch} moved from {expected_head} to {actual}; "
-                "preserve it instead of aborting provisioning"
+                f"created branch {branch} became a symbolic ref to "
+                f"{symbolic.stdout.strip()}; preserve it"
             )
-        self._run(repository, ["branch", "-D", "--", branch])
+        if symbolic.returncode != 1:
+            raise Refusal(
+                f"cannot determine whether created branch {branch} is a symbolic ref"
+            )
+        # --no-deref keeps a symbolic ref installed after the probe from
+        # redirecting the deletion to an unrelated branch.
+        result = self._run(
+            repository,
+            ["update-ref", "--no-deref", "-d", ref, expected_head],
+            check=False,
+        )
+        if result.returncode != 0:
+            if not self.branch_exists(repository, branch):
+                return
+            actual = self._run(
+                repository, ["rev-parse", "--verify", ref], check=False
+            )
+            observed = actual.stdout.strip() if actual.returncode == 0 else "unreadable"
+            detail = result.stderr.strip().splitlines()
+            raise Refusal(
+                f"created branch {branch} changed before atomic deletion: expected "
+                f"{expected_head}, found {observed}"
+                + (f" ({detail[-1]})" if detail else "")
+                + "; preserve it"
+            )
+        if self.branch_exists(repository, branch):
+            raise Refusal(f"atomic deletion left created branch {branch} present")
 
     def repair_worktree(self, repository: Path, checkout: Path) -> None:
         self._run(repository, ["worktree", "repair", str(checkout)])
@@ -10507,35 +10591,49 @@ class _LiveUseObservation:
 
 
 def _lsof_slot_use(
-    executable: Path, slot_path: Path
+    executable: Path, slot_path: Path, *, as_root: bool = False
 ) -> tuple[_LsofUseDiagnostic | None, bool, int]:
+    arguments = ("-nP", "-Fpcfn", "+D", str(slot_path))
     try:
-        completed = subprocess.run(
-            [str(executable), "-nP", "-Fpcfn", "+D", str(slot_path)],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except OSError as exc:
+        if as_root:
+            returncode, stdout_bytes, stderr_bytes = _run_root_owned_command(
+                executable,
+                arguments,
+                budget=_ReadOnlyCommandBudget.start(
+                    timeout_seconds=_LSOF_CENSUS_SECONDS,
+                    stdout_limit=16 * 1024 * 1024,
+                    stderr_limit=64 * 1024,
+                ),
+            )
+        else:
+            returncode, stdout_bytes, stderr_bytes = _run_bounded_read_only_command(
+                [str(executable), *arguments],
+                timeout_seconds=_LSOF_CENSUS_SECONDS,
+                stdout_limit=16 * 1024 * 1024,
+                stderr_limit=64 * 1024,
+            )
+        stdout = stdout_bytes.decode("utf-8", errors="strict")
+        stderr = stderr_bytes.decode("utf-8", errors="strict")
+    except (OSError, UnicodeError, Refusal) as exc:
         raise Refusal(
             f"process use is indeterminate because lsof failed: {exc}"
         ) from exc
-    if not _unrelated_lsof_warnings(completed.stderr, slot_path):
+    if not _unrelated_lsof_warnings(stderr, slot_path):
         raise Refusal(
             "process use is indeterminate because lsof reported: "
-            f"{completed.stderr.strip().splitlines()[0]}"
+            f"{stderr.strip().splitlines()[0]}"
         )
-    evidence, malformed = _parse_lsof_use_diagnostic(completed.stdout)
+    evidence, malformed = _parse_lsof_use_diagnostic(stdout)
     if evidence is None:
         if malformed:
             raise Refusal(
                 "process use is indeterminate because lsof returned malformed field output"
             )
-        if completed.returncode not in (0, 1):
+        if returncode not in (0, 1):
             raise Refusal(
-                f"process use is indeterminate because lsof exited {completed.returncode}"
+                f"process use is indeterminate because lsof exited {returncode}"
             )
-    return evidence, malformed, completed.returncode
+    return evidence, malformed, returncode
 
 
 def _lsof_use_is_recheckable(
@@ -10556,6 +10654,7 @@ def _lsof_use_is_recheckable(
 def _assert_slot_unused(
     slot_path: Path,
     record: ActiveRecord | None = None,
+    root_lsof: bool = False,
     *,
     use_lsof: bool = True,
     ignore_invoking_ancestry: bool = False,
@@ -10576,6 +10675,7 @@ def _assert_slot_unused(
             proc_root=proc_root,
             ignore_current_process=ignore_current_process,
             capture_generation=live_use_recheck is not None,
+            root_lsof=root_lsof,
         )
         if observation is None:
             return
@@ -10600,6 +10700,7 @@ def _observe_slot_use_once(
     proc_root: Path = Path("/proc"),
     ignore_current_process: bool = True,
     capture_generation: bool = False,
+    root_lsof: bool = False,
 ) -> _LiveUseObservation | None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
@@ -10627,7 +10728,14 @@ def _observe_slot_use_once(
     )
     direct_use_proven_absent = False
     if lsof is not None and use_lsof:
-        evidence, malformed_lsof, lsof_returncode = _lsof_slot_use(lsof, slot_path)
+        if root_lsof:
+            evidence, malformed_lsof, lsof_returncode = _lsof_slot_use(
+                lsof, slot_path, as_root=True
+            )
+        else:
+            evidence, malformed_lsof, lsof_returncode = _lsof_slot_use(
+                lsof, slot_path
+            )
         if evidence is not None:
             refusal = Refusal(
                 f"live process {evidence.pid} uses slot {slot_path}"
@@ -10654,9 +10762,11 @@ def _observe_slot_use_once(
 
                 def revalidate_lsof_use() -> bool:
                     try:
-                        rechecked, rechecked_malformed, rechecked_returncode = (
-                            _lsof_slot_use(lsof, slot_path)
-                        )
+                        if root_lsof:
+                            result = _lsof_slot_use(lsof, slot_path, as_root=True)
+                        else:
+                            result = _lsof_slot_use(lsof, slot_path)
+                        rechecked, rechecked_malformed, rechecked_returncode = result
                     except Refusal:
                         return False
                     return (
@@ -22160,7 +22270,7 @@ def _assert_abort_create_submodules_pristine(
                     ".",
                 ],
                 env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
-            ).stdout
+            ).stdout or vcs.tracked_content_status(child)
             if status:
                 raise Refusal(
                     f"cannot abort changed checkout {checkout_name}: submodule "
@@ -22177,6 +22287,81 @@ def _assert_abort_create_submodules_pristine(
             f"cannot abort changed checkout {checkout_name}: initialized submodule "
             f"{sorted(remaining)[0]} has no committed gitlink; preserve it for inspection"
         )
+    _assert_abort_create_module_repositories_proved(
+        checkout_name, tuple(repository for _prefix, repository in repositories), vcs
+    )
+
+
+def _abort_create_git_directory(
+    repository: Path, checkout_name: str, vcs: _GitVcs
+) -> Path:
+    value = vcs._run(
+        repository, ["rev-parse", "--path-format=absolute", "--git-dir"]
+    ).stdout.strip()
+    git_directory = Path(value)
+    if (
+        not value
+        or "\n" in value
+        or not git_directory.is_absolute()
+        or git_directory.is_symlink()
+        or not git_directory.is_dir()
+    ):
+        raise Refusal(
+            f"cannot abort changed checkout {checkout_name}: {repository} has an "
+            "unsafe Git administration directory"
+        )
+    return git_directory
+
+
+def _assert_abort_create_module_repositories_proved(
+    checkout_name: str, repositories: Sequence[Path], vcs: _GitVcs
+) -> None:
+    """Refuse every private submodule repository the pristine proof skipped.
+
+    A deinitialized submodule keeps its repository, including commits that
+    exist nowhere else, under the parent's ``modules`` directory with no work
+    tree to prove.  Git refuses to remove any worktree with ``modules``; keep
+    that refusal for each entry that is not a proved initialized submodule.
+    ``repositories`` starts with the checkout and lists every proved submodule.
+    """
+
+    proved: set[tuple[int, int]] = set()
+    for repository in repositories[1:]:
+        metadata = _abort_create_git_directory(repository, checkout_name, vcs).stat()
+        proved.add((metadata.st_dev, metadata.st_ino))
+    for repository in repositories:
+        pending = [_abort_create_git_directory(repository, checkout_name, vcs) / "modules"]
+        top = True
+        while pending:
+            directory = pending.pop()
+            if top:
+                top = False
+                if not directory.exists() and not directory.is_symlink():
+                    continue
+                if directory.is_symlink() or not directory.is_dir():
+                    raise Refusal(
+                        f"cannot abort changed checkout {checkout_name}: unsafe "
+                        f"submodule repository directory {directory}; preserve it"
+                    )
+            with os.scandir(directory) as entries:
+                children = sorted(entries, key=lambda entry: entry.name)
+            for entry in children:
+                path = Path(entry.path)
+                metadata = entry.stat(follow_symlinks=False)
+                if (metadata.st_dev, metadata.st_ino) in proved:
+                    continue
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise Refusal(
+                        f"cannot abort changed checkout {checkout_name}: unexpected "
+                        f"entry in submodule repositories: {path}; preserve it"
+                    )
+                if (path / "HEAD").exists() or (path / "HEAD").is_symlink():
+                    raise Refusal(
+                        f"cannot abort changed checkout {checkout_name}: submodule "
+                        f"repository {path} belongs to no initialized submodule; "
+                        "preserve it for inspection"
+                    )
+                pending.append(path)
 
 
 def _assert_abort_create_submodule_repository_pristine(
@@ -22814,12 +22999,23 @@ def _create_abort_exclusion_from_obj(
     raw = _as_mapping(value, label)
     _exact_keys(
         raw,
-        {"schema", "root", "root_identity", "guard", "guard_identity", "payloads"},
+        {
+            "schema",
+            "phase",
+            "root",
+            "root_identity",
+            "guard",
+            "guard_identity",
+            "payloads",
+        },
         set(),
         label,
     )
     if _as_int(raw["schema"], f"{label}.schema") != 1:
         raise StateError("create-abort exclusion schema is unsupported")
+    phase = _as_str(raw["phase"], f"{label}.phase")
+    if phase not in {"prepared", "sealed", "excluded", "removing"}:
+        raise StateError(f"unknown create-abort exclusion phase {phase!r}")
     root = Path(_as_str(raw["root"], f"{label}.root"))
     guard = Path(_as_str(raw["guard"], f"{label}.guard"))
     if (
@@ -22836,7 +23032,16 @@ def _create_abort_exclusion_from_obj(
         item_label = f"{label}.payloads[{index}]"
         item = _as_mapping(value_item, item_label)
         _exact_keys(
-            item, {"source", "source_alias", "name", "identity"}, set(), item_label
+            item,
+            {
+                "source",
+                "source_alias",
+                "name",
+                "identity",
+                "empty_after_exclusion",
+            },
+            set(),
+            item_label,
         )
         _relative, source = _relative_inside(
             config.root,
@@ -22861,11 +23066,21 @@ def _create_abort_exclusion_from_obj(
             _as_int(identity_values[0], f"{item_label}.identity[0]", minimum=1),
             _as_int(identity_values[1], f"{item_label}.identity[1]", minimum=1),
         )
+        empty_after_exclusion_value = item["empty_after_exclusion"]
+        if not isinstance(empty_after_exclusion_value, bool):
+            raise StateError(f"{item_label}.empty_after_exclusion must be boolean")
+        empty_after_exclusion = empty_after_exclusion_value
         if source in seen_sources:
             raise StateError("create-abort exclusion repeats a source path")
         seen_sources.add(source)
         payloads.append(
-            _CreateAbortExcludedPayload(source, source_alias, name, identity)
+            _CreateAbortExcludedPayload(
+                source,
+                source_alias,
+                name,
+                identity,
+                empty_after_exclusion,
+            )
         )
     if not payloads:
         raise StateError("create-abort exclusion has no payloads")
@@ -22888,6 +23103,7 @@ def _create_abort_exclusion_from_obj(
             raw["guard_identity"], f"{label}.guard_identity"
         ),
         payloads=tuple(payloads),
+        phase=phase,
     )
 
 
@@ -22896,6 +23112,7 @@ def _create_abort_exclusion_to_obj(
 ) -> dict[str, object]:
     return {
         "schema": 1,
+        "phase": exclusion.phase,
         "root": str(exclusion.root),
         "root_identity": list(exclusion.root_identity),
         "guard": str(exclusion.guard),
@@ -22906,10 +23123,60 @@ def _create_abort_exclusion_to_obj(
                 "source_alias": str(payload.source_alias),
                 "name": payload.name,
                 "identity": list(payload.identity),
+                "empty_after_exclusion": payload.empty_after_exclusion,
             }
             for payload in exclusion.payloads
         ],
     }
+
+
+def _set_create_abort_exclusion_phase(
+    config: Config,
+    journal_path: Path,
+    exclusion: _CreateAbortExclusion,
+    phase: str,
+) -> _CreateAbortExclusion:
+    updated_exclusion = dataclasses.replace(exclusion, phase=phase)
+    journal = _as_mapping(_read_json(journal_path, "create journal"), "create journal")
+    updated_journal = dict(journal)
+    updated_journal["abort_exclusion"] = _create_abort_exclusion_to_obj(
+        config, updated_exclusion
+    )
+    _write_journal(config, updated_journal, journal_path=journal_path)
+    return updated_exclusion
+
+
+def _remove_unrecorded_create_abort_guard(
+    guard: Path, root_identity: tuple[int, int, int]
+) -> None:
+    """Remove this slot's empty guard left by a crash before it was journaled.
+
+    Only root can create a root-owned directory in the sticky exclusion root,
+    and the name is private to this project and slot.  A guard that is still
+    mode 0700 and empty was never sealed and never held a payload; anything
+    else is preserved for inspection.
+    """
+
+    _assert_verified_root_context()
+    metadata = _root_validation_path_metadata(guard, "unrecorded create-abort guard")
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_dev != root_identity[0]
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or _root_validation_directory_names(guard)
+    ):
+        raise Refusal(
+            f"unrecorded create-abort exclusion guard exists: {guard}; preserve it"
+        )
+    _root_validation_exclusion_command(
+        Path("/usr/bin/rmdir"),
+        ("--", str(guard)),
+        "remove an unrecorded empty create-abort exclusion guard",
+    )
+    if guard.exists() or guard.is_symlink():
+        raise Refusal(f"unrecorded create-abort exclusion guard remains: {guard}")
 
 
 def _prepare_create_abort_exclusion(
@@ -22918,6 +23185,7 @@ def _prepare_create_abort_exclusion(
     journal: Mapping[str, object],
     slot: str,
     active_slot: Path,
+    active_slot_identity: tuple[int, int],
     removal_targets: Sequence[
         tuple[
             PlannedCheckout,
@@ -22928,7 +23196,16 @@ def _prepare_create_abort_exclusion(
             _AbortRemovalEntry,
         ]
     ],
+    recording: Callable[[], None],
 ) -> _CreateAbortExclusion:
+    """Create, record and seal the exclusion guard for ``removal_targets``.
+
+    ``recording`` runs immediately before the journal first names the guard.
+    From then on the caller must leave its path fences in place: a later
+    refusal is resolved by journal recovery, which needs every payload at its
+    recorded source.  A refusal before that point removes the unrecorded,
+    still-empty guard so the next attempt is not blocked by it.
+    """
     if "abort_exclusion" in journal:
         raise Refusal(
             "create-abort exclusion is already recorded; preserve it for inspection"
@@ -22938,14 +23215,19 @@ def _prepare_create_abort_exclusion(
     )
     guard = root / _create_abort_exclusion_name(config, slot)
     if guard.exists() or guard.is_symlink():
-        raise Refusal(
-            f"unrecorded create-abort exclusion guard exists: {guard}; preserve it"
-        )
-    sources: list[tuple[Path, _AbortRemovalEntry]] = []
+        _remove_unrecorded_create_abort_guard(guard, root_identity)
+    sources: list[tuple[Path, _AbortRemovalEntry | None]] = []
     for _item, _repository, destination, checkout_tree, admin, admin_tree in (
         removal_targets
     ):
         sources.extend(((destination, checkout_tree), (admin, admin_tree)))
+    if active_slot not in {source for source, _manifest in sources}:
+        active_metadata = active_slot.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(active_metadata.st_mode):
+            raise Refusal("create-abort slot root is not a directory")
+        if (active_metadata.st_dev, active_metadata.st_ino) != active_slot_identity:
+            raise Refusal("create-abort slot root identity changed before exclusion")
+        sources.append((active_slot, None))
     records = _self_mountinfo_records()
     payloads_list: list[_CreateAbortExcludedPayload] = []
     for index, (source, manifest) in enumerate(sources):
@@ -22954,7 +23236,11 @@ def _prepare_create_abort_exclusion(
         if (
             not stat.S_ISDIR(alias_metadata.st_mode)
             or (alias_metadata.st_dev, alias_metadata.st_ino)
-            != (manifest.device, manifest.inode)
+            != (
+                (manifest.device, manifest.inode)
+                if manifest is not None
+                else active_slot_identity
+            )
         ):
             raise Refusal(
                 f"create-abort mount alias names another object: {source_alias}"
@@ -22964,7 +23250,8 @@ def _prepare_create_abort_exclusion(
                 source=source,
                 source_alias=source_alias,
                 name=f"payload-{index}",
-                identity=(manifest.device, manifest.inode),
+                identity=(alias_metadata.st_dev, alias_metadata.st_ino),
+                empty_after_exclusion=manifest is None,
             )
         )
     payloads = tuple(payloads_list)
@@ -22974,25 +23261,43 @@ def _prepare_create_abort_exclusion(
         ("--mode=0700", "--", str(guard)),
         "create the create-abort exclusion guard",
     )
-    metadata = _root_validation_path_metadata(
-        guard, "create-abort exclusion guard"
-    )
-    guard_identity = (metadata.st_dev, metadata.st_ino, root_identity[2])
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != 0
-        or metadata.st_gid != 0
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        raise Refusal("create-abort exclusion guard is not root-owned and private")
-    exclusion = _CreateAbortExclusion(
-        root, root_identity, guard, guard_identity, payloads
-    )
-    updated_journal = dict(journal)
-    updated_journal["abort_exclusion"] = _create_abort_exclusion_to_obj(
-        config, exclusion
-    )
-    _write_journal(config, updated_journal, journal_path=journal_path)
+    recorded = False
+    try:
+        _interrupt_for_test("after-create-abort-exclusion-guard-mkdir")
+        metadata = _root_validation_path_metadata(
+            guard, "create-abort exclusion guard"
+        )
+        guard_identity = (metadata.st_dev, metadata.st_ino, root_identity[2])
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise Refusal("create-abort exclusion guard is not root-owned and private")
+        exclusion = _CreateAbortExclusion(
+            root, root_identity, guard, guard_identity, payloads, "prepared"
+        )
+        updated_journal = dict(journal)
+        updated_journal["abort_exclusion"] = _create_abort_exclusion_to_obj(
+            config, exclusion
+        )
+        recording()
+        recorded = True
+        _write_journal(config, updated_journal, journal_path=journal_path)
+    except Refusal:
+        if not recorded:
+            # Only root can create entries in a root-owned mode-0700 guard, and
+            # rmdir refuses a non-empty directory; a failure here leaves the
+            # guard for the next attempt to report as unrecorded.
+            with contextlib.suppress(Refusal):
+                _root_validation_exclusion_command(
+                    Path("/usr/bin/rmdir"),
+                    ("--", str(guard)),
+                    "remove an unrecorded create-abort exclusion guard",
+                )
+        raise
+    _interrupt_for_test("after-create-abort-exclusion-journal")
     _root_validation_exclusion_command(
         Path("/usr/bin/chmod"),
         ("000", "--", str(guard)),
@@ -23006,6 +23311,10 @@ def _prepare_create_abort_exclusion(
         or stat.S_IMODE(sealed.st_mode) != 0
     ):
         raise Refusal("create-abort exclusion guard did not become root-owned mode 000")
+    _interrupt_for_test("after-create-abort-exclusion-seal-before-journal")
+    exclusion = _set_create_abort_exclusion_phase(
+        config, journal_path, exclusion, "sealed"
+    )
     _interrupt_for_test("after-create-abort-exclusion-seal")
     return exclusion
 
@@ -23027,9 +23336,210 @@ def _create_abort_excluded_payload_metadata(
     return metadata
 
 
+_CREATE_ABORT_SNAPSHOT_FORMAT = "%P\\0%i\\0%y\\0%m\\0%U\\0%G\\0%n\\0%s\\0%T@\\0%C@\\0"
+_CREATE_ABORT_LISTING_FORMAT = "%P\\0%D\\0%i\\0%y\\0%m\\0%U\\0%G\\0%s\\0%l\\0"
+# Every formatted record is its name, a symlink's target, and fewer than this
+# many bytes of numbers and separators; every digest record is its absolute
+# path and fewer than this many.
+_CREATE_ABORT_RECORD_OVERHEAD = 256
+# Deliberately slower than cold storage, so a payload's hashing deadline is
+# spent on its own bytes and never on the fixed floor alone.
+_CREATE_ABORT_HASH_BYTES_PER_SECOND = 32 * 1024 * 1024
+_CREATE_ABORT_LIST_ENTRIES_PER_SECOND = 1000
+
+
+def _create_abort_payload_bounds(
+    root: Path, manifest: _AbortRemovalEntry | None, purpose: str
+) -> tuple[float, int]:
+    """Return the seconds and output bytes one root payload command needs.
+
+    The fixed 60-second, 16 MiB bound of a root command would otherwise cap
+    the size of a payload that can ever be removed: a large checkout or cache
+    would refuse on every resume.  Output is proportional to the recorded
+    entries and names, and hashing time to the recorded bytes, so the bound
+    still refuses a payload that grew far beyond its manifest.  The caller
+    keeps the fixed bound as the floor.
+    """
+
+    entries = tuple(
+        _flatten_abort_removal_manifest(() if manifest is None else manifest.children)
+    )
+    if purpose == "hash":
+        files = [
+            (name, entry) for name, entry in entries if stat.S_ISREG(entry.mode)
+        ]
+        prefix = len(os.fsencode(root)) + 1
+        output = sum(
+            prefix + len(os.fsencode(name)) + _CREATE_ABORT_RECORD_OVERHEAD
+            for name, _entry in files
+        )
+        seconds = sum(entry.size for _name, entry in files) / (
+            _CREATE_ABORT_HASH_BYTES_PER_SECOND
+        )
+    else:
+        output = sum(
+            len(os.fsencode(name))
+            + _CREATE_ABORT_RECORD_OVERHEAD
+            + (
+                len(os.fsencode(entry.digest_or_target or ""))
+                if stat.S_ISLNK(entry.mode)
+                else 0
+            )
+            for name, entry in entries
+        ) + _CREATE_ABORT_RECORD_OVERHEAD
+        seconds = len(entries) / _CREATE_ABORT_LIST_ENTRIES_PER_SECOND
+    return seconds, output
+
+
+def _root_create_abort_payload_output(
+    payload: _CreateAbortExcludedPayload,
+    arguments: Sequence[str],
+    purpose: str,
+    root: Path,
+    manifest: _AbortRemovalEntry | None,
+) -> bytes:
+    seconds, output = _create_abort_payload_bounds(root, manifest, purpose)
+    returncode, stdout, stderr = _run_root_owned_command(
+        Path("/usr/bin/find"),
+        arguments,
+        budget=_ReadOnlyCommandBudget.start(
+            timeout_seconds=60 + seconds,
+            stdout_limit=max(16 * 1024 * 1024, output),
+            stderr_limit=64 * 1024,
+        ),
+    )
+    if returncode != 0 or stderr:
+        detail = stderr.decode("utf-8", errors="replace").strip().splitlines()
+        raise Refusal(
+            f"verified root context could not {purpose} excluded create-abort payload "
+            f"{payload.name}" + (f": {detail[0]}" if detail else f" (exit {returncode})")
+        )
+    return stdout
+
+
+def _create_abort_excluded_payload_snapshot(
+    exclusion: _CreateAbortExclusion,
+    payload: _CreateAbortExcludedPayload,
+    manifest: _AbortRemovalEntry | None,
+) -> str:
+    """Digest every entry's identity and change time below one guarded payload."""
+
+    root = exclusion.guard / payload.name
+    stdout = _root_create_abort_payload_output(
+        payload,
+        (str(root), "-xdev", "-printf", _CREATE_ABORT_SNAPSHOT_FORMAT),
+        "snapshot",
+        root,
+        manifest,
+    )
+    return hashlib.sha256(stdout).hexdigest()
+
+
+_CREATE_ABORT_PROOF_TYPES = {b"d": stat.S_IFDIR, b"f": stat.S_IFREG, b"l": stat.S_IFLNK}
+
+
+def _flatten_abort_removal_manifest(
+    children: Sequence[_AbortRemovalEntry], prefix: str = ""
+) -> Iterator[tuple[str, _AbortRemovalEntry]]:
+    for child in children:
+        relative = f"{prefix}{child.name}"
+        yield relative, child
+        yield from _flatten_abort_removal_manifest(child.children, f"{relative}/")
+
+
+def _assert_create_abort_excluded_payload_matches_manifest(
+    exclusion: _CreateAbortExclusion,
+    payload: _CreateAbortExcludedPayload,
+    manifest: _AbortRemovalEntry | None,
+) -> None:
+    """Prove, after the final census, that a guarded payload is still its manifest.
+
+    Run once no process can reach the payload, so what it compares is what will
+    be deleted.  Contents are hashed rather than inferred from change times: a
+    write through a shared mapping whose page is already dirty changes bytes
+    without updating mtime or ctime, and a coarse-timestamp filesystem can hide
+    a same-size write inside one tick.
+    """
+
+    root = exclusion.guard / payload.name
+    changed = Refusal(
+        f"excluded create-abort payload {payload.name} changed after its "
+        "validation; preserve it"
+    )
+    listing = _root_create_abort_payload_output(
+        payload,
+        (str(root), "-xdev", "-printf", _CREATE_ABORT_LISTING_FORMAT),
+        "list",
+        root,
+        manifest,
+    )
+    fields = listing.split(b"\0")
+    if fields[-1] != b"" or (len(fields) - 1) % 9:
+        raise Refusal(f"excluded create-abort payload {payload.name} listing is malformed")
+    expected = dict(_flatten_abort_removal_manifest(() if manifest is None else manifest.children))
+    observed: set[str] = set()
+    regular: dict[str, str] = {}
+    for offset in range(0, len(fields) - 1, 9):
+        raw_name, device, inode, kind, mode, uid, gid, size, target = fields[offset : offset + 9]
+        name = os.fsdecode(raw_name)
+        file_type = _CREATE_ABORT_PROOF_TYPES.get(kind)
+        try:
+            numbers = tuple(int(value) for value in (device, inode, uid, gid, size))
+            permissions = int(mode, 8)
+        except ValueError as exc:
+            raise Refusal(
+                f"excluded create-abort payload {payload.name} listing is malformed"
+            ) from exc
+        if file_type is None:
+            raise changed
+        if name == "":
+            if file_type != stat.S_IFDIR or numbers[:2] != payload.identity:
+                raise changed
+            continue
+        entry = expected.get(name)
+        if entry is None or name in observed:
+            raise changed
+        observed.add(name)
+        if (
+            numbers[:4] != (entry.device, entry.inode, entry.uid, entry.gid)
+            or file_type | permissions != entry.mode
+            or (file_type != stat.S_IFDIR and numbers[4] != entry.size)
+        ):
+            raise changed
+        if file_type == stat.S_IFLNK and os.fsdecode(target) != entry.digest_or_target:
+            raise changed
+        if file_type == stat.S_IFREG:
+            if entry.digest_or_target is None:
+                raise changed
+            regular[name] = entry.digest_or_target
+    if observed != set(expected):
+        raise changed
+    if not regular:
+        return
+    digests = _root_create_abort_payload_output(
+        payload,
+        (str(root), "-xdev", "-type", "f", "-exec", "/usr/bin/sha256sum", "-z", "--", "{}", "+"),
+        "hash",
+        root,
+        manifest,
+    )
+    records = digests.split(b"\0")
+    if records[-1] != b"":
+        raise Refusal(f"excluded create-abort payload {payload.name} digests are malformed")
+    prefix = os.fsencode(root) + b"/"
+    hashed: dict[str, str] = {}
+    for record in records[:-1]:
+        digest, separator, path = record[:64], record[64:66], record[66:]
+        if separator != b"  " or not path.startswith(prefix):
+            raise Refusal(f"excluded create-abort payload {payload.name} digests are malformed")
+        hashed[os.fsdecode(path[len(prefix) :])] = digest.decode("ascii", errors="replace")
+    if hashed != regular:
+        raise changed
+
+
 def _exclude_create_abort_payloads(
     exclusion: _CreateAbortExclusion,
-    manifests: Sequence[_AbortRemovalEntry],
+    manifests: Sequence[_AbortRemovalEntry | None],
 ) -> None:
     if len(manifests) != len(exclusion.payloads):
         raise StateError("create-abort exclusion manifest count changed")
@@ -23067,10 +23577,16 @@ def _exclude_create_abort_payloads(
                 f"create-abort exclusion source alias changed: {payload.source}"
             )
     descriptors: list[int] = []
+    snapshots: list[str] = []
     try:
         for payload, manifest in zip(exclusion.payloads, manifests, strict=True):
-            descriptor = _open_asserted_abort_removal_tree(payload.source, manifest)
-            descriptors.append(descriptor)
+            descriptor = (
+                None
+                if manifest is None
+                else _open_asserted_abort_removal_tree(payload.source, manifest)
+            )
+            if descriptor is not None:
+                descriptors.append(descriptor)
             _interrupt_for_test("before-create-abort-exclusion-move")
             _root_validation_exclusion_command(
                 Path("/usr/bin/mv"),
@@ -23084,14 +23600,32 @@ def _exclude_create_abort_payloads(
                 "move a proved create-abort payload behind its exclusion guard",
             )
             _create_abort_excluded_payload_metadata(exclusion, payload)
-            opened = os.fstat(descriptor)
-            if (opened.st_dev, opened.st_ino) != payload.identity:
-                raise Refusal(
-                    f"excluded create-abort payload descriptor changed: {payload.name}"
-                )
-            _assert_abort_removal_directory(
-                descriptor, exclusion.guard / payload.name, manifest.children
+            snapshots.append(
+                _create_abort_excluded_payload_snapshot(exclusion, payload, manifest)
             )
+            _interrupt_for_test("after-create-abort-exclusion-snapshot")
+            if manifest is None:
+                if not payload.empty_after_exclusion:
+                    raise StateError("create-abort exclusion manifest is missing")
+                if _root_validation_directory_names(
+                    exclusion.guard / payload.name
+                ):
+                    raise Refusal(
+                        "create-abort slot root was not empty after excluding its "
+                        "authorized children; preserve it"
+                    )
+            else:
+                assert descriptor is not None
+                if payload.empty_after_exclusion:
+                    raise StateError("create-abort exclusion has an unexpected manifest")
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != payload.identity:
+                    raise Refusal(
+                        f"excluded create-abort payload descriptor changed: {payload.name}"
+                    )
+                _assert_abort_removal_directory(
+                    descriptor, exclusion.guard / payload.name, manifest.children
+                )
             _interrupt_for_test("after-create-abort-exclusion-move")
             if payload.source.exists() or payload.source.is_symlink():
                 raise Refusal(
@@ -23105,7 +23639,29 @@ def _exclude_create_abort_payloads(
         for descriptor in descriptors:
             os.close(descriptor)
         descriptors.clear()
-        _assert_slot_unused(exclusion.guard)
+        _assert_slot_unused(exclusion.guard, None, True)
+        # A process holding a cwd or descriptor from before its payload moved
+        # could write after that payload was validated and exit before the
+        # census.  The census proves no such process remains, so nothing can
+        # change the payloads now.  The metadata snapshot, taken before its
+        # validation, is a cheap first check; the manifest proof then compares
+        # every entry and every file's contents with what was proved before
+        # the move, which is what makes deleting them safe.
+        for payload, snapshot, manifest in zip(
+            exclusion.payloads, snapshots, manifests, strict=True
+        ):
+            if (
+                _create_abort_excluded_payload_snapshot(exclusion, payload, manifest)
+                != snapshot
+            ):
+                raise Refusal(
+                    f"excluded create-abort payload {payload.name} changed after its "
+                    "validation; preserve it"
+                )
+            _assert_create_abort_excluded_payload_matches_manifest(
+                exclusion, payload, manifest
+            )
+        _interrupt_for_test("after-create-abort-exclusion-all-moved")
     except BaseException:
         for descriptor in descriptors:
             os.close(descriptor)
@@ -23137,6 +23693,8 @@ def _remove_create_abort_exclusion(
         )
         if payload.name in _root_validation_directory_names(exclusion.guard):
             raise Refusal("excluded create-abort payload remains after removal")
+        _interrupt_for_test("after-create-abort-excluded-payload-remove")
+    _interrupt_for_test("after-create-abort-exclusion-all-payloads-remove")
     _interrupt_for_test("before-create-abort-exclusion-rmdir")
     if any(
         payload.source.exists() or payload.source.is_symlink()
@@ -23153,6 +23711,218 @@ def _remove_create_abort_exclusion(
     _interrupt_for_test("after-create-abort-exclusion-rmdir")
 
 
+def _clear_create_abort_exclusion_record(
+    config: Config,
+    journal_path: Path,
+    journal: Mapping[str, object],
+) -> dict[str, object]:
+    updated = dict(journal)
+    updated.pop("abort_exclusion", None)
+    _write_journal(config, updated, journal_path=journal_path)
+    return updated
+
+
+def _recover_create_abort_exclusion(
+    config: Config,
+    journal_path: Path,
+    journal: Mapping[str, object],
+    slot: str,
+    slot_type: str,
+) -> dict[str, object]:
+    exclusion = _create_abort_exclusion_from_obj(
+        config, slot, slot_type, journal["abort_exclusion"]
+    )
+    guard_present = exclusion.guard.exists() or exclusion.guard.is_symlink()
+    source_presence = tuple(
+        payload.source.exists() or payload.source.is_symlink()
+        for payload in exclusion.payloads
+    )
+    if not guard_present:
+        if exclusion.phase == "removing" and not any(source_presence):
+            return _clear_create_abort_exclusion_record(
+                config, journal_path, journal
+            )
+        if exclusion.phase != "removing" and all(source_presence):
+            records = _self_mountinfo_records()
+            for payload in exclusion.payloads:
+                current_alias = _path_alias_on_mount(
+                    payload.source, exclusion.root, records
+                )
+                metadata = current_alias.stat(follow_symlinks=False)
+                if (
+                    current_alias != payload.source_alias
+                    or not stat.S_ISDIR(metadata.st_mode)
+                    or (metadata.st_dev, metadata.st_ino) != payload.identity
+                ):
+                    raise Refusal(
+                        "create-abort source identity changed after recovery "
+                        f"rollback: {payload.source}"
+                    )
+            return _clear_create_abort_exclusion_record(
+                config, journal_path, journal
+            )
+        raise Refusal(
+            "create-abort exclusion guard disappeared before recoverable cleanup; "
+            "preserve every source path"
+        )
+
+    root_metadata = exclusion.root.stat(follow_symlinks=False)
+    root_identity = (
+        root_metadata.st_dev,
+        root_metadata.st_ino,
+        _open_directory_identity(exclusion.root, "create-abort exclusion root")[2],
+    )
+    if (
+        root_identity != exclusion.root_identity
+        or root_metadata.st_uid != 0
+        or root_metadata.st_gid != 0
+        or stat.S_IMODE(root_metadata.st_mode) != 0o1777
+    ):
+        raise Refusal("create-abort exclusion root changed before recovery")
+    guard_metadata = _root_validation_path_metadata(
+        exclusion.guard, "create-abort exclusion guard"
+    )
+    guard_mode = stat.S_IMODE(guard_metadata.st_mode)
+    if (
+        (guard_metadata.st_dev, guard_metadata.st_ino)
+        != exclusion.guard_identity[:2]
+        or guard_metadata.st_uid != 0
+        or guard_metadata.st_gid != 0
+        or guard_mode not in {0, 0o700}
+    ):
+        raise Refusal("create-abort exclusion guard changed before recovery")
+    if guard_mode == 0o700:
+        _root_validation_exclusion_command(
+            Path("/usr/bin/chmod"),
+            ("000", "--", str(exclusion.guard)),
+            "reseal the create-abort exclusion guard",
+        )
+    names = set(_root_validation_directory_names(exclusion.guard))
+    expected_names = {payload.name for payload in exclusion.payloads}
+    if names - expected_names:
+        raise Refusal(
+            "create-abort exclusion guard contains an unexpected entry; preserve it"
+        )
+    records = _self_mountinfo_records()
+    guarded: list[bool] = []
+    for payload, source_present in zip(
+        exclusion.payloads, source_presence, strict=True
+    ):
+        in_guard = payload.name in names
+        if in_guard:
+            _create_abort_excluded_payload_metadata(exclusion, payload)
+        if source_present:
+            current_alias = _path_alias_on_mount(
+                payload.source, exclusion.root, records
+            )
+            if current_alias != payload.source_alias:
+                raise Refusal(
+                    f"create-abort source alias changed during recovery: {payload.source}"
+                )
+            metadata = current_alias.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino) != payload.identity
+            ):
+                raise Refusal(
+                    f"create-abort source identity changed during recovery: "
+                    f"{payload.source}"
+                )
+        if source_present and in_guard:
+            raise Refusal(
+                f"create-abort payload exists at source and guard: {payload.source}; "
+                "preserve both"
+            )
+        if not source_present and not in_guard and exclusion.phase != "removing":
+            raise Refusal(
+                f"create-abort payload disappeared before removal phase: {payload.source}"
+            )
+        guarded.append(in_guard)
+
+    if exclusion.phase != "removing":
+        for payload, in_guard in reversed(
+            tuple(zip(exclusion.payloads, guarded, strict=True))
+        ):
+            if not in_guard:
+                continue
+            _interrupt_for_test("before-create-abort-exclusion-recovery-rollback")
+            _root_validation_exclusion_command(
+                Path("/usr/bin/mv"),
+                (
+                    "--no-clobber",
+                    "--no-target-directory",
+                    "--",
+                    str(exclusion.guard / payload.name),
+                    str(payload.source_alias),
+                ),
+                "restore a crash-interrupted create-abort payload",
+            )
+            remaining = set(_root_validation_directory_names(exclusion.guard))
+            metadata = payload.source_alias.stat(follow_symlinks=False)
+            if (
+                payload.name in remaining
+                or not stat.S_ISDIR(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino) != payload.identity
+            ):
+                raise Refusal(
+                    f"create-abort payload was not restored to its exact source: "
+                    f"{payload.source}"
+                )
+        if _root_validation_directory_names(exclusion.guard):
+            raise Refusal("create-abort exclusion guard is not empty after rollback")
+        _interrupt_for_test("before-create-abort-exclusion-recovery-rmdir")
+        _root_validation_exclusion_command(
+            Path("/usr/bin/rmdir"),
+            ("--", str(exclusion.guard)),
+            "remove a rolled-back create-abort exclusion guard",
+        )
+        _interrupt_for_test("after-create-abort-exclusion-recovery-rmdir")
+        return _clear_create_abort_exclusion_record(config, journal_path, journal)
+
+    if any(source_presence):
+        raise Refusal(
+            "create-abort source path reappeared during removal recovery; preserve it"
+        )
+    for payload, in_guard in zip(exclusion.payloads, guarded, strict=True):
+        if not in_guard:
+            continue
+        if payload.source.exists() or payload.source.is_symlink():
+            raise Refusal(
+                f"create-abort source path reappeared during removal recovery: "
+                f"{payload.source}; preserve it"
+            )
+        _create_abort_excluded_payload_metadata(exclusion, payload)
+        _root_validation_exclusion_command(
+            Path("/usr/bin/rm"),
+            (
+                "--recursive",
+                "--one-file-system",
+                "--",
+                str(exclusion.guard / payload.name),
+            ),
+            "resume removal of an excluded create-abort payload",
+        )
+        _interrupt_for_test("after-create-abort-exclusion-recovery-remove")
+    if _root_validation_directory_names(exclusion.guard):
+        raise Refusal("create-abort exclusion guard is not empty after resumed removal")
+    if any(
+        payload.source.exists() or payload.source.is_symlink()
+        for payload in exclusion.payloads
+    ):
+        raise Refusal(
+            "a create-abort source path reappeared before recovered guard removal; "
+            "preserve it"
+        )
+    _interrupt_for_test("before-create-abort-exclusion-recovery-rmdir")
+    _root_validation_exclusion_command(
+        Path("/usr/bin/rmdir"),
+        ("--", str(exclusion.guard)),
+        "remove a recovered create-abort exclusion guard",
+    )
+    _interrupt_for_test("after-create-abort-exclusion-recovery-rmdir")
+    return _clear_create_abort_exclusion_record(config, journal_path, journal)
+
+
 def _abort_create(
     config: Config,
     journal_path: Path,
@@ -23164,22 +23934,9 @@ def _abort_create(
     submodule_baselines: Mapping[str, object],
 ) -> None:
     if "abort_exclusion" in journal:
-        exclusion = _create_abort_exclusion_from_obj(
-            config, slot, slot_type, journal["abort_exclusion"]
+        journal = _recover_create_abort_exclusion(
+            config, journal_path, journal, slot, slot_type
         )
-        if exclusion.guard.exists() or exclusion.guard.is_symlink():
-            raise Refusal(
-                "create-abort has a root-excluded cleanup payload at "
-                f"{exclusion.guard}; preserve it for inspection"
-            )
-        if any(
-            payload.source.exists() or payload.source.is_symlink()
-            for payload in exclusion.payloads
-        ):
-            raise Refusal(
-                "create-abort exclusion guard disappeared while a source path exists; "
-                "preserve every path for inspection"
-            )
     slot_path = _slot_directory(config, slot, slot_type)
     fenced_slot = _create_abort_fenced_slot(config, slot, slot_type)
     removal_record = (
@@ -23269,7 +24026,10 @@ def _abort_create(
                 checkout, path=destination.relative_to(config.root).as_posix()
             )
             _assert_cache_policy_untracked(config, active_checkout, vcs)
-            status = vcs.status(destination, _cache_globs_for(config, checkout.name))
+            cache_globs = _cache_globs_for(config, checkout.name)
+            status = vcs.status(destination, cache_globs) or vcs.tracked_content_status(
+                destination, cache_globs
+            )
             if status:
                 first = status.splitlines()[0]
                 raise Refusal(
@@ -23306,15 +24066,12 @@ def _abort_create(
         )
     if active_slot.exists():
         _assert_slot_unused(active_slot)
-    for _item, _repository, _expected_head, present, _checkout, caches in preflight:
-        if present:
-            for cache in caches:
-                _remove_cache_directory(config, cache)
 
     fence_created = False
     exclusion_started = False
     removed_any = False
     original_mode: int | None = None
+    fence_identity: _PrivateCleanupIdentity | None = None
     try:
         if active_slot == slot_path and (slot_path.exists() or slot_path.is_symlink()):
             if slot_path.is_symlink() or not slot_path.is_dir():
@@ -23336,7 +24093,9 @@ def _abort_create(
                 ) from exc
             fence_created = True
             active_slot = fenced_slot
-            _seal_cleanup_path_private(config, fenced_slot)
+            _sealed_mode, fence_identity = _seal_cleanup_path_private(
+                config, fenced_slot
+            )
             _repair_create_abort_registrations(config, plan, active_slot, vcs)
             _interrupt_for_test("after-create-abort-path-fence")
 
@@ -23370,9 +24129,10 @@ def _abort_create(
                     checkout, path=destination.relative_to(config.root).as_posix()
                 )
                 _assert_cache_policy_untracked(config, active_checkout, vcs)
+                cache_globs = _cache_globs_for(config, checkout.name)
                 status = vcs.status(
-                    destination, _cache_globs_for(config, checkout.name)
-                )
+                    destination, cache_globs
+                ) or vcs.tracked_content_status(destination, cache_globs)
                 if status:
                     first = status.splitlines()[0]
                     raise Refusal(
@@ -23393,7 +24153,7 @@ def _abort_create(
         final = prove_removal_target(active_slot)
 
         _interrupt_for_test("after-create-abort-final-proof")
-        if final and removal_slot is None:
+        if (active_slot.exists() or active_slot.is_symlink()) and removal_slot is None:
             removal_slot = slot_path.with_name(
                 f".{slot}.abort-remove.{uuid.uuid4().hex}"
             )
@@ -23406,7 +24166,10 @@ def _abort_create(
             _write_journal(config, updated_journal, journal_path=journal_path)
             journal = updated_journal
             removal_record = (removal_slot, identity)
-        if final and active_slot != removal_slot:
+        if (
+            (active_slot.exists() or active_slot.is_symlink())
+            and active_slot != removal_slot
+        ):
             assert removal_slot is not None
             if removal_slot.exists() or removal_slot.is_symlink():
                 raise Refusal(
@@ -23458,17 +24221,26 @@ def _abort_create(
                 f"canonical slot path reappeared behind the create-abort fence: "
                 f"{slot_path}; preserve it for inspection"
             )
-        if removal_targets:
+        if removal_targets or active_slot.exists() or active_slot.is_symlink():
+            if removal_record is None:
+                raise StateError("create-abort active slot has no recorded identity")
+
+            def note_exclusion_recording() -> None:
+                nonlocal exclusion_started
+                exclusion_started = True
+
             exclusion = _prepare_create_abort_exclusion(
                 config,
                 journal_path,
                 journal,
                 slot,
                 active_slot,
+                removal_record[1][:2],
                 removal_targets,
+                note_exclusion_recording,
             )
-            exclusion_started = True
-            manifests = tuple(
+            assert exclusion_started
+            manifests: tuple[_AbortRemovalEntry | None, ...] = tuple(
                 manifest
                 for (
                     _item,
@@ -23480,7 +24252,13 @@ def _abort_create(
                 ) in removal_targets
                 for manifest in (checkout_tree, admin_tree)
             )
+            if len(exclusion.payloads) == len(manifests) + 1:
+                manifests += (None,)
             _exclude_create_abort_payloads(exclusion, manifests)
+            exclusion = _set_create_abort_exclusion_phase(
+                config, journal_path, exclusion, "excluded"
+            )
+            _interrupt_for_test("after-create-abort-exclusion-excluded-journal")
 
             def note_destructive_boundary() -> None:
                 nonlocal removed_any
@@ -23491,6 +24269,10 @@ def _abort_create(
             # reach the names passed to recursive removal, so its only possible
             # race is to recreate an original source name, which is checked and
             # preserved before and after every excluded deletion.
+            exclusion = _set_create_abort_exclusion_phase(
+                config, journal_path, exclusion, "removing"
+            )
+            _interrupt_for_test("after-create-abort-exclusion-removing-journal")
             _remove_create_abort_exclusion(exclusion, note_destructive_boundary)
             if any(
                 payload.source.exists() or payload.source.is_symlink()
@@ -23533,8 +24315,15 @@ def _abort_create(
             )
             _fsync_directory(fenced_slot.parent)
             _repair_create_abort_registrations(config, plan, fenced_slot, vcs)
+        # A refusal before the removal fence was recorded -- the first final
+        # proof, for one -- has only the identity sealed with the path fence.
+        # Without either, the fence is left for recovery to resume.
+        rollback_identity = (
+            removal_record[1] if removal_record is not None else fence_identity
+        )
         if (
             fence_created
+            and rollback_identity is not None
             and not exclusion_started
             and not removed_any
             and not slot_path.exists()
@@ -23545,13 +24334,12 @@ def _abort_create(
             if original_mode is not None:
                 fenced_slot.chmod(original_mode)
             _interrupt_for_test("before-create-abort-path-fence-rollback")
-            assert removal_record is not None
             assert original_mode is not None
             _rollback_create_abort_path(
                 config,
                 fenced_slot,
                 slot_path,
-                removal_record[1],
+                rollback_identity,
                 original_mode,
                 "roll back create-abort path fence",
             )
@@ -23559,22 +24347,22 @@ def _abort_create(
             _repair_create_abort_registrations(config, plan, slot_path, vcs)
         raise
     for item, repository, expected_head, _present, _checkout, _caches in preflight:
+        _interrupt_for_test("before-create-abort-branch-delete")
         vcs.delete_branch_at(repository, item.branch, expected_head)
     if slot_path.exists() or slot_path.is_symlink():
         raise Refusal(
             f"canonical slot path reappeared after create-abort removal: {slot_path}; "
             "preserve it for inspection"
         )
+    _interrupt_for_test("before-create-abort-final-root-check")
     for empty_root in (fenced_slot, removal_slot):
-        if empty_root is None or not empty_root.exists():
-            continue
-        try:
-            empty_root.rmdir()
-        except OSError as exc:
+        if empty_root is not None and (
+            empty_root.exists() or empty_root.is_symlink()
+        ):
             raise Refusal(
-                f"cannot remove aborted slot directory {empty_root}: {exc}"
-            ) from exc
-        _fsync_directory(empty_root.parent)
+                f"create-abort path reappeared after excluded removal: {empty_root}; "
+                "preserve it for inspection"
+            )
     _clear_journal(
         config,
         _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
@@ -30725,6 +31513,87 @@ def _absent_validate_maps_match(
     return matches[0] if matches else None
 
 
+_PATH_MAPS_AWK = r'''
+BEGIN {
+    RS = "\0";
+    while ((r = getline item < "/dev/stdin") > 0) paths[++count] = item;
+    if (r < 0) { print "maps selection input is unreadable" > "/dev/stderr"; exit 3; }
+    close("/dev/stdin");
+    RS = "\n";
+    for (file = 1; file < ARGC; file++) {
+        path = ARGV[file];
+        while ((r = getline row < path) > 0) {
+            mapping = row;
+            for (field = 1; field <= 5; field++) {
+                if (!sub(/^[^ \t]+[ \t]+/, "", mapping)) {
+                    print "malformed maps row in " path > "/dev/stderr";
+                    exit 3;
+                }
+            }
+            selected = 0;
+            for (i = 1; !selected && i <= count; i++) {
+                suffix = substr(mapping, length(paths[i]) + 1);
+                if (index(mapping, paths[i]) == 1 &&
+                    (suffix == "" || suffix == " (deleted)" ||
+                     substr(suffix, 1, 1) == "/")) selected = i;
+            }
+            if (selected) {
+                suffix = substr(mapping, length(paths[selected]) + 1);
+                printf "%s%c%d%c%s%c", path, 0, selected, 0, suffix, 0;
+            }
+        }
+        if (r < 0) {
+            print "/usr/bin/grep: " path ": " ERRNO > "/dev/stderr";
+            failed = 2;
+        }
+        close(path);
+    }
+    exit failed;
+}
+'''
+
+
+def _parse_compact_maps_path_matches(
+    output: bytes,
+    processes: Mapping[int, _AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    *,
+    census: str,
+) -> tuple[tuple[int, str, str, str], ...]:
+    ordered_targets = tuple(sorted(targets, key=str))
+    matches: list[tuple[int, str, str, str]] = []
+    for evidence_text, index_text, suffix in _census_nul_records(
+        output, 3, f"{census} compact maps"
+    ):
+        if not evidence_text.isascii():
+            raise Refusal(f"{census} compact maps census is undecodable")
+        evidence_path = Path(evidence_text)
+        if not index_text.isascii() or not index_text.isdecimal():
+            raise Refusal(f"{census} compact maps census returned an invalid target")
+        index = int(index_text)
+        if index < 1 or index > len(ordered_targets):
+            raise Refusal(f"{census} compact maps census returned an unknown target")
+        if suffix not in {"", " (deleted)"} and not suffix.startswith("/"):
+            raise Refusal(f"{census} compact maps census returned an invalid suffix")
+        target = ordered_targets[index - 1]
+        raw_target = f"{target}{suffix}"
+        observed = Path(os.path.normpath(raw_target.removesuffix(" (deleted)")))
+        matched = _matching_absent_validate_target(observed, targets)
+        if matched is None:
+            raise Refusal(f"{census} compact maps census escaped its selected target")
+        pid = _pid_from_proc_evidence(evidence_path)
+        process = processes.get(pid)
+        if process is None:
+            raise Refusal(f"{census} compact maps census returned an unexpected PID: {pid}")
+        if not _process_generation_is_current(process):
+            raise _ProcessEvidenceChanged(
+                f"PID {pid} generation changed during {census} maps census"
+            )
+        _target, slot = matched
+        matches.append((pid, slot, "map", str(observed)))
+    return tuple(matches)
+
+
 def _absent_validate_maps_matches(
     processes: Sequence[_AbsentProcessObservation],
     targets: Mapping[Path, str],
@@ -30733,28 +31602,27 @@ def _absent_validate_maps_matches(
     files = [str(Path("/proc") / str(process.pid) / "maps") for process in processes]
     if not files:
         return ()
-    patterns: list[str] = []
-    for target in sorted(targets, key=str):
+    ordered_targets = tuple(sorted(targets, key=str))
+    for target in ordered_targets:
         text = str(target)
         if "\n" in text or "\0" in text:
             raise Refusal("validation paths containing line or NUL bytes cannot be probed")
-        patterns.append(text)
-    pattern_input = ("\n".join(patterns) + "\n").encode("utf-8")
+    pattern_input = b"\0".join(os.fsencode(target) for target in ordered_targets) + b"\0"
     observed_by_pid = {process.pid: process for process in processes}
     chunks: list[bytes] = []
-    for arguments in _argument_batches(("-F", "-H", "-f", "-", "--"), files, ()):
-        batch_pids = {_pid_from_proc_evidence(Path(argument)) for argument in arguments[5:]}
+    for arguments in _argument_batches(("--", _PATH_MAPS_AWK), files, ()):
+        batch_pids = {_pid_from_proc_evidence(Path(argument)) for argument in arguments[2:]}
         batch_processes = {
             pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
         }
         returncode, stdout, stderr = _run_root_owned_command(
-            Path("/usr/bin/grep"), arguments, input_data=pattern_input, budget=budget
+            Path("/usr/bin/gawk"), arguments, input_data=pattern_input, budget=budget
         )
-        if returncode not in {0, 1, 2}:
-            raise Refusal(f"privileged grep census refused with exit {returncode}")
+        if returncode not in {0, 2}:
+            raise Refusal(f"privileged maps filter refused with exit {returncode}")
         _allow_only_vanished_process_diagnostics("grep", returncode, stderr, batch_processes)
         chunks.append(stdout)
-    return _parse_maps_path_matches(
+    return _parse_compact_maps_path_matches(
         b"".join(chunks), observed_by_pid, targets, census="privileged"
     )
 
