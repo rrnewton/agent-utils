@@ -235,9 +235,10 @@ def test_create_retried_after_abort_recovers_its_interruption(
 
 
 def _episode_events(
-    config: wrkslots.Config,
+    config: wrkslots.Config, path: Path | None = None
 ) -> tuple[list[Mapping[str, object]], dict[str, object]]:
-    path = wrkslots._finish_journal_path(config, "target")
+    if path is None:
+        path = wrkslots._finish_journal_path(config, "target")
     events: list[Mapping[str, object]] = [
         event
         for event in wrkslots._load_events(config, config.machine)
@@ -259,8 +260,21 @@ def _progress(
     return {**template, "payload": {**payload, "journal": dict(journal)}}
 
 
+REPLAYED = "path was reopened with the identity of a completed operation"
+REUSED = "path was reused after completion without a new operation"
+
+
 @pytest.mark.parametrize(
-    "shape", ("pending", "completed", "stale", "later-phase", "repeated-completion")
+    "shape",
+    (
+        "pending",
+        "completed",
+        "stale",
+        "later-phase",
+        "repeated-completion",
+        "replayed-opening",
+        "reused-fence",
+    ),
 )
 def test_scoped_finish_episodes_bind_the_latest_operation(
     tmp_path: Path,
@@ -279,7 +293,13 @@ def test_scoped_finish_episodes_bind_the_latest_operation(
     ]
     fenced = history[1]["payload"]
     assert isinstance(fenced, dict)
-    retry = {**first, "archive_id": f"{first['archive_id']}-retry"}
+    assert isinstance(first["fenced"], str)
+    retry = {
+        **first,
+        "archive_id": f"{first['archive_id']}-retry",
+        "fenced": f"{first['fenced'][:-32]}{'0' * 32}",
+    }
+    assert retry["fenced"] != first["fenced"]
     opened = _progress(history[0], retry)
     events: list[Mapping[str, object]] = [*history, opened]
     raw: Mapping[str, object] = retry
@@ -295,6 +315,14 @@ def test_scoped_finish_episodes_bind_the_latest_operation(
         raw = json.loads(json.dumps(fenced["journal"]))
     elif shape == "repeated-completion":
         events = [*history, history[3], opened]
+    elif shape == "replayed-opening":
+        # The completed operation's first progress, byte for byte.
+        events = [*history, history[0]]
+        raw = first
+    elif shape == "reused-fence":
+        # A new archive_id cannot disguise the completed operation's fence.
+        raw = {**first, "archive_id": f"{first['archive_id']}-retry"}
+        events = [*history, _progress(history[0], raw)]
     monkeypatch.setattr(wrkslots, "_load_events", lambda *_a, **_k: list(events))
     path = wrkslots._finish_journal_path(config, "target")
 
@@ -302,9 +330,80 @@ def test_scoped_finish_episodes_bind_the_latest_operation(
         with pytest.raises(wrkslots.StateError, match="differs from append-only"):
             wrkslots._scoped_operation_journal_completed(config, path, raw, "finish")
     elif shape == "later-phase":
-        with pytest.raises(wrkslots.StateError, match="without a new operation"):
+        with pytest.raises(wrkslots.StateError, match=REUSED):
+            wrkslots._scoped_operation_journal_completed(config, path, raw, "finish")
+    elif shape in {"replayed-opening", "reused-fence"}:
+        with pytest.raises(wrkslots.StateError, match=REPLAYED):
             wrkslots._scoped_operation_journal_completed(config, path, raw, "finish")
     else:
         assert wrkslots._scoped_operation_journal_completed(
             config, path, raw, "finish"
         ) == (shape == "completed")
+
+
+@pytest.fixture(scope="module")
+def aborted_create(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[wrkslots.Config, Path, list[Mapping[str, object]], dict[str, object]]:
+    # One interrupted and aborted create; its abort runs the host-wide slot-use
+    # census, which is too slow to repeat for every shape.
+    project, _repository, _remote = make_project(tmp_path_factory.mktemp("create"))
+    config = wrkslots._load_config(str(project), "testhost")
+    path = wrkslots._create_journal_path(config, "slot01")
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    aborted = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--abort-create"
+    )
+    assert aborted.returncode == 0, aborted.stderr
+    history, first = _episode_events(config, path)
+    return config, path, history, first
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ("new-operation", "replayed-opening", "later-write", "without-identity"),
+)
+def test_scoped_create_episodes_need_a_new_operation(
+    aborted_create: tuple[
+        wrkslots.Config, Path, list[Mapping[str, object]], dict[str, object]
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    config, path, history, first = aborted_create
+    kinds = [event["kind"] for event in history]
+    assert kinds[-1] == "operation-completed"
+    assert set(kinds[:-1]) == {"operation-progress-recorded"}
+    assert first["created"] == [] and first["hook_progress"] == 0
+    identity = first["operation_id"]
+    assert isinstance(identity, str) and len(identity) == 32
+    later = history[-2]["payload"]
+    assert isinstance(later, dict) and isinstance(later["journal"], dict)
+    assert later["journal"]["created"] != []
+    assert later["journal"]["operation_id"] == identity
+
+    raw: dict[str, object] = {**first, "operation_id": "0" * 32}
+    if shape == "replayed-opening":
+        # The aborted operation's first progress, byte for byte.
+        raw = dict(first)
+    elif shape == "later-write":
+        raw = {**later["journal"], "operation_id": "0" * 32}
+    elif shape == "without-identity":
+        # A journal written before create recorded an operation identity.
+        raw = {key: value for key, value in first.items() if key != "operation_id"}
+    events = [*history, _progress(history[0], raw)]
+    monkeypatch.setattr(wrkslots, "_load_events", lambda *_a, **_k: list(events))
+
+    if shape == "new-operation":
+        assert not wrkslots._scoped_operation_journal_completed(
+            config, path, raw, "create"
+        )
+    else:
+        with pytest.raises(
+            wrkslots.StateError,
+            match=REPLAYED if shape == "replayed-opening" else REUSED,
+        ):
+            wrkslots._scoped_operation_journal_completed(config, path, raw, "create")

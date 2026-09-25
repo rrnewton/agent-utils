@@ -184,6 +184,7 @@ _CREATE_JOURNAL_OPTIONAL = frozenset(
         "hook_progress",
         "hook_failure",
         "failure_policy",
+        "operation_id",
     }
 )
 _IMPORT_JOURNAL_REQUIRED = frozenset(
@@ -6880,6 +6881,11 @@ def _validate_journal_shape(
             _as_mapping(failure, "create journal.hook_failure")
         if "failure_policy" in raw:
             _as_str(raw["failure_policy"], "create journal.failure_policy")
+        if "operation_id" in raw and not re.fullmatch(
+            r"[0-9a-f]{32}",
+            _as_str(raw["operation_id"], "create journal.operation_id"),
+        ):
+            raise StateError("create journal has an invalid operation_id")
     elif kind == "import-existing":
         _exact_keys(raw, _IMPORT_JOURNAL_REQUIRED, set(), "import journal")
         record = _record_from_obj(raw["record"], "import journal.record")
@@ -7125,6 +7131,22 @@ def _scoped_operation_journal_opens(
     return journal.get("created") == [] and journal.get("hook_progress") == 0
 
 
+def _scoped_operation_identity(
+    journal: Mapping[str, object], operation: str
+) -> str | None:
+    """Return the value one scoped operation keeps and every new one replaces.
+
+    Each finish chooses its ``fenced`` name with a fresh uuid4 and keeps it for
+    every phase, including a rollback's.  Each create records a fresh uuid4
+    ``operation_id``; create journals written before that field existed have
+    none.  ``archive_id`` cannot serve: it embeds a one-second timestamp, so a
+    retry within the same second repeats it.
+    """
+
+    value = journal.get("fenced" if operation == "finish" else "operation_id")
+    return value if isinstance(value, str) else None
+
+
 def _scoped_operation_journal_completed(
     config: Config,
     path: Path,
@@ -7137,8 +7159,10 @@ def _scoped_operation_journal_completed(
     operations: a rolled-back finish completes while its ACTIVE row remains,
     and the retry writes the same path again.  Each completion closes an
     episode, and progress after it opens the next one only at the operation's
-    first phase.  The bytes must equal the latest progress, and completion is
-    that of the latest episode.
+    first phase and with an operation identity that no earlier episode on the
+    path used, so a replayed opening of a completed operation is refused.  The
+    bytes must equal the latest progress, and completion is that of the latest
+    episode.
     """
 
     label = f"scoped {operation} journal"
@@ -7148,6 +7172,7 @@ def _scoped_operation_journal_completed(
     )
     recorded: Mapping[str, object] | None = None
     completed = False
+    identities: set[str] = set()
     for event in _load_events(config, machine):
         event_kind = _as_str(event["kind"], "append-only event.kind")
         if event_kind not in {"operation-progress-recorded", "operation-completed"}:
@@ -7165,11 +7190,22 @@ def _scoped_operation_journal_completed(
             continue
         if event_kind == "operation-progress-recorded":
             assert journal is not None
-            if completed and not _scoped_operation_journal_opens(journal, operation):
+            identity = _scoped_operation_identity(journal, operation)
+            if completed and (
+                not _scoped_operation_journal_opens(journal, operation)
+                or identity is None
+            ):
                 raise StateError(
                     f"{label} path was reused after completion without a new "
                     "operation"
                 )
+            if completed and identity in identities:
+                raise StateError(
+                    f"{label} path was reopened with the identity of a completed "
+                    "operation"
+                )
+            if identity is not None:
+                identities.add(identity)
             recorded = journal
             completed = False
             continue
@@ -13446,6 +13482,7 @@ def _create_journal_payload(
     created_at: str,
     heartbeat_at: str,
     hook_progress: int,
+    operation_id: str,
 ) -> dict[str, object]:
     return {
         "schema": SCHEMA,
@@ -13467,6 +13504,7 @@ def _create_journal_payload(
         "hook_progress": hook_progress,
         "hook_failure": None,
         "failure_policy": "leave-for-inspection",
+        "operation_id": operation_id,
     }
 
 
@@ -13649,6 +13687,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         slot_path.parent.mkdir(parents=True, exist_ok=True)
         created_at = _utc_now()
         heartbeat_at = created_at
+        operation_id = uuid.uuid4().hex
         journal_path = _create_journal_path(config, args.slot)
         created: list[Checkout] = []
         _write_journal(
@@ -13663,6 +13702,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 created_at=created_at,
                 heartbeat_at=heartbeat_at,
                 hook_progress=0,
+                operation_id=operation_id,
             ),
             journal_path=journal_path,
         )
@@ -13697,6 +13737,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     created_at=created_at,
                     heartbeat_at=heartbeat_at,
                     hook_progress=0,
+                    operation_id=operation_id,
                 ),
                 journal_path=journal_path,
             )
@@ -13711,6 +13752,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             created_at=created_at,
             heartbeat_at=heartbeat_at,
             hook_progress=0,
+            operation_id=operation_id,
         )
         hook_progress = _run_post_provision_hooks(
             config, created, journal_path, hook_journal
@@ -13735,6 +13777,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 created_at=created_at,
                 heartbeat_at=heartbeat_at,
                 hook_progress=hook_progress,
+                operation_id=operation_id,
             ),
             journal_path=journal_path,
         )
