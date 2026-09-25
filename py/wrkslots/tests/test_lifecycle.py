@@ -55,12 +55,15 @@ def test_task_scope_identity_round_trips_and_legacy_rows_remain_readable(
     monkeypatch.setattr(
         wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
     )
+    worker_cgroup = (
+        f"{wrkslots._systemd_user_manager_cgroup()}/app.slice/wrkslots-worker.scope"
+    )
     owner = wrkslots.ProcessIdentity(
         pid=123,
         start_ticks=456,
         boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         host_id="host-a",
-        cgroup_path="/user.slice/wrkslots-worker.scope",
+        cgroup_path=worker_cgroup,
     )
     checkout = wrkslots.Checkout(
         name="source",
@@ -103,7 +106,7 @@ def test_task_scope_identity_round_trips_and_legacy_rows_remain_readable(
     assert encoded["task_scope"] == {
         "unit": "wrkslots-worker.scope",
         "invocation_id": "a" * 32,
-        "cgroup_path": "/user.slice/wrkslots-worker.scope",
+        "cgroup_path": worker_cgroup,
         "boot_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         "leader_pid": 123,
         "leader_start_ticks": 456,
@@ -136,9 +139,39 @@ def test_task_scope_identity_round_trips_and_legacy_rows_remain_readable(
             owner,
         )
 
+    # A same-named unit outside this user's manager cannot borrow the
+    # identity of the invocation link read from that manager.
+    for foreign_cgroup in (
+        "/user.slice/wrkslots-worker.scope",
+        "/system.slice/wrkslots-worker.scope",
+        "/user.slice/user-999999.slice/user@999999.service/app.slice/wrkslots-worker.scope",
+        f"{wrkslots._systemd_user_manager_cgroup()}-x/wrkslots-worker.scope",
+    ):
+        with pytest.raises(wrkslots.Refusal, match="not under the systemd user manager"):
+            wrkslots._task_scope_from_args(
+                argparse.Namespace(
+                    task_scope_unit="wrkslots-worker.scope",
+                    task_scope_invocation_id="a" * 32,
+                ),
+                replace(owner, cgroup_path=foreign_cgroup),
+            )
+
     (invocation_directory / "invocation:wrkslots-worker.scope").unlink()
     (invocation_directory / "invocation:wrkslots-worker.scope").symlink_to("b" * 32)
     with pytest.raises(wrkslots.Refusal, match="does not match"):
+        wrkslots._task_scope_from_args(
+            argparse.Namespace(
+                task_scope_unit="wrkslots-worker.scope",
+                task_scope_invocation_id="a" * 32,
+            ),
+            owner,
+        )
+
+    (invocation_directory / "invocation:wrkslots-worker.scope").unlink()
+    (invocation_directory / "invocation:wrkslots-worker.scope").write_text(
+        "a" * 32, encoding="ascii"
+    )
+    with pytest.raises(wrkslots.Refusal, match="not a systemd runtime symlink"):
         wrkslots._task_scope_from_args(
             argparse.Namespace(
                 task_scope_unit="wrkslots-worker.scope",
@@ -10901,7 +10934,7 @@ def _attach_task_scope_to_interrupted_journal(
     owner = container["owner"]
     assert isinstance(owner, dict)
     unit = "wrkslots-recovery.scope"
-    cgroup_path = f"/user.slice/{unit}"
+    cgroup_path = f"{wrkslots._systemd_user_manager_cgroup()}/app.slice/{unit}"
     owner["cgroup_path"] = cgroup_path
     scope = {
         "unit": unit,
@@ -11057,12 +11090,336 @@ def test_create_and_import_recovery_revalidate_task_scope_at_publication(
             if runtime_link == "missing"
             else "task scope invocation does not match" in captured.err
         )
+        assert (
+            "--abort-create" if operation == "create" else "--abort-import"
+        ) in captured.err
         assert active_slots(project) == []
         assert journal.read_bytes() == journal_before
         if runtime_link == "aba":
             after = invocation_link.lstat()
             assert (after.st_dev, after.st_ino) == aba_identity
             assert os.fsdecode(original_readlink(invocation_link)) == "b" * 32
+
+
+def _interrupt_scoped_import(project: Path, repository: Path) -> Path:
+    tree = checkout(project)
+    tree.parent.mkdir()
+    git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    interrupted = command(
+        project,
+        "import-existing",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-import",
+        "--purpose",
+        "interrupted scoped import",
+        "--repo",
+        "product=repo",
+        "--apply",
+        "--verified-live",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-import-journal"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    return control_directory(project) / "ACTIVE.testhost.journal"
+
+
+def test_abort_import_discards_an_import_whose_task_scope_ended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    journal = _interrupt_scoped_import(project, repository)
+    expected_scope = _attach_task_scope_to_interrupted_journal(project, journal)
+    journal_before = journal.read_bytes()
+    tree = checkout(project)
+    head_before = git(tree, "rev-parse", "HEAD").stdout
+    invocation_directory = tmp_path / "systemd-units"
+    invocation_directory.mkdir()
+    # The scope ended and systemd started a new invocation under the same name.
+    (invocation_directory / f"invocation:{expected_scope.unit}").symlink_to("b" * 32)
+    monkeypatch.setattr(
+        wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
+    )
+    recover_argv = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+
+    refused = wrkslots.main(recover_argv)
+    captured = capsys.readouterr()
+    assert refused == 3
+    assert "task scope invocation does not match" in captured.err
+    assert "wrkslots recover --coordinator-pid PID --abort-import" in captured.err
+    assert journal.read_bytes() == journal_before
+    blocked = command(project, "create", "slot02", "--agent", "codex-2", "--task",
+                      "task-slot02", "--purpose", "blocked by the import journal",
+                      "--owner-pid", str(os.getpid()), "--coordinator-pid",
+                      str(os.getpid()), "--repo", "product=repo")
+    assert blocked.returncode == 3
+
+    aborted = wrkslots.main([*recover_argv, "--abort-import"])
+    captured = capsys.readouterr()
+    assert aborted == 0, captured.err
+    assert "aborted interrupted import slot=slot01" in captured.out
+    assert not journal.exists()
+    assert active_slots(project) == []
+    assert tree.is_dir()
+    assert git(tree, "rev-parse", "HEAD").stdout == head_before
+    assert git(tree, "status", "--porcelain").stdout == ""
+    config = wrkslots._load_config(str(project), "testhost")
+    events = wrkslots._load_events(config)
+    assert [event["kind"] for event in events[-2:]] == [
+        "recovery-started",
+        "operation-completed",
+    ]
+    payload = events[-1]["payload"]
+    assert isinstance(payload, dict)
+    assert (payload["slot"], payload["operation"]) == ("slot01", "import-existing")
+
+    reimported = command(
+        project,
+        "import-existing",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-import",
+        "--purpose",
+        "import again after abort",
+        "--repo",
+        "product=repo",
+        "--apply",
+        "--verified-live",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert reimported.returncode == 0, reimported.stderr
+    assert len(active_slots(project)) == 1
+
+
+def test_abort_import_refuses_other_journals_and_durable_imports(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    create_journal = create_journal_path(project)
+    before = create_journal.read_bytes()
+    refused = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-import",
+    )
+    assert refused.returncode == 3
+    assert "--abort-import applies only to import-existing journals" in refused.stderr
+    assert create_journal.read_bytes() == before
+    assert checkout(project).is_dir()
+    combined = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-import",
+        "--abort-create",
+    )
+    assert combined.returncode == 2
+    assert "not allowed with argument" in combined.stderr
+    aborted_create = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+    assert aborted_create.returncode == 0, aborted_create.stderr
+
+    tree = checkout(project)
+    tree.parent.mkdir()
+    git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    durable = command(
+        project,
+        "import-existing",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-import",
+        "--purpose",
+        "durable import",
+        "--repo",
+        "product=repo",
+        "--apply",
+        "--verified-live",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-import-active-write"},
+    )
+    assert durable.returncode == 86, durable.stderr
+    import_journal = control_directory(project) / "ACTIVE.testhost.journal"
+    before = import_journal.read_bytes()
+    refused = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--abort-import"
+    )
+    assert refused.returncode == 3
+    assert "cannot abort import for slot slot01" in refused.stderr
+    assert import_journal.read_bytes() == before
+    assert len(active_slots(project)) == 1
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode == 0, recovered.stderr
+    assert not import_journal.exists()
+    assert len(active_slots(project)) == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "verifications"),
+    (("create", 2), ("register", 2), ("import-existing", 3), ("adopt", 2)),
+)
+@pytest.mark.parametrize("runtime_link", ("stable", "retargeted-before-publication"))
+def test_live_task_scope_is_rechecked_immediately_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+    verifications: int,
+    runtime_link: str,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    if operation in {"register", "import-existing"}:
+        tree = checkout(project)
+        tree.parent.mkdir()
+        git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
+    elif operation == "adopt":
+        made = create(project, bind_owner=False)
+        assert made.returncode == 0, made.stderr
+    unit = "wrkslots-live.scope"
+    scope_cgroup = f"{wrkslots._systemd_user_manager_cgroup()}/app.slice/{unit}"
+    monkeypatch.setattr(wrkslots, "_read_process_cgroup", lambda _pid_dir: scope_cgroup)
+    invocation_directory = tmp_path / "systemd-units"
+    invocation_directory.mkdir()
+    invocation_link = invocation_directory / f"invocation:{unit}"
+    invocation_link.symlink_to("a" * 32)
+    monkeypatch.setattr(
+        wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
+    )
+    original_verify = wrkslots._verify_task_scope_invocation
+    verification_calls: list[str] = []
+
+    def verify_then_retarget(scope: wrkslots.TaskScopeIdentity) -> None:
+        verification_calls.append(scope.invocation_id)
+        original_verify(scope)
+        # Everything up to the final check passes; only the recheck that sits
+        # immediately before publication can observe this replacement.
+        if (
+            runtime_link != "stable"
+            and len(verification_calls) == verifications - 1
+        ):
+            invocation_link.unlink()
+            invocation_link.symlink_to("b" * 32)
+
+    monkeypatch.setattr(wrkslots, "_verify_task_scope_invocation", verify_then_retarget)
+    pid = str(os.getpid())
+    scope_args = ["--task-scope-unit", unit, "--task-scope-invocation-id", "a" * 32]
+    identity_args = ["--agent", "codex-1", "--task", "task-slot01", "--purpose", "scoped"]
+    if operation == "create":
+        argv = ["create", "slot01", "--slot-type", "agent", "--coordinator-authorized",
+                *identity_args, "--owner-pid", pid, "--coordinator-pid", pid,
+                "--repo", "product=repo", "--branch", "product=codex/task"]
+    elif operation == "register":
+        argv = ["register", "slot01", "--slot-type", "agent", "--coordinator-authorized",
+                *identity_args, "--owner-pid", pid, "--coordinator-pid", pid,
+                "--verified-live", "--repo", "product=repo"]
+    elif operation == "import-existing":
+        argv = ["import-existing", "slot01", "--slot-type", "agent",
+                "--coordinator-authorized", *identity_args, "--repo", "product=repo",
+                "--apply", "--verified-live", "--owner-pid", pid,
+                "--coordinator-pid", pid]
+    else:
+        argv = ["adopt", "slot01", "--agent", "codex-1", "--owner-pid", pid,
+                "--expected-generation", "1"]
+
+    rc = wrkslots.main(["--project-root", str(project), *argv, *scope_args])
+    captured = capsys.readouterr()
+
+    assert verification_calls == ["a" * 32] * verifications
+    rows = active_slots(project)
+    if runtime_link == "stable":
+        assert rc == 0, captured.err
+        assert len(rows) == 1
+        row = rows[0]
+        assert isinstance(row, dict)
+        assert row["task_scope"]["unit"] == unit
+        assert row["task_scope"]["invocation_id"] == "a" * 32
+        assert row["task_scope"]["cgroup_path"] == scope_cgroup
+        if operation == "adopt":
+            # Adopt by the same owner rebinds the row to a newer invocation.
+            invocation_link.unlink()
+            invocation_link.symlink_to("c" * 32)
+            monkeypatch.setattr(wrkslots, "_verify_task_scope_invocation", original_verify)
+            rebound = wrkslots.main(
+                [
+                    "--project-root",
+                    str(project),
+                    "adopt",
+                    "slot01",
+                    "--agent",
+                    "codex-1",
+                    "--owner-pid",
+                    pid,
+                    "--expected-generation",
+                    str(row["generation"]),
+                    "--task-scope-unit",
+                    unit,
+                    "--task-scope-invocation-id",
+                    "c" * 32,
+                ]
+            )
+            captured = capsys.readouterr()
+            assert rebound == 0, captured.err
+            rebound_row = active_slots(project)[0]
+            assert isinstance(rebound_row, dict)
+            assert rebound_row["task_scope"]["invocation_id"] == "c" * 32
+        return
+    assert rc == 3
+    assert "task scope invocation does not match" in captured.err
+    if operation == "adopt":
+        assert len(rows) == 1
+        row = rows[0]
+        assert isinstance(row, dict)
+        assert row["owner"] is None
+        assert "task_scope" not in row
+    else:
+        assert rows == []
+    if operation == "create":
+        assert "--abort-create" in captured.err
+        assert create_journal_path(project).exists()
+    elif operation == "import-existing":
+        assert "--abort-import" in captured.err
+        assert (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
 def test_live_dirty_legacy_create_stays_exact_while_unrelated_creates_succeed(

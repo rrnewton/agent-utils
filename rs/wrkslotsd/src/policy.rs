@@ -13,7 +13,7 @@ use crate::evidence::{
 };
 use crate::replay::PendingOperationKind;
 use crate::replay::ReplayedLog;
-use crate::schema::ActiveRecordMeta;
+use crate::schema::{parse_timestamp_instant, ActiveRecordMeta};
 use crate::ObserverError;
 
 /// Stable three-valued outcome of shadow policy evaluation.
@@ -109,83 +109,21 @@ pub(crate) fn evaluate_without_inputs(
             let record = replayed.active_records.get(slot).ok_or_else(|| {
                 ObserverError::invalid(format!("missing replayed active record for {slot}"))
             })?;
-            Ok(PolicyDecision::legacy(
+            let mut decision = PolicyDecision::legacy(
                 &replayed.summary.machine,
                 &replayed.summary.tip_sha256,
                 meta,
                 canonical_sha256(record)?,
                 reason,
-            ))
+            );
+            block_on_hold_and_pending(&mut decision, replayed, slot, meta.generation);
+            Ok(decision)
         })
         .collect::<Result<Vec<_>, ObserverError>>()?;
-    for decision in &mut decisions {
-        let active_generation = decision.generation;
-        let slot = decision.slot.clone();
-        if replayed.holds.contains_key(&slot) {
-            decision.block("ACTIVE_HOLD");
-        }
-        for pending in replayed
-            .pending_operations
-            .iter()
-            .filter(|pending| pending.slot == slot)
-        {
-            if pending.generation.is_some() && pending.generation != active_generation {
-                decision.block("PENDING_GENERATION_CONFLICT");
-            }
-            decision.block(pending_reason(pending.kind));
-        }
-    }
-
-    let active_slots = replayed
-        .active_metadata
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let mut pending_without_active = BTreeMap::<&str, Vec<_>>::new();
-    for pending in &replayed.pending_operations {
-        if !active_slots.contains(pending.slot.as_str()) {
-            pending_without_active
-                .entry(pending.slot.as_str())
-                .or_default()
-                .push(pending);
-        }
-    }
-    for (slot, pending) in pending_without_active {
-        let first_generation = pending[0].generation;
-        let generation = pending
-            .iter()
-            .all(|marker| marker.generation == first_generation)
-            .then_some(first_generation)
-            .flatten();
-        let mut decision = PolicyDecision {
-            schema: 1,
-            verdict: Verdict::Unknown,
-            reason_codes: vec![reason.to_owned(), "ACTIVE_RECORD_MISSING".to_owned()],
-            machine: replayed.summary.machine.clone(),
-            slot: slot.to_owned(),
-            generation,
-            event_sha256: replayed.summary.tip_sha256.clone(),
-            active_record_sha256: None,
-            config_sha256: None,
-            evidence_sha256: None,
-            evaluated_at: None,
-            census_started_at: None,
-            evidence_observed_at: None,
-            evidence_age_at_evaluation_nanoseconds: None,
-            heartbeat_at: None,
-            heartbeat_ttl_seconds: None,
-            task_scope: None,
-            checkout_identities: Vec::new(),
-            reclaimable_bytes: 0,
-        };
-        if generation.is_none() && pending.iter().any(|marker| marker.generation.is_some()) {
-            decision.unknown("PENDING_GENERATION_CONFLICT");
-        }
-        for marker in pending {
-            decision.block(pending_reason(marker.kind));
-        }
-        decisions.push(decision);
-    }
+    decisions.extend(pending_only_decisions(
+        replayed,
+        &PendingOnlyInputs::Missing(reason),
+    ));
     Ok(decisions)
 }
 
@@ -264,24 +202,11 @@ pub(crate) fn evaluate(
                 decision.unknown("TASK_SCOPE_RUNTIME_UNVERIFIED");
             }
             decision.unknown("TASKGRAPH_CLAIM_UNVERIFIED");
-            if replayed.holds.contains_key(slot) {
-                decision.block("ACTIVE_HOLD");
-            }
-            let mut event_operation_pending = false;
-            for pending in replayed
-                .pending_operations
-                .iter()
-                .filter(|pending| pending.slot == *slot)
-            {
-                event_operation_pending = true;
-                if pending
-                    .generation
-                    .is_some_and(|generation| generation != meta.generation)
-                {
-                    decision.block("PENDING_GENERATION_CONFLICT");
-                }
-                decision.block(pending_reason(pending.kind));
-            }
+            let event_operation_pending =
+                block_on_hold_and_pending(&mut decision, replayed, slot, meta.generation);
+            // Heartbeat age depends only on the record and the census clock, so
+            // a slot absent from the census keeps its time-based blockers.
+            evaluate_time(&mut decision, config, freshness.lifecycle_at)?;
             let Some(observed) = evidence_by_slot.get(slot.as_str()).copied() else {
                 decision.unknown("EVIDENCE_MISSING");
                 return Ok(decision);
@@ -303,7 +228,6 @@ pub(crate) fn evaluate(
                 (Some(_), None) => decision.unknown("SCOPE_EVIDENCE_MISSING"),
                 (None, _) => decision.unknown("LEGACY_SCOPE_IDENTITY_MISSING"),
             }
-            evaluate_time(&mut decision, config, freshness.lifecycle_at)?;
             evaluate_storage(&mut decision, meta.checkouts.as_slice(), observed);
             match observed.journal {
                 JournalState::Absent => {
@@ -323,54 +247,135 @@ pub(crate) fn evaluate(
         })
         .collect::<Result<Vec<_>, ObserverError>>()?;
 
+    decisions.extend(pending_only_decisions(
+        replayed,
+        &PendingOnlyInputs::Bound {
+            config_sha256,
+            evidence_sha256,
+            evaluated_at,
+            evidence,
+            age_at_evaluation_nanoseconds: freshness.age_at_evaluation_nanoseconds,
+        },
+    ));
+    Ok(decisions)
+}
+
+/// Record the hold and pending-marker blockers of one ACTIVE row and report
+/// whether the event history leaves any operation pending for it.
+fn block_on_hold_and_pending(
+    decision: &mut PolicyDecision,
+    replayed: &ReplayedLog,
+    slot: &str,
+    generation: u64,
+) -> bool {
+    if replayed.holds.contains_key(slot) {
+        decision.block("ACTIVE_HOLD");
+    }
+    let mut operation_pending = false;
+    for pending in replayed
+        .pending_operations
+        .iter()
+        .filter(|pending| pending.slot == slot)
+    {
+        operation_pending = true;
+        if pending
+            .generation
+            .is_some_and(|pending_generation| pending_generation != generation)
+        {
+            decision.block("PENDING_GENERATION_CONFLICT");
+        }
+        decision.block(pending_reason(pending.kind));
+    }
+    operation_pending
+}
+
+/// Inputs to which a pending-only decision is bound.
+enum PendingOnlyInputs<'a> {
+    /// No policy inputs were supplied; the reason says why.
+    Missing(&'a str),
+    Bound {
+        config_sha256: &'a str,
+        evidence_sha256: &'a str,
+        evaluated_at: &'a str,
+        evidence: &'a EvidenceBundle,
+        age_at_evaluation_nanoseconds: i128,
+    },
+}
+
+/// A slot with pending markers but no ACTIVE row is always BLOCKED: a
+/// lifecycle operation may still own its checkout, and there is no record
+/// whose evidence could be checked.
+fn pending_only_decisions(
+    replayed: &ReplayedLog,
+    inputs: &PendingOnlyInputs<'_>,
+) -> Vec<PolicyDecision> {
     let mut pending_without_active = BTreeMap::<&str, Vec<_>>::new();
     for pending in &replayed.pending_operations {
-        if !active_slots.contains(pending.slot.as_str()) {
+        if !replayed.active_metadata.contains_key(&pending.slot) {
             pending_without_active
                 .entry(pending.slot.as_str())
                 .or_default()
                 .push(pending);
         }
     }
-    for (slot, pending) in pending_without_active {
-        let first_generation = pending[0].generation;
-        let generation = pending
-            .iter()
-            .all(|marker| marker.generation == first_generation)
-            .then_some(first_generation)
-            .flatten();
-        let mut decision = PolicyDecision {
-            schema: 1,
-            verdict: Verdict::Blocked,
-            reason_codes: vec!["ACTIVE_RECORD_MISSING".to_owned()],
-            machine: replayed.summary.machine.clone(),
-            slot: slot.to_owned(),
-            generation,
-            event_sha256: replayed.summary.tip_sha256.clone(),
-            active_record_sha256: None,
-            config_sha256: Some(config_sha256.to_owned()),
-            evidence_sha256: Some(evidence_sha256.to_owned()),
-            evaluated_at: Some(evaluated_at.to_owned()),
-            census_started_at: Some(evidence.census_started_at.clone()),
-            evidence_observed_at: Some(evidence.observed_at.clone()),
-            evidence_age_at_evaluation_nanoseconds: Some(
-                freshness.age_at_evaluation_nanoseconds.to_string(),
-            ),
-            heartbeat_at: None,
-            heartbeat_ttl_seconds: None,
-            task_scope: None,
-            checkout_identities: Vec::new(),
-            reclaimable_bytes: 0,
-        };
-        if generation.is_none() && pending.iter().any(|marker| marker.generation.is_some()) {
-            decision.unknown("PENDING_GENERATION_CONFLICT");
-        }
-        for marker in pending {
-            decision.block(pending_reason(marker.kind));
-        }
-        decisions.push(decision);
-    }
-    Ok(decisions)
+    pending_without_active
+        .into_iter()
+        .map(|(slot, pending)| {
+            let first_generation = pending[0].generation;
+            let generation = pending
+                .iter()
+                .all(|marker| marker.generation == first_generation)
+                .then_some(first_generation)
+                .flatten();
+            let mut decision = PolicyDecision {
+                schema: 1,
+                verdict: Verdict::Blocked,
+                reason_codes: Vec::new(),
+                machine: replayed.summary.machine.clone(),
+                slot: slot.to_owned(),
+                generation,
+                event_sha256: replayed.summary.tip_sha256.clone(),
+                active_record_sha256: None,
+                config_sha256: None,
+                evidence_sha256: None,
+                evaluated_at: None,
+                census_started_at: None,
+                evidence_observed_at: None,
+                evidence_age_at_evaluation_nanoseconds: None,
+                heartbeat_at: None,
+                heartbeat_ttl_seconds: None,
+                task_scope: None,
+                checkout_identities: Vec::new(),
+                reclaimable_bytes: 0,
+            };
+            match inputs {
+                PendingOnlyInputs::Missing(reason) => decision.unknown(reason),
+                PendingOnlyInputs::Bound {
+                    config_sha256,
+                    evidence_sha256,
+                    evaluated_at,
+                    evidence,
+                    age_at_evaluation_nanoseconds,
+                } => {
+                    decision.config_sha256 = Some((*config_sha256).to_owned());
+                    decision.evidence_sha256 = Some((*evidence_sha256).to_owned());
+                    decision.evaluated_at = Some((*evaluated_at).to_owned());
+                    decision.census_started_at = Some(evidence.census_started_at.clone());
+                    decision.evidence_observed_at = Some(evidence.observed_at.clone());
+                    decision.evidence_age_at_evaluation_nanoseconds =
+                        Some(age_at_evaluation_nanoseconds.to_string());
+                }
+            }
+            decision.block("ACTIVE_RECORD_MISSING");
+            if generation.is_none() && pending.iter().any(|marker| marker.generation.is_some()) {
+                decision.unknown("PENDING_GENERATION_CONFLICT");
+            }
+            for marker in pending {
+                decision.block(pending_reason(marker.kind));
+            }
+            decision
+        })
+        .collect()
 }
 
 fn pending_reason(kind: PendingOperationKind) -> &'static str {
@@ -404,8 +409,9 @@ fn validate_fresh_evidence(
         .map_err(|_| ObserverError::invalid("invalid shadow evidence observed_at"))?;
     let evaluated_at = DateTime::parse_from_rfc3339(evaluated_at)
         .map_err(|_| ObserverError::invalid("invalid shadow policy evaluated_at"))?;
-    let event_tip_recorded_at = DateTime::parse_from_rfc3339(&replayed.tip_recorded_at)
-        .map_err(|_| ObserverError::invalid("invalid replayed event-tip timestamp"))?;
+    // Replay admits event timestamps in the CPython grammar, not only RFC 3339.
+    let event_tip_recorded_at =
+        parse_timestamp_instant(&replayed.tip_recorded_at, "replayed event tip")?;
     if event_tip_recorded_at.signed_duration_since(started_at)
         > bounded_duration(config.maximum_future_skew_seconds)?
     {
@@ -487,7 +493,7 @@ fn exact_nanoseconds(duration: chrono::Duration) -> Result<i128, ObserverError> 
     Ok(i128::from(seconds) * 1_000_000_000 + i128::from(remainder))
 }
 
-fn evaluate_time(
+pub(crate) fn evaluate_time(
     decision: &mut PolicyDecision,
     config: &ShadowConfig,
     lifecycle_at: DateTime<chrono::FixedOffset>,
@@ -496,25 +502,27 @@ fn evaluate_time(
         decision.unknown("ACTIVE_HEARTBEAT_MISSING");
         return Ok(());
     };
-    let heartbeat = match DateTime::parse_from_rfc3339(heartbeat_at) {
-        Ok(value) => value,
-        Err(_) => {
-            decision.unknown("HEARTBEAT_TIMESTAMP_UNSUPPORTED");
-            return Ok(());
-        }
+    // Replay admits every heartbeat this parser accepts. Anything else cannot
+    // be aged, and an unageable heartbeat may be recent.
+    let Ok(heartbeat) = parse_timestamp_instant(heartbeat_at, "active heartbeat") else {
+        decision.block("HEARTBEAT_TIMESTAMP_UNSUPPORTED");
+        return Ok(());
     };
-    let age = lifecycle_at.signed_duration_since(heartbeat);
-    if age < chrono::Duration::zero() {
+    // A heartbeat after the lifecycle instant has a negative age and is
+    // younger than every threshold, as in the Python diagnosis that clamps
+    // age at zero. Only a lead beyond the permitted skew is clock evidence.
+    let age_nanoseconds = exact_nanoseconds(lifecycle_at.signed_duration_since(heartbeat))?;
+    if age_nanoseconds < -i128::from(config.maximum_future_skew_seconds) * 1_000_000_000 {
         decision.unknown("CLOCK_BEFORE_HEARTBEAT");
-        return Ok(());
     }
-    let age_nanoseconds = exact_nanoseconds(age)?;
-    let Some(heartbeat_ttl_seconds) = decision.heartbeat_ttl_seconds else {
-        decision.unknown("ACTIVE_HEARTBEAT_TTL_MISSING");
-        return Ok(());
-    };
-    if age_nanoseconds <= i128::from(heartbeat_ttl_seconds) * 1_000_000_000 {
-        decision.block("HEARTBEAT_TTL_ACTIVE");
+    match decision.heartbeat_ttl_seconds {
+        Some(heartbeat_ttl_seconds)
+            if age_nanoseconds <= i128::from(heartbeat_ttl_seconds) * 1_000_000_000 =>
+        {
+            decision.block("HEARTBEAT_TTL_ACTIVE");
+        }
+        Some(_) => {}
+        None => decision.unknown("ACTIVE_HEARTBEAT_TTL_MISSING"),
     }
     if age_nanoseconds <= i128::from(config.minimum_stale_seconds) * 1_000_000_000 {
         decision.block("MINIMUM_STALE_AGE_ACTIVE");

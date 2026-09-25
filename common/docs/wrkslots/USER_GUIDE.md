@@ -80,14 +80,19 @@ refuses publication and retains the recovery journal.
 When the owner runs in a dedicated transient systemd scope, `create`, `register`, `adopt`, and the
 live form of `import-existing` can record that stronger boundary. Pass both
 `--task-scope-unit UNIT.scope` and `--task-scope-invocation-id HEX32`, or neither. The owner PID is
-required, its recorded cgroup path must end in that exact scope unit, and `HEX32` is the lowercase
-32-hex `InvocationID` reported by systemd. Before publishing the row, wrkslots reads
+required, its recorded cgroup path must lie under the invoking user's systemd manager
+(`/user.slice/user-$UID.slice/user@$UID.service/`) and end in that exact scope unit, and `HEX32` is
+the lowercase 32-hex `InvocationID` reported by systemd. When the arguments are parsed and again
+immediately before publishing the row, wrkslots reads
 `/run/user/$UID/systemd/units/invocation:UNIT.scope` without following a replacement and requires
 its stable symlink target to equal `HEX32`. It then records the scope unit, invocation ID, cgroup
 path, boot ID, and owner PID/start-time generation together. If a crash leaves a create or live
 import journal, recovery repeats this link check immediately before it would publish the ACTIVE
 row; a missing, replaced, or retargeted link refuses publication and leaves the journal for
-inspection. For example, after placing the owner inside `agent-slot01.scope`:
+inspection. When the scope has really ended, discard the unpublished operation instead:
+`recover --slot SLOT --abort-create` removes a create's unchanged provisional worktrees, and
+`recover --abort-import` discards an import journal, which never changed any files. For example,
+after placing the owner inside `agent-slot01.scope`:
 
 ```sh
 TASK_SCOPE_UNIT=agent-slot01.scope
@@ -113,7 +118,9 @@ Git-registration discovery, and initialized nested-repository inspection.
 An append-only interrupted operation remains visible as a `BLOCKED` decision even when no ACTIVE
 row was ever published; unavailable generation, active-record digest, and heartbeat fields are
 reported as null instead of being invented. A plain rebuild without `--config`/`--evidence` also
-reports this blocker and adds `POLICY_INPUTS_MISSING`.
+reports this blocker and adds `POLICY_INPUTS_MISSING`. Once an index holds policy evidence, a plain
+rebuild of that index is refused rather than discarding the evidence; delete the disposable index
+file first to rebuild it without policy inputs.
 
 `--coordinator-authorized` on `remove` and `read-handoff` is optional provenance. It is required
 when `recover` starts a new cleanup for an unregistered validation path, because that operation has
