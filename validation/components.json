@@ -283,7 +283,8 @@
         "py/wrkslots/tests/test_event_memo.py",
         "py/wrkslots/tests/test_network.py",
         "py/wrkslots/tests/test_proc_status.py",
-        "py/wrkslots/tests/test_tool_authority.py"
+        "py/wrkslots/tests/test_tool_authority.py",
+        "py/wrkslots/tests/test_validate_batch_seal_ownership.py"
       ]
     },
     "wrkviz": {

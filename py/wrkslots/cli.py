@@ -20253,6 +20253,38 @@ def _write_validate_batch_seal_journal(
     _atomic_write_json(path, dict(payload))
 
 
+def _write_owned_validate_batch_seal_journal(
+    config: Config,
+    payload: Mapping[str, object],
+    owned: list[_RegularFileIdentity],
+) -> None:
+    """Write this invocation's seal and remember the exact file published."""
+
+    owned.clear()
+    _write_validate_batch_seal_journal(config, payload)
+    owned.append(
+        _read_regular_file_identity(
+            _validate_batch_seal_journal_path(config),
+            "validation-batch seal journal",
+            1024 * 1024,
+        )[1]
+    )
+
+
+def _validate_batch_seal_is_owned(
+    config: Config, owned: Sequence[_RegularFileIdentity]
+) -> bool:
+    """Return whether the current seal is exactly the file last written by us."""
+
+    path = _validate_batch_seal_journal_path(config)
+    if not owned or (not path.exists() and not path.is_symlink()):
+        return False
+    _contents, identity = _read_regular_file_identity(
+        path, "validation-batch seal journal", 1024 * 1024
+    )
+    return identity == owned[-1]
+
+
 def _assert_validate_batch_seals_disjoint_from_create(
     config: Config,
     *,
@@ -22095,10 +22127,14 @@ def _seal_validate_batch_targets(
     proof_manifests: Mapping[str, str],
     completed_records: Mapping[str, Path],
     removal_proofs: dict[str, _ValidationRemovalProof],
+    owned_seal: list[_RegularFileIdentity],
     *,
     single_validate_complete: bool = False,
 ) -> None:
-    """Preflight and seal each eligible target while the mutation locks are held."""
+    """Preflight and seal each eligible target while the mutation locks are held.
+
+    ``owned_seal`` receives the exact seal file this invocation publishes.
+    """
 
     with _mutation_locks(config, wait_seconds):
         _refuse_partial_state(config)
@@ -22132,7 +22168,7 @@ def _seal_validate_batch_targets(
             "actor": _identity_to_obj(coordinator),
             "targets": [],
         }
-        _write_validate_batch_seal_journal(config, seal_journal)
+        _write_owned_validate_batch_seal_journal(config, seal_journal, owned_seal)
         _interrupt_for_test("after-validate-batch-seal-journal")
         records = {record.slot: record for state in states for record in state.slots}
         for slot, generation in requested:
@@ -22219,7 +22255,9 @@ def _seal_validate_batch_targets(
                             config, selected_slot, selected_generation, target
                         ),
                     ]
-                    _write_validate_batch_seal_journal(config, seal_journal)
+                    _write_owned_validate_batch_seal_journal(
+                        config, seal_journal, owned_seal
+                    )
                     _interrupt_for_test("after-validate-batch-seal-target-planned")
 
                 original_mode, identity = _seal_cleanup_path_private(
@@ -22335,6 +22373,7 @@ def _remove_validate_batch(
     removed: list[dict[str, object]] = []
     same_uid_census_count = 0
     live_use_recheck = _LiveUseRecheckBudget()
+    owned_seal: list[_RegularFileIdentity] = []
     try:
         _seal_validate_batch_targets(
             config,
@@ -22349,6 +22388,7 @@ def _remove_validate_batch(
             proof_manifests,
             completed_records,
             removal_proofs,
+            owned_seal,
             single_validate_complete=single_validate_complete,
         )
         # Lock acquisition and the exact seal/preflight establish which paths
@@ -22455,8 +22495,14 @@ def _remove_validate_batch(
                 )
     finally:
         with _mutation_locks(config, args.wait_lock):
-            loaded_seal = _load_validate_batch_seal_journal(config)
-            has_finish = any(
+            # A refused invocation may find another operation's seal here; only
+            # the exact file this invocation published is its to retire.
+            loaded_seal = (
+                _load_validate_batch_seal_journal(config)
+                if _validate_batch_seal_is_owned(config, owned_seal)
+                else None
+            )
+            has_finish = loaded_seal is not None and any(
                 _as_str(
                     _load_journal(config, selected_path=journal_path)[1].get("kind"),
                     "journal.kind",

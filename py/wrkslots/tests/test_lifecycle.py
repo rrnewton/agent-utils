@@ -27466,7 +27466,7 @@ def test_remove_refuses_unrelated_finish_journal_before_target_mutation(
 @pytest.mark.parametrize(
     ("obstruction", "expected"),
     (("partial", "partial atomic update found"),
-     ("batch-seal", "validation-batch seal journal has invalid fields")),
+     ("batch-seal", "interrupted validation-batch seal recorded in")),
 )
 def test_scoped_validation_remove_keeps_global_recovery_obstructions(
     tmp_path: Path,
