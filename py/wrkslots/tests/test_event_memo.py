@@ -23,6 +23,7 @@ from wrkslots import cli
 from wrkslots.tests.test_lifecycle import (
     commit_validation_removal_schema,
     make_project,
+    prepare_cross_repository_target,
     prepare_dead_validate_slots,
     prepare_validation_removal_proof,
     stub_validate_batch_censuses,
@@ -317,6 +318,119 @@ def test_resumed_replay_rechecks_record_paths_like_a_cold_replay(
         )
         assert again == first
         assert work.folded == [0]
+
+
+def _warm_and_cold_refusals(
+    config: cli.Config, require_repository: bool
+) -> tuple[str, str]:
+    """Return the refusal a memoized replay gives and the one a cold replay gives."""
+
+    with pytest.raises(cli.Refusal) as warm:
+        cli._states_from_events(
+            config, config.machine, require_repository=require_repository
+        )
+    memo_stack = list(cli._ACTIVE_EVENT_MEMO)
+    cli._ACTIVE_EVENT_MEMO.clear()
+    try:
+        with pytest.raises(cli.Refusal) as cold:
+            cli._states_from_events(
+                config, config.machine, require_repository=require_repository
+            )
+    finally:
+        cli._ACTIVE_EVENT_MEMO.extend(memo_stack)
+    return str(warm.value), str(cold.value)
+
+
+def _replace_with_symlink(path: Path) -> None:
+    real = path.with_name(f"{path.name}-real")
+    path.rename(real)
+    path.symlink_to(real, target_is_directory=True)
+
+
+@pytest.mark.parametrize("require_repository", (False, True))
+def test_resumed_replay_rechecks_records_that_exist_only_in_the_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, require_repository: bool
+) -> None:
+    """A production log begins with a state import that can carry many slots."""
+
+    project, repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo",))
+    config = cli._load_config(str(project), "testhost")
+    replayed = cli._states_from_events(config, config.machine)
+    assert replayed is not None
+    active, archive = replayed
+    assert [record.slot for record in active.slots] == ["memo"]
+    directory = cli._event_directory(config)
+    for path in cli._event_files(directory):
+        path.unlink()
+    cli._write_event_file(
+        config,
+        config.machine,
+        "state-imported",
+        {
+            "active": cli._active_to_obj(active),
+            "archive": cli._archive_to_obj(archive),
+            "holds": [],
+        },
+    )
+    assert len(cli._event_files(directory)) == 1
+    work = _Work(monkeypatch)
+
+    with cli._event_memo_scope():
+        assert cli._states_from_events(
+            config, config.machine, require_repository=require_repository
+        ) == (active, archive)
+        work.folded.clear()
+        assert cli._states_from_events(
+            config, config.machine, require_repository=require_repository
+        ) == (active, archive)
+        assert work.folded == [0]
+        _replace_with_symlink(repository)
+        warm, cold = _warm_and_cold_refusals(config, require_repository)
+
+    assert "crosses a symlink" in cold
+    assert warm == cold
+
+
+def test_required_recheck_refuses_the_first_record_in_log_order(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo-a", "memo-b"))
+    config = cli._load_config(str(project), "testhost")
+
+    with cli._event_memo_scope():
+        assert cli._states_from_events(config, config.machine) is not None
+        for slot in ("memo-b", "memo-a"):
+            _replace_with_symlink(cli._slot_directory(config, slot, "validate"))
+        warm, cold = _warm_and_cold_refusals(config, True)
+
+    assert "memo-a" in cold and "memo-b" not in cold
+    assert warm == cold
+
+
+def test_unrequired_recheck_refuses_the_first_repository_in_log_order(
+    tmp_path: Path,
+) -> None:
+    project, other, _checkout = prepare_cross_repository_target(tmp_path)
+    config = cli._load_config(str(project), "testhost")
+    repositories = [
+        checkout.repository
+        for record in cli._load_active(config).slots
+        for checkout in record.checkouts
+    ]
+    assert len(set(repositories)) == 2
+
+    with cli._event_memo_scope():
+        assert cli._states_from_events(
+            config, config.machine, require_repository=False
+        ) is not None
+        _replace_with_symlink(other)
+        _replace_with_symlink(project / "repo")
+        warm, cold = _warm_and_cold_refusals(config, False)
+
+    assert cold.endswith(f"crosses a symlink: {project / 'repo'}")
+    assert warm == cold
 
 
 def test_remembered_replay_is_resumed_only_on_its_own_chain(

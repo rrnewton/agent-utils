@@ -4836,8 +4836,10 @@ def _event_from_path(
 # exact lstat identity and the chain position that validated it.  An event whose
 # change time is recent is never kept: a rewrite inside the same timestamp tick
 # could otherwise leave the identity unchanged.  Any later rewrite or rename
-# moves the change time, so a kept event can never hide a change.  Loaded events
-# are shared, never mutated, and consumers copy what they retain.
+# moves the change time, so a kept event can never hide a change.  The window
+# assumes the kernel stamps change times from this host's realtime clock, as a
+# local filesystem does; a clock stepped backwards only stops events being kept.
+# Loaded events are shared, never mutated, and consumers copy what they retain.
 _EVENT_MEMO_STABLE_NS = 2_000_000_000
 _EVENT_MEMO_ENTRIES_LIMIT = 1 << 17
 _REPLAY_MEMO_ENTRIES_LIMIT = 8
