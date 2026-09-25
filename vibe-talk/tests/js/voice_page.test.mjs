@@ -12087,6 +12087,35 @@ test("the SAME words in a LATER turn are a new row: repeating yourself is real",
   assert.deepStrictEqual(storedTexts(page), ["you: Yes.", "you: Yes."]);
 });
 
+test("a reconnect restarts the provider's turn numbers without touching the last call's rows", async () => {
+  // A new session numbers its turns from the start again, so turn 1 of the second call has the
+  // same identity as turn 1 of the first. Matching on that identity alone would rewrite the old
+  // row in place, or drop the new words as a late duplicate of it.
+  const page = newPage();
+  const first = await startNeutralCall(page);
+  speech(first, "user", 1, "Summarize the channel.", true);
+  turnDone(first, 1);
+  await page.el("hang-up").click();
+  await page.settle();
+
+  await page.el("talk").click();
+  const second = page.sockets[1];
+  assert.ok(second && second !== first, "the second call did not open a new socket");
+  second.onopen();
+  second.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  speech(second, "user", 1, "Summarize", false);
+  speech(second, "user", 1, "Summarize the channel.", true);
+  turnDone(second, 1);
+  await page.settle();
+
+  const rows = session_lines(page).map((li) => li.text());
+  assert.equal(rows.length, 2, `expected one row per call, got ${rows.length}`);
+  for (const row of rows) {
+    assert.match(row, /Summarize the channel\.$/);
+  }
+  assert.deepStrictEqual(storedTexts(page), ["you: Summarize the channel.", "you: Summarize the channel."]);
+});
+
 test("hanging up mid-turn stores the best text of the turn that was in progress", async () => {
   const page = newPage();
   const socket = await startNeutralCall(page);
