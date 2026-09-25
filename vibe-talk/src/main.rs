@@ -1,7 +1,9 @@
 //! `vibe-talk` server entry point.
 
+use std::future::IntoFuture;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use vibe_talk::agent_backend::NoAgentBackend;
@@ -18,6 +20,10 @@ use vibe_talk::state::AppState;
 use vibe_talk::store::disabled::DisabledStore;
 use vibe_talk::store::sqlite::SqliteStore;
 use vibe_talk::store::StateStore;
+
+/// Long enough for ordinary requests to finish, but shorter than an operator's stop timeout.
+/// Streaming responses can remain open forever, so graceful shutdown itself must have a bound.
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 const USAGE: &str = "\
 vibe-talk — a chat bridge for a voice agent
@@ -523,11 +529,47 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "vibe-talk listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serving")?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+    let mut server_shutdown = shutdown_rx.clone();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown(&mut server_shutdown).await;
+        })
+        .into_future();
+    match run_with_shutdown_deadline(server, shutdown_rx, GRACEFUL_SHUTDOWN_TIMEOUT).await {
+        Some(result) => result.context("serving")?,
+        None => tracing::warn!(
+            timeout_seconds = GRACEFUL_SHUTDOWN_TIMEOUT.as_secs(),
+            "graceful shutdown deadline reached; closing remaining streaming connections"
+        ),
+    }
     Ok(())
+}
+
+async fn wait_for_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
+}
+
+async fn run_with_shutdown_deadline<F>(
+    server: F,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    timeout: Duration,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => Some(result),
+        () = async {
+            wait_for_shutdown(&mut shutdown).await;
+            tokio::time::sleep(timeout).await;
+        } => None,
+    }
 }
 
 /// Check at startup that every configured channel can actually be read, and refuse to start if
@@ -618,5 +660,33 @@ async fn shutdown_signal() {
     tokio::select! {
         () = interrupt => tracing::info!("interrupted; shutting down"),
         () = terminate => tracing::info!("terminated; shutting down"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn an_open_stream_cannot_hold_shutdown_past_the_deadline() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let serving = std::future::pending::<()>();
+        let stopped = run_with_shutdown_deadline(serving, shutdown_rx, Duration::from_secs(5));
+        tokio::pin!(stopped);
+        assert!(shutdown_tx.send(true).is_ok());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(stopped.await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_server_exit_is_returned_without_waiting_for_shutdown() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let stopped = run_with_shutdown_deadline(
+            std::future::ready("served"),
+            shutdown_rx,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(stopped, Some("served"));
     }
 }

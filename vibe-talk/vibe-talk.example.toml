@@ -46,6 +46,10 @@ channel_registration = false
 # Environment: VIBE_TALK_DISCORD_BOT_TOKEN
 bot_token = "REPLACE-ME"
 
+# Deadline for one ordinary provider HTTP request, in seconds. Compatible bridges that perform a
+# bounded upstream command may need longer than the default 20. Values outside 1–120 are refused.
+request_timeout_seconds = 20
+
 # How many messages a read returns by default, and the ceiling a caller may request.
 default_fetch_limit = 50
 max_fetch_limit = 100
