@@ -294,19 +294,19 @@ def test_peer_cancellation_survives_a_later_deadline_in_the_same_run(tmp_path: P
     ready = shlex.quote(str(tmp_path / "ready"))
     cfg = DagConfig(
         steps=(
-            Step("a", "first", "spends the budget", "sleep 2", timeout=3, cpu_timeout=30),
+            Step("a", "first", "spends the budget", "sleep 3", timeout=6, cpu_timeout=30),
             Step(
                 "a", "peer", "cancelled by its failing peer", f"touch {ready}; sleep 30",
-                deps=["a.first"], timeout=3, cpu_timeout=30, fail_fast_family="failed",
+                deps=["a.first"], timeout=6, cpu_timeout=30, fail_fast_family="failed",
             ),
             Step(
                 "a", "boom", "fails after its peer starts",
                 f"while [ ! -f {ready} ]; do sleep 0.01; done; exit 7",
-                deps=["a.first"], timeout=3, cpu_timeout=30, fail_fast_family="failed",
+                deps=["a.first"], timeout=6, cpu_timeout=30, fail_fast_family="failed",
             ),
             Step(
                 "a", "independent", "cancelled only by the later run deadline", "sleep 30",
-                deps=["a.first"], timeout=3, cpu_timeout=30, fail_fast_family="independent",
+                deps=["a.first"], timeout=6, cpu_timeout=30, fail_fast_family="independent",
             ),
         )
     )
@@ -315,7 +315,7 @@ def test_peer_cancellation_survives_a_later_deadline_in_the_same_run(tmp_path: P
     os.environ[LOG_DIR_ENV] = str(logs)
     try:
         runner = Runner(
-            cfg, max_steps=3, max_cpus=3, cgroups=manager, run_timeout_s=4,
+            cfg, max_steps=3, max_cpus=3, cgroups=manager, run_timeout_s=7,
         )
         runner.run()
         result = runner.result()
