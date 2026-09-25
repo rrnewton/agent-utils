@@ -39,6 +39,12 @@ three controls appear above the history:
 * **All** interleaves channel and thread messages chronologically. Colored **Thread** badges
   distinguish conversations; tapping a badge opens that thread.
 
+A source added through Settings is always a separate entry in the channel picker, even when that
+source identifies one upstream conversation rather than a whole room. The **Threads** control is a
+different projection: it lists child conversations within the currently selected channel, and is
+absent when the configured backend does not provide thread timelines. It is not an alternate
+picker for added sources.
+
 The selected channel or space is remembered on this device when you reopen the app. If it is no
 longer configured, the app selects the first available channel.
 
@@ -775,7 +781,7 @@ code path the startup probe uses, which is itself in the same position — see *
 | Channel registration | `discord.channel_registration` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels` and `DELETE /channels/{id}` |
 | Upstream read marks | `discord.upstream_read_marks` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels/{id}/read` |
 | Chat service name | `discord.provider_name` | — | `Discord`; set to the source service's name (for example, `Google Chat`) when using a compatible HTTP bridge |
-| Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` for older bridges without thread support |
+| Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` to disable child-thread timelines; an added source that identifies one upstream conversation remains an ordinary channel-picker entry in every mode |
 | Discord bot token | `discord.bot_token` | `VIBE_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `VIBE_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `VIBE_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |

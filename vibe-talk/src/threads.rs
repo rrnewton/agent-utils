@@ -16,7 +16,11 @@ pub enum ThreadApi {
     Native,
     /// The normalized timeline and thread endpoints of a compatible bridge.
     Bridge,
-    /// Thread discovery and thread-specific posting are disabled.
+    /// Child-thread discovery and thread-specific posting are disabled.
+    ///
+    /// A provider-managed source that identifies one upstream conversation may still be exposed
+    /// as an ordinary app channel. This setting controls the projection within that channel, not
+    /// which sources appear in the channel picker.
     Off,
 }
 
