@@ -114,6 +114,35 @@ fn active_record_for(slot: &str, agent: &str, generation: u64, slot_type: &str) 
     })
 }
 
+/// The journal a create or import writer embeds for `record`, as far as replay
+/// reads it: the slot type and every checkout path the attempt places.
+fn attempt_journal(operation: &str, record: &Value) -> Value {
+    if operation == "import-existing" {
+        return json!({
+            "schema": 2,
+            "kind": operation,
+            "machine": "node-a",
+            "slot": record["slot"].clone(),
+            "record": record.clone(),
+        });
+    }
+    let planned = record["checkouts"]
+        .as_array()
+        .expect("fixture checkouts")
+        .iter()
+        .map(|checkout| json!({"name": checkout["name"].clone(), "destination": checkout["path"].clone()}))
+        .collect::<Vec<_>>();
+    json!({
+        "schema": 2,
+        "kind": operation,
+        "machine": "node-a",
+        "slot": record["slot"].clone(),
+        "slot_type": record["slot_type"].clone(),
+        "planned": planned,
+        "created": [],
+    })
+}
+
 fn imported_active_record(slot: &str, agent: &str, generation: u64) -> Value {
     let mut record = active_record_for(slot, agent, generation, "agent");
     let owner = record["owner"].clone();
@@ -5616,7 +5645,7 @@ fn create_import_recovery_log(
             "slot": "slot-a",
             "operation": operation,
             "journal_path": journal_path,
-            "journal": {"schema": 2, "kind": operation, "machine": "node-a", "slot": "slot-a"},
+            "journal": attempt_journal(operation, &record),
         }),
     );
     if matches!(outcome, CreateImportOutcome::RowDurable) {
@@ -5726,9 +5755,10 @@ fn completed_create_and_import_recoveries_close_their_marker_only_with_a_row() {
 
 #[test]
 fn a_later_create_of_the_same_slot_closes_a_row_less_recovery_marker() {
-    // Python's create refuses an existing slot path, so a later create that
-    // publishes a row proves the aborted attempt left no slot directory, and
-    // the new row owns that path. Both journal paths are reused per slot.
+    // Python's create refuses an existing slot path, so a later create of the
+    // same slot type that publishes a row owning every checkout path the
+    // aborted attempt planned proves that attempt left no slot directory.
+    // Both journal paths are reused per slot.
     for journal_path in ["CREATE.6.node-a.6.slot-a.journal", "ACTIVE.node-a.journal"] {
         let scratch = Scratch::new();
         let events = scratch.events();
@@ -5737,7 +5767,7 @@ fn a_later_create_of_the_same_slot_closes_a_row_less_recovery_marker() {
             "slot": "slot-a",
             "operation": "create",
             "journal_path": journal_path,
-            "journal": {"schema": 2, "kind": "create", "machine": "node-a", "slot": "slot-a"},
+            "journal": attempt_journal("create", &record),
         });
         let completion =
             json!({"slot": "slot-a", "operation": "create", "journal_path": journal_path});
@@ -5844,40 +5874,74 @@ fn a_later_create_of_the_same_slot_closes_a_row_less_recovery_marker() {
 
 #[test]
 fn create_recovery_marker_closes_only_on_its_bound_journal() {
-    // Python refuses two pending journals for one slot operation, so the only
-    // binding that can differ from a later completion is the legacy default:
-    // a recovery with no journal in the history is bound to the singleton.
-    // Completing a create journal elsewhere does not prove that one ended.
+    // A recovery that loads an already-completed legacy singleton journal is
+    // bound to that path. A later create of the same slot at the scoped path
+    // publishes a row owning the same storage, yet completing that other
+    // journal does not prove the singleton attempt ended.
     let scratch = Scratch::new();
     let events = scratch.events();
     let create_path = "CREATE.6.node-a.6.slot-a.journal";
     let singleton = "ACTIVE.node-a.journal";
+    let record = active_record("slot-a", 1);
+    let progress = |journal_path: &str| {
+        json!({
+            "slot": "slot-a",
+            "operation": "create",
+            "journal_path": journal_path,
+            "journal": attempt_journal("create", &record),
+        })
+    };
+    let completion = |journal_path: &str| json!({"slot": "slot-a", "operation": "create", "journal_path": journal_path});
     let mut tip = import_log(&events, vec![], vec![]);
     tip = append_event(
         &events,
         2,
+        &tip,
+        "operation-progress-recorded",
+        progress(singleton),
+    );
+    tip = append_event(
+        &events,
+        3,
+        &tip,
+        "operation-completed",
+        completion(singleton),
+    );
+    tip = append_event(
+        &events,
+        4,
         &tip,
         "recovery-started",
         recovery_started_payload("slot-a", "create"),
     );
     tip = append_event(
         &events,
-        3,
+        5,
         &tip,
         "operation-progress-recorded",
+        progress(create_path),
+    );
+    tip = append_event(
+        &events,
+        6,
+        &tip,
+        "active-state-recorded",
         json!({
+            "action": "slot-created",
             "slot": "slot-a",
-            "operation": "create",
-            "journal_path": create_path,
-            "journal": {"schema": 2, "kind": "create", "machine": "node-a", "slot": "slot-a"},
+            "previous_revision": 0,
+            "revision": 1,
+            "previous_record_sha256": null,
+            "record": record.clone(),
+            "evidence": {},
         }),
     );
     append_event(
         &events,
-        4,
+        7,
         &tip,
         "operation-completed",
-        json!({"slot": "slot-a", "operation": "create", "journal_path": create_path}),
+        completion(create_path),
     );
     assert_eq!(python_pending_journals(&events), json!({}));
     let pending = replay_stream(&events, None, |_| Ok(()))
@@ -5888,6 +5952,131 @@ fn create_recovery_marker_closes_only_on_its_bound_journal() {
         .map(|pending| (pending.kind, pending.journal_path.as_deref()))
         .collect::<Vec<_>>();
     assert_eq!(kinds, [(PendingOperationKind::Recovery, Some(singleton))]);
+}
+
+#[test]
+fn a_later_create_that_does_not_own_the_aborted_storage_keeps_the_recovery_marker() {
+    // Python derives the refused slot path from the new create's slot type,
+    // so a create of the same slot name under the other slot type proves
+    // nothing about the aborted attempt's directory. A row owning only some
+    // of the attempt's planned checkouts, or an attempt whose journal does
+    // not identify its storage, likewise leaves storage no row accounts for.
+    let create_path = "CREATE.6.node-a.6.slot-a.journal";
+    let agent_record = active_record("slot-a", 1);
+    let validate_record = active_record_for("slot-a", "agent-slot-a", 1, "validate");
+    let mut wider = attempt_journal("create", &agent_record);
+    wider["planned"]
+        .as_array_mut()
+        .expect("planned checkouts")
+        .push(json!({"name": "docs", "destination": "worktrees/slots/slot-a/docs"}));
+    // The same checkout paths under the other slot type isolate the slot-type
+    // comparison from the path comparison.
+    let mut validate_at_agent_paths = validate_record.clone();
+    validate_at_agent_paths["checkouts"] = agent_record["checkouts"].clone();
+    let mut unidentified = attempt_journal("create", &agent_record);
+    unidentified
+        .as_object_mut()
+        .expect("journal object")
+        .remove("planned");
+    for (case, aborted_journal, recreated) in [
+        (
+            "other slot type",
+            attempt_journal("create", &agent_record),
+            &validate_record,
+        ),
+        (
+            "same paths, other slot type",
+            attempt_journal("create", &agent_record),
+            &validate_at_agent_paths,
+        ),
+        ("unowned planned checkout", wider, &agent_record),
+        ("unidentified storage", unidentified, &agent_record),
+    ] {
+        let scratch = Scratch::new();
+        let events = scratch.events();
+        let completion =
+            json!({"slot": "slot-a", "operation": "create", "journal_path": create_path});
+        let mut tip = import_log(&events, vec![], vec![]);
+        tip = append_event(
+            &events,
+            2,
+            &tip,
+            "operation-progress-recorded",
+            json!({
+                "slot": "slot-a",
+                "operation": "create",
+                "journal_path": create_path,
+                "journal": aborted_journal,
+            }),
+        );
+        tip = append_event(
+            &events,
+            3,
+            &tip,
+            "recovery-started",
+            recovery_started_payload("slot-a", "create"),
+        );
+        tip = append_event(&events, 4, &tip, "operation-completed", completion.clone());
+        tip = append_event(
+            &events,
+            5,
+            &tip,
+            "operation-progress-recorded",
+            json!({
+                "slot": "slot-a",
+                "operation": "create",
+                "journal_path": create_path,
+                "journal": attempt_journal("create", recreated),
+            }),
+        );
+        tip = append_event(
+            &events,
+            6,
+            &tip,
+            "active-state-recorded",
+            json!({
+                "action": "slot-created",
+                "slot": "slot-a",
+                "previous_revision": 0,
+                "revision": 1,
+                "previous_record_sha256": null,
+                "record": recreated.clone(),
+                "evidence": {},
+            }),
+        );
+        append_event(&events, 7, &tip, "operation-completed", completion);
+        assert_eq!(python_pending_journals(&events), json!({}), "{case}");
+        let pending = replay_stream(&events, None, |_| Ok(()))
+            .unwrap_or_else(|error| panic!("replay {case}: {error}"))
+            .pending_operations
+            .iter()
+            .map(|pending| (pending.kind, pending.journal_path.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending,
+            [(PendingOperationKind::Recovery, Some(create_path.to_owned()))],
+            "{case}"
+        );
+        let (config, evidence) = write_policy_inputs(
+            &scratch,
+            std::slice::from_ref(recreated),
+            "2026-09-22T09:40:01+00:00",
+            |_| {},
+        );
+        let decisions =
+            evaluate_policy_at(&events, &config, &evidence, "2026-09-22T09:40:01+00:00")
+                .unwrap_or_else(|error| panic!("evaluate {case}: {error}"));
+        assert_eq!(decisions.len(), 1, "{case}");
+        assert_eq!(decisions[0].verdict, Verdict::Blocked, "{case}");
+        assert!(
+            decisions[0]
+                .reason_codes
+                .iter()
+                .any(|code| code == "RECOVERY_PENDING"),
+            "{case}: {:?}",
+            decisions[0].reason_codes
+        );
+    }
 }
 
 #[test]
