@@ -28175,7 +28175,7 @@ def test_final_slot_scan_does_not_use_stale_census_for_indeterminate_current_uid
         )
 
 
-def test_mount_namespace_reselects_after_representative_generation_changes(
+def test_mount_namespace_refuses_matching_representative_generation_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = Path("/absent/validate/gone")
@@ -28192,6 +28192,43 @@ def test_mount_namespace_reselects_after_representative_generation_changes(
     ) -> tuple[tuple[Path, str], ...]:
         inspected.append(pid)
         return ((target, str(target)),) if pid == 123 else ()
+
+    monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
+    monkeypatch.setattr(
+        wrkslots,
+        "_process_start_ticks",
+        lambda path: None if path.name == "123" else 18,
+    )
+    with pytest.raises(
+        wrkslots.Refusal,
+        match=(
+            r"PID 123 identity changed after mount matched a selected path; "
+            r"the selected path may still be in use"
+        ),
+    ):
+        wrkslots._absent_validate_mount_match(processes, {target: "gone"})
+    # Once positive target evidence exists, falling through to a second
+    # representative could turn an actual use into a false all-clear.
+    assert inspected == [123]
+
+
+def test_mount_namespace_reselects_after_nonmatching_representative_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path("/absent/validate/gone")
+    processes = (
+        wrkslots._AbsentProcessObservation(123, 17, "/other", "mnt:[same]"),
+        wrkslots._AbsentProcessObservation(124, 18, "/other", "mnt:[same]"),
+    )
+    inspected: list[int] = []
+
+    def mountinfo(
+        pid: int,
+        _budget: wrkslots._ReadOnlyCommandBudget,
+        _cache: dict[str, tuple[tuple[Path, str], ...]] | None = None,
+    ) -> tuple[tuple[Path, str], ...]:
+        inspected.append(pid)
+        return ()
 
     monkeypatch.setattr(wrkslots, "_mountinfo_path_references", mountinfo)
     monkeypatch.setattr(
@@ -28582,6 +28619,75 @@ def test_process_census_unknown_identity_refuses_without_retry(
             wrkslots._capture_same_uid_process_path_census((Path("/fixture/slot"),), budget=budget)
     assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
     assert snapshots == (1 if stage == "preflight" else 0)
+
+
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+def test_process_census_preflight_omits_proven_terminal_generation(
+    monkeypatch: pytest.MonkeyPatch, lane: str,
+) -> None:
+    process = wrkslots._AbsentProcessObservation(123, 17, "", "pid:123")
+    snapshots = 0
+
+    def snapshot() -> tuple[wrkslots._AbsentProcessObservation, ...]:
+        nonlocal snapshots
+        snapshots += 1
+        return (process,)
+
+    def observer(
+        processes: Sequence[wrkslots._AbsentProcessObservation],
+        _targets: Mapping[Path, str],
+        _budget: wrkslots._ReadOnlyCommandBudget | None = None,
+    ) -> tuple[()]:
+        assert processes == ()
+        return ()
+
+    monkeypatch.setattr(wrkslots, "_absent_validate_process_snapshot", snapshot)
+    monkeypatch.setattr(
+        wrkslots, "_same_uid_process_observations", lambda _budget: snapshot()
+    )
+    monkeypatch.setattr(
+        wrkslots, "_read_process_stat", lambda _path: wrkslots._ProcessStat(17, 0)
+    )
+    monkeypatch.setattr(
+        wrkslots, "_process_observation_is_active", lambda _process: False
+    )
+    monkeypatch.setattr(
+        wrkslots, "_process_generation_is_terminal", lambda _path, _stat: True
+    )
+    monkeypatch.setattr(wrkslots, "_absent_validate_find_matches", observer)
+    monkeypatch.setattr(wrkslots, "_absent_validate_maps_matches", observer)
+    monkeypatch.setattr(wrkslots, "_absent_validate_mount_matches", observer)
+    monkeypatch.setattr(
+        wrkslots,
+        "_same_uid_batched_path_matches",
+        lambda processes, _targets, _budget: (
+            ((), ())
+            if processes == ()
+            else pytest.fail("terminal process reached same-UID path readers")
+        ),
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_run_root_owned_command",
+        lambda *_args, **_kwargs: pytest.fail(
+            "terminal process reached a privileged command"
+        ),
+    )
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=5, stdout_limit=1024, stderr_limit=1024,
+    )
+    census = (
+        wrkslots._capture_process_path_census(
+            (Path("/fixture/slot"),), budget=budget
+        )
+        if lane == "privileged"
+        else wrkslots._capture_same_uid_process_path_census(
+            (Path("/fixture/slot"),), budget=budget
+        )
+    )
+    assert census.processes == ()
+    assert census.matches == ()
+    assert snapshots == 1
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))

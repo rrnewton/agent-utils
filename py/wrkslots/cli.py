@@ -28727,23 +28727,32 @@ def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
     return after is not None and after.start_ticks == process.start_ticks
 
 
-def _assert_process_observations_active(
+def _preflight_process_observations(
     processes: Sequence[_AbsentProcessObservation],
     budget: _ReadOnlyCommandBudget,
-) -> None:
+) -> tuple[_AbsentProcessObservation, ...]:
+    """Reject unstable identities and omit proven terminal generations."""
+
+    retained: list[_AbsentProcessObservation] = []
     for process in processes:
         budget.remaining_seconds()
         # Retain vanished identities in the original tuple: every downstream
         # observer must still establish absence or reject stale/reused evidence.
         pid_dir = Path("/proc") / str(process.pid)
         if _read_process_stat(pid_dir) is None:
+            retained.append(process)
             continue
         if _process_observation_is_active(process):
+            retained.append(process)
             continue
-        # Ordinary exit/zombie churn is positive terminal evidence. Retain the
-        # identity for downstream observers without restarting the host scan.
+        # Ordinary exit/zombie churn is positive terminal evidence. Once the
+        # same generation is proven terminal it cannot retain path or mount
+        # references, so do not send it to privileged readers. A merely
+        # vanished identity is retained above because PID reuse can race those
+        # readers and must still be detected downstream.
         current = _read_process_stat(pid_dir)
         if current is None:
+            retained.append(process)
             continue
         if current.start_ticks != process.start_ticks:
             raise _ProcessEvidenceChanged(
@@ -28754,6 +28763,7 @@ def _assert_process_observations_active(
         raise _ProcessEvidenceChanged(
             f"PID {process.pid} liveness changed before process path census"
         )
+    return tuple(retained)
 
 
 def _allow_only_vanished_process_diagnostics(
@@ -29244,7 +29254,7 @@ def _capture_same_uid_process_path_census(
         budget.remaining_seconds()
         try:
             processes = _same_uid_process_observations(budget)
-            _assert_process_observations_active(processes, budget)
+            processes = _preflight_process_observations(processes, budget)
             direct_matches, indeterminate = _same_uid_batched_path_matches(
                 processes, targets, budget
             )
@@ -29975,7 +29985,9 @@ def _capture_process_path_census(
                     include_owner_cgroups=False
                 )
             )
-            _assert_process_observations_active(processes, selected_budget)
+            processes = _preflight_process_observations(
+                processes, selected_budget
+            )
             path_matches = (
                 *_absent_validate_find_matches(processes, targets, selected_budget),
                 *_absent_validate_maps_matches(processes, targets, selected_budget),
