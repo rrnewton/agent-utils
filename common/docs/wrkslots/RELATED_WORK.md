@@ -136,18 +136,18 @@ Create and import-existing are the exception, but only when the slot has an ACTI
 completion. Such a completion closes the `recovery-started` marker for the same slot and operation
 when that marker is bound to the completed journal path, because the row now owns the slot's
 storage. A marker bound to another path stays open, such as the default for a journal that predates
-the event log. A completion that leaves no ACTIVE row also leaves the marker open. The current
-abort paths below leave no provisional storage, but replay reads histories written by every past
-writer, and a production history contains a create journal completed after `recovery-started` with
-no row ever published while its provisioned worktree, holding commits beyond the recorded start
-point, remained on disk. Such a slot therefore stays `BLOCKED` with `ACTIVE_RECORD_MISSING` and
+the event log. A completion that leaves no ACTIVE row also leaves the marker open. The current abort
+paths below leave no provisional storage, but replay reads histories written by every past writer,
+and a production history contains a create journal completed after `recovery-started` with no row
+ever published while its provisioned worktree, holding commits beyond the recorded start point,
+remained on disk. Such a slot therefore stays `BLOCKED` with `ACTIVE_RECORD_MISSING` and
 `RECOVERY_PENDING` instead of disappearing from the observer. The cost is a blocker for a slot that
 current code aborted cleanly, which lasts until the same slot is created again. Both create journal
 paths are reused by every create of a slot, and `_cmd_create` refuses an existing slot path, so a
 later create that publishes a row proves that the aborted attempt left no slot directory; its
 completion closes the earlier marker. That proof does not extend to branches or caches outside the
-slot path that an older writer may have left. The enumeration of `py/wrkslots/cli.py` below supports the
-row-present cases for histories written by that code. Line numbers are at `3156e0f`.
+slot path that an older writer may have left. The enumeration of `py/wrkslots/cli.py` below supports
+the row-present cases for histories written by that code. Line numbers are at `3156e0f`.
 
 - `_clear_journal` (5472) is the only writer of `operation-completed` (5483). Every
   `_write_event_file` and `writer.append` call passes a literal kind. The other occurrences, at 5558
