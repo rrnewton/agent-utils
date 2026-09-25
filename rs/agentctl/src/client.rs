@@ -2339,7 +2339,9 @@ mod tests {
             command
                 .args([
                     "-c",
-                    "/usr/bin/setsid /bin/sleep 30 & printf '%s\\n' \"$!\" > \"$1\"; exit 0",
+                    // The holder publishes its own pid atomically, so a timeout that kills this
+                    // shell cannot truncate the marker, and a forked holder is still recorded.
+                    "/usr/bin/setsid /bin/sh -c 'printf \"%s\\n\" \"$$\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\" && exec /bin/sleep 30' agentctl-holder \"$1\" & exit 0",
                     "agentctl-test",
                 ])
                 .arg(&self.escaped_pid_file);
@@ -2378,6 +2380,19 @@ mod tests {
                 .trim()
                 .parse()
                 .expect("fixture child pid is numeric")
+        }
+
+        fn wait_for_pid(path: &Path, timeout: Duration) -> Option<libc::pid_t> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Ok(value) = fs::read_to_string(path) {
+                    return Some(value.trim().parse().expect("fixture child pid is numeric"));
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
         }
 
         fn group_pid(&self) -> libc::pid_t {
@@ -3129,21 +3144,32 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn control_timeout_includes_pipes_inherited_after_the_parent_exits() {
-        let escaped = RecordedChild::new("setsid-holder");
         let mut unrelated = ChildGuard(Command::new("/bin/sleep").arg("30").spawn().unwrap());
-        let started = Instant::now();
-        // The timeout remains explicit, but leaves enough startup budget for the fixture to
-        // prove that its escaped descendant actually inherited the capture pipes under a loaded
-        // parallel test harness. The separate EINTR test exercises the short 150ms deadline.
-        let result = bounded_output(escaped.escaped_pipe_command(), Duration::from_secs(1));
-        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(5));
-        // The setsid child escaped the supervised group and really was retaining both capture
-        // pipes, so returning promptly did not depend on receiving EOF from reader threads.
-        assert_eq!(unsafe { libc::kill(escaped.escaped_pid(), 0) }, 0);
-        // The pinned private group must not be confused with any unrelated numeric identity.
-        assert!(unrelated.0.try_wait().unwrap().is_none());
-        escaped.terminate_escaped();
+        // The timeout remains explicit, but its clock starts at spawn, so a loaded host can fire
+        // it before the shell forks the escaped holder. Such an attempt never exercised inherited
+        // pipes; retry it with a longer budget. The separate EINTR test exercises the short
+        // 150ms deadline.
+        for timeout in [1, 3, 10].map(Duration::from_secs) {
+            let escaped = RecordedChild::new("setsid-holder");
+            let started = Instant::now();
+            let result = bounded_output(escaped.escaped_pipe_command(), timeout);
+            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
+            assert!(started.elapsed() < timeout + Duration::from_secs(4));
+            // Once forked, the holder is outside the killed group and publishes itself.
+            let Some(pid) =
+                RecordedChild::wait_for_pid(&escaped.escaped_pid_file, Duration::from_secs(5))
+            else {
+                continue;
+            };
+            // The setsid child escaped the supervised group and really was retaining both capture
+            // pipes, so returning promptly did not depend on receiving EOF from reader threads.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+            // The pinned private group must not be confused with any unrelated numeric identity.
+            assert!(unrelated.0.try_wait().unwrap().is_none());
+            escaped.terminate_escaped();
+            return;
+        }
+        panic!("the escaped pipe holder was never started before any timeout");
     }
 
     #[cfg(target_os = "linux")]
