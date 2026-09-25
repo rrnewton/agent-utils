@@ -4622,11 +4622,14 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     } else {
         None
     };
+    let selected_subgraph = filtered
+        .as_ref()
+        .is_some_and(|selected| selected.steps.len() < cfg.steps.len());
     let selected: &DagConfig = filtered.as_ref().unwrap_or(cfg);
 
     // A command opts into passthrough by carrying the reserved `{args}` token.  Apply this before
     // stress expansion so every shard receives the same scoped command.
-    let with_args = match apply_passthrough_args(selected, a.passthrough_args.as_deref()) {
+    let mut with_args = match apply_passthrough_args(selected, a.passthrough_args.as_deref()) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("{PROG}: run: {error}");
@@ -4653,6 +4656,17 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // commands which cannot be clamped must fail before sizing or expansion.
     let max_cpus = select_max_cpus_bounded(a, inherited_max_cpus);
     let effective_max_mem_bytes = select_max_mem_bytes(a, inherited_max_mem_bytes);
+    let inherited_memory_budget = uses_inherited_memory_budget(a, inherited_max_mem_bytes);
+    if let Some(budget) =
+        effective_max_mem_bytes.filter(|_| selected_subgraph || inherited_memory_budget)
+    {
+        // A selected config retains the source DAG's non-step policy, including its conservative
+        // whole-graph floor. That floor is not evidence that an omitted node consumes memory.
+        // Bound it to this invocation's physical budget before every planner/stress/admission
+        // preflight; the selected steps' own hard/default/RSS-derived caps remain unchanged and
+        // still refuse a genuinely infeasible selection.
+        with_args.mem_cap_floor_bytes = with_args.mem_cap_floor_bytes.min(budget);
+    }
     if let Err(error) = validate_max_cpus_rewrite(&with_args, max_cpus) {
         eprintln!("{PROG}: run: {error}");
         return 2;
@@ -4873,7 +4887,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         a,
         max_cpus,
         effective_max_mem_bytes,
-        uses_inherited_memory_budget(a, inherited_max_mem_bytes),
+        inherited_memory_budget,
     );
     if max_steps < 1 {
         return 2;
@@ -5776,6 +5790,99 @@ mod tests {
             ["test.unit"]
         );
         assert!(selected.steps[0].deps.is_empty());
+    }
+
+    #[test]
+    fn selected_run_memory_sizing_excludes_omitted_steps_but_keeps_dependencies() {
+        let marker = std::env::temp_dir().join(format!(
+            "dagrun-selected-memory-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let label_marker = std::env::temp_dir().join(format!(
+            "dagrun-label-selected-memory-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&label_marker);
+        let cfg = dag_from_json(
+            &serde_json::json!({
+                "mem_cap_floor_bytes": 8 * 1024_i64.pow(3),
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "large-dependency",
+                        "cmd": "true",
+                        "labels": ["all"],
+                        "hint": {"hard_mem_max_bytes": 8 * 1024_i64.pow(3)},
+                    },
+                    {
+                        "group": "g",
+                        "job": "small",
+                        "cmd": format!("touch {}", marker.display()),
+                        "deps": ["g.large-dependency"],
+                        "labels": ["all"],
+                        "hint": {"rss_baseline_bytes": 256 * 1024_i64.pow(2)},
+                    },
+                    {
+                        "group": "g",
+                        "job": "label-small",
+                        "cmd": format!("touch {}", label_marker.display()),
+                        "labels": ["all", "small-only"],
+                        "hint": {"rss_baseline_bytes": 256 * 1024_i64.pow(2)},
+                    },
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let common = [
+            "--selected=g.small",
+            "--max-cpus=2",
+            "--max-mem=1G",
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "--no-profile-feedback",
+            "--quiet",
+        ]
+        .map(String::from);
+
+        let mut ignored = common.to_vec();
+        ignored.push("--ignore-selected-deps".into());
+        let ignored = parse_run_args(&ignored).unwrap();
+        assert_eq!(cmd_run(&cfg, &ignored, &Palette { enabled: false }), 0);
+        assert!(marker.exists());
+
+        std::fs::remove_file(&marker).unwrap();
+        let closed = parse_run_args(&common).unwrap();
+        assert_eq!(cmd_run(&cfg, &closed, &Palette { enabled: false }), 2);
+        assert!(!marker.exists());
+
+        let mut all_tags = common.to_vec();
+        all_tags[0] = "--selected=g.large-dependency,g.small,g.label-small".into();
+        all_tags.push("--ignore-selected-deps".into());
+        let all_tags = parse_run_args(&all_tags).unwrap();
+        assert_eq!(cmd_run(&cfg, &all_tags, &Palette { enabled: false }), 2);
+        assert!(!marker.exists());
+        assert!(!label_marker.exists());
+
+        let mut all_labels = common.to_vec();
+        all_labels[0] = "--labels=all".into();
+        let all_labels = parse_run_args(&all_labels).unwrap();
+        assert_eq!(cmd_run(&cfg, &all_labels, &Palette { enabled: false }), 2);
+        assert!(!marker.exists());
+        assert!(!label_marker.exists());
+
+        let mut partial_label = common.to_vec();
+        partial_label[0] = "--labels=small-only".into();
+        let partial_label = parse_run_args(&partial_label).unwrap();
+        assert_eq!(
+            cmd_run(&cfg, &partial_label, &Palette { enabled: false }),
+            0
+        );
+        assert!(label_marker.exists());
+        std::fs::remove_file(label_marker).unwrap();
     }
 
     #[test]

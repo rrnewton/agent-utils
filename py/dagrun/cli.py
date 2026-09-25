@@ -4109,6 +4109,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
 
     # A selection includes its full dependency ancestry by default. Validate and select BEFORE
     # cgroup bring-up so a bad combination or tag fails fast (exit 2) without needing a scope.
+    source_step_count = len(cfg.steps)
     selected_raw = ns.selected if isinstance(ns.selected, str) else None
     labels_raw = ns.labels if isinstance(ns.labels, str) else None
     ignore_selected_deps = bool(ns.ignore_selected_deps)
@@ -4141,6 +4142,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         except _SelectedError as exc:
             print(f"{PROG}: {exc}", file=sys.stderr)
             return 2
+    selected_subgraph = len(cfg.steps) < source_step_count
 
     # Feature: --args — forward extra args into the selected step(s) that declare the {args}
     # placeholder (scope a step down to specific test case(s)). Applied BEFORE --stress so the
@@ -4167,6 +4169,21 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # reject those before either sizing or expansion.
     max_cpus = _select_max_cpus(ns, inherited_max_cpus)
     effective_max_mem_bytes = _select_max_mem_bytes(ns, inherited_max_mem_bytes)
+    inherited_memory_budget = _uses_inherited_memory_budget(
+        ns, inherited_max_mem_bytes
+    )
+    if effective_max_mem_bytes is not None and (
+        selected_subgraph or inherited_memory_budget
+    ):
+        # A selected config retains the source DAG's non-step policy, including its conservative
+        # whole-graph floor. That floor is not evidence that an omitted node consumes memory.
+        # Bound it to this invocation's physical budget before every planner/stress/admission
+        # preflight; the selected steps' own hard/default/RSS-derived caps remain unchanged and
+        # still refuse a genuinely infeasible selection.
+        cfg = dataclasses.replace(
+            cfg,
+            mem_cap_floor_bytes=min(cfg.mem_cap_floor_bytes, effective_max_mem_bytes),
+        )
     if error := _self_managed_width_error(cfg, max_cpus):
         print(f"{PROG}: run: {error}", file=sys.stderr)
         return 2
@@ -4390,9 +4407,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         ns,
         max_cpus,
         effective_max_mem_bytes,
-        inherited_memory_budget=_uses_inherited_memory_budget(
-            ns, inherited_max_mem_bytes
-        ),
+        inherited_memory_budget=inherited_memory_budget,
     )
     if max_steps < 1:
         if core_reservation is not None:

@@ -19,3 +19,7 @@ updated_at: 2026-09-25T11:39:54.964293653+00:00
 # Acceptance Criteria
 
 The report covers every executable gate and every `py/` pytest case with duration and ownership; Rust/libtest, JavaScript/browser, cross-language, package, example, and application cases without a common per-case timing schema are enumerated under measured owning gates and tracked for unified telemetry follow-up; expensive tests have an evidence-backed coverage rationale; fixed waits and redundant coverage are optimized; retained integration tests run only in relevant lanes.
+
+# Follow-up
+
+[gpt-5.6-sol] Cross-runner per-case telemetry beyond the complete gate-level ranking is tracked by #27 cross-runner-test-timing.

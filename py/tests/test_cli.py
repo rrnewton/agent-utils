@@ -679,6 +679,106 @@ def test_delegated_process_can_run_twice_in_process_after_aggregate_migration(
     assert all("step-outer.delegating/supervisor" in line for line in returned)
 
 
+def test_selected_run_memory_sizing_excludes_omitted_steps_but_keeps_dependencies(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "selected-ran"
+    label_marker = tmp_path / "label-selected-ran"
+    dag = tmp_path / "selected-memory.json"
+    dag.write_text(
+        json.dumps(
+            {
+                "mem_cap_floor_bytes": 8 * 1024**3,
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "large-dependency",
+                        "cmd": "true",
+                        "labels": ["all"],
+                        "hint": {"hard_mem_max_bytes": 8 * 1024**3},
+                    },
+                    {
+                        "group": "g",
+                        "job": "small",
+                        "cmd": f"touch {shlex.quote(str(marker))}",
+                        "deps": ["g.large-dependency"],
+                        "labels": ["all"],
+                        "hint": {"rss_baseline_bytes": 256 * 1024**2},
+                    },
+                    {
+                        "group": "g",
+                        "job": "label-small",
+                        "cmd": f"touch {shlex.quote(str(label_marker))}",
+                        "labels": ["all", "small-only"],
+                        "hint": {"rss_baseline_bytes": 256 * 1024**2},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    common = [
+        "run",
+        "--dag",
+        str(dag),
+        "--selected",
+        "g.small",
+        "--max-cpus",
+        "2",
+        "--max-mem",
+        "1G",
+        "--unsafe-no-cgroups",
+        "--no-profile",
+        "--no-profile-feedback",
+        "-q",
+    ]
+
+    rc, _, err = _capture([*common, "--ignore-selected-deps"])
+    assert rc == 0, err
+    assert marker.exists()
+
+    marker.unlink()
+    rc, _, err = _capture(common)
+    assert rc == 2
+    assert not marker.exists()
+    assert "minimum runnable footprint 8589934592" in err
+
+    all_tags = [*common, "--ignore-selected-deps"]
+    all_tags[4] = "g.large-dependency,g.small,g.label-small"
+    rc, _, err = _capture(all_tags)
+    assert rc == 2
+    assert not marker.exists()
+    assert not label_marker.exists()
+    assert "minimum runnable footprint 8589934592" in err
+
+    all_labels = [
+        "run",
+        "--dag",
+        str(dag),
+        "--labels",
+        "all",
+        "--max-cpus",
+        "2",
+        "--max-mem",
+        "1G",
+        "--unsafe-no-cgroups",
+        "--no-profile",
+        "--no-profile-feedback",
+        "-q",
+    ]
+    rc, _, err = _capture(all_labels)
+    assert rc == 2
+    assert not marker.exists()
+    assert not label_marker.exists()
+    assert "minimum runnable footprint 8589934592" in err
+
+    partial_label = [*all_labels]
+    partial_label[4] = "small-only"
+    rc, _, err = _capture(partial_label)
+    assert rc == 0, err
+    assert label_marker.exists()
+
+
 def test_allow_cgroup_failure_outer_delegates_a_named_unboxed_nested_run(
     tmp_path: Path,
 ) -> None:
