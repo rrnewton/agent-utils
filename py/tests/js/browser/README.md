@@ -22,7 +22,8 @@ run `check-deps.cjs`, which refuses with exit status 2, naming what is missing, 
 `node_modules/.bin/playwright`, never `npx`, which with nothing installed goes to the npm
 registry and can hang for minutes on a host that cannot reach it. On a host that has installed
 these packages before, `npm install --offline --no-audit --no-fund --no-package-lock` installs
-them from the npm cache with no network.
+them from the npm cache with no network. `py/tests/test_browser_dependency_check.py` holds
+both targets to that on copies of this directory, with stand-ins for `dagrun`, `npx` and `npm`.
 
 The suite treats DOM observability as a small UI testing contract. A check skips with
 a precise reason until its contract exists, then enforces the behavior. Production UI

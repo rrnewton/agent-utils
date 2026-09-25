@@ -15,20 +15,25 @@ const fs = require("fs");
 const path = require("path");
 
 const PACKAGE = "@playwright/test";
-const wanted = require("./package.json").devDependencies[PACKAGE];
+const wanted = (require("./package.json").devDependencies || {})[PACKAGE];
 const manifest = path.join(__dirname, "node_modules", PACKAGE, "package.json");
 const runner = path.join(__dirname, "node_modules", ".bin", "playwright");
 
+const problems = [];
+if (wanted === undefined) problems.push(`package.json does not pin ${PACKAGE} in devDependencies`);
 let installed = null;
 try {
   installed = JSON.parse(fs.readFileSync(manifest, "utf8")).version;
 } catch (error) {
-  if (error.code !== "ENOENT") throw error;
+  problems.push(
+    error.code === "ENOENT"
+      ? `${PACKAGE} is not installed in ${path.dirname(manifest)}`
+      : `${manifest} cannot be read: ${error.message}`,
+  );
 }
-
-const problems = [];
-if (installed === null) problems.push(`${PACKAGE} is not installed in ${path.dirname(manifest)}`);
-else if (installed !== wanted) problems.push(`${PACKAGE} ${installed} is installed; package.json pins ${wanted}`);
+if (installed !== null && wanted !== undefined && installed !== wanted) {
+  problems.push(`${PACKAGE} ${installed} is installed; package.json pins ${wanted}`);
+}
 if (!fs.existsSync(runner)) problems.push(`${runner} does not exist`);
 
 if (problems.length > 0) {
