@@ -2301,11 +2301,11 @@ mod tests {
             value[closing + 2] = *state;
             assert_eq!(parse_process_stat(&value, 4242).unwrap().state, *state);
         }
-        for state in [b'Q', b'0', b')', b'\x7f'] {
+        for state in b"Q0)\x7f" {
             let mut value =
                 b"4242 (worker) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0".to_vec();
             let closing = value.iter().rposition(|byte| *byte == b')').unwrap();
-            value[closing + 2] = state;
+            value[closing + 2] = *state;
             assert!(parse_process_stat(&value, 4242).is_err());
         }
     }

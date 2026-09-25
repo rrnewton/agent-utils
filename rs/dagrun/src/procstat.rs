@@ -253,10 +253,10 @@ mod tests {
             value[closing + 2] = *state;
             assert_eq!(parse(&value, Some(42)).unwrap().state, *state);
         }
-        for state in [b'Q', b'0', b')', b'\x7f'] {
+        for state in b"Q0)\x7f" {
             let mut value = record(42, b"worker");
             let closing = value.iter().rposition(|byte| *byte == b')').unwrap();
-            value[closing + 2] = state;
+            value[closing + 2] = *state;
             assert_eq!(
                 parse(&value, Some(42)).unwrap_err(),
                 "invalid process state"
