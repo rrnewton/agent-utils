@@ -11255,12 +11255,14 @@ def test_create_recovery_refuses_at_publication_when_scope_ends_during_provision
     assert "--abort-create" in captured.err
     assert active_slots(project) == []
     assert journal.read_bytes() == journal_before
+    assert checkout(project).is_dir()
 
     aborted = wrkslots.main([*recover_argv, "--slot", "slot01", "--abort-create"])
     captured = capsys.readouterr()
     assert aborted == 0, captured.err
     assert not journal.exists()
     assert active_slots(project) == []
+    assert not checkout(project).exists()
     assert verification_calls == [expected_scope, expected_scope]
 
 
