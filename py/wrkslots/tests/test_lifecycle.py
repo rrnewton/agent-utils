@@ -11189,6 +11189,81 @@ def test_create_and_import_recovery_revalidate_task_scope_at_publication(
             assert os.fsdecode(original_readlink(invocation_link)) == "b" * 32
 
 
+def test_create_recovery_refuses_at_publication_when_scope_ends_during_provisioning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project)
+    expected_scope = _attach_task_scope_to_interrupted_journal(project, journal)
+    journal_before = journal.read_bytes()
+    invocation_directory = tmp_path / "systemd-units"
+    invocation_directory.mkdir()
+    invocation_link = invocation_directory / f"invocation:{expected_scope.unit}"
+    invocation_link.symlink_to(expected_scope.invocation_id)
+    monkeypatch.setattr(
+        wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
+    )
+    original_verify = wrkslots._verify_task_scope_invocation
+    verification_calls: list[wrkslots.TaskScopeIdentity] = []
+
+    def verify_then_end_scope(scope: wrkslots.TaskScopeIdentity) -> None:
+        verification_calls.append(scope)
+        original_verify(scope)
+        # The check before provisioning passes; the scope then ends while
+        # provisioning and hooks run, so only the publication recheck sees it.
+        if len(verification_calls) == 1:
+            invocation_link.unlink()
+            invocation_link.symlink_to("b" * 32)
+
+    monkeypatch.setattr(wrkslots, "_verify_task_scope_invocation", verify_then_end_scope)
+    original_slot_free = wrkslots._assert_agent_and_slot_free
+    provisioning_started: list[str] = []
+
+    def recorded_slot_free(
+        config: wrkslots.Config,
+        slot: str,
+        agent: str,
+        slot_type: str,
+        *,
+        enforce_cap: bool = True,
+    ) -> None:
+        provisioning_started.append(slot)
+        original_slot_free(config, slot, agent, slot_type, enforce_cap=enforce_cap)
+
+    monkeypatch.setattr(wrkslots, "_assert_agent_and_slot_free", recorded_slot_free)
+    recover_argv = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    rc = wrkslots.main(recover_argv)
+    captured = capsys.readouterr()
+
+    assert rc == 3
+    assert verification_calls == [expected_scope, expected_scope]
+    assert provisioning_started == ["slot01"]
+    assert "task scope invocation does not match" in captured.err
+    assert "--abort-create" in captured.err
+    assert active_slots(project) == []
+    assert journal.read_bytes() == journal_before
+
+    aborted = wrkslots.main([*recover_argv, "--slot", "slot01", "--abort-create"])
+    captured = capsys.readouterr()
+    assert aborted == 0, captured.err
+    assert not journal.exists()
+    assert active_slots(project) == []
+    assert verification_calls == [expected_scope, expected_scope]
+
+
 def _interrupt_scoped_import(project: Path, repository: Path) -> Path:
     tree = checkout(project)
     tree.parent.mkdir()
