@@ -22,8 +22,10 @@ const runner = path.join(__dirname, "node_modules", ".bin", "playwright");
 const problems = [];
 if (wanted === undefined) problems.push(`package.json does not pin ${PACKAGE} in devDependencies`);
 let installed = null;
+let read = false; // Whether the installed manifest was read, whatever version it names.
 try {
   installed = JSON.parse(fs.readFileSync(manifest, "utf8")).version;
+  read = true;
 } catch (error) {
   problems.push(
     error.code === "ENOENT"
@@ -31,7 +33,9 @@ try {
       : `${manifest} cannot be read: ${error.message}`,
   );
 }
-if (installed !== null && wanted !== undefined && installed !== wanted) {
+if (read && typeof installed !== "string") {
+  problems.push(`${manifest} does not name the version installed`);
+} else if (read && wanted !== undefined && installed !== wanted) {
   problems.push(`${PACKAGE} ${installed} is installed; package.json pins ${wanted}`);
 }
 if (!fs.existsSync(runner)) problems.push(`${runner} does not exist`);

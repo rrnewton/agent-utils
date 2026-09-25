@@ -33,6 +33,8 @@ _WRKVIZ = _REPO / "py" / "wrkviz"
 _PACKAGE = "@playwright/test"
 _PINNED: str = json.loads((_BROWSER / "package.json").read_text())["devDependencies"][_PACKAGE]
 _OFFLINE_INSTALL = "npm install --offline --no-audit --no-fund --no-package-lock"
+# The pinned version with its last component one higher: differs only where a loose check would not.
+_NEAR_MISS = ".".join([*_PINNED.split(".")[:-1], str(int(_PINNED.split(".")[-1]) + 1)])
 
 # Records its argv as one JSON line, then runs the command after `--` only for the dependency
 # check's box.  Every other box is only recorded, and succeeds, so a target that skips the check
@@ -103,14 +105,41 @@ def test_the_check_refuses_when_nothing_is_installed(tmp_path: Path) -> None:
     assert f"{_PACKAGE} is not installed" in result.stderr
     assert "node_modules/.bin/playwright does not exist" in result.stderr
     assert _OFFLINE_INSTALL in result.stderr
+    assert "does not name the version" not in result.stderr  # Nothing was read to name one.
 
 
-def test_the_check_refuses_a_version_other_than_the_pinned_one(tmp_path: Path) -> None:
-    result = _check(_browser_copy(tmp_path, installed="0.0.1", runner=True))
+@pytest.mark.parametrize(
+    "version", ("0.0.1", _NEAR_MISS, f"{_PINNED}-beta"), ids=("other", "near-miss", "prerelease")
+)
+def test_the_check_refuses_a_version_other_than_the_pinned_one(
+    tmp_path: Path, version: str
+) -> None:
+    assert version != _PINNED
+    result = _check(_browser_copy(tmp_path, installed=version, runner=True))
 
     assert result.returncode == 2, result.stdout + result.stderr
-    assert f"{_PACKAGE} 0.0.1 is installed; package.json pins {_PINNED}" in result.stderr
+    assert f"{_PACKAGE} {version} is installed; package.json pins {_PINNED}" in result.stderr
     assert "does not exist" not in result.stderr
+
+
+@pytest.mark.parametrize("version", (None, "absent", 1), ids=("null", "absent", "number"))
+def test_the_check_refuses_an_installed_manifest_that_names_no_version(
+    tmp_path: Path, version: str | int | None
+) -> None:
+    browser = _browser_copy(tmp_path, installed=_PINNED, runner=True)
+    manifest: dict[str, object] = {"name": _PACKAGE}
+    if version != "absent":
+        manifest["version"] = version
+    (browser / "node_modules" / "@playwright" / "test" / "package.json").write_text(
+        json.dumps(manifest)
+    )
+
+    result = _check(browser)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert "node_modules/@playwright/test/package.json does not name the version" in result.stderr
+    assert "is not installed" not in result.stderr
 
 
 def test_the_check_refuses_an_install_without_its_runner(tmp_path: Path) -> None:
@@ -148,6 +177,7 @@ def test_the_check_refuses_an_installed_manifest_it_cannot_read(tmp_path: Path) 
     assert result.returncode == 2, result.stdout + result.stderr
     assert "node_modules/@playwright/test/package.json cannot be read" in result.stderr
     assert "is not installed" not in result.stderr
+    assert "does not name the version" not in result.stderr
 
 
 def test_the_check_passes_the_pinned_install(tmp_path: Path) -> None:
