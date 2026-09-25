@@ -40,9 +40,14 @@ def _prepare(tmp_path: Path) -> tuple[Path, wrkslots.Config]:
     return project, wrkslots._load_config(str(project), "testhost")
 
 
-def _finish_events(config: wrkslots.Config) -> list[tuple[str, str | None, str | None]]:
+FinishEvent = tuple[str, str | None, str | None, str | None]
+
+
+def _finish_events(config: wrkslots.Config) -> list[FinishEvent]:
+    """Return (kind, phase, archive_id, fenced) for the target's finish path."""
+
     path = wrkslots._finish_journal_path(config, "target")
-    observed: list[tuple[str, str | None, str | None]] = []
+    observed: list[FinishEvent] = []
     for event in wrkslots._load_events(config, config.machine):
         payload = event["payload"]
         assert isinstance(payload, dict)
@@ -51,8 +56,9 @@ def _finish_events(config: wrkslots.Config) -> list[tuple[str, str | None, str |
         journal = payload.get("journal")
         phase = journal.get("phase") if isinstance(journal, dict) else None
         archive = journal.get("archive_id") if isinstance(journal, dict) else None
+        fence = journal.get("fenced") if isinstance(journal, dict) else None
         assert isinstance(event["kind"], str)
-        observed.append((event["kind"], phase, archive))
+        observed.append((event["kind"], phase, archive, fence))
     return observed
 
 
@@ -91,13 +97,14 @@ def _refused_then_rolled_back(
     assert CHURN in capsys.readouterr().err
     assert calls == [0]
     first = _finish_events(config)
-    assert [(kind, phase) for kind, phase, _archive in first] == [
+    assert [(kind, phase) for kind, phase, _archive, _fence in first] == [
         ("operation-progress-recorded", "prepared"),
         ("operation-progress-recorded", "fenced"),
         ("operation-progress-recorded", "prepared"),
         ("operation-completed", None),
     ]
-    assert len({archive for _kind, _phase, archive in first[:3]}) == 1
+    assert len({archive for _kind, _phase, archive, _fence in first[:3]}) == 1
+    assert len({fence for _kind, _phase, _archive, fence in first[:3]}) == 1
     assert target.is_dir()
     assert not tuple(target.parent.glob(".target.fenced.1.*"))
     assert not wrkslots._finish_journal_path(config, "target").exists()
@@ -105,9 +112,9 @@ def _refused_then_rolled_back(
     assert [row["slot"] for row in active_slots(project) if isinstance(row, dict)] == [
         "target"
     ]
-    archive = first[0][2]
-    assert archive is not None
-    return archive
+    fence = first[0][3]
+    assert first[0][2] is not None and fence is not None
+    return fence
 
 
 def test_retry_after_refused_private_finish_removes_the_slot(
@@ -116,7 +123,7 @@ def test_retry_after_refused_private_finish_removes_the_slot(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project, config = _prepare(tmp_path)
-    first_archive = _refused_then_rolled_back(project, config, monkeypatch, capsys)
+    first_fence = _refused_then_rolled_back(project, config, monkeypatch, capsys)
     history = _event_bytes(config)
 
     assert remove_completed_validation(project) == 0, capsys.readouterr().err
@@ -132,7 +139,10 @@ def test_retry_after_refused_private_finish_removes_the_slot(
     second = _finish_events(config)[4:]
     assert second[0][:2] == ("operation-progress-recorded", "prepared")
     assert second[-1][:2] == ("operation-completed", None)
-    assert {archive for _kind, _phase, archive in second[:-1]} - {None} != {first_archive}
+    # The retry is a new operation. Its archive_id may repeat the first one's
+    # within the same second, so the per-operation fence is what must differ.
+    fences = {fence for _kind, _phase, _archive, fence in second[:-1]}
+    assert len(fences) == 1 and None not in fences and fences != {first_fence}
 
 
 def test_retry_interrupted_after_fence_is_recoverable(
