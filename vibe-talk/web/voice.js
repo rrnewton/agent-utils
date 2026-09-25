@@ -4041,17 +4041,22 @@ function judgeTurn(message, closingSegment) {
   health.heard = false;
   health.peak = 0;
   health.audioMs = 0;
-  // An interrupted turn was cut short by the listener — unless what it cut short was a second or
-  // more of audio nobody could hear. An empty answer to the page closing its own audio segment is
-  // the server acknowledging that boundary, not a reply. Neither is evidence either way. A turn
-  // that carried an `error` has had its verdict already.
+  // Heard is heard, however the turn ended: a reply the listener talked over, or one that carried
+  // an `error`, still proves the service was answering, so it ends any run of silent turns before
+  // it. Left standing, that run would join the next silent turn into a false report.
+  if (!silent) {
+    health.silentRun = 0;
+  }
+  // An interrupted turn was cut short by the listener — unless what it cut short was
+  // INTERRUPTED_SILENT_MS or more of audio nobody could hear. An empty answer to the page closing
+  // its own audio segment is the server acknowledging that boundary, not a reply. Neither is
+  // evidence of silence. A turn that carried an `error` has had its verdict already.
   const cutShort = message.interrupted === true && !(silent && turnAudioMs >= INTERRUPTED_SILENT_MS);
   if (errored || cutShort || (closingSegment && silent)) {
     return;
   }
   health.turns += 1;
   if (!silent) {
-    health.silentRun = 0;
     return;
   }
   health.silentRun += 1;
@@ -4144,6 +4149,13 @@ function handleVibeTalk(message) {
       addDetail(`voice session ${message.session_id || "started"}`);
       session.v1Ready = true;
       if (session.chat) {
+        // A typed call does not wait for a promised greeting. KNOWN LIMITATION: the protocol does
+        // not say whether a server greets a client that never sends `audio_start`, nor which turn
+        // number a greeting carries, so waiting could stall every typed call on a greeting that
+        // never comes. The cost: if a greeting DOES arrive after a prompt went out, the page
+        // cannot tell the two apart. The greeting's first frame disarms the prompt's no-reply
+        // bound, its `turn_complete` is taken as the prompt's, and a second queued prompt is sent
+        // while the first is still being answered.
         setStatus("Connected — type a message.");
         advanceVibeTalkInput();
         break;

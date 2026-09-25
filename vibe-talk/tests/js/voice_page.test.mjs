@@ -12416,6 +12416,27 @@ test("talking over half a second of silence does not hide a dead service; talkin
   assert.equal(page.healthPosts[0].audio_ms, 900);
 });
 
+test("an audible turn ends the silent run even when it was cut short or carried an error", async () => {
+  // Neither kind of turn is judged, but both were heard. A silent turn before one and a silent turn
+  // after it are not two in a row.
+  for (const kind of ["interrupted", "errored"]) {
+    const page = newPage();
+    const socket = await startNeutralCall(page);
+    agentTurn(page, socket, 1, { amplitude: SILENT });
+    if (kind === "errored") {
+      socket.onmessage({ data: JSON.stringify({ type: "error", message: "failed" }) });
+    }
+    agentTurn(page, socket, 2, { amplitude: SPEECH, interrupted: kind === "interrupted" });
+    agentTurn(page, socket, 3, { amplitude: SILENT });
+    await page.settle();
+    const expected = kind === "errored" ? ["error_frame"] : [];
+    assert.deepStrictEqual(page.healthPosts.map((r) => r.cause), expected, `${kind}: a stale silent run was reported`);
+    if (kind === "interrupted") {
+      assert.equal(state(page), "live", "a heard turn left the page believing the service was silent");
+    }
+  }
+});
+
 test("an error attaches to the next turn_complete, even when it arrives between turns", async () => {
   const page = newPage();
   const socket = await startNeutralCall(page);

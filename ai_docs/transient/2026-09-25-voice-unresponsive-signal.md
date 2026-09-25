@@ -211,7 +211,19 @@ that a one-line addition.
 - **Throttling is visible**: the first refused record in each window writes one
   `voice_health_throttled` line.
 - **A typed call's greeting** is judged as an ordinary turn and is not timed, because a typed call
-  does not wait for its greeting.
+  does not wait for its greeting. This leaves a known limitation. `vibe-talk-v1` does not say
+  whether a server greets a client that never sends `audio_start`, or which turn number a greeting
+  carries. If a server does greet after a typed call's first prompt has gone out (one queued before
+  `session_started`, or typed while the greeting plays), the page cannot tell the greeting from the
+  reply:
+  - the greeting's first frame disarms the prompt's 15 s bound;
+  - the greeting's `turn_complete` is taken as the prompt's;
+  - a second queued prompt is sent while the first is still being answered.
+  Waiting for the greeting instead would stall every typed call on a server that never greets one.
+  Fixing this properly needs the protocol to define both points.
+- **A heard turn always ends the silent run**, even one that is not judged because it was
+  interrupted or carried an `error`. Otherwise a silent turn before it and one after it would be
+  reported as two in a row.
 - Healthy reference, provider-neutral: first assistant audio about 0.86 s after the greeting was
   requested, and about 0.06 s after a typed prompt.
 

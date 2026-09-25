@@ -1763,8 +1763,8 @@ by text alone. The page reports each of these, once per call:
 | Cause | When |
 |---|---|
 | `silent_greeting` | the greeting turn is silent: a greeting is supposed to speak, so one is enough |
-| `silent_turns` | two consecutive turns are silent. One is not enough: turn detection may close an empty turn for background noise, and a response that only calls a tool may say nothing before the answer follows |
-| `no_reply` | 15 seconds after the greeting was promised, or after a typed prompt, with no audible PCM, no assistant text and no `turn_complete`. A typed call does not wait for its greeting, so there the greeting is judged as an ordinary turn and is not timed |
+| `silent_turns` | two consecutive turns are silent. One is not enough: turn detection may close an empty turn for background noise, and a response that only calls a tool may say nothing before the answer follows. Any turn that was heard ends the run, including one the listener interrupted or one that carried an `error` |
+| `no_reply` | 15 seconds after the greeting was promised, or after a typed prompt, with no audible PCM, no assistant text and no `turn_complete`. A typed call does not wait for its greeting, so there the greeting is judged as an ordinary turn and is not timed. Known limitation: if a server greets a typed call after its first prompt has gone out, the page cannot tell the greeting from the reply. The greeting disarms the prompt's bound, and the greeting's `turn_complete` is taken as the prompt's |
 | `error_frame` | the server sent `error`; the page already shows it in red and now also logs it, without its text. It is the verdict on the turn it arrives in, before or after that turn's audio: the next `turn_complete` is not counted as silent, and the no-reply bound is disarmed, so one failure is logged once. An `error` carries no turn number, so an `error` sent between turns spares the next turn instead |
 
 The status line then turns to the `unresponsive` state with "The voice service is not responding."
