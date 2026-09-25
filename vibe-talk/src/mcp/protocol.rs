@@ -261,6 +261,61 @@ fn arg_str(args: &Value, key: &str) -> Option<String> {
         .map(std::borrow::ToOwned::to_owned)
 }
 
+/// An identifier argument: a string, or a whole number standing for its own decimal digits.
+///
+/// Every schema says `string`, but the ids here are all digits, and a model — or the bridge
+/// carrying its call — that sends `900000000000000201` instead of `"900000000000000201"` means
+/// the same channel. Refusing it as `unknown_channel` while the error lists that very id is how
+/// a live agent came to report "the id I used is the one it says to use". Only an exact
+/// unsigned integer is read: a float has already lost digits, and rounding one would name a
+/// different message or channel rather than none.
+fn arg_id(args: &Value, key: &str) -> Option<String> {
+    match args.get(key)? {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => number.as_u64().map(|n| n.to_string()),
+        _ => None,
+    }
+}
+
+/// What an identifier argument that [`arg_id`] cannot read actually was, for the access log.
+///
+/// Only its JSON kind, never its value, so the line stays content-free while still telling a
+/// missing id apart from one that arrived in the wrong shape.
+fn unreadable_id_kind(args: &Value, key: &str) -> Option<&'static str> {
+    let value = args.get(key)?;
+    if arg_id(args, key).is_some() {
+        return None;
+    }
+    Some(match value {
+        Value::Null => "<null>",
+        Value::Bool(_) => "<bool>",
+        Value::Number(_) => "<inexact number>",
+        Value::Array(_) => "<array>",
+        Value::Object(_) => "<object>",
+        Value::String(_) => unreachable!("a string is always readable"),
+    })
+}
+
+/// The `channel` field of a `tool` access line: the id it named, or the shape it arrived in.
+///
+/// `-` (no field) still means an argument object without a `channel_id`. When `arguments` is
+/// not an object at all — a string holding JSON, say — the line says which kind it was instead,
+/// so "the caller sent no channel" and "the caller wrapped everything" no longer look alike.
+fn logged_channel(args: &Value) -> Option<String> {
+    let kind = match args {
+        Value::Object(_) => {
+            return arg_id(args, "channel_id")
+                .or_else(|| unreadable_id_kind(args, "channel_id").map(str::to_owned));
+        }
+        Value::Null => "<null arguments>",
+        Value::Bool(_) => "<bool arguments>",
+        Value::Number(_) => "<number arguments>",
+        Value::String(_) => "<string arguments>",
+        Value::Array(_) => "<array arguments>",
+    };
+    Some(kind.to_owned())
+}
+
 fn arg_u16(args: &Value, key: &str) -> Option<u16> {
     args.get(key)
         .and_then(Value::as_u64)
@@ -290,17 +345,14 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
         .unwrap_or_else(|| json!({}));
     // Ids, not content, at INFO. `channel` answers "which channel did it claim to read?"; the
     // arguments themselves — which for post_reply carry the message text — are DEBUG only.
-    let channel = args
-        .get("channel_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let channel = logged_channel(&args);
     let mut args = args;
     let mut channel = channel;
     // A channel named by its label or alias is the channel with that id. Resolved once, here,
     // so every channel tool — and the access log — sees the id. A name that matches nothing is
     // left as it is, and the allowlist refuses it below exactly as it refuses any other stranger.
-    if let Some(named) = channel.as_deref() {
-        if let Some(id) = ops::channel_named(state, named).await {
+    if let Some(named) = arg_id(&args, "channel_id") {
+        if let Some(id) = ops::channel_named(state, &named).await {
             if let Some(fields) = args.as_object_mut() {
                 fields.insert(
                     "channel_id".to_owned(),
@@ -517,8 +569,8 @@ fn page_header(page: &ops::Page) -> String {
 }
 
 async fn run_page(state: &AppState, args: &Value) -> Result<String, OpError> {
-    let channel_id = arg_str(args, "channel_id").unwrap_or_default();
-    let before = arg_str(args, "before");
+    let channel_id = arg_id(args, "channel_id").unwrap_or_default();
+    let before = arg_id(args, "before");
     let since = arg_str(args, "since");
     let until = arg_str(args, "until");
     let page = ops::page(
@@ -540,7 +592,7 @@ async fn run_page(state: &AppState, args: &Value) -> Result<String, OpError> {
 }
 
 async fn run_count(state: &AppState, args: &Value) -> Result<String, OpError> {
-    let channel_id = arg_str(args, "channel_id").unwrap_or_default();
+    let channel_id = arg_id(args, "channel_id").unwrap_or_default();
     let since = arg_str(args, "since");
     let cap = args
         .get("cap")
@@ -574,7 +626,7 @@ async fn run_count(state: &AppState, args: &Value) -> Result<String, OpError> {
 }
 
 async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
-    let channel_id = arg_str(args, "channel_id").unwrap_or_default();
+    let channel_id = arg_id(args, "channel_id").unwrap_or_default();
     let (info, entries, complete) = ops::digest(
         state,
         &channel_id,
@@ -616,7 +668,7 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
 }
 
 async fn run_find(state: &AppState, args: &Value) -> Result<String, OpError> {
-    let channel_id = arg_str(args, "channel_id").unwrap_or_default();
+    let channel_id = arg_id(args, "channel_id").unwrap_or_default();
     let query = arg_str(args, "query").unwrap_or_default();
     let (info, resolution, searched) =
         ops::resolve(state, &channel_id, &query, arg_u16(args, "limit"), None).await?;
@@ -662,8 +714,8 @@ async fn run_find(state: &AppState, args: &Value) -> Result<String, OpError> {
 }
 
 async fn run_read(state: &AppState, args: &Value) -> Result<String, OpError> {
-    let channel_id = arg_str(args, "channel_id").unwrap_or_default();
-    let message_id = arg_str(args, "message_id").unwrap_or_default();
+    let channel_id = arg_id(args, "channel_id").unwrap_or_default();
+    let message_id = arg_id(args, "message_id").unwrap_or_default();
     let (info, message) =
         ops::message_by_id(state, &channel_id, &message_id, arg_u16(args, "limit")).await?;
     let id = message.id.clone();
@@ -676,9 +728,9 @@ async fn run_read(state: &AppState, args: &Value) -> Result<String, OpError> {
 }
 
 async fn run_post(state: &AppState, args: &Value) -> Result<String, OpError> {
-    let channel_id = arg_str(args, "channel_id").unwrap_or_default();
+    let channel_id = arg_id(args, "channel_id").unwrap_or_default();
     let text = arg_str(args, "text").unwrap_or_default();
-    let reply_to = arg_str(args, "reply_to");
+    let reply_to = arg_id(args, "reply_to");
     let (info, posted, _parts) = ops::reply(state, &channel_id, &text, reply_to.as_deref()).await?;
     Ok(format!(
         "Posted to {} (id {}) as message {}.",
@@ -1114,5 +1166,146 @@ mod tests {
             INVALID_PARAMS,
             "a tool hidden from tools/list must also be unreachable by name"
         );
+    }
+
+    #[test]
+    fn an_id_is_read_from_a_string_or_an_exact_unsigned_integer_and_nothing_else() {
+        let args = json!({
+            "text": "900000000000000201",
+            "max": u64::MAX,
+            "past_f64": 9_007_199_254_740_993_u64,
+            "float": 900_000_000_000_000_201.0,
+            "whole_float": 1_111_111_111.0,
+            "negative": -1_111_111_111_i64,
+            "null": null,
+            "flag": true,
+            "list": ["1111111111"],
+            "object": { "id": "1111111111" },
+        });
+        assert_eq!(arg_id(&args, "text").as_deref(), Some("900000000000000201"));
+        assert_eq!(arg_id(&args, "max"), Some(u64::MAX.to_string()));
+        assert_eq!(
+            arg_id(&args, "past_f64").as_deref(),
+            Some("9007199254740993")
+        );
+        for key in [
+            "float",
+            "whole_float",
+            "negative",
+            "null",
+            "flag",
+            "list",
+            "object",
+            "absent",
+        ] {
+            assert_eq!(arg_id(&args, key), None, "{key}");
+        }
+        // Past u64 the text is not an exact unsigned integer any more, so it names nothing.
+        let huge: Value = serde_json::from_str(r#"{"id": 18446744073709551616}"#).expect("json");
+        assert_eq!(arg_id(&huge, "id"), None);
+    }
+
+    #[tokio::test]
+    async fn every_read_tool_accepts_its_ids_as_exact_integers() {
+        let (state, fake) = testing::state();
+        fake.seed(
+            &ChannelId(READ_CHANNEL.to_owned()),
+            "lead",
+            "the mac runner is green again",
+        );
+        let window = ops::messages(&state, READ_CHANNEL, None)
+            .await
+            .expect("seeded channel reads");
+        let message = window.messages[0].id.clone();
+        // Above 2^53: an id that went through a float on the way here would name another message.
+        let message_number: u64 = message.as_str().parse().expect("the fake's ids are digits");
+        assert!(message_number > 1 << 53, "{message_number}");
+        let channel_number: u64 = READ_CHANNEL.parse().expect("digits");
+        for (tool, extra) in [
+            ("digest_channel", json!({})),
+            ("read_page", json!({})),
+            ("count_messages", json!({})),
+            ("find_message", json!({ "query": "mac runner" })),
+            ("read_message", json!({ "message_id": message_number })),
+        ] {
+            let mut arguments = extra;
+            arguments["channel_id"] = json!(channel_number);
+            let outcome = dispatch(&state, Scope::Read, &call(tool, arguments)).await;
+            assert!(!is_error(&outcome), "{tool}: {}", result_text(&outcome));
+        }
+        let outcome = dispatch(
+            &state,
+            Scope::Read,
+            &call(
+                "read_message",
+                json!({ "channel_id": channel_number, "message_id": message_number }),
+            ),
+        )
+        .await;
+        assert!(
+            result_text(&outcome).contains("mac runner"),
+            "{}",
+            result_text(&outcome)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_id_that_is_not_an_exact_integer_is_refused_rather_than_rounded() {
+        let (state, _fake) = testing::state();
+        let near: f64 = READ_CHANNEL.parse().expect("digits");
+        for channel_id in [
+            json!(near),
+            json!(-1_111_111_111_i64),
+            json!(null),
+            json!(true),
+            json!([READ_CHANNEL]),
+            json!({ "id": READ_CHANNEL }),
+        ] {
+            let outcome = dispatch(
+                &state,
+                Scope::Read,
+                &call(
+                    "digest_channel",
+                    json!({ "channel_id": channel_id.clone() }),
+                ),
+            )
+            .await;
+            assert!(is_error(&outcome), "{channel_id}");
+            assert!(
+                result_text(&outcome).starts_with("unknown_channel"),
+                "{channel_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_integer_channel_id_posts_only_where_its_string_would() {
+        let (state, fake) = testing::state();
+        let writable: u64 = WRITE_CHANNEL.parse().expect("digits");
+        let read_only: u64 = READ_CHANNEL.parse().expect("digits");
+        let outcome = dispatch(
+            &state,
+            Scope::Write,
+            &call(
+                "post_reply",
+                json!({ "channel_id": read_only, "text": "on it" }),
+            ),
+        )
+        .await;
+        assert!(is_error(&outcome), "{}", result_text(&outcome));
+        assert!(fake.posted().is_empty(), "{:?}", fake.posted());
+        let outcome = dispatch(
+            &state,
+            Scope::Write,
+            &call(
+                "post_reply",
+                json!({ "channel_id": writable, "text": "on it" }),
+            ),
+        )
+        .await;
+        assert!(!is_error(&outcome), "{}", result_text(&outcome));
+        let posted = fake.posted();
+        assert_eq!(posted.len(), 1, "{posted:?}");
+        assert_eq!(posted[0].channel.as_str(), WRITE_CHANNEL);
     }
 }

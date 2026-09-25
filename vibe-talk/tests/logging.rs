@@ -457,3 +457,46 @@ async fn a_stream_leaves_one_line_at_attach_and_it_reads_as_instant() {
     );
     drop(response);
 }
+
+#[tokio::test]
+async fn a_tool_line_names_an_integer_channel_and_the_shape_of_an_unreadable_one() {
+    // A channel id that arrives in a shape the server cannot read was logged as `-`, exactly like
+    // no channel at all, so a live refusal could not say which of the two it had been sent.
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let number: u64 = READ_CHANNEL.parse().expect("digits");
+    let near: f64 = READ_CHANNEL.parse().expect("digits");
+    for (arguments, expected) in [
+        (
+            json!({ "channel_id": number }),
+            format!("channel=\"{READ_CHANNEL}\""),
+        ),
+        (
+            json!({ "channel_id": near }),
+            "channel=\"<inexact number>\"".to_owned(),
+        ),
+        (
+            json!({ "channel_id": null }),
+            "channel=\"<null>\"".to_owned(),
+        ),
+        (json!({}), "channel=\"-\"".to_owned()),
+        (
+            json!(format!("{{\"channel_id\": \"{READ_CHANNEL}\"}}")),
+            "channel=\"<string arguments>\"".to_owned(),
+        ),
+    ] {
+        let before = capture.access_lines().len();
+        rpc(
+            &harness,
+            Some(READ_TOKEN),
+            tools_call("digest_channel", arguments.clone()),
+        )
+        .await;
+        let lines = capture.access_lines();
+        let tool_line = lines[before..]
+            .iter()
+            .find(|line| line.contains("tool=\"digest_channel\""))
+            .unwrap_or_else(|| panic!("no tool line for {arguments}: {lines:?}"));
+        assert!(tool_line.contains(&expected), "{arguments}: {tool_line}");
+    }
+}

@@ -2691,6 +2691,14 @@ a name two channels share reaches neither. Naming only picks from the allowlist 
 it: a read-only channel named by its label is still refused for posting. An `unknown_channel`
 result lists the ids to use instead, so a wrong guess costs one retry rather than the answer.
 
+**An id may arrive as a JSON integer.** The schemas say `string`, but a caller that sends
+`channel_id`, `message_id`, `before` or `reply_to` as an exact unsigned integer means the id
+with those digits, and gets it. Anything else in that place — a float, a negative number,
+`null`, an array — names nothing: a float has already lost digits, and rounding it would pick a
+different message rather than none. The `tool` access line's `channel` field says which shape
+an unreadable id arrived in (`<inexact number>`, `<null>`, …), and `<string arguments>` when
+`arguments` itself was a string; `-` still means an object with no `channel_id` at all.
+
 **Every message a tool renders carries its author's mention token**, written as
 `[id | time | author <@author id>]`, so a model that wants to notify someone copies a working
 token instead of assembling one — and can only ever mention someone who has posted in an
