@@ -309,11 +309,15 @@ def test_expensive_subject_exhausts_only_its_own_planning_share(
     # share: 60 // 2 listings each, of which the cheap peer needs four.
     assert rows["a-deep"]["cache_status"] == "error"
     assert rows["a-deep"]["cache_bytes"] is None
-    assert rows["a-deep"]["cache_error"] == (
+    exhausted = (
         "cache planning exhausted this subject's share of 30 directory listings; "
         "no cache total can be published within this allowance"
     )
-    assert rows["a-deep"]["verdict"] != "DELETABLE"
+    assert rows["a-deep"]["cache_error"] == exhausted
+    # These directories have no registry row, which is always BLOCKED, so the
+    # verdict here says nothing about exhaustion. The registered-record test
+    # below pins that exhaustion itself becomes a blocking reason.
+    assert rows["a-deep"]["verdict"] == "BLOCKED"
     assert rows["b-cheap"]["cache_status"] == "complete"
     assert rows["b-cheap"]["cache_error"] is None
     assert rows["b-cheap"]["cache_bytes"] == _allocated(cheap_cache)
@@ -418,12 +422,15 @@ def test_registered_record_planning_uses_its_share(tmp_path: Path) -> None:
     assert bounded.returncode == 0, bounded.stderr
     row = {row["slot"]: row for row in json.loads(bounded.stdout)["slots"]}["slot01"]
     assert row["cache_status"] == "error"
-    assert row["cache_error"] == (
+    exhausted = (
         "cache planning exhausted this subject's share of 10 directory listings; "
         "no cache total can be published within this allowance"
     )
-    assert row["verdict"] != "DELETABLE"
+    assert row["cache_error"] == exhausted
+    assert row["verdict"] == "BLOCKED"
+    assert f"cache inspection failed: {exhausted}" in row["reasons"]
     assert complete.returncode == 0, complete.stderr
     row = {row["slot"]: row for row in json.loads(complete.stdout)["slots"]}["slot01"]
     assert row["cache_status"] == "complete"
     assert row["cache_bytes"] == _allocated(cache)
+    assert not [r for r in row["reasons"] if r.startswith("cache inspection")]
