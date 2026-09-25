@@ -1,15 +1,18 @@
 ---
 title: 'gchat-deployment-handoff: reproduce the mobile reader on the intended host'
-status: closed
+status: in_progress
 priority: 0
 issue_type: task
+assignee: opus-5.5
 labels:
 - vibe-talk
 - deployment
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T01:32:01.933921963+00:00
-updated_at: 2026-09-25T04:16:00.000000000+00:00
+updated_at: 2026-09-25T04:46:58.029027043+00:00
+claimed_at: 2026-09-25T04:46:58.029027043+00:00
+claimed_until: 2026-09-27T04:46:58.028846853+00:00
 ---
 
 # Description
