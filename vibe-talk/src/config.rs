@@ -357,6 +357,8 @@ pub struct DiscordConfig {
     pub owner_user_id: Option<String>,
     /// API base, so a test or a proxy can point elsewhere.
     pub api_base: String,
+    /// Deadline for one ordinary provider HTTP request, in seconds.
+    pub request_timeout_seconds: u64,
     /// Default number of messages a fetch returns.
     pub default_fetch_limit: u16,
     /// Hard ceiling on a caller-requested fetch size.
@@ -573,6 +575,7 @@ struct FileDiscord {
     bot_token: Option<Secret>,
     owner_user_id: Option<String>,
     api_base: Option<String>,
+    request_timeout_seconds: Option<u64>,
     default_fetch_limit: Option<u16>,
     max_fetch_limit: Option<u16>,
     max_count_scan: Option<u32>,
@@ -661,6 +664,7 @@ pub const DEFAULT_ELEVENLABS_API_BASE: &str = "https://api.elevenlabs.io/v1";
 pub const DEFAULT_TIMEZONE: &str = "UTC";
 const DEFAULT_FETCH_LIMIT: u16 = 50;
 const DEFAULT_MAX_FETCH_LIMIT: u16 = 100;
+const DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS: u64 = 20;
 /// Default cost ceiling for a count: five Discord requests' worth.
 const DEFAULT_MAX_COUNT_SCAN: u32 = 500;
 
@@ -802,6 +806,10 @@ impl Config {
             .discord
             .max_count_scan
             .unwrap_or(DEFAULT_MAX_COUNT_SCAN);
+        let request_timeout_seconds = file
+            .discord
+            .request_timeout_seconds
+            .unwrap_or(DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS);
         if default_fetch_limit == 0 || max_fetch_limit == 0 {
             return Err(ConfigError::Invalid {
                 field: "discord.max_fetch_limit".to_owned(),
@@ -812,6 +820,12 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "discord.max_count_scan".to_owned(),
                 detail: "must be at least 1, or counting can never answer anything".to_owned(),
+            });
+        }
+        if !(1..=120).contains(&request_timeout_seconds) {
+            return Err(ConfigError::Invalid {
+                field: "discord.request_timeout_seconds".to_owned(),
+                detail: "must be between 1 and 120 seconds".to_owned(),
             });
         }
         let live_poll_seconds = match get(ENV_LIVE_POLL_SECONDS) {
@@ -912,6 +926,7 @@ impl Config {
                     .map(|id| id.trim().to_owned())
                     .filter(|id| !id.is_empty()),
                 api_base: discord_api_base,
+                request_timeout_seconds,
                 default_fetch_limit,
                 max_fetch_limit,
                 max_count_scan,
@@ -1492,6 +1507,32 @@ writable = true
             matches!(&err, ConfigError::Invalid { field, .. } if field == "discord.default_fetch_limit"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn provider_request_timeout_is_bounded_and_configurable() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(
+            cfg.discord.request_timeout_seconds,
+            DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS
+        );
+
+        let text = FULL.replace("[discord]", "[discord]\nrequest_timeout_seconds = 75");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.discord.request_timeout_seconds, 75);
+
+        for seconds in [0, 121] {
+            let text = FULL.replace(
+                "[discord]",
+                &format!("[discord]\nrequest_timeout_seconds = {seconds}"),
+            );
+            let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+            assert!(
+                matches!(&err, ConfigError::Invalid { field, .. }
+                    if field == "discord.request_timeout_seconds"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

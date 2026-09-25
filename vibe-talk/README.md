@@ -769,6 +769,7 @@ code path the startup probe uses, which is itself in the same position — see *
 | Public URL | `server.public_base_url` | `VIBE_TALK_PUBLIC_BASE_URL` | informational |
 | Time zone | `server.timezone` | `VIBE_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
 | Count ceiling | `discord.max_count_scan` | — | how many messages a count may walk, default `500` |
+| Provider request timeout | `discord.request_timeout_seconds` | — | seconds for one ordinary provider HTTP request, default `20`, range `1`–`120`; compatible bridges may need longer |
 | Live poll interval | `discord.live_poll_seconds` | `VIBE_TALK_LIVE_POLL_SECONDS` | seconds between inbound reads per channel; **`0` (default) is OFF**, and under `5` is refused |
 | Live push token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; enables adapter push and cannot be combined with live polling |
 | Channel registration | `discord.channel_registration` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels` and `DELETE /channels/{id}` |

@@ -492,6 +492,7 @@ pub struct HttpDiscordClient {
     client: reqwest::Client,
     api_base: String,
     bot_token: Secret,
+    request_timeout: std::time::Duration,
     channel_registration: bool,
     upstream_read_marks: bool,
     /// Discord's rate limits, obeyed. Shared by every request this client makes, which is what
@@ -528,7 +529,9 @@ impl HttpDiscordClient {
                 env!("CARGO_PKG_VERSION"),
                 ")"
             ))
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(
+                config.request_timeout_seconds,
+            ))
             .build()
             .map_err(|e| {
                 ChatError::Transport(e.to_string()).with_provider(&config.provider_name)
@@ -540,6 +543,7 @@ impl HttpDiscordClient {
             client,
             api_base: config.api_base.clone(),
             bot_token: config.bot_token.clone(),
+            request_timeout: std::time::Duration::from_secs(config.request_timeout_seconds),
             channel_registration: config.channel_registration,
             upstream_read_marks: config.upstream_read_marks,
             limiter: RateLimiter::new(),
@@ -558,8 +562,7 @@ impl HttpDiscordClient {
     /// a per-caller retry would have every route rediscovering the same closed window one rejected
     /// request at a time.
     async fn send(&self, request: PreparedRequest) -> Result<serde_json::Value, ChatError> {
-        self.send_with_timeout(request, std::time::Duration::from_secs(20))
-            .await
+        self.send_with_timeout(request, self.request_timeout).await
     }
 
     async fn send_with_timeout(
@@ -847,6 +850,7 @@ mod tests {
             bot_token: Secret::new("abc"),
             owner_user_id: None,
             api_base: api_base.to_owned(),
+            request_timeout_seconds: 20,
             default_fetch_limit: 25,
             max_fetch_limit: 100,
             max_count_scan: 500,
@@ -884,6 +888,16 @@ mod tests {
             None,
             "a header struct that ends up in a log must not carry a credential"
         );
+    }
+
+    #[test]
+    fn configured_request_timeout_reaches_the_http_client() {
+        let mut config = client_config("https://bridge.example/v1", true);
+        config.request_timeout_seconds = 75;
+
+        let client = HttpDiscordClient::new(&config).expect("valid client");
+
+        assert_eq!(client.request_timeout, std::time::Duration::from_secs(75));
     }
 
     #[test]
@@ -1097,6 +1111,7 @@ mod tests {
             client: reqwest::Client::new(),
             api_base: format!("http://{address}"),
             bot_token: Secret::new("abc"),
+            request_timeout: std::time::Duration::from_secs(20),
             channel_registration: false,
             upstream_read_marks: true,
             limiter: RateLimiter::new(),
@@ -1150,6 +1165,7 @@ mod tests {
             client: reqwest::Client::new(),
             api_base: format!("http://{address}"),
             bot_token: Secret::new("abc"),
+            request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
             limiter: RateLimiter::new(),
@@ -1208,6 +1224,7 @@ mod tests {
             client: reqwest::Client::new(),
             api_base: format!("http://{address}"),
             bot_token: Secret::new("abc"),
+            request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
             limiter: RateLimiter::new(),
@@ -1255,6 +1272,7 @@ mod tests {
             client: reqwest::Client::new(),
             api_base: format!("http://{address}"),
             bot_token: Secret::new("abc"),
+            request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
             limiter: RateLimiter::new(),
@@ -1306,6 +1324,7 @@ mod tests {
                 client: reqwest::Client::new(),
                 api_base: format!("http://{address}"),
                 bot_token: Secret::new(TOKEN),
+                request_timeout: std::time::Duration::from_secs(20),
                 channel_registration: true,
                 upstream_read_marks: false,
                 limiter: RateLimiter::new(),
@@ -1350,6 +1369,7 @@ mod tests {
             client: reqwest::Client::new(),
             api_base: format!("http://{address}"),
             bot_token: Secret::new(TOKEN),
+            request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
             limiter: RateLimiter::new(),
@@ -1420,6 +1440,7 @@ mod tests {
             client: reqwest::Client::new(),
             api_base: format!("http://{address}"),
             bot_token: Secret::new("abc"),
+            request_timeout: std::time::Duration::from_secs(20),
             channel_registration: true,
             upstream_read_marks: false,
             limiter: RateLimiter::new(),
