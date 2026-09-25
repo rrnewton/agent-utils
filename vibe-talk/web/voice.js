@@ -464,6 +464,7 @@ function showView(name) {
   viewRestored = returning;
   // The chips belong to the list you are looking at, and you are now looking at a different one.
   renderScrollTools();
+  renderChannelFreshness();
   // Leaving the channel takes the reading with it: audio that goes on playing over the transcript
   // is audio the reader cannot see the source of, on a list where the next thing it does is
   // archive a message.
@@ -2275,6 +2276,11 @@ async function api(path, options) {
     // a reason that signing in again will not fix, and bouncing the owner back to the sign-in
     // screen for those would be a lie about which thing is broken.
     error.refused = response.status === 401 || response.status === 403;
+    // A token the server no longer accepts, or a read it refuses, ends this device's copy of
+    // what that token read. A 403 on a WRITE is narrower — a read-only channel — and is not this.
+    if (response.status === 401 || (response.status === 403 && init.method === "GET")) {
+      dropMessageCache();
+    }
     // THE MACHINE-READABLE HALF, kept rather than folded into the sentence. The server answers
     // with a taxonomy — `summarizer_not_configured` is a fact about the DEPLOYMENT, while
     // `summarizer_error` is a fact about one attempt — and a caller that has to tell those apart
@@ -4088,6 +4094,660 @@ function guard(fn) {
     });
 }
 
+// --- the offline message cache -------------------------------------------------------------------
+//
+// `#18 offline-message-cache`. A reload, a phone reclaiming the tab, or a cold start of the
+// installed app used to open on an empty channel that filled only when the network answered — and
+// never, offline. The page now keeps a bounded snapshot of what it last showed, per signed-in
+// identity, channel, view and thread, and draws it BEFORE any request completes. The server stays
+// the authority: every snapshot is refreshed in the background and merged by message id, and until
+// that refresh succeeds the screen says how old the rows it is showing are.
+//
+// localStorage, deliberately, rather than IndexedDB. It is synchronous, so the snapshot is drawn in
+// the same task that runs this script instead of after an open-and-upgrade round trip; the drafts
+// and the outbox already live there; and a few hundred messages fit well inside the bounds below.
+// CacheStorage is never used for any of it: a response kept there outlives sign-out and is served
+// by whatever a service worker decides, which is why the API answers `Cache-Control: no-store`.
+//
+// ONE key holding one envelope, always read, changed and written in one go and never mirrored in a
+// variable: another tab, or the main app on this origin, can replace the token underneath this
+// page, and a copy held in memory would write the previous identity's messages straight back. The
+// rows on SCREEN are such a copy, so they carry the identity that drew them, and a page that finds
+// the token changed underneath it clears them before it reads, draws or saves anything.
+//
+// THE IDENTITY is a fingerprint of the saved token, never the token itself. It labels which
+// credential read these rows, and anything that disagrees with it — another token, no token, a
+// refusal — deletes the whole envelope rather than filtering it. Messages that credential can no
+// longer read must not stay on the device.
+
+const MESSAGE_CACHE_KEY = "vibe-talk.voice.message-cache";
+const MESSAGE_CACHE_VERSION = 1;
+/** Rows kept per channel, newest first: its messages, and separately its thread cards. */
+const MESSAGE_CACHE_ROWS = 120;
+/** Channels kept at once; the least recently opened goes first. */
+const MESSAGE_CACHE_SCOPES = 12;
+/** The whole envelope, in UTF-16 code units — about 1.2 MB, leaving the quota to the outbox. */
+const MESSAGE_CACHE_CHARS = 600000;
+
+/**
+ * How the channel rows on screen relate to the server: "fresh" from a read in this page, "saved"
+ * from the device and not yet refreshed, or "offline"/"failed" when the refresh did not succeed.
+ */
+let channelFreshness = "fresh";
+/** When the rows on screen were last known to be current, or 0 when there are none. */
+let channelFreshAt = 0;
+/** Whether `/client-config` has answered in this page, as opposed to the saved shell standing in. */
+let clientConfigApplied = false;
+/** The fingerprint of the token the channel rows on screen were read or drawn for. */
+let screenIdentity = tokenFingerprint(token());
+
+/** A stable 64-bit label for a token. Not a secret and not a check: only "is it the same one". */
+function tokenFingerprint(value) {
+  if (!value) return "";
+  let a = 0x811c9dc5;
+  let b = 0x9747b28c;
+  for (let i = 0; i < value.length; i += 1) {
+    const c = value.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193);
+    b = Math.imul(b ^ c, 0x5bd1e995);
+    b ^= b >>> 13;
+  }
+  const hex = (n) => (n >>> 0).toString(16).padStart(8, "0");
+  return hex(a) + hex(b);
+}
+
+/** Write and read back: private browsing and a full quota both refuse silently or by throwing. */
+function storedExactly(key, encoded) {
+  try {
+    localStorage.setItem(key, encoded);
+    return localStorage.getItem(key) === encoded;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function dropMessageCache() {
+  try {
+    localStorage.removeItem(MESSAGE_CACHE_KEY);
+  } catch (_error) {
+    // Nothing was readable either, so nothing is left to disclose.
+  }
+}
+
+const cachedRowsValid = (rows) => Array.isArray(rows) && rows.every((row) =>
+  row !== null && typeof row === "object" && (typeof row.id === "string" || typeof row.id === "number"));
+
+const coverageValid = (views) => views !== null && typeof views === "object" && !Array.isArray(views) &&
+  Object.values(views).every((cover) => cover !== null && typeof cover === "object" &&
+    (cover.floor === null || Number.isFinite(cover.floor)) && typeof cover.more === "boolean" &&
+    Number.isFinite(cover.at) && typeof cover.notice === "string");
+
+function validCacheEntry(entry) {
+  if (entry === null || typeof entry !== "object" || !Number.isFinite(entry.usedAt) ||
+      !cachedRowsValid(entry.messages) || !cachedRowsValid(entry.threads) ||
+      !Array.isArray(entry.dismissed)) return false;
+  if (entry.mode === "timeline") return coverageValid(entry.views) && typeof entry.hasThreads === "boolean";
+  return entry.mode === "page" && Number.isFinite(entry.savedAt) && typeof entry.more === "boolean";
+}
+
+function validCacheShell(shell) {
+  return shell !== null && typeof shell === "object" && cachedRowsValid(shell.channels);
+}
+
+/**
+ * The envelope for the token saved right now, or null when there is no token to scope it to.
+ *
+ * Anything unreadable — an interrupted write, another version, another identity — is removed and
+ * replaced by an empty envelope. A damaged entry is dropped on its own; the rest survive it.
+ */
+function readMessageCache() {
+  const identity = tokenFingerprint(token());
+  let raw = null;
+  try {
+    raw = localStorage.getItem(MESSAGE_CACHE_KEY);
+  } catch (_error) {
+    return null;
+  }
+  const empty = identity ? { v: MESSAGE_CACHE_VERSION, identity, shell: null, scopes: {} } : null;
+  if (raw === null) return empty;
+  let cache = null;
+  try {
+    cache = JSON.parse(raw);
+  } catch (_error) {
+    cache = null;
+  }
+  if (!identity || cache === null || typeof cache !== "object" || cache.v !== MESSAGE_CACHE_VERSION ||
+      cache.identity !== identity || cache.scopes === null || typeof cache.scopes !== "object" ||
+      Array.isArray(cache.scopes)) {
+    dropMessageCache();
+    return empty;
+  }
+  for (const [key, entry] of Object.entries(cache.scopes)) {
+    if (!validCacheEntry(entry)) delete cache.scopes[key];
+  }
+  if (!validCacheShell(cache.shell)) cache.shell = null;
+  return cache;
+}
+
+/** Cut a timeline entry's `field` to its newest `limit` and say which views lost rows by it. */
+function trimCanonField(entry, field, limit) {
+  if (entry[field].length <= limit) return;
+  const timeField = field === "threads" ? "updated_at" : "timestamp";
+  const removed = entry[field].slice(0, entry[field].length - limit);
+  entry[field] = entry[field].slice(-limit);
+  const cut = timeOf(entry[field][0], timeField);
+  for (const [key, cover] of Object.entries(entry.views)) {
+    const { view, thread } = viewOfKey(key);
+    if ((field === "threads") !== (view === "threads")) continue;
+    if (field === "messages" && !removed.some((message) => inView(message, view, thread))) continue;
+    cover.more = true;
+    if (Number.isFinite(cut)) cover.floor = cover.floor === null ? cut : Math.max(cover.floor, cut);
+  }
+}
+
+/**
+ * Keep the newest `limit` rows of an entry. A timeline entry is one channel's store, so cutting it
+ * raises the floor of every view that lost a row — the view then says older history exists rather
+ * than showing a gap. A timeline cursor is never kept: it is opaque and it expires. A legacy page
+ * cursor is just the oldest id, so it is kept.
+ */
+function trimCacheEntry(entry, limit) {
+  if (entry.mode === "timeline") {
+    trimCanonField(entry, "messages", limit);
+    trimCanonField(entry, "threads", limit);
+  } else if (entry.messages.length > limit) {
+    entry.messages = entry.messages.slice(-limit);
+    entry.more = true;
+  }
+  const kept = new Set(entry.messages.map((message) => String(message.id)));
+  entry.dismissed = entry.dismissed.map(String).filter((id) => kept.has(id));
+  if (entry.mode === "page") {
+    entry.cursor = entry.more && entry.messages.length > 0 ? String(entry.messages[0].id) : null;
+  }
+}
+
+/**
+ * Store the envelope inside its bounds, giving up space in a fixed order: other channels, least
+ * recently opened first; then half of `keep` at a time; then the whole cache. It is a convenience,
+ * so it never holds on to space the token, the drafts or an unsent message could need.
+ */
+function writeMessageCache(cache, keep = null) {
+  const leastRecent = () => Object.keys(cache.scopes)
+    .filter((key) => key !== keep)
+    .sort((a, b) => cache.scopes[a].usedAt - cache.scopes[b].usedAt);
+  while (Object.keys(cache.scopes).length > MESSAGE_CACHE_SCOPES) {
+    delete cache.scopes[leastRecent()[0]];
+  }
+  for (;;) {
+    const encoded = JSON.stringify(cache);
+    if (encoded.length <= MESSAGE_CACHE_CHARS && storedExactly(MESSAGE_CACHE_KEY, encoded)) return true;
+    const oldest = leastRecent()[0];
+    const held = keep === null ? null : cache.scopes[keep];
+    const size = held ? Math.max(held.messages.length, held.threads.length) : 0;
+    if (oldest !== undefined) {
+      delete cache.scopes[oldest];
+    } else if (size > 1) {
+      trimCacheEntry(held, Math.floor(size / 2));
+    } else {
+      dropMessageCache();
+      return false;
+    }
+  }
+}
+
+/** Forget the saved rows of every channel `gone` answers true for. */
+function forgetChannelScopes(gone) {
+  const cache = readMessageCache();
+  if (!cache) return;
+  for (const key of Object.keys(cache.scopes)) {
+    if (gone(key)) delete cache.scopes[key];
+  }
+  writeMessageCache(cache);
+}
+
+/**
+ * Keep what the page needs to draw the channel before `/client-config` answers: the channels, the
+ * read mode, and who "me" is, so a saved row is coloured as it was. Channels the server no longer
+ * lists go at the same moment — the credential can no longer read them.
+ */
+function saveCacheShell(config) {
+  const cache = readMessageCache();
+  if (!cache) return;
+  const channels = Array.isArray(config.channels) ? config.channels : [];
+  cache.shell = {
+    channels,
+    threading_supported: config.threading_supported === true,
+    self_author_id: config.self_author_id || null,
+    owner_author_id: config.owner_author_id || null,
+  };
+  const listed = new Set(channels.map((channel) => String(channel.id)));
+  for (const key of Object.keys(cache.scopes)) {
+    if (!listed.has(key)) delete cache.scopes[key];
+  }
+  writeMessageCache(cache);
+}
+
+/**
+ * Carry an add, rename or removal made here into the saved channel list, so the next cold start
+ * draws the picker as it now is, not as `/client-config` last described it.
+ */
+function saveCacheChannels() {
+  const cache = readMessageCache();
+  if (!cache || !cache.shell) return;
+  cache.shell.channels = knownChannels;
+  writeMessageCache(cache);
+}
+
+// --- one store per channel, and the views projected from it ---
+//
+// Main, Threads, All and each thread are FOUR ANSWERS FROM ONE CHANNEL, and the page holds the
+// channel once: every message any view has read, by id, in time order, and every thread summary.
+// A view is a projection of that store — Main is what was posted to the channel directly, thread
+// roots included; All is everything; a thread is its own messages — so switching view is local
+// work, a live arrival reaches every view at once, and a correction read in one view is the row
+// every other view shows.
+//
+// A PROJECTION NEVER INVENTS COVERAGE. Each view remembers how far back its OWN pages reached, and
+// shows the store only from there up: Main's newest page does not prove anything about the thread
+// replies between its rows, so All is not drawn from it. A view no page has covered is read.
+
+/** The selected channel's store. `views` maps a view key to how far back that view is covered. */
+let channelCanon = emptyCanon();
+
+function emptyCanon(channel = "") {
+  return { channel: String(channel), messages: [], threads: [], views: new Map(), dismissed: new Set(), hasThreads: false };
+}
+
+const viewKey = (view = channelView, thread = selectedThreadId) => (view === "thread" ? `thread:${thread}` : view);
+
+function viewOfKey(key) {
+  return key.startsWith("thread:") ? { view: "thread", thread: key.slice("thread:".length) } : { view: key, thread: null };
+}
+
+const timeOf = (item, field) => Date.parse(item && item[field]);
+
+/** Whether `message` belongs in `view`: the same rule the server's timeline applies. */
+function inView(message, view, thread) {
+  const id = threadOf(message);
+  if (view === "flat") return true;
+  if (view === "thread") return id === thread;
+  return !id || message.thread.is_root === true;
+}
+
+/** Stable by time when every row has one; otherwise in the order given, which is the server's. */
+function inTimeOrder(items, field) {
+  const times = items.map((item) => timeOf(item, field));
+  if (!times.every(Number.isFinite)) return items;
+  return items
+    .map((item, index) => ({ item, at: times[index], index }))
+    .sort((a, b) => a.at - b.at || a.index - b.index)
+    .map(({ item }) => item);
+}
+
+/**
+ * Fold one page into the store. A NEWEST page is the truth for its view from its oldest row up, so
+ * a row of that view it does not carry there was deleted upstream and goes; an older page only
+ * adds. Rows another view holds are untouched either way.
+ */
+function mergeIntoCanon(field, arriving, older, hasMore, belongs) {
+  const timeField = field === "threads" ? "updated_at" : "timestamp";
+  const incoming = new Set(arriving.map((item) => String(item.id)));
+  const edge = arriving.length ? timeOf(arriving[0], timeField) : NaN;
+  const kept = channelCanon[field].filter((item) => !incoming.has(String(item.id)) &&
+    (older || !belongs(item) || (hasMore && Number.isFinite(edge) && timeOf(item, timeField) < edge)));
+  channelCanon[field] = inTimeOrder(older ? [...arriving, ...kept] : [...kept, ...arriving], timeField);
+}
+
+/** A thread's summary, from a thread page or a live reply, replacing the one held by id. */
+function upsertThreadSummary(summary) {
+  const id = String(summary.id);
+  channelCanon.threads = inTimeOrder(
+    [...channelCanon.threads.filter((held) => String(held.id) !== id), summary], "updated_at");
+}
+
+/** Record what one page proved about its view's coverage. `lower` of two floors: null is "unknown". */
+function coverView(arriving, older, hasMore, notice, view = channelView, thread = selectedThreadId) {
+  const key = viewKey(view, thread);
+  const timeField = view === "threads" ? "updated_at" : "timestamp";
+  const prior = channelCanon.views.get(key);
+  const parsed = arriving.length ? timeOf(arriving[0], timeField) : NaN;
+  const edge = Number.isFinite(parsed) ? parsed : null;
+  const lower = (a, b) => (a === null || b === null ? null : Math.min(a, b));
+  let more = hasMore;
+  let floor = hasMore ? edge : null;
+  if (hasMore && prior && !older) {
+    // A refresh that stops short keeps the history already walked back to, as the rows do.
+    more = prior.more;
+    floor = prior.more ? lower(prior.floor, edge) : null;
+  } else if (hasMore && prior && older) {
+    floor = lower(prior.floor, edge);
+  }
+  channelCanon.views.set(key, {
+    floor, more, notice,
+    at: older && prior ? prior.at : Date.now(),
+    live: true,
+    cursor: prior ? prior.cursor : null,
+  });
+}
+
+/** Fold a page read for a view — the current one by default — into the store. */
+function foldTimelinePage(payload, older, view = channelView, thread = selectedThreadId) {
+  const channel = String(el("discord-channel").value);
+  if (channelCanon.channel !== channel) loadCanon(channel);
+  const hasMore = payload.has_more === true;
+  if (view === "threads") {
+    mergeIntoCanon("threads", payload.threads || [], older, hasMore, () => true);
+  } else {
+    mergeIntoCanon("messages", payload.messages || [], older, hasMore, (message) => inView(message, view, thread));
+  }
+  if (payload.thread) upsertThreadSummary(payload.thread);
+  if (view !== "thread") channelCanon.hasThreads = payload.has_threads === true;
+  coverView(view === "threads" ? payload.threads || [] : payload.messages || [], older, hasMore, payload.notice || "",
+    view, thread);
+}
+
+/** A live arrival or an acknowledged send: every view it belongs to has it from now on. */
+function foldLiveMessage(message) {
+  const channel = String(el("discord-channel").value);
+  if (channelCanon.channel !== channel) loadCanon(channel);
+  const id = String(message.id);
+  channelCanon.messages = inTimeOrder(
+    [...channelCanon.messages.filter((held) => String(held.id) !== id), message], "timestamp");
+  const thread = threadOf(message);
+  const summary = thread && channelCanon.threads.find((held) => String(held.id) === thread);
+  if (summary && timeOf(message, "timestamp") > timeOf(summary, "updated_at")) {
+    upsertThreadSummary({ ...summary, updated_at: message.timestamp });
+  }
+}
+
+/** The current view's rows from the store, or null when no page has covered this view. */
+function projectView(view = channelView, thread = selectedThreadId) {
+  const cover = channelCanon.views.get(viewKey(view, thread));
+  if (!cover) return null;
+  const threads = view === "threads";
+  const timeField = threads ? "updated_at" : "timestamp";
+  return channelCanon[threads ? "threads" : "messages"].filter((item) =>
+    (threads || inView(item, view, thread)) &&
+    !(cover.more && cover.floor !== null && timeOf(item, timeField) < cover.floor));
+}
+
+/** The read state of the rows on screen is the store's read state for those rows. */
+function syncCanonDismissed() {
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
+  for (const message of timelineMessages) {
+    const id = String(message.id);
+    if (archivedIds.has(id)) channelCanon.dismissed.add(id);
+    else channelCanon.dismissed.delete(id);
+  }
+}
+
+/** Load a channel's store from the device, or start it empty. Marks it recently used. */
+function loadCanon(channel) {
+  channelCanon = emptyCanon(channel);
+  const cache = readMessageCache();
+  const entry = cache ? cache.scopes[String(channel)] : undefined;
+  if (!entry || entry.mode !== "timeline") return;
+  channelCanon.messages = entry.messages;
+  channelCanon.threads = entry.threads;
+  channelCanon.hasThreads = entry.hasThreads;
+  channelCanon.dismissed = new Set(entry.dismissed.map(String));
+  for (const [key, cover] of Object.entries(entry.views)) {
+    channelCanon.views.set(key, { ...cover, live: false, cursor: null });
+  }
+  entry.usedAt = Date.now();
+  writeMessageCache(cache, String(channel));
+}
+
+/**
+ * Draw the current view from the store, with no request. False when no page has covered it. Saved
+ * rows go through the same applier a read uses, so they are built, filtered and grouped exactly as
+ * fetched ones — but WITHOUT retiring anything from the outbox: only the server seeing a message
+ * proves it was delivered.
+ */
+function drawProjection() {
+  const cover = channelCanon.views.get(viewKey());
+  if (!cover) return false;
+  const channel = el("discord-channel").value;
+  const payload = {
+    channel: knownChannel(channel),
+    thread: channelView === "thread"
+      ? channelCanon.threads.find((held) => String(held.id) === selectedThreadId) || selectedThread
+      : null,
+    has_threads: channelCanon.hasThreads,
+    has_more: cover.more,
+    next_before: cover.cursor,
+    notice: cover.notice,
+    dismissed: [...channelCanon.dismissed],
+  };
+  try {
+    timelineMessages = [];
+    timelineThreads = [];
+    applyTimelinePage(payload, false, true);
+  } catch (_error) {
+    // A saved row this version cannot draw is a damaged entry, not a reason to break the page.
+    clearChannelScreen();
+    forgetChannelScopes((id) => id === String(channel));
+    return false;
+  }
+  discordNewestId = timelineMessages.length > 0 ? String(timelineMessages[timelineMessages.length - 1].id) : null;
+  channelFreshAt = cover.at;
+  delete cover.landedHidden;
+  setChannelFreshness(cover.live ? "fresh" : "saved");
+  // A delivered send whose row is saved here shows once, as that row — but its receipt stays until
+  // the server itself is seen to have the message.
+  renderOutgoingMessages();
+  return true;
+}
+
+/**
+ * Record what the channel holds. Called after every read that succeeded and after every local
+ * change to the rows — a live arrival, an acknowledged send, an archive — so a reload shows what
+ * the reader last saw.
+ *
+ * NOT in the legacy to-do filter: that list is `/todo`, a filtered answer, and saving it as the
+ * channel would show a reload a channel with its dealt-with messages missing.
+ */
+function saveChannelScope() {
+  if (!el("discord-channel").value || (todoMode && !threadingSupported) || !screenBelongsToToken()) return;
+  const cache = readMessageCache();
+  if (!cache) return;
+  const key = String(el("discord-channel").value);
+  const now = Date.now();
+  let entry = null;
+  if (threadingSupported) {
+    if (channelCanon.channel !== key) return;
+    syncCanonDismissed();
+    const views = {};
+    for (const [view, cover] of channelCanon.views) {
+      views[view] = { floor: cover.floor, more: cover.more, at: cover.at, notice: cover.notice };
+    }
+    const held = new Set(channelCanon.messages.map((message) => String(message.id)));
+    entry = {
+      mode: "timeline",
+      usedAt: now,
+      messages: channelCanon.messages.slice(),
+      threads: channelCanon.threads.slice(),
+      views,
+      hasThreads: channelCanon.hasThreads,
+      dismissed: [...channelCanon.dismissed].filter((id) => held.has(id)),
+    };
+  } else {
+    const messages = [...el("discord-log").children].flatMap(rowMessages);
+    const shown = new Set(messages.map((message) => String(message.id)));
+    entry = {
+      mode: "page",
+      savedAt: channelFreshAt || now,
+      usedAt: now,
+      messages,
+      threads: [],
+      more: discordMoreAbove !== false,
+      cursor: null,
+      dismissed: [...archivedIds].filter((id) => shown.has(id)),
+    };
+  }
+  trimCacheEntry(entry, MESSAGE_CACHE_ROWS);
+  cache.scopes[key] = entry;
+  writeMessageCache(cache, key);
+}
+
+/**
+ * Draw the selected channel's saved rows, if this device has them: the store's projection of the
+ * current view in timeline mode, the saved page in legacy mode.
+ */
+function hydrateChannelScope() {
+  const channel = el("discord-channel").value;
+  if (!channel || (todoMode && !threadingSupported)) return false;
+  screenBelongsToToken();
+  if (threadingSupported) {
+    if (channelCanon.channel !== String(channel)) loadCanon(channel);
+    return drawProjection();
+  }
+  const cache = readMessageCache();
+  const key = String(channel);
+  const entry = cache ? cache.scopes[key] : undefined;
+  if (!entry || entry.mode !== "page") return false;
+  entry.usedAt = Date.now();
+  writeMessageCache(cache, key);
+  const payload = {
+    channel: knownChannel(channel),
+    messages: entry.messages,
+    has_more: entry.more,
+    next_before: entry.cursor || null,
+    dismissed: entry.dismissed,
+  };
+  try {
+    el("discord-log").replaceChildren();
+    const loaded = applyNewestPage(payload, true);
+    renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
+  } catch (_error) {
+    clearChannelScreen();
+    forgetChannelScopes((id) => id === key);
+    return false;
+  }
+  const rows = entry.messages;
+  discordNewestId = rows.length > 0 ? String(rows[rows.length - 1].id) : null;
+  channelFreshAt = entry.savedAt;
+  setChannelFreshness("saved");
+  renderOutgoingMessages();
+  return true;
+}
+
+/**
+ * Before `/client-config` answers: put the channel picker and the saved rows up from the shell, so
+ * a reload opens on the application rather than on the sign-in form and an empty channel.
+ */
+function hydrateFromCache() {
+  const cache = readMessageCache();
+  if (!cache || !cache.shell) return false;
+  const shell = cache.shell;
+  threadingSupported = shell.threading_supported === true;
+  knownChannels = shell.channels;
+  if (shell.self_author_id) noteSelfAuthor(shell.self_author_id);
+  ownerAuthorId = shell.owner_author_id || null;
+  fillChannelSelect("discord-channel");
+  fillChannelSelect("settings-channel");
+  renderChannelBox();
+  restoreChannelComposer();
+  hydrateChannelScope();
+  return true;
+}
+
+/** Take every channel row off the screen and out of memory. */
+function clearChannelScreen() {
+  ++discordLoadGeneration;
+  stopReading();
+  readingMode = false;
+  channelContexts.clear();
+  channelCanon = emptyCanon();
+  timelineMessages = [];
+  timelineThreads = [];
+  archivedIds = new Set();
+  discordMoreAbove = false;
+  discordOlderCursor = null;
+  discordNewestId = null;
+  el("discord-log").replaceChildren();
+  el("thread-list").replaceChildren();
+  el("channel-summary").replaceChildren();
+  el("timeline-notice").hidden = true;
+  renderOlderControl();
+  channelFreshAt = 0;
+  setChannelFreshness("fresh");
+  screenIdentity = tokenFingerprint(token());
+}
+
+/**
+ * Whether the rows on screen were read for the token saved now. When another tab or the main app
+ * has replaced it, they are cleared here — false — so they can be neither saved under the new
+ * identity nor merged into its first read.
+ */
+function screenBelongsToToken() {
+  if (screenIdentity === tokenFingerprint(token())) return true;
+  clearChannelScreen();
+  // Reading the envelope deletes it when it, too, belongs to the previous token.
+  readMessageCache();
+  return false;
+}
+
+/** Sign-out, another token, or a refusal: nothing this credential read may stay behind. */
+function forgetMessages() {
+  dropMessageCache();
+  clearChannelScreen();
+}
+
+/** A channel read failed. Say so over the rows it leaves standing — or take them away. */
+function noteChannelReadFailure(error) {
+  if (error && error.refused) {
+    forgetMessages();
+    return;
+  }
+  if (error && error.status === 404 && error.code === "unknown_channel") {
+    const channel = String(el("discord-channel").value);
+    forgetChannelScopes((id) => id === channel);
+    clearChannelScreen();
+    return;
+  }
+  // With nothing on screen the error itself is the whole report.
+  if (channelFreshAt) setChannelFreshness(error && error.network ? "offline" : "failed");
+}
+
+function setChannelFreshness(state) {
+  channelFreshness = state;
+  renderChannelFreshness();
+}
+
+/**
+ * Over the top of the list rather than in it: a sentence at the head of the history scrolls away
+ * with it, and the reader is usually at the bottom, which is exactly where "these are old" has to
+ * be visible. Hidden while the pull-to-refresh pill is in the same place.
+ */
+function renderChannelFreshness() {
+  const pill = el("channel-freshness");
+  const at = stamp(channelFreshAt);
+  const text = channelFreshness === "saved"
+    ? (el("channel-loading").hidden ? `Showing messages saved ${at}` : `Saved ${at} · refreshing…`)
+    : channelFreshness === "offline"
+      ? `Offline · showing messages saved ${at}`
+      : channelFreshness === "failed"
+        ? `Refresh failed · showing messages from ${at}`
+        : "";
+  pill.textContent = text;
+  pill.setAttribute("data-state", channelFreshness);
+  pill.hidden = text === "" || currentView !== "discord" || !el("pull-refresh").hidden;
+}
+
+/** The page drew a snapshot for one channel and mode; `/client-config` may describe another. */
+function reconcileChannelSnapshot(before) {
+  if (before.key === channelContextKey() && before.threading === threadingSupported) return;
+  clearChannelScreen();
+  channelView = "main";
+  selectedThreadId = null;
+  selectedThread = null;
+  channelHasThreads = false;
+  hydrateChannelScope();
+  restoreChannelComposer();
+  renderControls();
+}
+
 // --- channel views, threads and the channel composer ------------------------------------------
 
 function channelContextKey() {
@@ -4160,8 +4820,10 @@ function renderChannelNavigation() {
 function saveChannelDrafts() {
   try {
     const encoded = JSON.stringify(Object.fromEntries(channelDrafts));
-    localStorage.setItem(CHANNEL_DRAFTS_KEY, encoded);
-    return localStorage.getItem(CHANNEL_DRAFTS_KEY) === encoded;
+    if (storedExactly(CHANNEL_DRAFTS_KEY, encoded)) return true;
+    // Saved messages can be fetched again; what the reader typed cannot.
+    dropMessageCache();
+    return storedExactly(CHANNEL_DRAFTS_KEY, encoded);
   } catch (_error) {
     return false;
   }
@@ -4191,6 +4853,7 @@ function restoreChannelComposer() {
 }
 
 function rememberChannelContext() {
+  syncCanonDismissed();
   channelContexts.set(channelContextKey(), {
     messages: timelineMessages,
     threads: timelineThreads,
@@ -4203,6 +4866,9 @@ function rememberChannelContext() {
     newest: discordNewestId,
     position: captureScroll(),
     top: el("scroll-area").scrollTop,
+    freshness: channelFreshness,
+    freshAt: channelFreshAt,
+    dismissed: archivedIds,
   });
 }
 
@@ -4227,20 +4893,55 @@ async function changeChannelView(view, threadId = null, summary = null) {
   el("thread-list").replaceChildren(...(held ? held.cards : []));
   el("channel-summary").replaceChildren(...(held ? held.seam : []));
   el("timeline-notice").hidden = true;
+  channelFreshAt = held ? held.freshAt : 0;
+  channelFreshness = held ? held.freshness : "fresh";
+  if (held) archivedIds = held.dismissed;
   restoreChannelComposer();
   renderOlderControl();
   renderControls();
   if (held) {
     el("scroll-area").scrollTop = held.top;
     restoreScroll(held.position);
+    catchUpHeldView();
+    renderChannelFreshness();
     // Switching back to a view already fetched in this page is a local
     // presentation change. The live stream and periodic poll refresh the
     // active view; a tab switch itself must not become another network wait.
     return;
-  } else {
-    scrollToNewest();
   }
-  await loadDiscord({ keepPosition: Boolean(held) });
+  // Not drawn in this page yet, but covered by the channel's store — read earlier, or saved on
+  // this device: project it, with no request. The stream and the poll keep it current from here.
+  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value) && drawProjection()) {
+    renderChannelFreshness();
+    scrollToNewest();
+    return;
+  }
+  scrollToNewest();
+  await loadDiscord();
+}
+
+/** A held view missed what the stream delivered while it was hidden; the store did not. */
+function catchUpHeldView() {
+  const projected = threadingSupported ? projectView() : null;
+  if (!projected) return;
+  const cover = channelCanon.views.get(viewKey());
+  if (cover.landedHidden) {
+    // A page read for this view arrived while it was hidden: it is as current as that read.
+    delete cover.landedHidden;
+    channelFreshAt = cover.at;
+    channelFreshness = "fresh";
+  }
+  const threads = channelView === "threads";
+  const held = threads ? timelineThreads : timelineMessages;
+  const ids = (items) => items.map((item) => String(item.id)).join("\n");
+  if (ids(projected) === ids(held)) return;
+  if (threads) {
+    timelineThreads = projected;
+    el("thread-list").replaceChildren(...projected.map(threadCard));
+  } else {
+    timelineMessages = projected;
+    renderCachedTimeline();
+  }
 }
 
 function openThread(id, summary = null) {
@@ -4278,6 +4979,8 @@ function threadCard(summary) {
 function renderChannelLoading(loading) {
   const indicator = el("channel-loading");
   indicator.hidden = !loading;
+  // "Saved 14:05" and "Saved 14:05 · refreshing…" are different claims; only the second waits.
+  renderChannelFreshness();
   if (!loading) return;
   indicator.textContent = channelView === "threads"
     ? "Loading threads…"
@@ -4319,32 +5022,30 @@ function timelinePath(before = null) {
   return path;
 }
 
-function mergeTimelineItems(previous, arriving, older, hasMore, timeField) {
-  const incoming = new Set(arriving.map((item) => String(item.id)));
-  if (older) return [...arriving, ...previous.filter((item) => !incoming.has(String(item.id)))];
-  const edge = arriving.length ? Date.parse(arriving[0][timeField]) : NaN;
-  const kept = hasMore && Number.isFinite(edge)
-    ? previous.filter((item) => !incoming.has(String(item.id)) && Date.parse(item[timeField]) < edge)
-    : [];
-  return [...kept, ...arriving];
-}
-
-function applyTimelinePage(payload, older = false) {
-  observeOutgoingMessages(payload.messages || []);
+function applyTimelinePage(payload, older = false, saved = false) {
+  if (!saved) observeOutgoingMessages(payload.messages || []);
   const previousCount = channelView === "threads" ? timelineThreads.length : timelineMessages.length;
   const incoming = channelView === "threads" ? payload.threads || [] : payload.messages || [];
-  const merged = mergeTimelineItems(
-    channelView === "threads" ? timelineThreads : timelineMessages,
-    incoming, older, payload.has_more === true,
-    channelView === "threads" ? "updated_at" : "timestamp"
-  );
+  // Into the channel's store, and this view back out of it: what the reader sees is the store's
+  // projection, so a row another view corrected or the stream delivered is here too.
+  if (!saved) foldTimelinePage(payload, older);
+  const merged = projectView() || [];
   if (channelView === "threads") timelineThreads = merged;
   else timelineMessages = merged;
   // Retain the oldest cursor when a refresh retained the history already walked back to.
-  if (older || merged.length <= incoming.length || previousCount === 0) {
+  if (saved) {
+    // Saved on the device, a cursor is never kept, so whether older history exists is unknown
+    // until a read supplies one — the seam says so and the walk-back control waits. A projection
+    // of a view read in this page has its live cursor.
+    discordMoreAbove = payload.has_more === true ? (payload.next_before ? true : undefined) : false;
+    discordOlderCursor = payload.next_before || null;
+  } else if (older || merged.length <= incoming.length || previousCount === 0 ||
+      (discordMoreAbove === undefined && !discordOlderCursor)) {
     discordMoreAbove = payload.has_more === true;
     discordOlderCursor = payload.next_before || null;
   }
+  const cover = channelCanon.views.get(viewKey());
+  if (cover && !saved) cover.cursor = discordOlderCursor;
   channelHasThreads = payload.has_threads === true || channelView === "thread";
   if (payload.thread) selectedThread = payload.thread;
   noteArchived(payload, !older && merged.length <= incoming.length);
@@ -4409,7 +5110,9 @@ function renderCachedTimeline() {
 async function loadTimeline(options) {
   const generation = ++discordLoadGeneration;
   const context = channelContextKey();
-  if (!el("discord-channel").value) return;
+  const channel = String(el("discord-channel").value);
+  const [view, thread, canon] = [channelView, selectedThreadId, channelCanon];
+  if (!channel) return;
   if (discordFetchInFlight) {
     queueDiscordLoad(options);
     return;
@@ -4420,28 +5123,59 @@ async function loadTimeline(options) {
   renderChannelLoading(true);
   try {
     const payload = await api(timelinePath());
-    if (generation !== discordLoadGeneration || context !== channelContextKey()) return;
+    if (generation !== discordLoadGeneration || context !== channelContextKey()) {
+      foldLateTimelinePage(payload, { context, channel, view, thread, canon });
+      return;
+    }
     // Remove the in-flow indicator before measuring or restoring scroll. In
     // real browsers scrollTop is clamped when it disappears, but making the
     // order explicit also keeps the viewport model deterministic.
     renderChannelLoading(false);
-    if (!(options && options.keepPosition)) {
+    // ...unless what is on screen came from the device or a read that failed: those rows are what
+    // the reader has, and the refresh MERGES into them rather than replacing them with one page.
+    if (!(options && options.keepPosition) && channelFreshness === "fresh") {
       // An explicit refresh starts a fresh provider snapshot. Retaining old pages here would
       // retain their expiring cursor forever, even though the newest request made a new one.
       timelineMessages = [];
       timelineThreads = [];
       discordOlderCursor = null;
       discordMoreAbove = false;
+      channelCanon.views.delete(viewKey());
     }
     const messages = applyTimelinePage(payload);
     settleAfterRead(messages, { keepPosition: Boolean(options && options.keepPosition), area, ...position });
+    channelFreshAt = Date.now();
+    setChannelFreshness("fresh");
+    saveChannelScope();
     renderScrollTools();
     requestVisibleSummaries();
   } catch (error) {
-    if (generation === discordLoadGeneration && context === channelContextKey()) throw error;
+    if (generation === discordLoadGeneration && context === channelContextKey()) {
+      noteChannelReadFailure(error);
+      throw error;
+    }
   } finally {
     await finishDiscordLoad();
   }
+}
+
+/**
+ * The reader switched views while this newest page was on its way. It is still the newest page of
+ * the view it was read for, so the store keeps it — the same store, for the same channel and
+ * token: a cleared screen or another channel is a new store, and the page is dropped. Without
+ * this, a switch during the cold-start refresh would leave that view "saved" until the poll.
+ */
+function foldLateTimelinePage(payload, read) {
+  if (!threadingSupported || channelCanon !== read.canon || read.canon.channel !== read.channel ||
+      String(el("discord-channel").value) !== read.channel) return;
+  foldTimelinePage(payload, false, read.view, read.thread);
+  channelCanon.views.get(viewKey(read.view, read.thread)).landedHidden = true;
+  if (read.context === channelContextKey()) {
+    // Back on the view it was read for: that view is current now, not only on its next showing.
+    catchUpHeldView();
+    renderChannelFreshness();
+  }
+  saveChannelScope();
 }
 
 async function loadOlderTimeline() {
@@ -4455,6 +5189,7 @@ async function loadOlderTimeline() {
     if (context !== channelContextKey() || generation !== discordLoadGeneration) return;
     olderFetchInFlight = false;
     preservingScroll(() => applyTimelinePage(payload, true));
+    saveChannelScope();
     renderScrollTools();
     requestVisibleSummaries();
   } catch (error) {
@@ -4480,8 +5215,13 @@ async function loadOlderTimeline() {
 function persistOutgoingMessages() {
   try {
     const encoded = JSON.stringify([...outgoingMessages.values()]);
-    localStorage.setItem(OUTGOING_KEY, encoded);
-    outgoingStorageOkay = localStorage.getItem(OUTGOING_KEY) === encoded;
+    outgoingStorageOkay = storedExactly(OUTGOING_KEY, encoded);
+    if (!outgoingStorageOkay) {
+      // A full quota is not a reason to lose an unsent message: saved channel rows can be read
+      // again, so they give up their space first.
+      dropMessageCache();
+      outgoingStorageOkay = storedExactly(OUTGOING_KEY, encoded);
+    }
   } catch (_error) {
     outgoingStorageOkay = false;
   }
@@ -7076,10 +7816,10 @@ function renderOlderControl() {
  * page IS the whole channel, and anything else on screen is stale — a deleted message, or another
  * channel's.
  */
-function applyNewestPage(payload) {
+function applyNewestPage(payload, saved = false) {
   const list = el("discord-log");
   const messages = payload.messages || [];
-  observeOutgoingMessages(messages);
+  if (!saved) observeOutgoingMessages(messages);
   const oldest = messages.length ? messages[0].id : null;
   // Compared on the row's NEWEST constituent, so a combined row is kept only when the whole of it
   // is older than this page — otherwise a message would be on screen twice, once in each row.
@@ -7164,6 +7904,7 @@ async function loadOlder() {
       // button on the one step where they have finally arrived at the beginning.
       renderOlderControl();
     });
+    saveChannelScope();
     renderScrollTools();
     // The rows that just arrived above the viewport are candidates too, and the reader is right
     // at the top of them. `#49 cached-summaries`.
@@ -7285,6 +8026,7 @@ function renderPull(state) {
   element.hidden = state === null;
   element.setAttribute("data-state", state === null ? "idle" : state);
   element.textContent = state === null ? "" : PULL_LABELS[state];
+  renderChannelFreshness();
 }
 
 function pullCancel() {
@@ -7482,6 +8224,7 @@ function channelReadPosition(area) {
  *   arriving at the top of a long history means scrolling past everything already read.
  */
 async function loadDiscord(options) {
+  screenBelongsToToken();
   if (threadingSupported) return loadTimeline(options);
   // `#50 todo-view`. Every path that re-reads the channel comes through here — the background
   // poll, Refresh, entering the view, changing channel — so the mode is honoured HERE rather than
@@ -7523,11 +8266,17 @@ async function loadDiscord(options) {
     renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
     const messages = payload.messages || [];
     settleAfterRead(messages, { keepPosition, area, ...position });
+    channelFreshAt = Date.now();
+    setChannelFreshness("fresh");
+    saveChannelScope();
     renderScrollTools();
     // Every row here is new — `applyNewestPage` replaced the list — so the ones on screen have to
     // be asked about again. `summariesAsked` is what stops that being a second request for a
     // message already answered, which matters most here: this runs every DISCORD_POLL_MS.
     requestVisibleSummaries();
+  } catch (error) {
+    if (currentDiscordLoad(generation, channel, false)) noteChannelReadFailure(error);
+    throw error;
   } finally {
     await finishDiscordLoad();
   }
@@ -7770,12 +8519,20 @@ function todoSummary() {
  * Outside the mode this is an ordinary append, because nothing on screen is claiming a count.
  */
 function appendChannelRow(message) {
-  if ([...el("discord-log").children].some((row) => idsOf(row).includes(String(message.id)))) return;
+  if (threadingSupported) foldLiveMessage(message);
+  if ([...el("discord-log").children].some((row) => idsOf(row).includes(String(message.id)))) {
+    if (threadingSupported) saveChannelScope();
+    return;
+  }
   if (threadingSupported) {
     const id = threadOf(message);
     if (channelView === "threads" ||
         (channelView === "thread" && id !== selectedThreadId) ||
-        (channelView === "main" && id && !message.thread.is_root)) return;
+        (channelView === "main" && id && !message.thread.is_root)) {
+      // Not this view's row, but the store has it, and so will the next start.
+      saveChannelScope();
+      return;
+    }
     if (!timelineMessages.some((held) => String(held.id) === String(message.id))) timelineMessages.push(message);
   }
   const list = el("discord-log");
@@ -7796,6 +8553,8 @@ function appendChannelRow(message) {
   // appender, rather than at each of its callers: an arriving message can be the ANSWER to
   // something already on screen, so the row that changes is not necessarily the one just added.
   renderChannelRows();
+  // A live arrival and an acknowledged send are both what a reload should show next.
+  saveChannelScope();
   if (!todoMode) {
     return;
   }
@@ -7841,6 +8600,7 @@ async function toggleArchived(ids) {
 async function refreshAfterInboxChange() {
   if (threadingSupported) {
     renderCachedTimeline();
+    saveChannelScope();
     return;
   }
   if (todoMode) {
@@ -7855,6 +8615,7 @@ async function refreshAfterInboxChange() {
     renderTodoControls();
   } else {
     renderChannelRows();
+    saveChannelScope();
   }
 }
 
@@ -8239,9 +9000,17 @@ function scheduleDiscordPoll() {
     discordPollTimer = null;
     if (currentView !== "discord") return;
     guardQuietly(async () => {
-      await loadDiscord({ keepPosition: true });
-      if (currentView === "discord") {
-        scheduleDiscordPoll();
+      // A failed poll is the case polling exists for — the network comes back — so the next one
+      // is armed whatever this one did. A page that opened offline never heard `/client-config`
+      // either, and it asks again first.
+      let refused = false;
+      try {
+        refused = !clientConfigApplied && !(await signIn());
+        if (!refused) await loadDiscord({ keepPosition: true });
+      } finally {
+        if (currentView === "discord" && !refused) {
+          scheduleDiscordPoll();
+        }
       }
     })();
   }, DISCORD_POLL_MS);
@@ -9293,6 +10062,7 @@ async function addChannel() {
   // Redrawn from the answer rather than from a re-read: the server hands back the whole list
   // precisely so the two pickers and the editor cannot disagree about what exists.
   knownChannels = payload.channels || knownChannels;
+  saveCacheChannels();
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
   const addedId = String((payload.channel && payload.channel.id) || id);
@@ -9507,6 +10277,7 @@ async function addDirectoryChannel(entry) {
   }
   channelDirectory.adding.delete(entry.source);
   knownChannels = payload.channels || knownChannels;
+  saveCacheChannels();
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
   entry.tracked = true;
@@ -9531,7 +10302,9 @@ async function removeChannel() {
     return;
   }
   const previousChannel = el("discord-channel").value;
+  forgetChannelScopes((channel) => channel === String(id));
   knownChannels = payload.channels || [];
+  saveCacheChannels();
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
   renderChannelBox();
@@ -9634,6 +10407,7 @@ function adoptChannel(payload) {
     knownChannels = knownChannels.map((channel) =>
       String(channel.id) === String(updated.id) ? updated : channel
     );
+    saveCacheChannels();
   }
   el("alias-note").textContent = (payload && payload.alias_notice) || "";
   fillChannelSelect("discord-channel");
@@ -9822,6 +10596,8 @@ function applyClientConfig(config) {
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.
   startChannelStream(select.value);
+  clientConfigApplied = true;
+  saveCacheShell(config);
 }
 
 /**
@@ -9842,6 +10618,8 @@ async function signIn() {
     config = await api("/api/v1/client-config");
   } catch (error) {
     if (error.refused) {
+      // Whatever this credential read before, it can no longer read it.
+      forgetMessages();
       showError(
         error.status === 403
           ? `That token may read but not post, and this page needs the write-scope one — ` +
@@ -9855,9 +10633,13 @@ async function signIn() {
     }
     showError(`Signed in, but vibe-talk did not answer: ${error.message}`);
     showScreen("main");
+    // Saved rows stay up, and say they are saved rather than current.
+    if (channelFreshAt) setChannelFreshness(error.network ? "offline" : "failed");
     return true;
   }
+  const drawn = { key: channelContextKey(), threading: threadingSupported };
   applyClientConfig(config);
+  reconcileChannelSnapshot(drawn);
   clearError();
   showScreen("main");
   // Short, because the invitation itself now lives in the empty transcript — the largest thing on
@@ -9898,7 +10680,11 @@ async function saveToken() {
     setStatus("nothing to save");
     return;
   }
-  if (value !== token()) stopOutgoingSends();
+  if (value !== token()) {
+    stopOutgoingSends();
+    // Another credential may not be able to read what this one did.
+    forgetMessages();
+  }
   localStorage.setItem(TOKEN_KEY, value);
   // Read it back rather than assuming: private browsing and a full quota both make setItem throw
   // or silently do nothing, and "saved" would then be a lie the owner only discovers later.
@@ -9926,6 +10712,7 @@ function forgetToken() {
   // page that is still receiving one channel's messages is the leak this control exists to close.
   stopChannelStream();
   stopOutgoingSends();
+  forgetMessages();
   localStorage.removeItem(TOKEN_KEY);
   el("api-token").value = "";
   markSave(SAVE_LABEL, "", false);
@@ -10234,9 +11021,13 @@ el("view-switch").addEventListener("click", () => {
   // to agree or the fix is invisible.
   const returning = viewRestored;
   guardQuietly(async () => {
-    await loadDiscord(returning ? { keepPosition: true } : undefined);
-    if (currentView === "discord") {
-      scheduleDiscordPoll();
+    try {
+      await loadDiscord(returning ? { keepPosition: true } : undefined);
+    } finally {
+      // Armed after a failure too: offline is exactly when the reader needs the page to try again.
+      if (currentView === "discord") {
+        scheduleDiscordPoll();
+      }
     }
   })();
 });
@@ -10276,10 +11067,17 @@ function changeSelectedChannel() {
   // is the most confident possible way of being wrong.
   el("channel-summary").replaceChildren();
   renderOlderControl();
+  channelFreshAt = 0;
+  channelFreshness = "fresh";
+  // `#18 offline-message-cache`. The new channel as this device last saw it, until the read below
+  // answers — which then merges into those rows rather than replacing them.
+  const saved = hydrateChannelScope();
+  renderChannelFreshness();
+  if (saved) scrollToNewest();
   // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
   // the same reason the walk-back cursor is dropped two lines above.
   startChannelStream(el("discord-channel").value);
-  return loadDiscord();
+  return loadDiscord(saved && currentView === "discord" ? { keepPosition: true } : undefined);
 }
 el("discord-channel").addEventListener("change", guardQuietly(changeSelectedChannel));
 // `#39 channel-alias`. Pointing the editor at another channel shows THAT channel's name; it does
@@ -10421,8 +11219,12 @@ showView("voice");
 renderEmptyState();
 renderControls();
 // No token means no interface to show yet: the sign-in screen is the whole page until there is
-// one. With a token, prove it before showing the main screen.
+// one. With a token, prove it before showing the main screen — unless this device saved the
+// channel for that same token, in which case the application is up in this task, with the saved
+// rows in it, and the proof arrives behind it. A refusal still ends on the sign-in screen, with
+// every saved row gone. `#18 offline-message-cache`.
 if (token()) {
+  if (hydrateFromCache()) showScreen("main");
   guardQuietly(signIn)();
 } else {
   showScreen("signin");

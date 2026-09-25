@@ -77,9 +77,9 @@ permission fallback instead of risking repeated prompts after app switches.
 
 Installation does not add offline access. There is no service worker, every app asset is served
 with `Cache-Control: no-store`, and the server applies the same policy centrally to all `/api/`
-and `/mcp` responses, including errors. Chat text, transcripts, minted session URLs, and API
-responses are not placed in a browser-managed offline cache. The installed app still requires the
-server to be reachable.
+and `/mcp` responses, including errors. Transcripts, minted session URLs, and API responses are
+never placed in Cache Storage or any other browser-managed HTTP cache. The installed app still
+requires the server to be reachable to load at all.
 
 To ask Chrome's own installability engine about the checked-out page, run:
 
@@ -92,6 +92,40 @@ The check uses Playwright's Chromium by default and prints its version. Set
 `python3 vibe-talk/tests/pwa_installability.py --url https://your-host/voice` to inspect a deployed
 origin. A green result means CDP reports no manifest or installability errors under an Android
 viewport; it is not proof that a physical phone displayed the menu item or launched the app.
+
+### Saved messages on this device
+
+Opening the channel view used to mean a blank list until the server answered. `/voice` now keeps a
+bounded snapshot of the channel rows it has already shown, in `localStorage` under
+`vibe-talk.voice.message-cache`, and draws it immediately on the next visit:
+
+- **Drawn before the network.** The rows appear as soon as the page loads, with a pill over the top
+  of the list saying `Saved 14:02 · refreshing…`. It disappears once the refresh lands.
+- **One read to catch up.** A cold start makes one newest-page read, for the channel and view on
+  screen only, and merges it in without duplicating rows. Rows the server no longer returns are
+  dropped. It does not refetch every saved channel or walk back through history. After that, the
+  live stream and the regular poll keep the view current.
+- **Views are local.** The snapshot keeps one store per channel. Switching among Main, Threads,
+  All and a thread already read is redrawn from that store without a request.
+- **Honest when stale.** If the refresh cannot reach the server, the rows stay and the pill says
+  `Offline · showing messages saved …`. A server error says `Refresh failed · …`.
+- **Bounded.** At most 120 messages and 120 thread cards per channel, 12 channels (the least
+  recently used goes first) and about 600,000 characters in total. When storage is full the
+  snapshot shrinks, and unsent messages in the outbox always win the space. A damaged entry is
+  discarded rather than drawn.
+- **Tied to the token.** The snapshot records a fingerprint of the token that read it. Signing
+  out, saving a different token (on either page, or in another tab), or a `401`, or a `403` on a
+  read, removes it. A channel dropped from the server's configuration is pruned.
+- **Not a cursor store.** Provider paging cursors expire, so they are never saved. Scrolling above
+  the saved rows waits for the first live read.
+
+This is chat text at rest in the browser profile. Anyone who can open that profile can read the
+most recent rows until the token is changed or you sign out. It is not an offline mode: without an
+app-shell service worker the page itself cannot load with no network, only keep what it has.
+
+`make -C vibe-talk offline-cache-browser` walks that whole sequence in a real Chromium at an
+Android phone's size, against a loopback fake API. Pass `SCREENSHOTS=/tmp/shots` to keep one PNG
+per step.
 
 ## Reading messages with a device voice
 
@@ -3183,7 +3217,9 @@ Beyond the security list above:
 * **A contextual update reaches the agent only while `/voice` is open.** The conversation socket
   belongs to the browser, not to this server (see "Live push"), so closing the tab ends the relay
   even though the server keeps ingesting.
-* The web app has no service worker and no offline mode.
+* The web app has no service worker and no offline mode. It keeps a bounded snapshot of recent
+  channel rows in `localStorage` (see "Saved messages on this device"), but the page itself
+  cannot load without the server.
 * **The MCP endpoint has never been driven by a real ElevenLabs agent.** It is tested against the
   protocol as written and against `curl`; the registration steps above are from the vendor's
   documentation, not from a completed round trip.

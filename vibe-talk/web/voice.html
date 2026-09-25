@@ -195,6 +195,18 @@
             </div>
           </div>
 
+          <!--
+            `#18 offline-message-cache`. How old the channel rows are, whenever they are not a read
+            that just succeeded: saved on this device and refreshing, or kept after a refresh that
+            failed. It floats over the top of the list — outside the scroller, so it never scrolls
+            away, and below the view tabs, so it never covers one. A zero-height anchor, so its
+            appearing moves nothing. It is a status and not an alert: it is spoken once when it
+            changes, never interrupts.
+          -->
+          <div id="channel-freshness-anchor">
+            <p id="channel-freshness" data-state="fresh" role="status" aria-live="polite" hidden></p>
+          </div>
+
           <!-- THE one scrolling element on the page. -->
           <div id="scroll-area">
             <!--
