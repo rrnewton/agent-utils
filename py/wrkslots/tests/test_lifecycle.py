@@ -26985,6 +26985,9 @@ def test_clean_caches_only_refuses_invalid_unselected_scoped_finish_journal(
     mark_owner_dead(project, slot="other")
     set_liveness(project, "dead")
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    # Removal now reaches the validate-batch census boundaries; keep this
+    # journal test isolated from host process churn and sudo policy.
+    stub_validate_batch_censuses(monkeypatch)
     monkeypatch.setattr(
         wrkslots, "_interrupt_for_test", interrupt_after_finish_journal
     )
@@ -27000,16 +27003,22 @@ def test_clean_caches_only_refuses_invalid_unselected_scoped_finish_journal(
     journal.write_text(json.dumps(raw) + "\n", encoding="utf-8")
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
     capsys.readouterr()
+    only = ["--project-root", str(project), "clean-caches", "--only", "slot01"]
 
-    result = wrkslots.main(
-        [
-            "--project-root",
-            str(project),
-            "clean-caches",
-            "--only",
-            "slot01",
-        ]
+    # The interrupted removal leaves its validation-batch seal, which refuses
+    # every clean first.
+    seal = wrkslots._validate_batch_seal_journal_path(
+        wrkslots._load_config(str(project), "testhost")
     )
+    assert seal.is_file()
+    assert wrkslots.main(only) == 3
+    sealed = capsys.readouterr()
+    assert "interrupted validation-batch seal recorded" in sealed.err
+    assert artifact.is_file()
+
+    # Without the seal the damaged finish journal must refuse on its own.
+    seal.unlink()
+    result = wrkslots.main(only)
     captured = capsys.readouterr()
 
     assert result == 3
