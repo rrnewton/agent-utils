@@ -3,7 +3,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
@@ -65,15 +66,30 @@ enum Commands {
         after_help = "Example: agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"
     )]
     Adopt(Adopt),
+    /// Recover or reconcile a failed Muse launch by exact generation and live PID
+    #[command(
+        after_help = "Example: agentctl recover-start reviewer --expected-token TOKEN --expected-pid 12345"
+    )]
+    RecoverStart(RecoverStart),
+    /// Move a live one-pane Herdr tab without restarting its agent
+    #[command(
+        after_help = "Example: agentctl relocate reviewer --workspace-label project --new-tab"
+    )]
+    Relocate(Relocate),
     /// Stop an owned runtime, or safely unregister an adopted one, and archive state
     #[command(after_help = "Example: agentctl stop reviewer")]
     Stop(Stop),
-    /// List registered agents with live status or an explicit probe error
+    /// List registered agents with live health; exit nonzero if any result is non-healthy
     #[command(after_help = "Example: agentctl list --registry .agentctl")]
     List,
-    /// Show durable metadata, queue state, and the live runtime probe
+    /// Show durable metadata and live health; exit nonzero for a non-healthy result
     #[command(after_help = "Example: agentctl status reviewer")]
     Status(Named),
+    /// Check sessions independently; return nonzero unless every result is healthy
+    #[command(
+        after_help = "Example: agentctl health reviewer implementer --watch 300 --interval 5"
+    )]
+    Health(Health),
     /// Persist and deliver a prompt when the agent is ready
     #[command(
         after_help = "Examples:\n  agentctl send reviewer 'Review the diff'\n  agentctl send reviewer --file task.txt --message-id review-1"
@@ -82,6 +98,11 @@ enum Commands {
     /// Deliver queued prompts that are known not to have been submitted
     #[command(after_help = "Example: agentctl drain reviewer --ready-timeout 60")]
     Drain(Drain),
+    /// Reconcile one ambiguous Muse prompt from exact transcript evidence
+    #[command(
+        after_help = "Example: agentctl reconcile-delivery reviewer MESSAGE_ID --expected-sha256 SHA256"
+    )]
+    ReconcileDelivery(ReconcileDelivery),
     /// Read visible terminal output and save a bounded snapshot
     #[command(after_help = "Example: agentctl read reviewer --lines 100")]
     Read(Read),
@@ -123,6 +144,19 @@ struct Named {
 }
 
 #[derive(Args)]
+struct Health {
+    /// Registered session names; omission checks every active registry entry
+    #[arg(value_name = "NAME")]
+    names: Vec<String>,
+    /// Bounded polling duration in seconds; 0 performs one check
+    #[arg(long, default_value = "0", value_parser = health_watch_seconds)]
+    watch: f64,
+    /// Positive seconds between watch checks
+    #[arg(long, default_value = "5", value_parser = health_interval_seconds)]
+    interval: f64,
+}
+
+#[derive(Args)]
 struct Stop {
     #[command(flatten)]
     agent: Named,
@@ -135,6 +169,18 @@ struct Stop {
     /// Exact lowercase SHA-256 of the identity-less agent.json bytes
     #[arg(long, value_name = "SHA256")]
     expected_record_sha256: Option<String>,
+}
+
+#[derive(Args)]
+struct RecoverStart {
+    #[command(flatten)]
+    agent: Named,
+    /// Exact registry generation printed by status (required)
+    #[arg(long, required = true, value_name = "TOKEN")]
+    expected_token: String,
+    /// Exact live Muse PID whose executable and complete argv must match (required)
+    #[arg(long, required = true, value_name = "PID", value_parser = positive_pid)]
+    expected_pid: u64,
 }
 
 #[derive(Args)]
@@ -199,9 +245,12 @@ struct Start {
     /// UTF-8 file containing the initial prompt; conflicts with --brief
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
-    /// Existing Herdr workspace ID (otherwise HERDR_WORKSPACE_ID or a subagents workspace)
-    #[arg(long, value_name = "ID")]
+    /// Existing Herdr workspace ID; overrides the project default
+    #[arg(long, value_name = "ID", conflicts_with = "workspace_label")]
     workspace_id: Option<String>,
+    /// Unique Herdr workspace label; overrides the project default
+    #[arg(long, value_name = "LABEL", conflicts_with = "workspace_id")]
+    workspace_label: Option<String>,
     /// Seconds to wait for harness startup, greater than zero and at most 300
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
@@ -257,6 +306,31 @@ struct Adopt {
     /// Stable native conversation ID already reported by this exact pane
     #[arg(long, value_name = "ID")]
     session: Option<String>,
+}
+
+#[derive(Args)]
+struct Relocate {
+    #[command(flatten)]
+    agent: Named,
+    /// Exact existing destination workspace id
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with = "workspace_label",
+        required_unless_present = "workspace_label"
+    )]
+    workspace_id: Option<String>,
+    /// Unique existing destination workspace label
+    #[arg(
+        long,
+        value_name = "LABEL",
+        conflicts_with = "workspace_id",
+        required_unless_present = "workspace_id"
+    )]
+    workspace_label: Option<String>,
+    /// Move into a new tab; other relocation layouts are intentionally unsupported
+    #[arg(long, required = true)]
+    new_tab: bool,
 }
 
 #[derive(Args)]
@@ -335,6 +409,17 @@ struct Drain {
     agent: Named,
     #[command(flatten)]
     delivery: Delivery,
+}
+#[derive(Args)]
+struct ReconcileDelivery {
+    #[command(flatten)]
+    agent: Named,
+    /// Exact caller-selected queue message identifier
+    #[arg(value_name = "MESSAGE_ID")]
+    message_id: String,
+    /// Exact lowercase SHA-256 of the retained queue artifact
+    #[arg(long, required = true, value_name = "SHA256")]
+    expected_sha256: String,
 }
 #[derive(Args)]
 struct Read {
@@ -537,6 +622,32 @@ fn startup_seconds(value: &str) -> Result<f64, String> {
     }
     Ok(value)
 }
+fn health_watch_seconds(value: &str) -> Result<f64, String> {
+    let value = seconds(value)?;
+    if value > 86_400.0 {
+        return Err("health watch seconds must be at most 86400".to_owned());
+    }
+    Ok(value)
+}
+fn health_interval_seconds(value: &str) -> Result<f64, String> {
+    let value = positive_seconds(value)?;
+    if value > 3_600.0 {
+        return Err("health interval seconds must be at most 3600".to_owned());
+    }
+    Ok(value)
+}
+fn positive_pid(value: &str) -> Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("expected a positive decimal Linux process id".to_owned());
+    }
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "expected a positive decimal Linux process id".to_owned())?;
+    if parsed == 0 || parsed > i32::MAX as u64 {
+        return Err("Linux process id must be between 1 and 2147483647".to_owned());
+    }
+    Ok(parsed)
+}
 fn chat_delivery_seconds(value: &str) -> Result<f64, String> {
     let value = seconds(value)?;
     if value > 30.0 {
@@ -673,10 +784,11 @@ fn run(args: Cli) -> Result<i32, Failure> {
             return run_chat(args.registry, args.herdr_bin, value);
         }
         Commands::Profiles(value) => {
-            let (path, profiles) = crate::profiles::load_profiles(&value.cwd, true)?;
+            let (path, config) = crate::profiles::load_project_config(&value.cwd, true)?;
             write_json(&json!({
                 "path": path,
-                "profiles": profiles.values().map(crate::profiles::LaunchProfile::public).collect::<Vec<_>>()
+                "default_workspace": config.default_workspace,
+                "profiles": config.profiles.values().map(crate::profiles::LaunchProfile::public).collect::<Vec<_>>()
             }))
             .map_err(Failure::Output)?;
             return Ok(0);
@@ -700,8 +812,10 @@ fn run(args: Cli) -> Result<i32, Failure> {
     let client =
         HerdrClient::with_executable("direct", &args.herdr_bin).map_err(AgentError::from)?;
     let manager = ManagedAgents::new(&client, &args.registry)?;
-    let mut result = match command {
+    let result = match command {
         Commands::Start(value) => {
+            let (_, project_config) = crate::profiles::load_project_config(&value.cwd, true)?;
+            let launch_profile = value.profile.clone();
             let (harness, mode, model, reasoning_effort, harness_args, environment) =
                 if let Some(profile_name) = value.profile.as_deref() {
                     let mut overlaps = Vec::new();
@@ -732,8 +846,7 @@ fn run(args: Cli) -> Result<i32, Failure> {
                             overlaps.join(", ")
                         )));
                     }
-                    let (_, profiles) = crate::profiles::load_profiles(&value.cwd, false)?;
-                    let profile = profiles.get(profile_name).ok_or_else(|| {
+                    let profile = project_config.profiles.get(profile_name).ok_or_else(|| {
                         Failure::Usage(format!(
                             "unknown profile {profile_name:?}; run agentctl profiles --cwd {}",
                             value.cwd.display()
@@ -775,8 +888,21 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 ),
                 None => value.brief,
             };
+            let (mut workspace_id, mut workspace_label) =
+                (value.workspace_id, value.workspace_label);
+            if mode == "interactive" && workspace_id.is_none() && workspace_label.is_none() {
+                if let Some(selector) = project_config.default_workspace {
+                    if selector.kind == "id" {
+                        workspace_id = Some(selector.value);
+                    } else {
+                        workspace_label = Some(selector.value);
+                    }
+                }
+            }
             let options = StartOptions {
-                workspace_id: value.workspace_id,
+                launch_profile,
+                workspace_id,
+                workspace_label,
                 harness,
                 model,
                 resume: value.resume,
@@ -807,6 +933,15 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 session: value.session,
             },
         )?,
+        Commands::RecoverStart(value) => {
+            manager.recover_start(&value.agent.name, &value.expected_token, value.expected_pid)?
+        }
+        Commands::Relocate(value) => manager.relocate(
+            &value.agent.name,
+            value.workspace_id.as_deref(),
+            value.workspace_label.as_deref(),
+            value.new_tab,
+        )?,
         Commands::Stop(value) => {
             if value.recover_legacy_adoption
                 && (value.expected_token.is_none() || value.expected_record_sha256.is_none())
@@ -830,8 +965,47 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 },
             )?
         }
-        Commands::List => json!(manager.list()?),
-        Commands::Status(value) => manager.status(&value.name)?,
+        Commands::List => {
+            let (rows, healthy) = manager.list_with_health();
+            let result = json!(rows);
+            write_json(&result).map_err(Failure::Output)?;
+            return Ok(if healthy { 0 } else { 1 });
+        }
+        Commands::Status(value) => {
+            let (result, healthy) = manager.status_with_health(&value.name)?;
+            write_json(&result).map_err(Failure::Output)?;
+            return Ok(if healthy { 0 } else { 1 });
+        }
+        Commands::Health(value) => {
+            let deadline = Instant::now() + Duration::from_secs_f64(value.watch);
+            let mut polls = 0_u64;
+            let mut health;
+            loop {
+                let probe_deadline = if value.watch > 0.0 {
+                    deadline
+                } else {
+                    Instant::now() + Duration::from_secs(60)
+                };
+                health = manager.health_until(&value.names, probe_deadline);
+                polls += 1;
+                if health["healthy"] != true || Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(
+                    Duration::from_secs_f64(value.interval)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+            health["polls"] = json!(polls);
+            health["watch_seconds"] = json!(value.watch);
+            health["interval_seconds"] = json!(value.interval);
+            let healthy = health["healthy"] == true;
+            write_json(&health).map_err(Failure::Output)?;
+            return Ok(if healthy { 0 } else { 1 });
+        }
         Commands::Send(value) => {
             if value.model.is_some() {
                 return Err(Failure::Usage(
@@ -862,6 +1036,11 @@ fn run(args: Cli) -> Result<i32, Failure> {
                 76
             });
         }
+        Commands::ReconcileDelivery(value) => json!(manager.reconcile_delivery(
+            &value.agent.name,
+            &value.message_id,
+            &value.expected_sha256,
+        )?),
         Commands::Read(value) => {
             if !matches!(value.output.as_str(), "tail" | "all") || value.since_turn.is_some() {
                 return Err(Failure::Usage("interactive agents expose terminal snapshots; last/since_turn require headless transcripts".to_owned()));
@@ -901,7 +1080,6 @@ fn run(args: Cli) -> Result<i32, Failure> {
             unreachable!()
         }
     };
-    add_capabilities(&mut result);
     write_json(&result).map_err(Failure::Output)?;
     Ok(0)
 }
@@ -1038,38 +1216,6 @@ fn capabilities_document(
     })
 }
 
-fn add_capabilities(value: &mut serde_json::Value) {
-    if let Some(values) = value.as_array_mut() {
-        for value in values {
-            add_capabilities(value);
-        }
-    } else if value.get("adapter").is_some() && value.get("name").is_some() {
-        value["capabilities"] = if matches!(
-            value["adapter"].as_str(),
-            Some("herdr" | "herdr-pane" | "herdr-foreign")
-        ) && value["mode"] == "interactive"
-            && value["backend"] == "herdr"
-        {
-            json!([
-                "send",
-                "status",
-                "read",
-                "wait",
-                "stop",
-                "attach",
-                "pause",
-                "resume",
-                "terminal-snapshot",
-                "drain",
-                "goal",
-                "bind-session"
-            ])
-        } else {
-            json!(["status"])
-        };
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,6 +1259,20 @@ mod tests {
         ] {
             assert!(help.contains(required));
         }
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "reconcile-delivery",
+            "reviewer",
+            "message-1",
+            "--expected-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ])
+        .unwrap();
+        let Some(Commands::ReconcileDelivery(reconcile)) = parsed.command else {
+            panic!("expected reconcile-delivery command");
+        };
+        assert_eq!(reconcile.agent.name, "reviewer");
+        assert_eq!(reconcile.message_id, "message-1");
         assert!(Cli::try_parse_from([
             "agentctl",
             "chat",
@@ -1421,34 +1581,6 @@ mod tests {
                 .as_array()
                 .expect("missing capability list")
                 .contains(&json!("rust-provider"))
-        );
-    }
-
-    #[test]
-    fn adopted_interactive_records_advertise_the_full_named_interface() {
-        let mut record = json!({
-            "name": "foreign",
-            "adapter": "herdr-foreign",
-            "mode": "interactive",
-            "backend": "herdr",
-        });
-        add_capabilities(&mut record);
-        assert_eq!(
-            record["capabilities"],
-            json!([
-                "send",
-                "status",
-                "read",
-                "wait",
-                "stop",
-                "attach",
-                "pause",
-                "resume",
-                "terminal-snapshot",
-                "drain",
-                "goal",
-                "bind-session"
-            ])
         );
     }
 }

@@ -17,8 +17,9 @@ from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
-from agentctl.sessions import Sessions
-from agentctl.subagents import AgentRecord
+from agentctl.launch_contract import RuntimeControl
+from agentctl.sessions import Sessions, _runtime_launch_contract
+from agentctl.subagents import AgentRecord, LaunchSpec
 import agentctl.codex_goal as native_goal
 from .test_herdr_subagents import FakeManagedClient
 
@@ -72,7 +73,7 @@ def test_adopted_agent_supports_named_operations_and_preserves_native_identity(
     }
     assert result["capabilities"] == [
         "send", "status", "read", "wait", "stop", "attach", "pause", "resume",
-        "terminal-snapshot", "drain", "goal", "bind-session",
+        "terminal-snapshot", "drain", "goal", "bind-session", "relocate",
     ]
     assert [row["name"] for row in sessions.list()] == ["foreign"]
 
@@ -88,6 +89,33 @@ def test_adopted_agent_supports_named_operations_and_preserves_native_identity(
     assert binding["kind"] == "session"
     assert binding["agent"] == "codex"
     assert binding["value"] == "native-session"
+
+
+def test_every_adopted_operation_revalidates_the_shell_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
+    adopt(sessions, pane, tmp_path)
+    fake.foreign_shell_identity = replace(
+        fake.foreign_shell_identity,
+        starttime_ticks=fake.foreign_shell_identity.starttime_ticks + 1,
+    )
+
+    status = sessions.status("foreign")
+    assert status["agent_status"] == "unknown"
+    assert "shell generation changed" in str(status["probe_error"])
+    operations = (
+        lambda: sessions.send_session("foreign", "message"),
+        lambda: sessions.read_session("foreign"),
+        lambda: sessions.wait("foreign", timeout=0),
+        lambda: sessions.pause("foreign"),
+        lambda: sessions.attach("foreign"),
+        lambda: sessions.bind_session("foreign", "native-session"),
+    )
+    for operation in operations:
+        with pytest.raises((AgentDeliveryError, HerdrUnavailable)):
+            operation()
+    assert fake.submitted == []
 
 
 def test_stop_unregisters_foreign_agent_without_closing_or_mutating_runtime(
@@ -108,10 +136,13 @@ def test_stop_unregisters_foreign_agent_without_closing_or_mutating_runtime(
     assert sessions.list() == []
     archive = Path(str(stopped["archive"]))
     saved = json.loads((archive / "agent.json").read_text())
-    assert saved["adapter"] == "herdr-foreign"
+    assert saved["launch"]["adapter"] == "herdr-foreign"
     assert saved["token"] == original["token"]
     assert (archive / "output.json").is_file()
     assert list((archive / "queue/processed").iterdir())
+    assert sessions.stop(
+        "foreign", expected_token=str(original["token"]),
+    ) == stopped
 
 
 def test_stop_unregisters_confirmed_dead_foreign_agent_without_closing_shell(
@@ -169,7 +200,7 @@ def test_malformed_foreign_shell_identities_are_rejected(
     unknown["foreign_shell_identity"]["unexpected"] = 1
     variants.append(unknown)
     wrong_adapter = json.loads(json.dumps(original))
-    wrong_adapter["adapter"] = "herdr"
+    wrong_adapter["launch"]["adapter"] = "herdr"
     variants.append(wrong_adapter)
 
     for document in variants:
@@ -323,7 +354,7 @@ def test_stop_refuses_absent_legacy_foreign_record_without_shell_identity(
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     original = adopt(sessions, pane, tmp_path)
     path = sessions.registry / "foreign" / "agent.json"
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = sessions.get("foreign").to_document()
     del document["foreign_shell_identity"]
     path.write_text(json.dumps(document), encoding="utf-8")
     fake.infos[pane] = replace(
@@ -344,7 +375,7 @@ def test_stop_refuses_live_legacy_foreign_record_without_shell_identity(
     sessions, fake, pane = setup_foreign(tmp_path, monkeypatch)
     original = adopt(sessions, pane, tmp_path)
     path = sessions.registry / "foreign" / "agent.json"
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = sessions.get("foreign").to_document()
     del document["foreign_shell_identity"]
     path.write_text(json.dumps(document), encoding="utf-8")
 
@@ -362,7 +393,7 @@ def prepare_legacy_dead(
     """Turn one newly adopted fixture into the exact old on-disk shape."""
     original = adopt(sessions, pane, Path(fake.infos[pane].cwd))
     record_path = sessions.registry / "foreign" / "agent.json"
-    document = json.loads(record_path.read_text(encoding="utf-8"))
+    document = sessions.get("foreign").to_document()
     del document["foreign_shell_identity"]
     record_path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
     raw = record_path.read_bytes()
@@ -380,7 +411,7 @@ def test_explicit_legacy_recovery_archives_exact_record_queue_and_output_without
     original = adopt(sessions, pane, tmp_path)
     sessions.send_session("foreign", "retained request")
     path = sessions.registry / "foreign" / "agent.json"
-    document = json.loads(path.read_text(encoding="utf-8"))
+    document = sessions.get("foreign").to_document()
     del document["foreign_shell_identity"]
     path.write_text(json.dumps(document, separators=(",", ":")), encoding="utf-8")
     raw = path.read_bytes()
@@ -1193,10 +1224,15 @@ def test_adopt_refuses_same_harness_session_held_by_headless_record(
     sessions._prepare()
     (sessions.registry / "headless").mkdir(mode=0o700)
     sessions._save(AgentRecord(
-        "headless", "headless-token", "codex", str(tmp_path), 1.0,
-        lifecycle="running", session_value="native-session",
-        adapter="turn-runner", mode="headless", backend="tmux",
-        runtime_home=str(tmp_path / "runtime"),
+        "headless", "headless-token",
+        LaunchSpec(
+            "codex", str(tmp_path), "turn-runner", "headless", "tmux",
+            None, None, None, ("codex",), (), str(tmp_path / "runtime"),
+            "owned", None,
+        ),
+        1.0,
+        lifecycle="running", session_agent="codex",
+        session_value="native-session", session_source="observed",
     ))
     with pytest.raises(AgentDeliveryError, match="already registered as 'headless'"):
         adopt(sessions, pane, tmp_path)
@@ -1261,8 +1297,17 @@ def test_headless_start_stops_runtime_if_session_is_claimed_by_adopted_agent(
         record: AgentRecord, action: str, **_options: object,
     ) -> dict[str, object]:
         actions.append(action)
-        return {"record": {"mode": "headless", "backend": "tmux",
-                           "session_id": "native-session"}, "result": {}}
+        return {"record": {
+            "name": record.name, "harness": record.launch.harness,
+            "cwd": record.launch.cwd, "model": record.launch.model,
+            "mode": "headless", "backend": "tmux",
+            "harness_args": record.arguments,
+            "codex_bypass_permissions": False,
+                "control": RuntimeControl.outer_session(record.token).to_document(),
+                "launch": _runtime_launch_contract(record).to_document(),
+                "tmux_target": "workers:headless", "presentation_pane": None,
+                "session_id": "native-session",
+        }, "result": {}}
 
     monkeypatch.setattr(sessions, "_worker", worker)
     with pytest.raises(AgentDeliveryError, match="already registered as 'foreign'"):

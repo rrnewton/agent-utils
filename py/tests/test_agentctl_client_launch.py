@@ -16,13 +16,24 @@ from pathlib import Path
 
 import agentctl.client as client_module
 from agentctl.client import (
+    claude_active_screen,
+    claude_prompt_is_exact_composer,
+    claude_prompt_transcript_count,
+    claude_staged_composer,
     CustomProcessIdentity,
     HerdrClient,
     ProcessInfo,
+    muse_idle_composer,
     muse_prompt_in_composer,
     muse_prompt_in_transcript,
+    muse_prompt_is_exact_composer,
     muse_prompt_transcript_count,
     muse_startup_metadata,
+    muse_verified_process_composer,
+    muse_verified_process_idle_composer,
+    muse_verified_process_prompt_in_composer,
+    muse_verified_process_prompt_is_exact_composer,
+    muse_verified_process_prompt_transcript_count,
 )
 from agentctl.errors import HerdrUnavailable
 from agentctl.procstat import parse_process_stat
@@ -164,6 +175,149 @@ def test_custom_muse_launch_uses_literal_shell_quoting_and_exact_pane_report() -
     ]
 
 
+def test_custom_muse_launch_accepts_current_model_footer_without_auto_review() -> None:
+    screen = (
+        "Muse Code at Meta (https://fb.workplace.com/groups/27315719428107177)\n"
+        "Using AI Gateway (Meta Model API upstream)\n\n"
+        "  Muse Code 1.4.0\n\n"
+        "────────────────\n❯\n────────────────\n"
+        "  kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n"
+    )
+    client, calls = _custom_runner(screen)
+    identity = client.start_pane_agent(
+        "worker", "muse", "p1",
+        ("--model", "kiki_gb300_mxfp8_6p2_840_nwr", "--reasoning-effort", "xhigh", "--yolo"),
+        timeout=1,
+    )
+    assert identity.pid == 2_147_483_647
+    assert any(call[1:3] == ["pane", "report-agent"] for call in calls)
+
+
+def test_current_muse_footer_does_not_turn_a_choice_into_an_idle_composer() -> None:
+    screen = (
+        "  Muse Code 1.4.0\n\n"
+        "────────────────\n❯ Yes, continue\n  No, exit\n────────────────\n"
+        "  kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n"
+    )
+    assert not muse_idle_composer(screen)
+    assert not muse_idle_composer(screen.replace("❯ Yes, continue\n  No, exit", "❯\n  pending text"))
+
+
+def test_claude_active_screen_requires_current_activity_controls() -> None:
+    divider = "─" * 40
+    screen = (
+        "completed output\n✻ Waiting for 1 background agent to finish\n"
+        f"{divider}\n❯\n{divider}\n"
+        "auto mode on · ← 2 agents · ↓ to manage\n"
+        "● main\n◯ reviewer Checking tests 8m\n"
+    )
+    assert claude_active_screen(screen)
+    assert claude_active_screen(screen.replace("Waiting", "Waited").replace(
+        "↓ to manage", "esc to interrupt",
+    ))
+    assert not claude_active_screen(screen.replace("Waiting", "Waited"))
+    assert not claude_active_screen(screen.replace("← 2 agents", "← 1 agent"))
+    staged_while_active = (
+        "● Background command still running\n"
+        "✽ Considering… (20m 51s)\n"
+        f"{divider}\n"
+        "❯ queued follow-up prompt\n"
+        "  ctrl+x ctrl+s to send now\n"
+        f"{divider}\n"
+        "⏵⏵ auto mode on · esc to interrupt · ← 2 agents\n"
+    )
+    assert claude_active_screen(staged_while_active)
+    assert not claude_active_screen(
+        screen.replace("❯", "old transcript\n❯", 1).replace(
+            "✻ Waiting for 1 background agent to finish\n", "", 1,
+        )
+    )
+
+
+def test_claude_staged_prompt_is_distinct_from_a_submitted_turn() -> None:
+    divider = "─" * 40
+    prompt = "review the deterministic- scheduling contract"
+    staged = (
+        "● Background command still running\n"
+        f"{divider}\n"
+        "❯ review the deterministic-\n"
+        "  scheduling contract\n"
+        "  ctrl+x ctrl+s to send now\n"
+        f"{divider}\n"
+        "⏵⏵ auto mode on · esc to interrupt · ← 2 agents\n"
+    )
+    assert claude_staged_composer(staged)
+    assert claude_prompt_is_exact_composer(staged, prompt)
+    assert claude_prompt_transcript_count(staged, prompt) == 0
+
+    submitted = (
+        f"❯ {prompt}\n"
+        "● Working on the request\n"
+        f"{divider}\n❯\n{divider}\n"
+        "⏵⏵ auto mode on · esc to interrupt\n"
+    )
+    assert not claude_staged_composer(submitted)
+    assert not claude_prompt_is_exact_composer(submitted, prompt)
+    assert claude_prompt_transcript_count(submitted, prompt) == 1
+
+
+def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
+    executable = os.path.realpath("/bin/true")
+    process_probes = 0
+
+    def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal process_probes
+        argv = list(command)
+        if argv[1:3] == ["pane", "process-info"]:
+            process_probes += 1
+            process_argv: object = None if process_probes == 1 else [executable]
+            output = {"result": {"process_info": {
+                "pane_id": "p1", "shell_pid": 10,
+                "foreground_process_group_id": 11,
+                "foreground_processes": [{
+                    "pid": 2_147_483_647, "name": "true", "cmdline": executable,
+                    "argv": process_argv, "executable": executable,
+                }],
+            }}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(output), "")
+        if argv[1:3] == ["pane", "read"]:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                "Muse Code 1.4.0\n────────────────\n❯\n────────────────\n"
+                "watermelon-preview · xhigh · /work/project · Auto-review\n",
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    client = HerdrClient(herdr_bin="fixture-herdr", run=run)
+    client._harness_executable = lambda _kind: executable  # type: ignore[assignment]
+    identity = client.start_pane_agent("worker", "muse", "p1", (), timeout=1)
+    assert identity.pid == 2_147_483_647
+    assert process_probes >= 2
+
+
+def test_custom_muse_process_probe_honors_remaining_startup_deadline(
+    tmp_path: Path,
+) -> None:
+    herdr = tmp_path / "blocking-herdr"
+    herdr.write_text(
+        "#!/usr/bin/python3\n"
+        "import sys, time\n"
+        "if sys.argv[1:3] == ['pane', 'process-info']:\n"
+        "    time.sleep(5)\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    herdr.chmod(0o700)
+    client = HerdrClient(
+        herdr_bin=str(herdr), environ={"AGENTCTL_MUSE_BIN": "/bin/true"},
+    )
+    started = time.monotonic()
+    with pytest.raises(HerdrUnavailable, match="timed out|deadline"):
+        client.start_pane_agent("worker", "muse", "p1", (), timeout=0.1)
+    assert time.monotonic() - started < 1.0
+
+
 def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     prompt = "literal $(unexpanded) delivery\nsecond line"
     header = "Muse Code 1.3.0\n"
@@ -171,7 +325,7 @@ def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     footer = "watermelon-preview · xhigh · /work/project · Auto-review\n"
     staged = header + divider + f"❯ {prompt}\n" + divider + footer
     accepted = (
-        header + f"❯ {prompt}\nWorking...\n" + divider + "❯\n" + divider + footer
+        header + f"❯ {prompt}\n◆ Working...\n" + divider + "❯\n" + divider + footer
     )
     error_redraw = header + divider + f"❯ {prompt}\nError: retry\n" + divider + footer
     assert muse_prompt_in_composer(staged, prompt)
@@ -179,6 +333,7 @@ def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     assert muse_prompt_in_transcript(accepted, prompt)
     assert not muse_prompt_in_composer(accepted, prompt)
     assert muse_prompt_in_composer(error_redraw, prompt)
+    assert not muse_prompt_is_exact_composer(error_redraw, prompt)
     assert not muse_prompt_in_transcript(error_redraw, prompt)
     repeated_staged = (
         header + f"❯ {prompt}\n◆ prior answer\n" + divider
@@ -190,6 +345,72 @@ def test_muse_prompt_must_move_from_composer_to_transcript() -> None:
     assert muse_prompt_transcript_count(repeated_staged, prompt) == 1
     assert muse_prompt_transcript_count(cleared_without_submit, prompt) == 1
 
+    long_prompt = "prefix " + ("middle " * 40) + "suffix"
+    changed_middle = "prefix " + ("changed " * 40) + "suffix"
+    collapsed = header + divider + f"❯ [Pasted Content {len(long_prompt)} chars]\n" + divider + footer
+    deceptive = header + divider + f"❯ {changed_middle}\n" + divider + footer
+    prefixed = (
+        header + f"❯ {long_prompt} extra\n◆ Working\n"
+        + divider + "❯\n" + divider + footer
+    )
+    assert not muse_prompt_in_composer(collapsed, long_prompt)
+    assert not muse_prompt_in_composer(deceptive, long_prompt)
+    assert not muse_prompt_in_transcript(prefixed, long_prompt)
+
+
+def test_headerless_muse_composer_requires_verified_process_context() -> None:
+    screen = (
+        "old transcript after the version header scrolled away\n"
+        "────────────────\n❯\n────────────────\n"
+        "kiki · xhigh · /work/project · YOLO\n"
+    )
+    assert not muse_idle_composer(screen)
+    assert muse_verified_process_composer(screen)
+    assert muse_verified_process_idle_composer(screen)
+    prompt = "require the full deterministic-scheduling-review skill"
+    staged = screen.replace("❯\n", f"❯ {prompt}\n")
+    assert not muse_prompt_is_exact_composer(staged, prompt)
+    assert muse_verified_process_prompt_is_exact_composer(staged, prompt)
+    assert muse_verified_process_prompt_in_composer(staged, prompt)
+    accepted = screen.replace(
+        "old transcript after the version header scrolled away\n",
+        f"❯ {prompt}\n◆ Working\n",
+    )
+    assert muse_verified_process_prompt_transcript_count(accepted, prompt) == 1
+
+
+def test_exact_muse_composer_matches_only_requested_hyphen_soft_wraps() -> None:
+    divider = "─" * 40
+    footer = "kiki · xhigh · /work/project · YOLO\n"
+    prompt = (
+        "Use deterministic-scheduling-review and keep this buffered prompt "
+        "byte-for-byte"
+    )
+    wrapped = (
+        "old transcript\n"
+        f"{divider}\n"
+        "❯ Use deterministic-\n"
+        "  scheduling-review and keep this buffered prompt byte-for-byte\n"
+        f"{divider}\n{footer}"
+    )
+    assert muse_verified_process_composer(wrapped)
+    assert muse_verified_process_prompt_is_exact_composer(wrapped, prompt)
+    assert not muse_verified_process_prompt_is_exact_composer(
+        wrapped, prompt.replace("byte-for-byte", "byte for byte"),
+    )
+    accepted = (
+        "❯ Use deterministic-\n"
+        "  scheduling-review and keep this buffered prompt byte-for-byte\n"
+        "◆ Working\n"
+        f"{divider}\n❯\n{divider}\n{footer}"
+    )
+    assert muse_verified_process_prompt_transcript_count(accepted, prompt) == 1
+
+    # Only a physical boundary immediately after the same hyphen may omit the
+    # normalization space.  This does not globally erase spaces around '-'.
+    weakened = wrapped.replace("deterministic-\n", "deterministic -\n")
+    assert not muse_verified_process_prompt_is_exact_composer(weakened, prompt)
+
 
 def test_custom_muse_launch_never_accepts_a_trust_prompt() -> None:
     client, calls = _custom_runner("Do you trust this workspace?\n❯ Yes\n  No\n")
@@ -200,6 +421,16 @@ def test_custom_muse_launch_never_accepts_a_trust_prompt() -> None:
 
 def test_custom_muse_launch_rejects_bare_prompt_without_idle_footer() -> None:
     client, calls = _custom_runner("A choice dialog\n❯\n")
+    with pytest.raises(HerdrUnavailable, match="verified idle composer"):
+        client.start_pane_agent("worker", "muse", "p1", (), timeout=0.01)
+    assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
+
+
+def test_custom_muse_launch_rejects_auto_review_without_versioned_header() -> None:
+    client, calls = _custom_runner(
+        "────────────────\n❯\n────────────────\n"
+        "watermelon-preview · xhigh · /work/project · Auto-review\n"
+    )
     with pytest.raises(HerdrUnavailable, match="verified idle composer"):
         client.start_pane_agent("worker", "muse", "p1", (), timeout=0.01)
     assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
@@ -261,6 +492,77 @@ def test_custom_harness_rejects_matching_report_when_kernel_executable_differs(
     )
     with pytest.raises(HerdrUnavailable, match="not the foreground process"):
         client.verify_custom_harness("p1", "muse")
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_legacy_recovery_uses_basename_only_with_exact_image_and_arguments() -> None:
+    executable = os.path.realpath("/usr/bin/sleep")
+    process = subprocess.Popen([executable, "30"], start_new_session=True)
+    try:
+        observed = HerdrClient._process_identity(process.pid)
+        assert observed is not None
+        identity, process_group, _path = observed
+        response = {"result": {"process_info": {
+            "pane_id": "p1", "shell_pid": 1,
+            "foreground_process_group_id": process_group,
+            "foreground_processes": [{
+                "pid": process.pid, "name": "sleep", "cmdline": f"{executable} 30",
+                "argv": [executable, "30"], "executable": executable,
+            }],
+        }}}
+        client = HerdrClient(
+            herdr_bin="fixture-herdr", run=Runner({"process_info": response["result"]["process_info"]})
+        )
+        assert client.recover_pane_agent(
+            "p1", ("sleep", "30"), identity.executable_device,
+            identity.executable_inode, process.pid,
+        ) == identity
+        with pytest.raises(HerdrUnavailable, match="argv does not exactly match"):
+            client.recover_pane_agent(
+                "p1", ("sleep", "31"), identity.executable_device,
+                identity.executable_inode, process.pid,
+            )
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_recovered_publication_detects_exit_after_commit_through_pinned_pidfd() -> None:
+    executable = os.path.realpath("/usr/bin/sleep")
+    process = subprocess.Popen([executable, "30"], start_new_session=True)
+    try:
+        observed = HerdrClient._process_identity(process.pid)
+        assert observed is not None
+        identity, process_group, _path = observed
+        response = {"result": {"process_info": {
+            "pane_id": "p1", "shell_pid": 1,
+            "foreground_process_group_id": process_group,
+            "foreground_processes": [{
+                "pid": process.pid, "name": "sleep", "cmdline": executable,
+                "argv": [executable, "30"], "executable": executable,
+            }],
+        }}}
+
+        def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, json.dumps(response), "")
+
+        client = HerdrClient(herdr_bin="fixture-herdr", run=run)
+        committed = False
+
+        def commit() -> None:
+            nonlocal committed
+            committed = True
+            process.kill()
+            process.wait(timeout=5)
+
+        with pytest.raises(HerdrUnavailable, match="exited"):
+            client.commit_recovered_pane_agent("p1", "muse", identity, commit)
+        assert committed
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")

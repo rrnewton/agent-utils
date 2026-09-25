@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from collections.abc import Sequence
 from importlib.resources import files
 from pathlib import Path
@@ -18,7 +19,7 @@ from agentctl.client import HerdrClient
 from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
 from agentctl.profiles import (
-    load_profiles, validate_raw_harness_arguments,
+    load_project_config, validate_raw_harness_arguments,
 )
 from agentctl.sessions import Sessions
 from agentctl.skill_install import install_skill
@@ -59,6 +60,15 @@ def _environment_entry(value: str) -> str:
         return environment_entries((value,))[0]
     except HerdrRunError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _positive_pid(value: str) -> int:
+    if not value.isascii() or not value.isdigit():
+        raise argparse.ArgumentTypeError("expected a positive decimal Linux process id")
+    parsed = int(value, 10)
+    if not 1 <= parsed <= 2_147_483_647:
+        raise argparse.ArgumentTypeError("Linux process id must be between 1 and 2147483647")
+    return parsed
 
 
 def parser() -> argparse.ArgumentParser:
@@ -103,7 +113,11 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--env", action="append", default=[], type=_environment_entry,
         metavar="KEY=VALUE",
         help="interactive Herdr only: set a literal variable in the created tab; repeat; values are not shown by status")
-    start.add_argument("--workspace-id", metavar="ID", help="interactive only: exact Herdr workspace; default: current workspace or a shared subagents workspace")
+    workspace = start.add_mutually_exclusive_group()
+    workspace.add_argument("--workspace-id", metavar="ID",
+        help="interactive only: exact Herdr workspace; overrides the project default")
+    workspace.add_argument("--workspace-label", metavar="LABEL",
+        help="interactive only: unique Herdr workspace label; overrides the project default")
     first = start.add_mutually_exclusive_group()
     first.add_argument("--brief", metavar="TEXT", help="initial task, submitted after launch")
     first.add_argument("--file", metavar="PATH", help="UTF-8 file containing the initial task")
@@ -125,9 +139,45 @@ def parser() -> argparse.ArgumentParser:
     adopt.add_argument("--session", metavar="ID",
         help="optional stable native conversation ID already reported by this exact pane")
 
-    command("list", "List every registered session, including unavailable and failed launches.", "agentctl list")
+    recover_start = command(
+        "recover-start",
+        "Recover or reconcile a failed Muse launch by exact saved generation and live PID.",
+        "agentctl recover-start reviewer --expected-token TOKEN --expected-pid 12345",
+        named=True,
+    )
+    recover_start.add_argument("--expected-token", required=True, metavar="TOKEN",
+        help="exact registry generation printed by status (required)")
+    recover_start.add_argument("--expected-pid", required=True, type=_positive_pid, metavar="PID",
+        help="exact live Muse PID whose executable and complete argv must match (required)")
+
+    relocate = command(
+        "relocate",
+        "Move a live one-pane Herdr tab without restarting its agent.",
+        "agentctl relocate reviewer --workspace-label project --new-tab",
+        named=True,
+    )
+    destination = relocate.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--workspace-id", metavar="ID",
+        help="exact existing destination workspace id")
+    destination.add_argument("--workspace-label", metavar="LABEL",
+        help="unique existing destination workspace label")
+    relocate.add_argument("--new-tab", action="store_true", required=True,
+        help="move into a new tab; other relocation layouts are intentionally unsupported")
+
+    command("list", "List every session with live health; exit nonzero if any result is non-healthy.", "agentctl list")
     command("capabilities", "Show the adapters and services available in this installation.", "agentctl capabilities")
-    command("status", "Inspect saved identity, runtime state, and supported operations.", "agentctl status reviewer", named=True)
+    command("status", "Inspect saved identity and live health; exit nonzero for a non-healthy result.", "agentctl status reviewer", named=True)
+    health = command(
+        "health",
+        "Check one or more sessions independently and return nonzero unless every check is healthy.",
+        "agentctl health reviewer implementer --watch 300 --interval 5",
+    )
+    health.add_argument("names", nargs="*", metavar="NAME",
+        help="registered session names; omission checks every active registry entry")
+    health.add_argument("--watch", type=_ascii_float, default=0.0, metavar="SECONDS",
+        help="bounded polling duration; exit early on a non-healthy result (default: 0, one check; maximum: 86400)")
+    health.add_argument("--interval", type=_ascii_float, default=5.0, metavar="SECONDS",
+        help="positive delay between watch checks (default: 5 seconds; maximum: 3600)")
     send = command("send", "Submit follow-up work; uncertain delivery is retained for inspection.",
         "agentctl send reviewer 'Please check the cancellation path too'", named=True)
     _message(send)
@@ -137,6 +187,16 @@ def parser() -> argparse.ArgumentParser:
     drain = command("drain", "Deliver safely pending interactive requests; never replay uncertain submissions.",
         "agentctl drain reviewer --ready-timeout 0", named=True)
     _delivery(drain)
+    reconcile = command(
+        "reconcile-delivery",
+        "Reconcile one ambiguous Muse message from exact transcript evidence.",
+        "agentctl reconcile-delivery reviewer MESSAGE_ID --expected-sha256 SHA256",
+        named=True,
+    )
+    reconcile.add_argument("message_id", metavar="MESSAGE_ID",
+        help="exact caller-selected queue message identifier")
+    reconcile.add_argument("--expected-sha256", required=True, metavar="SHA256",
+        help="exact lowercase SHA-256 of the retained queue artifact")
     read = command("read", "Read a terminal snapshot or a headless transcript/answer.",
         "agentctl read reviewer --lines 100", named=True)
     read.add_argument("--lines", type=_bounded_uint, default=500, metavar="COUNT", help="maximum tail/snapshot lines (default: 500)")
@@ -254,8 +314,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _serve(args.registry, args.herdr_bin)
     try:
         if args.command == "profiles":
-            path, profiles = load_profiles(args.cwd, absent_ok=True)
-            print(json.dumps({"path": str(path), "profiles": [item.public() for item in profiles.values()]},
+            path, config = load_project_config(args.cwd, absent_ok=True)
+            print(json.dumps({"path": str(path),
+                "default_workspace": (config.default_workspace.public()
+                    if config.default_workspace is not None else None),
+                "profiles": [item.public() for item in config.profiles.values()]},
                 indent=2, sort_keys=True))
             return 0
         if args.command == "skill":
@@ -268,6 +331,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if value is not None and (not math.isfinite(value) or value < 0 or value > 31_536_000
                 or (key in ("working_timeout", "startup_timeout") and value == 0)):
                 raise ValueError(f"{key.replace('_', '-')} must be finite and within its documented range")
+        if args.command == "health":
+            if not math.isfinite(args.watch) or not 0 <= args.watch <= 86_400:
+                raise ValueError("watch must be finite and between 0 and 86400 seconds")
+            if not math.isfinite(args.interval) or not 0 < args.interval <= 3_600:
+                raise ValueError("interval must be finite, positive, and at most 3600 seconds")
         for key in ("max_attempts", "lines"):
             if getattr(args, key, 1) <= 0:
                 raise ValueError(f"{key.replace('_', '-')} must be positive")
@@ -277,6 +345,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         result: object
         name = getattr(args, "name", "")
         if args.command == "start":
+            _config_path, project_config = load_project_config(
+                args.cwd, absent_ok=True,
+            )
             profile = None
             if args.profile is not None:
                 overlaps = []
@@ -293,9 +364,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     overlaps.append("--env")
                 if overlaps:
                     raise ValueError(f"--profile conflicts with explicit launch settings: {', '.join(overlaps)}")
-                _path, available = load_profiles(args.cwd)
                 try:
-                    profile = available[args.profile]
+                    profile = project_config.profiles[args.profile]
                 except KeyError as exc:
                     raise ValueError(f"unknown profile {args.profile!r}; run agentctl profiles --cwd {args.cwd}") from exc
             harness = profile.harness if profile else (args.harness or "codex")
@@ -311,22 +381,66 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             harness_args = list(profile.argv) if profile else args.harness_arg
             environment = list(profile.environment) if profile else args.env
+            workspace_id = args.workspace_id
+            workspace_label = args.workspace_label
+            if (mode == "interactive" and workspace_id is None
+                    and workspace_label is None):
+                selector = project_config.default_workspace
+                if selector is not None:
+                    if selector.kind == "id":
+                        workspace_id = selector.value
+                    else:
+                        workspace_label = selector.value
             brief = Path(args.file).read_text(encoding="utf-8") if args.file else args.brief
             result = sessions.start_session(name, cwd=args.cwd, mode=mode, backend=args.backend,
                 harness=harness, model=model, brief=brief, resume=args.resume,
-                reasoning_effort=reasoning_effort, harness_args=harness_args,
+                reasoning_effort=reasoning_effort, launch_profile=args.profile,
+                harness_args=harness_args,
                 environment=environment,
-                workspace_id=args.workspace_id,
+                workspace_id=workspace_id, workspace_label=workspace_label,
                 startup_timeout=args.startup_timeout, ready_timeout=args.ready_timeout,
                 working_timeout=args.working_timeout, max_attempts=args.max_attempts)
         elif args.command == "adopt":
             result = sessions.adopt(name, pane_id=args.pane,
                 expected_workspace=args.workspace, expected_cwd=args.cwd,
                 harness=args.harness, session=args.session)
+        elif args.command == "recover-start":
+            result = sessions.recover_start(
+                name, expected_token=args.expected_token, expected_pid=args.expected_pid,
+            )
+        elif args.command == "relocate":
+            result = sessions.relocate(
+                name, workspace_id=args.workspace_id,
+                workspace_label=args.workspace_label, new_tab=args.new_tab,
+            )
         elif args.command == "list":
-            result = sessions.list()
+            rows, healthy = sessions.list_with_health()
+            print(json.dumps(rows, indent=2, sort_keys=True))
+            return 0 if healthy else 1
         elif args.command == "status":
-            result = sessions.status(name)
+            result, healthy = sessions.status_with_health(name)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if healthy else 1
+        elif args.command == "health":
+            deadline = time.monotonic() + args.watch
+            polls = 0
+            while True:
+                probe_deadline = (
+                    deadline if args.watch > 0
+                    else time.monotonic() + 60.0
+                )
+                result = sessions.health(args.names, deadline=probe_deadline)
+                polls += 1
+                if not result["healthy"] or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(args.interval, max(0.0, deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    break
+            result["polls"] = polls
+            result["watch_seconds"] = args.watch
+            result["interval_seconds"] = args.interval
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if result["healthy"] else 1
         elif args.command == "send":
             result = sessions.send_session(name, _text(args) or "", message_id=args.message_id, model=args.model, **options)
         elif args.command == "read":
@@ -339,6 +453,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             outcome = sessions.drain(name, **options)
             print(json.dumps(asdict(outcome), indent=2, sort_keys=True))
             return 75 if outcome.blocked else (76 if outcome.quarantined else 0)
+        elif args.command == "reconcile-delivery":
+            from dataclasses import asdict
+            outcome = sessions.reconcile_delivery(
+                name, args.message_id, args.expected_sha256,
+            )
+            print(json.dumps(asdict(outcome), indent=2, sort_keys=True))
+            return 0
         elif args.command == "goal":
             result = sessions.goal(name, _text(args, optional=True), goal_command=_goal_command(args), **options)
         elif args.command == "bind-session":

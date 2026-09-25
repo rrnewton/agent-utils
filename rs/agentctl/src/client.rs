@@ -7,7 +7,7 @@ use chat_subscription_plugin::process::ProcessPluginChild;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, OsString};
+use std::ffi::{CStr, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -63,6 +63,24 @@ pub struct CustomProcessIdentity {
     pub executable_inode: u64,
 }
 
+/// Durable custom-launch information emitted before and after process creation.
+#[derive(Clone, Debug)]
+pub enum CustomLaunchObservation {
+    /// Executable and complete argv pinned before the pane launch request.
+    Intent {
+        /// Canonical executable pathname used in argv zero.
+        executable: PathBuf,
+        /// Device number of the opened executable image.
+        device: u64,
+        /// Inode number of the opened executable image.
+        inode: u64,
+        /// Complete literal argv submitted to the pane.
+        argv: Vec<String>,
+    },
+    /// Kernel process generation observed after launch.
+    Process(CustomProcessIdentity),
+}
+
 /// Exact supported idle-shell process generation and kernel executable path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneShellProof {
@@ -91,12 +109,24 @@ struct PinnedHarnessExecutable {
     inode: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct LiveCustomProcess {
     identity: CustomProcessIdentity,
     process_group_id: u64,
     executable_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    pidfd: OwnedFd,
 }
+
+impl PartialEq for LiveCustomProcess {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.process_group_id == other.process_group_id
+            && self.executable_path == other.executable_path
+    }
+}
+
+impl Eq for LiveCustomProcess {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaneProcessState {
@@ -117,12 +147,44 @@ fn canonical_boot_uuid(value: &str) -> bool {
 }
 
 fn bounded_file(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
-    let value = fs::read(path).map_err(|error| {
-        AdapterError::unavailable(format!("cannot read {label} {}: {error}", path.display()))
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            AdapterError::unavailable(format!("cannot read {label} {}: {error}", path.display()))
+        })?;
+    let before = file.metadata().map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot inspect {label} {}: {error}",
+            path.display()
+        ))
     })?;
-    if value.is_empty() || value.len() > limit {
+    if !before.file_type().is_file() || before.len() > limit as u64 {
         return Err(AdapterError::unavailable(format!(
             "{label} {} has an invalid length",
+            path.display()
+        )));
+    }
+    let mut value = Vec::with_capacity(before.len().min(limit as u64) as usize);
+    file.by_ref()
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut value)
+        .map_err(|error| {
+            AdapterError::unavailable(format!("cannot read {label} {}: {error}", path.display()))
+        })?;
+    let after = file.metadata().map_err(|error| {
+        AdapterError::unavailable(format!(
+            "cannot reinspect {label} {}: {error}",
+            path.display()
+        ))
+    })?;
+    if value.is_empty()
+        || value.len() > limit
+        || (before.dev(), before.ino(), before.len()) != (after.dev(), after.ino(), after.len())
+    {
+        return Err(AdapterError::unavailable(format!(
+            "{label} {} has an invalid or changing length",
             path.display()
         )));
     }
@@ -348,6 +410,7 @@ fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
         },
         process_group_id: stat_before.0,
         executable_path: executable_path_before,
+        pidfd,
     })
 }
 
@@ -356,6 +419,38 @@ fn live_custom_process(_pid: u64) -> Result<LiveCustomProcess> {
     Err(AdapterError::unavailable(
         "custom process identity requires Linux pidfds and procfs",
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn process_generation_absent_after_failed_inspection(
+    pid: u32,
+    inspection_error: AdapterError,
+    existence: io::Result<bool>,
+) -> Result<bool> {
+    match existence {
+        Ok(false) => Ok(true),
+        Ok(true) => Err(inspection_error),
+        Err(error) => Err(AdapterError::unavailable(format!(
+            "cannot prove recorded process {pid} absent after identity inspection failed ({inspection_error}): {error}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_exists(pid: libc::pid_t) -> io::Result<bool> {
+    // SAFETY: signal zero performs an existence/permission check without
+    // delivering a signal to the checked positive PID.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else if error.raw_os_error() == Some(libc::EPERM) {
+        Ok(true)
+    } else {
+        Err(error)
+    }
 }
 
 fn supported_shell_name(path: &Path) -> bool {
@@ -491,11 +586,6 @@ fn process_has_no_descendants(pid: u64) -> Result<bool> {
                     )))
                 }
             };
-            if raw.len() > PROC_STAT_BYTES {
-                return Err(AdapterError::unavailable(format!(
-                    "process {process} stat is invalid"
-                )));
-            }
             let parent = parse_process_stat(&raw, process)?.parent_pid;
             if process > 0 {
                 parents.insert(process, parent);
@@ -653,31 +743,23 @@ pub(crate) fn muse_trust_prompt(screen: &str) -> bool {
 }
 
 pub(crate) fn muse_idle_composer(screen: &str) -> bool {
-    screen.contains("Auto-review") && screen.lines().any(|line| matches!(line.trim(), "❯" | "›"))
+    muse_composer_regions(screen, true)
+        .is_some_and(|(_, composer)| matches!(composer.trim(), "❯" | "›"))
 }
 
-fn muse_text_visible(screen: &str, text: &str) -> bool {
-    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let rendered = screen.split_whitespace().collect::<Vec<_>>().join(" ");
-    if wanted.is_empty() {
-        return false;
-    }
-    if wanted.chars().count() <= 160 {
-        return rendered.contains(&wanted);
-    }
-    let prefix = wanted.chars().take(80).collect::<String>();
-    let mut suffix = wanted.chars().rev().take(80).collect::<Vec<_>>();
-    suffix.reverse();
-    let suffix = suffix.into_iter().collect::<String>();
-    rendered.contains(&prefix) && rendered.contains(&suffix)
+pub(crate) fn muse_verified_process_idle_composer(screen: &str) -> bool {
+    muse_composer_regions(screen, false)
+        .is_some_and(|(_, composer)| matches!(composer.trim(), "❯" | "›"))
 }
 
-fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
+pub(crate) fn muse_verified_process_composer(screen: &str) -> bool {
+    muse_composer_regions(screen, false)
+        .is_some_and(|(_, composer)| muse_editor_segments(&composer).is_some())
+}
+
+fn muse_composer_regions(screen: &str, require_header: bool) -> Option<(String, String)> {
     let lines = screen.lines().collect::<Vec<_>>();
-    let footer = lines
-        .iter()
-        .rposition(|line| line.contains("Auto-review"))?;
-    let dividers = lines[..footer]
+    let dividers = lines
         .iter()
         .enumerate()
         .filter_map(|(index, line)| {
@@ -691,33 +773,302 @@ fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
         .collect::<Vec<_>>();
     let bottom = *dividers.last()?;
     let top = *dividers.get(dividers.len().checked_sub(2)?)?;
+    let footer = &lines[bottom + 1..];
+    let status_fields = footer
+        .iter()
+        .find_map(|line| {
+            (!line.trim().is_empty()).then(|| line.split('·').map(str::trim).collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    let versioned_header = lines[..top].iter().any(|line| {
+        line.trim()
+            .strip_prefix("Muse Code ")
+            .is_some_and(|version| {
+                let pieces = version.split('.').collect::<Vec<_>>();
+                pieces.len() == 3
+                    && pieces.iter().all(|piece| {
+                        !piece.is_empty() && piece.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+    });
+    let current_footer = (!require_header || versioned_header)
+        && matches!(status_fields.len(), 3 | 4)
+        && status_fields.iter().all(|field| !field.is_empty())
+        && muse_effort(status_fields[1])
+        && (status_fields.len() == 3 || matches!(status_fields[3], "YOLO" | "Auto-review"));
+    if !current_footer {
+        return None;
+    }
     Some((lines[..top].join("\n"), lines[top + 1..bottom].join("\n")))
 }
 
-pub(crate) fn muse_prompt_in_composer(screen: &str, text: &str) -> bool {
-    muse_composer_regions(screen).is_some_and(|(_, composer)| muse_text_visible(&composer, text))
+fn muse_prompt_in_composer_context(
+    screen: &str,
+    text: &str,
+    require_header: bool,
+    exact: bool,
+) -> bool {
+    muse_composer_regions(screen, require_header)
+        .is_some_and(|(_, composer)| muse_editor_matches(&composer, text, exact))
 }
 
-pub(crate) fn muse_prompt_transcript_count(screen: &str, text: &str) -> usize {
-    let Some((transcript, _)) = muse_composer_regions(screen) else {
+fn muse_editor_segments(editor: &str) -> Option<Vec<String>> {
+    let mut lines = editor
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let first = lines.first_mut()?;
+    let marker = ["❯", "›"]
+        .iter()
+        .find(|marker| first.as_str() == **marker || first.starts_with(&format!("{marker} ")))?;
+    *first = first[marker.len()..].trim().to_owned();
+    if first.is_empty() {
+        lines.remove(0);
+    }
+    Some(lines)
+}
+
+fn muse_editor_matches(editor: &str, text: &str, exact: bool) -> bool {
+    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(segments) = muse_editor_segments(editor) else {
+        return false;
+    };
+    if wanted.is_empty() {
+        return false;
+    }
+    let mut prefixes = HashSet::from([String::new()]);
+    let mut previous = "";
+    for (index, segment) in segments.iter().enumerate() {
+        let separators: &[&str] = if index == 0 {
+            &[""]
+        } else if previous.ends_with('-') {
+            &[" ", ""]
+        } else {
+            &[" "]
+        };
+        let mut next = HashSet::new();
+        for prefix in &prefixes {
+            for separator in separators {
+                let rendered = format!("{prefix}{separator}{segment}");
+                if !exact && (rendered == wanted || rendered.starts_with(&format!("{wanted} "))) {
+                    return true;
+                }
+                if wanted.starts_with(&rendered) {
+                    next.insert(rendered);
+                }
+            }
+        }
+        if next.is_empty() {
+            return false;
+        }
+        prefixes = next;
+        previous = segment;
+    }
+    prefixes.contains(&wanted)
+}
+
+fn muse_marked_prompt_count(screen: &str, text: &str) -> usize {
+    let lines = screen.lines().collect::<Vec<_>>();
+    let mut count = 0;
+    let mut index = 0;
+    while index < lines.len() {
+        let stripped = lines[index].trim();
+        if !["❯", "›"]
+            .iter()
+            .any(|marker| stripped == *marker || stripped.starts_with(&format!("{marker} ")))
+        {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < lines.len() {
+            let next = lines[end].trim();
+            if ["◆", "❯", "›"]
+                .iter()
+                .any(|marker| next == *marker || next.starts_with(&format!("{marker} ")))
+            {
+                break;
+            }
+            end += 1;
+        }
+        if muse_editor_matches(&lines[index..end].join("\n"), text, true) {
+            count += 1;
+        }
+        index = end;
+    }
+    count
+}
+
+#[cfg(test)]
+pub(crate) fn muse_prompt_in_composer(screen: &str, text: &str) -> bool {
+    muse_prompt_in_composer_context(screen, text, true, false)
+}
+
+pub(crate) fn muse_verified_process_prompt_in_composer(screen: &str, text: &str) -> bool {
+    muse_prompt_in_composer_context(screen, text, false, false)
+}
+
+#[cfg(test)]
+pub(crate) fn muse_prompt_is_exact_composer(screen: &str, text: &str) -> bool {
+    muse_prompt_in_composer_context(screen, text, true, true)
+}
+
+pub(crate) fn muse_verified_process_prompt_is_exact_composer(screen: &str, text: &str) -> bool {
+    muse_prompt_in_composer_context(screen, text, false, true)
+}
+
+#[cfg(test)]
+pub(crate) fn muse_prompt_in_transcript(screen: &str, text: &str) -> bool {
+    muse_prompt_transcript_count(screen, text) > 0
+}
+
+fn muse_prompt_transcript_count_context(screen: &str, text: &str, require_header: bool) -> usize {
+    let Some((transcript, _)) = muse_composer_regions(screen, require_header) else {
         return 0;
     };
-    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let rendered = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
-    if wanted.is_empty() {
-        return 0;
+    muse_marked_prompt_count(&transcript, text)
+}
+
+#[cfg(test)]
+pub(crate) fn muse_prompt_transcript_count(screen: &str, text: &str) -> usize {
+    muse_prompt_transcript_count_context(screen, text, true)
+}
+
+pub(crate) fn muse_verified_process_prompt_transcript_count(screen: &str, text: &str) -> usize {
+    muse_prompt_transcript_count_context(screen, text, false)
+}
+
+pub(crate) fn claude_active_screen(screen: &str) -> bool {
+    let lines = screen.lines().collect::<Vec<_>>();
+    let dividers = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            (trimmed.chars().count() >= 3
+                && trimmed
+                    .chars()
+                    .all(|value| matches!(value, '─' | '━' | '═')))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some((&top, &bottom)) = dividers
+        .get(dividers.len().saturating_sub(2))
+        .zip(dividers.last())
+    else {
+        return false;
+    };
+    let before = lines[top.saturating_sub(12)..top].join(" ");
+    let after = lines[bottom + 1..lines.len().min(bottom + 12)].join(" ");
+    let waiting = before.split("Waiting for ").skip(1).any(|suffix| {
+        let mut fields = suffix.split_whitespace();
+        fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|value| value > 0)
+            && matches!(fields.next(), Some("background"))
+            && fields
+                .next()
+                .is_some_and(|value| value.starts_with("agent"))
+            && suffix.contains("to finish")
+    });
+    let fields = after.split_whitespace().collect::<Vec<_>>();
+    let agent_count = fields.windows(3).any(|window| {
+        matches!(window[0], "←" | "<-")
+            && window[1].parse::<u64>().is_ok_and(|value| value >= 2)
+            && window[2].starts_with("agent")
+    });
+    after.contains("esc to interrupt") || (waiting && agent_count)
+}
+
+fn claude_composer_regions(screen: &str) -> Option<(String, String)> {
+    let lines = screen.lines().collect::<Vec<_>>();
+    let dividers = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            (trimmed.chars().count() >= 3
+                && trimmed
+                    .chars()
+                    .all(|value| matches!(value, '─' | '━' | '═')))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let bottom = *dividers.last()?;
+    let top = *dividers.get(dividers.len().checked_sub(2)?)?;
+    let hint = "ctrl+x ctrl+s to send now";
+    let editor = &lines[top + 1..bottom];
+    if !editor.iter().any(|line| {
+        line.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+            .contains(hint)
+    }) {
+        return None;
     }
-    if wanted.chars().count() <= 160 {
-        return rendered.match_indices(&wanted).count();
+    let content = editor
+        .iter()
+        .filter(|line| {
+            !line
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+                .contains(hint)
+        })
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    muse_editor_segments(&content)?;
+    Some((lines[..top].join("\n"), content))
+}
+
+pub(crate) fn claude_staged_composer(screen: &str) -> bool {
+    claude_composer_regions(screen)
+        .is_some_and(|(_, composer)| muse_editor_segments(&composer).is_some_and(|v| !v.is_empty()))
+}
+
+pub(crate) fn claude_prompt_is_exact_composer(screen: &str, text: &str) -> bool {
+    claude_composer_regions(screen)
+        .is_some_and(|(_, composer)| muse_editor_matches(&composer, text, true))
+}
+
+pub(crate) fn claude_prompt_transcript_count(screen: &str, text: &str) -> usize {
+    let transcript = claude_composer_regions(screen)
+        .map_or_else(|| screen.to_owned(), |(transcript, _)| transcript);
+    let lines = transcript.lines().collect::<Vec<_>>();
+    let mut count = 0;
+    let mut index = 0;
+    while index < lines.len() {
+        let stripped = lines[index].trim();
+        if stripped != "❯" && !stripped.starts_with("❯ ") {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < lines.len() {
+            let following = lines[end].trim();
+            let marker = ["❯", "●", "✻", "✽", "⏺", "◆"]
+                .iter()
+                .any(|marker| following.starts_with(marker));
+            let divider = following.chars().count() >= 3
+                && following
+                    .chars()
+                    .all(|value| matches!(value, '─' | '━' | '═'));
+            if marker || divider {
+                break;
+            }
+            end += 1;
+        }
+        if muse_editor_matches(&lines[index..end].join("\n"), text, true) {
+            count += 1;
+        }
+        index = end;
     }
-    let prefix = wanted.chars().take(80).collect::<String>();
-    let mut suffix = wanted.chars().rev().take(80).collect::<Vec<_>>();
-    suffix.reverse();
-    let suffix = suffix.into_iter().collect::<String>();
-    rendered
-        .match_indices(&prefix)
-        .count()
-        .min(rendered.match_indices(&suffix).count())
+    count
 }
 #[derive(Debug)]
 pub(crate) struct BoundedOutput {
@@ -750,13 +1101,47 @@ fn bounded_output_with_cancellation_and_shutdown(
     cancelled: &dyn Fn() -> bool,
     shutdown: &mut dyn FnMut(&mut ProcessPluginChild, Duration) -> io::Result<ExitStatus>,
 ) -> io::Result<BoundedOutput> {
-    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+    let deadline = control_deadline(timeout)?;
+    let captured = CapturedProcess::spawn(command)?;
+    finish_bounded_output(captured, timeout, deadline, cancelled, shutdown)
+}
+
+fn control_deadline(timeout: Duration) -> io::Result<Instant> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "control command timeout is too large",
         )
-    })?;
-    let mut captured = CapturedProcess::spawn(command)?;
+    })
+}
+
+#[cfg(test)]
+fn bounded_output_after_spawn_hook_for_test(
+    command: Command,
+    timeout: Duration,
+    after_spawn: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<BoundedOutput> {
+    // Establish fixture readiness without giving the code under test a fresh deadline: this is
+    // the same absolute deadline production creates before spawning the command.
+    let deadline = control_deadline(timeout)?;
+    let captured = CapturedProcess::spawn(command)?;
+    after_spawn()?;
+    finish_bounded_output(
+        captured,
+        timeout,
+        deadline,
+        &|| false,
+        &mut ProcessPluginChild::shutdown,
+    )
+}
+
+fn finish_bounded_output(
+    mut captured: CapturedProcess,
+    timeout: Duration,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    shutdown: &mut dyn FnMut(&mut ProcessPluginChild, Duration) -> io::Result<ExitStatus>,
+) -> io::Result<BoundedOutput> {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut stdout_eof = false;
@@ -974,6 +1359,21 @@ pub struct Pane {
     pub tab_id: String,
     /// Herdr workspace identifier.
     pub workspace_id: String,
+    /// Stable terminal identity retained when Herdr reroutes a pane.
+    pub terminal_id: Option<String>,
+}
+
+/// Result of moving one pane while retaining its stable terminal generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneMove {
+    /// Pane identifier immediately before the move.
+    pub previous_pane_id: String,
+    /// Tab identifier immediately before the move.
+    pub previous_tab_id: String,
+    /// Workspace identifier immediately before the move.
+    pub previous_workspace_id: String,
+    /// The same terminal after Herdr assigned its new route.
+    pub pane: Pane,
 }
 
 /// Identity and readiness fields for one interactive-agent pane.
@@ -1032,6 +1432,11 @@ impl HerdrClient {
         timeout: Duration,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<CommandOutput> {
+        if cancelled() {
+            return Err(AdapterError::unavailable(
+                "Herdr control operation was cancelled before invocation",
+            ));
+        }
         let executable = resolve_executable(&self.executable)?;
         let mut command = Command::new(executable);
         command.args(args);
@@ -1091,6 +1496,62 @@ impl HerdrClient {
             &format!("tab rename {tab_id}"),
         )?;
         Ok(())
+    }
+    /// Move one pane into a new tab without restarting its terminal process.
+    pub fn move_pane_to_new_tab(
+        &self,
+        pane_id: &str,
+        expected_terminal_id: &str,
+        workspace_id: &str,
+        label: &str,
+    ) -> Result<PaneMove> {
+        let result = self.call(
+            &strings(&[
+                "pane",
+                "move",
+                pane_id,
+                "--expect-terminal-id",
+                expected_terminal_id,
+                "--workspace",
+                workspace_id,
+                "--new-tab",
+                "--label",
+                label,
+                "--no-focus",
+            ]),
+            &format!("pane move {pane_id}"),
+        )?;
+        let moved = required_object(&result, "move_result", "pane move")?;
+        if moved.get("changed").and_then(Value::as_bool) != Some(true) {
+            return Err(AdapterError::unavailable(
+                "pane move did not report changed=true",
+            ));
+        }
+        let pane = required_object(moved, "pane", "pane move")?;
+        let created = required_object(moved, "created_tab", "pane move")?;
+        let pane = Pane {
+            pane_id: required_string(pane, "pane_id", "pane move pane")?,
+            tab_id: required_string(pane, "tab_id", "pane move pane")?,
+            workspace_id: required_string(pane, "workspace_id", "pane move pane")?,
+            terminal_id: Some(required_string(pane, "terminal_id", "pane move pane")?),
+        };
+        if pane.workspace_id != workspace_id
+            || pane.terminal_id.as_deref() != Some(expected_terminal_id)
+            || required_string(created, "workspace_id", "pane move created_tab")? != workspace_id
+            || required_string(created, "tab_id", "pane move created_tab")? != pane.tab_id
+            || created.get("pane_count").and_then(Value::as_u64) != Some(1)
+            || required_string(moved, "focused_pane_id", "pane move")? != pane.pane_id
+        {
+            return Err(AdapterError::unavailable(
+                "pane move returned contradictory destination routing",
+            ));
+        }
+        Ok(PaneMove {
+            previous_pane_id: required_string(moved, "previous_pane_id", "pane move")?,
+            previous_tab_id: required_string(moved, "previous_tab_id", "pane move")?,
+            previous_workspace_id: required_string(moved, "previous_workspace_id", "pane move")?,
+            pane,
+        })
     }
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn close_tab(&self, tab_id: &str) -> Result<()> {
@@ -1255,12 +1716,73 @@ impl HerdrClient {
             .then_some(observed.identity))
     }
 
-    fn recorded_custom_harness_observed(
+    fn recoverable_custom_harness_observed(
+        &self,
+        pane_id: &str,
+        expected_argv: &[String],
+        expected_device: u64,
+        expected_inode: u64,
+        expected_pid: u64,
+    ) -> Result<LiveCustomProcess> {
+        let (foreground_process_group_id, processes) =
+            self.foreground_processes(pane_id, &|| false)?;
+        let mut matches = processes
+            .into_iter()
+            .filter(|process| process.get("pid").and_then(Value::as_u64) == Some(expected_pid));
+        let process = matches.next().ok_or_else(|| {
+            AdapterError::unavailable(format!(
+                "expected one foreground process with pid {expected_pid}, found 0"
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(AdapterError::unavailable(format!(
+                "expected one foreground process with pid {expected_pid}, found more than one"
+            )));
+        }
+        let argv = process
+            .get("argv")
+            .and_then(Value::as_array)
+            .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+            .ok_or_else(|| {
+                AdapterError::unavailable(
+                    "foreground process argv is absent or contains a non-string value",
+                )
+            })?;
+        let expected = expected_argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let legacy_program_matches = expected.first().zip(argv.first()).is_some_and(
+            |(expected_program, observed_program)| {
+                !Path::new(expected_program).is_absolute()
+                    && !expected_program.contains('/')
+                    && Path::new(observed_program)
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        == Some(*expected_program)
+                    && argv.get(1..) == expected.get(1..)
+            },
+        );
+        if argv != expected && !legacy_program_matches {
+            return Err(AdapterError::unavailable(format!(
+                "pid {expected_pid} argv does not exactly match the recorded launch arguments"
+            )));
+        }
+        let observed = live_custom_process(expected_pid)?;
+        if observed.process_group_id != foreground_process_group_id
+            || observed.identity.executable_device != expected_device
+            || observed.identity.executable_inode != expected_inode
+        {
+            return Err(AdapterError::unavailable(
+                "custom harness recovery did not match the pinned executable and process group",
+            ));
+        }
+        Ok(observed)
+    }
+
+    fn recorded_custom_harness_process(
         &self,
         pane_id: &str,
         identity: &CustomProcessIdentity,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<bool> {
+    ) -> Result<Option<LiveCustomProcess>> {
         if !identity.valid() {
             return Err(AdapterError::unavailable(
                 "recorded custom process identity is invalid",
@@ -1284,11 +1806,23 @@ impl HerdrClient {
             }
         }
         if matches != 1 {
-            return Ok(false);
+            return Ok(None);
         }
         let observed = live_custom_process(identity.pid)?;
-        Ok(observed.process_group_id == foreground_process_group_id
+        Ok((observed.process_group_id == foreground_process_group_id
             && observed.identity == *identity)
+            .then_some(observed))
+    }
+
+    fn recorded_custom_harness_observed(
+        &self,
+        pane_id: &str,
+        identity: &CustomProcessIdentity,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        Ok(self
+            .recorded_custom_harness_process(pane_id, identity, cancelled)?
+            .is_some())
     }
 
     /// Require the fixed-location custom harness executable in one exact foreground pane.
@@ -1299,6 +1833,36 @@ impl HerdrClient {
         identity: Option<&CustomProcessIdentity>,
     ) -> Result<()> {
         self.verify_custom_harness_with_cancellation(pane_id, kind, identity, &|| false)
+    }
+
+    /// Prove that one recorded Linux PID generation is no longer live.
+    ///
+    /// A reused PID is absence of the recorded generation.  An unreadable but
+    /// still-present procfs entry is uncertainty and therefore fails closed.
+    pub fn process_generation_absent(&self, expected: &CustomProcessIdentity) -> Result<bool> {
+        if !expected.valid() {
+            return Err(AdapterError::unavailable(
+                "recorded custom process identity is invalid",
+            ));
+        }
+        match live_custom_process(expected.pid) {
+            Ok(observed) => Ok(observed.identity != *expected),
+            Err(error) => {
+                let pid = libc::pid_t::try_from(expected.pid)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        AdapterError::unavailable("recorded custom process id is invalid")
+                    })?;
+                process_generation_absent_after_failed_inspection(
+                    u32::try_from(expected.pid).map_err(|_| {
+                        AdapterError::unavailable("recorded custom process id is invalid")
+                    })?,
+                    error,
+                    process_exists(pid),
+                )
+            }
+        }
     }
 
     /// Prove that no child command owns the terminal and the foreground process
@@ -1357,11 +1921,19 @@ impl HerdrClient {
 
     /// Capture one stable supported idle-shell generation with no descendants.
     pub fn pane_idle_shell_identity(&self, pane_id: &str) -> Result<Option<PaneShellProof>> {
-        let before = self.pane_process_state(pane_id, &|| false)?;
+        self.pane_idle_shell_identity_with_cancellation(pane_id, &|| false)
+    }
+
+    pub(crate) fn pane_idle_shell_identity_with_cancellation(
+        &self,
+        pane_id: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<PaneShellProof>> {
+        let before = self.pane_process_state(pane_id, cancelled)?;
         let Some(proof) = self.idle_shell_proof(&before)? else {
             return Ok(None);
         };
-        let after = self.pane_process_state(pane_id, &|| false)?;
+        let after = self.pane_process_state(pane_id, cancelled)?;
         if after != before || self.idle_shell_proof(&after)?.as_ref() != Some(&proof) {
             return Ok(None);
         }
@@ -1381,11 +1953,59 @@ impl HerdrClient {
         Ok(observed.identity)
     }
 
+    /// Require the complete shell process generation captured when a pane was adopted.
+    pub fn verify_pane_shell_identity(
+        &self,
+        pane_id: &str,
+        expected: &CustomProcessIdentity,
+    ) -> Result<()> {
+        self.verify_pane_shell_identity_with_cancellation(pane_id, expected, &|| false)
+    }
+
+    pub(crate) fn verify_pane_shell_identity_with_cancellation(
+        &self,
+        pane_id: &str,
+        expected: &CustomProcessIdentity,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        if !expected.valid() {
+            return Err(AdapterError::unavailable(
+                "recorded pane shell identity is invalid",
+            ));
+        }
+        let state = self.pane_process_state(pane_id, cancelled)?;
+        if state.shell_pid != expected.pid {
+            return Err(AdapterError::identity_mismatch(format!(
+                "recorded pane shell generation changed for pane {pane_id}"
+            )));
+        }
+        let observed = supported_shell_process(state.shell_pid)?.ok_or_else(|| {
+            AdapterError::unavailable(format!(
+                "cannot verify recorded pane shell generation for pane {pane_id}"
+            ))
+        })?;
+        if observed.identity != *expected || observed.process_group_id != state.shell_pid {
+            return Err(AdapterError::identity_mismatch(format!(
+                "recorded pane shell generation changed for pane {pane_id}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Require the recorded shell generation and Herdr's strict idle-shell presentation.
     pub fn pane_is_same_idle_shell(
         &self,
         pane_id: &str,
         expected: &CustomProcessIdentity,
+    ) -> Result<bool> {
+        self.pane_is_same_idle_shell_with_cancellation(pane_id, expected, &|| false)
+    }
+
+    pub(crate) fn pane_is_same_idle_shell_with_cancellation(
+        &self,
+        pane_id: &str,
+        expected: &CustomProcessIdentity,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<bool> {
         if !expected.valid() {
             return Err(AdapterError::unavailable(
@@ -1393,7 +2013,7 @@ impl HerdrClient {
             ));
         }
         Ok(self
-            .pane_idle_shell_identity(pane_id)?
+            .pane_idle_shell_identity_with_cancellation(pane_id, cancelled)?
             .is_some_and(|proof| proof.identity == *expected))
     }
 
@@ -1435,13 +2055,15 @@ impl HerdrClient {
         pane_id: &str,
         arguments: &[String],
         timeout: Duration,
-        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
+        persist: &mut dyn FnMut(CustomLaunchObservation) -> Result<()>,
     ) -> Result<()> {
         if timeout.is_zero() || timeout > Duration::from_secs(300) {
             return Err(AdapterError::unavailable(
                 "agent startup timeout must be between 0 and 300 seconds",
             ));
         }
+        let deadline = Instant::now() + timeout;
+        let cancelled = || Instant::now() >= deadline;
         if kind.is_empty()
             || !kind.as_bytes()[0].is_ascii_lowercase()
             || !kind
@@ -1455,8 +2077,14 @@ impl HerdrClient {
         let executable = pin_harness_executable(resolve_harness_executable(kind)?)?;
         let mut command = vec![executable.path.display().to_string()];
         command.extend_from_slice(arguments);
+        persist(CustomLaunchObservation::Intent {
+            executable: executable.path.clone(),
+            device: executable.device,
+            inode: executable.inode,
+            argv: command.clone(),
+        })?;
         let line = shell_join(&command)?;
-        self.call_ok(
+        self.call_ok_with_cancellation(
             &[
                 "pane".to_owned(),
                 "run".to_owned(),
@@ -1464,11 +2092,24 @@ impl HerdrClient {
                 line,
             ],
             &format!("pane run {kind:?}"),
+            &cancelled,
         )?;
-        let deadline = Instant::now() + timeout;
         let mut observed = None;
+        let mut last_probe_error = None;
         while Instant::now() < deadline {
-            observed = self.custom_harness_observed(pane_id, &executable, &|| false)?;
+            match self.custom_harness_observed(pane_id, &executable, &cancelled) {
+                Ok(value) => observed = value,
+                Err(error) => {
+                    // Herdr can briefly expose an incomplete process snapshot or
+                    // fail one control request while the process is coming up.
+                    // Startup already owns a deadline, so preserve the last error
+                    // and retry within that existing bound.
+                    if Instant::now() < deadline || last_probe_error.is_none() {
+                        last_probe_error = Some(error.to_string());
+                    }
+                    observed = None;
+                }
+            }
             if observed.is_some() {
                 break;
             }
@@ -1477,21 +2118,26 @@ impl HerdrClient {
             );
         }
         let observed = observed.ok_or_else(|| {
+            let detail = last_probe_error
+                .as_deref()
+                .map_or_else(String::new, |error| {
+                    format!("; last process probe: {error}")
+                });
             AdapterError::unavailable(format!(
-                "custom harness {kind:?} was not the foreground process in pane {pane_id}"
+                "custom harness {kind:?} was not the foreground process in pane {pane_id}{detail}"
             ))
         })?;
         // Persist before trust/readiness/report checks. If any later step fails, stop still has
         // enough kernel identity to close only this observed process's pane.
-        persist_identity(observed.clone())?;
+        persist(CustomLaunchObservation::Process(observed.clone()))?;
         let mut ready = false;
         while Instant::now() < deadline {
-            if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
+            if !self.recorded_custom_harness_observed(pane_id, &observed, &cancelled)? {
                 return Err(AdapterError::unavailable(format!(
                     "custom harness {kind:?} identity changed before readiness in pane {pane_id}"
                 )));
             }
-            let screen = self.read(pane_id, "visible", Some(200))?;
+            let screen = self.read_with_cancellation(pane_id, "visible", Some(200), &cancelled)?;
             if muse_trust_prompt(&screen)
                 && !arguments.iter().any(|value| value == "--trust-workspace")
             {
@@ -1512,12 +2158,12 @@ impl HerdrClient {
                 "custom harness {kind:?} did not reach a verified idle composer in pane {pane_id}"
             )));
         }
-        if !self.recorded_custom_harness_observed(pane_id, &observed, &|| false)? {
+        if !self.recorded_custom_harness_observed(pane_id, &observed, &cancelled)? {
             return Err(AdapterError::unavailable(format!(
                 "custom harness {kind:?} identity changed before report in pane {pane_id}"
             )));
         }
-        self.call_ok(
+        self.call_ok_with_cancellation(
             &strings(&[
                 "pane",
                 "report-agent",
@@ -1532,9 +2178,101 @@ impl HerdrClient {
                 "agentctl custom harness",
             ]),
             &format!("report custom agent {pane_id}"),
+            &cancelled,
         )?;
         Ok(())
     }
+
+    /// Recover one launch that became live before its first process snapshot was usable.
+    pub fn recover_pane_agent(
+        &self,
+        pane_id: &str,
+        expected_argv: &[String],
+        expected_device: u64,
+        expected_inode: u64,
+        expected_pid: u64,
+    ) -> Result<CustomProcessIdentity> {
+        if expected_pid == 0 || expected_pid > i32::MAX as u64 {
+            return Err(AdapterError::unavailable(
+                "expected custom harness pid is not a positive Linux process id",
+            ));
+        }
+        if expected_argv.is_empty()
+            || expected_argv
+                .iter()
+                .any(|value| value.is_empty() || value.contains('\0'))
+            || expected_device == 0
+            || expected_inode == 0
+        {
+            return Err(AdapterError::unavailable(
+                "saved custom harness launch intent is incomplete",
+            ));
+        }
+        let first = self.recoverable_custom_harness_observed(
+            pane_id,
+            expected_argv,
+            expected_device,
+            expected_inode,
+            expected_pid,
+        )?;
+        let second = self.recoverable_custom_harness_observed(
+            pane_id,
+            expected_argv,
+            expected_device,
+            expected_inode,
+            expected_pid,
+        )?;
+        if second != first {
+            return Err(AdapterError::unavailable(
+                "custom harness identity changed during recovery",
+            ));
+        }
+        Ok(first.identity)
+    }
+
+    /// Commit recovered session state while a pidfd pins the exact foreground process.
+    #[cfg(target_os = "linux")]
+    pub fn commit_recovered_pane_agent(
+        &self,
+        pane_id: &str,
+        kind: &str,
+        identity: &CustomProcessIdentity,
+        commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let observed = self
+            .recorded_custom_harness_process(pane_id, identity, &|| false)?
+            .ok_or_else(|| {
+                AdapterError::unavailable(format!(
+                    "custom harness {kind:?} is not the foreground process in pane {pane_id}"
+                ))
+            })?;
+        commit()?;
+        require_live_pidfd(&observed.pidfd, identity.pid)?;
+        if self
+            .recorded_custom_harness_process(pane_id, identity, &|| false)?
+            .is_none()
+        {
+            return Err(AdapterError::unavailable(format!(
+                "custom harness {kind:?} changed during state publication in pane {pane_id}"
+            )));
+        }
+        require_live_pidfd(&observed.pidfd, identity.pid)
+    }
+
+    /// Recovery publication cannot be made generation-atomic without Linux pidfds.
+    #[cfg(not(target_os = "linux"))]
+    pub fn commit_recovered_pane_agent(
+        &self,
+        _pane_id: &str,
+        _kind: &str,
+        _identity: &CustomProcessIdentity,
+        _commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        Err(AdapterError::unavailable(
+            "custom harness recovery publication requires Linux pidfds",
+        ))
+    }
+
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn agent_pane(&self, name: &str) -> Result<String> {
         self.agent_pane_with_cancellation(name, &|| false)
@@ -1608,6 +2346,7 @@ impl HerdrClient {
                     pane_id: required_string(pane, "pane_id", "pane list entry")?,
                     tab_id: required_string(pane, "tab_id", "pane list entry")?,
                     workspace_id: required_string(pane, "workspace_id", "pane list entry")?,
+                    terminal_id: optional_string(pane, "terminal_id", "pane list entry")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1723,8 +2462,7 @@ impl HerdrClient {
                 "--timeout".to_owned(),
                 timeout_ms.to_string(),
             ],
-            CONTROL_TIMEOUT
-                .max(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(5))),
+            Duration::from_millis(timeout_ms.max(1)),
             cancelled,
         )?;
         if completed.status != 0 {
@@ -2311,19 +3049,65 @@ mod tests {
     }
 
     #[test]
+    fn proc_stat_parser_ignores_non_utf8_process_names() {
+        let raw = b"123 (arbitrary\xff) S 7 8 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 42\n";
+        let parsed = parse_process_stat(raw, 123).unwrap();
+        assert_eq!(parsed.state, b'S');
+        assert_eq!(parsed.parent_pid, 7);
+        assert_eq!(parsed.process_group_id, 8);
+        assert_eq!(parsed.starttime_ticks, 42);
+        assert!(parse_process_stat(raw, 124).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_process_identity_inspection_requires_a_process_existence_proof() {
+        let inspection = || AdapterError::unavailable("procfs identity unavailable");
+        assert!(
+            process_generation_absent_after_failed_inspection(123, inspection(), Ok(false),)
+                .unwrap()
+        );
+
+        let live = process_generation_absent_after_failed_inspection(123, inspection(), Ok(true))
+            .unwrap_err();
+        assert_eq!(live.message(), "procfs identity unavailable");
+
+        let unavailable = process_generation_absent_after_failed_inspection(
+            123,
+            inspection(),
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+        )
+        .unwrap_err();
+        assert!(unavailable.message().contains("cannot prove"));
+        assert!(unavailable
+            .message()
+            .contains("procfs identity unavailable"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_process_existence_probe_is_not_absence() {
+        let pid = libc::pid_t::try_from(std::process::id()).unwrap();
+        assert!(process_exists(pid).unwrap());
+    }
+
+    #[test]
     fn muse_prompt_must_move_from_composer_to_transcript() {
         let prompt = "literal $(unexpanded) delivery\nsecond line";
         let header = "Muse Code 1.3.0\n";
         let divider = "────────────────\n";
         let footer = "watermelon-preview · xhigh · /work/project · Auto-review\n";
         let staged = format!("{header}{divider}❯ {prompt}\n{divider}{footer}");
-        let accepted = format!("{header}❯ {prompt}\nWorking...\n{divider}❯\n{divider}{footer}");
+        let accepted = format!("{header}❯ {prompt}\n◆ Working...\n{divider}❯\n{divider}{footer}");
         let error_redraw = format!("{header}{divider}❯ {prompt}\nError: retry\n{divider}{footer}");
         assert!(muse_prompt_in_composer(&staged, prompt));
         assert_eq!(muse_prompt_transcript_count(&staged, prompt), 0);
+        assert!(!muse_prompt_in_transcript(&staged, prompt));
         assert_eq!(muse_prompt_transcript_count(&accepted, prompt), 1);
+        assert!(muse_prompt_in_transcript(&accepted, prompt));
         assert!(!muse_prompt_in_composer(&accepted, prompt));
         assert!(muse_prompt_in_composer(&error_redraw, prompt));
+        assert!(!muse_prompt_is_exact_composer(&error_redraw, prompt));
         assert_eq!(muse_prompt_transcript_count(&error_redraw, prompt), 0);
         let repeated_staged =
             format!("{header}❯ {prompt}\n◆ prior answer\n{divider}❯ {prompt}\n{divider}{footer}");
@@ -2334,6 +3118,143 @@ mod tests {
             muse_prompt_transcript_count(&cleared_without_submit, prompt),
             1
         );
+        let long_prompt = format!("prefix {}suffix", "middle ".repeat(40));
+        let changed_middle = format!("prefix {}suffix", "changed ".repeat(40));
+        let collapsed = format!(
+            "{header}{divider}❯ [Pasted Content {} chars]\n{divider}{footer}",
+            long_prompt.chars().count()
+        );
+        let deceptive = format!("{header}{divider}❯ {changed_middle}\n{divider}{footer}");
+        let prefixed =
+            format!("{header}❯ {long_prompt} extra\n◆ Working\n{divider}❯\n{divider}{footer}");
+        assert!(!muse_prompt_in_composer(&collapsed, &long_prompt));
+        assert!(!muse_prompt_in_composer(&deceptive, &long_prompt));
+        assert!(!muse_prompt_in_transcript(&prefixed, &long_prompt));
+        let assistant_echo = format!("{header}◆ {long_prompt}\n{divider}❯\n{divider}{footer}");
+        assert!(!muse_prompt_in_transcript(&assistant_echo, &long_prompt));
+    }
+
+    #[test]
+    fn headerless_muse_composer_requires_verified_process_context() {
+        let screen = "old transcript after the version header scrolled away\n\
+                      ────────────────\n❯\n────────────────\n\
+                      kiki · xhigh · /work/project · YOLO\n";
+        assert!(!muse_idle_composer(screen));
+        assert!(muse_verified_process_idle_composer(screen));
+        let prompt = "require the full deterministic-scheduling-review skill";
+        let staged = screen.replace("❯\n", &format!("❯ {prompt}\n"));
+        assert!(!muse_prompt_is_exact_composer(&staged, prompt));
+        assert!(muse_verified_process_prompt_is_exact_composer(
+            &staged, prompt
+        ));
+        assert!(muse_verified_process_prompt_in_composer(&staged, prompt));
+        let accepted = screen.replace(
+            "old transcript after the version header scrolled away\n",
+            &format!("❯ {prompt}\n◆ Working\n"),
+        );
+        assert_eq!(
+            muse_verified_process_prompt_transcript_count(&accepted, prompt),
+            1
+        );
+    }
+
+    #[test]
+    fn exact_muse_composer_matches_only_requested_hyphen_soft_wraps() {
+        let divider = "────────────────────────────────────────";
+        let footer = "kiki · xhigh · /work/project · YOLO\n";
+        let prompt =
+            "Use deterministic-scheduling-review and keep this buffered prompt byte-for-byte";
+        let wrapped = format!(
+            "old transcript\n{divider}\n❯ Use deterministic-\n  scheduling-review and keep this buffered prompt byte-for-byte\n{divider}\n{footer}"
+        );
+        assert!(muse_verified_process_composer(&wrapped));
+        assert!(muse_verified_process_prompt_is_exact_composer(
+            &wrapped, prompt
+        ));
+        assert!(!muse_verified_process_prompt_is_exact_composer(
+            &wrapped,
+            &prompt.replace("byte-for-byte", "byte for byte")
+        ));
+        let accepted = format!(
+            "❯ Use deterministic-\n  scheduling-review and keep this buffered prompt byte-for-byte\n◆ Working\n{divider}\n❯\n{divider}\n{footer}"
+        );
+        assert_eq!(
+            muse_verified_process_prompt_transcript_count(&accepted, prompt),
+            1
+        );
+        let weakened = wrapped.replace("deterministic-\n", "deterministic -\n");
+        assert!(!muse_verified_process_prompt_is_exact_composer(
+            &weakened, prompt
+        ));
+    }
+
+    #[test]
+    fn current_muse_footer_identifies_only_an_empty_composer() {
+        let prefix = "Muse Code at Meta (https://fb.workplace.com/groups/27315719428107177)\n\
+                      Using AI Gateway (Meta Model API upstream)\n\n  Muse Code 1.4.0\n\n";
+        let divider = "────────────────\n";
+        let footer = "kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n";
+        assert!(muse_idle_composer(&format!(
+            "{prefix}{divider}❯\n{divider}{footer}"
+        )));
+        assert!(!muse_idle_composer(&format!(
+            "{prefix}{divider}❯ Yes, continue\n  No, exit\n{divider}{footer}"
+        )));
+        assert!(!muse_idle_composer(&format!(
+            "{prefix}{divider}❯\n  pending text\n{divider}{footer}"
+        )));
+        assert!(!muse_idle_composer(&format!(
+            "{divider}❯\n{divider}watermelon-preview · xhigh · /work/project · Auto-review\n"
+        )));
+    }
+
+    #[test]
+    fn claude_active_screen_requires_current_activity_controls() {
+        let divider = "─".repeat(40);
+        let screen = format!(
+            "completed output\n✻ Waiting for 1 background agent to finish\n\
+             {divider}\n❯\n{divider}\nauto mode on · ← 2 agents · ↓ to manage\n\
+             ● main\n◯ reviewer Checking tests 8m\n"
+        );
+        assert!(claude_active_screen(&screen));
+        assert!(claude_active_screen(
+            &screen
+                .replace("Waiting", "Waited")
+                .replace("↓ to manage", "esc to interrupt")
+        ));
+        assert!(!claude_active_screen(&screen.replace("Waiting", "Waited")));
+        assert!(!claude_active_screen(
+            &screen.replace("← 2 agents", "← 1 agent")
+        ));
+        let staged_while_active = format!(
+            "● Background command still running\n✽ Considering… (20m 51s)\n\
+             {divider}\n❯ queued follow-up prompt\n  ctrl+x ctrl+s to send now\n\
+             {divider}\n⏵⏵ auto mode on · esc to interrupt · ← 2 agents\n"
+        );
+        assert!(claude_active_screen(&staged_while_active));
+    }
+
+    #[test]
+    fn claude_staged_prompt_is_distinct_from_a_submitted_turn() {
+        let divider = "─".repeat(40);
+        let prompt = "review the deterministic- scheduling contract";
+        let staged = format!(
+            "● Background command still running\n{divider}\n\
+             ❯ review the deterministic-\n  scheduling contract\n\
+               ctrl+x ctrl+s to send now\n{divider}\n\
+             ⏵⏵ auto mode on · esc to interrupt · ← 2 agents\n"
+        );
+        assert!(claude_staged_composer(&staged));
+        assert!(claude_prompt_is_exact_composer(&staged, prompt));
+        assert_eq!(claude_prompt_transcript_count(&staged, prompt), 0);
+
+        let submitted = format!(
+            "❯ {prompt}\n● Working on the request\n{divider}\n❯\n{divider}\n\
+             ⏵⏵ auto mode on · esc to interrupt\n"
+        );
+        assert!(!claude_staged_composer(&submitted));
+        assert!(!claude_prompt_is_exact_composer(&submitted, prompt));
+        assert_eq!(claude_prompt_transcript_count(&submitted, prompt), 1);
     }
 
     #[cfg(target_os = "linux")]
@@ -2450,19 +3371,6 @@ mod tests {
                 .trim()
                 .parse()
                 .expect("fixture child pid is numeric")
-        }
-
-        fn wait_for_pid(path: &Path, timeout: Duration) -> Option<libc::pid_t> {
-            let deadline = Instant::now() + timeout;
-            loop {
-                if let Ok(value) = fs::read_to_string(path) {
-                    return Some(value.trim().parse().expect("fixture child pid is numeric"));
-                }
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
         }
 
         fn group_pid(&self) -> libc::pid_t {
@@ -3081,6 +3989,86 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn legacy_recovery_uses_basename_only_with_exact_image_and_arguments() {
+        let herdr = FakeExecutable::new("{}");
+        let harness = herdr.root.join("muse");
+        install_test_elf("/bin/sleep", &harness);
+        let mut process = spawn_test_process(&harness);
+        let pid = process.0.id();
+        herdr.set_response(&process_info_response(pid, &harness));
+        let identity = herdr
+            .client()
+            .custom_harness_observed(
+                "pane",
+                &pin_harness_executable(harness.clone()).unwrap(),
+                &|| false,
+            )
+            .unwrap()
+            .expect("observe process");
+
+        assert_eq!(
+            herdr
+                .client()
+                .recover_pane_agent(
+                    "pane",
+                    &["muse".to_owned(), "30".to_owned()],
+                    identity.executable_device,
+                    identity.executable_inode,
+                    u64::from(pid),
+                )
+                .unwrap(),
+            identity
+        );
+        assert!(herdr
+            .client()
+            .recover_pane_agent(
+                "pane",
+                &["muse".to_owned(), "31".to_owned()],
+                identity.executable_device,
+                identity.executable_inode,
+                u64::from(pid),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("argv does not exactly match"));
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovered_publication_detects_exit_after_commit_through_pinned_pidfd() {
+        let herdr = FakeExecutable::new("{}");
+        let harness = herdr.root.join("muse");
+        install_test_elf("/bin/sleep", &harness);
+        let pinned = pin_harness_executable(harness.clone()).unwrap();
+        let mut process = spawn_test_process(&harness);
+        let pid = process.0.id();
+        herdr.set_response(&process_info_response(pid, &harness));
+        let identity = herdr
+            .client()
+            .custom_harness_observed("pane", &pinned, &|| false)
+            .unwrap()
+            .expect("observe original process");
+        let mut committed = false;
+        let mut commit = || {
+            committed = true;
+            process.0.kill().unwrap();
+            process.0.wait().unwrap();
+            Ok(())
+        };
+
+        let error = herdr
+            .client()
+            .commit_recovered_pane_agent("pane", "muse", &identity, &mut commit)
+            .unwrap_err();
+
+        assert!(committed);
+        assert!(error.to_string().contains("exited"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn recorded_custom_identity_refuses_replacement_process_and_field_mismatches() {
         let herdr = FakeExecutable::new("{}");
         let harness = herdr.root.join("muse");
@@ -3215,31 +4203,43 @@ mod tests {
     #[test]
     fn control_timeout_includes_pipes_inherited_after_the_parent_exits() {
         let mut unrelated = ChildGuard(Command::new("/bin/sleep").arg("30").spawn().unwrap());
-        // The timeout remains explicit, but its clock starts at spawn, so a loaded host can fire
-        // it before the shell forks the escaped holder. Such an attempt never exercised inherited
-        // pipes; retry it with a longer budget. The separate EINTR test exercises the short
-        // 150ms deadline.
-        for timeout in [1, 3, 10].map(Duration::from_secs) {
-            let escaped = RecordedChild::new("setsid-holder");
-            let started = Instant::now();
-            let result = bounded_output(escaped.escaped_pipe_command(), timeout);
-            assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
-            assert!(started.elapsed() < timeout + Duration::from_secs(4));
-            // Once forked, the holder is outside the killed group and publishes itself.
-            let Some(pid) =
-                RecordedChild::wait_for_pid(&escaped.escaped_pid_file, Duration::from_secs(5))
-            else {
-                continue;
-            };
-            // The setsid child escaped the supervised group and really was retaining both capture
-            // pipes, so returning promptly did not depend on receiving EOF from reader threads.
-            assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
-            // The pinned private group must not be confused with any unrelated numeric identity.
-            assert!(unrelated.0.try_wait().unwrap().is_none());
-            escaped.terminate_escaped();
-            return;
-        }
-        panic!("the escaped pipe holder was never started before any timeout");
+        let escaped = RecordedChild::new("setsid-holder");
+        let escaped_pid_file = escaped.escaped_pid_file.clone();
+        let mut fixture_ready = || {
+            let readiness_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if fs::read_to_string(&escaped_pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                if Instant::now() >= readiness_deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "fixture did not publish the escaped pipe-holder PID",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let started = Instant::now();
+        // The readiness hook makes the escaped-pipe premise deterministic under scheduler load.
+        // The absolute timeout is still created before spawn, and the hook cannot reset it.
+        let result = bounded_output_after_spawn_hook_for_test(
+            escaped.escaped_pipe_command(),
+            Duration::from_secs(1),
+            &mut fixture_ready,
+        );
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The setsid child escaped the supervised group and really was retaining both capture
+        // pipes, so returning promptly did not depend on receiving EOF from reader threads.
+        assert_eq!(unsafe { libc::kill(escaped.escaped_pid(), 0) }, 0);
+        // The pinned private group must not be confused with any unrelated numeric identity.
+        assert!(unrelated.0.try_wait().unwrap().is_none());
+        escaped.terminate_escaped();
     }
 
     #[cfg(target_os = "linux")]

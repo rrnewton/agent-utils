@@ -66,10 +66,10 @@ class GatedHarness(Harness):
         self.prompted = threading.Event()
         self.lookup: Gate | None = None
 
-    def pane_info(self, pane_id: str) -> AgentPaneInfo:
+    def pane_info(self, pane_id: str, *, timeout: float = 30.0) -> AgentPaneInfo:
         if self.lookup is not None:
             self.lookup.wait()
-        return super().pane_info(pane_id)
+        return super().pane_info(pane_id, timeout=timeout)
 
     def prompt_agent(self, pane_id: str, text: str) -> None:
         super().prompt_agent(pane_id, text)

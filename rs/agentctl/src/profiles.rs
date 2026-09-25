@@ -1,6 +1,7 @@
 //! Strict project-local launch profiles.
 use serde::de::{Error as _, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -14,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::agent::AgentError;
 
-pub(crate) const SCHEMA: &str = "agentctl-profiles/v1";
+pub(crate) const SCHEMA: &str = "agentctl-profiles/v2";
+pub(crate) const LEGACY_SCHEMA: &str = "agentctl-profiles/v1";
 const PROFILE_PATH: &str = ".agentctl/profiles.json";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const SYSTEM_GIT: &str = "/usr/bin/git";
@@ -32,6 +34,26 @@ pub(crate) struct LaunchProfile {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) argv: Vec<String>,
     pub(crate) environment: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkspaceSelector {
+    pub(crate) kind: String,
+    pub(crate) value: String,
+}
+
+impl Serialize for WorkspaceSelector {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(&self.kind, &self.value)?;
+        map.end()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectConfig {
+    pub(crate) profiles: BTreeMap<String, LaunchProfile>,
+    pub(crate) default_workspace: Option<WorkspaceSelector>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +90,34 @@ impl LaunchProfile {
 struct Document {
     schema: String,
     profiles: UniqueMap<RawProfile>,
+    #[serde(default)]
+    default_workspace: FieldPresence<RawWorkspaceSelector>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWorkspaceSelector {
+    #[serde(default)]
+    id: FieldPresence<String>,
+    #[serde(default)]
+    label: FieldPresence<String>,
+}
+
+enum FieldPresence<T> {
+    Missing,
+    Present(T),
+}
+
+impl<T> Default for FieldPresence<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for FieldPresence<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::Present)
+    }
 }
 
 #[derive(Deserialize)]
@@ -560,10 +610,10 @@ fn validate(name: String, raw: RawProfile) -> Result<LaunchProfile, AgentError> 
     })
 }
 
-pub(crate) fn load_profiles(
+pub(crate) fn load_project_config(
     cwd: &Path,
     absent_ok: bool,
-) -> Result<(PathBuf, BTreeMap<String, LaunchProfile>), AgentError> {
+) -> Result<(PathBuf, ProjectConfig), AgentError> {
     let cwd = fs::canonicalize(cwd).map_err(|error| {
         fail(format!(
             "cwd is not a directory: {}: {error}",
@@ -574,7 +624,13 @@ pub(crate) fn load_profiles(
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && absent_ok => {
-            return Ok((path, BTreeMap::new()));
+            return Ok((
+                path,
+                ProjectConfig {
+                    profiles: BTreeMap::new(),
+                    default_workspace: None,
+                },
+            ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(fail(format!(
@@ -659,18 +715,52 @@ pub(crate) fn load_profiles(
             path.display()
         ))
     })?;
-    if document.schema != SCHEMA {
+    if !matches!(document.schema.as_str(), LEGACY_SCHEMA | SCHEMA)
+        || (document.schema == LEGACY_SCHEMA
+            && matches!(&document.default_workspace, FieldPresence::Present(_)))
+        || (document.schema == SCHEMA
+            && matches!(&document.default_workspace, FieldPresence::Missing))
+    {
         return Err(fail(format!(
-            "profile config must use schema {SCHEMA:?} and an object of profiles"
+            "profile config must use schema {LEGACY_SCHEMA:?} or {SCHEMA:?} with exactly its documented fields"
         )));
     }
+    let default_workspace = match document.default_workspace {
+        FieldPresence::Present(raw) => {
+            let (kind, value) = match (raw.id, raw.label) {
+                (FieldPresence::Present(value), FieldPresence::Missing) => ("id", value),
+                (FieldPresence::Missing, FieldPresence::Present(value)) => ("label", value),
+                _ => {
+                    return Err(fail(
+                        "default_workspace must contain exactly one of id or label",
+                    ));
+                }
+            };
+            if !valid_text(&value) || value.len() > 256 {
+                return Err(fail(
+                    "default workspace selector must be nonempty, NUL-free, and at most 256 UTF-8 bytes",
+                ));
+            }
+            Some(WorkspaceSelector {
+                kind: kind.to_owned(),
+                value,
+            })
+        }
+        FieldPresence::Missing => None,
+    };
     let profiles = document
         .profiles
         .0
         .into_iter()
         .map(|(name, profile)| validate(name.clone(), profile).map(|value| (name, value)))
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    Ok((path, profiles))
+    Ok((
+        path,
+        ProjectConfig {
+            profiles,
+            default_workspace,
+        },
+    ))
 }
 
 pub(crate) fn reasoning_arguments(
@@ -696,5 +786,40 @@ pub(crate) fn reasoning_arguments(
         _ => Err(fail(format!(
             "reasoning effort is not supported for harness {harness:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_selector_preserves_presence_and_rejects_null_values() {
+        for document in [
+            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":null}"#,
+            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":{"id":"w","label":null}}"#,
+            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":{"id":null}}"#,
+            r#"{"schema":"agentctl-profiles/v1","profiles":{},"default_workspace":null}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Document>(document).is_err(),
+                "{document}"
+            );
+        }
+
+        let missing: Document =
+            serde_json::from_str(r#"{"schema":"agentctl-profiles/v2","profiles":{}}"#).unwrap();
+        assert!(matches!(missing.default_workspace, FieldPresence::Missing));
+        let exact: Document = serde_json::from_str(
+            r#"{"schema":"agentctl-profiles/v2","profiles":{},"default_workspace":{"label":"dev-hermit-014"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            exact.default_workspace,
+            FieldPresence::Present(RawWorkspaceSelector {
+                id: FieldPresence::Missing,
+                label: FieldPresence::Present(value),
+            }) if value == "dev-hermit-014"
+        ));
     }
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shlex
@@ -7,13 +8,24 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, cast
 
 import pytest
 
 from agentctl.foreign import agent_keeper, agent_runner, lib
-from agentctl.client import AgentPaneInfo
+from agentctl.client import AgentPaneInfo, CustomProcessIdentity
 from agentctl.errors import HerdrUnavailable
+
+
+def _runner_identity(pid: int, started_at: int) -> CustomProcessIdentity:
+    return CustomProcessIdentity(
+        version=1,
+        boot_id="11111111-2222-3333-4444-555555555555",
+        pid=pid,
+        starttime_ticks=started_at,
+        executable_device=3,
+        executable_inode=4,
+    )
 
 
 @pytest.fixture()
@@ -41,6 +53,24 @@ def test_backend_selection_prefers_call_then_environment_then_config(
     assert lib.selected_backend("tmux") == "tmux"
     monkeypatch.delenv("SUBAGENTS_BACKEND")
     assert lib.selected_backend() == "tmux"
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2, 3, 12])
+def test_last_message_preview_marks_bounded_diagnostic_truncation(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch, limit: int,
+) -> None:
+    lib.ensure_agent_dirs("worker")
+    monkeypatch.setattr(lib, "MAX_QUEUE_MESSAGE_BYTES", 4)
+    path = lib.last_message_path("worker")
+    path.write_bytes(b"xxxxx")
+
+    preview = lib.last_message_preview("worker", limit=limit)
+
+    assert len(preview) <= limit
+    if limit <= 3:
+        assert preview == "..."[:limit]
+    else:
+        assert preview.endswith("...")
 
 
 def test_mode_selection_prefers_call_then_environment_then_project(
@@ -97,22 +127,36 @@ def test_legacy_registry_writer_cannot_enable_bypass_on_a_native_worker(
 ) -> None:
     rec = _tui_record("native-worker", fake_backend_state)
     rec.mode = lib.HEADLESS_MODE
+    rec.presentation_pane = None
+    rec.backend = "tmux"
+    rec.tmux_target = f"subagents:{rec.name}"
+    rec.runner_identity = lib.capture_process_identity(os.getpid())
+    rec.runner_pid = rec.runner_identity.pid
+    rec.runner_started_at = str(rec.runner_identity.starttime_ticks)
     rec.codex_bypass_permissions = False
     with lib.registry_lock() as agents:
         agents[rec.name] = rec
-    original_rows = json.loads(lib.REGISTRY.read_text())
-    for row in original_rows:
-        row.pop("codex_bypass_permissions")
+    permission_path = lib._permission_policy_path(rec.name)
+    permission_path.parent.mkdir(parents=True, exist_ok=True)
+    permission_path.write_text(json.dumps({
+        "name": rec.name, "created_at": rec.created_at,
+        "codex_bypass_permissions": False,
+    }))
+    original_rows = [_untagged_runtime_row(rec)]
+    original_rows[0].pop("codex_bypass_permissions")
     # A still-running pre-upgrade process serializes only fields it knows.
     lib.REGISTRY.write_text(json.dumps(original_rows))
     monkeypatch.setenv("SUBAGENTS_CODEX_BYPASS_PERMISSIONS", "1")
     restored = lib.read_registry()[rec.name]
     assert restored.codex_bypass_permissions is False
+    assert permission_path.exists()
+    assert "schema" not in json.loads(lib.REGISTRY.read_text())[0]
     argv = agent_runner._build_codex_argv(restored, lib.Message(0, "next task", None, lib.now_iso()))
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
-    lib._permission_policy_path(rec.name).write_text("invalid sidecar")
-    with pytest.raises(lib.AgentOperationError, match="cannot read worker permissions"):
+    permission_path.write_text("invalid sidecar")
+    with pytest.raises(lib.AgentOperationError) as raised:
         lib.read_registry()
+    assert raised.value.code == "invalid_permission_policy"
 
 
 def test_auto_detection_requires_herdr_environment_socket_and_live_server(
@@ -244,6 +288,7 @@ def test_tmux_record_operations_ignore_changed_default_session(
     rec.mode = lib.HEADLESS_MODE
     rec.backend = "tmux"
     rec.tmux_target = "original:worker"
+    rec.runner_pid = 123
     monkeypatch.setattr(lib, "TMUX_SESSION", "unrelated")
     windows = {"original": {"worker"}, "unrelated": {"worker"}}
     calls: list[tuple[str, ...]] = []
@@ -351,13 +396,19 @@ def _tui_record(name: str, cwd: Path) -> lib.AgentRecord:
         model="model-a",
         session_id=None,
         status="idle",
-        runner_pid=os.getpid(),
-        runner_started_at=lib.pid_start_time(os.getpid()),
+        runner_pid=None,
+        runner_started_at=None,
         next_seq=0,
         created_at="2020-01-01T00:00:00+00:00",
         last_turn_at=None,
         mode=lib.TUI_MODE,
         presentation_pane="wT:p2",
+        control=lib.RuntimeControl.standalone("standalone-test-generation"),
+        owner_launch=lib.RuntimeLaunchContract.create(
+            cwd=str(cwd), harness="codex", model="model-a",
+            backend="herdr", mode=lib.TUI_MODE, harness_args=(),
+            permission_mode="native", runtime_home=lib.BASE,
+        ),
     )
 
 
@@ -367,14 +418,22 @@ def test_unknown_runner_identity_never_authorizes_a_signal(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    rec = _tui_record("identity-unknown", fake_backend_state)
+    rec = dataclasses.replace(
+        _tui_record("identity-unknown", fake_backend_state),
+        mode=lib.HEADLESS_MODE,
+        runner_pid=4242,
+        runner_started_at="9001",
+        runner_identity=_runner_identity(4242, 9001),
+        owner_launch=_headless_owner_launch(fake_backend_state),
+    )
     assert rec.runner_pid is not None and rec.runner_started_at is not None
     lib.ensure_agent_dirs(rec.name)
     token = "staged"
+    assert rec.runner_identity is not None
     lib.write_staged_runner(
         rec.name,
         token,
-        lib.RunnerIdentity(rec.runner_pid, rec.runner_started_at),
+        rec.runner_identity,
     )
     (lib.agent_dir(rec.name) / "active-harness.json").write_text(json.dumps({
         "runner_pid": rec.runner_pid,
@@ -401,30 +460,63 @@ def test_unknown_runner_identity_never_authorizes_a_signal(
         lambda pid, signum: signals.append(("killpg", pid, signum)),
     )
 
-    operations = (
-        lambda: lib.runner_identity_alive(rec),
-        lambda: lib.read_staged_runner(rec.name, token),
-        lambda: lib.terminate_runner_identity(
-            lib.RunnerIdentity(rec.runner_pid or 0, rec.runner_started_at)
-        ),
-        lambda: lib.terminate_active_harness(rec),
+    assert lib.runner_liveness(rec) is lib.ProcessLiveness.UNKNOWN
+    assert lib.read_staged_runner(rec.name, token) is None
+    assert not lib.terminate_runner_identity(
+        cast(lib.RunnerIdentity, rec.runner_identity)
     )
-    for operation in operations:
-        with pytest.raises(lib.AgentOperationError) as excinfo:
-            operation()
-        assert excinfo.value.code == "runner_identity_unknown"
+    with pytest.raises(lib.AgentOperationError) as excinfo:
+        lib.terminate_active_harness(rec)
+    assert excinfo.value.code == "harness_identity_unknown"
     assert signals == []
 
 
-def test_unbound_runner_identity_preserves_legacy_signaling(
-    monkeypatch: pytest.MonkeyPatch,
+def _headless_owner_launch(
+    cwd: Path, *, backend: str = "tmux", model: str | None = None,
+) -> lib.RuntimeLaunchContract:
+    return lib.RuntimeLaunchContract.create(
+        cwd=str(cwd), harness="codex", model=model, backend=backend,
+        mode=lib.HEADLESS_MODE, harness_args=(), permission_mode="native",
+        runtime_home=lib.BASE,
+    )
+
+
+def _untagged_runtime_row(record: lib.AgentRecord) -> dict[str, object]:
+    row = record.to_public_dict()
+    for field in ("schema", "control", "launch"):
+        row.pop(field)
+    return row
+
+
+@pytest.mark.parametrize(
+    "observation, expected",
+    [(("R", "9001"), lib.ProcessLiveness.LIVE),
+     (("Z", "9001"), lib.ProcessLiveness.DEAD),
+     (("x", "9001"), lib.ProcessLiveness.DEAD),
+     (("?", "9001"), lib.ProcessLiveness.UNKNOWN),
+     (("R", "9002"), lib.ProcessLiveness.DEAD),
+     (FileNotFoundError(), lib.ProcessLiveness.DEAD),
+     (PermissionError(), lib.ProcessLiveness.UNKNOWN),
+     (ValueError("malformed stat"), lib.ProcessLiveness.UNKNOWN)],
+)
+def test_runner_identity_liveness_is_exact_and_tristate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    observation: tuple[str, str] | BaseException, expected: lib.ProcessLiveness,
 ) -> None:
-    signals: list[tuple[int, int]] = []
-    monkeypatch.setattr(os, "kill", lambda pid, signum: signals.append((pid, signum)))
-    monkeypatch.setattr(lib, "pid_alive", lambda _pid: True)
-    monkeypatch.setattr(lib, "pid_start_time", lambda _pid: "current")
-    assert lib.terminate_runner_identity(lib.RunnerIdentity(4242, None), grace=0)
-    assert signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+    identity = _runner_identity(4242, 9001)
+    record = dataclasses.replace(
+        _tui_record("worker", tmp_path), mode=lib.HEADLESS_MODE,
+        runner_pid=4242, runner_started_at="9001", runner_identity=identity,
+    )
+
+    def read(_pid: int) -> tuple[str, str]:
+        if isinstance(observation, BaseException):
+            raise observation
+        return observation
+
+    monkeypatch.setattr(lib, "_read_process_state_start", read)
+    monkeypatch.setattr(lib, "capture_process_identity", lambda _pid: identity)
+    assert lib.runner_liveness(record) is expected
 
 
 class _FakeSharedAgentClient:
@@ -769,8 +861,10 @@ def test_workspace_death_is_loud_and_preserves_recovery_snapshot(
     rec.session_id = "session-to-recover"
     rec.runner_pid = 999_990
     rec.runner_started_at = "stale"
-    with lib.registry_lock() as agents:
-        agents[name] = rec
+    legacy = _untagged_runtime_row(rec)
+    lib.REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    lib.REGISTRY.write_text(json.dumps([legacy]))
+    stored_legacy = json.loads(lib.REGISTRY.read_text())[0]
     monkeypatch.setattr(lib, "_herdr_workspace_exists", lambda workspace_id: False)
 
     notes = lib.gc()
@@ -781,7 +875,7 @@ def test_workspace_death_is_loud_and_preserves_recovery_snapshot(
     archive = next(lib.ARCHIVE.iterdir())
     snapshot = json.loads((archive / "WORKSPACE_LOST.json").read_text())
     assert snapshot["workspace_id"] == "wLost"
-    assert snapshot["agent"]["session_id"] == "session-to-recover"
+    assert snapshot["agent"] == stored_legacy
 
 
 def test_workspace_probe_failure_preserves_agent_instead_of_guessing_death(
@@ -972,6 +1066,60 @@ def test_old_server_rewrite_preserves_herdr_identity_through_tab_target() -> Non
     assert record.backend == "herdr"
 
 
+def test_current_runtime_record_has_one_tagged_process_identity_authority(
+    fake_backend_state: Path,
+) -> None:
+    record = _tui_record("runtime-schema", fake_backend_state)
+    record.mode = lib.HEADLESS_MODE
+    record.backend = "tmux"
+    record.tmux_target = "subagents:runtime-schema"
+    record.presentation_pane = None
+    record.runner_identity = lib.capture_process_identity(os.getpid())
+    record.runner_pid = record.runner_identity.pid
+    record.runner_started_at = str(record.runner_identity.starttime_ticks)
+    document = record.to_dict()
+
+    assert document["schema"] == lib.RUNTIME_RECORD_SCHEMA
+    assert "runner_pid" not in document
+    assert "runner_started_at" not in document
+    assert isinstance(document["runner_identity"], dict)
+    assert lib.AgentRecord.from_dict(document).runner_identity == record.runner_identity
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("next_seq", True),
+        ("status", "stopped"),
+        ("harness", 7),
+        ("presentation_pane", "wT:p9"),
+    ],
+)
+def test_current_runtime_record_rejects_wrong_types_and_crossed_dimensions(
+    fake_backend_state: Path, field: str, value: object,
+) -> None:
+    record = _tui_record("runtime-invalid", fake_backend_state)
+    record.mode = lib.HEADLESS_MODE
+    record.backend = "tmux"
+    record.tmux_target = "subagents:runtime-invalid"
+    record.presentation_pane = None
+    record.runner_identity = lib.capture_process_identity(os.getpid())
+    record.runner_pid = record.runner_identity.pid
+    record.runner_started_at = str(record.runner_identity.starttime_ticks)
+    document = record.to_dict()
+    document[field] = value
+
+    with pytest.raises(SystemExit):
+        lib.AgentRecord.from_dict(document)
+
+
+def test_current_runtime_record_rejects_unknown_fields(fake_backend_state: Path) -> None:
+    document = _tui_record("runtime-extra", fake_backend_state).to_dict()
+    document["retired_writer_field"] = True
+    with pytest.raises(SystemExit):
+        lib.AgentRecord.from_dict(document)
+
+
 def test_old_server_rewrite_recovers_tui_mode_and_pane_from_durable_identity(
     fake_backend_state: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -984,7 +1132,12 @@ def test_old_server_rewrite_recovers_tui_mode_and_pane_from_durable_identity(
     with lib.registry_lock() as agents:
         agents[name] = original
 
-    stripped = original.to_dict()
+    lib.presentation_identity_path(name).write_text(json.dumps({
+        "name": original.name, "created_at": original.created_at,
+        "backend": original.backend, "tmux_target": original.tmux_target,
+        "mode": original.mode, "presentation_pane": original.presentation_pane,
+    }))
+    stripped = _untagged_runtime_row(original)
     for key in ("backend", "mode", "presentation_pane"):
         del stripped[key]
     lib.REGISTRY.write_text(json.dumps([stripped]) + "\n")
@@ -993,8 +1146,9 @@ def test_old_server_rewrite_recovers_tui_mode_and_pane_from_durable_identity(
     assert recovered.backend == "herdr"
     assert recovered.mode == lib.TUI_MODE
     assert recovered.presentation_pane == "wT:p2"
-    assert lib.presentation_identity_path(name).exists()
+    assert not lib.presentation_identity_path(name).exists()
     repaired = json.loads(lib.REGISTRY.read_text())[0]
+    assert repaired["schema"] == lib.RUNTIME_RECORD_SCHEMA
     assert repaired["backend"] == "herdr"
     assert repaired["mode"] == lib.TUI_MODE
     assert repaired["presentation_pane"] == "wT:p2"
@@ -1006,7 +1160,6 @@ def test_old_server_rewrite_recovers_tui_mode_and_pane_from_durable_identity(
     def deliver(rec: lib.AgentRecord) -> list[int]:
         delivered_to.append(rec.presentation_pane or "")
         return []
-
     monkeypatch.setattr(lib, "_deliver_tui_messages", deliver)
     result = lib.send_message_to_agent(name, "still reaches the TUI")
 
@@ -1014,6 +1167,36 @@ def test_old_server_rewrite_recovers_tui_mode_and_pane_from_durable_identity(
     assert result.presentation_pane == "wT:p2"
     assert delivered_to == ["wT:p2"]
 
+
+def test_legacy_identity_sidecars_reject_duplicate_json_keys(
+    fake_backend_state: Path,
+) -> None:
+    name = "duplicate-legacy-sidecar"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    lib.ensure_agent_dirs(name)
+    original = _tui_record(name, cwd)
+    row = _untagged_runtime_row(original)
+    for field in ("backend", "mode", "presentation_pane"):
+        row.pop(field)
+    lib.REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    lib.REGISTRY.write_text(json.dumps([row]) + "\n")
+    lib.presentation_identity_path(name).write_text(
+        '{"schema":"first","schema":"second"}\n'
+    )
+    with pytest.raises(SystemExit):
+        lib.read_registry()
+
+    lib.presentation_identity_path(name).unlink()
+    permission_row = _untagged_runtime_row(original)
+    permission_row.pop("codex_bypass_permissions")
+    lib.REGISTRY.write_text(json.dumps([permission_row]) + "\n")
+    lib._permission_policy_path(name).write_text(
+        '{"name":"first","name":"second"}\n'
+    )
+    with pytest.raises(lib.AgentOperationError) as raised:
+        lib.read_registry()
+    assert raised.value.code == "invalid_permission_policy"
 
 def test_stale_presentation_identity_does_not_apply_to_reused_name(
     fake_backend_state: Path,
@@ -1026,7 +1209,12 @@ def test_stale_presentation_identity_does_not_apply_to_reused_name(
     with lib.registry_lock() as agents:
         agents[name] = original
 
-    stale_row = original.to_dict()
+    lib.presentation_identity_path(name).write_text(json.dumps({
+        "name": original.name, "created_at": original.created_at,
+        "backend": original.backend, "tmux_target": original.tmux_target,
+        "mode": original.mode, "presentation_pane": original.presentation_pane,
+    }))
+    stale_row = _untagged_runtime_row(original)
     stale_row["created_at"] = "2026-07-13T00:00:00+00:00"
     for key in ("backend", "mode", "presentation_pane"):
         del stale_row[key]
@@ -1057,9 +1245,12 @@ def test_migration_preserves_session_and_updates_presentation(
             status="idle",
             runner_pid=os.getpid(),
             runner_started_at=lib.pid_start_time(os.getpid()),
+            runner_identity=lib.capture_process_identity(os.getpid()),
             next_seq=1,
             created_at=lib.now_iso(),
             last_turn_at=lib.now_iso(),
+            control=lib.RuntimeControl.standalone("standalone-test-generation"),
+            owner_launch=_headless_owner_launch(cwd),
         )
 
     killed: list[lib.AgentRecord] = []
@@ -1068,10 +1259,13 @@ def test_migration_preserves_session_and_updates_presentation(
     monkeypatch.setattr(
         lib,
         "wait_for_staged_runner",
-        lambda name, token: lib.RunnerIdentity(pid=999_999, started_at="new-start"),
+        lambda name, token: _runner_identity(999_999, 9002),
     )
     monkeypatch.setattr(lib, "terminate_runner", lambda rec: True)
-    monkeypatch.setattr(lib, "wait_for_staged_runner_activation", lambda name, token: True)
+    monkeypatch.setattr(
+        lib, "wait_for_staged_runner_activation",
+        lambda name, token, identity, generation, fingerprint: True,
+    )
     guards: list[tuple[str, str]] = []
     monkeypatch.setattr(lib, "create_legacy_tmux_guard", lambda name, cwd, **kwargs: guards.append((name, cwd)))
     monkeypatch.setattr(lib, "launch_window", lambda backend, name, cwd, wrapper: "wB:t9")
@@ -1110,9 +1304,12 @@ def test_migration_destination_runner_dies_keeps_tmx_source_intact(
             status="idle",
             runner_pid=old_pid,
             runner_started_at=old_start,
+            runner_identity=lib.capture_process_identity(old_pid),
             next_seq=1,
             created_at=lib.now_iso(),
             last_turn_at=lib.now_iso(),
+            control=lib.RuntimeControl.standalone("standalone-test-generation"),
+            owner_launch=_headless_owner_launch(cwd),
         )
 
     killed: list[lib.AgentRecord] = []
@@ -1149,8 +1346,11 @@ def test_activation_timeout_restores_source_registry_after_commit(
         agents[name] = lib.AgentRecord(name=name, harness="codex", backend="tmux",
             tmux_target=f"subagents:{name}", cwd=str(cwd), model=None, session_id="session-kept",
             status="idle", runner_pid=old_pid, runner_started_at=old_start, next_seq=1,
-            created_at=lib.now_iso(), last_turn_at=lib.now_iso())
-    destination = lib.RunnerIdentity(999_998, "destination-start")
+            runner_identity=lib.capture_process_identity(old_pid),
+            created_at=lib.now_iso(), last_turn_at=lib.now_iso(),
+            control=lib.RuntimeControl.standalone("standalone-test-generation"),
+            owner_launch=_headless_owner_launch(cwd))
+    destination = _runner_identity(999_998, 9003)
     killed: list[str] = []
     stopped: list[int] = []
     monkeypatch.setattr(lib, "backend_available", lambda _backend: True)
@@ -1160,7 +1360,10 @@ def test_activation_timeout_restores_source_registry_after_commit(
     monkeypatch.setattr(lib, "terminate_runner", lambda _rec: True)
     monkeypatch.setattr(lib, "terminate_runner_identity", lambda identity: stopped.append(identity.pid))
     monkeypatch.setattr(lib, "kill_window", lambda rec: killed.append(rec.tmux_target))
-    def activation(_name: str, _token: str) -> bool:
+    def activation(
+        _name: str, _token: str, _identity: lib.RunnerIdentity,
+        _generation: str | None, _fingerprint: str | None,
+    ) -> bool:
         with lib.registry_lock() as agents:
             assert agents[name].runner_pid == destination.pid
             assert agents[name].backend == "herdr"
@@ -1170,7 +1373,7 @@ def test_activation_timeout_restores_source_registry_after_commit(
     def restart(_name: str, old: lib.AgentRecord) -> lib.RunnerIdentity:
         current = lib.read_registry()[name]
         assert current.backend == old.backend and current.tmux_target == old.tmux_target
-        return lib.RunnerIdentity(old_pid, old_start)
+        return _runner_identity(old_pid, int(old_start or "1"))
     monkeypatch.setattr(lib, "_restore_legacy_tmux_runner", restart)
     with pytest.raises(lib.AgentOperationError) as caught:
         lib.migrate_agent(name)
@@ -1204,9 +1407,12 @@ def test_legacy_tmux_source_without_pause_ack_stops_only_after_idle_check(
             status="idle",
             runner_pid=old_pid,
             runner_started_at=old_start,
+            runner_identity=lib.capture_process_identity(old_pid),
             next_seq=1,
             created_at=lib.now_iso(),
             last_turn_at=lib.now_iso(),
+            control=lib.RuntimeControl.standalone("standalone-test-generation"),
+            owner_launch=_headless_owner_launch(cwd),
         )
 
     stopped: list[lib.AgentRecord] = []
@@ -1217,14 +1423,17 @@ def test_legacy_tmux_source_without_pause_ack_stops_only_after_idle_check(
     monkeypatch.setattr(
         lib,
         "wait_for_staged_runner",
-        lambda name, token: lib.RunnerIdentity(pid=999_998, started_at="legacy-new"),
+        lambda name, token: _runner_identity(999_998, 9004),
     )
     def stop_runner(rec: lib.AgentRecord) -> bool:
         stopped.append(rec)
         return True
 
     monkeypatch.setattr(lib, "terminate_runner", stop_runner)
-    monkeypatch.setattr(lib, "wait_for_staged_runner_activation", lambda name, token: True)
+    monkeypatch.setattr(
+        lib, "wait_for_staged_runner_activation",
+        lambda name, token, identity, generation, fingerprint: True,
+    )
     monkeypatch.setattr(lib, "create_legacy_tmux_guard", lambda name, cwd, **kwargs: None)
 
     def launch(backend: str, name: str, cwd: str, wrapper: str) -> str:
@@ -1266,15 +1475,18 @@ def test_legacy_tmux_destination_failure_restores_tmux_runner(
             status="idle",
             runner_pid=old_pid,
             runner_started_at=old_start,
+            runner_identity=lib.capture_process_identity(old_pid),
             next_seq=1,
             created_at=lib.now_iso(),
             last_turn_at=lib.now_iso(),
+            control=lib.RuntimeControl.standalone("standalone-test-generation"),
+            owner_launch=_headless_owner_launch(cwd),
         )
 
     stopped: list[lib.AgentRecord] = []
     killed: list[lib.AgentRecord] = []
     launches: list[str] = []
-    restored = lib.RunnerIdentity(pid=999_997, started_at="restored")
+    restored = _runner_identity(999_997, 9005)
     monkeypatch.setattr(lib, "backend_available", lambda backend: True)
     monkeypatch.setattr(lib, "wait_for_pause_ack", lambda name, old: False)
     monkeypatch.setattr(lib, "wait_for_staged_runner", lambda name, token: None)
@@ -1292,7 +1504,8 @@ def test_legacy_tmux_destination_failure_restores_tmux_runner(
     def publish_restored_runner(name: str, previous: lib.RunnerIdentity) -> lib.RunnerIdentity:
         with lib.registry_lock() as agents:
             agents[name].runner_pid = restored.pid
-            agents[name].runner_started_at = restored.started_at
+            agents[name].runner_started_at = str(restored.starttime_ticks)
+            agents[name].runner_identity = restored
             agents[name].status = "idle"
         return restored
 
@@ -1315,6 +1528,7 @@ def test_legacy_tmux_destination_failure_restores_tmux_runner(
 
 
 def _headless_conversion_source(name: str, cwd: Path) -> lib.AgentRecord:
+    identity = lib.capture_process_identity(os.getpid())
     return lib.AgentRecord(
         name=name,
         harness="codex",
@@ -1326,9 +1540,12 @@ def _headless_conversion_source(name: str, cwd: Path) -> lib.AgentRecord:
         status="idle",
         runner_pid=os.getpid(),
         runner_started_at=lib.pid_start_time(os.getpid()),
+        runner_identity=identity,
         next_seq=1,
         created_at=lib.now_iso(),
         last_turn_at=lib.now_iso(),
+        control=lib.RuntimeControl.standalone("standalone-test-generation"),
+        owner_launch=_headless_owner_launch(cwd, model="model-a"),
     )
 
 
@@ -1417,7 +1634,7 @@ def test_headless_to_tui_failure_keeps_paused_source_and_removes_destination(
     assert lib.read_registry()[name].mode == lib.HEADLESS_MODE
     assert not lib.migration_pause_path(name).exists()
     assert not lib.migration_pause_ack_path(name).exists()
-    assert lib.runner_identity_alive(lib.read_registry()[name])
+    assert lib.runner_liveness(lib.read_registry()[name]) is lib.ProcessLiveness.LIVE
 
 
 def test_legacy_headless_to_tui_failure_restores_tmux_source(
@@ -1430,7 +1647,7 @@ def test_legacy_headless_to_tui_failure_restores_tmux_source(
     source = _headless_conversion_source(name, cwd)
     with lib.registry_lock() as agents:
         agents[name] = source
-    restored = lib.RunnerIdentity(999_993, "restored")
+    restored = _runner_identity(999_993, 9006)
     probe = lib.TuiProbe(True, True, "idle", 999_994)
     launches: list[str] = []
     monkeypatch.setattr(lib, "backend_available", lambda backend: True)
@@ -1461,7 +1678,8 @@ def test_legacy_headless_to_tui_failure_restores_tmux_source(
     def publish_restore(name: str, previous: lib.RunnerIdentity) -> lib.RunnerIdentity:
         with lib.registry_lock() as agents:
             agents[name].runner_pid = restored.pid
-            agents[name].runner_started_at = restored.started_at
+            agents[name].runner_started_at = str(restored.starttime_ticks)
+            agents[name].runner_identity = restored
         return restored
 
     monkeypatch.setattr(lib, "wait_for_restarted_runner", publish_restore)
@@ -1483,9 +1701,10 @@ def test_resume_source_intake_removes_pause_and_ack_markers(
     cwd.mkdir(parents=True)
     lib.ensure_agent_dirs(name)
     source = _headless_conversion_source(name, cwd)
-    lib.write_migration_pause(name, lib.RunnerIdentity(source.runner_pid or -1, source.runner_started_at))
+    assert source.runner_identity is not None
+    lib.write_migration_pause(name, source.runner_identity)
     lib.acknowledge_migration_pause(
-        name, lib.RunnerIdentity(source.runner_pid or -1, source.runner_started_at)
+        name, source.runner_identity
     )
 
     lib._resume_source_intake(name, source)
@@ -1571,6 +1790,8 @@ def test_force_retirement_archives_without_probing_unavailable_backend(
             next_seq=0,
             created_at=lib.now_iso(),
             last_turn_at=None,
+            control=lib.RuntimeControl.standalone("standalone-test-generation"),
+            owner_launch=_headless_owner_launch(cwd, backend="herdr"),
         )
 
     def backend_probe_must_not_run(*_args: object, **_kwargs: object) -> bool:

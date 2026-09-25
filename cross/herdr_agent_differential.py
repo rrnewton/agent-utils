@@ -78,6 +78,10 @@ with open(state_path, encoding="utf-8") as handle:
     state = json.load(handle)
 args = sys.argv[1:]
 state.setdefault("calls", []).append(args)
+pane_id = state.get("pane_id", "w1:p1")
+tab_id = state.get("tab_id", "w1:t1")
+workspace_id = state.get("workspace_id", "w1")
+terminal_id = state.get("terminal_id", "term-fixture-1")
 
 if args == ["goal-rpc"]:
     for line in sys.stdin:
@@ -109,8 +113,8 @@ if args[:2] == ["pane", "list"]:
         save()
         raise SystemExit(1)
     panes = [] if state.get("closed") or state.get("missing_pane") else [{
-        "pane_id": "w1:p1", "tab_id": state.get("tab_id", "w1:t1"),
-        "workspace_id": "w1",
+        "pane_id": pane_id, "tab_id": tab_id,
+        "workspace_id": workspace_id, "terminal_id": terminal_id,
     }]
     if state.get("duplicate_recorded_pane"):
         panes.append({"pane_id":"w1:p1", "tab_id":"w1:duplicate", "workspace_id":"w1"})
@@ -120,19 +124,36 @@ if args[:2] == ["pane", "list"]:
 elif args[:2] == ["pane", "get"]:
     pane = args[2]
     human = pane == "w1:p2" and state.get("extra_pane")
-    if pane != "w1:p1" and not human:
+    if pane != pane_id and not human:
         print("missing pane", file=sys.stderr)
         save()
         raise SystemExit(1)
     envelope({"pane": {
         "pane_id": pane,
-        "workspace_id": "w1",
+        "workspace_id": "w1" if human else workspace_id,
         "cwd": root,
         "agent": None if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("harness", "codex"),
         "agent_status": "unknown" if human or state.get("empty_shell") or (state.get("custom_harness") and not state.get("custom_reported")) else state.get("status", "idle"),
         "agent_session": None if human or state.get("empty_shell") or state.get("sessionless") or state.get("custom_harness") else {"agent": state.get("harness", "codex"), "value": "session-1"},
     }})
 elif args[:2] == ["pane", "process-info"]:
+    state["process_info_calls"] = int(state.get("process_info_calls", 0)) + 1
+    save()
+    process_info_delay = float(state.get("process_info_delay", 0))
+    if process_info_delay > 0:
+        time.sleep(process_info_delay)
+    transient_failures = int(state.get("process_info_failures_remaining", 0))
+    if transient_failures > 0:
+        state["process_info_failures_remaining"] = transient_failures - 1
+        print("injected transient process-info failure", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    malformed_responses = int(state.get("malformed_process_info_remaining", 0))
+    if malformed_responses > 0:
+        state["malformed_process_info_remaining"] = malformed_responses - 1
+        save()
+        envelope({"process_info": None})
+        raise SystemExit(0)
     if state.get("fail_process_info"):
         print("injected process-info failure", file=sys.stderr)
         save()
@@ -165,7 +186,7 @@ elif args[:2] == ["pane", "process-info"]:
             else process_pid if state.get("custom_pid") else 200
         )
     envelope({"process_info": {
-        "pane_id":"w1:p1", "shell_pid":shell_pid,
+        "pane_id":pane_id, "shell_pid":shell_pid,
         "foreground_process_group_id":foreground_process_group_id,
         "foreground_processes":foreground_processes,
     }})
@@ -177,9 +198,43 @@ elif args[:2] == ["tab", "create"]:
     ]
     envelope({"tab": {"tab_id": "w1:t1"}, "root_pane": {
         "pane_id":"w1:p1", "tab_id":"w1:t1", "workspace_id":"w1",
+        "terminal_id":terminal_id,
+    }})
+elif args[:2] == ["pane", "move"]:
+    if (args[2] != pane_id or "--new-tab" not in args or "--no-focus" not in args
+            or "--expect-terminal-id" not in args):
+        print("invalid pane move", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    expected_terminal = args[args.index("--expect-terminal-id") + 1]
+    if state.pop("replace_terminal_before_move", False):
+        terminal_id = "replacement-terminal"
+        state["terminal_id"] = terminal_id
+    if expected_terminal != terminal_id:
+        print("conditional terminal identity changed", file=sys.stderr)
+        save()
+        raise SystemExit(1)
+    target = args[args.index("--workspace") + 1]
+    previous_pane, previous_tab, previous_workspace = pane_id, tab_id, workspace_id
+    pane_id, tab_id, workspace_id = f"{target}:p-moved", f"{target}:t-moved", target
+    state.update({"pane_id": pane_id, "tab_id": tab_id, "workspace_id": workspace_id})
+    if state.pop("lose_move_response", False):
+        save()
+        print("injected lost pane move response", file=sys.stderr)
+        raise SystemExit(1)
+    envelope({"move_result": {
+        "changed": True,
+        "previous_pane_id": previous_pane,
+        "previous_tab_id": previous_tab,
+        "previous_workspace_id": previous_workspace,
+        "focused_pane_id": pane_id,
+        "created_tab": {"tab_id": tab_id, "workspace_id": workspace_id,
+                        "pane_count": 1},
+        "pane": {"pane_id": pane_id, "tab_id": tab_id,
+                 "workspace_id": workspace_id, "terminal_id": terminal_id},
     }})
 elif args[:2] == ["pane", "close"]:
-    if args[2] != "w1:p1":
+    if args[2] != pane_id:
         raise SystemExit("refusing unexpected pane close")
     if state.get("custom_pid"):
         try:
@@ -219,16 +274,18 @@ elif args[:2] == ["agent", "get"]:
         print("named agent unavailable", file=sys.stderr)
         save()
         raise SystemExit(1)
-    envelope({"agent": {"name":args[2], "pane_id":"w1:p1"}})
+    envelope({"agent": {"name":args[2], "pane_id":pane_id}})
 elif args[:2] == ["pane", "report-agent-session"]:
     state["reported_session"] = args[args.index("--agent-session-id") + 1]
 elif args[:2] == ["workspace", "get"]:
     envelope({"workspace": {
-        "workspace_id": state.get("workspace_response_id", "w1"),
-        "label": "project",
+        "workspace_id": state.get("workspace_response_id", args[2]),
+        "label": "project" if args[2] == "w1" else f"project-{args[2]}",
     }})
 elif args[:2] == ["agent", "prompt"]:
     state.setdefault("submitted", []).append(args[3])
+    if state.get("working_after_prompt"):
+        state["status"] = "working"
     if state.get("run_mode") == "gate":
         save()
         with open(os.path.join(root, "run-entered"), "w", encoding="utf-8") as handle:
@@ -267,6 +324,10 @@ elif args[:2] == ["agent", "wait"]:
         raise SystemExit(1)
     print(json.dumps({"result": {"agent": {"pane_id": args[2], "agent_status": "working"}}}, sort_keys=True))
 elif args[:2] == ["pane", "read"]:
+    read_delay = float(state.get("read_delay", 0))
+    if read_delay > 0:
+        save()
+        time.sleep(read_delay)
     if state.get("fail_read"):
         print("injected pane read failure", file=sys.stderr)
         save()
@@ -278,10 +339,11 @@ elif args[:2] == ["pane", "read"]:
     if state.get("leave_idle_shell_on_read"):
         state["idle_shell_busy"] = True
     source = args[args.index("--source") + 1]
-    if source == "visible" and state.get("screen"):
+    if source in ("visible", "recent-unwrapped") and state.get("screen"):
         sys.stdout.write(state["screen"])
-    elif source == "visible" and state.get("custom_harness"):
-        prefix = "Muse Code 1.3.0\n\nreasoning effort ultra is not available (gate ultra_reasoning_effort is closed); using xhigh\n"
+    elif source in ("visible", "recent-unwrapped") and state.get("custom_harness"):
+        prefix = ("" if state.get("muse_headerless") else "Muse Code 1.3.0\n\n")
+        prefix += "reasoning effort ultra is not available (gate ultra_reasoning_effort is closed); using xhigh\n"
         divider = "────────────────\n"
         history = "".join("❯ " + text + "\n◆ accepted\n" for text in state.get("submitted", []))
         footer = "watermelon-preview · xhigh · project · Auto-review\n"

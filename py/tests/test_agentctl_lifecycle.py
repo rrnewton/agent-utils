@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,11 +15,12 @@ from typing import cast
 
 import pytest
 
-from agentctl import agent
+from agentctl import agent, cli, legacy_cli
 import agentctl.subagents as subagents_module
 from agentctl.client import AgentPaneInfo, HerdrClient, Pane, PaneShellProof
 from agentctl.errors import AgentDeliveryError, HerdrUnavailable
 from agentctl.subagents import ManagedAgents
+from agentctl.sessions import Sessions
 from .test_agentctl_adopt import prepare_legacy_dead, setup_foreign
 from .test_herdr_subagents import FakeManagedClient, setup
 
@@ -40,6 +42,153 @@ def test_start_holds_its_generation_lock_through_brief_and_returned_status(tmp_p
     result = manager.start("worker", cwd=str(tmp_path), brief="this generation's task")
     assert result["lifecycle"] == "running"
     assert fake.submitted == ["this generation's task"]
+
+
+def test_status_output_and_exit_share_one_probe_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    status = {"name": "worker", "lifecycle": "running", "agent_status": "idle"}
+    observation = {
+        "name": "worker", "token": "generation", "lifecycle": "running",
+        "agent_status": "idle", "probe_error": None, "health": "healthy",
+        "runtime_state": "live", "reason_code": "ok", "reason": "live",
+        "first_detected_at": 1.0, "last_checked_at": 1.0,
+        "recorded": True, "record_path": str(tmp_path / "health.json"),
+    }
+    monkeypatch.setattr(
+        Sessions, "status_health_snapshot",
+        lambda self, name: (observation, status),
+    )
+    monkeypatch.setattr(
+        Sessions, "status",
+        lambda self, name: (_ for _ in ()).throw(AssertionError("second probe")),
+    )
+    assert cli.main(["status", "worker", "--registry", str(tmp_path / "registry")]) == 0
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["agent_status"] == "idle"
+    assert rendered["runtime_state"] == "live"
+
+
+def test_list_output_and_exit_share_one_probe_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    observations = [
+        {
+            "name": "alive", "token": "one", "lifecycle": "running",
+            "agent_status": "idle", "probe_error": None, "health": "healthy",
+            "runtime_state": "live", "reason_code": "ok", "reason": "live",
+            "first_detected_at": 1.0, "last_checked_at": 1.0,
+            "recorded": True, "record_path": str(tmp_path / "alive-health.json"),
+        },
+        {
+            "name": "dead", "token": "two", "lifecycle": "running",
+            "agent_status": "unknown", "probe_error": "shell fallback",
+            "health": "unhealthy", "runtime_state": "dead",
+            "reason_code": "expected-harness-missing", "reason": "shell fallback",
+            "first_detected_at": 2.0, "last_checked_at": 2.0,
+            "recorded": True, "record_path": str(tmp_path / "dead-health.json"),
+        },
+    ]
+    statuses = [
+        {"name": "alive", "lifecycle": "running", "agent_status": "idle"},
+        {"name": "dead", "lifecycle": "running", "agent_status": "unknown"},
+    ]
+    monkeypatch.setattr(
+        Sessions, "health_snapshot",
+        lambda self, names: ({"healthy": False, "sessions": observations}, statuses),
+    )
+    monkeypatch.setattr(
+        Sessions, "status",
+        lambda self, name: (_ for _ in ()).throw(AssertionError("second probe")),
+    )
+    assert cli.main(["list", "--registry", str(tmp_path / "registry")]) == 1
+    rendered = json.loads(capsys.readouterr().out)
+    assert [(row["name"], row["runtime_state"]) for row in rendered] == [
+        ("alive", "live"), ("dead", "dead"),
+    ]
+
+
+def test_legacy_status_uses_the_canonical_health_payload_and_exit_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    observation = {
+        "name": "worker", "token": "generation", "lifecycle": "running",
+        "agent_status": "unknown", "probe_error": "shell fallback",
+        "health": "unhealthy", "runtime_state": "dead",
+        "reason_code": "expected-harness-missing", "reason": "shell fallback",
+        "first_detected_at": 1.0, "last_checked_at": 2.0,
+        "recorded": True, "record_path": str(tmp_path / "health.json"),
+    }
+    monkeypatch.setattr(
+        Sessions, "status_health_snapshot",
+        lambda self, name: (observation, {"name": name, "lifecycle": "running"}),
+    )
+
+    assert legacy_cli.main([
+        "status", "--name", "worker", "--registry", str(tmp_path / "registry"),
+    ]) == 1
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["health"] == "unhealthy"
+    assert rendered["runtime_state"] == "dead"
+    assert rendered["health_reason_code"] == "expected-harness-missing"
+
+
+def test_legacy_list_uses_the_canonical_aggregate_exit_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    observation = {
+        "name": "worker", "token": "generation", "lifecycle": "running",
+        "agent_status": "unknown", "probe_error": "probe timed out",
+        "health": "unknown", "runtime_state": "unknown",
+        "reason_code": "runtime-probe-failed", "reason": "probe timed out",
+        "first_detected_at": 1.0, "last_checked_at": 2.0,
+        "recorded": False, "record_path": None,
+    }
+    monkeypatch.setattr(
+        Sessions, "health_snapshot",
+        lambda self, names: (
+            {"healthy": False, "sessions": [observation]},
+            [{"name": "worker", "lifecycle": "running"}],
+        ),
+    )
+
+    assert legacy_cli.main([
+        "list", "--registry", str(tmp_path / "registry"),
+    ]) == 1
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered[0]["health"] == "unknown"
+    assert rendered[0]["runtime_state"] == "unknown"
+
+
+def test_health_watch_skips_contended_first_lock_and_probes_later_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("alpha", cwd=str(tmp_path))
+    manager.start("beta", cwd=str(tmp_path))
+    fake.pane_info_calls = fake.panes_calls = 0
+    descriptor = os.open(manager.registry / ".alpha.lock", os.O_RDONLY)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: manager)
+    started = time.monotonic()
+    try:
+        assert cli.main([
+            "health", "alpha", "beta", "--watch", "60", "--interval", "5",
+            "--registry", str(manager.registry),
+        ]) == 1
+    finally:
+        os.close(descriptor)
+    elapsed = time.monotonic() - started
+    rendered = json.loads(capsys.readouterr().out)
+    rows = {row["name"]: row for row in rendered["sessions"]}
+    assert elapsed < 1.0
+    assert rendered["polls"] == 1
+    assert rendered["watch_seconds"] == 60.0
+    assert rows["alpha"]["health"] == "unknown"
+    assert rows["alpha"]["reason_code"] == "lifecycle-lock-contended"
+    assert rows["alpha"]["recorded"] is False
+    assert rows["beta"]["health"] == "healthy"
+    assert fake.pane_info_calls > 0 and fake.panes_calls > 0
 
 
 def test_start_holds_registry_identity_lock_through_native_session_commit(
@@ -134,7 +283,7 @@ def test_old_partial_allocation_is_recovered_only_for_the_original_unclaimed_she
 
 def test_stop_preserves_a_sibling_pane_added_during_output_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
-    manager.start("worker", cwd=str(tmp_path))
+    started = manager.start("worker", cwd=str(tmp_path))
     original_read = fake.read
     inserted = False
 
@@ -151,6 +300,7 @@ def test_stop_preserves_a_sibling_pane_added_during_output_capture(tmp_path: Pat
     result = manager.stop("worker")
     assert result["pane_closed"] is True and result["tab_closed"] is False
     assert fake.presentations == [Pane("w1:human", "w1:t1", "w1")]
+    assert manager.stop("worker", expected_token=str(started["token"])) == result
 
 
 def make_managed_dead(
@@ -182,6 +332,424 @@ def test_managed_dead_stop_requires_token_then_closes_exact_pane_and_archives(
     assert fake.presentations == []
     assert json.loads((archive / "agent.json").read_text())["lifecycle"] == "stopped"
     assert json.loads((archive / "output.json").read_text())["pane_id"] == pane
+    assert manager.stop("worker", expected_token=token) == result
+
+
+def test_terminal_receipt_outcome_must_match_the_record_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    _pane, token = make_managed_dead(manager, _fake, tmp_path)
+    stopped = manager.stop("worker", expected_token=token)
+    record_path = Path(str(stopped["archive"])) / "agent.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["terminal"]["outcome"] = "owned-pane-closed"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError, match="disagrees"):
+        manager.stop("worker", expected_token=token)
+
+
+def test_muse_terminal_outcome_mutation_cannot_change_retry_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    stopped = manager.stop("worker", expected_token=token)
+    assert stopped["managed_dead"] is True
+    assert stopped["runtime_preserved"] is True
+    record_path = Path(str(stopped["archive"])) / "agent.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["terminal"]["outcome"] = "custom-runtime-absent"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError, match="disagrees"):
+        manager.stop("worker", expected_token=token)
+
+
+def _make_owned_muse_dead(
+    manager: ManagedAgents, fake: FakeManagedClient, tmp_path: Path,
+) -> tuple[str, str]:
+    started = manager.start("worker", cwd=str(tmp_path), harness="muse")
+    pane = str(started["pane_id"])
+    fake.custom_running = False
+    # Herdr may retain the last harness label after the process has exited.
+    assert fake.infos[pane].agent == "muse"
+    return pane, str(started["token"])
+
+
+def save_v3_stopped_prefix(manager: ManagedAgents, name: str) -> None:
+    """Write the exact stopped-without-terminal prefix emitted before schema v4."""
+    path = manager.registry / name / "agent.json"
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored.pop("terminal") is None
+    stored["schema"] = "agentctl-session/v3"
+    stored["lifecycle"] = "stopped"
+    path.write_text(json.dumps(stored), encoding="utf-8")
+
+
+def test_owned_dead_muse_requires_token_and_archives_exact_stale_label_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    objective = "recover the retained timerfd worktree"
+    queue = manager.registry / "worker" / "queue"
+    identifier = agent.enqueue(
+        queue,
+        f"Your ongoing goal: {objective}\n"
+        "Work toward this goal and report completion or blockers.",
+        message_id="legacy-goal",
+    )
+    artifact_path = queue / "inbox" / f"{identifier}.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("kind")
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    record_path = manager.registry / "worker" / "agent.json"
+    stored = json.loads(record_path.read_text(encoding="utf-8"))
+    goal = cast(dict[str, object], stored.pop("goal"))
+    native = cast(dict[str, object] | None, stored.pop("native_session"))
+    stored.pop("terminal")
+    stored.update({
+        "schema": "agentctl-session/v2",
+        "session_agent": None if native is None else native["agent"],
+        "session_value": None if native is None else native["value"],
+        "goal": objective,
+        "goal_delivery": "possibly_submitted",
+        "goal_session_id": None if native is None else native["value"],
+        "goal_command": goal["native_command"],
+        "goal_messages": {},
+        "goal_message_id": identifier,
+    })
+    record_path.write_text(json.dumps(stored), encoding="utf-8")
+
+    with pytest.raises(AgentDeliveryError, match="requires --expected-token"):
+        manager.stop("worker")
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["managed_dead"] is True
+    assert result["pane_closed"] is False
+    assert result["runtime_preserved"] is True
+    assert fake.closed == []
+    assert len(fake.presentations) == 1
+    assert (fake.presentations[0].pane_id, fake.presentations[0].tab_id) == (
+        "w1:p1", "w1:t1",
+    )
+    archive = Path(str(result["archive"]))
+    assert json.loads((archive / "agent.json").read_text())["lifecycle"] == "stopped"
+    assert json.loads((archive / "output.json").read_text())["pane_id"] == pane
+    assert json.loads(
+        (archive / "queue" / "inbox" / f"{identifier}.json").read_text()
+    )["kind"] == "goal"
+
+
+@pytest.mark.parametrize("mutation", ("descendant", "moved", "label"))
+def test_owned_dead_muse_refuses_unproved_or_changed_pane(
+    mutation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    if mutation == "descendant":
+        fake.custom_at_idle_shell = False
+    elif mutation == "moved":
+        fake.presentations[0] = replace(fake.presentations[0], tab_id="moved")
+    else:
+        fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], agent="claude")
+
+    with pytest.raises((AgentDeliveryError, HerdrUnavailable)):
+        manager.stop("worker", expected_token=token)
+    assert fake.closed == []
+    assert (manager.registry / "worker").is_dir()
+
+
+def test_owned_dead_muse_refuses_shell_generation_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    original = fake.pane_idle_shell_identity
+    calls = 0
+
+    def changing(pane_id: str) -> PaneShellProof | None:
+        nonlocal calls
+        proof = original(pane_id)
+        calls += 1
+        if proof is not None and calls > 1:
+            return replace(
+                proof,
+                identity=replace(
+                    proof.identity,
+                    starttime_ticks=proof.identity.starttime_ticks + 1,
+                ),
+            )
+        return proof
+
+    monkeypatch.setattr(fake, "pane_idle_shell_identity", changing)
+    with pytest.raises(AgentDeliveryError, match="runtime identity changed"):
+        manager.stop("worker", expected_token=token)
+    assert fake.closed == []
+
+
+def test_owned_dead_muse_never_closes_a_replacement_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    replacement = replace(fake.presentations[0], terminal_id="replacement-terminal")
+    fake.presentations[0] = replacement
+
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["managed_dead"] is True
+    assert result["pane_closed"] is False
+    assert result["runtime_preserved"] is True
+    assert "conditional close" in str(result["continuation"])
+    assert fake.presentations == [replacement]
+    assert fake.closed == []
+
+
+@pytest.mark.parametrize("replace_terminal", [False, True])
+def test_owned_dead_muse_retries_stopped_before_archive_without_touching_pane(
+    replace_terminal: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    original_publish = manager._publish_pinned_directory
+
+    def fail_before_rename(*_args: object, **_kwargs: object) -> None:
+        raise AgentDeliveryError("injected failure before archive rename")
+
+    monkeypatch.setattr(manager, "_publish_pinned_directory", fail_before_rename)
+    with pytest.raises(AgentDeliveryError, match="before archive rename"):
+        manager.stop("worker", expected_token=token)
+    active = manager.registry / "worker"
+    assert json.loads((active / "agent.json").read_text())["lifecycle"] == "stopped"
+    assert (active / "terminal-retirement.json").is_file()
+
+    if replace_terminal:
+        fake.presentations[0] = replace(
+            fake.presentations[0], terminal_id="replacement-terminal",
+        )
+    retained = list(fake.presentations)
+    monkeypatch.setattr(manager, "_publish_pinned_directory", original_publish)
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["pane_closed"] is False
+    assert result["runtime_preserved"] is True
+    assert fake.presentations == retained
+    assert fake.closed == []
+    assert not active.exists()
+
+
+def test_owned_dead_muse_stop_result_loss_reconciles_from_archive_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    first = manager.stop("worker", expected_token=token)
+    retained = list(fake.presentations)
+
+    second = manager.stop("worker", expected_token=token)
+
+    assert second == first
+    assert fake.presentations == retained
+    assert fake.closed == []
+
+
+def test_ordinary_muse_stop_retries_stopped_before_archive_without_retirement_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    started = manager.start(
+        "worker", cwd=str(tmp_path), harness="muse", workspace_id="w1",
+    )
+    token = str(started["token"])
+    # This is the ordinary teardown prefix: its pane was already closed, then
+    # lifecycle=stopped was committed, but archive rename did not happen.
+    fake.presentations.clear()
+    save_v3_stopped_prefix(manager, "worker")
+    active = manager.registry / "worker"
+    assert not (active / "terminal-retirement.json").exists()
+
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["pane_closed"] is False
+    assert not active.exists()
+    assert Path(str(result["archive"])).is_dir()
+    assert fake.closed == []
+    assert manager.stop("worker", expected_token=token) == result
+
+
+@pytest.mark.parametrize("replacement_terminal", [False, True])
+def test_stopped_muse_without_retirement_receipt_never_closes_surviving_pane(
+    replacement_terminal: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    save_v3_stopped_prefix(manager, "worker")
+    if replacement_terminal:
+        fake.presentations[0] = replace(
+            fake.presentations[0], terminal_id="replacement-terminal",
+        )
+    retained = list(fake.presentations)
+
+    with pytest.raises(AgentDeliveryError, match="no managed-dead retirement receipt"):
+        manager.stop("worker", expected_token=token)
+
+    assert fake.presentations == retained
+    assert fake.closed == []
+    assert (manager.registry / "worker").is_dir()
+
+
+def test_ordinary_stopped_muse_never_closes_pane_created_after_absence_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    replacement = replace(
+        fake.presentations[0], terminal_id="replacement-after-absence",
+    )
+    fake.presentations.clear()
+    save_v3_stopped_prefix(manager, "worker")
+    original_panes = fake.panes
+    injected = False
+
+    def panes_then_replace() -> tuple[Pane, ...]:
+        nonlocal injected
+        snapshot = original_panes()
+        if not injected:
+            injected = True
+            assert not snapshot
+            fake.presentations.append(replacement)
+        return snapshot
+
+    monkeypatch.setattr(fake, "panes", panes_then_replace)
+    result = manager.stop("worker", expected_token=token)
+
+    assert result["ordinary_stop_recovered"] is True
+    assert result["pane_closed"] is False
+    assert fake.presentations == [replacement]
+    assert fake.closed == []
+
+
+def test_ordinary_stopped_muse_requires_exact_explicit_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    fake.presentations.clear()
+    save_v3_stopped_prefix(manager, "worker")
+
+    with pytest.raises(AgentDeliveryError, match="requires --expected-token"):
+        manager.stop("worker")
+    with pytest.raises(AgentDeliveryError, match="was replaced"):
+        manager.stop("worker", expected_token="f" * len(token))
+
+    assert (manager.registry / "worker/agent.json").is_file()
+    assert not (manager.registry / "archive").exists()
+    assert fake.closed == []
+
+
+def test_archive_destination_rejects_untrusted_token_path_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    record = manager.get("worker")
+    record.token = "../escape"
+
+    with pytest.raises(AgentDeliveryError, match="token has an invalid shape"):
+        manager._archive_destination(record)
+
+    assert not (manager.registry / "archive").exists()
+
+
+@pytest.mark.parametrize("mutation", ["directory", "record"])
+def test_ordinary_stopped_muse_publication_refuses_generation_mutation(
+    mutation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    fake.presentations.clear()
+    save_v3_stopped_prefix(manager, "worker")
+    active = manager.registry / "worker"
+    displaced = manager.registry / ".worker-displaced"
+    real_rename = subagents_module._rename_directory_noreplace_at
+
+    def mutate_then_publish(
+        source_parent: int, source_name: str,
+        destination_parent: int, destination_name: str,
+    ) -> None:
+        if mutation == "directory":
+            active.rename(displaced)
+            active.mkdir(mode=0o700)
+            (active / "agent.json").write_bytes((displaced / "agent.json").read_bytes())
+            (active / "agent.json").chmod(0o600)
+        else:
+            changed = json.loads((active / "agent.json").read_text())
+            changed["error"] = "replacement record"
+            agent._atomic_json(str(active / "agent.json"), changed)
+        real_rename(source_parent, source_name, destination_parent, destination_name)
+
+    monkeypatch.setattr(
+        subagents_module, "_rename_directory_noreplace_at", mutate_then_publish,
+    )
+    with pytest.raises(AgentDeliveryError, match="changed|published directory"):
+        manager.stop("worker", expected_token=token)
+
+    assert fake.closed == []
+    assert not (manager.registry / "archive" / f"worker-{token}").is_symlink()
+
+
+@pytest.mark.parametrize("swap_after", ["agent.json", "terminal-retirement.json"])
+def test_owned_dead_muse_archive_receipt_refuses_directory_replacement_between_reads(
+    swap_after: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    _pane, token = _make_owned_muse_dead(manager, fake, tmp_path)
+    first = manager.stop("worker", expected_token=token)
+    destination = Path(str(first["archive"]))
+    saved = {
+        name: (destination / name).read_bytes()
+        for name in ("agent.json", "terminal-retirement.json")
+    }
+    retained = list(fake.presentations)
+    original = manager._pinned_artifact_bytes
+    swapped = False
+
+    def replace_after_read(
+        pinned: subagents_module._PinnedAgentDirectory, *, name: str,
+        limit: int, purpose: str, require_named_directory: bool = True,
+    ) -> bytes:
+        nonlocal swapped
+        content = original(
+            pinned, name=name, limit=limit, purpose=purpose,
+            require_named_directory=require_named_directory,
+        )
+        if name == swap_after and not swapped:
+            swapped = True
+            displaced = destination.with_name(destination.name + "-displaced")
+            destination.rename(displaced)
+            destination.mkdir(mode=0o700)
+            for artifact, artifact_bytes in saved.items():
+                replacement = destination / artifact
+                replacement.write_bytes(artifact_bytes)
+                replacement.chmod(0o600)
+        return content
+
+    monkeypatch.setattr(manager, "_pinned_artifact_bytes", replace_after_read)
+    with pytest.raises(AgentDeliveryError, match="directory changed"):
+        manager.stop("worker", expected_token=token)
+
+    assert swapped
+    assert fake.presentations == retained
+    assert fake.closed == []
 
 
 def test_managed_dead_stop_refuses_expanded_stopped_record_before_close(
@@ -192,7 +760,7 @@ def test_managed_dead_stop_refuses_expanded_stopped_record_before_close(
     active = manager.registry / "worker"
     record_path = active / "agent.json"
     document = json.loads(record_path.read_text())
-    document["future_padding"] = ["x"] * 150_000
+    document["extensions"]["future_padding"] = ["x"] * 150_000
     raw = (json.dumps(document, separators=(",", ":")) + "\n").encode()
     stopped = dict(document)
     stopped["lifecycle"] = "stopped"
@@ -1611,14 +2179,14 @@ def test_unknown_metadata_survives_ownership_and_session_updates_without_a_wrapp
     manager.start("worker", cwd=str(tmp_path))
     path = tmp_path / "registry/worker/agent.json"
     record = json.loads(path.read_text())
-    record["future_metadata"] = {"nested": [1, "preserve"]}
+    record["extensions"]["future_metadata"] = {"nested": [1, "preserve"]}
     agent._atomic_json(str(path), record)
     manager.pause("worker")
     manager.bind_session("worker", "session-1")
     saved = json.loads(path.read_text())
-    assert saved["future_metadata"] == record["future_metadata"]
+    assert saved["extensions"]["future_metadata"] == record["extensions"]["future_metadata"]
     assert "_unknown" not in saved
-    assert manager.status("worker")["future_metadata"] == record["future_metadata"]
+    assert manager.status("worker")["future_metadata"] == record["extensions"]["future_metadata"]
     invalid = manager.get("worker")
     invalid._unknown["paused"] = False
     with pytest.raises(AgentDeliveryError, match="conflicts"):

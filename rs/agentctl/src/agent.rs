@@ -17,7 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use serde::Serialize;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -27,7 +28,112 @@ use crate::error::{AdapterError, EXIT_BUSY, EXIT_TIMEOUT};
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const MESSAGE_ID_MAX: usize = 255;
+const RECONCILE_ARTIFACT_MAX_BYTES: u64 = 16 << 20;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+struct StrictJson(Value);
+
+impl<'de> Deserialize<'de> for StrictJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = StrictJson;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(StrictJson(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(StrictJson(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(StrictJson(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(StrictJson)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(StrictJson(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictJson(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJson(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJson(Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        StrictJson::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        while let Some(StrictJson(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(StrictJson(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom(format!(
+                    "duplicate JSON object key {key:?}"
+                )));
+            }
+            let StrictJson(value) = map.next_value()?;
+            values.insert(key, value);
+        }
+        Ok(StrictJson(Value::Object(values)))
+    }
+}
+
+pub(crate) fn decode_json_strict(contents: &[u8]) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(contents);
+    let StrictJson(value) = StrictJson::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
 
 /// Identity assertions for one already-running interactive Herdr agent.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -70,6 +176,27 @@ pub enum QueueMessageState {
     Processed,
     /// Delivery may have occurred and automatic replay is unsafe.
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueueMessageKind {
+    Message,
+    Goal,
+}
+
+#[derive(Clone, Copy)]
+struct QueueMessageIntent<'a> {
+    message_id: Option<&'a str>,
+    kind: QueueMessageKind,
+}
+
+impl QueueMessageKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Goal => "goal",
+        }
+    }
 }
 
 impl QueueOutcome {
@@ -240,23 +367,38 @@ pub trait AgentApi: Send + Sync {
     ) -> crate::error::Result<String>;
 
     /// Cancellation-aware pane enumeration used by long-running service owners.
-    fn panes_with_runtime(&self, _runtime: &dyn AgentRuntime) -> crate::error::Result<Vec<Pane>> {
+    fn panes_with_runtime(&self, runtime: &dyn AgentRuntime) -> crate::error::Result<Vec<Pane>> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "agent control operation was cancelled",
+            ));
+        }
         self.panes()
     }
     /// Cancellation-aware pane inspection used by long-running service owners.
     fn pane_info_with_runtime(
         &self,
         pane_id: &str,
-        _runtime: &dyn AgentRuntime,
+        runtime: &dyn AgentRuntime,
     ) -> crate::error::Result<AgentPaneInfo> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "agent control operation was cancelled",
+            ));
+        }
         self.pane_info(pane_id)
     }
     /// Cancellation-aware workspace inspection used by long-running service owners.
     fn workspace_label_with_runtime(
         &self,
         workspace_id: &str,
-        _runtime: &dyn AgentRuntime,
+        runtime: &dyn AgentRuntime,
     ) -> crate::error::Result<String> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "agent control operation was cancelled",
+            ));
+        }
         self.workspace_label(workspace_id)
     }
     /// Cancellation-aware prompt submission used by long-running service owners.
@@ -284,8 +426,13 @@ pub trait AgentApi: Send + Sync {
         pane_id: &str,
         source: &str,
         lines: Option<usize>,
-        _runtime: &dyn AgentRuntime,
+        runtime: &dyn AgentRuntime,
     ) -> crate::error::Result<String> {
+        if runtime.cancelled() {
+            return Err(crate::error::AdapterError::unavailable(
+                "agent control operation was cancelled",
+            ));
+        }
         self.read(pane_id, source, lines)
     }
 }
@@ -552,7 +699,26 @@ fn validate_target_with_runtime<A: AgentApi + ?Sized>(
 
 /// Persist one prompt before any readiness or transport operation.
 pub fn enqueue(root: &Path, text: &str, message_id: Option<&str>) -> AgentResult<String> {
-    enqueue_internal(root, text, message_id, true, &SystemRuntime::default())
+    enqueue_internal(
+        root,
+        text,
+        message_id,
+        true,
+        QueueMessageKind::Message,
+        &SystemRuntime::default(),
+    )
+}
+
+/// Persist one typed goal artifact without beginning delivery.
+pub(crate) fn enqueue_goal(root: &Path, text: &str, message_id: &str) -> AgentResult<String> {
+    enqueue_internal(
+        root,
+        text,
+        Some(message_id),
+        true,
+        QueueMessageKind::Goal,
+        &SystemRuntime::default(),
+    )
 }
 
 fn enqueue_internal(
@@ -560,6 +726,7 @@ fn enqueue_internal(
     text: &str,
     message_id: Option<&str>,
     serialize: bool,
+    kind: QueueMessageKind,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<String> {
     if text.is_empty() {
@@ -589,6 +756,7 @@ fn enqueue_internal(
     }
     let document = json!({
         "id": identifier,
+        "kind": kind.as_str(),
         "text": text,
         "queued_at": unix_seconds(),
         "delivery_attempts": 0,
@@ -784,6 +952,134 @@ pub fn send<A: AgentApi + ?Sized>(
     )
 }
 
+/// Commit one explicitly selected ambiguous prompt after exact external evidence.
+pub fn reconcile_delivery<F>(
+    root: &Path,
+    message_id: &str,
+    expected_sha256: &str,
+    evidence: F,
+) -> AgentResult<QueueResult>
+where
+    F: FnOnce(&str) -> AgentResult<bool>,
+{
+    validate_message_id(message_id)?;
+    if expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(AgentError::delivery(
+            "expected-sha256 must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    validate_existing_queue(root)?;
+    let directories = QueueDirectories::new(root);
+    for directory in directories.all() {
+        validate_private_directory(directory, "queue state directory", false)?;
+    }
+    let queue_lock_path = root.join(".delivery.lock");
+    let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
+    queue_lock
+        .lock_exclusive()
+        .map_err(|error| io_error("lock queue delivery", &queue_lock_path, error))?;
+    let filename = format!("{message_id}.json");
+    let candidates = [
+        (
+            QueueMessageState::Pending,
+            directories.inbox.join(&filename),
+        ),
+        (
+            QueueMessageState::Inflight,
+            directories.inflight.join(&filename),
+        ),
+        (
+            QueueMessageState::Processed,
+            directories.processed.join(&filename),
+        ),
+        (
+            QueueMessageState::Failed,
+            directories.failed.join(&filename),
+        ),
+    ];
+    let mut locations = candidates
+        .into_iter()
+        .filter(|(_, path)| fs::symlink_metadata(path).is_ok())
+        .collect::<Vec<_>>();
+    if locations.len() != 1 {
+        return Err(AgentError::delivery(format!(
+            "message {message_id} must have exactly one durable queue location"
+        )));
+    }
+    let (state, source) = locations.pop().expect("one queue location");
+    let encoded =
+        read_bytes_with_policy_bounded(&source, false, Some(RECONCILE_ARTIFACT_MAX_BYTES))?;
+    if format!("{:x}", Sha256::digest(&encoded)) != expected_sha256 {
+        return Err(AgentError::delivery(
+            "queued message does not match expected-sha256",
+        ));
+    }
+    let document = decode_json_strict(&encoded)
+        .map_err(|error| AgentError::delivery(format!("queued message is invalid: {error}")))?;
+    let document = document
+        .as_object()
+        .ok_or_else(|| AgentError::delivery("queued message has an invalid shape"))?;
+    let text = document
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| AgentError::delivery("queued message has no nonempty text"))?;
+    if document.get("id").and_then(Value::as_str) != Some(message_id) {
+        return Err(AgentError::delivery(
+            "queued message does not match its selected identifier",
+        ));
+    }
+    if state == QueueMessageState::Pending {
+        return Err(AgentError::delivery(
+            "pending messages have not crossed the injection barrier",
+        ));
+    }
+    let sidecar = directories.failed.join(format!("{filename}.error"));
+    if state == QueueMessageState::Processed {
+        remove_optional_sidecar(&sidecar, &directories.failed)?;
+        return Ok(QueueResult {
+            message_id: message_id.to_owned(),
+            delivered: vec![message_id.to_owned()],
+            quarantined: Vec::new(),
+            pending: Vec::new(),
+            blocked: None,
+            outcome: QueueOutcome::Delivered,
+        });
+    }
+    if document.get("possibly_submitted") != Some(&Value::Bool(true)) {
+        return Err(AgentError::delivery(
+            "ambiguous artifact lacks the durable injection-barrier marker",
+        ));
+    }
+    if !evidence(text)? {
+        return Err(AgentError::delivery(
+            "live transcript does not contain this exact prompt as a Muse user turn",
+        ));
+    }
+    transition(&source, &directories.processed.join(&filename))?;
+    remove_optional_sidecar(&sidecar, &directories.failed)?;
+    Ok(QueueResult {
+        message_id: message_id.to_owned(),
+        delivered: vec![message_id.to_owned()],
+        quarantined: Vec::new(),
+        pending: Vec::new(),
+        blocked: None,
+        outcome: QueueOutcome::Delivered,
+    })
+}
+
+fn remove_optional_sidecar(path: &Path, parent: &Path) -> AgentResult<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_directory(parent),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("remove reconciled delivery sidecar", path, error)),
+    }
+}
+
 /// Send one prompt using an injected readiness runtime.
 pub fn send_with_runtime<A: AgentApi + ?Sized>(
     client: &A,
@@ -793,7 +1089,18 @@ pub fn send_with_runtime<A: AgentApi + ?Sized>(
     options: DrainOptions,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<QueueResult> {
-    send_identified_with_runtime(client, target, root, text, options, runtime, None)
+    send_identified_with_kind(
+        client,
+        target,
+        root,
+        text,
+        options,
+        runtime,
+        QueueMessageIntent {
+            message_id: None,
+            kind: QueueMessageKind::Message,
+        },
+    )
 }
 
 /// Persist a caller-identified prompt without replacing an existing queue artifact.
@@ -805,14 +1112,17 @@ pub fn send_identified<A: AgentApi + ?Sized>(
     message_id: &str,
     options: DrainOptions,
 ) -> AgentResult<QueueResult> {
-    send_identified_with_runtime(
+    send_identified_with_kind(
         client,
         target,
         root,
         text,
         options,
         &SystemRuntime::default(),
-        Some(message_id),
+        QueueMessageIntent {
+            message_id: Some(message_id),
+            kind: QueueMessageKind::Message,
+        },
     )
 }
 
@@ -825,12 +1135,50 @@ pub(crate) fn send_identified_with_runtime<A: AgentApi + ?Sized>(
     runtime: &dyn AgentRuntime,
     message_id: Option<&str>,
 ) -> AgentResult<QueueResult> {
+    send_identified_with_kind(
+        client,
+        target,
+        root,
+        text,
+        options,
+        runtime,
+        QueueMessageIntent {
+            message_id,
+            kind: QueueMessageKind::Message,
+        },
+    )
+}
+
+fn send_identified_with_kind<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    text: &str,
+    options: DrainOptions,
+    runtime: &dyn AgentRuntime,
+    intent: QueueMessageIntent<'_>,
+) -> AgentResult<QueueResult> {
     bind_queue_with_runtime(root, target, runtime)?;
     // Explicit IDs serialize their cross-directory check against delivery transitions. Generated
     // identifiers plus no-replace creation need not wait behind a long-running drain. The drain and terminal-artifact inspection below resolve any message
     // consumed by another sender between these phases.
-    let identifier = enqueue_internal(root, text, message_id, message_id.is_some(), runtime)?;
+    let identifier = enqueue_internal(
+        root,
+        text,
+        intent.message_id,
+        intent.message_id.is_some(),
+        intent.kind,
+        runtime,
+    )?;
     let result = drain_with_runtime(client, target, root, options, runtime)?;
+    finish_identified_delivery(root, identifier, result)
+}
+
+pub(crate) fn finish_identified_delivery(
+    root: &Path,
+    identifier: String,
+    result: QueueResult,
+) -> AgentResult<QueueResult> {
     let filename = format!("{identifier}.json");
     let failed_path = root.join("failed").join(&filename);
     if result.quarantined.contains(&identifier) || fs::symlink_metadata(&failed_path).is_ok() {
@@ -902,9 +1250,19 @@ pub fn status<A: AgentApi + ?Sized>(
     target: &Target,
     root: &Path,
 ) -> AgentResult<QueueStatus> {
+    status_with_runtime(client, target, root, &SystemRuntime::default())
+}
+
+/// Read validated live-agent and queue state with caller-owned cancellation.
+pub(crate) fn status_with_runtime<A: AgentApi + ?Sized>(
+    client: &A,
+    target: &Target,
+    root: &Path,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<QueueStatus> {
     validate_existing_queue(root)?;
     validate_existing_binding(root, target)?;
-    let info = resolve_target(client, target)?;
+    let info = resolve_target_with_runtime(client, target, runtime)?;
     let directories = QueueDirectories::new(root);
     Ok(QueueStatus {
         pane_id: info.pane_id,
@@ -927,8 +1285,10 @@ pub fn status<A: AgentApi + ?Sized>(
 /// phase while the caller holds the surrounding agent lifecycle lock.
 pub fn message_state(root: &Path, message_id: &str) -> AgentResult<Option<QueueMessageState>> {
     validate_message_id(message_id)?;
-    if fs::symlink_metadata(root).is_err() {
-        return Ok(None);
+    match fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("inspect queue directory", root, error)),
     }
     validate_existing_queue(root)?;
     let filename = format!("{message_id}.json");
@@ -944,7 +1304,7 @@ pub fn message_state(root: &Path, message_id: &str) -> AgentResult<Option<QueueM
         let path = directory.join(&filename);
         match fs::symlink_metadata(&path) {
             Ok(_) => {
-                let document = load_message(&path)?;
+                let document = load_message_bounded(&path, RECONCILE_ARTIFACT_MAX_BYTES)?;
                 if document.get("id").and_then(Value::as_str) != Some(message_id) {
                     return Err(AgentError::delivery(format!(
                         "queue artifact {} contains a different message id",
@@ -1016,7 +1376,7 @@ fn wait_ready<A: AgentApi + ?Sized>(
                 info.pane_id
             )));
         }
-        if matches!(info.status.as_str(), "idle" | "done") {
+        if matches!(info.status.as_str(), "idle" | "done" | "staged") {
             return Ok(info);
         }
         if info.status == "blocked" {
@@ -1028,7 +1388,7 @@ fn wait_ready<A: AgentApi + ?Sized>(
         let now = runtime.monotonic();
         if now >= deadline {
             return Err(AgentError::delivery(format!(
-                "pane {} did not become idle/done within {}s; last status={}",
+                "pane {} did not become idle/done/staged within {}s; last status={}",
                 info.pane_id,
                 timeout.as_secs_f64(),
                 info.status
@@ -1059,13 +1419,12 @@ fn deliver_one<A: AgentApi + ?Sized>(
             .wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime)
             .map_err(|error| {
                 AgentError::delivery(format!(
-                    "pane {} did not confirm idle/done -> working submission: {error}",
-                    info.pane_id
+                    "pane {} did not confirm ready -> working submission; outcome is unknown: {error}",
+                    info.pane_id,
                 ))
             });
     };
     let deadline = runtime.monotonic().saturating_add(working_timeout);
-    let mut last_error = None;
     loop {
         if runtime.cancelled() {
             return Err(AgentError::delivery(format!(
@@ -1075,17 +1434,18 @@ fn deliver_one<A: AgentApi + ?Sized>(
         }
         let remaining = deadline.saturating_sub(runtime.monotonic());
         if remaining.is_zero() {
-            let detail = last_error.unwrap_or_else(|| "working-state deadline elapsed".to_owned());
             return Err(AgentError::delivery(format!(
-                "pane {} did not confirm idle/done -> working submission: {detail}",
+                "pane {} did not confirm ready -> working submission; outcome is unknown",
                 info.pane_id
             )));
         }
         let wait = chunk.min(remaining);
         let millis = wait.as_millis().clamp(1, u64::MAX.into()) as u64;
-        match client.wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error.to_string()),
+        if client
+            .wait_agent_status_with_runtime(&info.pane_id, "working", millis, runtime)
+            .is_ok()
+        {
+            return Ok(());
         }
     }
 }
@@ -1266,7 +1626,7 @@ fn bind_queue_with_runtime(
     Ok(())
 }
 
-fn validate_existing_binding(root: &Path, target: &Target) -> AgentResult<()> {
+pub(crate) fn validate_existing_binding(root: &Path, target: &Target) -> AgentResult<()> {
     let binding_path = root.join("target.json");
     let actual = match fs::symlink_metadata(&binding_path) {
         Ok(_) => read_private_json(&binding_path)?,
@@ -1287,6 +1647,48 @@ fn validate_existing_binding(root: &Path, target: &Target) -> AgentResult<()> {
         )));
     }
     Ok(())
+}
+
+pub(crate) fn relocate_existing_binding(
+    root: &Path,
+    old: &Target,
+    new: &Target,
+) -> AgentResult<()> {
+    validate_target_authority(old)?;
+    validate_target_authority(new)?;
+    match fs::symlink_metadata(root) {
+        Ok(_) => validate_private_directory(root, "queue directory", false)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("inspect queue directory", root, error)),
+    }
+    let lock_path = root.join(".binding.lock");
+    let binding_path = root.join("target.json");
+    let lock = open_private_lock(&lock_path, "queue binding lock")?;
+    lock.lock_exclusive()
+        .map_err(|error| io_error("lock queue binding", &lock_path, error))?;
+    let actual = match fs::symlink_metadata(&binding_path) {
+        Ok(_) => read_private_json(&binding_path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_error(
+                "inspect queue target binding",
+                &binding_path,
+                error,
+            ))
+        }
+    };
+    let old_expected = binding(old)?;
+    let new_expected = binding(new)?;
+    if actual == new_expected {
+        return Ok(());
+    }
+    if actual != old_expected {
+        return Err(AgentError::delivery(format!(
+            "queue {} is bound to {actual}, refusing relocation from {old_expected} to {new_expected}",
+            root.display()
+        )));
+    }
+    atomic_json(&binding_path, &new_expected)
 }
 
 fn validate_existing_queue(root: &Path) -> AgentResult<()> {
@@ -1560,7 +1962,7 @@ pub(crate) fn cleanup_atomic_json_temporaries(directory: &Path) -> AgentResult<(
     Ok(())
 }
 
-fn atomic_json_create(path: &Path, value: &Value) -> io::Result<()> {
+pub(crate) fn atomic_json_create(path: &Path, value: &Value) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("JSON path has no parent"))?;
@@ -1613,6 +2015,7 @@ fn temporary_file_io(parent: &Path) -> io::Result<(PathBuf, File)> {
     ))
 }
 
+#[cfg(test)]
 fn read_json(path: &Path) -> AgentResult<Value> {
     read_json_with_policy(path, false)
 }
@@ -1621,7 +2024,33 @@ pub(crate) fn read_private_json(path: &Path) -> AgentResult<Value> {
     read_json_with_policy(path, true)
 }
 
+pub(crate) fn read_private_json_bounded(path: &Path, max_bytes: u64) -> AgentResult<Value> {
+    if max_bytes == 0 {
+        return Err(AgentError::delivery("JSON byte limit must be positive"));
+    }
+    read_json_with_policy_bounded(path, true, Some(max_bytes))
+}
+
 fn read_json_with_policy(path: &Path, require_private: bool) -> AgentResult<Value> {
+    read_json_with_policy_bounded(path, require_private, None)
+}
+
+fn read_json_with_policy_bounded(
+    path: &Path,
+    require_private: bool,
+    max_bytes: Option<u64>,
+) -> AgentResult<Value> {
+    let contents = read_bytes_with_policy_bounded(path, require_private, max_bytes)?;
+    decode_json_strict(&contents).map_err(|error| {
+        AgentError::delivery(format!("cannot read JSON {}: {error}", path.display()))
+    })
+}
+
+fn read_bytes_with_policy_bounded(
+    path: &Path,
+    require_private: bool,
+    max_bytes: Option<u64>,
+) -> AgentResult<Vec<u8>> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1633,22 +2062,70 @@ fn read_json_with_policy(path: &Path, require_private: bool) -> AgentResult<Valu
     if !metadata.file_type().is_file()
         || metadata.uid() != unsafe { libc::getuid() }
         || require_private && metadata.permissions().mode() & 0o077 != 0
+        || metadata.nlink() != 1
     {
         return Err(AgentError::delivery(format!(
             "unsafe JSON artifact: {}",
             path.display()
         )));
     }
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|error| io_error("read JSON", path, error))?;
-    serde_json::from_str(&contents).map_err(|error| {
-        AgentError::delivery(format!("cannot read JSON {}: {error}", path.display()))
-    })
+    if max_bytes.is_some_and(|limit| metadata.len() == 0 || metadata.len() > limit) {
+        return Err(AgentError::delivery(format!(
+            "JSON artifact {} exceeds its bounded size",
+            path.display()
+        )));
+    }
+    let mut contents = Vec::new();
+    match max_bytes {
+        Some(limit) => {
+            Read::by_ref(&mut file)
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut contents)
+                .map_err(|error| io_error("read JSON", path, error))?;
+            if contents.len() as u64 > limit {
+                return Err(AgentError::delivery(format!(
+                    "JSON artifact {} exceeds its bounded size",
+                    path.display()
+                )));
+            }
+        }
+        None => {
+            file.read_to_end(&mut contents)
+                .map_err(|error| io_error("read JSON", path, error))?;
+        }
+    }
+    let final_metadata = file
+        .metadata()
+        .map_err(|error| io_error("reinspect JSON", path, error))?;
+    if final_metadata.dev() != metadata.dev()
+        || final_metadata.ino() != metadata.ino()
+        || final_metadata.len() != contents.len() as u64
+        || final_metadata.mode() != metadata.mode()
+        || final_metadata.uid() != metadata.uid()
+        || final_metadata.nlink() != 1
+        || final_metadata.mtime() != metadata.mtime()
+        || final_metadata.mtime_nsec() != metadata.mtime_nsec()
+        || final_metadata.ctime() != metadata.ctime()
+        || final_metadata.ctime_nsec() != metadata.ctime_nsec()
+    {
+        return Err(AgentError::delivery(format!(
+            "JSON artifact changed while it was read: {}",
+            path.display()
+        )));
+    }
+    Ok(contents)
 }
 
 fn load_message(path: &Path) -> AgentResult<Map<String, Value>> {
-    let value = read_json(path).map_err(|error| {
+    load_message_with_limit(path, None)
+}
+
+fn load_message_bounded(path: &Path, max_bytes: u64) -> AgentResult<Map<String, Value>> {
+    load_message_with_limit(path, Some(max_bytes))
+}
+
+fn load_message_with_limit(path: &Path, max_bytes: Option<u64>) -> AgentResult<Map<String, Value>> {
+    let value = read_json_with_policy_bounded(path, false, max_bytes).map_err(|error| {
         AgentError::delivery(format!(
             "cannot read queued message {}: {error}",
             path.display()
@@ -1843,7 +2320,7 @@ fn sync_directory_io(path: &Path) -> io::Result<()> {
         .sync_all()
 }
 
-fn validate_message_id(identifier: &str) -> AgentResult<()> {
+pub(crate) fn validate_message_id(identifier: &str) -> AgentResult<()> {
     let bytes = identifier.as_bytes();
     let first_ok = bytes.first().is_some_and(u8::is_ascii_alphanumeric);
     let rest_ok = bytes
@@ -1976,6 +2453,7 @@ mod tests {
                     pane_id: "w1:p1".to_owned(),
                     tab_id: "w1:t1".to_owned(),
                     workspace_id: "w1".to_owned(),
+                    terminal_id: None,
                 }],
                 workspace_label: "acme".to_owned(),
                 state: Mutex::new(FakeState {
@@ -2007,6 +2485,7 @@ mod tests {
                 pane_id: "w1:p2".to_owned(),
                 tab_id: "w1:t1".to_owned(),
                 workspace_id: "w1".to_owned(),
+                terminal_id: None,
             });
             fake.state
                 .lock()
@@ -2446,6 +2925,59 @@ mod tests {
     }
 
     #[test]
+    fn explicit_delivery_reconciliation_is_hash_bound_and_crash_idempotent() {
+        let directory = TestDirectory::new("reconcile-delivery");
+        bind_queue(directory.path(), &target()).unwrap();
+        let identifier = "ambiguous-message";
+        enqueue(directory.path(), "exact prompt", Some(identifier)).unwrap();
+        let inbox = directory.path().join(format!("inbox/{identifier}.json"));
+        let mut document = read_private_json(&inbox).unwrap();
+        document["possibly_submitted"] = json!(true);
+        document["delivery_state"] = json!("inflight");
+        atomic_json(&inbox, &document).unwrap();
+        let failed = directory.path().join(format!("failed/{identifier}.json"));
+        transition(&inbox, &failed).unwrap();
+        let artifact = fs::read(&failed).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&artifact));
+
+        assert!(
+            reconcile_delivery(directory.path(), identifier, &"0".repeat(64), |_| Ok(true),)
+                .unwrap_err()
+                .to_string()
+                .contains("expected-sha256")
+        );
+        assert!(
+            reconcile_delivery(directory.path(), identifier, &digest, |_| Ok(false))
+                .unwrap_err()
+                .to_string()
+                .contains("exact prompt")
+        );
+
+        let sidecar = directory
+            .path()
+            .join(format!("failed/{identifier}.json.error"));
+        fs::create_dir(&sidecar).unwrap();
+        let error = reconcile_delivery(directory.path(), identifier, &digest, |text| {
+            Ok(text == "exact prompt")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("sidecar"));
+        let processed = directory
+            .path()
+            .join(format!("processed/{identifier}.json"));
+        assert_eq!(fs::read(&processed).unwrap(), artifact);
+        fs::remove_dir(&sidecar).unwrap();
+        assert_eq!(
+            reconcile_delivery(directory.path(), identifier, &digest, |_| {
+                panic!("processed reconciliation must not request new evidence")
+            })
+            .unwrap()
+            .outcome,
+            QueueOutcome::Delivered
+        );
+    }
+
+    #[test]
     fn cancellation_before_injection_leaves_prompt_safely_pending() {
         let directory = TestDirectory::new("cancel-before-injection");
         let fake = FakeAgent::new(&["idle"]);
@@ -2549,6 +3081,12 @@ mod tests {
             assert_eq!(error.exit_code(), 76);
             assert_eq!(error.outcome(), Some(QueueOutcome::PossiblySubmitted));
             assert!(!error.safe_to_retry());
+            let expected_detail = if failure == "run" {
+                "connection vanished after write"
+            } else {
+                "no working transition"
+            };
+            assert!(error.to_string().contains(expected_detail));
             let artifact = &error.undelivered().expect("ambiguous details").artifact;
             let document = read_json(artifact).unwrap();
             assert_eq!(document["possibly_submitted"], true);
@@ -2743,6 +3281,39 @@ mod tests {
         assert_eq!(
             message_state(directory.path(), "chat-request-1").unwrap(),
             Some(QueueMessageState::Processed)
+        );
+    }
+
+    #[test]
+    fn exact_message_state_distinguishes_absence_from_root_inspection_failure() {
+        let directory = TestDirectory::new("message-state-root-error");
+        let regular = directory.path().join("not-a-directory");
+        fs::write(&regular, b"occupied").unwrap();
+        let error = message_state(&regular.join("queue"), "message-1").unwrap_err();
+        assert!(
+            error.to_string().contains("inspect queue directory"),
+            "{error}"
+        );
+        assert_eq!(
+            message_state(&directory.path().join("absent"), "message-1").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_message_state_rejects_duplicate_json_keys() {
+        let directory = TestDirectory::new("message-state-duplicate-json");
+        prepare(directory.path()).unwrap();
+        fs::write(
+            directory.path().join("inbox/message-1.json"),
+            br#"{"id":"message-1","id":"forged","text":"task"}
+"#,
+        )
+        .unwrap();
+        let error = message_state(directory.path(), "message-1").unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate JSON object key"),
+            "{error}"
         );
     }
 

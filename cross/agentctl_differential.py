@@ -19,13 +19,14 @@ import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
 from herdr_agent_differential import Harness, Outcome, PairCase, Report, _queue_snapshot, _state
 
 _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
 _GOAL_COMMAND = ("--goal-command-json", '["<HERDR>","goal-rpc"]')
 _CAPABILITIES = ["send", "status", "read", "wait", "stop", "attach", "pause", "resume",
-                 "terminal-snapshot", "drain", "goal", "bind-session"]
+                 "terminal-snapshot", "drain", "goal", "bind-session", "relocate"]
 _SHELL_IDENTITY_FIELDS = {
     "version", "boot_id", "pid", "starttime_ticks",
     "executable_device", "executable_inode",
@@ -36,12 +37,22 @@ def _normalize(value: object) -> object:
     if isinstance(value, list):
         return [_normalize(item) for item in value]
     if isinstance(value, dict):
-        return {str(key): ("<TOKEN>" if key == "token" else 0 if key == "created_at"
+        return {str(key): ("<TOKEN>" if key == "token" else 0 if key in {
+                              "created_at", "checked_at", "first_detected_at",
+                              "last_checked_at", "last_unhealthy_at", "last_unknown_at",
+                              "health_first_detected_at", "health_last_checked_at",
+                          }
                           else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
+                          else "<EXECUTABLE_IDENTITY>" if key in {
+                              "launch_executable_device", "launch_executable_inode",
+                          } and item is not None
                           else "<ARCHIVE>" if key == "archive"
                           # Native identity diagnostics use edition-specific quote styles.
                           else re.sub(r'"([a-z][a-z0-9-]*)"', r"'\1'", item)
-                          if key == "probe_error" and isinstance(item, str) else _normalize(item))
+                          if key in {"probe_error", "reason", "health_reason", "last_unhealthy_reason",
+                                     "last_unknown_reason", "blocked", "delivery_error"}
+                          and isinstance(item, str)
+                          else _normalize(item))
                 for key, item in value.items()}
     return value
 
@@ -96,6 +107,77 @@ def _submission_count(root: Path, text: str) -> int:
     return values.count(text) if isinstance(values, list) else 0
 
 
+def _session_storage_shape(root: Path) -> tuple[set[str], set[str], str, str]:
+    """Read the durable schema without comparing edition-specific identities."""
+    document = json.loads(
+        (root / "registry/worker/agent.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(document, dict):
+        return set(), set(), "", ""
+    launch = document.get("launch")
+    if not isinstance(launch, dict):
+        return set(), set(), "", ""
+    return (
+        set(document), set(launch), str(document.get("schema", "")),
+        str(launch.get("schema", "")),
+    )
+
+
+def _legacy_session_document(document: object) -> dict[str, object]:
+    """Downgrade one v3 fixture to the last supported flat v1 shape."""
+    if not isinstance(document, dict) or document.get("schema") != "agentctl-session/v3":
+        raise AssertionError(f"expected current session storage, got {document!r}")
+    launch = document.get("launch")
+    goal = document.get("goal")
+    native = document.get("native_session")
+    extensions = document.get("extensions")
+    if (not isinstance(launch, dict) or not isinstance(goal, dict)
+            or (native is not None and not isinstance(native, dict))
+            or not isinstance(extensions, dict)):
+        raise AssertionError(f"invalid current session storage: {document!r}")
+    legacy = {
+        str(key): value for key, value in document.items()
+        if key not in {"schema", "launch", "goal", "native_session", "extensions"}
+    }
+    executable = launch.get("executable")
+    if executable is None:
+        executable = {}
+    if not isinstance(executable, dict):
+        raise AssertionError(f"invalid launch executable: {launch!r}")
+    argv = launch.get("argv")
+    if not isinstance(argv, list):
+        raise AssertionError(f"invalid launch argv: {launch!r}")
+    legacy.update({
+        "schema": 1,
+        "harness": launch.get("harness"),
+        "cwd": launch.get("cwd"),
+        "adapter": launch.get("adapter"),
+        "mode": launch.get("mode"),
+        "backend": launch.get("backend"),
+        "model": launch.get("model"),
+        "resume": launch.get("resume"),
+        "arguments": argv[1:],
+        "launch_profile": launch.get("profile"),
+        "launch_argv": argv,
+        "launch_environment_names": launch.get("environment_names"),
+        "runtime_home": launch.get("runtime_home"),
+        "runtime_ownership": launch.get("runtime_ownership"),
+        "launch_executable": executable.get("path"),
+        "launch_executable_device": executable.get("device"),
+        "launch_executable_inode": executable.get("inode"),
+        "session_agent": None if native is None else native.get("agent"),
+        "session_value": None if native is None else native.get("value"),
+        "goal": goal.get("objective"),
+        "goal_delivery": None,
+        "goal_session_id": None if native is None else native.get("value"),
+        "goal_command": goal.get("native_command"),
+        "goal_messages": {},
+        "goal_message_id": goal.get("message_id"),
+    })
+    legacy.update({str(key): value for key, value in extensions.items()})
+    return legacy
+
+
 def _retire_fixture_processes(case: PairCase) -> None:
     """Stop only custom children created by this differential's private Herdr fixtures."""
     process_ids: list[int] = []
@@ -138,7 +220,10 @@ def _orientation(harness: Harness, report: Report) -> None:
     case = harness.case("primary-orientation")
     _pair(harness, report, case, "primary/version", ("--version",))
     for arguments in ((), ("--help",), ("start", "--help"), ("adopt", "--help"),
-                      ("stop", "--help"), ("send", "--help"), ("goal", "--help")):
+                      ("recover-start", "--help"), ("relocate", "--help"),
+                      ("health", "--help"),
+                      ("stop", "--help"), ("send", "--help"),
+                      ("reconcile-delivery", "--help"), ("goal", "--help")):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, arguments), strict=True):
             report.require(f"primary/help/{arguments}/{edition}",
                            outcome.returncode == 0 and not outcome.stderr and "--registry" in outcome.stdout
@@ -151,7 +236,15 @@ def _orientation(harness: Harness, report: Report) -> None:
                            and (all(option in outcome.stdout for option in (
                                "--recover-legacy-adoption", "--expected-token",
                                "--expected-record-sha256",
-                           )) if arguments == ("stop", "--help") else True),
+                           )) if arguments == ("stop", "--help") else True)
+                           and (all(option in outcome.stdout for option in (
+                               "--expected-token", "--expected-pid",
+                           )) if arguments == ("recover-start", "--help") else True)
+                           and (all(option in outcome.stdout for option in (
+                               "--watch", "--interval",
+                           )) if arguments == ("health", "--help") else True)
+                           and ("--expected-sha256" in outcome.stdout
+                                if arguments == ("reconcile-delivery", "--help") else True),
                            f"missing operation help: {outcome!r}")
     for command in ("quickstart", "userguide"):
         for edition, outcome in zip(("python", "rust"), harness.invoke(case, (command,)), strict=True):
@@ -178,8 +271,33 @@ def _lifecycle(harness: Harness, report: Report) -> None:
                       "--env", "META_CODEX_AI_GATEWAY=azure-codex-cyber:openai",
                       "--env", "LITERAL= spaces $(unexpanded) = remain "):
             continue
+        shapes = [_session_storage_shape(root) for root in (case.python_root, case.rust_root)]
+        report.require(
+            f"primary/{kind}/storage-schema",
+            shapes[0] == shapes[1]
+            and shapes[0][2:] == ("agentctl-session/v3", "agentctl-launch/v2")
+            and not {
+                "harness", "cwd", "adapter", "mode", "backend", "model", "resume",
+                "arguments", "launch_argv", "launch_executable", "runtime_home",
+                "runtime_ownership", "runner_pid", "runner_started_at",
+                "session_agent", "session_value", "goal_delivery",
+                "goal_session_id", "goal_command", "goal_messages",
+                "goal_message_id",
+            } & shapes[0][0],
+            f"edition storage schemas diverged or retained duplicate authorities: {shapes!r}",
+        )
         for command in (("status", "worker"), ("list",), ("wait", "worker", "--timeout", "0")):
             _pair(harness, report, case, f"primary/{kind}/{command[0]}", (*command, *_COMMON))
+        _pair(
+            harness, report, case, f"primary/{kind}/health",
+            ("health", "worker", *_COMMON),
+        )
+        report.require(
+            f"primary/{kind}/health-record",
+            all((root / "registry/worker/health.json").is_file()
+                for root in (case.python_root, case.rust_root)),
+            "health did not retain its per-generation observation",
+        )
         expected_args = (["resume", "session-1", "--no-alt-screen"] if kind == "codex"
                          else ["--resume", "session-1"]) + ["--model", "chosen-model", "--extra"]
         report.require(f"primary/{kind}/native-launch-presets",
@@ -233,6 +351,32 @@ def _lifecycle(harness: Harness, report: Report) -> None:
             and len(list((root / "registry/archive").iterdir())) == 1
                        for root in (case.python_root, case.rust_root)), "owned pane or archival contract diverged")
 
+    lost_event = harness.case("primary-native-lost-status-event")
+    if _start(
+        harness, report, lost_event, "primary/lost-status-event/start",
+        "--harness", "claude",
+    ):
+        _change(lost_event, {"wait_mode": "fail", "working_after_prompt": True})
+        text = "review this exact change"
+        _pair(
+            harness, report, lost_event,
+            "primary/lost-status-event/reconciled",
+            ("send", "worker", text, "--message-id", "lost-event", *_COMMON),
+        )
+        report.require(
+            "primary/lost-status-event/exactly-once",
+            all(_submission_count(root, text) == 1 for root in (
+                lost_event.python_root, lost_event.rust_root,
+            )),
+            "lost status event caused prompt reinjection",
+        )
+        report.require(
+            "primary/lost-status-event/durable",
+            _queue_snapshot(lost_event.python_root, "registry/worker/queue")
+            == _queue_snapshot(lost_event.rust_root, "registry/worker/queue"),
+            "lost-event reconciliation produced different queue state",
+        )
+
     custom = harness.case("primary-existing-native-kind")
     python, _ = _pair(harness, report, custom, "primary/native-kind/start", (
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
@@ -252,7 +396,8 @@ def _lifecycle(harness: Harness, report: Report) -> None:
 
 def _profiles(harness: Harness, report: Report) -> None:
     document = {
-        "schema": "agentctl-profiles/v1",
+        "schema": "agentctl-profiles/v2",
+        "default_workspace": {"id": "w1"},
         "profiles": {
             "astra-ultra": {
                 "harness": "codex", "mode": "interactive", "model": "gpt-6-astra",
@@ -264,6 +409,10 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "harness": "codex", "mode": "interactive", "model": "gpt-5.6-sol",
                 "argv": ["--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
                 "env": {"META_CODEX_AI_GATEWAY": "azure-codex-cyber:openai"},
+            },
+            "claude-opus-55": {
+                "harness": "claude", "mode": "interactive", "model": "opus",
+                "argv": [], "env": {},
             },
             "watermelon": {
                 "harness": "muse", "mode": "interactive",
@@ -296,13 +445,14 @@ def _profiles(harness: Harness, report: Report) -> None:
                          "--dangerously-bypass-approvals-and-sandbox"],
         "sol": ["--no-alt-screen", "--model", "gpt-5.6-sol",
                 "--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
+        "claude-opus-55": ["--model", "opus"],
         "watermelon": ["--model", "kiki_gb300_mxfp8_6p2_840_nwr", "--reasoning-effort", "ultra"],
         "muse-literal": ["--trust-workspace", '--meta-tag=literal $(unexpanded) "quotes"',
                          "--meta-tag=repeatable"],
         "codex-safe-config": ["--no-alt-screen", "--config=features.web_search=true"],
     }
-    for profile in ("astra-ultra", "sol", "watermelon", "muse-literal", "codex-safe-config"):
-        case = harness.case(f"primary-profile-{profile}")
+
+    def configure(case: PairCase) -> None:
         for root in (case.python_root, case.rust_root):
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             (root / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
@@ -311,6 +461,21 @@ def _profiles(harness: Harness, report: Report) -> None:
             config = directory / "profiles.json"
             config.write_text(json.dumps(document), encoding="utf-8")
             config.chmod(0o600)
+
+    def process_info_retried(root: Path) -> bool:
+        calls = _state(root).get("process_info_calls")
+        return isinstance(calls, int) and not isinstance(calls, bool) and calls >= 2
+
+    def process_info_called(root: Path) -> bool:
+        calls = _state(root).get("process_info_calls")
+        return isinstance(calls, int) and not isinstance(calls, bool) and calls >= 1
+
+    for profile in (
+        "astra-ultra", "sol", "claude-opus-55", "watermelon",
+        "muse-literal", "codex-safe-config",
+    ):
+        case = harness.case(f"primary-profile-{profile}")
+        configure(case)
         listed = _pair(harness, report, case, f"primary/profile/{profile}/list",
                        ("profiles", "--cwd", "<ROOT>"))
         for edition, outcome in zip(("python", "rust"), listed, strict=True):
@@ -318,7 +483,8 @@ def _profiles(harness: Harness, report: Report) -> None:
             serialized = json.dumps(public, sort_keys=True)
             report.require(
                 f"primary/profile/{profile}/list-redaction/{edition}",
-                "azure-codex-cyber:openai" not in serialized
+                public.get("default_workspace") == {"id": "w1"}
+                and "azure-codex-cyber:openai" not in serialized
                 and "--dangerously-enable-internet-mode" not in serialized
                 and "private-fixture.png" not in serialized
                 and any(
@@ -331,8 +497,9 @@ def _profiles(harness: Harness, report: Report) -> None:
                 ),
                 f"safe profile metadata disclosed private values or omitted headless Muse: {public!r}",
             )
+        workspace = () if profile == "claude-opus-55" else ("--workspace-id", "w1")
         python, rust = _pair(harness, report, case, f"primary/profile/{profile}/start", (
-            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "start", "worker", "--cwd", "<ROOT>", *workspace,
             "--profile", profile, *_COMMON,
         ))
         status = _json(python)
@@ -364,6 +531,22 @@ def _profiles(harness: Harness, report: Report) -> None:
                         )
                     ),
                     f"{edition} omitted the pinned custom process identity: {raw_status!r}",
+                )
+                report.require(
+                    f"primary/profile/watermelon/launch-intent/{edition}",
+                    raw_status.get("launch_profile") == "watermelon"
+                    and isinstance(raw_status.get("launch_argv"), list)
+                    and bool(raw_status["launch_argv"])
+                    and raw_status.get("launch_executable")
+                    == raw_status["launch_argv"][0]
+                    and raw_status.get("launch_argv")
+                    == [raw_status.get("launch_executable"), *expected[profile]]
+                    and isinstance(identity, dict)
+                    and raw_status.get("launch_executable_device")
+                    == identity.get("executable_device")
+                    and raw_status.get("launch_executable_inode")
+                    == identity.get("executable_inode"),
+                    f"{edition} did not bind recovery intent to the launched image: {raw_status!r}",
                 )
             report.require("primary/profile/watermelon/effective-effort",
                            isinstance(status, dict)
@@ -414,7 +597,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                 _pair(
                     harness, report, case,
                     f"primary/profile/watermelon/refuse-{label}-status",
-                    ("status", "worker", *_COMMON),
+                    ("status", "worker", *_COMMON), 1,
                 )
                 refused = harness.invoke(case, ("stop", "worker", *_COMMON))
                 report.require(
@@ -435,7 +618,7 @@ def _profiles(harness: Harness, report: Report) -> None:
             _pair(
                 harness, report, case,
                 "primary/profile/watermelon/refuse-process-group-status",
-                ("status", "worker", *_COMMON),
+                ("status", "worker", *_COMMON), 1,
             )
             refused = harness.invoke(case, ("stop", "worker", *_COMMON))
             report.require(
@@ -484,6 +667,23 @@ def _profiles(harness: Harness, report: Report) -> None:
                                and not list((root / "registry/worker/queue/failed").glob("*.json"))
                                for root in (case.python_root, case.rust_root)),
                            "Muse pane delivery lacked an exact post-Enter receipt")
+            wrapped_prompt = (
+                "Review the timerfd deterministic-\nscheduling change without weakening tests."
+            )
+            _change(case, {"muse_headerless": True})
+            _pair(harness, report, case, "primary/profile/watermelon/headerless-multiline", (
+                "send", "worker", wrapped_prompt, "--message-id", "muse-headerless",
+                *_COMMON,
+            ))
+            report.require(
+                "primary/profile/watermelon/headerless-multiline-receipt",
+                all(
+                    _state(root).get("submitted") == [prompt, wrapped_prompt]
+                    and (root / "registry/worker/queue/processed/muse-headerless.json").is_file()
+                    for root in (case.python_root, case.rust_root)
+                ),
+                "verified long-lived Muse process did not preserve multiline composer input",
+            )
             _change(case, {
                 "custom_post_error": True, "custom_submitted": False, "custom_draft": "",
             })
@@ -495,6 +695,32 @@ def _profiles(harness: Harness, report: Report) -> None:
                 (root / "registry/worker/queue/failed/muse-error.json").is_file()
                 for root in (case.python_root, case.rust_root)
             ), "Muse draft/error redraw was incorrectly accepted as delivery")
+            _change(case, {
+                "custom_post_error": False, "custom_submitted": False,
+                "custom_draft": "",
+            })
+            reconciled: list[Outcome] = []
+            for command, root in (
+                (harness.python, case.python_root),
+                (harness.rust, case.rust_root),
+            ):
+                artifact = root / "registry/worker/queue/failed/muse-error.json"
+                digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                reconciled.append(harness._invoke_one(command, root, (
+                    "reconcile-delivery", "worker", "muse-error",
+                    "--expected-sha256", digest, *_COMMON,
+                )))
+            report.require(
+                "primary/profile/watermelon/exact-reconciliation",
+                all(outcome.returncode == 0 for outcome in reconciled)
+                and _json(reconciled[0]) == _json(reconciled[1])
+                and all(
+                    (root / "registry/worker/queue/processed/muse-error.json").is_file()
+                    and not (root / "registry/worker/queue/failed/muse-error.json").exists()
+                    for root in (case.python_root, case.rust_root)
+                ),
+                f"exact Muse delivery reconciliation diverged: {reconciled!r}",
+            )
             _change(case, {
                 "custom_post_error": False, "custom_clear_without_submit": True,
                 "custom_submitted": False, "custom_draft": "",
@@ -519,6 +745,129 @@ def _profiles(harness: Harness, report: Report) -> None:
         _pair(harness, report, case, f"primary/profile/{profile}/stop", (
             "stop", "worker", *_COMMON,
         ))
+
+    for label, injected in (
+        ("command-failure", {"process_info_failures_remaining": 1}),
+        ("malformed-envelope", {"malformed_process_info_remaining": 1}),
+    ):
+        case = harness.case(f"primary-profile-watermelon-transient-{label}", injected)
+        configure(case)
+        started = _pair(
+            harness, report, case,
+            f"primary/profile/watermelon/transient-{label}",
+            (
+                "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+                "--profile", "watermelon", "--startup-timeout", "1", *_COMMON,
+            ),
+        )
+        report.require(
+            f"primary/profile/watermelon/transient-{label}-retried",
+            all(process_info_retried(root)
+                for root in (case.python_root, case.rust_root)),
+            f"transient process-info failure was not retried: {started!r}",
+        )
+        _pair(
+            harness, report, case,
+            f"primary/profile/watermelon/transient-{label}-stop",
+            ("stop", "worker", *_COMMON),
+        )
+
+    permanent = harness.case(
+        "primary-profile-watermelon-permanent-process-info-failure",
+        {"fail_process_info": True},
+    )
+    configure(permanent)
+    outcomes = harness.invoke(permanent, (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--profile", "watermelon", "--startup-timeout", "0.15", *_COMMON,
+    ))
+    report.require(
+        "primary/profile/watermelon/permanent-process-info-retried",
+        all(
+            outcome.returncode == 75
+            and "last process probe" in outcome.stderr
+            and "injected process-info failure" in outcome.stderr
+            for outcome in outcomes
+        )
+        and all(process_info_retried(root)
+                for root in (permanent.python_root, permanent.rust_root)),
+        f"permanent process-info failure was not retried: {outcomes!r}",
+    )
+    _retire_fixture_processes(permanent)
+
+    for blocked_stage, injected in (
+        ("process-info", {"process_info_delay": 5}),
+        ("post-observation-read", {"read_delay": 5}),
+    ):
+        blocking = harness.case(
+            f"primary-profile-watermelon-blocking-{blocked_stage}", injected,
+        )
+        configure(blocking)
+        blocking_outcomes: list[Outcome] = []
+        elapsed: list[float] = []
+        for command, root in zip(
+            (harness.python, harness.rust),
+            (blocking.python_root, blocking.rust_root),
+            strict=True,
+        ):
+            started_at = time.monotonic()
+            blocking_outcomes.append(harness._invoke_one(command, root, (
+                "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+                "--profile", "watermelon", "--startup-timeout", "0.15", *_COMMON,
+            )))
+            elapsed.append(time.monotonic() - started_at)
+        report.require(
+            f"primary/profile/watermelon/blocking-{blocked_stage}-deadline",
+            all(outcome.returncode == 75 for outcome in blocking_outcomes)
+            and all(duration < 1.0 for duration in elapsed)
+            and all(process_info_called(root)
+                    for root in (blocking.python_root, blocking.rust_root)),
+            f"blocking {blocked_stage} escaped startup deadline: elapsed={elapsed!r}; "
+            f"outcomes={blocking_outcomes!r}",
+        )
+        _retire_fixture_processes(blocking)
+
+    health_bound = harness.case("primary-health-blocking-runtime-probe")
+    configure(health_bound)
+    _pair(harness, report, health_bound, "primary/health/blocking-probe-start", (
+        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+        "--profile", "watermelon", "--startup-timeout", "1", *_COMMON,
+    ))
+    _change(health_bound, {"process_info_delay": 5})
+    health_outcomes: list[Outcome] = []
+    health_elapsed: list[float] = []
+
+    def deadline_health(outcome: Outcome) -> bool:
+        value = _json(outcome)
+        if not isinstance(value, dict) or value.get("healthy") is not False:
+            return False
+        sessions = value.get("sessions")
+        return (
+            isinstance(sessions, list) and len(sessions) == 1
+            and isinstance(sessions[0], dict)
+            and sessions[0].get("reason_code") == "probe-deadline-exceeded"
+        )
+
+    for command, root in zip(
+        (harness.python, harness.rust),
+        (health_bound.python_root, health_bound.rust_root),
+        strict=True,
+    ):
+        started_at = time.monotonic()
+        health_outcomes.append(harness._invoke_one(command, root, (
+            "health", "worker", "--watch", "0.15", "--interval", "0.05", *_COMMON,
+        )))
+        health_elapsed.append(time.monotonic() - started_at)
+    report.require(
+        "primary/health/blocking-runtime-probe-deadline",
+        all(outcome.returncode == 1 for outcome in health_outcomes)
+        and all(duration < 1.0 for duration in health_elapsed)
+        and all(deadline_health(outcome) for outcome in health_outcomes),
+        f"blocking health probe escaped watch deadline: elapsed={health_elapsed!r}; "
+        f"outcomes={health_outcomes!r}",
+    )
+    _change(health_bound, {"process_info_delay": 0})
+    _retire_fixture_processes(health_bound)
 
 
 def _skill_install(harness: Harness, report: Report) -> None:
@@ -770,6 +1119,24 @@ def _profile_refusals(harness: Harness, report: Report) -> None:
     ), "profile discovery executed Git from caller PATH")
 
     strict_documents = {
+        "v2-missing-default-workspace": json.dumps({
+            "schema": "agentctl-profiles/v2", "profiles": base["profiles"],
+        }),
+        "v1-with-default-workspace": json.dumps({
+            **base, "default_workspace": {"id": "w1"},
+        }),
+        "v2-ambiguous-default-workspace": json.dumps({
+            "schema": "agentctl-profiles/v2", "profiles": base["profiles"],
+            "default_workspace": {"id": "w1", "label": "project"},
+        }),
+        "v2-unknown-default-workspace": json.dumps({
+            "schema": "agentctl-profiles/v2", "profiles": base["profiles"],
+            "default_workspace": {"name": "project"},
+        }),
+        "v2-empty-default-workspace": json.dumps({
+            "schema": "agentctl-profiles/v2", "profiles": base["profiles"],
+            "default_workspace": {"label": ""},
+        }),
         "duplicate-json": (
             '{"schema":"agentctl-profiles/v1","profiles":{'
             '"worker":{"harness":"codex","mode":"interactive"},'
@@ -987,7 +1354,110 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
     report.require("primary/handoff/uncertain-retained", all(
         _state(root).get("submitted") == ["queued before handoff", "uncertain request"]
         and (root / "registry/worker/queue/failed/uncertain.json").exists()
-        for root in (case.python_root, case.rust_root)), "uncertain work was replayed or discarded")
+                   for root in (case.python_root, case.rust_root)), "uncertain work was replayed or discarded")
+
+
+def _relocation(harness: Harness, report: Report) -> None:
+    case = harness.case("primary-relocation")
+    if not _start(harness, report, case, "primary/relocation/start"):
+        return
+    _change(case, {"status": "working"})
+    _pair(harness, report, case, "primary/relocation/queue", (
+        "send", "worker", "preserve across move", "--message-id", "relocate-pending",
+        "--ready-timeout", "0", *_COMMON,
+    ), 75)
+    before = {
+        root: (root / "registry/worker/queue/inbox/relocate-pending.json").read_bytes()
+        for root in (case.python_root, case.rust_root)
+    }
+    python, _ = _pair(harness, report, case, "primary/relocation/move", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ))
+    moved = _json(python)
+    report.require(
+        "primary/relocation/identity-and-queue",
+        isinstance(moved, dict)
+        and moved.get("workspace_id") == "w2"
+        and moved.get("pane_id") == "w2:p-moved"
+        and moved.get("terminal_id") == "term-fixture-1"
+        and all(
+            _state(root).get("pane_id") == "w2:p-moved"
+            and (root / "registry/worker/queue/inbox/relocate-pending.json").read_bytes()
+            == before[root]
+            and not (root / "registry/worker/relocation.json").exists()
+            for root in (case.python_root, case.rust_root)
+        ),
+        f"relocation changed generation/queue or lost route: {moved!r}",
+    )
+    _change(case, {"status": "idle"})
+    _pair(harness, report, case, "primary/relocation/drain", (
+        "drain", "worker", *_COMMON,
+    ))
+    report.require(
+        "primary/relocation/queued-delivery",
+        all(_state(root).get("submitted") == ["preserve across move"]
+            for root in (case.python_root, case.rust_root)),
+        "relocation changed or lost queued work",
+    )
+
+    lost = harness.case("primary-relocation-lost-response", {"lose_move_response": True})
+    if not _start(harness, report, lost, "primary/relocation/lost/start"):
+        return
+    _pair(harness, report, lost, "primary/relocation/lost/first", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ), 69)
+    _pair(harness, report, lost, "primary/relocation/lost/reconcile", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ))
+    report.require(
+        "primary/relocation/lost/exactly-once",
+        all(
+            sum(
+                call[:2] == ["pane", "move"]
+                for call in cast(list[list[str]], _state(root).get("calls", []))
+            ) == 1
+            and not (root / "registry/worker/relocation.json").exists()
+            for root in (lost.python_root, lost.rust_root)
+        ),
+        "lost move response was repeated or not reconciled",
+    )
+
+    replaced = harness.case(
+        "primary-relocation-terminal-replacement",
+        {"replace_terminal_before_move": True},
+    )
+    if not _start(harness, report, replaced, "primary/relocation/replaced/start"):
+        return
+    _pair(harness, report, replaced, "primary/relocation/replaced/refusal", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ), 69)
+    report.require(
+        "primary/relocation/replaced/no-side-effect",
+        all(
+            _state(root).get("workspace_id", "w1") == "w1"
+            and _state(root).get("pane_id", "w1:p1") == "w1:p1"
+            and (root / "registry/worker/relocation.json").is_file()
+            for root in (replaced.python_root, replaced.rust_root)
+        ),
+        "conditional move changed routing after terminal replacement",
+    )
+
+    multi = harness.case("primary-relocation-multi-pane")
+    if not _start(harness, report, multi, "primary/relocation/multi/start"):
+        return
+    _change(multi, {"extra_pane": True})
+    _pair(harness, report, multi, "primary/relocation/multi/refusal", (
+        "relocate", "worker", "--workspace-id", "w2", "--new-tab", *_COMMON,
+    ), 75)
+    report.require(
+        "primary/relocation/multi/no-side-effect",
+        all(
+            _state(root).get("pane_id", "w1:p1") == "w1:p1"
+            and not (root / "registry/worker/relocation.json").exists()
+            for root in (multi.python_root, multi.rust_root)
+        ),
+        "multi-pane refusal moved the terminal or created a journal",
+    )
 
 
 def _registry_and_interop(harness: Harness, report: Report) -> None:
@@ -999,16 +1469,16 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
     if _start(harness, report, older, "primary/old-record/start"):
         for root in (older.python_root, older.rust_root):
             path = root / "registry/worker/agent.json"
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = _legacy_session_document(json.loads(path.read_text(encoding="utf-8")))
             for key in ("adapter", "mode", "backend", "paused", "runtime_home"):
                 record.pop(key, None)
             path.write_text(json.dumps(record), encoding="utf-8")
         python, _ = _pair(harness, report, older, "primary/old-record/defaults", ("status", "worker", *_COMMON))
-        record = _json(python)
-        report.require("primary/old-record/compatible", isinstance(record, dict) and all(record.get(key) == value
+        status_value = _json(python)
+        report.require("primary/old-record/compatible", isinstance(status_value, dict) and all(status_value.get(key) == value
                        for key, value in {"adapter": "herdr", "mode": "interactive", "backend": "herdr",
                                           "paused": False, "runtime_home": None}.items()),
-                       f"older records lost their interactive defaults: {record!r}")
+                       f"older records lost their interactive defaults: {status_value!r}")
     for option in ("--registry", "--state"):
         for before in (True, False):
             label = f"primary/global/{option}/{'before' if before else 'after'}"
@@ -1029,7 +1499,9 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
         path = root / "registry/worker/agent.json"
         if path.exists():
             record = json.loads(path.read_text(encoding="utf-8"))
-            record["extension_metadata"] = {"purpose": "review", "labels": ["persistent"]}
+            record["extensions"]["extension_metadata"] = {
+                "purpose": "review", "labels": ["persistent"],
+            }
             path.write_text(json.dumps(record), encoding="utf-8")
         paused = harness._invoke_one(consumer, root, ("pause", "worker", *_COMMON))
         refused = harness._invoke_one(producer, root, ("send", "worker", "human owns input", *_COMMON))
@@ -1042,7 +1514,9 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
                        f"canonical registry/handoff incompatible: {outcomes!r}; refused={refused!r}")
         archives = list((root / "registry/archive").glob("*/agent.json"))
         report.require(f"primary/interop/{label}/extension-metadata", len(archives) == 1
-                       and json.loads(archives[0].read_text(encoding="utf-8")).get("extension_metadata")
+                       and json.loads(archives[0].read_text(encoding="utf-8")).get(
+                           "extensions", {}
+                       ).get("extension_metadata")
                        == {"purpose": "review", "labels": ["persistent"]},
                        "another edition discarded unknown record metadata during handoff/retirement")
 
@@ -1128,15 +1602,17 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     python, _ = _pair(
         harness, report, case, "primary/legacy-adopted/status",
         ("status", "foreign", *_COMMON),
+        1,
     )
     status = _json(python)
     report.require(
         "primary/legacy-adopted/status-shape",
         isinstance(status, dict)
         and status.get("adapter") == "herdr-foreign"
-        and status.get("agent_status") == "idle"
-        and status.get("pending") == ["000000000007"],
-        f"pre-profile adopted record or pending queue was not readable: {status!r}",
+        and status.get("agent_status") == "unknown"
+        and status.get("health") == "unknown"
+        and status.get("health_reason_code") == "runtime-probe-failed",
+        f"identity-less adopted record was not reported unknown: {status!r}",
     )
     immutable_after_status = [
         {
@@ -1158,10 +1634,15 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
     _pair(
         harness, report, case, "primary/legacy-adopted/drain",
         ("drain", "foreign", *_COMMON),
+        75,
     )
-    snapshots = [
+    raw_snapshots = [
         _queue_snapshot(root, "registry/foreign/queue")
         for root in (case.python_root, case.rust_root)
+    ]
+    snapshots: list[dict[str, object]] = [
+        cast(dict[str, object], _normalize(snapshot))
+        for snapshot in raw_snapshots
     ]
     immutable_after_drain = [
         {
@@ -1170,21 +1651,16 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
         }
         for root in (case.python_root, case.rust_root)
     ]
-    processed = snapshots[0].get("processed/000000000007.json")
     report.require(
         "primary/legacy-adopted/drained-once",
-        all(_state(root).get("submitted") == ["legacy fifo"]
-            and not list((root / "registry/foreign/queue/inbox").iterdir())
-            and (root / "registry/foreign/queue/processed/000000000007.json").is_file()
+        all(_state(root).get("submitted") == []
+            and (root / "registry/foreign/queue/inbox/000000000007.json").is_file()
+            and not list((root / "registry/foreign/queue/processed").iterdir())
             for root in (case.python_root, case.rust_root))
         and immutable_after_drain == immutable_before
         and snapshots[0] == snapshots[1]
-        and set(snapshots[0]) == {"processed/000000000007.json"}
-        and isinstance(processed, dict)
-        and processed.get("seq") == 7
-        and processed.get("text") == "legacy fifo"
-        and processed.get("tui_delivery_attempts") == 0,
-        f"pre-profile pending artifact diverged or was lost: {snapshots!r}",
+        and set(snapshots[0]) == {"inbox/000000000007.json"},
+        f"identity-less pending artifact was delivered, changed, or lost: {snapshots!r}",
     )
     _change(case, {"empty_shell": True})
     _pair(
@@ -1268,7 +1744,7 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
                 == immutable_after_drain[index]["agent.json"]
             and _queue_snapshot(
                 list((root / "registry/archive").glob("*"))[0], "queue"
-            ) == snapshots[index]
+            ) == raw_snapshots[index]
             for index, root in enumerate((case.python_root, case.rust_root))
         ),
         "explicit recovery changed legacy record/queue bytes or mutated its runtime",
@@ -1291,7 +1767,7 @@ def _ownership(harness: Harness, report: Report) -> None:
                                    for root in (case.python_root, case.rust_root)),
                            f"closing the owned pane also closed the human pane: {result!r}")
         else:
-            _pair(harness, report, case, f"primary/ownership/{label}/status", ("status", "worker", *_COMMON))
+            _pair(harness, report, case, f"primary/ownership/{label}/status", ("status", "worker", *_COMMON), 1)
             outcomes = harness.invoke(case, ("stop", "worker", *_COMMON))
             report.require(f"primary/ownership/{label}/stop-refusal", all(outcome.returncode == 69 for outcome in outcomes)
                            and all((root / "registry/worker/agent.json").exists() and not _state(root).get("closed")
@@ -1303,6 +1779,50 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
     if not _start(harness, report, case, "primary/managed-dead/start"):
         return
     _change(case, {"empty_shell": True, "sessionless": True})
+    health_python, _ = _pair(
+        harness,
+        report,
+        case,
+        "primary/managed-dead/health",
+        ("health", "worker", *_COMMON),
+        1,
+    )
+    health = _json(health_python)
+    report.require(
+        "primary/managed-dead/health-classification",
+        isinstance(health, dict)
+        and health.get("healthy") is False
+        and isinstance(health.get("sessions"), list)
+        and len(health["sessions"]) == 1
+        and health["sessions"][0].get("health") == "unhealthy"
+        and health["sessions"][0].get("reason_code") == "expected-harness-missing",
+        f"dead expected harness was not a machine-readable failure: {health!r}",
+    )
+    status_python, _ = _pair(
+        harness, report, case, "primary/managed-dead/status",
+        ("status", "worker", *_COMMON), 1,
+    )
+    status = _json(status_python)
+    report.require(
+        "primary/managed-dead/status-classification",
+        isinstance(status, dict)
+        and status.get("lifecycle") == "running"
+        and status.get("runtime_state") == "dead"
+        and status.get("health") == "unhealthy",
+        f"status did not distinguish saved intent from dead runtime: {status!r}",
+    )
+    listed_python, _ = _pair(
+        harness, report, case, "primary/managed-dead/list",
+        ("list", *_COMMON), 1,
+    )
+    listed = _json(listed_python)
+    report.require(
+        "primary/managed-dead/list-classification",
+        isinstance(listed, list)
+        and len(listed) == 1
+        and listed[0].get("runtime_state") == "dead",
+        f"list did not expose the dead runtime: {listed!r}",
+    )
     refused = harness.invoke(case, ("stop", "worker", *_COMMON))
     report.require(
         "primary/managed-dead/token-required",
@@ -1671,9 +2191,37 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
         ("nonfinite", ("send", "worker", "text", "--ready-timeout", "nan")),
         ("zero-working", ("send", "worker", "text", "--working-timeout", "0")),
         ("zero-startup", ("start", "worker", "--startup-timeout", "0")),
+        ("negative-health-watch", ("health", "--watch", "-1")),
+        ("oversize-health-watch", ("health", "--watch", "86401")),
+        ("zero-health-interval", ("health", "--interval", "0")),
+        ("nonfinite-health-interval", ("health", "--interval", "inf")),
+        ("recover-start-missing-pid", (
+            "recover-start", "worker", "--expected-token", "generation",
+        )),
+        ("recover-start-missing-token", (
+            "recover-start", "worker", "--expected-pid", "123",
+        )),
+        ("recover-start-zero-pid", (
+            "recover-start", "worker", "--expected-token", "generation",
+            "--expected-pid", "0",
+        )),
+        ("recover-start-nonascii-pid", (
+            "recover-start", "worker", "--expected-token", "generation",
+            "--expected-pid", "١٢٣",
+        )),
         ("environment-missing-equals", ("start", "worker", "--env", "MISSING_EQUALS")),
         ("environment-empty-name", ("start", "worker", "--env", "=value")),
         ("environment-invalid-name", ("start", "worker", "--env", "BAD-NAME=value")),
+        ("workspace-selector-conflict", (
+            "start", "worker", "--workspace-id", "w1", "--workspace-label", "project",
+        )),
+        ("relocate-missing-new-tab", (
+            "relocate", "worker", "--workspace-id", "w1",
+        )),
+        ("relocate-selector-conflict", (
+            "relocate", "worker", "--workspace-id", "w1",
+            "--workspace-label", "project", "--new-tab",
+        )),
         ("zero-lines", ("read", "worker", "--lines", "0")),
         ("underscore-count", ("read", "worker", "--lines", "1_0")),
         ("unicode-time", ("wait", "worker", "--timeout", "١.0")),
@@ -1713,6 +2261,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _skill_install(harness, report)
             _profile_refusals(harness, report)
             _handoff_and_pending(harness, report)
+            _relocation(harness, report)
             _registry_and_interop(harness, report)
             _legacy_adopted_registry_and_queue(harness, report)
             _ownership(harness, report)

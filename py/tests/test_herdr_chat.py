@@ -19,10 +19,12 @@ class Harness(HerdrClient):
         self.state = "idle"
         self.fail_confirmation = False
 
-    def pane_info(self, pane_id: str) -> AgentPaneInfo:
+    def pane_info(self, pane_id: str, *, timeout: float = 30.0) -> AgentPaneInfo:
+        del timeout
         return AgentPaneInfo(pane_id, "w1", self.cwd, "codex", self.state, None, None)
 
-    def workspace_label(self, workspace_id: str) -> str:
+    def workspace_label(self, workspace_id: str, *, timeout: float = 30.0) -> str:
+        del workspace_id, timeout
         return "project"
 
     def prompt_agent(self, pane_id: str, text: str) -> None:

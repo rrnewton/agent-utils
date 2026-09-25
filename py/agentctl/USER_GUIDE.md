@@ -15,7 +15,9 @@ workspace, agent prompt, agent wait, and session inspection APIs.
 
 The manager itself is a short-lived command. Herdr owns an interactive agent's
 terminal process. There is no manager daemon or hosted coordination service to
-keep alive. The manager is independent of shell-command execution utilities.
+keep alive. The bounded `health --watch` loop is an optional liveness observer,
+not a process supervisor: it never starts an agent or replays a prompt. The
+manager is independent of shell-command execution utilities.
 
 Run `agentctl capabilities` to inspect the modes, backends, harnesses, and
 services present in this installation. **The Python distribution includes the
@@ -236,7 +238,8 @@ credential-shaped environment or argument names.
 
 ```json
 {
-  "schema": "agentctl-profiles/v1",
+  "schema": "agentctl-profiles/v2",
+  "default_workspace": {"label": "project"},
   "profiles": {
     "preferred-reviewer": {
       "harness": "muse",
@@ -245,6 +248,13 @@ credential-shaped environment or argument names.
       "reasoning_effort": "high",
       "argv": [],
       "env": {"ROUTING_SELECTOR": "provider-route"}
+    },
+    "claude-opus-55": {
+      "harness": "claude",
+      "mode": "interactive",
+      "model": "opus",
+      "argv": [],
+      "env": {}
     }
   }
 }
@@ -262,6 +272,12 @@ are launch policy and therefore must not contain secrets. Raw Codex
 `-c`/`--config` and `-p`/`--profile` arguments cannot accompany a structured
 model or effort because those opaque settings could override the structured
 selection.
+
+`default_workspace` is the one project-owned destination for starts that omit
+an explicit workspace. It contains exactly one `id` or `label`; labels must
+resolve uniquely. `--workspace-id` and `--workspace-label` override it for one
+start. Version-1 profile files remain readable but have no project workspace
+default.
 
 Interactive profiles support Codex, Claude, and Muse. Headless profiles support
 Codex, AGY, and Muse in installations that include the worker extension.
@@ -306,7 +322,27 @@ agentctl send reviewer 'Focus on cancellation and restart behavior'
 be repeated. `--resume SESSION` resumes an explicitly identified conversation.
 When `--resume` is set, raw Codex `resume` and Claude
 `--resume`/`--continue` selectors are refused before registry state is created.
-Use `--workspace-id` to choose an exact Herdr workspace.
+Use `--workspace-id` to choose an exact Herdr workspace or
+`--workspace-label` to resolve one unique label. If neither is supplied,
+`default_workspace` from the project config applies before the
+`HERDR_WORKSPACE_ID`/`subagents` fallback.
+
+Move a running interactive session without restarting it only through the
+identity-bound relocation transaction:
+
+```sh
+agentctl relocate reviewer --workspace-label project --new-tab
+```
+
+Relocation supports a one-pane source tab. It records the exact session token,
+terminal identity, old route, and intended workspace before asking Herdr to
+move the pane; a retry reconciles an interrupted move by terminal identity.
+The Herdr command must support the atomic `--expect-terminal-id` precondition;
+with an older Herdr release, the command retains its recovery journal but does
+not move the live pane.
+The session's launch specification, goal, and queue stay in the same registry
+generation. Ambiguous labels, multi-pane source tabs, changed processes, and
+changed terminals are refused.
 
 Interactive Herdr starts also accept repeatable `--env KEY=VALUE`. Each entry is
 passed as one literal argument to Herdr when it creates the tab, before the
@@ -355,6 +391,16 @@ host's ordinary credential facilities for secrets. If a launch using `--env`
 fails, its retained status record uses a generic diagnostic so terminal-control
 errors cannot copy a value into later status output; the immediate command still
 reports the launch failure to its caller.
+
+New records retain the selected profile name, resolved literal harness
+arguments, non-secret environment variable names, and explicit owned/foreign
+runtime policy. For custom Muse launches they also retain the executable path
+and pinned device/inode before process creation. Environment values are never
+persisted. Launch argv is retained exactly (as the existing `arguments` field
+already was), so secrets must be supplied through environment policy rather
+than command-line arguments. Native Codex and Claude executable selection is
+still delegated to Herdr, so those records identify the Herdr harness kind and
+argv but do not form a complete unattended restart recipe.
 
 ### Adopt an existing Herdr agent
 
@@ -455,10 +501,28 @@ request ID and artifact path. Preserve that ID and use `drain` for pending
 work. Sending the same task under a new ID creates a second request and can
 duplicate work; it is not a recovery operation.
 
+Muse can collapse a long bracketed paste to a placeholder such as
+`[Pasted Content 1440 chars]`. `agentctl` does not treat the placeholder or its
+character count as evidence and does not press Enter. If a human subsequently
+submits the retained text, reconcile only after the complete prompt is visible
+as a Muse user turn above an empty composer:
+
+```sh
+sha256sum .agentctl/registry/reviewer/queue/failed/MESSAGE_ID.json
+agentctl reconcile-delivery reviewer MESSAGE_ID --expected-sha256 SHA256
+```
+
+Reconciliation never sends terminal input. It binds the selected artifact,
+exact bytes, current pane/process generation, and complete rendered user turn,
+then moves those unchanged bytes to `processed/`. A retry after a crash is
+idempotent. If any proof is absent or the prompt is still in the composer, the
+artifact remains quarantined.
+
 ## Observe and take over
 
 ```sh
 agentctl read reviewer --lines 100
+agentctl health reviewer implementer
 agentctl wait reviewer --timeout 60
 agentctl pause reviewer
 agentctl attach reviewer
@@ -469,6 +533,62 @@ agentctl resume reviewer
 that the snapshot is the final answer. `wait` observes readiness, which can occur
 between steps of an active goal. Neither readiness nor successful delivery
 proves completion of the task.
+
+`status` preserves the saved record fields, including `lifecycle`, and adds a
+separate `runtime_state`, `health`, reason, and detection timestamps. A saved
+Muse editor containing unsubmitted text is reported as `agent_status: staged`,
+not `working`; drain may press Enter only when that complete buffered text is
+the exact queued message. A real submitted turn or background task remains
+`working`.
+
+A saved `lifecycle: "running"` whose pane has returned to a shell is reported as
+`runtime_state: "dead"`, `health: "unhealthy"`, and exits 1. `list` applies the
+same rule to every entry and exits 1 if any entry is non-healthy. Automation
+that needs only the aggregate health document can use `health` directly.
+`health [NAME ...]` checks every requested name independently, or every active
+registry entry when no name is supplied. One malformed or stale record is
+reported as its own `unknown` result and does not suppress later results. A
+lifecycle lock held by `start`, `send`, recovery, or another controller is also
+a bounded `unknown` / `lifecycle-lock-contended` row with `recorded: false`;
+the scan continues to later names instead of waiting behind that operation.
+The aggregate exits zero only when every result is `healthy`; confirmed pane or
+expected-harness disappearance is `unhealthy`, while an unavailable Herdr
+transport is `unknown`. Both non-healthy outcomes exit 1 and are emitted as
+JSON.
+
+For headless workers, a dead result requires an explicit `runner_alive: false`
+observation whose name, PID, and Linux process start time all match the saved
+runner generation. Transport, decoding, and runtime errors remain `unknown`
+regardless of their wording, as does a liveness receipt for another process
+generation. A positive receipt requires a readable matching `/proc` start time
+and a non-zombie process. Missing, mismatched, or zombie processes are false;
+permission and parse uncertainty is `null` and therefore `unknown`, never
+healthy. Because detached startup may return before the runner publishes its
+PID, the first later exact positive receipt is bound to the still-current outer
+generation while its private lifecycle lock is held.
+
+Each check atomically updates `.agentctl/NAME/health.json` with the session
+token, exact reason, `first_detected_at`, and `last_checked_at` Unix timestamps.
+The file also retains the most recent unhealthy and unknown reason/timestamp
+after the current condition changes. A record that cannot be loaded or written
+still appears in aggregate output with `recorded: false`.
+
+Use `--watch SECONDS` for a bounded polling process (0 means one check, maximum
+86,400 seconds) and `--interval SECONDS` for its positive delay (default 5,
+maximum 3,600 seconds). The command exits immediately on a non-healthy result
+or successfully after the watch bound. One-shot status/list/health probes have
+a 60-second control bound, and every lock and runtime request receives only
+the time remaining in the overall watch bound. This shape can run from a systemd user
+timer or another service manager without granting restart authority:
+
+```ini
+[Service]
+Type=oneshot
+ExecStart=/absolute/path/agentctl --registry /work/project/.agentctl health --watch 55 --interval 5
+```
+
+The watcher only probes and records health. It never restarts a harness, changes
+the saved lifecycle, drains a queue, or resubmits a prompt.
 
 `pause` blocks automated input through the session manager; it lets an active
 turn finish. `attach` focuses the terminal and does not itself transfer input
@@ -517,6 +637,30 @@ session, and original shell identity must still match the record. An adopted
 record without the shell's boot ID, PID, start ticks, and executable
 device/inode cannot be retired automatically, whether the agent looks live or
 absent.
+
+A custom Muse launch can become live while an early Herdr process snapshot is
+still missing `argv`. New starts retry that transient response until the existing
+startup deadline. The pane launch, every process snapshot, readiness read, final
+identity check, and pane report all share that one deadline; no individual
+control request gets a fresh 30-second allowance. For a `launch_failed` Muse record that has a complete owned
+pane and saved launch intent, inspect the pane and recover only the exact process
+you observed. This also reconciles a retry when the exact process identity was
+already persisted but the subsequent pane report failed:
+
+```sh
+agentctl recover-start NAME --expected-token TOKEN --expected-pid PID
+```
+
+This command accepts only that narrow failed-launch shape. It requires the saved
+pane, tab, workspace, and canonical working directory; the supplied PID; the
+complete saved launch argv; and the saved pinned Muse executable image to
+match twice before persisting identity. It then requires a visibly idle Muse
+composer and re-verifies that identity before reporting the pane as `idle` and
+changing lifecycle to `running`. Liveness without an idle-composer observation
+leaves the record `launch_failed`; it does not manufacture readiness. A failure
+after identity persistence remains safely stoppable through the normal
+exact-identity path. The command never launches a replacement process or replays
+the initial brief.
 
 A narrowly scoped recovery command exists only for an identity-less
 `herdr-foreign` record whose raw JSON omits `foreign_shell_identity`. Run
@@ -713,6 +857,24 @@ registry. An independent worker-compatibility registry retains its own command
 and environment until those workers are stopped and started through the unified
 interface. Creating a new registry does not adopt an agent by matching its name;
 use `agentctl adopt` with the explicit live identity assertions above.
+
+One transitional worker-registry format (`agentctl-runtime/v2`) recorded a
+generation without recording whether the unified session manager or the
+standalone compatibility command owned it. Agentctl therefore will not adopt or
+mutate a headless v2 row. Retire that exact generation through the compatibility
+command instead:
+
+```console
+herdr-subagents down NAME --recover-v2-generation GENERATION
+```
+
+This operation requires the row's complete boot-bound runner identity, stops
+only that exact process generation, preserves its presentation, and writes a
+generation-bound deterministic archive receipt. A wrong generation, an
+unverifiable process, or colliding live/archive state fails without signaling or
+rewriting anything. Start a new unified session only after this retirement is
+complete.
+
 Low-level compatibility arguments remain discoverable with each entry point's
 `--help`.
 

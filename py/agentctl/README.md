@@ -8,6 +8,7 @@ coordinator agent uses the same named-session interface.
 agentctl quickstart
 agentctl start reviewer --cwd . --brief 'Review the current changes'
 agentctl send reviewer 'Focus on cancellation and restart behavior'
+agentctl health reviewer
 agentctl attach reviewer
 ```
 
@@ -39,8 +40,15 @@ The documentation is installed with the command and works offline:
 
 - `agentctl quickstart` gets the first session running.
 - `agentctl userguide` explains ownership, recovery, goals, and available extensions.
+- `agentctl health [NAME ...]` gives automation a nonzero aggregate liveness
+  verdict without changing lifecycle state or restarting a worker.
 - `agentctl profiles --cwd DIR` lists owner-defined launch profiles without
-  printing their environment or raw arguments.
+  printing their environment or raw arguments. The same private config can
+  select one default Herdr workspace for project starts.
+- `agentctl relocate NAME --workspace-label LABEL --new-tab` moves a verified
+  one-pane live session without restarting it and reconciles interrupted moves.
+  It requires a Herdr `pane move` that atomically enforces
+  `--expect-terminal-id`; older Herdr releases refuse before moving the pane.
 - `agentctl skill install` installs this interface's bundled skill for Codex,
   Claude, and Muse without overwriting divergent content. Muse uses its native
   managed skill installer; an identical managed copy is not reinstalled.

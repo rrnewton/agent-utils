@@ -22,6 +22,7 @@ while keeping their terminals available for direct inspection.
      --brief 'Review the current changes and report concrete problems'
    agentctl list
    agentctl status reviewer
+   agentctl health reviewer
    ```
 
    A project can keep owner-specific launch choices in the private, ignored
@@ -32,6 +33,11 @@ while keeping their terminals available for direct inspection.
    agentctl profiles --cwd .
    agentctl start reviewer --cwd . --profile preferred-reviewer
    ```
+
+   Profile schema v2 can declare one `default_workspace` by exact ID or unique
+   label, so project starts do not silently fall back to the shared
+   `subagents` workspace. Override it per start with `--workspace-id` or
+   `--workspace-label`.
 
    To keep an agent that is already running in Herdr, adopt its exact live
    identity instead. All four assertions are required; adoption changes neither
@@ -45,6 +51,13 @@ while keeping their terminals available for direct inspection.
    `adopt --harness muse` is refused. Start an owned Muse session—for example,
    through a validated profile—so agentctl can pin the exact foreground process
    identity itself.
+
+   `status` keeps the saved lifecycle fields but adds a separate live health
+   verdict. It exits nonzero when the expected harness disappeared or when
+   liveness cannot be confirmed. `list` applies the same rule independently to
+   every record. Use `health` when automation needs only the aggregate verdict;
+   all three write the exact reason and detection times to
+   `.agentctl/NAME/health.json`.
 
 3. Send follow-up work and inspect progress:
 
@@ -66,6 +79,13 @@ while keeping their terminals available for direct inspection.
    agentctl attach reviewer
    agentctl resume reviewer
    ```
+
+   To preserve a running agent while moving its one-pane tab to another Herdr
+   workspace, use `agentctl relocate reviewer --workspace-label project
+   --new-tab`. This requires Herdr's atomic `--expect-terminal-id` move
+   precondition; older Herdr releases refuse rather than risk moving a replaced
+   terminal. Interrupted moves are reconciled by stable terminal and process
+   identity; the queue and goal remain attached to the same session generation.
 
 5. Finish with `agentctl stop reviewer`. This stops a runtime created by
    `agentctl` and archives its session state. For an adopted agent it only

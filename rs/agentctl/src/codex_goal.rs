@@ -254,6 +254,15 @@ pub fn get_goal(
     command: &[String],
     timeout: Duration,
 ) -> Result<Option<Value>, String> {
+    let mut rpc = start_goal_request(session_id, command, timeout)?;
+    finish_goal_request(session_id, &mut rpc)
+}
+
+fn start_goal_request(
+    session_id: &str,
+    command: &[String],
+    timeout: Duration,
+) -> Result<Rpc, String> {
     if session_id.is_empty() || session_id.contains('\0') {
         return Err("session_id must be a nonempty session identifier".to_owned());
     }
@@ -273,6 +282,24 @@ pub fn get_goal(
         "method": "thread/goal/get",
         "params": {"threadId": session_id}
     }))?;
+    Ok(rpc)
+}
+
+#[cfg(test)]
+fn get_goal_after_request_hook_for_test(
+    session_id: &str,
+    command: &[String],
+    timeout: Duration,
+    after_goal_request: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Option<Value>, String> {
+    let mut rpc = start_goal_request(session_id, command, timeout)?;
+    // Rpc's one absolute deadline was created before process spawn. Waiting for a fixture-side
+    // readiness marker here therefore cannot reset or extend the timeout under test.
+    after_goal_request()?;
+    finish_goal_request(session_id, &mut rpc)
+}
+
+fn finish_goal_request(session_id: &str, rpc: &mut Rpc) -> Result<Option<Value>, String> {
     let result = rpc.receive(2)?;
     let Some(goal) = result.get("goal").filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -430,34 +457,51 @@ done
 
     #[test]
     fn timeout_kills_transport_descendants() {
-        // The deadline starts before the transport shell runs, so a loaded host can expire it
-        // before the fixture publishes its descendant. Such an attempt never exercised a
-        // descendant; retry it with a longer deadline rather than read an unpublished marker.
-        for timeout in [300, 1_000, 3_000, 10_000].map(Duration::from_millis) {
-            let fixture = Fixture::new();
-            let start = Instant::now();
-            let error = get_goal("thread-fixture", &fixture.command("hang"), timeout).unwrap_err();
-            assert!(error.contains("timed out"), "{error}");
-            assert!(start.elapsed() < timeout + Duration::from_secs(5));
-            let Ok(pid) = fs::read_to_string(fixture.0.join("child.pid")) else {
-                continue;
-            };
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                match fs::read_to_string(format!("/proc/{pid}/stat")) {
-                    Err(_) => return,
-                    Ok(stat)
-                        if stat
-                            .rsplit_once(") ")
-                            .is_some_and(|(_, tail)| tail.starts_with('Z')) =>
-                    {
-                        return
-                    }
-                    Ok(_) => thread::sleep(Duration::from_millis(10)),
+        let fixture = Fixture::new();
+        let child_pid_file = fixture.0.join("child.pid");
+        let mut child_pid = None;
+        let mut fixture_ready = || {
+            let readiness_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(pid) = fs::read_to_string(&child_pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+                {
+                    child_pid = Some(pid);
+                    return Ok(());
                 }
+                if Instant::now() >= readiness_deadline {
+                    return Err("fixture did not publish the transport child PID".to_owned());
+                }
+                thread::sleep(Duration::from_millis(5));
             }
-            panic!("timed-out transport child {pid} is still running");
+        };
+        let start = Instant::now();
+        let error = get_goal_after_request_hook_for_test(
+            "thread-fixture",
+            &fixture.command("hang"),
+            Duration::from_millis(300),
+            &mut fixture_ready,
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let pid = child_pid.expect("fixture readiness captured the child PID");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => return,
+                Ok(stat)
+                    if stat
+                        .rsplit_once(") ")
+                        .is_some_and(|(_, tail)| tail.starts_with('Z')) =>
+                {
+                    return
+                }
+                Ok(_) => {}
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        panic!("the hang fixture never published its descendant before any deadline");
+        panic!("timed-out transport child {pid} is still running");
     }
 }

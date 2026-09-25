@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from agentctl.errors import HerdrUnavailable
+from agentctl.errors import HerdrUnavailable, RuntimeIdentityMismatch
 from agentctl.jsonx import as_mapping, as_sequence, get_int, get_str, opt_str
 from agentctl.procstat import parse_process_stat
 
@@ -97,64 +97,291 @@ def muse_trust_prompt(screen: str) -> bool:
 
 def muse_idle_composer(screen: str) -> bool:
     """Recognize Muse's idle composer without mistaking a choice prompt for it."""
-    if "Auto-review" not in screen:
-        return False
-    return any(line.strip() in ("❯", "›") for line in screen.splitlines())
+    regions = _muse_composer_regions(screen, require_header=True)
+    return regions is not None and regions[1].strip() in ("❯", "›")
 
 
-def _muse_text_visible(screen: str, text: str) -> bool:
-    wanted = " ".join(text.split())
-    rendered = " ".join(screen.split())
-    if not wanted:
-        return False
-    if len(wanted) <= 160:
-        return wanted in rendered
-    return wanted[:80] in rendered and wanted[-80:] in rendered
+def muse_verified_process_idle_composer(screen: str) -> bool:
+    """Recognize an idle editor after the caller proves this is the live Muse process.
+
+    A long-running session eventually scrolls its version header out of the visible
+    viewport.  This narrower fallback still requires Muse's ruled editor and valid
+    status footer; callers must additionally require an exact custom-process proof
+    and Herdr's terminal ``idle``/``done`` observation.
+    """
+    regions = _muse_composer_regions(screen, require_header=False)
+    return regions is not None and regions[1].strip() in ("❯", "›")
 
 
-def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
-    """Split transcript/composer using Muse's two rules above its status footer."""
+def muse_verified_process_composer(screen: str) -> bool:
+    """Recognize Muse's current editor after exact live-process verification.
+
+    Unlike :func:`muse_verified_process_idle_composer`, this accepts a composer
+    containing buffered input.  It says nothing about whether that input is the
+    caller's prompt; delivery must compare the entire editor before pressing
+    Enter.
+    """
+    regions = _muse_composer_regions(screen, require_header=False)
+    return regions is not None and _muse_editor_segments(regions[1]) is not None
+
+
+def _muse_composer_regions(
+    screen: str, *, require_header: bool = True,
+) -> tuple[str, str] | None:
+    """Split transcript/composer using Muse's ruled editor and status footer."""
     lines = screen.splitlines()
-    footer = next(
-        (index for index in range(len(lines) - 1, -1, -1) if "Auto-review" in lines[index]),
-        None,
-    )
-    if footer is None:
-        return None
     dividers = [
-        index for index, line in enumerate(lines[:footer])
+        index for index, line in enumerate(lines)
         if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
     ]
     if len(dividers) < 2:
         return None
     top, bottom = dividers[-2:]
+    footer = lines[bottom + 1:]
+    current_status = next((line.strip() for line in footer if line.strip()), "")
+    status_fields = [field.strip() for field in current_status.split("·")]
+    versioned_header = any(
+        re.fullmatch(r"Muse Code [0-9]+\.[0-9]+\.[0-9]+", line.strip())
+        for line in lines[:top]
+    )
+    current_footer = (
+        (versioned_header or not require_header)
+        and len(status_fields) in (3, 4)
+        and all(status_fields)
+        and _MUSE_EFFORT.fullmatch(status_fields[1]) is not None
+        and (len(status_fields) == 3 or status_fields[3] in ("YOLO", "Auto-review"))
+    )
+    if not current_footer:
+        return None
     return "\n".join(lines[:top]), "\n".join(lines[top + 1:bottom])
 
 
+def _muse_editor_segments(editor: str) -> tuple[str, ...] | None:
+    """Return normalized editor lines after one leading Muse prompt marker."""
+    lines = [" ".join(line.split()) for line in editor.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return None
+    first = lines[0]
+    marker = next(
+        (candidate for candidate in ("❯", "›")
+         if first == candidate or first.startswith(candidate + " ")),
+        None,
+    )
+    if marker is None:
+        return None
+    initial = first[len(marker):].strip()
+    return tuple(([initial] if initial else []) + lines[1:])
+
+
+def _muse_editor_matches(editor: str, text: str, *, exact: bool) -> bool:
+    """Match a logical prompt against one conservatively rendered Muse editor.
+
+    A terminal may soft-wrap ``deterministic-scheduling`` immediately after
+    the hyphen, rendering ``deterministic-`` and ``scheduling`` on successive
+    physical lines.  At each such physical boundary we consider both the
+    ordinary whitespace-normalized rendering and the no-space soft-wrap form,
+    but retain only candidates that are exact prefixes of *this* requested
+    prompt.  We never globally remove whitespace around hyphens.
+    """
+    wanted = " ".join(text.split())
+    segments = _muse_editor_segments(editor)
+    if not wanted or segments is None:
+        return False
+    prefixes = {""}
+    previous = ""
+    for index, segment in enumerate(segments):
+        separators = ("",) if index == 0 else ((" ", "") if previous.endswith("-") else (" ",))
+        next_prefixes: set[str] = set()
+        for prefix in prefixes:
+            for separator in separators:
+                rendered = prefix + separator + segment
+                if not exact and (
+                    rendered == wanted or rendered.startswith(wanted + " ")
+                ):
+                    return True
+                if wanted.startswith(rendered):
+                    next_prefixes.add(rendered)
+        if not next_prefixes:
+            return False
+        prefixes = next_prefixes
+        previous = segment
+    return wanted in prefixes
+
+
+def _muse_prompt_in_composer(
+    screen: str, text: str, *, require_header: bool, exact: bool,
+) -> bool:
+    """Compare one terminal rendering within a verified composer."""
+    regions = _muse_composer_regions(screen, require_header=require_header)
+    if regions is None:
+        return False
+    return _muse_editor_matches(regions[1], text, exact=exact)
+
+
 def muse_prompt_in_composer(screen: str, text: str) -> bool:
-    """Require the literal prompt inside Muse's active bottom editor region."""
-    regions = _muse_composer_regions(screen)
-    return regions is not None and _muse_text_visible(regions[1], text)
+    """Conservatively detect a prompt retained in Muse's bottom editor."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=True, exact=False,
+    )
+
+
+def muse_verified_process_prompt_in_composer(screen: str, text: str) -> bool:
+    """Detect retained input when exact live-process proof supplies the Muse identity."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=False, exact=False,
+    )
+
+
+def muse_prompt_is_exact_composer(screen: str, text: str) -> bool:
+    """Require the entire active Muse editor to be this literal prompt."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=True, exact=True,
+    )
+
+
+def muse_verified_process_prompt_is_exact_composer(screen: str, text: str) -> bool:
+    """Require exact editor text after the caller pins the live Muse process."""
+    return _muse_prompt_in_composer(
+        screen, text, require_header=False, exact=True,
+    )
+
+
+def _muse_prompt_transcript_count(transcript: str, text: str) -> int:
+    """Count complete marker-delimited user turns, never prompt prefixes."""
+    if not " ".join(text.split()):
+        return 0
+    lines = transcript.splitlines()
+    count = 0
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not any(
+            stripped == marker or stripped.startswith(marker + " ")
+            for marker in ("❯", "›")
+        ):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines):
+            next_line = lines[end].strip()
+            if any(
+                next_line == marker or next_line.startswith(marker + " ")
+                for marker in ("◆", "❯", "›")
+            ):
+                break
+            end += 1
+        if _muse_editor_matches("\n".join(lines[index:end]), text, exact=True):
+            count += 1
+        index = end
+    return count
 
 
 def muse_prompt_in_transcript(screen: str, text: str) -> bool:
-    """Require the literal prompt above Muse's active bottom editor region."""
-    regions = _muse_composer_regions(screen)
-    return regions is not None and _muse_text_visible(regions[0], text)
+    """Require the exact prompt as a user turn above the active Muse editor."""
+    return muse_prompt_transcript_count(screen, text) > 0
+
+
+def _muse_prompt_transcript_count_in_screen(
+    screen: str, text: str, *, require_header: bool,
+) -> int:
+    regions = _muse_composer_regions(screen, require_header=require_header)
+    if regions is None:
+        return 0
+    return _muse_prompt_transcript_count(regions[0], text)
 
 
 def muse_prompt_transcript_count(screen: str, text: str) -> int:
     """Count bounded prompt renderings above the composer for transition proofs."""
-    regions = _muse_composer_regions(screen)
-    if regions is None:
-        return 0
-    wanted = " ".join(text.split())
-    rendered = " ".join(regions[0].split())
-    if not wanted:
-        return 0
-    if len(wanted) <= 160:
-        return rendered.count(wanted)
-    return min(rendered.count(wanted[:80]), rendered.count(wanted[-80:]))
+    return _muse_prompt_transcript_count_in_screen(
+        screen, text, require_header=True,
+    )
+
+
+def muse_verified_process_prompt_transcript_count(screen: str, text: str) -> int:
+    """Count exact user turns after the caller pins the live Muse process."""
+    return _muse_prompt_transcript_count_in_screen(
+        screen, text, require_header=False,
+    )
+
+
+def claude_active_screen(screen: str) -> bool:
+    """Recognize Claude's current activity controls around the live composer."""
+    lines = screen.splitlines()
+    dividers = [
+        index for index, line in enumerate(lines)
+        if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+    ]
+    if len(dividers) < 2:
+        return False
+    top, bottom = dividers[-2:]
+    before = " ".join(" ".join(lines[max(0, top - 12):top]).split())
+    after = " ".join(" ".join(lines[bottom + 1:bottom + 12]).split())
+    waiting = re.search(
+        r"Waiting for [1-9][0-9]* background agents? to finish", before,
+    ) is not None
+    count = re.search(r"(?:←|<-)\s*([0-9]+) agents?\b", after)
+    return "esc to interrupt" in after or (
+        waiting and count is not None and int(count.group(1)) >= 2
+    )
+
+
+def _claude_composer_regions(screen: str) -> tuple[str, str] | None:
+    """Split Claude's ruled composer and require its explicit staged-input hint."""
+    lines = screen.splitlines()
+    dividers = [
+        index for index, line in enumerate(lines)
+        if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+    ]
+    if len(dividers) < 2:
+        return None
+    top, bottom = dividers[-2:]
+    editor = lines[top + 1:bottom]
+    hint = "ctrl+x ctrl+s to send now"
+    if not any(hint in " ".join(line.split()).lower() for line in editor):
+        return None
+    content = [line for line in editor if hint not in " ".join(line.split()).lower()]
+    if _muse_editor_segments("\n".join(content)) is None:
+        return None
+    return "\n".join(lines[:top]), "\n".join(content)
+
+
+def claude_staged_composer(screen: str) -> bool:
+    """Recognize a nonempty Claude composer whose UI says it is not submitted."""
+    regions = _claude_composer_regions(screen)
+    return regions is not None and bool(_muse_editor_segments(regions[1]))
+
+
+def claude_prompt_is_exact_composer(screen: str, text: str) -> bool:
+    """Require the complete staged Claude editor to equal one requested prompt."""
+    regions = _claude_composer_regions(screen)
+    return regions is not None and _muse_editor_matches(regions[1], text, exact=True)
+
+
+def claude_prompt_transcript_count(screen: str, text: str) -> int:
+    """Count exact submitted Claude user turns above the current composer."""
+    regions = _claude_composer_regions(screen)
+    transcript = regions[0] if regions is not None else screen
+    lines = transcript.splitlines()
+    count = 0
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not (stripped == "❯" or stripped.startswith("❯ ")):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines):
+            following = lines[end].strip()
+            if (following.startswith(("❯", "●", "✻", "✽", "⏺", "◆"))
+                    or (len(following) >= 3
+                        and set(following) <= {"─", "━", "═"})):
+                break
+            end += 1
+        if _muse_editor_matches("\n".join(lines[index:end]), text, exact=True):
+            count += 1
+        index = end
+    return count
 
 
 def _get_process_id(mapping: dict[str, object], key: str, what: str) -> int:
@@ -174,6 +401,17 @@ class Pane:
     pane_id: str
     tab_id: str
     workspace_id: str
+    terminal_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PaneMove:
+    """One exact Herdr pane move, including its pre-move routing identity."""
+
+    previous_pane_id: str
+    previous_tab_id: str
+    previous_workspace_id: str
+    pane: Pane
 
 
 @dataclass(frozen=True)
@@ -225,6 +463,10 @@ def _bounded_control_command(
     *,
     environ: Mapping[str, str] | None = None,
     timeout: float = CONTROL_TIMEOUT_SECONDS,
+    input_text: str | None = None,
+    stdout_limit: int = _CONTROL_STDOUT_BYTES,
+    stderr_limit: int = _CONTROL_STDERR_BYTES,
+    strict_utf8: bool = False,
 ) -> "subprocess.CompletedProcess[str]":
     """Capture one control command and kill its whole process group on timeout.
 
@@ -234,36 +476,74 @@ def _bounded_control_command(
     could leave an unbounded helper behind or block forever waiting for its inherited pipe ends.
     """
     argv = list(command)
-    process = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=None if environ is None else dict(environ),
-        start_new_session=True,
+    process = (
+        subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=None if environ is None else dict(environ),
+            start_new_session=True,
+        )
+        if input_text is None else
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=None if environ is None else dict(environ),
+            start_new_session=True,
+        )
     )
     assert process.stdout is not None and process.stderr is not None
     stdout_content = bytearray()
     stderr_content = bytearray()
     streams = {
         process.stdout.fileno(): (
-            process.stdout, stdout_content, _CONTROL_STDOUT_BYTES, "stdout",
+            process.stdout, stdout_content, stdout_limit, "stdout",
         ),
         process.stderr.fileno(): (
-            process.stderr, stderr_content, _CONTROL_STDERR_BYTES, "stderr",
+            process.stderr, stderr_content, stderr_limit, "stderr",
         ),
     }
+    input_content = b"" if input_text is None else input_text.encode("utf-8")
+    input_offset = 0
+    input_descriptor: int | None = None
     poller = select.poll()
     for descriptor in streams:
         os.set_blocking(descriptor, False)
         poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+    if process.stdin is not None:
+        input_descriptor = process.stdin.fileno()
+        os.set_blocking(input_descriptor, False)
+        poller.register(
+            input_descriptor,
+            select.POLLOUT | select.POLLHUP | select.POLLERR,
+        )
     deadline = time.monotonic() + timeout
     try:
-        while streams:
+        while streams or input_descriptor is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(argv, timeout)
             events = poller.poll(max(1, min(10, int(remaining * 1000))))
             for descriptor, _event in events:
+                if descriptor == input_descriptor:
+                    assert process.stdin is not None
+                    try:
+                        if input_offset < len(input_content):
+                            input_offset += os.write(
+                                descriptor,
+                                input_content[input_offset: input_offset + (64 << 10)],
+                            )
+                        if input_offset == len(input_content):
+                            poller.unregister(descriptor)
+                            process.stdin.close()
+                            input_descriptor = None
+                    except BrokenPipeError:
+                        poller.unregister(descriptor)
+                        process.stdin.close()
+                        input_descriptor = None
+                    continue
                 stream = streams.get(descriptor)
                 if stream is None:
                     continue
@@ -303,15 +583,16 @@ def _bounded_control_command(
             pass
         finally:
             process.kill()
-            for pipe in (process.stdout, process.stderr):
-                pipe.close()
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None and not pipe.closed:
+                    pipe.close()
             process.wait()
         raise
     return subprocess.CompletedProcess(
         argv,
         returncode,
-        stdout_content.decode("utf-8", errors="replace"),
-        stderr_content.decode("utf-8", errors="replace"),
+        stdout_content.decode("utf-8", errors="strict" if strict_utf8 else "replace"),
+        stderr_content.decode("utf-8", errors="strict" if strict_utf8 else "replace"),
     )
 
 
@@ -462,9 +743,23 @@ class HerdrClient:
         ) as exc:  # pragma: no cover - _execute already narrows production failures
             raise HerdrUnavailable(f"cannot invoke Herdr: {exc}") from exc
 
-    def _call(self, args: Sequence[str], purpose: str) -> dict[str, object]:
+    @staticmethod
+    def _remaining_timeout(deadline: float, purpose: str) -> float:
+        """Return the positive time left in one caller-owned operation."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HerdrUnavailable(f"{purpose} deadline expired")
+        return remaining
+
+    def _call(
+        self,
+        args: Sequence[str],
+        purpose: str,
+        *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> dict[str, object]:
         """Invoke a socket-API subcommand and return its ``result`` object."""
-        completed = self._invoke(args)
+        completed = self._invoke(args, timeout=timeout)
         if completed.returncode != 0:
             detail = (
                 completed.stderr or completed.stdout or ""
@@ -613,6 +908,49 @@ class HerdrClient:
         except TypeError as exc:
             raise HerdrUnavailable(f"tab create: invalid allocation identity: {exc}") from exc
 
+    def move_pane_to_new_tab(
+        self, pane_id: str, *, expected_terminal_id: str,
+        workspace_id: str, label: str,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> PaneMove:
+        """Conditionally move one exact terminal generation into a new tab."""
+        result = self._call(
+            [
+                "pane", "move", pane_id,
+                "--expect-terminal-id", expected_terminal_id,
+                "--workspace", workspace_id,
+                "--new-tab", "--label", label, "--no-focus",
+            ],
+            f"pane move {pane_id}", timeout=timeout,
+        )
+        try:
+            moved = as_mapping(result.get("move_result"), "pane move")
+            if moved.get("changed") is not True:
+                raise TypeError("pane move did not report changed=true")
+            pane = as_mapping(moved.get("pane"), "pane move pane")
+            created = as_mapping(moved.get("created_tab"), "pane move created_tab")
+            parsed = Pane(
+                get_str(pane, "pane_id", "pane move pane"),
+                get_str(pane, "tab_id", "pane move pane"),
+                get_str(pane, "workspace_id", "pane move pane"),
+                get_str(pane, "terminal_id", "pane move pane"),
+            )
+            if (parsed.workspace_id != workspace_id
+                    or parsed.terminal_id != expected_terminal_id
+                    or get_str(created, "workspace_id", "pane move created_tab") != workspace_id
+                    or get_str(created, "tab_id", "pane move created_tab") != parsed.tab_id
+                    or get_int(created, "pane_count", "pane move created_tab") != 1
+                    or get_str(moved, "focused_pane_id", "pane move") != parsed.pane_id):
+                raise TypeError("pane move returned contradictory destination routing")
+            return PaneMove(
+                get_str(moved, "previous_pane_id", "pane move"),
+                get_str(moved, "previous_tab_id", "pane move"),
+                get_str(moved, "previous_workspace_id", "pane move"),
+                parsed,
+            )
+        except TypeError as exc:
+            raise HerdrUnavailable(f"pane move: invalid Herdr response: {exc}") from exc
+
     def close_tab(self, tab_id: str) -> None:
         """Close one explicitly owned tab, without closing its shared workspace."""
         self._call_ok(["tab", "close", tab_id], f"tab close {tab_id}")
@@ -669,7 +1007,10 @@ class HerdrClient:
             )
         return _validated_executable(candidate, kind)
 
-    def report_pane_agent(self, pane_id: str, kind: str, state: str) -> None:
+    def report_pane_agent(
+        self, pane_id: str, kind: str, state: str, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
         """Label one exact custom-harness pane without registering an agent name."""
         self._call_ok(
             [
@@ -678,6 +1019,7 @@ class HerdrClient:
                 "--message", "agentctl custom harness",
             ],
             f"report custom agent {pane_id}",
+            timeout=timeout,
         )
 
     @staticmethod
@@ -723,16 +1065,10 @@ class HerdrClient:
             def process_stat() -> tuple[int, int] | None:
                 with open(f"/proc/{pid}/stat", "rb") as stream:
                     raw = stream.read(8193)
-                if not raw or len(raw) > 8192:
-                    return None
                 parsed = parse_process_stat(raw)
-                if (
-                    parsed is None
-                    or parsed.pid != pid
-                    or parsed.state == "Z"
-                    or parsed.pgrp < 1
-                    or parsed.starttime < 1
-                ):
+                if (parsed is None or parsed.pid != pid or parsed.state == "Z"
+                        or not 1 <= parsed.pgrp <= _MAX_PROCESS_ID
+                        or not 1 <= parsed.starttime <= _MAX_U64):
                     return None
                 return parsed.pgrp, parsed.starttime
 
@@ -820,9 +1156,10 @@ class HerdrClient:
                 except (OSError, UnicodeError, ValueError):
                     return None
                 parsed = parse_process_stat(raw)
-                if parsed is None or parsed.pid != process or len(raw) > 8192:
+                if parsed is None or parsed.pid != process:
                     return None
-                parents[process] = parsed.ppid
+                if process > 0:
+                    parents[process] = parsed.ppid
             return parents
 
         def has_descendant(parents: dict[int, int]) -> bool:
@@ -892,13 +1229,20 @@ class HerdrClient:
             return None
         return PaneShellProof(observed[0], executable_path)
 
-    def pane_idle_shell_identity(self, pane_id: str) -> PaneShellProof | None:
+    def pane_idle_shell_identity(
+        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> PaneShellProof | None:
         """Return one stable idle-shell proof, including absence of descendants."""
-        before = self.process_info(pane_id)
+        deadline = time.monotonic() + timeout
+        before = self.process_info(
+            pane_id, timeout=self._remaining_timeout(deadline, "idle-shell proof")
+        )
         proof = self._idle_shell_proof(before)
         if proof is None:
             return None
-        after = self.process_info(pane_id)
+        after = self.process_info(
+            pane_id, timeout=self._remaining_timeout(deadline, "idle-shell proof")
+        )
         if after != before or self._idle_shell_proof(after) != proof:
             return None
         return proof
@@ -954,19 +1298,45 @@ class HerdrClient:
     def verify_custom_harness(
         self, pane_id: str, kind: str,
         expected_identity: CustomProcessIdentity | None = None,
+        *, timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> None:
         """Require the recorded custom process or strict current-path identity."""
         executable = None if expected_identity is not None else self._harness_executable(kind)
         if self._pane_process_identity(
-            self.process_info(pane_id), executable, expected_identity
+            self.process_info(pane_id, timeout=timeout), executable, expected_identity
         ) is None:
             raise HerdrUnavailable(
                 f"custom harness {kind!r} is not the foreground process in pane {pane_id}"
             )
 
-    def pane_is_idle_shell(self, pane_id: str) -> bool:
+    def process_generation_absent(
+        self, expected: CustomProcessIdentity,
+    ) -> bool:
+        """Prove that one recorded Linux PID generation is no longer live.
+
+        A changed boot/start/image identity proves that the recorded generation
+        ended.  An unreadable but still-present PID is uncertainty, not death.
+        """
+        observed = self._process_identity(expected.pid)
+        if observed is not None:
+            return observed[0] != expected
+        try:
+            os.kill(expected.pid, 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError) as exc:
+            raise HerdrUnavailable(
+                f"cannot prove recorded process {expected.pid} absent: {exc}"
+            ) from exc
+        raise HerdrUnavailable(
+            f"cannot prove recorded process {expected.pid} identity"
+        )
+
+    def pane_is_idle_shell(
+        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> bool:
         """Prove the pane has returned to Herdr's original shell process group."""
-        return self.pane_idle_shell_identity(pane_id) is not None
+        return self.pane_idle_shell_identity(pane_id, timeout=timeout) is not None
 
     def pane_shell_identity(self, pane_id: str) -> CustomProcessIdentity:
         """Capture the kernel identity of the shell process Herdr owns for one pane."""
@@ -978,16 +1348,46 @@ class HerdrClient:
             )
         return observed[0]
 
+    def verify_pane_shell_identity(
+        self, pane_id: str, expected: CustomProcessIdentity, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
+        """Require the exact shell generation recorded for an adopted pane.
+
+        The shell is normally in the background while an adopted harness owns
+        the foreground process group, so an idle-shell proof is intentionally
+        too strong here.  This check binds the current Herdr pane's shell PID
+        to the complete boot/start/image identity captured at adoption.  An
+        unreadable procfs observation is not absence and therefore fails
+        closed as an unavailable observation.
+        """
+        info = self.process_info(pane_id, timeout=timeout)
+        if info.shell_pid != expected.pid:
+            raise RuntimeIdentityMismatch(
+                f"recorded pane shell generation changed for pane {pane_id}"
+            )
+        observed = self._process_identity(info.shell_pid)
+        if observed is None:
+            raise HerdrUnavailable(
+                f"cannot verify recorded pane shell generation for pane {pane_id}"
+            )
+        if observed[0] != expected:
+            raise RuntimeIdentityMismatch(
+                f"recorded pane shell generation changed for pane {pane_id}"
+            )
+
     def pane_is_same_idle_shell(
-        self, pane_id: str, expected: CustomProcessIdentity,
+        self, pane_id: str, expected: CustomProcessIdentity, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> bool:
         """Prove both idle-shell state and the exact shell generation captured earlier."""
-        proof = self.pane_idle_shell_identity(pane_id)
+        proof = self.pane_idle_shell_identity(pane_id, timeout=timeout)
         return proof is not None and proof.identity == expected
 
     def start_pane_agent(
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
         *, timeout: float = 30.0,
+        on_launch_intent: Callable[[str, int, int, tuple[str, ...]], None] | None = None,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
     ) -> CustomProcessIdentity:
         """Launch and verify a custom TUI through one exact Herdr pane.
@@ -998,6 +1398,7 @@ class HerdrClient:
         del name
         if not 0 < timeout <= 300:
             raise ValueError("agent startup timeout must be between 0 and 300 seconds")
+        deadline = time.monotonic() + timeout
         executable = self._harness_executable(kind)
         try:
             descriptor = os.open(executable, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
@@ -1017,22 +1418,43 @@ class HerdrClient:
                     f"custom harness {kind!r} must be a native ELF executable"
                 )
             launch_image = (metadata.st_dev, metadata.st_ino)
+            if on_launch_intent is not None:
+                on_launch_intent(
+                    executable, metadata.st_dev, metadata.st_ino,
+                    (executable, *arguments),
+                )
             self._call_ok(
                 ["pane", "run", pane_id, shlex.join([executable, *arguments])],
                 f"pane run {kind!r}",
+                timeout=self._remaining_timeout(deadline, "custom harness startup"),
             )
-            deadline = time.monotonic() + timeout
             observed: CustomProcessIdentity | None = None
+            last_probe_error: HerdrUnavailable | None = None
             while time.monotonic() < deadline:
-                observed = self._pane_process_identity(
-                    self.process_info(pane_id), executable, launch_image=launch_image
-                )
+                try:
+                    observed = self._pane_process_identity(
+                        self.process_info(
+                            pane_id,
+                            timeout=self._remaining_timeout(
+                                deadline, "custom harness process probe"
+                            ),
+                        ),
+                        executable,
+                        launch_image=launch_image,
+                    )
+                except HerdrUnavailable as exc:
+                    # Herdr can briefly expose a foreground entry before its argv
+                    # snapshot is populated. Startup already owns a deadline, so
+                    # keep polling instead of abandoning a process we just launched.
+                    last_probe_error = exc
+                    observed = None
                 if observed is not None:
                     break
                 self._sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             if observed is None:
+                detail = f"; last process probe: {last_probe_error}" if last_probe_error else ""
                 raise HerdrUnavailable(
-                    f"custom harness {kind!r} was not the foreground process in pane {pane_id}"
+                    f"custom harness {kind!r} was not the foreground process in pane {pane_id}{detail}"
                 )
             if on_observed is not None:
                 on_observed(observed)
@@ -1040,8 +1462,14 @@ class HerdrClient:
             os.close(descriptor)
         ready = False
         while time.monotonic() < deadline:
-            self.verify_custom_harness(pane_id, kind, observed)
-            screen = self.read(pane_id, source="visible", lines=200)
+            self.verify_custom_harness(
+                pane_id, kind, observed,
+                timeout=self._remaining_timeout(deadline, "custom harness readiness"),
+            )
+            screen = self.read(
+                pane_id, source="visible", lines=200,
+                timeout=self._remaining_timeout(deadline, "custom harness readiness"),
+            )
             if muse_trust_prompt(screen) and "--trust-workspace" not in arguments:
                 raise HerdrUnavailable(
                     f"{kind} workspace trust prompt requires human attention; no input was submitted"
@@ -1056,13 +1484,132 @@ class HerdrClient:
             raise HerdrUnavailable(
                 f"custom harness {kind!r} did not reach a verified idle composer in pane {pane_id}"
             )
-        self.verify_custom_harness(pane_id, kind, observed)
-        self.report_pane_agent(pane_id, kind, "idle")
+        self.verify_custom_harness(
+            pane_id, kind, observed,
+            timeout=self._remaining_timeout(deadline, "custom harness final verification"),
+        )
+        self.report_pane_agent(
+            pane_id, kind, "idle",
+            timeout=self._remaining_timeout(deadline, "custom harness report"),
+        )
         return observed
 
-    def agent_pane(self, name: str) -> str:
+    def recover_pane_agent(
+        self, pane_id: str, expected_argv: Sequence[str], expected_device: int,
+        expected_inode: int, expected_pid: int,
+    ) -> CustomProcessIdentity:
+        """Pin one unrecorded failed launch by exact pane, PID, image, and argv."""
+        if not 1 <= expected_pid <= _MAX_PROCESS_ID:
+            raise HerdrUnavailable("expected custom harness pid is not a positive Linux process id")
+        if (not expected_argv or any(not isinstance(item, str) or not item or "\0" in item
+                                     for item in expected_argv)
+                or not 1 <= expected_device <= _MAX_U64
+                or not 1 <= expected_inode <= _MAX_U64):
+            raise HerdrUnavailable("saved custom harness launch intent is incomplete")
+
+        def observe() -> CustomProcessIdentity:
+            result = self._call(
+                ["pane", "process-info", "--pane", pane_id],
+                f"pane process-info {pane_id}",
+            )
+            try:
+                info = as_mapping(result.get("process_info"), "pane process-info")
+                if get_str(info, "pane_id", "pane process-info") != pane_id:
+                    raise TypeError("returned a different pane identity")
+                foreground_pgid = _get_process_id(
+                    info, "foreground_process_group_id", "pane process-info"
+                )
+                matches: list[dict[str, object]] = []
+                for entry in as_sequence(
+                    info.get("foreground_processes"), "foreground_processes"
+                ):
+                    process = as_mapping(entry, "foreground process")
+                    if _get_process_id(process, "pid", "foreground process") == expected_pid:
+                        matches.append(process)
+                if len(matches) != 1:
+                    raise TypeError(
+                        f"expected one foreground process with pid {expected_pid}, found {len(matches)}"
+                    )
+                raw_argv = as_sequence(matches[0].get("argv"), "foreground process argv")
+                argv_matches = list(raw_argv) == list(expected_argv)
+                legacy_program_matches = (
+                    bool(raw_argv)
+                    and not os.path.isabs(expected_argv[0])
+                    and "/" not in expected_argv[0]
+                    and isinstance(raw_argv[0], str)
+                    and os.path.basename(raw_argv[0]) == expected_argv[0]
+                    and list(raw_argv[1:]) == list(expected_argv[1:])
+                )
+                if not argv_matches and not legacy_program_matches:
+                    raise TypeError(
+                        f"pid {expected_pid} argv does not exactly match the recorded launch arguments"
+                    )
+            except TypeError as exc:
+                raise HerdrUnavailable(
+                    f"pane process-info: cannot recover custom harness identity: {exc}"
+                ) from exc
+            observed = self._process_identity(expected_pid)
+            if (observed is None or observed[1] != foreground_pgid
+                    or (observed[0].executable_device, observed[0].executable_inode)
+                    != (expected_device, expected_inode)):
+                raise HerdrUnavailable(
+                    "custom harness recovery did not match the recorded executable and process group"
+                )
+            return observed[0]
+
+        first = observe()
+        second = observe()
+        if second != first:
+            raise HerdrUnavailable("custom harness identity changed during recovery")
+        return first
+
+    def commit_recovered_pane_agent(
+        self, pane_id: str, kind: str, identity: CustomProcessIdentity,
+        commit: Callable[[], None],
+    ) -> None:
+        """Publish recovered state while one pidfd pins the verified process."""
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            raise HerdrUnavailable("custom harness recovery requires Linux pidfds")
+        try:
+            descriptor = opener(identity.pid, 0)
+        except OSError as exc:
+            raise HerdrUnavailable(
+                f"cannot pin recovered custom process {identity.pid}: {exc}"
+            ) from exc
+        poller = select.poll()
+        poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+        try:
+            if poller.poll(0):
+                raise HerdrUnavailable(
+                    "recovered custom harness exited before state publication"
+                )
+            self.verify_custom_harness(pane_id, kind, identity)
+            commit()
+            if poller.poll(0):
+                raise HerdrUnavailable(
+                    "recovered custom harness exited during state publication"
+                )
+            self.verify_custom_harness(pane_id, kind, identity)
+            if poller.poll(0):
+                raise HerdrUnavailable(
+                    "recovered custom harness exited after state publication"
+                )
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                raise HerdrUnavailable(
+                    f"cannot close recovered custom process pidfd: {exc}"
+                ) from exc
+
+    def agent_pane(
+        self, name: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> str:
         """Resolve an exact live Herdr agent name, rejecting a stale pane occupant."""
-        result = self._call(["agent", "get", name], f"agent get {name!r}")
+        result = self._call(
+            ["agent", "get", name], f"agent get {name!r}", timeout=timeout
+        )
         try:
             info = as_mapping(result.get("agent"), "agent get")
             if get_str(info, "name", "agent get") != name:
@@ -1081,12 +1628,15 @@ class HerdrClient:
             "report managed agent session",
         )
 
-    def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
+    def panes(
+        self, workspace_id: str | None = None, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> tuple[Pane, ...]:
         """Every pane, optionally restricted to one workspace."""
         args = ["pane", "list"]
         if workspace_id is not None:
             args += ["--workspace", workspace_id]
-        result = self._call(args, "pane list")
+        result = self._call(args, "pane list", timeout=timeout)
         out: list[Pane] = []
         try:
             for entry in as_sequence(result.get("panes"), "pane list"):
@@ -1095,6 +1645,7 @@ class HerdrClient:
                     pane_id=get_str(pane, "pane_id", "pane list entry"),
                     tab_id=get_str(pane, "tab_id", "pane list entry"),
                     workspace_id=get_str(pane, "workspace_id", "pane list entry"),
+                    terminal_id=opt_str(pane, "terminal_id"),
                 )
                 if workspace_id is not None and parsed.workspace_id != workspace_id:
                     raise HerdrUnavailable(
@@ -1114,9 +1665,13 @@ class HerdrClient:
             return False
         return True
 
-    def pane_info(self, pane_id: str) -> AgentPaneInfo:
+    def pane_info(
+        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> AgentPaneInfo:
         """Return validated identity/readiness data for an interactive pane."""
-        result = self._call(["pane", "get", pane_id], f"pane get {pane_id}")
+        result = self._call(
+            ["pane", "get", pane_id], f"pane get {pane_id}", timeout=timeout
+        )
         try:
             pane = as_mapping(result.get("pane"), "pane get")
             returned = get_str(pane, "pane_id", "pane get")
@@ -1143,9 +1698,13 @@ class HerdrClient:
         except TypeError as exc:
             raise HerdrUnavailable(f"pane get: invalid Herdr response: {exc}") from exc
 
-    def workspace_label(self, workspace_id: str) -> str:
+    def workspace_label(
+        self, workspace_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> str:
         """Return the label for one exact workspace id."""
-        result = self._call(["workspace", "get", workspace_id], "workspace get")
+        result = self._call(
+            ["workspace", "get", workspace_id], "workspace get", timeout=timeout
+        )
         try:
             workspace = as_mapping(result.get("workspace"), "workspace get")
             returned = get_str(workspace, "workspace_id", "workspace get")
@@ -1162,7 +1721,7 @@ class HerdrClient:
         purpose = f"wait for pane {pane_id} status {status}"
         completed = self._invoke(
             ["agent", "wait", pane_id, "--until", status, "--timeout", str(timeout_ms)],
-            timeout=max(CONTROL_TIMEOUT_SECONDS, timeout_ms / 1000.0 + 5.0),
+            timeout=max(0.001, timeout_ms / 1000.0),
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "").strip() or f"exit {completed.returncode}"
@@ -1196,10 +1755,14 @@ class HerdrClient:
         except (TypeError, ValueError) as exc:
             raise HerdrUnavailable(f"invalid Herdr server status: {exc}") from exc
 
-    def process_info(self, pane_id: str) -> ProcessInfo:
+    def process_info(
+        self, pane_id: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> ProcessInfo:
         """The pane's live shell pid and foreground process group — the readiness signal."""
         result = self._call(
-            ["pane", "process-info", "--pane", pane_id], f"pane process-info {pane_id}"
+            ["pane", "process-info", "--pane", pane_id],
+            f"pane process-info {pane_id}",
+            timeout=timeout,
         )
         try:
             info = as_mapping(result.get("process_info"), "pane process-info")
@@ -1244,6 +1807,7 @@ class HerdrClient:
         *,
         source: str = "recent-unwrapped",
         lines: int | None = None,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
     ) -> str:
         """Read the pane's rendered text. ANSI is stripped (no ``--raw``), trailing spaces included.
 
@@ -1253,19 +1817,22 @@ class HerdrClient:
         args = ["pane", "read", pane_id, "--source", source]
         if lines is not None:
             args += ["--lines", str(lines)]
-        completed = self._invoke(args)
+        completed = self._invoke(args, timeout=timeout)
         if completed.returncode != 0:
             detail = (completed.stderr or "").strip() or f"exit {completed.returncode}"
             raise HerdrUnavailable(f"pane read {pane_id}: {detail}")
         return completed.stdout
 
-    def _call_ok(self, args: Sequence[str], purpose: str) -> None:
+    def _call_ok(
+        self, args: Sequence[str], purpose: str, *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
         """Invoke a subcommand that reports success only through its exit status.
 
         ``pane run`` and ``pane send-keys`` write NOTHING on success — they are input-injection
         calls, not queries — so requiring a JSON envelope here would fail every successful call.
         """
-        completed = self._invoke(args)
+        completed = self._invoke(args, timeout=timeout)
         if completed.returncode != 0:
             detail = (
                 completed.stderr or completed.stdout or ""
@@ -1286,9 +1853,14 @@ class HerdrClient:
         """Insert literal text without synthesizing a submission keystroke."""
         self._call_ok(["pane", "send-text", pane_id, text], f"pane send-text {pane_id}")
 
-    def send_keys(self, pane_id: str, keys: str) -> None:
+    def send_keys(
+        self, pane_id: str, keys: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> None:
         """Send named key presses (for example ``ctrl+u``) to a pane."""
-        self._call_ok(["pane", "send-keys", pane_id, keys], f"pane send-keys {pane_id}")
+        self._call_ok(
+            ["pane", "send-keys", pane_id, keys],
+            f"pane send-keys {pane_id}", timeout=timeout,
+        )
 
     def close_pane(self, pane_id: str) -> None:
         """Close one exact pane, preserving any other panes added to its tab."""
