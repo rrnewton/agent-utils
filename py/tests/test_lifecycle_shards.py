@@ -1099,6 +1099,32 @@ class _CallerExit(BaseException):
     """What a caller's handler raises that an `except Exception` would miss, as sys.exit does."""
 
 
+_LATER = "Then, before that reached the caller, this was raised too:\n"
+
+
+def _attached(raised: BaseException, stderr: str) -> list[str]:
+    """What the runner attached to raised, each by the last line of its traceback, in order.
+
+    From Python 3.11 each later exception is attached to the first as a note.  Python 3.10 has no
+    notes, so the runner prints each to stderr instead.
+    """
+
+    if sys.version_info >= (3, 11):
+        assert _LATER not in stderr
+        notes: list[str] = getattr(raised, "__notes__", [])
+    else:
+        assert not hasattr(raised, "__notes__")
+        notes = [_LATER + part for part in stderr.split(_LATER)[1:]]
+    assert all(note.startswith(_LATER + "Traceback (most recent call last):\n") for note in notes)
+    return [note.rstrip("\n").splitlines()[-1] for note in notes]
+
+
+def _line(kind: type[BaseException], message: str) -> str:
+    """The last line of the traceback of kind(message)."""
+
+    return f"{kind.__module__}.{kind.__qualname__}: {message}"
+
+
 @pytest.mark.parametrize("while_", ("installing", "restoring"))
 def test_a_signal_while_handlers_change_leaves_the_caller_with_all_its_own_handlers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, while_: str
@@ -1183,7 +1209,8 @@ def test_a_handler_raising_as_the_stop_signals_are_blocked_leaves_the_caller_as_
             signal.signal(signum, handler)
         real_sigmask(signal.SIG_SETMASK, caller_mask)
 
-    assert len(blocks) == (1 if while_ == "installing" else 2)
+    # Restoring, the call that raised is made again: it cannot tell whether that call blocked them.
+    assert len(blocks) == (1 if while_ == "installing" else 3)
     assert started.exists() == (while_ == "restoring")
     assert left_mask == caller_mask
     assert left_handlers == own
@@ -1298,6 +1325,7 @@ def test_a_handler_raising_while_the_handlers_are_put_back_still_unblocks_the_st
 def test_a_handler_raising_as_any_one_handler_is_put_back_still_puts_back_every_one(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     failing: int,
     while_: str,
     changes: bool,
@@ -1307,7 +1335,8 @@ def test_a_handler_raising_as_any_one_handler_is_put_back_still_puts_back_every_
     at the first call that raises: every handler after it would stay the runner's recorder, and a
     caller whose SIGTERM is only recorded no longer stops for it.  The one whose call raised is
     tried again, whether or not that call had changed it, so every handler comes back.  The same
-    holds when what the caller's handler raises is not an Exception."""
+    holds when what the caller's handler raises is not an Exception.  What raised reaches the
+    caller, but never in front of an install that raised first."""
 
     real_signal = signal.signal
     real_sigmask = signal.pthread_sigmask
@@ -1358,9 +1387,15 @@ def test_a_handler_raising_as_any_one_handler_is_put_back_still_puts_back_every_
     assert left_handlers == own
     assert left_mask == caller_mask
     assert type(raised.value) is stop
-    assert str(raised.value) == "put back"  # Not swallowed: it still reaches the caller.
+    captured = capsys.readouterr()
+    later = _attached(raised.value, captured.err)
     if while_ == "installing":
-        assert str(raised.value.__context__) == "install"
+        assert str(raised.value) == "install"
+        assert later == [_line(stop, "put back")]  # Not swallowed: it still reaches the caller.
+    else:
+        assert str(raised.value) == "put back"
+        assert later == []
+        assert "=== mapped lifecycle shard" not in captured.out  # Raised before any report.
     assert started.exists() == (while_ == "restoring")
 
 
@@ -1426,11 +1461,12 @@ def test_a_handler_raising_as_the_stop_signals_are_unblocked_after_installing_pu
 
 
 def test_a_handler_that_can_never_be_put_back_is_tried_a_bounded_number_of_times(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A call that raises every time cannot put its handler back, however often it is tried, and
     trying it forever would never return to the caller.  It is tried _PUT_BACK_ATTEMPTS times in
-    all; every other handler and the mask still come back, and the first exception is raised."""
+    all; every other handler and the mask still come back, and the first exception is raised, with
+    the later two attached."""
 
     real_signal = signal.signal
     real_sigmask = signal.pthread_sigmask
@@ -1467,12 +1503,232 @@ def test_a_handler_that_can_never_be_put_back_is_tried_a_bounded_number_of_times
     assert runner._PUT_BACK_ATTEMPTS == 3
     assert calls == [*stop_signals, *stop_signals, stuck, stuck]
     assert str(raised.value) == f"call {len(stop_signals) + 1 + stop_signals.index(stuck)}"
+    assert _attached(raised.value, capsys.readouterr().err) == [
+        _line(_CallerStop, f"call {2 * len(stop_signals) + 1}"),
+        _line(_CallerStop, f"call {2 * len(stop_signals) + 2}"),
+    ]
     assert left_mask == caller_mask
     assert {signum: left_handlers[signum] for signum in stop_signals if signum != stuck} == {
         signum: own[signum] for signum in stop_signals if signum != stuck
     }
     # The stuck one could not be put back: it is still the runner's recorder.
     assert isinstance(getattr(left_handlers[stuck], "__self__", None), runner._Signals)
+
+
+@pytest.mark.parametrize(
+    "cleanup", ("put-back", "mask-before-changing", "mask-after-changing", "both")
+)
+@pytest.mark.parametrize("first", ("install", "unblock", "work", "work-then-stopping", "signal"))
+def test_the_first_failure_reaches_the_caller_with_what_putting_things_back_raised_attached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    first: str,
+    cleanup: str,
+) -> None:
+    """Python raises the last of several failures, keeping the first as its __context__ at best,
+    though the first is what went wrong: an install, the unblocking after the installs, the run
+    itself, or a stop signal.  The caller gets that, with each later exception attached, in order,
+    and still gets back every handler and its mask, which is put back again if a call raised
+    before it changed the mask, as a pending handler can, even with what an `except Exception`
+    would miss, as sys.exit raises."""
+
+    real_signal = signal.signal
+    real_sigmask = signal.pthread_sigmask
+    stop_signals = runner._STOP_SIGNALS
+    own = {signum: signal.getsignal(signum) for signum in stop_signals}
+    caller_mask = real_sigmask(signal.SIG_BLOCK, ())
+    assert not set(stop_signals) & caller_mask
+    calls: list[int] = []
+    masks: list[set[int | signal.Signals]] = []
+    mask_back: list[int] = []  # The calls made so far at each attempt to put the mask back.
+
+    def set_handler(
+        signum: int, handler: Callable[[int, FrameType | None], object] | int | None
+    ) -> Callable[[int, FrameType | None], object] | int | None:
+        calls.append(signum)
+        masks.append(real_sigmask(signal.SIG_BLOCK, ()))
+        if first == "install" and len(calls) == len(stop_signals):
+            real_signal(signum, handler)
+            raise _CallerStop("install")
+        if cleanup in ("put-back", "both") and len(calls) == len(stop_signals) + 1:
+            raise _CallerStop("put back")  # Before changing it: only the retry puts it back.
+        return real_signal(signum, handler)
+
+    def sigmask(how: int, mask: Iterable[int]) -> set[int | signal.Signals]:
+        if how != signal.SIG_SETMASK:
+            return set(real_sigmask(how, mask))
+        if len(calls) == len(stop_signals) and first != "install":  # Unblocking after installing.
+            result = set(real_sigmask(how, mask))
+            if first == "unblock":
+                raise _CallerStop("unblock")
+            return result
+        mask_back.append(len(calls))
+        if len(mask_back) == 1 and cleanup in ("mask-before-changing", "both"):
+            raise _CallerExit("mask back")
+        result = set(real_sigmask(how, mask))
+        if len(mask_back) == 1 and cleanup == "mask-after-changing":
+            raise _CallerExit("mask back")
+        return result
+
+    def fail_to_start(_parent: int, _signum: int) -> Callable[[], None]:
+        raise _CallerStop("work")
+
+    def fail_to_stop(*_args: object) -> None:
+        raise _CallerStop("stopping")
+
+    monkeypatch.setattr(runner.signal, "signal", set_handler)
+    monkeypatch.setattr(runner.signal, "pthread_sigmask", sigmask)
+    if first.startswith("work"):
+        monkeypatch.setattr(runner, "_signal_on_parent_death", fail_to_start)
+    if first == "work-then-stopping":
+        monkeypatch.setattr(runner, "_stop_shards", fail_to_stop)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    # The shard stops the runner while it is still running, so the signal is what came first.
+    stops_its_runner = (
+        "import os, signal, time; os.kill(os.getppid(), signal.SIGTERM); time.sleep(60)"
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises((_CallerStop, SystemExit)) as raised:
+            runner.run_commands(((sys.executable, "-c", stops_its_runner),), logs)
+        monkeypatch.undo()
+        left_mask = real_sigmask(signal.SIG_BLOCK, ())
+        left_handlers = {signum: signal.getsignal(signum) for signum in stop_signals}
+    finally:  # Whatever the result, the rest of the suite gets this process back as it was.
+        monkeypatch.undo()
+        for signum, handler in own.items():
+            real_signal(signum, handler)
+        real_sigmask(signal.SIG_SETMASK, caller_mask)
+    captured = capsys.readouterr()
+
+    if first == "signal":
+        assert type(raised.value) is SystemExit
+        assert raised.value.code == 128 + signal.SIGTERM
+        assert "=== mapped lifecycle shard 1/1 INTERRUPTED rc=-15 ===" in captured.out
+        assert time.monotonic() - started < 30  # SIGTERM gets the shard no grace.
+    else:
+        assert type(raised.value) is _CallerStop
+        assert str(raised.value) == ("work" if first.startswith("work") else first)
+    later = {
+        "put-back": [_line(_CallerStop, "put back")],
+        "mask-before-changing": [_line(_CallerExit, "mask back")],
+        "mask-after-changing": [_line(_CallerExit, "mask back")],
+        "both": [_line(_CallerStop, "put back"), _line(_CallerExit, "mask back")],
+    }[cleanup]
+    if first == "work-then-stopping":
+        later = [_line(_CallerStop, "stopping"), *later]
+    assert _attached(raised.value, captured.err) == later
+    assert left_handlers == own
+    assert left_mask == caller_mask
+    # Every handler went back with the stop signals held back, and the mask went back once more
+    # after a call that raised, whether or not that call had changed it.
+    assert all(mask == caller_mask | set(stop_signals) for mask in masks)
+    retried = cleanup in ("put-back", "both")
+    put_back = 2 * len(stop_signals) + int(retried)
+    assert calls == [*stop_signals, *stop_signals, *stop_signals[:int(retried)]]
+    assert mask_back == ([put_back] if cleanup == "put-back" else [put_back, put_back])
+
+
+@pytest.mark.parametrize("stop", (_CallerStop, _CallerExit), ids=("exception", "base-exception"))
+@pytest.mark.parametrize("changes", (False, True), ids=("before-changing", "after-changing"))
+def test_holding_the_stop_signals_back_again_is_retried_before_any_handler_goes_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    changes: bool,
+    stop: type[BaseException],
+) -> None:
+    """A pending handler may raise as the call that holds the stop signals back is entered, before
+    it changes the mask.  That call is made again, so every handler still goes back with the stop
+    signals held back, and the mask comes back; what raised still reaches the caller, before the
+    shards' report, which could raise in front of it."""
+
+    real_signal = signal.signal
+    real_sigmask = signal.pthread_sigmask
+    stop_signals = runner._STOP_SIGNALS
+    own = {signum: signal.getsignal(signum) for signum in stop_signals}
+    caller_mask = real_sigmask(signal.SIG_BLOCK, ())
+    assert not set(stop_signals) & caller_mask
+    calls: list[int] = []
+    masks: list[set[int | signal.Signals]] = []
+    blocks: list[int] = []
+
+    def set_handler(
+        signum: int, handler: Callable[[int, FrameType | None], object] | int | None
+    ) -> Callable[[int, FrameType | None], object] | int | None:
+        calls.append(signum)
+        masks.append(real_sigmask(signal.SIG_BLOCK, ()))
+        return real_signal(signum, handler)
+
+    def sigmask(how: int, mask: Iterable[int]) -> set[int | signal.Signals]:
+        if how == signal.SIG_BLOCK and set(stop_signals) <= set(mask):
+            blocks.append(len(calls))
+            if len(blocks) == 2:  # The first attempt to hold them back again, after the run.
+                if changes:
+                    real_sigmask(how, mask)
+                raise stop("block")
+        return set(real_sigmask(how, mask))
+
+    monkeypatch.setattr(runner.signal, "signal", set_handler)
+    monkeypatch.setattr(runner.signal, "pthread_sigmask", sigmask)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    try:
+        with pytest.raises(stop) as raised:
+            runner.run_commands(((sys.executable, "-c", "pass"),), logs)
+        monkeypatch.undo()
+        left_mask = real_sigmask(signal.SIG_BLOCK, ())
+        left_handlers = {signum: signal.getsignal(signum) for signum in stop_signals}
+    finally:  # Whatever the result, the rest of the suite gets this process back as it was.
+        monkeypatch.undo()
+        for signum, handler in own.items():
+            real_signal(signum, handler)
+        real_sigmask(signal.SIG_SETMASK, caller_mask)
+
+    assert blocks == [0, len(stop_signals), len(stop_signals)]
+    assert calls == [*stop_signals, *stop_signals]
+    assert all(mask == caller_mask | set(stop_signals) for mask in masks)
+    assert left_handlers == own
+    assert left_mask == caller_mask
+    assert type(raised.value) is stop
+    assert str(raised.value) == "block"
+    captured = capsys.readouterr()
+    assert _attached(raised.value, captured.err) == []
+    assert "=== mapped lifecycle shard" not in captured.out
+
+
+@pytest.mark.parametrize("python", ("3.11", "3.10"))
+def test_each_later_failure_is_attached_to_the_first_once_with_its_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], python: str
+) -> None:
+    """The first failure is returned to be raised; each later one, however often it was raised,
+    is attached once, in order, as a note carrying its traceback, or on Python 3.10, which has no
+    notes, printed to stderr at once."""
+
+    if python == "3.10":
+        monkeypatch.setattr(sys, "version_info", (3, 10, 0))
+    elif sys.version_info < (3, 11):
+        pytest.skip("exception notes need Python 3.11")
+    failures: list[BaseException] = []
+    for message in ("first", "second", "third"):
+        try:
+            raise _CallerStop(message)
+        except _CallerStop as exc:
+            failures.append(exc)
+    first, second, third = failures
+
+    result = runner._first_of([first, second, third, second])
+    later = _attached(result, capsys.readouterr().err)
+    notes: list[str] = getattr(result, "__notes__", [])
+    monkeypatch.undo()
+
+    assert result is first
+    assert later == [_line(_CallerStop, "second"), _line(_CallerStop, "third")]
+    if python == "3.11":
+        assert all('raise _CallerStop(message)' in note for note in notes)
+    assert runner._first_of([third]) is third
 
 
 def test_a_caller_that_already_blocks_signals_keeps_them_blocked_during_and_after_the_run(

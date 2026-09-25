@@ -18,7 +18,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+import traceback
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from types import FrameType
 from typing import NoReturn
@@ -67,9 +68,10 @@ _KILL_SECONDS = 5.0
 # bytecode, which no Python code can guard against (see "Note on Signal Handlers and Exceptions"
 # in the signal module's documentation), so it can leave the recorder or the mask in place.
 _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
-# How many times, at most, each of the caller's handlers is put back.  A call that raises may or may
-# not have changed the handler first, so one whose call raised is tried again.  A call that raises
-# every time leaves that handler as it was, and the first exception still reaches the caller.
+# How many times, at most, each of the caller's handlers is put back, and its mask.  A call that
+# raises may or may not have changed the handler or the mask first (both are Python functions, and a
+# pending handler can raise as one is entered), so one whose call raised is tried again.  A call
+# that raises every time leaves that handler, or the mask, as it was, and still reaches the caller.
 _PUT_BACK_ATTEMPTS = 3
 # Nothing can catch a SIGKILL of the runner itself, as a supervisor that kills the caller's process
 # group sends, so each shard leader is also told to receive a signal when the runner dies.  A mapped
@@ -283,9 +285,17 @@ def run_commands(
     """Run every shard concurrently and report every result before failing.
 
     Leaves the caller's signal handlers and mask as it found them, whatever stop signals arrive,
-    and even if a call that blocks or unblocks them, installs a handler or puts one back raises.
-    That holds only for a single-threaded caller, and not if the caller's own handler for some
-    other signal raises between two of those calls: see _STOP_SIGNALS.
+    and even if a call that blocks or unblocks them, installs a handler or puts one back raises:
+    each call that puts a handler or the mask back is tried again, up to _PUT_BACK_ATTEMPTS calls
+    in all, and one that raises every time leaves that handler, or the mask, as it was.  That holds
+    only for a single-threaded caller, and not if the caller's own handler for some other signal
+    raises at the wrong moment: see _STOP_SIGNALS.
+
+    When more than one thing goes wrong, the first is what the caller gets: an exception raised
+    first, or the exit for a stop signal received first, with each later exception, such as one
+    from putting the handlers back, attached to it (see _first_of).  A failure to put the handlers
+    back that nothing came before is raised as soon as it happens, without the shards' report: a
+    report that raised would put a later failure in front of it.
     """
 
     processes: list[subprocess.Popen[bytes]] = []
@@ -308,15 +318,15 @@ def run_commands(
         for signum in _STOP_SIGNALS:
             previous[signum] = signal.getsignal(signum)
             signal.signal(signum, signals.record)
-    except BaseException:
-        try:
-            _put_back(previous)
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
-        raise
+    except BaseException as exc:
+        fault = exc
+    if fault is not None:
+        raise _first_of([fault, *_restore(previous, caller_mask, blocked=True)])
+    # What stopping the run raised, or unblocking the stop signals: later than any fault.
+    escaped: BaseException | None = None
     try:
         # Unblocking runs pending handlers too, and the recorders are all installed by now, so it
-        # happens inside the try whose finally puts every handler back.
+        # happens inside the try after which every handler goes back.
         signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
         try:
             for index, command in enumerate(commands):
@@ -357,20 +367,13 @@ def run_commands(
             _stop_shards(
                 processes, groups, signals, _INTERRUPT_GRACE_SECONDS if forward else 0.0, forward
             )
-    finally:
-        # Every shard has ended or been sent SIGKILL, so a signal may now act as the caller
-        # arranged: even one that interrupts a report blocked on a full pipe cannot orphan anything.
-        # Stop signals are held back while handlers change, so none acts on a half-changed set;
-        # and the caller's handlers and mask come back even if a handler raises out of the call
-        # that holds them back.  If putting one handler back raises, every other one still goes
-        # back, that one is tried again, and the mask comes back too.
-        try:
-            signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)
-        finally:
-            try:
-                _put_back(previous)
-            finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
+    except BaseException as exc:
+        escaped = exc
+    # Every shard has ended or been sent SIGKILL, so a signal may now act as the caller arranged:
+    # even one that interrupts a report blocked on a full pipe cannot orphan anything.
+    cleanup = _restore(previous, caller_mask)
+    if escaped is not None:
+        raise _first_of([*([] if fault is None else [fault]), escaped, *cleanup])
     if interrupted:
         try:
             for index, process in enumerate(processes):
@@ -387,8 +390,12 @@ def run_commands(
         except (Exception, KeyboardInterrupt):
             pass  # A closed pipe or another Ctrl-C ends the report, not the reason for stopping.
         if fault is not None:
-            raise fault
-        _exit_for(signals.received[0])
+            raise _first_of([fault, *cleanup])
+        _exit_for(signals.received[0], cleanup)
+    if cleanup:
+        if signals.received:  # It came after the last shard ended, before the handlers went back.
+            _exit_for(signals.received[0], cleanup)
+        raise _first_of(cleanup)
     returncodes = [process.wait() for process in processes]
     for index, (returncode, log) in enumerate(zip(returncodes, logs, strict=True)):
         _report_shard(
@@ -404,13 +411,51 @@ def run_commands(
 _Handler = Callable[[int, FrameType | None], object] | int | None
 
 
-def _put_back(handlers: Mapping[signal.Signals, _Handler]) -> None:
-    """Put back every one of handlers, even if putting one back raises.
+def _restore(
+    previous: Mapping[signal.Signals, _Handler],
+    caller_mask: Iterable[int],
+    *,
+    blocked: bool = False,
+) -> list[BaseException]:
+    """Put back the caller's handlers, then its mask; return what raised, in order, raising nothing.
 
-    A handler whose call raised is tried again, up to _PUT_BACK_ATTEMPTS calls in all, and then
-    the first exception is raised, so it still reaches the caller.
+    Stop signals are held back while the handlers change, so none acts on a half-changed set; if
+    blocked, the caller has held them back already.  Each step runs even if the one before it
+    raised, as a handler may raise out of the call that holds the stop signals back, and unblocking
+    them runs any pending handler of the caller's own.  Both mask calls are tried again if they
+    raise, as putting a handler back is: making either again changes nothing it already changed.
     """
-    first: BaseException | None = None
+    failures: list[BaseException] = []
+    if not blocked:
+        failures.extend(_retried(lambda: signal.pthread_sigmask(signal.SIG_BLOCK, _STOP_SIGNALS)))
+    failures.extend(_put_back(previous))
+    failures.extend(_retried(lambda: signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)))
+    return failures
+
+
+def _retried(call: Callable[[], object]) -> list[BaseException]:
+    """Make call, and again each time it raises, up to _PUT_BACK_ATTEMPTS calls in all.
+
+    Returns what raised, in order.
+    """
+
+    failures: list[BaseException] = []
+    for _attempt in range(_PUT_BACK_ATTEMPTS):
+        try:
+            call()
+        except BaseException as exc:
+            failures.append(exc)
+        else:
+            break
+    return failures
+
+
+def _put_back(handlers: Mapping[signal.Signals, _Handler]) -> list[BaseException]:
+    """Put back every one of handlers, even if putting one back raises; return what raised.
+
+    A handler whose call raised is tried again, up to _PUT_BACK_ATTEMPTS calls in all.
+    """
+    failures: list[BaseException] = []
     remaining = dict(handlers)
     for _attempt in range(_PUT_BACK_ATTEMPTS):
         failed: dict[signal.Signals, _Handler] = {}
@@ -418,14 +463,36 @@ def _put_back(handlers: Mapping[signal.Signals, _Handler]) -> None:
             try:
                 signal.signal(signum, handler)
             except BaseException as exc:
-                if first is None:
-                    first = exc
+                failures.append(exc)
                 failed[signum] = handler
         remaining = failed
         if not remaining:
             break
-    if first is not None:
-        raise first
+    return failures
+
+
+def _first_of(failures: Sequence[BaseException]) -> BaseException:
+    """Return the first of failures, which are in the order they happened, with the rest attached.
+
+    Raising the last would leave the first only as its __context__, or lose it, though the first is
+    what went wrong.  Each later one (once, however often it was raised) is attached to the first
+    as a note carrying its traceback, which Python prints with the first.  Python 3.10 has no
+    notes, so there each is printed to stderr at once instead.
+    """
+    first = failures[0]
+    attached = [first]
+    for later in failures[1:]:
+        if any(later is known for known in attached):
+            continue
+        attached.append(later)
+        note = "Then, before that reached the caller, this was raised too:\n" + "".join(
+            traceback.format_exception(type(later), later, later.__traceback__)
+        )
+        if sys.version_info >= (3, 11):
+            first.add_note(note)
+        else:
+            print(note, file=sys.stderr, flush=True)
+    return first
 
 
 class _Signals:
@@ -450,10 +517,13 @@ class _Signals:
         return True
 
 
-def _exit_for(signum: int) -> NoReturn:
+def _exit_for(signum: int, later: Sequence[BaseException] = ()) -> NoReturn:
+    """Exit as for signum, with anything raised after it arrived attached (see _first_of)."""
+
+    exit_: BaseException = SystemExit(128 + signum)
     if signum == signal.SIGINT:
-        raise KeyboardInterrupt
-    raise SystemExit(128 + signum)
+        exit_ = KeyboardInterrupt()
+    raise _first_of([exit_, *later])
 
 
 def _signal_on_parent_death(parent: int, signum: int) -> Callable[[], None]:
