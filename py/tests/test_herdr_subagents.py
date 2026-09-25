@@ -34,6 +34,7 @@ class FakeManagedClient:
         self.fail_start = False
         self.custom_dies_after_report = False
         self.custom_fails_after_observation = False
+        self.custom_dies_during_recovery_commit = False
         self.custom_running = False
         self.custom_ready = True
         self.custom_at_idle_shell = True
@@ -131,6 +132,17 @@ class FakeManagedClient:
                 or not self.custom_running):
             raise HerdrUnavailable("custom harness recovery did not match")
         return self.custom_identity
+
+    def commit_recovered_pane_agent(
+        self, pane_id: str, kind: str, identity: CustomProcessIdentity,
+        commit: Callable[[], None],
+    ) -> None:
+        self.verify_custom_harness(pane_id, kind, identity)
+        commit()
+        if self.custom_dies_during_recovery_commit:
+            self.custom_dies_during_recovery_commit = False
+            self.custom_running = False
+        self.verify_custom_harness(pane_id, kind, identity)
 
     def report_pane_agent(self, pane_id: str, kind: str, state: str) -> None:
         assert state == "idle"
@@ -674,17 +686,7 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
             "worker", expected_token=str(started["token"]), expected_pid=201,
         )
 
-    original_report = fake.report_pane_agent
-    report_calls = 0
-
-    def fail_first_report(pane_id: str, kind: str, state: str) -> None:
-        nonlocal report_calls
-        report_calls += 1
-        if report_calls == 1:
-            raise HerdrUnavailable("transient report failure")
-        original_report(pane_id, kind, state)
-
-    monkeypatch.setattr(fake, "report_pane_agent", fail_first_report)
+    fake.custom_dies_during_recovery_commit = True
     with pytest.raises(AgentDeliveryError, match="after identity persistence"):
         manager.recover_start(
             "worker", expected_token=str(started["token"]),
@@ -693,6 +695,9 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
     partially_recovered = manager.get("worker")
     assert partially_recovered.lifecycle == "launch_failed"
     assert partially_recovered.custom_process_identity == fake.custom_identity
+    assert partially_recovered.pane_reported_by_agentctl is False
+
+    fake.custom_running = True
 
     recovered = manager.recover_start(
         "worker", expected_token=str(started["token"]),
@@ -703,6 +708,7 @@ def test_identityless_failed_muse_launch_requires_token_and_exact_pid_to_recover
     recovered_identity = cast(dict[str, object], recovered["custom_process_identity"])
     assert recovered_identity["pid"] == fake.custom_identity.pid
     assert manager.get("worker").error is None
+    assert manager.get("worker").pane_reported_by_agentctl is False
     assert fake.submitted == []
 
 
@@ -929,6 +935,23 @@ def test_agent_record_v2_has_one_tagged_launch_authority(
     ):
         assert duplicate not in stored
     assert manager.get("worker").arguments == started["arguments"]
+
+
+@pytest.mark.parametrize(
+    "collision",
+    ("launch_argv", "launch_profile", "argv", "profile", "adapter", "arguments"),
+)
+def test_agent_record_v2_extensions_cannot_shadow_launch_authority(
+    collision: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    path = manager.registry / "worker" / "agent.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["extensions"][collision] = ["replacement"]
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(AgentDeliveryError, match="invalid agent record extensions"):
+        manager.get("worker")
 
 
 def test_agent_record_v1_migrates_once_and_refuses_conflicting_argument_authorities(

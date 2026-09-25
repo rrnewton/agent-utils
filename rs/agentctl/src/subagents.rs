@@ -626,17 +626,14 @@ pub trait ManagedApi: AgentApi {
             "custom pane harness recovery is unavailable",
         ))
     }
-    /// Publish one pane-local custom harness status after identity verification.
-    fn report_pane_agent(
+    /// Commit recovered session state while its custom process stays pinned.
+    fn commit_recovered_pane_agent(
         &self,
-        _pane: &str,
-        _harness: &str,
-        _state: &str,
-    ) -> crate::error::Result<()> {
-        Err(crate::error::AdapterError::unavailable(
-            "custom pane harness reporting is unavailable",
-        ))
-    }
+        pane: &str,
+        harness: &str,
+        identity: &CustomProcessIdentity,
+        commit: &mut dyn FnMut() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()>;
     /// Require the configured custom harness in one exact foreground pane.
     fn verify_custom_harness(
         &self,
@@ -920,13 +917,14 @@ impl ManagedApi for HerdrClient {
             expected_pid,
         )
     }
-    fn report_pane_agent(
+    fn commit_recovered_pane_agent(
         &self,
         pane: &str,
         harness: &str,
-        state: &str,
+        identity: &CustomProcessIdentity,
+        commit: &mut dyn FnMut() -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
-        HerdrClient::report_pane_agent(self, pane, harness, state)
+        HerdrClient::commit_recovered_pane_agent(self, pane, harness, identity, commit)
     }
     fn verify_custom_harness(
         &self,
@@ -1346,6 +1344,22 @@ impl AgentRecord {
                             path.display()
                         ))
                     })?;
+                const LAUNCH_FIELDS: [&str; 14] = [
+                    "schema",
+                    "harness",
+                    "cwd",
+                    "adapter",
+                    "mode",
+                    "backend",
+                    "model",
+                    "resume",
+                    "profile",
+                    "argv",
+                    "environment_names",
+                    "runtime_home",
+                    "runtime_ownership",
+                    "executable",
+                ];
                 document.insert("schema".to_owned(), json!(1));
                 document.insert("harness".to_owned(), json!(launch.harness));
                 document.insert("cwd".to_owned(), json!(launch.cwd));
@@ -1379,7 +1393,19 @@ impl AgentRecord {
                 document.insert("launch_executable_device".to_owned(), device);
                 document.insert("launch_executable_inode".to_owned(), inode);
                 for (key, value) in extensions {
-                    if document.contains_key(&key) || key == "arguments" {
+                    if document.contains_key(&key)
+                        || LAUNCH_FIELDS.contains(&key.as_str())
+                        || matches!(
+                            key.as_str(),
+                            "arguments"
+                                | "launch_profile"
+                                | "launch_argv"
+                                | "launch_environment_names"
+                                | "launch_executable"
+                                | "launch_executable_device"
+                                | "launch_executable_inode"
+                        )
+                    {
                         return Err(fail(format!(
                             "invalid agent record extension {:?}: {}",
                             key,
@@ -3100,33 +3126,34 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         record.custom_process_identity = Some(identity.clone());
         self.save(&record)?;
         let final_check = (|| -> Result<()> {
-            self.client
-                .verify_custom_harness(&pane_id, &record.harness, Some(&identity))?;
             let screen = self.client.read(&pane_id, "visible", Some(200))?;
             if !muse_idle_composer(&screen) {
                 return Err(fail(
                     "start recovery found the exact Muse process but no verified idle composer",
                 ));
             }
+            let harness = record.harness.clone();
+            let mut commit = || -> crate::error::Result<()> {
+                // Custom process identity is the durable authority. Herdr's
+                // native agent label remains advisory and need not be
+                // published during crash recovery.
+                record.lifecycle = "running".to_owned();
+                record.error = None;
+                self.save(&record)
+                    .map_err(|error| crate::error::AdapterError::unavailable(error.to_string()))
+            };
             self.client
-                .verify_custom_harness(&pane_id, &record.harness, Some(&identity))?;
-            self.client
-                .report_pane_agent(&pane_id, &record.harness, "idle")?;
-            record.pane_reported_by_agentctl = true;
-            self.save(&record)?;
-            self.checked(&record)?;
+                .commit_recovered_pane_agent(&pane_id, &harness, &identity, &mut commit)?;
             Ok(())
         })();
         if let Err(error) = final_check {
+            record.lifecycle = "launch_failed".to_owned();
             record.error = Some(format!(
                 "start recovery failed after identity persistence: {error}"
             ));
             self.save(&record)?;
             return Err(fail(record.error.clone().expect("saved recovery error")));
         }
-        record.lifecycle = "running".to_owned();
-        record.error = None;
-        self.save(&record)?;
         self.status(agent_name)
     }
 
@@ -6099,8 +6126,8 @@ mod tests {
                     custom_reported: AtomicBool::new(false),
                     custom_alive: AtomicBool::new(false),
                     custom_dies_after_report: AtomicBool::new(false),
+                    custom_dies_during_recovery_commit: AtomicBool::new(false),
                     custom_fails_after_identity: AtomicBool::new(false),
-                    fail_custom_report_once: AtomicBool::new(false),
                     fail_custom_verify_once: AtomicBool::new(false),
                     custom_verify_calls: AtomicU64::new(0),
                     custom_ready: AtomicBool::new(true),
@@ -6237,8 +6264,8 @@ mod tests {
         custom_reported: AtomicBool,
         custom_alive: AtomicBool,
         custom_dies_after_report: AtomicBool,
+        custom_dies_during_recovery_commit: AtomicBool,
         custom_fails_after_identity: AtomicBool,
-        fail_custom_report_once: AtomicBool,
         fail_custom_verify_once: AtomicBool,
         custom_verify_calls: AtomicU64,
         custom_ready: AtomicBool,
@@ -6606,16 +6633,22 @@ mod tests {
                 ))
             }
         }
-        fn report_pane_agent(&self, _: &str, harness: &str, state: &str) -> AdapterResult<()> {
-            if self.fail_custom_report_once.swap(false, Ordering::Relaxed) {
-                return Err(AdapterError::unavailable("transient report failure"));
+        fn commit_recovered_pane_agent(
+            &self,
+            pane: &str,
+            harness: &str,
+            identity: &CustomProcessIdentity,
+            commit: &mut dyn FnMut() -> AdapterResult<()>,
+        ) -> AdapterResult<()> {
+            self.verify_custom_harness(pane, harness, Some(identity))?;
+            commit()?;
+            if self
+                .custom_dies_during_recovery_commit
+                .swap(false, Ordering::Relaxed)
+            {
+                self.custom_alive.store(false, Ordering::Relaxed);
             }
-            if harness != "muse" || state != "idle" {
-                return Err(AdapterError::unavailable("invalid custom harness report"));
-            }
-            self.custom_reported.store(true, Ordering::Relaxed);
-            self.started.store(true, Ordering::Relaxed);
-            Ok(())
+            self.verify_custom_harness(pane, harness, Some(identity))
         }
         fn verify_custom_harness(
             &self,
@@ -6983,7 +7016,7 @@ mod tests {
             .contains("did not match"));
         fixture
             .client
-            .fail_custom_report_once
+            .custom_dies_during_recovery_commit
             .store(true, Ordering::Relaxed);
         assert!(manager
             .recover_start(
@@ -6997,6 +7030,8 @@ mod tests {
         let partial = agent::read_private_json(&path).unwrap();
         assert_eq!(partial["lifecycle"], "launch_failed");
         assert_eq!(partial["custom_process_identity"]["pid"], 4242);
+        assert_eq!(partial["pane_reported_by_agentctl"], false);
+        fixture.client.custom_alive.store(true, Ordering::Relaxed);
         let recovered = manager
             .recover_start(
                 "worker",
@@ -7007,6 +7042,7 @@ mod tests {
         assert_eq!(recovered["lifecycle"], "running");
         assert!(recovered["probe_error"].is_null());
         assert_eq!(recovered["custom_process_identity"]["pid"], 4242);
+        assert_eq!(recovered["pane_reported_by_agentctl"], false);
         assert!(fixture.client.runs.lock().unwrap().is_empty());
     }
 
@@ -7358,6 +7394,31 @@ mod tests {
             fixture.manager().get("worker").unwrap()["arguments"],
             started["arguments"]
         );
+    }
+
+    #[test]
+    fn agent_record_v2_extensions_cannot_shadow_launch_authority() {
+        for collision in [
+            "launch_argv",
+            "launch_profile",
+            "argv",
+            "profile",
+            "adapter",
+            "arguments",
+        ] {
+            let fixture = Fixture::new();
+            fixture.start(None);
+            let path = fixture.root.join("registry/worker/agent.json");
+            let mut document = agent::read_private_json(&path).unwrap();
+            document["extensions"][collision] = json!(["replacement"]);
+            agent::atomic_json(&path, &document).unwrap();
+            assert!(fixture
+                .manager()
+                .load("worker")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid agent record extension"));
+        }
     }
 
     #[test]

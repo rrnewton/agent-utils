@@ -19,9 +19,11 @@ import json
 import os
 import re
 import secrets
+import select
 import signal
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -120,6 +122,7 @@ MIGRATION_READY_TIMEOUT_S: float = float(os.environ.get("SUBAGENTS_MIGRATION_REA
 # A brand-new agent whose runner has not yet recorded its pid is not reaped by
 # gc for this long, so `up` immediately followed by `status` cannot self-reap.
 STARTUP_GRACE_S: int = 20
+MAX_RUNTIME_REGISTRY_BYTES: int = 8 << 20
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _HERDR_TAB_ID_RE = re.compile(r"^w[^:]+:t[0-9]+$")
@@ -891,11 +894,44 @@ def _clear_legacy_sidecars(name: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _read_bounded_private_text(path: Path, limit: int, label: str) -> str:
+    """Read one regular private control file without an unbounded allocation."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise AgentOperationError("control_record_unavailable", f"cannot open {label}: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            raise AgentOperationError(
+                "control_record_invalid", f"{label} is not a regular file within {limit} bytes",
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while total <= limit:
+            block = os.read(descriptor, min(64 << 10, limit + 1 - total))
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+        if total > limit:
+            raise AgentOperationError(
+                "control_record_invalid", f"{label} exceeds {limit} bytes",
+            )
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeError as exc:
+        raise AgentOperationError("control_record_invalid", f"{label} is not UTF-8") from exc
+    finally:
+        os.close(descriptor)
+
+
 def _load_unlocked() -> tuple[dict[str, AgentRecord], bool]:
     if not REGISTRY.exists():
         return {}, False
     try:
-        raw = json.loads(REGISTRY.read_text())
+        raw = json.loads(_read_bounded_private_text(
+            REGISTRY, MAX_RUNTIME_REGISTRY_BYTES, "runtime registry",
+        ))
     except json.JSONDecodeError as exc:
         die(f"registry.json is corrupt ({exc}); inspect {REGISTRY} by hand")
     if not isinstance(raw, list):
@@ -1146,18 +1182,62 @@ def terminate_active_harness(rec: AgentRecord) -> bool:
         )
     if harness_state is ProcessLiveness.DEAD:
         return False
-    try:
-        if os.getpgid(harness.pid) != harness.pid:
-            raise AgentOperationError("harness_identity_changed", "active harness no longer owns its process group")
-        # Re-prove the full boot/start/image tuple immediately before signaling.
-        if runner_liveness(harness_record) is not ProcessLiveness.LIVE:
-            raise AgentOperationError(
-                "harness_identity_unknown", "active harness identity changed before teardown"
-            )
-        os.killpg(harness.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return False
-    return True
+    with _verified_pidfd(harness, "active harness teardown") as descriptor:
+        if descriptor is None:
+            return False
+        try:
+            if os.getpgid(harness.pid) != harness.pid:
+                raise AgentOperationError(
+                    "harness_identity_changed",
+                    "active harness no longer owns its process group",
+                )
+            # Freeze the exact leader through its pidfd before addressing the
+            # process group by numeric PGID. Keeping the pidfd open prevents
+            # that leader generation from being confused with a reused PID;
+            # stopping it also prevents it from forking between proof and kill.
+            _pidfd_signal(descriptor, signal.SIGSTOP)
+            deadline = time.monotonic() + 0.5
+            while True:
+                if not _pidfd_live(descriptor):
+                    return False
+                try:
+                    state, started_at = _read_process_state_start(harness.pid)
+                except (FileNotFoundError, ProcessLookupError):
+                    return False
+                except (OSError, UnicodeError, ValueError) as exc:
+                    raise AgentOperationError(
+                        "harness_identity_unknown",
+                        f"cannot observe stopped harness leader: {exc}",
+                    ) from exc
+                if started_at != str(harness.starttime_ticks):
+                    raise AgentOperationError(
+                        "harness_identity_changed",
+                        "active harness identity changed before group teardown",
+                    )
+                if state in ("T", "t"):
+                    break
+                if time.monotonic() >= deadline:
+                    raise AgentOperationError(
+                        "harness_identity_unknown",
+                        "active harness did not enter a stopped state before group teardown",
+                    )
+                time.sleep(0.01)
+            if os.getpgid(harness.pid) != harness.pid:
+                raise AgentOperationError(
+                    "harness_identity_changed",
+                    "active harness no longer owns its process group",
+                )
+            os.killpg(harness.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return False
+        except BaseException:
+            # Do not strand a proven live process if the group action itself
+            # cannot be completed. This signal is also generation-safe.
+            if _pidfd_live(descriptor):
+                with contextlib.suppress(ProcessLookupError, AgentOperationError):
+                    _pidfd_signal(descriptor, signal.SIGCONT)
+            raise
+        return True
 
 
 def transcript_path(name: str) -> Path:
@@ -1600,6 +1680,94 @@ def runner_liveness(rec: AgentRecord) -> ProcessLiveness:
         legacy_pid=rec.runner_pid,
         legacy_started_at=rec.runner_started_at,
     )
+
+
+def _pidfd_live(descriptor: int) -> bool:
+    """Observe exit on one already pinned Linux process generation."""
+    poller = select.poll()
+    poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+    while True:
+        try:
+            return not poller.poll(0)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise AgentOperationError(
+                "runner_liveness_unknown", f"cannot inspect pinned process: {exc}",
+            ) from exc
+
+
+def _wait_pidfd_exit(descriptor: int, timeout: float) -> bool:
+    """Wait a bounded interval for the exact pidfd generation to exit."""
+    poller = select.poll()
+    poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return not _pidfd_live(descriptor)
+        try:
+            return bool(poller.poll(max(1, int(remaining * 1000))))
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise AgentOperationError(
+                "runner_liveness_unknown", f"cannot wait for pinned process: {exc}",
+            ) from exc
+
+
+def _pidfd_signal(descriptor: int, signum: int) -> None:
+    """Signal exactly the process generation held by ``descriptor``."""
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if sender is None:
+        raise AgentOperationError(
+            "runner_identity_unknown", "safe process teardown requires Linux pidfd signaling",
+        )
+    try:
+        sender(descriptor, signum, None, 0)
+    except ProcessLookupError:
+        raise
+    except OSError as exc:
+        raise AgentOperationError(
+            "runner_signal_failed", f"cannot signal pinned process: {exc}",
+        ) from exc
+
+
+@contextlib.contextmanager
+def _verified_pidfd(
+    identity: RunnerIdentity, operation: str,
+) -> Iterator[Optional[int]]:
+    """Keep a pidfd open from the last identity proof through any signal."""
+    opener = getattr(os, "pidfd_open", None)
+    if opener is None:
+        raise AgentOperationError(
+            "runner_identity_unknown", f"safe {operation} requires Linux pidfds",
+        )
+    try:
+        descriptor = opener(identity.pid, 0)
+    except ProcessLookupError:
+        yield None
+        return
+    except OSError as exc:
+        raise AgentOperationError(
+            "runner_identity_unknown", f"cannot pin process for {operation}: {exc}",
+        ) from exc
+    try:
+        if not _pidfd_live(descriptor):
+            yield None
+            return
+        state = process_identity_liveness(identity)
+        if state is ProcessLiveness.DEAD or not _pidfd_live(descriptor):
+            yield None
+            return
+        if state is ProcessLiveness.UNKNOWN:
+            raise AgentOperationError(
+                "runner_liveness_unknown",
+                f"cannot verify complete process identity for {operation}",
+            )
+        yield descriptor
+    finally:
+        os.close(descriptor)
 
 
 def require_live_runner(rec: AgentRecord, operation: str) -> None:
@@ -2255,41 +2423,20 @@ def break_runner_pane_to_window(rec: AgentRecord) -> Optional[str]:
 
 def terminate_runner_identity(identity: RunnerIdentity, grace: float = 2.0) -> bool:
     """Stop a matching process identity with a bounded graceful shutdown and kill fallback."""
-    state = process_identity_liveness(identity)
-    if state is ProcessLiveness.DEAD:
-        return False
-    if state is ProcessLiveness.UNKNOWN:
-        raise AgentOperationError(
-            "runner_liveness_unknown",
-            "cannot verify complete runner identity before teardown",
-        )
-    try:
-        os.kill(identity.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
-        state = process_identity_liveness(identity)
-        if state is ProcessLiveness.DEAD:
-            return True
-        if state is ProcessLiveness.UNKNOWN:
-            raise AgentOperationError(
-                "runner_liveness_unknown",
-                "runner identity became unobservable during teardown",
-            )
-        time.sleep(0.1)
-    final_state = process_identity_liveness(identity)
-    if final_state is ProcessLiveness.UNKNOWN:
-        raise AgentOperationError(
-            "runner_liveness_unknown",
-            "runner identity became unobservable before forced teardown",
-        )
-    if final_state is ProcessLiveness.LIVE:
+    with _verified_pidfd(identity, "runner teardown") as descriptor:
+        if descriptor is None:
+            return False
         try:
-            os.kill(identity.pid, signal.SIGKILL)
+            _pidfd_signal(descriptor, signal.SIGTERM)
         except ProcessLookupError:
+            return False
+        if _wait_pidfd_exit(descriptor, grace):
             return True
-    return True
+        try:
+            _pidfd_signal(descriptor, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return True
 
 
 def terminate_runner(rec: AgentRecord, grace: float = 2.0) -> bool:

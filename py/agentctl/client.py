@@ -97,9 +97,7 @@ def muse_trust_prompt(screen: str) -> bool:
 def muse_idle_composer(screen: str) -> bool:
     """Recognize Muse's idle composer without mistaking a choice prompt for it."""
     regions = _muse_composer_regions(screen)
-    return regions is not None and any(
-        line.strip() in ("❯", "›") for line in regions[1].splitlines()
-    )
+    return regions is not None and regions[1].strip() in ("❯", "›")
 
 
 def _muse_text_visible(screen: str, text: str) -> bool:
@@ -123,7 +121,6 @@ def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
         return None
     top, bottom = dividers[-2:]
     footer = lines[bottom + 1:]
-    old_footer = any("Auto-review" in line for line in footer)
     current_status = next((line.strip() for line in footer if line.strip()), "")
     status_fields = [field.strip() for field in current_status.split("·")]
     current_footer = (
@@ -132,9 +129,9 @@ def _muse_composer_regions(screen: str) -> tuple[str, str] | None:
         and len(status_fields) in (3, 4)
         and all(status_fields)
         and _MUSE_EFFORT.fullmatch(status_fields[1]) is not None
-        and (len(status_fields) == 3 or status_fields[3] == "YOLO")
+        and (len(status_fields) == 3 or status_fields[3] in ("YOLO", "Auto-review"))
     )
-    if not old_footer and not current_footer:
+    if not current_footer:
         return None
     return "\n".join(lines[:top]), "\n".join(lines[top + 1:bottom])
 
@@ -1230,6 +1227,46 @@ class HerdrClient:
         if second != first:
             raise HerdrUnavailable("custom harness identity changed during recovery")
         return first
+
+    def commit_recovered_pane_agent(
+        self, pane_id: str, kind: str, identity: CustomProcessIdentity,
+        commit: Callable[[], None],
+    ) -> None:
+        """Publish recovered state while one pidfd pins the verified process."""
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            raise HerdrUnavailable("custom harness recovery requires Linux pidfds")
+        try:
+            descriptor = opener(identity.pid, 0)
+        except OSError as exc:
+            raise HerdrUnavailable(
+                f"cannot pin recovered custom process {identity.pid}: {exc}"
+            ) from exc
+        poller = select.poll()
+        poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
+        try:
+            if poller.poll(0):
+                raise HerdrUnavailable(
+                    "recovered custom harness exited before state publication"
+                )
+            self.verify_custom_harness(pane_id, kind, identity)
+            commit()
+            if poller.poll(0):
+                raise HerdrUnavailable(
+                    "recovered custom harness exited during state publication"
+                )
+            self.verify_custom_harness(pane_id, kind, identity)
+            if poller.poll(0):
+                raise HerdrUnavailable(
+                    "recovered custom harness exited after state publication"
+                )
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                raise HerdrUnavailable(
+                    f"cannot close recovered custom process pidfd: {exc}"
+                ) from exc
 
     def agent_pane(
         self, name: str, *, timeout: float = CONTROL_TIMEOUT_SECONDS,

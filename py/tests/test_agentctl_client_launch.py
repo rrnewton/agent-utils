@@ -189,6 +189,7 @@ def test_current_muse_footer_does_not_turn_a_choice_into_an_idle_composer() -> N
         "  kiki_gb300_mxfp8_6p2_840_nwr · xhigh · /work/project · YOLO\n"
     )
     assert not muse_idle_composer(screen)
+    assert not muse_idle_composer(screen.replace("❯ Yes, continue\n  No, exit", "❯\n  pending text"))
 
 
 def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
@@ -212,7 +213,10 @@ def test_custom_muse_launch_retries_transient_null_process_argv() -> None:
             return subprocess.CompletedProcess(argv, 0, json.dumps(output), "")
         if argv[1:3] == ["pane", "read"]:
             return subprocess.CompletedProcess(
-                argv, 0, "────────────────\n❯\n────────────────\nAuto-review\n", "",
+                argv, 0,
+                "Muse Code 1.4.0\n────────────────\n❯\n────────────────\n"
+                "watermelon-preview · xhigh · /work/project · Auto-review\n",
+                "",
             )
         return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -286,6 +290,16 @@ def test_custom_muse_launch_rejects_bare_prompt_without_idle_footer() -> None:
     assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
 
 
+def test_custom_muse_launch_rejects_auto_review_without_versioned_header() -> None:
+    client, calls = _custom_runner(
+        "────────────────\n❯\n────────────────\n"
+        "watermelon-preview · xhigh · /work/project · Auto-review\n"
+    )
+    with pytest.raises(HerdrUnavailable, match="verified idle composer"):
+        client.start_pane_agent("worker", "muse", "p1", (), timeout=0.01)
+    assert not any(call[1:3] == ["pane", "report-agent"] for call in calls)
+
+
 def test_custom_harness_missing_executable_is_a_refusal() -> None:
     client = HerdrClient(herdr_bin="fixture-herdr", run=Runner({}))
     with pytest.raises(HerdrUnavailable, match="not found"):
@@ -342,6 +356,44 @@ def test_custom_harness_rejects_matching_report_when_kernel_executable_differs(
     )
     with pytest.raises(HerdrUnavailable, match="not the foreground process"):
         client.verify_custom_harness("p1", "muse")
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_recovered_publication_detects_exit_after_commit_through_pinned_pidfd() -> None:
+    executable = os.path.realpath("/usr/bin/sleep")
+    process = subprocess.Popen([executable, "30"], start_new_session=True)
+    try:
+        observed = HerdrClient._process_identity(process.pid)
+        assert observed is not None
+        identity, process_group, _path = observed
+        response = {"result": {"process_info": {
+            "pane_id": "p1", "shell_pid": 1,
+            "foreground_process_group_id": process_group,
+            "foreground_processes": [{
+                "pid": process.pid, "name": "sleep", "cmdline": executable,
+                "argv": [executable, "30"], "executable": executable,
+            }],
+        }}}
+
+        def run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, json.dumps(response), "")
+
+        client = HerdrClient(herdr_bin="fixture-herdr", run=run)
+        committed = False
+
+        def commit() -> None:
+            nonlocal committed
+            committed = True
+            process.kill()
+            process.wait(timeout=5)
+
+        with pytest.raises(HerdrUnavailable, match="exited"):
+            client.commit_recovered_pane_agent("p1", "muse", identity, commit)
+        assert committed
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")

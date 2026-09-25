@@ -1415,11 +1415,13 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
         ("drain", "foreign", *_COMMON),
         75,
     )
-    snapshots: list[dict[str, object]] = [
-        cast(dict[str, object], _normalize(
-            _queue_snapshot(root, "registry/foreign/queue")
-        ))
+    raw_snapshots = [
+        _queue_snapshot(root, "registry/foreign/queue")
         for root in (case.python_root, case.rust_root)
+    ]
+    snapshots: list[dict[str, object]] = [
+        cast(dict[str, object], _normalize(snapshot))
+        for snapshot in raw_snapshots
     ]
     immutable_after_drain = [
         {
@@ -1521,7 +1523,7 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
                 == immutable_after_drain[index]["agent.json"]
             and _queue_snapshot(
                 list((root / "registry/archive").glob("*"))[0], "queue"
-            ) == snapshots[index]
+            ) == raw_snapshots[index]
             for index, root in enumerate((case.python_root, case.rust_root))
         ),
         "explicit recovery changed legacy record/queue bytes or mutated its runtime",

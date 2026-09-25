@@ -16,6 +16,7 @@ from typing import Iterator
 import pytest
 
 from agentctl import worker_rpc
+from agentctl.client import CustomProcessIdentity
 from agentctl.foreign import agent_runner, lib
 
 
@@ -796,7 +797,7 @@ def test_harness_cleanup_refuses_changed_ownership(
     fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch, changed: str,
 ) -> None:
     rec = _install_agy_agent(fake_runner_state, "ownership")
-    runner = lib.CustomProcessIdentity(
+    runner = CustomProcessIdentity(
         version=1, boot_id="11111111-2222-3333-4444-555555555555",
         pid=22, starttime_ticks=100, executable_device=3, executable_inode=4,
     )
@@ -824,6 +825,15 @@ def test_harness_cleanup_refuses_changed_ownership(
             else lib.ProcessLiveness.DEAD
         ),
     )
+    @contextlib.contextmanager
+    def pinned(_identity: lib.RunnerIdentity, _operation: str) -> Iterator[int | None]:
+        yield 91
+    monkeypatch.setattr(lib, "_verified_pidfd", pinned)
+    monkeypatch.setattr(lib, "_pidfd_signal", lambda *_args: None)
+    monkeypatch.setattr(lib, "_pidfd_live", lambda _descriptor: True)
+    monkeypatch.setattr(
+        lib, "_read_process_state_start", lambda _pid: ("T", str(harness.starttime_ticks)),
+    )
     monkeypatch.setattr(os, "getpgid", lambda pid: pid + 1 if changed == "process_group" else pid)
     monkeypatch.setattr(os, "killpg", lambda *_args: pytest.fail("changed ownership was signaled"))
     if changed == "process_group":
@@ -831,6 +841,92 @@ def test_harness_cleanup_refuses_changed_ownership(
             lib.terminate_active_harness(rec)
     else:
         assert not lib.terminate_active_harness(rec)
+
+
+def test_runner_teardown_keeps_pidfd_authority_through_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = CustomProcessIdentity(
+        version=1, boot_id="11111111-2222-3333-4444-555555555555",
+        pid=4242, starttime_ticks=9001, executable_device=3, executable_inode=4,
+    )
+    events: list[tuple[str, int]] = []
+    live = True
+    monkeypatch.setattr(os, "pidfd_open", lambda pid, flags: 77)
+    monkeypatch.setattr(
+        lib, "process_identity_liveness",
+        lambda observed: lib.ProcessLiveness.LIVE if observed == identity else pytest.fail(
+            "wrong process generation was verified"
+        ),
+    )
+    monkeypatch.setattr(lib, "_pidfd_live", lambda descriptor: live)
+
+    def pinned_signal(descriptor: int, signum: int) -> None:
+        nonlocal live
+        assert descriptor == 77
+        events.append(("signal", signum))
+        live = False
+
+    monkeypatch.setattr(lib, "_pidfd_signal", pinned_signal)
+    monkeypatch.setattr(
+        os, "kill", lambda *_args: pytest.fail("numeric PID signaling reintroduced"),
+    )
+    monkeypatch.setattr(os, "close", lambda descriptor: events.append(("close", descriptor)))
+    assert lib.terminate_runner_identity(identity, grace=0.0)
+    assert events == [("signal", signal.SIGTERM), ("close", 77)]
+
+
+def test_harness_group_signal_happens_while_leader_pidfd_is_open(
+    fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = _install_agy_agent(fake_runner_state, "pinned-group")
+    runner = CustomProcessIdentity(
+        version=1, boot_id="11111111-2222-3333-4444-555555555555",
+        pid=4241, starttime_ticks=9000, executable_device=3, executable_inode=4,
+    )
+    harness = replace(runner, pid=4242, starttime_ticks=9001, executable_inode=5)
+    rec.runner_pid = runner.pid
+    rec.runner_started_at = str(runner.starttime_ticks)
+    rec.runner_identity = runner
+    (lib.agent_dir(rec.name) / "active-harness.json").write_text(json.dumps({
+        "schema": "agentctl-active-harness/v2",
+        "runner": asdict(runner),
+        "harness": asdict(harness),
+    }))
+    events: list[tuple[str, int]] = []
+    closed = False
+    monkeypatch.setattr(
+        lib, "process_identity_liveness", lambda _identity, **_kwargs: lib.ProcessLiveness.LIVE,
+    )
+    monkeypatch.setattr(os, "pidfd_open", lambda pid, flags: 77)
+    monkeypatch.setattr(lib, "_pidfd_live", lambda descriptor: True)
+    monkeypatch.setattr(
+        lib, "_read_process_state_start", lambda _pid: ("T", str(harness.starttime_ticks)),
+    )
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(
+        lib, "_pidfd_signal", lambda descriptor, signum: events.append(("pidfd", signum)),
+    )
+
+    def kill_group(process_group: int, signum: int) -> None:
+        assert not closed, "pidfd was closed before numeric process-group signal"
+        assert process_group == harness.pid
+        events.append(("group", signum))
+
+    def close(descriptor: int) -> None:
+        nonlocal closed
+        assert descriptor == 77
+        closed = True
+        events.append(("close", descriptor))
+
+    monkeypatch.setattr(os, "killpg", kill_group)
+    monkeypatch.setattr(os, "close", close)
+    assert lib.terminate_active_harness(rec)
+    assert events == [
+        ("pidfd", signal.SIGSTOP),
+        ("group", signal.SIGKILL),
+        ("close", 77),
+    ]
 
 
 def test_stop_marker_preserves_active_turn_grace_period(fake_runner_state: Path) -> None:

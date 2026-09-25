@@ -109,12 +109,24 @@ struct PinnedHarnessExecutable {
     inode: u64,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct LiveCustomProcess {
     identity: CustomProcessIdentity,
     process_group_id: u64,
     executable_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    pidfd: OwnedFd,
 }
+
+impl PartialEq for LiveCustomProcess {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.process_group_id == other.process_group_id
+            && self.executable_path == other.executable_path
+    }
+}
+
+impl Eq for LiveCustomProcess {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaneProcessState {
@@ -321,6 +333,7 @@ fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
         },
         process_group_id: stat_before.0,
         executable_path: executable_path_before,
+        pidfd,
     })
 }
 
@@ -637,11 +650,7 @@ pub(crate) fn muse_trust_prompt(screen: &str) -> bool {
 }
 
 pub(crate) fn muse_idle_composer(screen: &str) -> bool {
-    muse_composer_regions(screen).is_some_and(|(_, composer)| {
-        composer
-            .lines()
-            .any(|line| matches!(line.trim(), "❯" | "›"))
-    })
+    muse_composer_regions(screen).is_some_and(|(_, composer)| matches!(composer.trim(), "❯" | "›"))
 }
 
 fn muse_text_visible(screen: &str, text: &str) -> bool {
@@ -677,7 +686,6 @@ fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
     let bottom = *dividers.last()?;
     let top = *dividers.get(dividers.len().checked_sub(2)?)?;
     let footer = &lines[bottom + 1..];
-    let old_footer = footer.iter().any(|line| line.contains("Auto-review"));
     let status_fields = footer
         .iter()
         .find_map(|line| {
@@ -697,8 +705,8 @@ fn muse_composer_regions(screen: &str) -> Option<(String, String)> {
     }) && matches!(status_fields.len(), 3 | 4)
         && status_fields.iter().all(|field| !field.is_empty())
         && muse_effort(status_fields[1])
-        && (status_fields.len() == 3 || status_fields[3] == "YOLO");
-    if !old_footer && !current_footer {
+        && (status_fields.len() == 3 || matches!(status_fields[3], "YOLO" | "Auto-review"));
+    if !current_footer {
         return None;
     }
     Some((lines[..top].join("\n"), lines[top + 1..bottom].join("\n")))
@@ -1277,7 +1285,7 @@ impl HerdrClient {
         expected_device: u64,
         expected_inode: u64,
         expected_pid: u64,
-    ) -> Result<CustomProcessIdentity> {
+    ) -> Result<LiveCustomProcess> {
         let (foreground_process_group_id, processes) =
             self.foreground_processes(pane_id, &|| false)?;
         let mut matches = processes
@@ -1316,15 +1324,15 @@ impl HerdrClient {
                 "custom harness recovery did not match the pinned executable and process group",
             ));
         }
-        Ok(observed.identity)
+        Ok(observed)
     }
 
-    fn recorded_custom_harness_observed(
+    fn recorded_custom_harness_process(
         &self,
         pane_id: &str,
         identity: &CustomProcessIdentity,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<bool> {
+    ) -> Result<Option<LiveCustomProcess>> {
         if !identity.valid() {
             return Err(AdapterError::unavailable(
                 "recorded custom process identity is invalid",
@@ -1348,11 +1356,23 @@ impl HerdrClient {
             }
         }
         if matches != 1 {
-            return Ok(false);
+            return Ok(None);
         }
         let observed = live_custom_process(identity.pid)?;
-        Ok(observed.process_group_id == foreground_process_group_id
+        Ok((observed.process_group_id == foreground_process_group_id
             && observed.identity == *identity)
+            .then_some(observed))
+    }
+
+    fn recorded_custom_harness_observed(
+        &self,
+        pane_id: &str,
+        identity: &CustomProcessIdentity,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<bool> {
+        Ok(self
+            .recorded_custom_harness_process(pane_id, identity, cancelled)?
+            .is_some())
     }
 
     /// Require the fixed-location custom harness executable in one exact foreground pane.
@@ -1727,28 +1747,52 @@ impl HerdrClient {
                 "custom harness identity changed during recovery",
             ));
         }
-        Ok(first)
+        Ok(first.identity)
     }
 
-    /// Publish the pane-local custom harness report after recovery verification.
-    pub fn report_pane_agent(&self, pane_id: &str, kind: &str, state: &str) -> Result<()> {
-        self.call_ok(
-            &strings(&[
-                "pane",
-                "report-agent",
-                pane_id,
-                "--source",
-                "agentctl",
-                "--agent",
-                kind,
-                "--state",
-                state,
-                "--message",
-                "agentctl custom harness",
-            ]),
-            &format!("report custom agent {pane_id}"),
-        )
+    /// Commit recovered session state while a pidfd pins the exact foreground process.
+    #[cfg(target_os = "linux")]
+    pub fn commit_recovered_pane_agent(
+        &self,
+        pane_id: &str,
+        kind: &str,
+        identity: &CustomProcessIdentity,
+        commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let observed = self
+            .recorded_custom_harness_process(pane_id, identity, &|| false)?
+            .ok_or_else(|| {
+                AdapterError::unavailable(format!(
+                    "custom harness {kind:?} is not the foreground process in pane {pane_id}"
+                ))
+            })?;
+        commit()?;
+        require_live_pidfd(&observed.pidfd, identity.pid)?;
+        if self
+            .recorded_custom_harness_process(pane_id, identity, &|| false)?
+            .is_none()
+        {
+            return Err(AdapterError::unavailable(format!(
+                "custom harness {kind:?} changed during state publication in pane {pane_id}"
+            )));
+        }
+        require_live_pidfd(&observed.pidfd, identity.pid)
     }
+
+    /// Recovery publication cannot be made generation-atomic without Linux pidfds.
+    #[cfg(not(target_os = "linux"))]
+    pub fn commit_recovered_pane_agent(
+        &self,
+        _pane_id: &str,
+        _kind: &str,
+        _identity: &CustomProcessIdentity,
+        _commit: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        Err(AdapterError::unavailable(
+            "custom harness recovery publication requires Linux pidfds",
+        ))
+    }
+
     /// Invoke and validate the corresponding Herdr agent-control operation.
     pub fn agent_pane(&self, name: &str) -> Result<String> {
         self.agent_pane_with_cancellation(name, &|| false)
@@ -2526,6 +2570,12 @@ mod tests {
         assert!(!muse_idle_composer(&format!(
             "{prefix}{divider}❯ Yes, continue\n  No, exit\n{divider}{footer}"
         )));
+        assert!(!muse_idle_composer(&format!(
+            "{prefix}{divider}❯\n  pending text\n{divider}{footer}"
+        )));
+        assert!(!muse_idle_composer(&format!(
+            "{divider}❯\n{divider}watermelon-preview · xhigh · /work/project · Auto-review\n"
+        )));
     }
 
     #[cfg(target_os = "linux")]
@@ -3269,6 +3319,38 @@ mod tests {
             .client()
             .verify_custom_harness("pane", "muse", Some(&identity))
             .expect("verification uses the recorded image, not the replaced pathname");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovered_publication_detects_exit_after_commit_through_pinned_pidfd() {
+        let herdr = FakeExecutable::new("{}");
+        let harness = herdr.root.join("muse");
+        install_test_elf("/bin/sleep", &harness);
+        let pinned = pin_harness_executable(harness.clone()).unwrap();
+        let mut process = spawn_test_process(&harness);
+        let pid = process.0.id();
+        herdr.set_response(&process_info_response(pid, &harness));
+        let identity = herdr
+            .client()
+            .custom_harness_observed("pane", &pinned, &|| false)
+            .unwrap()
+            .expect("observe original process");
+        let mut committed = false;
+        let mut commit = || {
+            committed = true;
+            process.0.kill().unwrap();
+            process.0.wait().unwrap();
+            Ok(())
+        };
+
+        let error = herdr
+            .client()
+            .commit_recovered_pane_agent("pane", "muse", &identity, &mut commit)
+            .unwrap_err();
+
+        assert!(committed);
+        assert!(error.to_string().contains("exited"));
     }
 
     #[cfg(target_os = "linux")]

@@ -633,8 +633,21 @@ class AgentRecord:
             if set(launch) != launch_fields or launch.get("schema") != _LAUNCH_SPEC_SCHEMA:
                 raise AgentDeliveryError(f"invalid agent record launch fields: {path}")
             extensions = document.get("extensions")
+            canonical_extension_fields = (
+                top_fields
+                | launch_fields
+                | {
+                    key for key, field_info in cls.__dataclass_fields__.items()
+                    if field_info.init
+                }
+                | {
+                    "arguments", "launch_profile", "launch_argv",
+                    "launch_environment_names", "launch_executable",
+                    "launch_executable_device", "launch_executable_inode",
+                }
+            )
             if not isinstance(extensions, dict) or any(
-                not isinstance(key, str) or key in top_fields or key in launch_fields
+                not isinstance(key, str) or key in canonical_extension_fields
                 for key in extensions
             ):
                 raise AgentDeliveryError(f"invalid agent record extensions: {path}")
@@ -1623,9 +1636,11 @@ class ManagedAgents:
                     "start recovery requires a launch_failed Muse interactive Herdr "
                     "record with complete launch intent and pane ownership"
                 )
+            pane_id = record.pane_id
+            assert pane_id is not None
             presentations = [
                 pane for pane in self.client.panes()
-                if pane.pane_id == record.pane_id
+                if pane.pane_id == pane_id
             ]
             if (len(presentations) != 1
                     or presentations[0].tab_id != record.tab_id
@@ -1633,8 +1648,8 @@ class ManagedAgents:
                 raise AgentDeliveryError(
                     "refusing start recovery: recorded pane, tab, or workspace ownership changed"
                 )
-            info = self.client.pane_info(record.pane_id)
-            if (info.pane_id != record.pane_id
+            info = self.client.pane_info(pane_id)
+            if (info.pane_id != pane_id
                     or info.workspace_id != record.workspace_id
                     or os.path.realpath(info.cwd) != os.path.realpath(record.cwd)
                     or info.agent not in (None, record.harness)):
@@ -1642,7 +1657,7 @@ class ManagedAgents:
                     "refusing start recovery: live pane identity or agent report changed"
                 )
             identity = self.client.recover_pane_agent(
-                record.pane_id, record.launch_argv,
+                pane_id, record.launch_argv,
                 record.launch_executable_device, record.launch_executable_inode,
                 expected_pid,
             )
@@ -1654,30 +1669,28 @@ class ManagedAgents:
             record.custom_process_identity = identity
             self._save(record)
             try:
-                self.client.verify_custom_harness(
-                    record.pane_id, record.harness, identity,
-                )
-                screen = self.client.read(
-                    record.pane_id, source="visible", lines=200,
-                )
-                if not muse_idle_composer(screen):
-                    raise HerdrUnavailable(
-                        "start recovery found the exact Muse process but no verified idle composer"
+                def commit_running() -> None:
+                    screen = self.client.read(
+                        pane_id, source="visible", lines=200,
                     )
-                self.client.verify_custom_harness(
-                    record.pane_id, record.harness, identity,
+                    if not muse_idle_composer(screen):
+                        raise HerdrUnavailable(
+                            "start recovery found the exact Muse process but no verified idle composer"
+                        )
+                    # The exact process identity, not Herdr's advisory native
+                    # label, is the durable authority for custom harnesses.
+                    record.lifecycle = "running"
+                    record.error = None
+                    self._save(record)
+
+                self.client.commit_recovered_pane_agent(
+                    pane_id, record.harness, identity, commit_running,
                 )
-                self.client.report_pane_agent(record.pane_id, record.harness, "idle")
-                record.pane_reported_by_agentctl = True
-                self._save(record)
-                self._checked(record)
             except HerdrRunError as exc:
+                record.lifecycle = "launch_failed"
                 record.error = f"start recovery failed after identity persistence: {exc}"
                 self._save(record)
                 raise AgentDeliveryError(record.error) from exc
-            record.lifecycle = "running"
-            record.error = None
-            self._save(record)
             return self._status_record(record)
 
     def _adopt_locked(
