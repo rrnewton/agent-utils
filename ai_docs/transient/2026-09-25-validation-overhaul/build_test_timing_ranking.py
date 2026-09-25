@@ -15,6 +15,8 @@ import json
 import math
 import os
 import re
+import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -217,11 +219,12 @@ def _read_junit(
 
 
 _NODEID_LINE = re.compile(r"^[^\s].*\.py::")
+_ABSOLUTE_POSIX_PATH = re.compile(r"(?:^|[\s=:\"'(])/(?!/)[^\s,;\")']+")
+_ABSOLUTE_WINDOWS_PATH = re.compile(r"(?:^|[\s=:\"'(])[A-Za-z]:[\\/]")
 
 
-def _collection_command(phase: PhaseInput) -> list[str]:
+def _collection_arguments(phase: PhaseInput) -> list[str]:
     return [
-        sys.executable,
         "-m",
         "pytest",
         "--collect-only",
@@ -233,6 +236,23 @@ def _collection_command(phase: PhaseInput) -> list[str]:
         "--rootdir=.",
         *phase.pytest_args,
     ]
+
+
+def _collection_command(phase: PhaseInput) -> list[str]:
+    # Execute with this process's interpreter so collection and ranking cannot silently use
+    # different environments. The provenance uses the portable spelling below and never records
+    # this often host- or vendor-specific absolute path.
+    return [sys.executable, *_collection_arguments(phase)]
+
+
+def _portable_collection_command(phase: PhaseInput) -> str:
+    return shlex.join(["python3", *_collection_arguments(phase)])
+
+
+def _public_python_version() -> str:
+    # sys.version and platform.python_version() may retain a downstream build suffix. The public
+    # language version is the numeric base represented independently by sys.version_info.
+    return f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
 
 def _collect_phase(phase: PhaseInput) -> set[str]:
@@ -584,9 +604,9 @@ def _verified_capture_snapshot() -> dict[str, object]:
             f"current={current.get('workspace_snapshot_sha256')}"
         )
     return {
-        "before_path": str(CAPTURE_SNAPSHOT_BEFORE),
+        "before_path": CAPTURE_SNAPSHOT_BEFORE.name,
         "before_recorded_at_utc": before.get("recorded_at_utc"),
-        "after_path": str(CAPTURE_SNAPSHOT_AFTER),
+        "after_path": CAPTURE_SNAPSHOT_AFTER.name,
         "after_recorded_at_utc": after.get("recorded_at_utc"),
         "pre_post_match": True,
         "junit_inputs_absent_before_capture": True,
@@ -651,6 +671,120 @@ def _atomic_write(path: Path, data: bytes) -> None:
             temporary.unlink()
 
 
+def _string_fields(value: object, path: str = "$") -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    if isinstance(value, str):
+        result.append((path, value))
+    elif isinstance(value, dict):
+        for key, nested in value.items():
+            result.extend(_string_fields(nested, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            result.extend(_string_fields(nested, f"{path}[{index}]"))
+    return result
+
+
+def _assert_public_provenance(provenance: dict[str, object]) -> None:
+    environment = provenance.get("environment")
+    if not isinstance(environment, dict):
+        raise ValueError("provenance environment must be an object")
+    python_version = environment.get("python")
+    if (
+        not isinstance(python_version, str)
+        or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", python_version) is None
+    ):
+        raise ValueError(
+            "provenance Python version must be a public numeric base version"
+        )
+
+    collection = provenance.get("collection_contract")
+    phases = collection.get("phases") if isinstance(collection, dict) else None
+    if not isinstance(phases, list):
+        raise ValueError("provenance collection phases must be a list")
+    for index, phase in enumerate(phases):
+        command = (
+            phase.get("live_collection_command") if isinstance(phase, dict) else None
+        )
+        if not isinstance(command, str) or shlex.split(command)[:3] != [
+            "python3",
+            "-m",
+            "pytest",
+        ]:
+            raise ValueError(
+                f"provenance collection phase {index} must use portable python3 -m pytest"
+            )
+
+    hostname = socket.gethostname()
+    runtime_identities = {
+        str(REPO_ROOT),
+        str(PY_ROOT),
+        str(Path.home()),
+        sys.executable,
+        sys.prefix,
+        sys.exec_prefix,
+        sys.base_prefix,
+        hostname,
+    }
+    if "." in hostname:
+        runtime_identities.add(hostname.split(".", 1)[0])
+    runtime_identities.update(
+        str(Path(value).resolve())
+        for value in tuple(runtime_identities)
+        if value.startswith("/")
+    )
+    runtime_identities.difference_update({"", "/", "."})
+    for field, value in _string_fields(provenance):
+        if _ABSOLUTE_POSIX_PATH.search(value) or _ABSOLUTE_WINDOWS_PATH.search(value):
+            raise ValueError(f"provenance field {field} contains an absolute path")
+        if any(identity in value for identity in runtime_identities):
+            raise ValueError(
+                f"provenance field {field} contains a runtime host identity"
+            )
+
+
+def _privacy_self_test() -> int:
+    commands = [_portable_collection_command(phase) for phase in PHASES]
+    for phase, command in zip(PHASES, commands, strict=True):
+        if shlex.split(command) != ["python3", *_collection_arguments(phase)]:
+            raise AssertionError("portable collection command changed meaning")
+        if _collection_command(phase)[0] != sys.executable:
+            raise AssertionError(
+                "live collection no longer uses the running interpreter"
+            )
+
+    provenance: dict[str, object] = {
+        "environment": {"python": _public_python_version()},
+        "collection_contract": {
+            "phases": [{"live_collection_command": command} for command in commands]
+        },
+        "source_snapshot": {
+            "before_path": CAPTURE_SNAPSHOT_BEFORE.name,
+            "after_path": CAPTURE_SNAPSHOT_AFTER.name,
+        },
+    }
+    _assert_public_provenance(provenance)
+
+    def expect_rejection(field: str, value: str) -> None:
+        candidate = json.loads(json.dumps(provenance))
+        if field == "python":
+            candidate["environment"]["python"] = value
+        else:
+            candidate[field] = value
+        try:
+            _assert_public_provenance(candidate)
+        except ValueError:
+            return
+        raise AssertionError(f"privacy check accepted the {field} regression fixture")
+
+    expect_rejection("python", f"{_public_python_version()}+vendor")
+    expect_rejection("absolute_path", "/private/toolchain/python3")
+    hostname = socket.gethostname()
+    if hostname:
+        expect_rejection("hostname", hostname)
+    print("build_test_timing_ranking --self-test: PASSED")
+    return 0
+
+
 def _provenance(
     timings: list[Timing],
     inputs: list[JunitInput],
@@ -675,7 +809,7 @@ def _provenance(
                     sum(item.suite_seconds for item in phase_inputs), 3
                 ),
                 "nodeid_set_sha256": _set_digest(captured_by_phase[phase.name]),
-                "live_collection_command": " ".join(_collection_command(phase)),
+                "live_collection_command": _portable_collection_command(phase),
                 "exact_capture_collection_equality": True,
             }
         )
@@ -683,7 +817,7 @@ def _provenance(
         {
             "phase": item.phase,
             "isolation": item.isolation,
-            "path": str(item.path),
+            "path": item.path.name,
             "bytes": item.path.stat().st_size,
             "sha256": _sha256_file(item.path),
             "cases": item.cases,
@@ -695,7 +829,7 @@ def _provenance(
         for item in inputs
     ]
     union = {item.nodeid for item in timings}
-    return {
+    provenance: dict[str, object] = {
         "schema": "agent-utils-validation-test-timing-provenance/v2",
         "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "privacy": {
@@ -704,7 +838,7 @@ def _provenance(
         },
         "source_snapshot": capture_snapshot,
         "environment": {
-            "python": sys.version.split()[0],
+            "python": _public_python_version(),
             "logical_cpus": os.cpu_count(),
             "note": "One shared-host census; use as a scheduling seed, not a stable benchmark.",
         },
@@ -783,6 +917,8 @@ def _provenance(
             "review-skip-contract": "Confirm the skip is an intentional platform contract, not absent coverage.",
         },
     }
+    _assert_public_provenance(provenance)
+    return provenance
 
 
 def main() -> int:
@@ -791,10 +927,26 @@ def main() -> int:
     parser.add_argument("--end", type=int)
     parser.add_argument("--header", action="store_true")
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--provenance-output", type=Path)
     parser.add_argument("--write-snapshot", type=Path)
     args = parser.parse_args()
+    if args.self_test:
+        if any(
+            value
+            for value in (
+                args.verify,
+                args.output is not None,
+                args.provenance_output is not None,
+                args.write_snapshot is not None,
+                args.header,
+                args.start != 0,
+                args.end is not None,
+            )
+        ):
+            parser.error("--self-test cannot be combined with other options")
+        return _privacy_self_test()
     if args.write_snapshot is not None:
         if any(
             value
