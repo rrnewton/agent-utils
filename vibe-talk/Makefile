@@ -10,7 +10,7 @@
 # The root one runs everything below by name, so the two cannot drift into different definitions of
 # what validating vibe-talk means.
 
-.PHONY: validate validate-boxed dag-check fmt check test page android-speech-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check test page pwa-installability android-speech-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -64,6 +64,13 @@ test:
 # of them is how the second comes to exist without ever being run.
 page:
 	node --test tests/js/*.test.mjs
+
+# A real current Chromium, speaking CDP. This validates the installability decision the DOM-only
+# page suite cannot make. It uses a loopback secure context by default; set VIBE_TALK_CHROMIUM to
+# inspect with a particular Chrome executable, or pass --url directly to the script for a deployed
+# server. It deliberately states that this is not physical-device launcher proof.
+pwa-installability:
+	python3 tests/pwa_installability.py
 
 # The physical-device run is opt-in, but its signal/language evaluator has offline negative
 # controls. Keep those controls in the ordinary gate so a broken harness cannot silently bless a

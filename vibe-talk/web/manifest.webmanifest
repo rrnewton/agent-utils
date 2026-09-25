@@ -5,6 +5,7 @@
   "description": "Read, hear, and reply to your chat messages.",
   "start_url": "/voice",
   "scope": "/",
+  "display_override": ["standalone"],
   "display": "browser",
   "background_color": "#152638",
   "icons": [
