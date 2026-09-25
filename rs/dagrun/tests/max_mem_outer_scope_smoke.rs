@@ -30,9 +30,9 @@ const OK_DAG: &str = r#"{"steps": [{"group": "g", "job": "ok", "cmd": "true"}]}"
 /// unambiguously the binding ceiling and the expected line is deterministic.
 const TINY_BUDGET_BYTES: i64 = 1024 * 1024;
 
-/// These tests exercise creation of a new outer systemd scope. The cargo-test process may itself
-/// run inside a parent dagrun's explicitly delegated step, so scrub that inherited one-step
-/// authority rather than accidentally testing the distinct adoption route.
+/// Build a controlled fresh-top-level invocation. The cargo-test process may itself run below a
+/// parent dagrun, so scrub inherited scope identity, one-step delegation, and ambient route knobs
+/// rather than accidentally selecting a parent-owned or operator-forced route.
 fn top_level_command(bin: &str) -> Command {
     let mut command = Command::new(bin);
     for name in [
@@ -40,6 +40,8 @@ fn top_level_command(bin: &str) -> Command {
         "DAGRUN_OUTER_RUN",
         "DAGRUN_DELEGATED_CGROUP",
         "DAGRUN_DELEGATED_UNBOXED",
+        "DAGRUN_DIRECT_CGROUP",
+        "DAGRUN_FORCE_SCOPE_ATTEMPT",
         "DAGRUN_SCOPE_UNIT",
         "DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES",
         "DAGRUN_EXPECTED_OUTER_CPU_COUNT",
@@ -69,6 +71,9 @@ fn max_mem_is_the_outer_scope_ceiling_the_run_announces() {
             "--max-mem",
             "1M",
         ])
+        // The announcement precedes scope bring-up. Select the explicit policy-skip route so this
+        // assertion cannot migrate out of an aggregate validator's delegated cgroup.
+        .env("CI", "1")
         .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");
@@ -76,6 +81,7 @@ fn max_mem_is_the_outer_scope_ceiling_the_run_announces() {
 
     let without_budget = top_level_command(bin)
         .args(["run", "--dag", dag.to_str().unwrap(), "-q", "--no-profile"])
+        .env("CI", "1")
         .env_remove("DAGRUN_OUTER_MEMORY_MAX_BYTES")
         .output()
         .expect("failed to spawn the built binary");

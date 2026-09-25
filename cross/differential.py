@@ -116,10 +116,12 @@ from herdr_differential import compare_herdr_run
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-#: Passed to every `run` comparison. Cgroup boxing is ON by default in both builds; this flag
-#: downgrades to the deterministic, environment-independent UNBOXED scheduling core so the two
-#: implementations are compared on identical observable behavior (boxing is proven separately).
-ACF = "--allow-cgroup-failure"
+#: Passed to every generic ``run`` comparison.  Those cases test scheduling semantics rather than
+#: cgroup setup, so select the deterministic unboxed core explicitly.  The weaker
+#: ``--allow-cgroup-failure`` is not equivalent on a capable or already-delegated host: it can
+#: remain boxed and make the harness's physical limits part of a synthetic fixture.  Cases that
+#: exercise boxing omit this flag and explicitly retain the outer runner authority instead.
+UNBOXED = "--unsafe-no-cgroups"
 
 #: Passed to every `run` comparison so the default auto-logging profile store (Feature D) does not
 #: write CSVs into the harness CWD during the differential; the scheduling behavior under test is
@@ -138,6 +140,60 @@ NOFB = "--no-profile-feedback"
 SYNTH_MACHINE = "cross_synth_machine"
 SYNTH_CONTAINER = "cross_synth_container"
 
+#: The one-hop nesting handshake granted to THIS differential by an outer dagrun.  It is not
+#: ambient configuration for the Python/Rust children it compares.
+#: Letting a generic child inherit them makes a synthetic ``--max-mem 64G`` planning case run as
+#: a nested scheduler inside this harness's much smaller step cgroup, so both engines correctly
+#: refuse the fixture and the differential reports dozens of false failures.  Explicit boxing
+#: cases opt back in via ``inherit_runner_authority=True`` so they remain below the parent-owned
+#: containment boundary rather than asking systemd to move into a sibling scope.  Ancestor-scope
+#: identity and expected-limit variables are deliberately NOT here: in a delegated child they
+#: describe the ancestor, while the delegated root itself is the live source of physical limits.
+_RUNNER_AUTHORITY_ENV = frozenset(
+    {
+        "DAGRUN_DELEGATED_CGROUP",
+        "DAGRUN_DELEGATED_UNBOXED",
+        "DAGRUN_OUTER_RUN",
+    }
+)
+
+#: Runner inputs that each synthetic case must state itself.  Unlike the authority set above,
+#: these are scrubbed even for a boxed case; an individual fixture can reintroduce one in ``extra``
+#: after the scrub when that variable is the behavior under test.  ``DAGRUN_STEP`` and
+#: ``DAGRUN_STEP_STARTED_MONOTONIC_NS`` are deliberately absent: they preserve the outer runner's
+#: process-tree ownership and deadline attribution across the harness's subprocess boundary.
+_AMBIENT_CASE_CONTROL_ENV = frozenset(
+    {
+        "DAGRUN_ADMISSION_BUDGET_BYTES",
+        "DAGRUN_ADMISSION_HEADROOM_BYTES",
+        "DAGRUN_CAPTURE_MAX_BYTES",
+        "DAGRUN_CONTAINER_CLASS",
+        "DAGRUN_COPIES",
+        "DAGRUN_COPY",
+        "DAGRUN_CORE_LEDGER",
+        "DAGRUN_CPU_TIMEOUT_MULTIPLIER",
+        "DAGRUN_CPU_TIMEOUT_PLATFORM",
+        "DAGRUN_DIRECT_CGROUP",
+        "DAGRUN_EXTRA_ARGS",
+        "DAGRUN_EXPECTED_OUTER_CPU_COUNT",
+        "DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES",
+        "DAGRUN_EXPECTED_RUNTIME_MAX_SEC",
+        "DAGRUN_FORCE_SCOPE_ATTEMPT",
+        "DAGRUN_IN_SCOPE",
+        "DAGRUN_JOBS_ENV",
+        "DAGRUN_LOG_DIR",
+        "DAGRUN_LOG_MAX_BYTES",
+        "DAGRUN_MEM_LEDGER",
+        "DAGRUN_NO_STEP_LOGS",
+        "DAGRUN_OUTER_MEMORY_MAX_BYTES",
+        "DAGRUN_PROFILE_DIR",
+        "DAGRUN_RESOURCE_CAPS_PATH",
+        "DAGRUN_RUN_TIMEOUT",
+        "DAGRUN_SCOPE_UNIT",
+        "DAGRUN_TEST_COUNTS_PATH",
+    }
+)
+
 _COUNTS_RE = re.compile(
     r"(\d+) passed, (\d+) failed, (\d+) aborted, "
     r"(\d+) intentionally skipped, (\d+) dependency-skipped, (\d+) not launched"
@@ -150,6 +206,10 @@ _SIZING_RE = re.compile(
 _SIZING_REFUSAL_RE = re.compile(
     r"REFUSED — minimum runnable footprint (\d+) bytes cannot fit safely within budget "
     r"(\d+) bytes"
+)
+_TERMINAL_STEP_DURATION_RE = re.compile(
+    r"(?m)^(\[[^\]\n]+\] [✓✗] (?:PASS|FAIL)\s+.+?) "
+    r"\([0-9]+s(, [^\n)]*)?\)$"
 )
 
 CPU_FOOTPRINT_GUEST = os.path.join(REPO_ROOT, "cross", "cpu_footprint_guest.py")
@@ -200,6 +260,12 @@ class Report:
     def bad(self, label: str, detail: str) -> None:
         self.checks += 1
         self.failures.append(f"{label}: {detail}")
+
+
+def _deterministic_run_output(output: str) -> str:
+    """Keep plan/run semantics while removing only volatile rounded terminal durations."""
+
+    return _TERMINAL_STEP_DURATION_RE.sub(r"\1 (<elapsed>\2)", output)
 
 
 # --------------------------------------------------------------------------- command wiring
@@ -330,15 +396,26 @@ def rs_command(tool: str) -> list[str]:
     raise FileNotFoundError(f"Rust artifact for {tool!r} would not stabilize: {last_error}")
 
 
-def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+def _env(
+    extra: Mapping[str, str] | None = None,
+    *,
+    inherit_runner_authority: bool = False,
+) -> dict[str, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.path.join(REPO_ROOT, "py") + os.pathsep + env.get("PYTHONPATH", "")
     # Deterministic, color-free output regardless of the runner's TTY state.
     env["NO_COLOR"] = "1"
-    # Rust and Python both support explicit evidence, but an ambient caller setting must not make
-    # unrelated differential cases write into one shared directory or gain extra banners.
-    env.pop("DAGRUN_LOG_DIR", None)
-    env.pop("DAGRUN_NO_STEP_LOGS", None)
+    # An outer validation DAG may deliberately delegate a bounded cgroup to THIS harness.  The
+    # hundreds of synthetic child invocations are independent top-level inputs, however: they
+    # must not mistake the harness's one-hop authority or 2.5-GiB physical ceiling for fixture
+    # input.  A handful of tests intentionally exercise boxing; those retain authority explicitly
+    # so they stay inside the parent-owned cgroup.  Policy knobs remain opt-in per fixture in both
+    # modes, and ``extra`` is applied last for exactly that reason.
+    if not inherit_runner_authority:
+        for name in _RUNNER_AUTHORITY_ENV:
+            env.pop(name, None)
+    for name in _AMBIENT_CASE_CONTROL_ENV:
+        env.pop(name, None)
     # Same reasoning, for the operator's build width. Both engines resolve intent from these two
     # variables in the OUTERMOST process, which here is the differential's own child — so a
     # developer who happens to export CARGO_BUILD_JOBS makes every case run under a width nobody
@@ -347,12 +424,10 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     # which is applied after these pops.
     env.pop("CARGO_BUILD_JOBS", None)
     env.pop("DAGRUN_OPERATOR_BUILD_JOBS", None)
-    env.pop("DAGRUN_JOBS_ENV", None)
     # Profile identity overrides belong only to the fixtures that set them explicitly. Ambient
     # values could make a writer emit one filename while a reader searches another and let an
     # interoperability check pass vacuously on two empty summaries.
     env.pop("DAGRUN_MACHINE_ID", None)
-    env.pop("DAGRUN_CONTAINER_CLASS", None)
     # The retired spelling must not make a differential case accidentally pass.
     env.pop("SAFE_CI_DAG_RUNNER_JOBS_ENV", None)
     if extra:
@@ -375,6 +450,7 @@ def run(
     extra_env: Mapping[str, str] | None = None,
     *,
     timeout_s: float = 120.0,
+    inherit_runner_authority: bool = False,
 ) -> Outcome:
     started = time.monotonic()
     try:
@@ -382,7 +458,10 @@ def run(
             [*cmd, *args],
             capture_output=True,
             text=True,
-            env=_env(extra_env),
+            env=_env(
+                extra_env,
+                inherit_runner_authority=inherit_runner_authority,
+            ),
             start_new_session=True,
             check=False,
             timeout=timeout_s,
@@ -1523,7 +1602,7 @@ def compare_selected_behavior(py: list[str], rs: list[str], rep: Report) -> None
             ),
         )
         for label, extra, expected_exit, expected_nodes in cases:
-            args = ("run", "--dag", path, "-q", *extra, NOPROF, NOFB, ACF)
+            args = ("run", "--dag", path, "-q", *extra, NOPROF, NOFB, UNBOXED)
             po = run(py, args)
             ro = run(rs, args)
             pc, rc = _counts(po.stderr), _counts(ro.stderr)
@@ -2028,7 +2107,7 @@ def compare_run_timeout(py: list[str], rs: list[str], rep: Report) -> None:
                 cmd,
                 (
                     "run", "--dag", dag, "-q", "-s", "1", "-j", "1", NOPROF, NOFB,
-                    ACF, "--run-timeout", "6",
+                    UNBOXED, "--run-timeout", "6",
                 ),
             )
 
@@ -2125,7 +2204,10 @@ def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
                 )
             return pid_file, run(
                 cmd,
-                ("run", "--dag", dag_path, "-q", "-s", "1", "-j", "1", NOPROF, NOFB, ACF),
+                (
+                    "run", "--dag", dag_path, "-q", "-s", "1", "-j", "1",
+                    NOPROF, NOFB, UNBOXED,
+                ),
             )
 
         pid_files: list[str] = []
@@ -2563,6 +2645,7 @@ def compare_box_subcommand(py: list[str], rs: list[str], rep: Report) -> None:
                 *hostile,
             ),
             {"DAGRUN_PROFILE_DIR": os.path.join(tempfile.gettempdir(), "cross-box")},
+            inherit_runner_authority=True,
         )
         for name, cmd in (("py", py), ("rs", rs))
     }
@@ -2952,13 +3035,12 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # passed/aborted split, which depends on which in-flight step is cancelled first, so
         # only the exit code is compared here.
         #
-        # All `run` comparisons pass --allow-cgroup-failure: cgroup-v2 boxing is ON by default in
-        # BOTH builds, but boxing is environment-dependent and cannot be asserted byte-identically
-        # here (see cross/README.md). The flag makes both builds run the SAME observable UNBOXED
-        # scheduling core deterministically, regardless of whether the host can box. Boxing itself
-        # is proven by each build's own tests (Python pytest + the Rust boxing smoke test).
+        # All generic `run` comparisons explicitly select --unsafe-no-cgroups: cgroup-v2 boxing is
+        # environment-dependent and cannot be asserted byte-identically here (see cross/README.md).
+        # This makes both builds run the SAME observable UNBOXED scheduling core even when the
+        # differential itself was given a delegated cgroup. Dedicated cases below exercise boxing.
         concurrent_args = (
-            "run", "--dag", dag_path, "-q", "-s", "4", "-j", "64", NOPROF, NOFB, ACF,
+            "run", "--dag", dag_path, "-q", "-s", "4", "-j", "64", NOPROF, NOFB, UNBOXED,
         )
         po = run(py, concurrent_args)
         ro = run(rs, concurrent_args)
@@ -2978,7 +3060,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # work, so both builds account for EVERY node rather than leaving a race-dependent tail in
         # the not-launched bucket.)
         serial_args = (
-            "run", "--dag", dag_path, "-q", "-s", "1", "-j", "64", "-k", NOPROF, NOFB, ACF,
+            "run", "--dag", dag_path, "-q", "-s", "1", "-j", "64", "-k", NOPROF, NOFB,
+            UNBOXED,
         )
         po = run(py, serial_args)
         ro = run(rs, serial_args)
@@ -2995,8 +3078,20 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
 
         # 5) --max-mem sizing decision, when the fixture supplies a budget.
         if fx.max_mem is not None:
-            po = run(py, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, NOFB, ACF))
-            ro = run(rs, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, NOFB, ACF))
+            po = run(
+                py,
+                (
+                    "run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem,
+                    NOPROF, NOFB, UNBOXED,
+                ),
+            )
+            ro = run(
+                rs,
+                (
+                    "run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem,
+                    NOPROF, NOFB, UNBOXED,
+                ),
+            )
             label = f"{fx.name}/sizing"
             ps, rss = _sizing(po.stderr), _sizing(ro.stderr)
             prefusal, rrefusal = _sizing_refusal(po.stderr), _sizing_refusal(ro.stderr)
@@ -3022,7 +3117,7 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
             tag, expected_nodes = selection
             selected_args = (
                 "run", "--dag", dag_path, "-q", "-s", "1", "-j", "64", "--selected", tag,
-                NOPROF, NOFB, ACF,
+                NOPROF, NOFB, UNBOXED,
             )
             po = run(py, selected_args)
             ro = run(rs, selected_args)
@@ -3597,8 +3692,18 @@ def compare_profile_timeseries_trace(py: list[str], rs: list[str], rep: Report) 
             )
         extra = {"DAGRUN_NO_STEP_LOGS": "1", "DAGRUN_FORCE_SCOPE_ATTEMPT": "1"}
         outcomes = {
-            "py": run(py, args_for(stores["py"]), extra),
-            "rs": run(rs, args_for(stores["rs"]), extra),
+            "py": run(
+                py,
+                args_for(stores["py"]),
+                extra,
+                inherit_runner_authority=True,
+            ),
+            "rs": run(
+                rs,
+                args_for(stores["rs"]),
+                extra,
+                inherit_runner_authority=True,
+            ),
         }
         unavailable = {
             name: _boxing_capability_unavailable(outcome) for name, outcome in outcomes.items()
@@ -3894,13 +3999,13 @@ def compare_plan_feedback(py: list[str], rs: list[str], rep: Report) -> None:
         po = run(
             py,
             ("run", "--dag", dag_path, "-q", "-k", "--max-mem", "8G", "--perf-dir", store,
-             NOPROF, ACF),
+             NOPROF, UNBOXED),
             extra,
         )
         ro = run(
             rs,
             ("run", "--dag", dag_path, "-q", "-k", "--max-mem", "8G", "--perf-dir", store,
-             NOPROF, ACF),
+             NOPROF, UNBOXED),
             extra,
         )
         ps, rss = _sizing(po.stderr), _sizing(ro.stderr)
@@ -4428,10 +4533,13 @@ def compare_speedup_model(py: list[str], rs: list[str], rep: Report) -> None:
             if po.returncode != ro.returncode or po.returncode != 0:
                 rep.bad(label, f"py={po}\nrs={ro}")
                 continue
-            if po.stdout != ro.stdout:
+            py_output = _deterministic_run_output(po.stdout)
+            rs_output = _deterministic_run_output(ro.stdout)
+            if py_output != rs_output:
                 rep.bad(
                     label,
-                    f"budgeted --show-plan differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}",
+                    "budgeted --show-plan or semantic run output differs\n"
+                    f"--- py ---\n{py_output}\n--- rs ---\n{rs_output}",
                 )
                 continue
             table = po.stdout.partition("parallel-speedup model")[2]
@@ -5431,8 +5539,8 @@ def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
             fh.write('{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}')
         bad_jobs = ("abc", "3..1", "0..2", "1..x")
         for spec in bad_jobs:
-            po = run(py, ("sweep", "--dag", path, "--step", "g.j", "--jobs", spec, ACF))
-            ro = run(rs, ("sweep", "--dag", path, "--step", "g.j", "--jobs", spec, ACF))
+            po = run(py, ("sweep", "--dag", path, "--step", "g.j", "--jobs", spec, UNBOXED))
+            ro = run(rs, ("sweep", "--dag", path, "--step", "g.j", "--jobs", spec, UNBOXED))
             label = f"sweep-jobs-error:{spec}"
             if po.returncode != ro.returncode:
                 rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
@@ -5464,6 +5572,7 @@ def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
             )
         args = (
             "sweep", "--dag", fixed, "--step", "g.fixed", "--jobs", "1..2", NOPROF,
+            UNBOXED,
         )
         po = run(py, args, {"SELF_MANAGED_MARKER": marker["py"]})
         ro = run(rs, args, {"SELF_MANAGED_MARKER": marker["rs"]})
@@ -5638,7 +5747,9 @@ def compare_sweep_success(py: list[str], rs: list[str], rep: Report) -> None:
                 },
                 handle,
             )
-        args = ("sweep", "--dag", path, "--step", "g.j", "--jobs", "1..2", NOPROF, ACF)
+        args = (
+            "sweep", "--dag", path, "--step", "g.j", "--jobs", "1..2", NOPROF, UNBOXED,
+        )
         po = run(py, args)
         try:
             with open(observed, encoding="utf-8") as handle:
@@ -7242,7 +7353,10 @@ def compare_operator_build_width(py: list[str], rs: list[str], rep: Report) -> N
             ("unstated", {}, "no CARGO_BUILD_JOBS in the environment"),
         ):
             env = {**base, **extra_env}
-            outcomes = {"py": run(py, args, env), "rs": run(rs, args, env)}
+            outcomes = {
+                "py": run(py, args, env, inherit_runner_authority=True),
+                "rs": run(rs, args, env, inherit_runner_authority=True),
+            }
             label = f"operator-build-width:{leg}"
             if all(_boxing_capability_unavailable(out) for out in outcomes.values()):
                 print(
@@ -7357,7 +7471,12 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                             "CARGO_BUILD_JOBS": "8",
                         }
                     )
-                outcomes[name] = run(command, args, env)
+                outcomes[name] = run(
+                    command,
+                    args,
+                    env,
+                    inherit_runner_authority=boxed,
+                )
                 observed[name] = output.read_text(encoding="utf-8") if output.exists() else None
 
             check = f"jobs-env:{label}"
@@ -7406,7 +7525,12 @@ def compare_jobs_env_width(py: list[str], rs: list[str], rep: Report) -> None:
                 }
                 if boxed:
                     env["DAGRUN_FORCE_SCOPE_ATTEMPT"] = "1"
-                outcomes[name] = run(command, args, env)
+                outcomes[name] = run(
+                    command,
+                    args,
+                    env,
+                    inherit_runner_authority=boxed,
+                )
                 spawned[name] = output.exists()
 
             check = f"jobs-env:{label}"
@@ -7528,7 +7652,20 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
             }
             for name, path in logs.items()
         }
-        outcomes = {"py": run(py, args, extra["py"]), "rs": run(rs, args, extra["rs"])}
+        outcomes = {
+            "py": run(
+                py,
+                args,
+                extra["py"],
+                inherit_runner_authority=True,
+            ),
+            "rs": run(
+                rs,
+                args,
+                extra["rs"],
+                inherit_runner_authority=True,
+            ),
+        }
         unavailable = {name: _boxing_capability_unavailable(out) for name, out in outcomes.items()}
         if all(unavailable.values()):
             print(
@@ -7598,17 +7735,35 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok("pin-run:nonpositive-refused")
         else:
             rep.bad("pin-run:nonpositive-refused", f"py={po}\nrs={ro}")
+        delegated = _inside_delegated_harness()
         valid = ("pin-run", "--cores", "1", "--", "true")
-        po, ro = run(py, valid, extra), run(rs, valid, extra)
-        if po.returncode == ro.returncode == 0:
-            rep.ok("pin-run:reserve-apply-release")
-        elif po.returncode == ro.returncode == 3 and "HARD" in po.stderr and "HARD" in ro.stderr:
-            rep.ok("pin-run:hard-capability-unavailable-refused")
-        else:
-            rep.bad(
-                "pin-run:reserve-apply-release",
-                f"expected both 0; py={po.returncode} rs={ro.returncode}\npy:{po.stderr}\nrs:{ro.stderr}",
+        if delegated:
+            # pin-run currently creates a transient systemd scope directly; unlike `run`, it has
+            # no delegated-root execution path.  Invoking that from a parent-owned validation
+            # cgroup could migrate the command into a sibling scope and escape the outer step's
+            # ownership.  Its live cross-engine HARD-pin behavior remains covered by standalone
+            # differential runs on a capable host; do not weaken containment to repeat it here.
+            print(
+                "cross[dagrun]: SKIP pin-run live execution: the differential is itself "
+                "inside a parent-owned delegated cgroup; tracked by #28 delegated-cpuset"
             )
+            rep.ok("pin-run:delegated-parent-safety-skip")
+        else:
+            po, ro = run(py, valid, extra), run(rs, valid, extra)
+            if po.returncode == ro.returncode == 0:
+                rep.ok("pin-run:reserve-apply-release")
+            elif (
+                po.returncode == ro.returncode == 3
+                and "HARD" in po.stderr
+                and "HARD" in ro.stderr
+            ):
+                rep.ok("pin-run:hard-capability-unavailable-refused")
+            else:
+                rep.bad(
+                    "pin-run:reserve-apply-release",
+                    f"expected both 0; py={po.returncode} rs={ro.returncode}\n"
+                    f"py:{po.stderr}\nrs:{ro.stderr}",
+                )
 
         missing_exec = ("pin-run", "--cores", "1", "--", "/definitely/missing/command")
         po, ro = run(py, missing_exec, extra), run(rs, missing_exec, extra)
@@ -7626,13 +7781,18 @@ def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
             "-c",
             "import os; os.kill(os.getpid(), 15)",
         )
-        po, ro = run(py, signaled, extra), run(rs, signaled, extra)
-        if po.returncode == ro.returncode == 143:
-            rep.ok("pin-run:signal-status")
-        elif po.returncode == ro.returncode == 3 and "HARD" in po.stderr and "HARD" in ro.stderr:
-            rep.ok("pin-run:signal-status-hard-capability-unavailable")
-        else:
-            rep.bad("pin-run:signal-status", f"py={po}\nrs={ro}")
+        if not delegated:
+            po, ro = run(py, signaled, extra), run(rs, signaled, extra)
+            if po.returncode == ro.returncode == 143:
+                rep.ok("pin-run:signal-status")
+            elif (
+                po.returncode == ro.returncode == 3
+                and "HARD" in po.stderr
+                and "HARD" in ro.stderr
+            ):
+                rep.ok("pin-run:signal-status-hard-capability-unavailable")
+            else:
+                rep.bad("pin-run:signal-status", f"py={po}\nrs={ro}")
 
 
 def compare_dagrun(rand_count: int, seed: int) -> int:
@@ -7831,6 +7991,13 @@ def compare_cpuset_alloc() -> int:
     py = py_command_for(tool)
     rs = rs_command(tool)
     rep = Report()
+    live_scope_allowed = not _inside_delegated_harness()
+    if not live_scope_allowed:
+        print(
+            "cross[cpuset-alloc]: SKIP live systemd-scope cases: the differential is itself "
+            "inside a parent-owned delegated cgroup; tracked by #28 delegated-cpuset"
+        )
+        rep.ok("live-scope:delegated-parent-safety-skip")
 
     _record_exact(rep, "version", py, rs, ("--version",))
     for args, required in (
@@ -7874,26 +8041,27 @@ def compare_cpuset_alloc() -> int:
         else:
             rep.bad(f"irq-budget:nonzero-sample:{budget_args[0]}", f"py={po}\nrs={ro}")
 
-    selftest_args = ("selftest", "--cores", "1", "--sample-s", "0")
-    py_selftest = run(py, selftest_args)
-    rs_selftest = run(rs, selftest_args)
-    py_ok, py_value = _parsed_json(py_selftest.stdout)
-    rs_ok, rs_value = _parsed_json(rs_selftest.stdout)
-    py_verdict = py_value.get("verdict") if py_ok and isinstance(py_value, dict) else None
-    rs_verdict = rs_value.get("verdict") if rs_ok and isinstance(rs_value, dict) else None
-    if (
-        py_selftest.returncode == rs_selftest.returncode
-        and py_selftest.returncode in (0, 1, 3)
-        and py_verdict == rs_verdict
-        and isinstance(py_verdict, str)
-    ):
-        rep.ok("selftest:mutation-verdict")
-    else:
-        rep.bad(
-            "selftest:mutation-verdict",
-            f"py={py_selftest.returncode}:{py_value!r}; "
-            f"rs={rs_selftest.returncode}:{rs_value!r}",
-        )
+    if live_scope_allowed:
+        selftest_args = ("selftest", "--cores", "1", "--sample-s", "0")
+        py_selftest = run(py, selftest_args)
+        rs_selftest = run(rs, selftest_args)
+        py_ok, py_value = _parsed_json(py_selftest.stdout)
+        rs_ok, rs_value = _parsed_json(rs_selftest.stdout)
+        py_verdict = py_value.get("verdict") if py_ok and isinstance(py_value, dict) else None
+        rs_verdict = rs_value.get("verdict") if rs_ok and isinstance(rs_value, dict) else None
+        if (
+            py_selftest.returncode == rs_selftest.returncode
+            and py_selftest.returncode in (0, 1, 3)
+            and py_verdict == rs_verdict
+            and isinstance(py_verdict, str)
+        ):
+            rep.ok("selftest:mutation-verdict")
+        else:
+            rep.bad(
+                "selftest:mutation-verdict",
+                f"py={py_selftest.returncode}:{py_value!r}; "
+                f"rs={rs_selftest.returncode}:{rs_value!r}",
+            )
 
     with tempfile.TemporaryDirectory(prefix="cpuset-cross-") as tmp:
         py_ledger = os.path.join(tmp, "py.json")
@@ -8038,7 +8206,7 @@ def compare_cpuset_alloc() -> int:
 
         # Each implementation must be able to observe the other's LIVE reservation, choose a
         # disjoint core, and leave the shared ledger empty after both wrapped commands exit.
-        if len(os.sched_getaffinity(0)) >= 2:
+        if live_scope_allowed and len(os.sched_getaffinity(0)) >= 2:
             assignment_re = re.compile(r'reserved (\{"cores":\[[^]]*\],"count":\d+\})')
 
             def reserved_cores(stderr: str) -> set[int] | None:
@@ -8183,23 +8351,24 @@ def compare_cpuset_alloc() -> int:
     for label, invalid_args in invalid_invocations:
         _record_same_exit(rep, label, py, rs, invalid_args, 2)
 
-    # A wrapped command's own help flag belongs to that command, not the allocator.
-    help_args = ("run", "--cores", "1", "--", "printf", "%s\\n", "--help")
-    po, ro = run(py, help_args), run(rs, help_args)
-    if (
-        po.returncode == ro.returncode == 0
-        and po.stdout.endswith("--help\n")
-        and ro.stdout.endswith("--help\n")
-    ):
-        rep.ok("run:wrapped-help-passthrough")
-    elif (
-        po.returncode == ro.returncode == 3
-        and "HARD" in po.stderr
-        and "HARD" in ro.stderr
-    ):
-        rep.ok("run:wrapped-help-hard-capability-unavailable")
-    else:
-        rep.bad("run:wrapped-help-passthrough", f"py={po}\nrs={ro}")
+    if live_scope_allowed:
+        # A wrapped command's own help flag belongs to that command, not the allocator.
+        help_args = ("run", "--cores", "1", "--", "printf", "%s\\n", "--help")
+        po, ro = run(py, help_args), run(rs, help_args)
+        if (
+            po.returncode == ro.returncode == 0
+            and po.stdout.endswith("--help\n")
+            and ro.stdout.endswith("--help\n")
+        ):
+            rep.ok("run:wrapped-help-passthrough")
+        elif (
+            po.returncode == ro.returncode == 3
+            and "HARD" in po.stderr
+            and "HARD" in ro.stderr
+        ):
+            rep.ok("run:wrapped-help-hard-capability-unavailable")
+        else:
+            rep.bad("run:wrapped-help-passthrough", f"py={po}\nrs={ro}")
 
     missing_exec = ("run", "--cores", "1", "--", "/definitely/missing/command")
     po, ro = run(py, missing_exec), run(rs, missing_exec)
@@ -8221,13 +8390,18 @@ def compare_cpuset_alloc() -> int:
         "-c",
         "import os; os.kill(os.getpid(), 15)",
     )
-    po, ro = run(py, signaled), run(rs, signaled)
-    if po.returncode == ro.returncode == 143:
-        rep.ok("run:signal-status")
-    elif po.returncode == ro.returncode == 3 and "HARD" in po.stderr and "HARD" in ro.stderr:
-        rep.ok("run:signal-status-hard-capability-unavailable")
-    else:
-        rep.bad("run:signal-status", f"py={po}\nrs={ro}")
+    if live_scope_allowed:
+        po, ro = run(py, signaled), run(rs, signaled)
+        if po.returncode == ro.returncode == 143:
+            rep.ok("run:signal-status")
+        elif (
+            po.returncode == ro.returncode == 3
+            and "HARD" in po.stderr
+            and "HARD" in ro.stderr
+        ):
+            rep.ok("run:signal-status-hard-capability-unavailable")
+        else:
+            rep.bad("run:signal-status", f"py={po}\nrs={ro}")
     _record_same_exit(rep, "cli:abbreviation-refused", py, rs, ("status", "--ledg", "x"), 2)
     _record_same_exit(rep, "unknown-command", py, rs, ("not-a-command",), 2)
 

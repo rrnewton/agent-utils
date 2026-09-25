@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -195,12 +196,18 @@ def test_status_and_reclaim_json(tmp_path: Path, capsys: pytest.CaptureFixture[s
 @pytest.mark.skipif(not shutil.which("systemd-run"), reason="systemd-run not installed")
 def test_selftest_verdict_is_hard_when_systemd_available(
     capsys: pytest.CaptureFixture[str],
+    inherited_runner_authority_env: Mapping[str, str],
 ) -> None:
     """If a systemd user scope works here, the mutation self-test must conclude
     HARD: the child's escape to an excluded core is masked and the spinners stay
     inside the reserved set. If systemd is present but a user scope cannot be
     created (some CI images), the tool reports UNTESTABLE — accept that, don't
     assert a false HARD."""
+    if inherited_runner_authority_env:
+        pytest.skip(
+            "live systemd scope would escape the parent-owned delegated validation cgroup; "
+            "tracked by #28 delegated-cpuset"
+        )
     k = 2 if len(os.sched_getaffinity(0)) >= 3 else 1
     rc = ca.main(["selftest", "--cores", str(k), "--sample-s", "0.05"])
     out = json.loads(capsys.readouterr().out)

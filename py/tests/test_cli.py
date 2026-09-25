@@ -2457,7 +2457,9 @@ def test_unsafe_no_cgroups_deliberately_skips_boxing() -> None:
         assert "cgroup boxing ACTIVE" not in result.stderr
 
 
-def test_boxed_run_enforces_cpu_timeout() -> None:
+def test_boxed_run_enforces_cpu_timeout(
+    inherited_runner_authority_env: Mapping[str, str],
+) -> None:
     # Behavioral parity anchor for the Rust `cpu_timeout_smoke.rs`: prove the DEFAULT boxed run
     # actually ENFORCES a per-step CPU-time budget. A step that busy-loops forever with a tiny
     # cpu_timeout must be reaped as a CPU-TIMEOUT well before its (much larger) wall timeout.
@@ -2479,7 +2481,7 @@ def test_boxed_run_enforces_cpu_timeout() -> None:
              "-q", "--no-profile"],
             capture_output=True,
             text=True,
-            env=dict(os.environ),
+            env={**os.environ, **inherited_runner_authority_env},
         )
         if proc.returncode == 3:
             pytest.skip(
@@ -2497,7 +2499,9 @@ def test_boxed_run_enforces_cpu_timeout() -> None:
         )
 
 
-def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:
+def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work(
+    inherited_runner_authority_env: Mapping[str, str],
+) -> None:
     # Plant both sides of the forcing default through the real cgroup path. Each command first
     # reads its own cpu.max, so a pass/failure cannot be attributed to merely configuring the
     # model without applying the one-core quota in the kernel.
@@ -2521,7 +2525,10 @@ def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:
         )
         path = Path(tmp) / f"{label}.json"
         path.write_text(dag, encoding="utf-8")
-        env = {k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")}
+        env = {
+            **{k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")},
+            **inherited_runner_authority_env,
+        }
         return subprocess.run(
             [sys.executable, "-m", "dagrun", "run", "--dag", str(path),
              "-q", "--no-profile"],
@@ -2555,7 +2562,9 @@ def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:
         )
 
 
-def test_boxed_reexec_via_symlink_imports_package() -> None:
+def test_boxed_reexec_via_symlink_imports_package(
+    inherited_runner_authority_env: Mapping[str, str],
+) -> None:
     # Regression guard for the fleet-wide local-validate breakage: a DEFAULT boxed run invoked
     # through the py/bin symlink (NOT `python -m`, NOT pip-installed) must re-exec a child that
     # can still import the package. The old code re-exec'd `python -m dagrun`, whose fresh child
@@ -2565,6 +2574,13 @@ def test_boxed_reexec_via_symlink_imports_package() -> None:
     # environment-dependent, so exit 3 (boxing genuinely unavailable) is a valid LOUD skip; the
     # one thing that must NEVER appear is the import failure.
     import os
+
+    if inherited_runner_authority_env:
+        pytest.skip(
+            "fresh top-level systemd re-exec could escape the parent-owned "
+            "validation cgroup; run this integration test standalone; "
+            "tracked by #29 delegated-scope-smokes"
+        )
 
     symlink = Path(__file__).resolve().parent.parent / "bin" / "dagrun"
     assert symlink.exists(), f"expected the console symlink at {symlink}"
@@ -2576,7 +2592,17 @@ def test_boxed_reexec_via_symlink_imports_package() -> None:
         path = Path(tmp) / "cpu.json"
         path.write_text(dag, encoding="utf-8")
         # Scrub CI markers so boxing is NOT skipped: this must exercise the real re-exec.
-        env = {k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in (
+                "CI",
+                "GITHUB_ACTIONS",
+                "DAGRUN_DIRECT_CGROUP",
+                "DAGRUN_FORCE_SCOPE_ATTEMPT",
+            )
+        }
         proc = subprocess.run(
             [sys.executable, str(symlink), "run", "--dag", str(path), "-q", "--no-profile"],
             capture_output=True,
@@ -2614,15 +2640,34 @@ def test_cores_flag_refuses_unboxed_soft_affinity() -> None:
         assert "hard cgroup cpuset unavailable; refusing to run" in err
 
 
-def test_boxed_stdin_dag_survives_scope_reexec() -> None:
+def test_boxed_stdin_dag_survives_scope_reexec(
+    inherited_runner_authority_env: Mapping[str, str],
+) -> None:
     import os
+
+    if inherited_runner_authority_env:
+        pytest.skip(
+            "fresh top-level systemd re-exec could escape the parent-owned "
+            "validation cgroup; run this integration test standalone; "
+            "tracked by #29 delegated-scope-smokes"
+        )
 
     symlink = Path(__file__).resolve().parent.parent / "bin" / "dagrun"
     dag = (
         '{"steps":[{"group":"stress","job":"singleton","cmd":"sleep 1",'
         '"hint":{"hard_mem_max_bytes":67108864}}]}'
     )
-    env = {k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in (
+            "CI",
+            "GITHUB_ACTIONS",
+            "DAGRUN_DIRECT_CGROUP",
+            "DAGRUN_FORCE_SCOPE_ATTEMPT",
+        )
+    }
     proc = subprocess.run(
         [
             sys.executable,

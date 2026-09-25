@@ -3,8 +3,24 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+fn inherited_outer_run() -> bool {
+    std::env::var_os("DAGRUN_DELEGATED_CGROUP").is_some()
+        || std::env::var_os("DAGRUN_DELEGATED_UNBOXED").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        || std::env::var_os("DAGRUN_IN_SCOPE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        || std::env::var_os("DAGRUN_OUTER_RUN").is_some()
+}
+
 #[test]
 fn boxed_stdin_dag_keeps_step_and_cpu_limits_independent() {
+    if inherited_outer_run() {
+        eprintln!(
+            "skipping boxed stdin scope re-exec: a fresh top-level systemd user scope could escape \
+             the parent-owned validation boundary; run this integration test standalone; tracked \
+             by #29 delegated-scope-smokes"
+        );
+        return;
+    }
     let exe = env!("CARGO_BIN_EXE_dagrun");
     let mut child = Command::new(exe)
         .args([
@@ -31,6 +47,8 @@ fn boxed_stdin_dag_keeps_step_and_cpu_limits_independent() {
         .env_remove("DAGRUN_DELEGATED_UNBOXED")
         .env_remove("DAGRUN_IN_SCOPE")
         .env_remove("DAGRUN_SCOPE_UNIT")
+        .env_remove("DAGRUN_DIRECT_CGROUP")
+        .env_remove("DAGRUN_FORCE_SCOPE_ATTEMPT")
         .env_remove("DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES")
         .env_remove("DAGRUN_EXPECTED_OUTER_CPU_COUNT")
         .stdin(Stdio::piped())

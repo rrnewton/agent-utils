@@ -12,6 +12,7 @@
 //! the instrument (`DAGRUN_FORCE_SCOPE_ATTEMPT=1`) to answer the capability question on a runner
 //! population nobody has measured.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -48,6 +49,35 @@ impl Drop for Fixture {
 struct Out {
     code: Option<i32>,
     text: String,
+}
+
+/// Whether this test binary itself entered below an outer dagrun containment boundary.
+///
+/// `runner_command` deliberately removes the outer scope identity and any one-hop delegation
+/// because most cases below model a fresh top-level invocation. A real
+/// `systemd-run --user --scope` is different: systemd cannot place a scope below the caller's
+/// scope, so creating one here can move the probe or boxed runner into a sibling unit outside the
+/// outer validator's ownership. Read the test process's original environment before constructing
+/// that scrubbed child command and retain those live cases only when this integration test is run
+/// standalone.
+fn inherited_outer_run() -> bool {
+    std::env::var_os("DAGRUN_DELEGATED_CGROUP").is_some()
+        || std::env::var_os("DAGRUN_DELEGATED_UNBOXED").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        || std::env::var_os("DAGRUN_IN_SCOPE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        || std::env::var_os("DAGRUN_OUTER_RUN").is_some()
+}
+
+fn skip_top_level_scope_under_outer_run(case: &str) -> bool {
+    if !inherited_outer_run() {
+        return false;
+    }
+    eprintln!(
+        "skipping {case}: a top-level systemd user scope could escape the parent-owned validation \
+         boundary; run this integration test standalone for live scope coverage; tracked by #29 \
+         delegated-scope-smokes"
+    );
+    true
 }
 
 /// Build a runner command without inheriting the scope policy/control knobs that these tests vary.
@@ -144,11 +174,28 @@ fn policy_skip_is_named_as_untested_not_as_unavailable() {
 #[test]
 fn a_forced_attempt_that_fails_reports_a_probe_failure_not_a_skip() {
     let fx = Fixture::new("forced_fail");
+    // Make the failure deterministic and local. Removing the session-bus variables is not a
+    // containment boundary: a usable default user bus can still let the real systemd manager move
+    // this child into a sibling scope outside an aggregate validator's delegated subtree.
+    let shim_dir = fx.dir.join("bin");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    let systemd_run = shim_dir.join("systemd-run");
+    std::fs::write(&systemd_run, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&systemd_run, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        shim_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let r = run(
         &fx,
-        &[("CI", "1"), ("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")],
+        &[
+            ("CI", "1"),
+            ("DAGRUN_FORCE_SCOPE_ATTEMPT", "1"),
+            ("PATH", &path),
+        ],
         &[],
-        true,
+        false,
     );
 
     assert_eq!(
@@ -197,6 +244,9 @@ fn the_sanctioned_opt_out_is_untouched() {
 /// is the positive half: without it, A and B are satisfiable by a build that never boxes at all.
 #[test]
 fn forcing_the_attempt_boxes_where_boxing_is_possible() {
+    if skip_top_level_scope_under_outer_run("forced-box live scope") {
+        return;
+    }
     let probe = Command::new("systemd-run")
         .args([
             "--user",
@@ -238,6 +288,9 @@ fn forcing_the_attempt_boxes_where_boxing_is_possible() {
 /// Skipped where a `--user` scope is unavailable, so this says nothing false on a runner.
 #[test]
 fn the_boxed_path_observes_the_live_pid_in_the_promised_cgroup() {
+    if skip_top_level_scope_under_outer_run("observed-box live scope") {
+        return;
+    }
     let probe = Command::new("systemd-run")
         .args([
             "--user",
@@ -440,6 +493,11 @@ fn every_containment_state_reaches_the_banner_and_the_durable_journal() {
     }
 
     // 3) RUN-BOXED, where the host can box. Carries the observation so the claim is recheckable.
+    // A delegated aggregate runner cannot safely create this fresh top-level systemd scope, but
+    // the unboxed and direct-route journal assertions above remain valuable and still ran.
+    if skip_top_level_scope_under_outer_run("run-boxed containment-record leg") {
+        return;
+    }
     let probe = Command::new("systemd-run")
         .args([
             "--user",
