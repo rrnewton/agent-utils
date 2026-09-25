@@ -566,3 +566,22 @@ test("the digest page preserves browser-default playback for an older server", a
   assert.equal(page.spoken.length, 1);
   assert.equal(page.utterances[0].voice, undefined);
 });
+
+test("replacing or forgetting the shared token takes the voice page's saved messages with it", async () => {
+  // `#18 offline-message-cache`: the voice page keeps channel rows on the device for the token that
+  // read them, and this page can change that token without the voice page ever running.
+  const CACHE = "vibe-talk.voice.message-cache";
+  const store = new Map([["vibe-talk.token", "read-token-aaaaaaaaaaaaaaaa"], [CACHE, "{\"v\":1}"]]);
+  const page = newPage(undefined, store);
+  await page.settle();
+  page.el("api-token").value = "read-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  assert.equal(store.has(CACHE), true, "saving the SAME token discarded rows it can still read");
+  page.el("api-token").value = "read-token-bbbbbbbbbbbbbbbb";
+  await page.el("save-token").click();
+  assert.equal(store.has(CACHE), false, "another token inherited the saved messages");
+
+  store.set(CACHE, "{\"v\":1}");
+  await page.el("forget-token").click();
+  assert.equal(store.has(CACHE), false, "signing out left the saved messages on the device");
+});

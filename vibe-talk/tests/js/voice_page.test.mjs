@@ -884,7 +884,7 @@ function openStream() {
  * `store` is the browser's localStorage. Passing an existing one is how a RELOAD is simulated:
  * same storage, brand new script execution.
  */
-function newPage(store = new Map(), script = SCRIPT) {
+function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const elements = new Map();
   for (const [id, markup] of PAGE_ELEMENTS) {
     const element = new FakeElement(id);
@@ -1035,6 +1035,8 @@ function newPage(store = new Map(), script = SCRIPT) {
     threadingSupported: false,
     threads: [],
     timelineCalls: [],
+    /** Every request the page made, as `METHOD path`, so a test can count what did NOT happen. */
+    requests: [],
     timeline: async (path) => {
       const url = new URL(path, "http://fixture.test");
       const view = url.searchParams.get("view");
@@ -1422,6 +1424,7 @@ function newPage(store = new Map(), script = SCRIPT) {
     TextEncoder,
     WebSocket: FakeWebSocket,
     fetch: async (path, options) => {
+      page.requests.push(`${(options && options.method) || "GET"} ${path}`);
       if (String(path).startsWith("/api/v1/voice-session")) {
         return page.mint(path, options);
       }
@@ -1852,6 +1855,10 @@ function newPage(store = new Map(), script = SCRIPT) {
     page.deviceSpeech = engine;
     return engine;
   };
+  // The page makes its first requests while the script is still running, so a test that needs to
+  // hold or fail THOSE — a reload that must draw before the network answers — arranges the fixture
+  // here, before a line of the page has run.
+  if (arrange) arrange(page);
   vm.createContext(context);
   vm.runInContext(script, context, { filename: "voice.js" });
   return page;
@@ -2103,6 +2110,22 @@ const TUNING_BANDS = {
     "same author are silently welded together and the second one can be archived by a tap aimed " +
     "at the first, and below about half a second the split halves of one long post — which is the " +
     "case this exists for — arrive too far apart to be caught"],
+  // `#18 offline-message-cache`. The saved snapshot is a convenience that shares its storage with
+  // the token, the drafts and the unsent messages, so every bound here is about how much of the
+  // quota it may take and how much history a cold start has to be worth drawing.
+  MESSAGE_CACHE_VERSION: [1, 1,
+    "the saved envelope's shape. Changing it discards every device's snapshot, which is the right " +
+    "answer to a new shape and must be a decision a test sees rather than an edit nobody noticed"],
+  MESSAGE_CACHE_ROWS: [50, 400,
+    "rows kept per channel view. Fewer than one page and a cold start draws less than the first " +
+    "read will; past a few hundred, one busy channel crowds every other scope out of the budget"],
+  MESSAGE_CACHE_SCOPES: [2, 40,
+    "channel views kept at once. One would forget the main channel the moment a thread was opened; " +
+    "dozens mostly keep views nobody will open again, each one a copy of messages on the device"],
+  MESSAGE_CACHE_CHARS: [100000, 1500000,
+    "the whole snapshot in UTF-16 units. Browsers give an origin about five million of them, and " +
+    "the outbox must never be the thing refused; below a hundred thousand a single long page of " +
+    "assistant answers no longer fits"],
   HOLD_MS: [250, 1500,
     "how long a finger rests before the row shows who sent it and when. Below about a quarter of " +
     "a second an ordinary tap becomes a hold and the message stops folding; past a second and a " +
@@ -9634,7 +9657,14 @@ test("switching channel starts the walk again rather than stepping back from a s
   // A cursor is a message id in ONE channel. Carrying it across would ask the server to step back
   // from a message that is not there, which the route answers with an error the reader cannot act
   // on — and would be a confusing one, because they only changed channel.
+  //
+  // Three REAL channels since `#18 offline-message-cache`: going back to a channel this device has
+  // saved rightly draws that channel's own rows and cursor, so a "change" to the same channel no
+  // longer stands in for a change to a stranger.
   const page = newPage();
+  const second = { id: "1110000000000000002", label: "second", writable: true };
+  const third = { id: "1110000000000000003", label: "third", writable: true };
+  page.channels = [{ ...CHANNEL }, second, third];
   await signIn(page);
   pagedChannel(page, { steps: 3, size: 4 });
   await showDiscord(page, []);
@@ -9642,6 +9672,7 @@ test("switching channel starts the walk again rather than stepping back from a s
   await page.settle();
   assert.equal(page.el("discord-log").children.length, 8);
 
+  page.el("discord-channel").value = second.id;
   await page.el("discord-channel").dispatch("change");
   await page.settle();
 
@@ -9656,6 +9687,7 @@ test("switching channel starts the walk again rather than stepping back from a s
   // cursor armed is the dangerous case: a scroll to the top would then ask this server to step
   // back from a message that is not in this channel, and the reader only changed channel.
   page.channelPage = errorResponse(502, "discord_error", "nope");
+  page.el("discord-channel").value = third.id;
   await page.el("discord-channel").dispatch("change");
   await page.settle();
   assert.equal(
@@ -16971,4 +17003,734 @@ test("channel browser: rows are finger-sized and the list scrolls inside the pan
   assert.match(cssBlock(".channel-directory li"), /min-height:\s*2\.75rem/);
   assert.match(cssBlock(".channel-directory button"), /min-height:\s*2\.75rem/);
   assert.match(cssBlock(".channel-directory .directory-name"), /overflow-wrap:\s*anywhere/);
+});
+
+// --- the offline message cache ------------------------------------------------------------------
+//
+// `#18 offline-message-cache`. A reload or a cold start draws the channel as this device last saw
+// it, before any request answers; the refresh merges into it; a failed refresh leaves it standing
+// and says how old it is; and nothing a credential read survives that credential. Every test here
+// reloads over the SAME storage with a brand-new script, which is what a reload is.
+
+const MESSAGE_CACHE_KEY = "vibe-talk.voice.message-cache";
+const TOKEN_STORAGE_KEY = "vibe-talk.token";
+const savedCache = (page) => JSON.parse(page.storage.get(MESSAGE_CACHE_KEY) || "null");
+const savedScopes = (page) => (savedCache(page) || { scopes: {} }).scopes;
+/** The device keeps ONE entry per channel: its store in timeline mode, its page in legacy mode. */
+const scopeKey = (channel) => String(channel);
+const freshness = (page) => page.el("channel-freshness");
+
+/** Wrap a fixture route so it answers only when the test opens it. */
+function gate(respond) {
+  let open = null;
+  const opened = new Promise((resolve) => {
+    open = resolve;
+  });
+  return { respond: (...args) => opened.then(() => respond(...args)), open: () => open() };
+}
+
+/** A reload over the same storage, its network arranged before the script runs. */
+const reloadPage = (store, arrange) => newPage(store, SCRIPT, arrange);
+
+const offline = async () => {
+  throw new TypeError("Failed to fetch");
+};
+
+test("a reload draws the saved timeline before any request answers, then merges the refresh", async () => {
+  const first = newPage();
+  first.threadingSupported = true;
+  await signIn(first);
+  const saved = [
+    message({ id: "501", content: "first saved" }),
+    message({ id: "502", content: "a typo in the saved copy" }),
+    message({ id: "503", content: "third saved" }),
+  ];
+  await showDiscord(first, saved);
+  assert.deepStrictEqual(
+    savedScopes(first)[scopeKey(CHANNEL.id)].messages.map((m) => m.id),
+    ["501", "502", "503"],
+    "a successful read was not saved for the next start"
+  );
+
+  let config = null;
+  let timeline = null;
+  const page = reloadPage(first.storage, (p) => {
+    p.threadingSupported = true;
+    config = gate(p.clientConfig);
+    timeline = gate(p.timeline);
+    p.clientConfig = config.respond;
+    p.timeline = timeline.respond;
+  });
+  // Synchronously: nothing has answered, nothing has even been awaited.
+  assert.equal(page.screen(), "main", "a reload with a saved channel waited for the network");
+  assert.deepStrictEqual(shownIds(page), ["501", "502", "503"], "the saved rows were not drawn first");
+  assert.equal(page.el("discord-channel").value, CHANNEL.id, "the picker waited for /client-config");
+
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["501", "502", "503"], "entering the view dropped the saved rows");
+  assert.equal(freshness(page).hidden, false, "saved rows were presented as current");
+  assert.match(freshness(page).textContent, /^Saved \d{2}:\d{2} · refreshing…$/);
+  assert.equal(page.timelineCalls.length, 1, "the background refresh never started");
+
+  page.messages = [
+    saved[0],
+    { ...saved[1], content: "the corrected text" },
+    saved[2],
+    message({ id: "504", content: "arrived while away" }),
+  ];
+  config.open();
+  timeline.open();
+  await page.settle();
+  await page.settle();
+
+  assert.deepStrictEqual(shownIds(page), ["501", "502", "503", "504"], "the refresh duplicated or lost rows");
+  assert.match(page.el("discord-log").children[1].text(), /the corrected text/);
+  assert.doesNotMatch(page.el("discord-log").text(), /typo/, "a corrected row kept its stale text");
+  assert.equal(freshness(page).hidden, true, "a successful refresh still says the rows are saved");
+  const entry = savedScopes(page)[scopeKey(CHANNEL.id)];
+  assert.deepStrictEqual(entry.messages.map((m) => m.id), ["501", "502", "503", "504"]);
+  assert.equal(entry.messages[1].content, "the corrected text", "the correction was not saved");
+});
+
+test("a legacy page-mode channel is saved, drawn first on reload, and merged the same way", async () => {
+  const first = newPage();
+  await signIn(first);
+  await showDiscord(first, [message({ id: "601", content: "one" }), message({ id: "602", content: "two" })]);
+
+  let reads = null;
+  const page = reloadPage(first.storage, (p) => {
+    reads = gate(p.channelPage);
+    p.channelPage = reads.respond;
+  });
+  assert.deepStrictEqual(shownIds(page), ["601", "602"]);
+  assert.equal(page.pageReads, 0, "the saved rows were drawn by a request rather than from the device");
+
+  await page.el("view-switch").click();
+  page.messages = [message({ id: "602", content: "two, edited" }), message({ id: "603", content: "three" })];
+  reads.open();
+  await page.settle();
+  await page.settle();
+  // No `has_more`: this page IS the whole channel, so 601 was deleted upstream and goes; the saved
+  // copy of 602 gives way to the edit, and nothing appears twice.
+  assert.deepStrictEqual(shownIds(page), ["602", "603"]);
+  assert.match(page.el("discord-log").children[0].text(), /two, edited/);
+  assert.equal(freshness(page).hidden, true);
+});
+
+test("offline, the saved rows stay up and say how old they are, and the next poll recovers", async () => {
+  const first = newPage();
+  await signIn(first);
+  await showDiscord(first, [message({ id: "701", content: "kept offline" })]);
+
+  const page = reloadPage(first.storage, (p) => {
+    p.onlineConfig = p.clientConfig;
+    p.clientConfig = offline;
+    p.channelPage = offline;
+  });
+  await page.settle();
+  assert.equal(page.screen(), "main");
+  await page.el("view-switch").click();
+  await page.settle();
+
+  assert.deepStrictEqual(shownIds(page), ["701"], "a failed refresh took the saved rows away");
+  assert.equal(freshness(page).hidden, false);
+  assert.match(freshness(page).textContent, /^Offline · showing messages saved \d{2}:\d{2}$/);
+  assert.match(page.el("error").textContent, /Could not reach vibe-talk/);
+  assert.equal(page.streamOpens.length, 0);
+
+  // The network comes back. The poll is still armed although every read so far failed, and the
+  // page that never heard /client-config asks for it before reading.
+  page.clientConfig = page.onlineConfig;
+  page.channelPage = async () =>
+    json(200, { channel: CHANNEL, messages: [message({ id: "701", content: "kept offline" }),
+      message({ id: "702", content: "after reconnecting" })], has_more: false });
+  assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "a failed read stopped the channel polling");
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["701", "702"]);
+  assert.equal(freshness(page).hidden, true, "a recovered read still says it is offline");
+  assert.equal(page.streamOpens.length, 1, "the late /client-config never attached the live stream");
+});
+
+test("a refresh the SERVER fails is reported as a failure, not as being offline", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "711", content: "on screen" })]);
+  page.channelPage = errorResponse(502, "discord_error", "the provider is down");
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), ["711"]);
+  assert.match(freshness(page).textContent, /^Refresh failed · showing messages from \d{2}:\d{2}$/);
+  assert.equal(freshness(page).getAttribute("data-state"), "failed");
+  // ...and it gives way to the pull-to-refresh pill, which sits in exactly the same place.
+  page.el("pull-refresh").hidden = false;
+  await page.el("view-switch").click();
+  await page.el("view-switch").click();
+  assert.equal(freshness(page).hidden, true, "two pills stacked in one place");
+});
+
+test("each scope keeps at most MESSAGE_CACHE_ROWS rows, and a reload walks back from the oldest kept", async () => {
+  const rows = sourceConstant("MESSAGE_CACHE_ROWS");
+  const page = newPage();
+  await signIn(page);
+  const all = [];
+  for (let i = 0; i < rows + 80; i += 1) all.push(message({ id: String(10000 + i), content: `m${i}` }));
+  page.channelPage = async () =>
+    json(200, { channel: CHANNEL, messages: all, has_more: true, next_before: all[0].id });
+  await showDiscord(page, all);
+
+  const entry = savedScopes(page)[scopeKey(CHANNEL.id)];
+  assert.equal(entry.messages.length, rows, "the per-scope bound was not applied");
+  assert.equal(entry.messages[0].id, all[80].id, "the bound kept the oldest rows rather than the newest");
+  assert.equal(entry.more, true, "a trimmed snapshot claims to be the whole channel");
+  assert.equal(entry.cursor, all[80].id);
+
+  const paths = [];
+  const again = reloadPage(page.storage, (p) => {
+    p.channelPage = async (path) => {
+      paths.push(String(path));
+      return json(200, { channel: CHANNEL, messages: all.slice(60, 80), has_more: true, next_before: all[60].id });
+    };
+  });
+  assert.equal(again.el("discord-log").children.length, rows);
+  assert.equal(again.el("load-older").hidden, false, "the trimmed snapshot offered no way further back");
+  await again.el("load-older").click();
+  await again.settle();
+  assert.match(paths.at(-1), new RegExp(`[?&]before=${all[80].id}(&|$)`));
+  assert.equal(again.el("discord-log").children.length, rows + 20);
+});
+
+test("at most MESSAGE_CACHE_SCOPES scopes are kept, and the least recently opened go first", async () => {
+  const limit = sourceConstant("MESSAGE_CACHE_SCOPES");
+  const page = newPage();
+  const channels = [];
+  for (let i = 0; i < limit + 2; i += 1) {
+    channels.push({ id: String(1120000000000000000n + BigInt(i)), label: `c${i}`, writable: true });
+  }
+  page.channels = channels;
+  await signIn(page);
+  page.channelPage = async (path) => {
+    const id = /channels\/([^/]+)\/page/.exec(String(path))[1];
+    return json(200, { channel: knownOf(id), messages: [message({ id: `${id}9`, channel_id: id })], has_more: false });
+  };
+  const knownOf = (id) => channels.find((c) => c.id === id);
+  await showDiscord(page, []);
+  for (let i = 1; i < channels.length; i += 1) {
+    page.setClock(page.clock() + 1000);
+    page.el("discord-channel").value = channels[i].id;
+    await page.el("discord-channel").dispatch("change");
+    await page.settle();
+  }
+  const kept = Object.keys(savedScopes(page));
+  assert.equal(kept.length, limit, "the scope bound was not applied");
+  assert.ok(!kept.includes(channels[0].id) && !kept.includes(channels[1].id),
+    "the least recently opened scopes survived");
+  assert.ok(kept.includes(channels.at(-1).id), "the scope on screen was evicted");
+});
+
+test("the whole snapshot stays inside MESSAGE_CACHE_CHARS, halving the current scope if it must", async () => {
+  const budget = sourceConstant("MESSAGE_CACHE_CHARS");
+  const page = newPage();
+  await signIn(page);
+  const big = [];
+  for (let i = 0; i < 100; i += 1) big.push(message({ id: String(20000 + i), content: `${i} ${"x".repeat(9000)}` }));
+  await showDiscord(page, big);
+  const stored = page.storage.get(MESSAGE_CACHE_KEY);
+  assert.ok(stored.length <= budget, `the snapshot is ${stored.length} units, over ${budget}`);
+  const entry = savedScopes(page)[scopeKey(CHANNEL.id)];
+  assert.ok(entry.messages.length > 0 && entry.messages.length < 100);
+  assert.equal(entry.messages.at(-1).id, big.at(-1).id, "halving kept the old end of the channel");
+  assert.equal(entry.more, true);
+  assert.equal(entry.cursor, entry.messages[0].id);
+});
+
+test("storage refusing the snapshot costs nothing but the snapshot", async () => {
+  const page = newPage();
+  const set = page.storage.set.bind(page.storage);
+  page.storage.set = (key, value) => {
+    if (key === MESSAGE_CACHE_KEY) throw new Error("QuotaExceededError");
+    return set(key, value);
+  };
+  await signIn(page);
+  await showDiscord(page, [message({ id: "801", content: "still readable" })]);
+  assert.deepStrictEqual(shownIds(page), ["801"]);
+  assert.equal(page.storage.has(MESSAGE_CACHE_KEY), false);
+  assert.equal(page.el("error").hidden, true, "a refused convenience was reported as an error");
+});
+
+test("a full quota gives the snapshot's space to an unsent message", async () => {
+  const page = newPage();
+  await signIn(page);
+  const big = [];
+  for (let i = 0; i < 20; i += 1) big.push(message({ id: String(30000 + i), content: "y".repeat(5000) }));
+  await showDiscord(page, big);
+  assert.ok(page.storage.has(MESSAGE_CACHE_KEY));
+  const total = () => [...page.storage].reduce((n, [k, v]) => n + k.length + String(v).length, 0);
+  const budget = total() + 40;
+  page.storage.set = (key, value) => {
+    const previous = page.storage.has(key) ? key.length + String(page.storage.get(key)).length : 0;
+    if (total() - previous + key.length + String(value).length > budget) throw new Error("QuotaExceededError");
+    return Map.prototype.set.call(page.storage, key, value);
+  };
+  delayedReply(page);
+  await page.el("channel-compose-text").setValue("this must survive a reload");
+  page.el("channel-send").click();
+  assert.equal(savedOutgoing(page).length, 1, "the unsent message lost to the saved channel");
+  assert.equal(page.storage.has(MESSAGE_CACHE_KEY), false);
+  assert.doesNotMatch(outgoingRows(page)[0].text(), /could not save/);
+});
+
+test("a damaged snapshot is discarded without breaking the start, and a damaged scope alone", async () => {
+  const store = new Map([[TOKEN_STORAGE_KEY, "write-token-aaaaaaaaaaaaaaaa"], [MESSAGE_CACHE_KEY, "{\"v\":1,\"ident"]]);
+  const page = reloadPage(store);
+  assert.equal(store.has(MESSAGE_CACHE_KEY), false, "an interrupted write was kept");
+  await page.settle();
+  assert.equal(page.screen(), "main");
+
+  await showDiscord(page, [message({ id: "901", content: "good scope" })]);
+  const cache = savedCache(page);
+  cache.scopes["1110000000000000077"] = { mode: "page", messages: "not a list" };
+  page.storage.set(MESSAGE_CACHE_KEY, JSON.stringify(cache));
+  const again = reloadPage(page.storage);
+  assert.deepStrictEqual(shownIds(again), ["901"], "one damaged entry took the good one with it");
+  assert.equal("1110000000000000077" in savedScopes(again), false, "the damaged entry was kept");
+});
+
+test("changing the token clears every saved and shown message before the new one is used", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1001", content: "readable by the first token" })]);
+  assert.ok(page.storage.has(MESSAGE_CACHE_KEY));
+
+  page.el("api-token").value = "write-token-bbbbbbbbbbbbbbbb";
+  page.el("save-token").click();
+  assert.equal(page.storage.has(MESSAGE_CACHE_KEY), false, "another credential inherited the saved rows");
+  assert.deepStrictEqual(shownIds(page), [], "another credential inherited the rows on screen");
+  await page.settle();
+  assert.doesNotMatch(page.renderedText(), /readable by the first token/);
+});
+
+test("signing out removes the saved messages and the rows on screen", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1101", content: "private" })]);
+  await page.el("forget-token").click();
+  assert.equal(page.storage.has(MESSAGE_CACHE_KEY), false);
+  assert.deepStrictEqual(shownIds(page), []);
+  assert.doesNotMatch(page.renderedText(), /private/);
+});
+
+test("a snapshot saved for one token is never drawn for another", async () => {
+  // The main app shares this origin and this token key, so the token can change underneath the
+  // page without its sign-out control ever being pressed.
+  const first = newPage();
+  await signIn(first);
+  await showDiscord(first, [message({ id: "1201", content: "first identity only" })]);
+  first.storage.set(TOKEN_STORAGE_KEY, "write-token-cccccccccccccccc");
+  const page = reloadPage(first.storage, (p) => {
+    p.clientConfig = () => new Promise(() => {});
+  });
+  assert.deepStrictEqual(shownIds(page), []);
+  assert.equal(page.storage.has(MESSAGE_CACHE_KEY), false, "the other identity's snapshot survived");
+  assert.equal(page.screen(), "signin", "the app was shown from a snapshot this token did not make");
+});
+
+test("a token replaced in another tab never inherits the rows this page is showing", async () => {
+  // The main app and other tabs share the token. This page is not told; it has to notice before it
+  // merges into, or saves, rows the previous token read.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1251", content: "read by the old token" })]);
+  page.storage.set(TOKEN_STORAGE_KEY, "write-token-dddddddddddddddd");
+  page.stream().push(sseMessage(message({ id: "1252", content: "arrives on the old stream" })));
+  await page.settle();
+  assert.doesNotMatch(JSON.stringify(savedCache(page) || {}), /old token|old stream/,
+    "the previous token's rows were saved under the new one");
+  assert.deepStrictEqual(shownIds(page), [], "the previous token's rows stayed on screen");
+
+  page.channelPage = async () =>
+    json(200, { channel: CHANNEL, messages: [message({ id: "1253", content: "read by the new token" })], has_more: true });
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), ["1253"]);
+  assert.deepStrictEqual(savedScopes(page)[scopeKey(CHANNEL.id)].messages.map((m) => m.id), ["1253"]);
+});
+
+test("a refusal at start removes the snapshot it had already drawn", async () => {
+  const first = newPage();
+  await signIn(first);
+  await showDiscord(first, [message({ id: "1301", content: "revoked" })]);
+  const page = reloadPage(first.storage, (p) => {
+    p.clientConfig = errorResponse(401, "unauthorized", "token revoked");
+  });
+  assert.deepStrictEqual(shownIds(page), ["1301"]);
+  await page.settle();
+  assert.equal(page.screen(), "signin");
+  assert.deepStrictEqual(shownIds(page), [], "a revoked token's rows stayed on screen");
+  assert.equal(page.storage.has(MESSAGE_CACHE_KEY), false, "a revoked token's rows stayed on the device");
+});
+
+test("a refused channel read removes that credential's messages too", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1401", content: "no longer allowed" })]);
+  page.channelPage = errorResponse(401, "unauthorized", "token revoked");
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), []);
+  assert.equal(page.storage.has(MESSAGE_CACHE_KEY), false);
+});
+
+test("a channel the server no longer lists takes its saved scopes with it", async () => {
+  const page = newPage();
+  const other = { id: "1110000000000000009", label: "other", writable: true };
+  page.channels = [{ ...CHANNEL }, other];
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1501", content: "in lead team" })]);
+  page.channels = [other];
+  const again = reloadPage(page.storage, (p) => {
+    p.channels = [other];
+  });
+  await again.settle();
+  assert.equal(scopeKey(CHANNEL.id) in savedScopes(again), false, "an unlisted channel's rows stayed");
+  assert.deepStrictEqual(shownIds(again), [], "an unlisted channel's rows stayed on screen");
+});
+
+/** The channel reads a page made — history, not the stream, config or anything else. */
+const channelReads = (page) => page.requests.filter((request) => /^GET \/api\/v1\/channels\/[^/]+\/(timeline|page)\b/.test(request));
+
+test("one store per channel: every view it covered is drawn after a reload with no request", async () => {
+  const first = await threadPage();
+  const data = threadData();
+  const threadId = data.threads[0].id;
+  await first.el("channel-view-threads").click();
+  await first.settle();
+  await first.el("thread-list").children[0].children[0].click();
+  await first.settle();
+  await first.el("thread-back").click();
+  await first.el("channel-view-flat").click();
+  await first.settle();
+  const entry = savedScopes(first)[scopeKey(CHANNEL.id)];
+  assert.deepStrictEqual(entry.messages.map((m) => m.id), ["200", "201", "202", "203", "204"],
+    "the channel's rows were not held once, in time order");
+  assert.deepStrictEqual(entry.threads.map((t) => t.id), data.threads.map((t) => t.id));
+  assert.deepStrictEqual(Object.keys(entry.views).sort(), ["flat", "main", `thread:${threadId}`, "threads"].sort());
+
+  let reads = null;
+  const page = reloadPage(first.storage, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    reads = gate(p.timeline);
+    p.timeline = reads.respond;
+  });
+  assert.deepStrictEqual(channelReads(page), [], "a cold start read history before the channel was opened");
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  // Exactly ONE bounded newest page, for the channel and view on screen — not every saved view,
+  // not every saved channel, not a walk back through history.
+  assert.equal(channelReads(page).length, 1, `a cold start made ${channelReads(page).length} history reads`);
+  const refresh = new URL(channelReads(page)[0].slice(4), "http://fixture.test");
+  assert.equal(refresh.searchParams.get("view"), "main");
+  assert.equal(refresh.searchParams.get("before"), null, "the cold-start refresh walked back into history");
+  assert.equal(refresh.searchParams.get("limit"), String(sourceConstant("DISCORD_PAGE_LIMIT")));
+
+  page.el("channel-view-threads").click();
+  await page.settle();
+  assert.deepStrictEqual(page.el("thread-list").children.map((card) => card.getAttribute("data-context-id")),
+    data.threads.map((t) => t.id));
+  page.el("thread-list").children[0].children[0].click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["201", "202"]);
+  assert.equal(page.el("thread-title").textContent, "First discussion");
+  page.el("thread-back").click();
+  page.el("channel-view-flat").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  page.el("channel-view-main").click();
+  await page.settle();
+  assert.equal(channelReads(page).length, 1, "switching among covered views went to the network");
+
+  page.messages = data.messages;
+  reads.open();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.equal(channelReads(page).length, 1);
+  assert.equal(freshness(page).hidden, true, `the refreshed view still says: ${freshness(page).textContent}`);
+
+  // All was not refreshed: it says when it was saved, and does not claim to be refreshing.
+  await page.el("channel-view-flat").click();
+  assert.equal(channelReads(page).length, 1);
+  assert.match(freshness(page).textContent, /^Showing messages saved \d{2}:\d{2}$/);
+  // The poll refreshes the view on screen, and only that one.
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  await page.settle();
+  assert.equal(channelReads(page).length, 2);
+  assert.match(channelReads(page)[1], /view=flat/);
+  assert.equal(freshness(page).hidden, true);
+});
+
+test("a refresh that lands after the reader switched away still makes its view current", async () => {
+  const first = await threadPage();
+  const data = threadData();
+  await first.el("channel-view-flat").click();
+  await first.settle();
+  await first.el("channel-view-main").click();
+  await first.settle();
+
+  let reads = null;
+  const page = reloadPage(first.storage, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    reads = gate(p.timeline);
+    p.timeline = reads.respond;
+  });
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(channelReads(page).length, 1);
+  // Away before the cold-start page for Main arrives.
+  page.el("channel-view-flat").click();
+  await page.settle();
+  page.messages = [...data.messages, message({ id: "206", content: "posted elsewhere meanwhile" })];
+  reads.open();
+  await page.settle();
+  await page.settle();
+  assert.equal(channelReads(page).length, 1, "the page for Main was read again for All");
+
+  page.el("channel-view-main").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203", "206"], "Main dropped the page read for it");
+  assert.equal(freshness(page).hidden, true, `Main still says: ${freshness(page).textContent}`);
+  assert.equal(channelReads(page).length, 1, "returning to Main went to the network");
+  assert.ok(savedScopes(page)[scopeKey(CHANNEL.id)].messages.some((m) => m.id === "206"),
+    "the late page was not saved");
+});
+
+test("switching Main, Threads, All and a read thread in one page is local, and each sees live rows", async () => {
+  const page = await threadPage();
+  const data = threadData();
+  await page.el("channel-view-threads").click();
+  await page.el("thread-list").children[0].children[0].click();
+  await page.el("thread-back").click();
+  await page.el("channel-view-flat").click();
+  await page.el("channel-view-main").click();
+  await page.settle();
+
+  // A reply arrives on the stream while Main — where replies do not show — is on screen. The page
+  // re-reads the view on screen for the server's counts, as it always has; nothing else.
+  const first = data.threads[0];
+  const reads = channelReads(page).length;
+  page.stream().push(sseMessage(message({ id: "205", content: "a live reply", thread: { ...data.messages[2].thread } })));
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(channelReads(page).slice(reads).map((r) => new URL(r.slice(4), "http://x").searchParams.get("view")),
+    ["main"], "a live arrival re-read more than the view on screen");
+  const before = channelReads(page).length;
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "a reply was drawn in Main");
+
+  await page.el("channel-view-flat").click();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204", "205"], "All missed the live reply");
+  await page.el("channel-view-threads").click();
+  assert.equal(page.el("thread-list").children.at(-1).getAttribute("data-context-id"), first.id,
+    "the thread with the newest activity did not move to the bottom");
+  await page.el("thread-list").children.at(-1).children[0].click();
+  assert.deepStrictEqual(shownIds(page), ["201", "202", "205"], "the thread missed its own live reply");
+  await page.el("thread-back").click();
+  await page.el("channel-view-main").click();
+  await page.settle();
+  assert.equal(channelReads(page).length, before, "switching among read views went to the network");
+});
+
+test("a view no page has covered is read, once", async () => {
+  const page = await threadPage();
+  const before = channelReads(page).length;
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  assert.equal(channelReads(page).length, before + 1);
+  assert.match(channelReads(page).at(-1), /view=flat/);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  await page.el("channel-view-main").click();
+  await page.el("channel-view-flat").click();
+  await page.settle();
+  assert.equal(channelReads(page).length, before + 1, "a covered view was read again");
+});
+
+test("a cold start with several saved channels reads only the one on screen", async () => {
+  const other = { id: "1110000000000000004", label: "other", writable: true };
+  const first = newPage();
+  first.channels = [{ ...CHANNEL }, other];
+  await signIn(first);
+  await showDiscord(first, [message({ id: "1801", content: "lead" })]);
+  first.el("discord-channel").value = other.id;
+  first.channelPage = async () => json(200, { channel: other,
+    messages: [message({ id: "1802", channel_id: other.id, content: "other" })], has_more: false });
+  await first.el("discord-channel").dispatch("change");
+  await first.settle();
+  first.el("discord-channel").value = CHANNEL.id;
+  first.channelPage = async () => json(200, { channel: CHANNEL, messages: [message({ id: "1801", content: "lead" })], has_more: false });
+  await first.el("discord-channel").dispatch("change");
+  await first.settle();
+  assert.deepStrictEqual(Object.keys(savedScopes(first)).sort(), [CHANNEL.id, other.id].sort());
+
+  const page = reloadPage(first.storage, (p) => {
+    p.channels = [{ ...CHANNEL }, other];
+  });
+  await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(channelReads(page).length, 1, `a cold start read ${channelReads(page).length} channels`);
+  assert.match(channelReads(page)[0], new RegExp(`/channels/${CHANNEL.id}/page\\?`));
+  assert.doesNotMatch(channelReads(page)[0], /before=/, "the cold-start refresh walked back into history");
+  assert.equal(page.streamOpens.length, 1, "the page did not fall back on the live stream");
+});
+
+test("a saved timeline waits for a live cursor, and a step back over the overlap duplicates nothing", async () => {
+  const limit = 3;
+  const all = [];
+  for (let i = 0; i < 9; i += 1) all.push(message({ id: String(40000 + i), content: `t${i}` }));
+  const serve = (p) => async (path) => {
+    const url = new URL(path, "http://fixture.test");
+    const before = url.searchParams.get("before");
+    const end = before ? Number(before.split(":")[1]) : all.length;
+    const start = Math.max(0, end - limit);
+    return json(200, { channel: CHANNEL, messages: all.slice(start, end), threads: [], has_threads: false,
+      has_more: start > 0, next_before: start > 0 ? `cursor:${start}` : null, dismissed: [] });
+  };
+  const first = newPage();
+  first.threadingSupported = true;
+  first.timeline = serve(first);
+  await signIn(first);
+  await showDiscord(first, []);
+  await first.el("load-older").click();
+  await first.settle();
+  assert.deepStrictEqual(shownIds(first), all.slice(3).map((m) => m.id));
+
+  let reads = null;
+  const page = reloadPage(first.storage, (p) => {
+    p.threadingSupported = true;
+    reads = gate(serve(p));
+    p.timeline = reads.respond;
+  });
+  await page.el("view-switch").click();
+  assert.deepStrictEqual(shownIds(page), all.slice(3).map((m) => m.id));
+  assert.equal(page.el("load-older").hidden, true, "a saved snapshot offered an expired cursor");
+  assert.match(page.el("channel-summary").text(), /older ones are not loaded/);
+  reads.open();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), all.slice(3).map((m) => m.id), "the refresh dropped the saved rows above it");
+  assert.equal(page.el("load-older").hidden, false, "the refresh's live cursor was not adopted");
+  await page.el("load-older").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), all.slice(3).map((m) => m.id), "the overlapping step duplicated rows");
+  await page.el("load-older").click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), all.map((m) => m.id));
+  assert.equal(new Set(shownIds(page)).size, all.length);
+});
+
+test("a delivered send is shown once from the snapshot, and only the server retires its receipt", async () => {
+  const first = newPage();
+  await signIn(first);
+  await showDiscord(first, []);
+  const finish = delayedReply(first);
+  await first.el("channel-compose-text").setValue("sent before the reload");
+  const submitted = first.el("channel-send").click();
+  await first.settle();
+  finish(json(200, { posted: message({ id: "1601", content: "sent before the reload" }) }));
+  await submitted;
+  await first.settle();
+  assert.deepStrictEqual(savedScopes(first)[scopeKey(CHANNEL.id)].messages.map((m) => m.id), ["1601"],
+    "the acknowledged send was not saved");
+  assert.equal(savedOutgoing(first).length, 1);
+
+  let reads = null;
+  const page = reloadPage(first.storage, (p) => {
+    reads = gate(p.channelPage);
+    p.channelPage = reads.respond;
+  });
+  await page.el("view-switch").click();
+  assert.deepStrictEqual(shownIds(page), ["1601"]);
+  assert.equal(outgoingRows(page).length, 0, "the delivered send was drawn twice");
+  assert.equal(savedOutgoing(page).length, 1, "the device's own copy retired the receipt");
+  page.messages = [message({ id: "1601", content: "sent before the reload" })];
+  reads.open();
+  await page.settle();
+  await page.settle();
+  assert.equal(savedOutgoing(page).length, 0, "the server's copy did not retire the receipt");
+});
+
+test("read state and live arrivals are saved as they happen", async () => {
+  const page = newPage();
+  page.dealtWith.add("1702");
+  page.messages = [message({ id: "1701", content: "open" }), message({ id: "1702", content: "done already" })];
+  await signIn(page);
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.deepStrictEqual(savedScopes(page)[scopeKey(CHANNEL.id)].dismissed, ["1702"]);
+
+  await doneButton(row(page, 0)).click();
+  await page.settle();
+  assert.deepStrictEqual(savedScopes(page)[scopeKey(CHANNEL.id)].dismissed.sort(), ["1701", "1702"],
+    "a local Done was not saved");
+
+  page.stream().push(sseMessage(message({ id: "1703", content: "live" })));
+  await page.settle();
+  assert.deepStrictEqual(savedScopes(page)[scopeKey(CHANNEL.id)].messages.map((m) => m.id), ["1701", "1702", "1703"],
+    "a live arrival was not saved");
+
+  const again = reloadPage(page.storage, (p) => {
+    p.channelPage = () => new Promise(() => {});
+  });
+  assert.deepStrictEqual(shownIds(again), ["1701", "1702", "1703"]);
+  assert.equal(again.el("discord-log").children[0].getAttribute("data-archived"), "true");
+  assert.equal(again.el("discord-log").children[2].getAttribute("data-archived"), "false");
+});
+
+test("no private response is ever handed to a service worker's CacheStorage", () => {
+  // The snapshot lives in this origin's localStorage, scoped to the token and removed with it.
+  // CacheStorage would outlive sign-out and be served by whatever a worker decides.
+  assert.doesNotMatch(SCRIPT_CODE, /\bcaches\b|serviceWorker|CacheStorage/);
+  assert.doesNotMatch(HTML_CODE, /serviceWorker|caches\./);
+});
+
+test("a channel added or removed here is in the saved picker the next cold start draws", async () => {
+  // `#19 channel-browser` and the add form change the list between two `/client-config` answers;
+  // the saved shell follows them, or a cold start draws the picker as it was before the change.
+  const page = browsingPage();
+  await openBrowser(page);
+  const row = page.el("channel-directory-list").children[1];
+  await row.children.find((kid) => kid.tagName === "button").click();
+  await page.settle();
+  const added = String(page.registeredChannelId);
+  assert.ok(
+    savedCache(page).shell.channels.some((channel) => String(channel.id) === added),
+    "the browsed channel was added, but the saved picker does not have it"
+  );
+
+  let config = null;
+  const reloaded = reloadPage(page.storage, (p) => {
+    p.channelRegistrationSupported = true;
+    p.channelDiscoverySupported = true;
+    p.channels = page.channels;
+    config = gate(p.clientConfig);
+    p.clientConfig = config.respond;
+  });
+  assert.ok(
+    reloaded.el("discord-channel").children.some((option) => option.value === added),
+    "the cold start drew the picker from before the add"
+  );
+  config.open();
+  await reloaded.settle();
+
+  await reloaded.el("open-settings").click();
+  reloaded.el("settings-channel").value = added;
+  reloaded.el("settings-channel").dispatch("change");
+  await reloaded.el("remove-channel").click();
+  await reloaded.settle();
+  assert.deepStrictEqual(reloaded.removeChannelCalls, [added]);
+  assert.ok(
+    !savedCache(reloaded).shell.channels.some((channel) => String(channel.id) === added),
+    "the channel was removed, but the saved picker still offers it"
+  );
 });

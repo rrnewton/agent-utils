@@ -98,6 +98,21 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#18 offline-message-cache` in the browser engine: saved rows drawn across a real reload before
+  # the network answers, one newest-page read, local view switches, a real fetch failure, sign-out
+  # clearing, empty Cache Storage and no service worker, and the pill clear of the view tabs.
+  - group: check
+    job: offline-cache-browser
+    desc: saved-message snapshot in current Chromium at a 412x915 Android viewport
+    cmd: cd vibe-talk && python3 tests/offline_cache_browser.py
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # ---- the build everything else needs ----------------------------------------------------------
   - group: build
     job: release

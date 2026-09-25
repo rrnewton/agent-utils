@@ -188,6 +188,9 @@ body {
 
 #scroll-area {
   grid-row: 3;
+  /* Explicit, because #channel-freshness-anchor shares this cell: two items auto-placed into one
+     row are given two columns. */
+  grid-column: 1;
 }
 
 /* `hidden` has to beat the layout modes below, all of which set `display`. */
@@ -1502,6 +1505,46 @@ body {
   font-size: 0.78rem;
   box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
   pointer-events: none;
+}
+
+/* `#18 offline-message-cache`. The same pill as #pull-refresh, which it gives way to: rows saved
+   on this device, or kept after a refresh that failed, say how old they are over the list rather
+   than at the head of it, where the reader at the bottom would never see it. Anchored to the top
+   of the scroller, not of the pane: pinned to the pane it sat over the Main/Threads/All tabs and
+   hid one. Wraps on a narrow phone rather than running off both edges. */
+#channel-freshness-anchor {
+  /* The scroller's own grid cell, at its top: auto-placed, it took the tabs' row. */
+  grid-row: 3;
+  grid-column: 1;
+  align-self: start;
+  position: relative;
+  height: 0;
+}
+
+#channel-freshness {
+  position: absolute;
+  z-index: 2;
+  top: 0.4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100% - 2rem);
+  margin: 0;
+  padding: 0.25rem 0.75rem;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font-size: 0.78rem;
+  text-align: center;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  pointer-events: none;
+}
+
+#channel-freshness[data-state="offline"],
+#channel-freshness[data-state="failed"] {
+  color: var(--warn);
+  border-color: currentColor;
 }
 
 /* Armed reads differently from merely being dragged, because the difference is the whole of what

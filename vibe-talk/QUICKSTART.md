@@ -25,7 +25,10 @@ To install the reader on Android, serve it over HTTPS, open `/voice` in Chrome, 
 **Install app** from the browser menu. Chrome opens the installed app in its own window. On iOS,
 Safari's **Add to Home Screen** remains a browser-mode shortcut so microphone handling retains the
 safer browser fallback. The app has no service worker or offline cache; private API responses are
-`Cache-Control: no-store`. Remove and reinstall an older shortcut if its icon stays blank.
+`Cache-Control: no-store`. The channel view does keep a bounded snapshot of recent rows in
+`localStorage`, cleared on sign-out or a token change, so a revisit draws immediately (see
+[saved messages](README.md#saved-messages-on-this-device)). Remove and reinstall an older shortcut
+if its icon stays blank.
 
 Budget about an hour if you do all six, most of it clicking through two dashboards and waiting on
 DNS. Half that if you stop after step 3.

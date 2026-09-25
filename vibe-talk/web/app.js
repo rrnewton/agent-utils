@@ -10,6 +10,9 @@
 //    never put in a URL, so it cannot leak through a referrer or a server log.
 
 const TOKEN_KEY = "vibe-talk.token";
+// The voice page's saved channel rows, readable only with the token that read them. This page
+// shares that token, so replacing or forgetting it here must take them too.
+const MESSAGE_CACHE_KEY = "vibe-talk.voice.message-cache";
 // Read, never written. See the matching comment in voice.js: a browser that signed in before the
 // service was renamed still holds its token under the old key on this same origin, and saying so
 // is the difference between "you were signed out" and "this deployment is broken".
@@ -399,12 +402,15 @@ function wire() {
   el("save-token").addEventListener(
     "click",
     guard(async () => {
-      localStorage.setItem(TOKEN_KEY, el("api-token").value.trim());
+      const next = el("api-token").value.trim();
+      if (next !== token()) localStorage.removeItem(MESSAGE_CACHE_KEY);
+      localStorage.setItem(TOKEN_KEY, next);
       await loadConfig();
     })
   );
   el("forget-token").addEventListener("click", () => {
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(MESSAGE_CACHE_KEY);
     el("api-token").value = "";
     setStatus("token forgotten");
   });

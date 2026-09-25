@@ -10,7 +10,7 @@
 # The root one runs everything below by name, so the two cannot drift into different definitions of
 # what validating vibe-talk means.
 
-.PHONY: validate validate-boxed dag-check fmt check test page pwa-installability android-speech-self-test container-smoke clean
+.PHONY: validate validate-boxed dag-check fmt check test page pwa-installability offline-cache-browser android-speech-self-test container-smoke clean
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -71,6 +71,13 @@ page:
 # server. It deliberately states that this is not physical-device launcher proof.
 pwa-installability:
 	python3 tests/pwa_installability.py
+
+# `#18 offline-message-cache` in a real Chromium at a phone's size: localStorage across a real
+# reload, a real fetch failure, the Cache Storage and service-worker registries, and the pill's
+# layout against the view tabs -- what the DOM-only suite cannot observe. Loopback fake API only.
+# Pass SCREENSHOTS=dir to keep one PNG per step.
+offline-cache-browser:
+	python3 tests/offline_cache_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # The physical-device run is opt-in, but its signal/language evaluator has offline negative
 # controls. Keep those controls in the ordinary gate so a broken harness cannot silently bless a

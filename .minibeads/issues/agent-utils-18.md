@@ -1,8 +1,9 @@
 ---
 title: 'offline-message-cache: show downloaded messages before refresh'
-status: open
+status: in_progress
 priority: 0
 issue_type: feature
+assignee: opus-5.5
 labels:
 - vibe-talk
 - pwa
@@ -11,7 +12,9 @@ labels:
 depends_on:
   agent-utils-1: parent-child
 created_at: 2026-09-25T04:23:34.824211145+00:00
-updated_at: 2026-09-25T04:23:34.824211145+00:00
+updated_at: 2026-09-25T05:19:54.982579786+00:00
+claimed_at: 2026-09-25T05:19:54.982579786+00:00
+claimed_until: 2026-09-27T05:19:54.982428038+00:00
 ---
 
 # Description
