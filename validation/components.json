@@ -280,6 +280,7 @@
         "py/wrkslots/tests/test_census_traversal_deadline.py",
         "py/wrkslots/tests/test_cli.py",
         "py/wrkslots/tests/test_e2e_stress.py",
+        "py/wrkslots/tests/test_event_memo.py",
         "py/wrkslots/tests/test_network.py",
         "py/wrkslots/tests/test_proc_status.py",
         "py/wrkslots/tests/test_tool_authority.py"
