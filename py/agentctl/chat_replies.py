@@ -16,7 +16,7 @@ def _undecorate(line: str) -> tuple[str, str]:
     """Return marker text and its margin, replacing a native leading bullet."""
     stripped = line.lstrip(" \t")
     margin = line[:len(line) - len(stripped)]
-    if stripped.startswith(("• ", "⏺ ")):
+    if stripped.startswith(("• ", "⏺ ", "● ")):
         stripped = stripped[2:]
         margin += "  "
         extra = len(stripped) - len(stripped.lstrip(" \t"))
@@ -76,7 +76,7 @@ def _scan(
         if raw_marker is not None and raw_marker["close"]:
             raw_closing[raw_marker["nonce"]] = None
         stripped = line.lstrip(" \t")
-        decorated = stripped.startswith(("• ", "⏺ "))
+        decorated = stripped.startswith(("• ", "⏺ ", "● "))
         if active is None:
             # Native TUIs echo wrapped user prompts beneath ›/❯. Their hanging
             # indentation does not turn markers in user text into assistant output.
@@ -149,7 +149,7 @@ def extract_replies(text: str, nonces: Collection[str]) -> dict[str, list[str]]:
     callers provide durable occurrence-based delivery deduplication across captures.
 
     Inline examples, quoted markers, native terminal prompt echoes, and markers
-    inside Markdown fences are ignored. A native leading ``• ``/``⏺ `` on an
+    inside Markdown fences are ignored. A native leading ``• ``/``⏺ ``/``● `` on an
     expected opening marker starts a fresh assistant item, discarding an unrelated
     outside-block fence. Native decorations and shared terminal indentation are
     removed without stripping body bullets or meaningful code indentation.

@@ -6441,7 +6441,7 @@ fn sequenced_ordinal(identifier: &str, expected_nonce: &str) -> Option<u32> {
 fn undecorate(line: &str) -> (String, String, bool) {
     let stripped = line.trim_start_matches([' ', '\t']);
     let mut margin = line[..line.len() - stripped.len()].to_owned();
-    let (stripped, decorated) = ["• ", "⏺ "]
+    let (stripped, decorated) = ["• ", "⏺ ", "● "]
         .into_iter()
         .find_map(|prefix| stripped.strip_prefix(prefix).map(|value| (value, true)))
         .unwrap_or((stripped, false));
@@ -10411,5 +10411,25 @@ mod tests {
         assert_eq!(error.outcome, OutboundOutcome::Unknown);
         assert!(started.elapsed() < Duration::from_secs(5));
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_leading_bullets_decorate_reply_markers() {
+        // Codex renders `•`; Claude Code renders `⏺`, or `●` as observed on Linux.
+        let nonce = "AAAAAAAAAAAAAAAAAAAAAA";
+        for bullet in ["•", "⏺", "●"] {
+            let rendered = format!(
+                "{bullet} <CHAT_REPLY_{nonce}_1>\n  [model] answer\n  </CHAT_REPLY_{nonce}_1>\n"
+            );
+            let scan = scan_reply_blocks(&rendered, nonce).unwrap();
+            assert_eq!(
+                scan.blocks,
+                vec![ScannedReply {
+                    ordinal: 1,
+                    body: "[model] answer".to_owned(),
+                }],
+                "{bullet}"
+            );
+        }
     }
 }

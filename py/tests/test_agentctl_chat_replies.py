@@ -21,7 +21,7 @@ def test_only_expected_standalone_complete_blocks_are_replies() -> None:
     assert extract_replies(text, set()) == {}
 
 
-@pytest.mark.parametrize("decoration", ["", "• ", "⏺ "])
+@pytest.mark.parametrize("decoration", ["", "• ", "⏺ ", "● "])
 def test_native_margin_removal_preserves_lists_and_code_indentation(decoration: str) -> None:
     prefix = "  " + " " * len(decoration)
     text = (
@@ -71,13 +71,13 @@ def test_inline_prompt_markers_and_untrusted_source_echo_are_ignored() -> None:
 
 
 @pytest.mark.parametrize("fence", ["```", "~~~~"])
-@pytest.mark.parametrize("decoration", ["", "• ", "⏺ "])
+@pytest.mark.parametrize("decoration", ["", "• ", "⏺ ", "● "])
 def test_markers_inside_code_fences_are_examples(fence: str, decoration: str) -> None:
     text = f"{decoration}{fence}xml\n{block('example')}\n{fence}\n{block('actual')}"
     assert extract_replies(text, [FIRST]) == {FIRST: ["actual"]}
 
 
-@pytest.mark.parametrize("decoration", ["• ", "⏺ "])
+@pytest.mark.parametrize("decoration", ["• ", "⏺ ", "● "])
 def test_fresh_native_reply_marker_resets_unrelated_unclosed_fence(decoration: str) -> None:
     text = (
         f"Earlier tool output:\n```xml\n{block('undecorated example')}\n"
@@ -87,7 +87,7 @@ def test_fresh_native_reply_marker_resets_unrelated_unclosed_fence(decoration: s
     assert extract_replies(text, [FIRST]) == {FIRST: ["actual answer"]}
 
 
-@pytest.mark.parametrize("decoration", ["• ", "⏺ "])
+@pytest.mark.parametrize("decoration", ["• ", "⏺ ", "● "])
 def test_native_marker_inside_active_reply_fence_remains_code(decoration: str) -> None:
     body = f"```xml\n{decoration}{block('literal example')}\n```\nactual conclusion"
     assert extract_replies(block(body), [FIRST]) == {FIRST: [body]}
@@ -208,7 +208,7 @@ def test_mixed_tag_spellings_do_not_close_a_block(opening: str, closing: str) ->
 
 
 @pytest.mark.parametrize("protocol", ["CHAT", "GCHAT"])
-@pytest.mark.parametrize("decoration", ["", "• ", "⏺ "])
+@pytest.mark.parametrize("decoration", ["", "• ", "⏺ ", "● "])
 def test_unavailable_ids_are_reported_once_in_first_seen_order(protocol: str, decoration: str) -> None:
     text = (
         f"{decoration}{block('wrong', SECOND, protocol)}\n"
@@ -244,7 +244,7 @@ def test_unknown_ids_ignore_inline_quoted_and_fenced_examples(protocol: str) -> 
 
 
 @pytest.mark.parametrize("prompt", ["›", "❯"])
-@pytest.mark.parametrize("decoration", ["• ", "⏺ "])
+@pytest.mark.parametrize("decoration", ["• ", "⏺ ", "● "])
 def test_terminal_prompt_echo_and_indented_continuations_are_not_agent_replies(prompt: str, decoration: str) -> None:
     text = (
         f"{prompt} <CHAT_REPLY_prompt-id>\n"
@@ -260,7 +260,7 @@ def test_terminal_prompt_echo_and_indented_continuations_are_not_agent_replies(p
 
 
 @pytest.mark.parametrize("prompt", ["›", "❯"])
-@pytest.mark.parametrize("decoration", ["• ", "⏺ "])
+@pytest.mark.parametrize("decoration", ["• ", "⏺ ", "● "])
 @pytest.mark.parametrize("indent", ["", "  ", "\t"])
 @pytest.mark.parametrize("protocol", ["CHAT", "GCHAT"])
 def test_decorated_prompt_examples_cannot_send_or_trigger_unknown_id_feedback(

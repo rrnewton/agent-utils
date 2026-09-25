@@ -1036,13 +1036,13 @@ impl RouteCache {
     }
 
     fn patterns(&self) -> Vec<String> {
-        vec![r"^[^\S\r\n]*(?:[•⏺][ \t]+)?</(?:GCHAT|CHAT)_REPLY_[^<>\s]*>[^\S\r\n]*$".to_owned()]
+        vec![r"^[^\S\r\n]*(?:[•⏺●][ \t]+)?</(?:GCHAT|CHAT)_REPLY_[^<>\s]*>[^\S\r\n]*$".to_owned()]
     }
 }
 
 fn matched_identifier(line: &str) -> Option<&str> {
     let stripped = line.trim();
-    let stripped = ["• ", "⏺ "]
+    let stripped = ["• ", "⏺ ", "● "]
         .into_iter()
         .find_map(|prefix| stripped.strip_prefix(prefix))
         .unwrap_or(stripped)
@@ -3164,6 +3164,10 @@ mod tests {
         assert_eq!(
             matched_identifier("  • </CHAT_REPLY_nonce_4>  "),
             Some("nonce_4")
+        );
+        assert_eq!(
+            matched_identifier("● </CHAT_REPLY_nonce_5>"),
+            Some("nonce_5")
         );
         assert_eq!(matched_identifier("```"), None);
         assert_eq!(matched_identifier("<CHAT_REPLY_nonce_4>"), None);
