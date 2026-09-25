@@ -1709,6 +1709,9 @@ pub struct StopOptions {
 pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     client: &'a A,
     registry: PathBuf,
+    /// Workspace inherited from the launching Herdr pane (`HERDR_WORKSPACE_ID`),
+    /// used when a start names none.
+    inherited_workspace: Option<String>,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
@@ -1721,7 +1724,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .map_err(|error| fail(error.to_string()))?
                 .join(registry)
         };
-        Ok(Self { client, registry })
+        let inherited_workspace = std::env::var("HERDR_WORKSPACE_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        Ok(Self {
+            client,
+            registry,
+            inherited_workspace,
+        })
+    }
+
+    /// Replace the inherited workspace, so tests never depend on the pane that runs them.
+    #[cfg(test)]
+    fn with_inherited_workspace(mut self, workspace: Option<&str>) -> Self {
+        self.inherited_workspace = workspace.map(str::to_owned);
+        self
     }
 
     fn directory(&self, agent_name: &str) -> Result<PathBuf> {
@@ -2699,11 +2716,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             .workspace_id
             .clone()
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::env::var("HERDR_WORKSPACE_ID")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            });
+            .or_else(|| self.inherited_workspace.clone());
         let selected = if let Some(workspace) = selected {
             self.client.workspace_label(&workspace)?;
             Some(workspace)
@@ -4697,7 +4710,9 @@ mod tests {
             }
         }
         fn manager(&self) -> ManagedAgents<'_, Fake> {
-            ManagedAgents::new(&self.client, &self.root.join("registry")).unwrap()
+            ManagedAgents::new(&self.client, &self.root.join("registry"))
+                .unwrap()
+                .with_inherited_workspace(None)
         }
         fn start(&self, brief: Option<String>) -> Value {
             self.manager()
@@ -5363,6 +5378,59 @@ mod tests {
                 "sandbox_mode=read-only"
             ])
         );
+    }
+
+    #[test]
+    fn direct_start_ignores_a_conflicting_real_herdr_workspace() {
+        // Re-run a start fixture with a conflicting workspace in the real process environment.
+        // The fake Herdr reports its own workspace, so a fixture that still inherited
+        // HERDR_WORKSPACE_ID would refuse its own launch whenever the suite runs inside a pane.
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg("--exact")
+        .arg("subagents::tests::direct_start_preserves_unstructured_raw_policy_and_nonoverriding_codex_config")
+        .arg("--test-threads=1")
+        .env("HERDR_WORKSPACE_ID", "conflicting-workspace")
+        .output()
+        .expect("run start fixture under a conflicting workspace");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+    }
+
+    #[test]
+    fn direct_start_prefers_named_workspace_then_inherited_workspace() {
+        let named = Fixture::new();
+        named
+            .manager()
+            .with_inherited_workspace(Some("elsewhere"))
+            .start(
+                "worker",
+                &named.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+
+        let inherited = Fixture::new();
+        let error = inherited
+            .manager()
+            .with_inherited_workspace(Some("elsewhere"))
+            .start("worker", &inherited.root, StartOptions::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("workspace identity changed"));
+        let record: Value = serde_json::from_slice(
+            &fs::read(inherited.root.join("registry/worker/agent.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["workspace_id"], "elsewhere");
     }
 
     #[test]
